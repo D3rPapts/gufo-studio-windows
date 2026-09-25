@@ -29,6 +29,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/platform/net.hpp"
+#include "src/core/platform/socket.hpp"
 
 namespace {
 namespace net = gufo::net;
@@ -368,7 +369,7 @@ public:
     std::string response;
     char buffer[4096];
     for (;;) {
-      const auto count = ::read(fd, buffer, sizeof(buffer));
+      const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
       assert(count >= 0);
       if (count == 0) {
         break;
@@ -782,7 +783,7 @@ void TestExpectContinue() {
     std::string response;
     char buffer[4096];
     while (response.size() < interim.size()) {
-      const auto count = ::read(fd, buffer, interim.size() - response.size());
+      const auto count = gufo::platform::SocketRead(fd, buffer, interim.size() - response.size());
       assert(count > 0);
       response.append(buffer, static_cast<std::size_t>(count));
     }
@@ -790,7 +791,7 @@ void TestExpectContinue() {
     assert(net::SendNoSignal(fd, "hello", 5) == 5);
     response.clear();
     for (;;) {
-      const auto count = ::read(fd, buffer, sizeof(buffer));
+      const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
       assert(count >= 0);
       if (count == 0)
         break;
@@ -2487,7 +2488,7 @@ std::string SendParts(const std::string& host, int port,
   std::string response;
   char buffer[4096];
   for (;;) {
-    const auto count = ::read(fd, buffer, sizeof(buffer));
+    const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
     assert(count >= 0);
     if (count == 0)
       break;
@@ -2971,39 +2972,51 @@ void TestSignalShutdown() {
   // both idle listeners and active generation return through normal cleanup.
   for (const int signal : {SIGINT, SIGTERM}) {
     for (const bool active : {false, true}) {
+      const auto run_case = [&] {
+        RunningServer server({}, true);
+        // Accepting a request proves run() installed its handlers.
+        ExpectStatus(server.Post("/echo", "ready"), 200);
+        int fd = -1;
+        if (active) {
+          server.backend->wait_for_disconnect = true;
+          fd = server.Connect();
+          const std::string body = R"({"prompt":"hello"})";
+          const std::string request =
+              "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
+              std::to_string(body.size()) + "\r\n\r\n" + body;
+          assert(net::SendNoSignal(fd, request.data(), request.size()) ==
+                 static_cast<ssize_t>(request.size()));
+          assert(
+              server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+        }
+#ifdef _WIN32
+        assert(::raise(signal) == 0);
+#else
+        assert(::kill(::getpid(), signal) == 0);
+#endif
+        assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
+        if (active) {
+          assert(server.backend->disconnected);
+          net::CloseSocket(fd);
+        }
+      };
+#ifdef _WIN32
+      // No fork() on Windows: run in-process. The CRT calls the handler
+      // synchronously on this thread, and without one SIGINT/SIGTERM would
+      // end the runner, which fails the test just as loudly.
+      run_case();
+#else
       const pid_t child = ::fork();
       assert(child >= 0);
       if (child == 0) {
         ::alarm(5);
-        {
-          RunningServer server({}, true);
-          // Accepting a request proves run() installed its handlers.
-          ExpectStatus(server.Post("/echo", "ready"), 200);
-          int fd = -1;
-          if (active) {
-            server.backend->wait_for_disconnect = true;
-            fd = server.Connect();
-            const std::string body = R"({"prompt":"hello"})";
-            const std::string request =
-                "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
-                std::to_string(body.size()) + "\r\n\r\n" + body;
-            assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-                   static_cast<ssize_t>(request.size()));
-            assert(server.backend->entered.try_acquire_for(
-                std::chrono::seconds(2)));
-          }
-          assert(::kill(::getpid(), signal) == 0);
-          assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
-          if (active) {
-            assert(server.backend->disconnected);
-            net::CloseSocket(fd);
-          }
-        }
+        run_case();
         ::_exit(0);
       }
       int status = 0;
       assert(::waitpid(child, &status, 0) == child);
       assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
     }
   }
 }
