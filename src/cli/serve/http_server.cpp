@@ -51,6 +51,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
+#include "src/core/platform/socket.hpp"
 #include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
@@ -102,7 +103,7 @@ private:
 bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    const ssize_t n = gufo::platform::SocketRead(fd, buf, sizeof(buf));
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -118,7 +119,7 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = ::read(fd, buf, want);
+    const ssize_t r = gufo::platform::SocketRead(fd, buf, want);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -164,7 +165,7 @@ bool SendChunk(int fd, std::string_view data, std::string_view prefix = {}) {
 
 bool IsPeerDisconnected(int fd) noexcept {
   pollfd descriptor{
-      .fd = fd,
+      .fd = static_cast<decltype(pollfd::fd)>(fd),
       .events = POLLIN | POLLERR | POLLHUP,
       .revents = 0,
   };
@@ -183,7 +184,8 @@ bool IsPeerDisconnected(int fd) noexcept {
   if ((descriptor.revents & POLLIN) == 0)
     return false;
   char byte;
-  const auto count = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  const auto count =
+      gufo::platform::SocketRecv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
   return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                         errno != EINTR);
 }
@@ -1875,13 +1877,21 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   const int yes = 1;
+#ifdef _WIN32
+  // Windows SO_REUSEADDR lets another process steal a bound port; exclusive
+  // use is the Linux SO_REUSEADDR behavior for a listening server.
+  gufo::platform::SetSocketOption(listen_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                                  yes);
+#else
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
   // `::` serves IPv4 clients too. Set it explicitly: the kernel default
-  // follows net.ipv6.bindv6only, which differs between hosts.
+  // follows net.ipv6.bindv6only, which differs between hosts (and Windows
+  // defaults to IPv6 only).
   const int no = 0;
   if (addr.ss_family == AF_INET6 &&
-      ::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) !=
-          0) {
+      ::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY,
+                   reinterpret_cast<const char*>(&no), sizeof(no)) != 0) {
     if (error != nullptr)
       *error = "setsockopt(IPV6_V6ONLY) failed";
     net::CloseSocket(listen_fd_);
@@ -1960,7 +1970,14 @@ void HttpServer::run(bool handle_signals) {
                               "poll HTTP listener");
     if (ready <= 0)
       continue;
-    const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    const int client_fd =
+        static_cast<int>(::accept(listen_fd_, nullptr, nullptr));
+#ifdef _WIN32
+    // Winsock sockets inherit the listener's nonblocking mode; the request
+    // handlers rely on blocking reads with timeouts.
+    if (client_fd >= 0)
+      (void)net::SetBlocking(client_fd);
+#endif
     if (client_fd < 0) {
       if (stopped_.load(std::memory_order_acquire)) {
         break;
@@ -1986,7 +2003,7 @@ void HttpServer::run(bool handle_signals) {
           handle_connection(client_fd);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            net::CloseSocket(worker_ptr->fd);
+            gufo::platform::CloseConnection(worker_ptr->fd);
             worker_ptr->fd = -1;
           }
           worker_ptr->done.store(true, std::memory_order_release);
@@ -2000,7 +2017,7 @@ void HttpServer::run(bool handle_signals) {
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
       (void)SendAll(client_fd, BuildResponse(response));
-      net::CloseSocket(client_fd);
+      gufo::platform::CloseConnection(client_fd);
     }
   }
   reap_workers();
@@ -2294,9 +2311,18 @@ void HttpServer::handle_connection(int client_fd) {
         }
         if (ok) {
           req.body = std::move(body);
+#ifdef _WIN32
+          // WSAPoll does not report a connection that stop() shut down
+          // locally, so a stopping server cancels its generations directly.
+          req.is_cancelled = [this, client_fd] {
+            return stopped_.load(std::memory_order_acquire) ||
+                   IsPeerDisconnected(client_fd);
+          };
+#else
           req.is_cancelled = [client_fd] {
             return IsPeerDisconnected(client_fd);
           };
+#endif
         }
       }
     }

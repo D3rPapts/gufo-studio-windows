@@ -102,7 +102,7 @@ WebSocket::~WebSocket() {
   Close();
   // Cancellation can wake the consumer before the reader finishes its close
   // reply. Let that writer complete before shutting down the send half.
-  (void)::shutdown(fd_, SHUT_RD);
+  platform::StopSocketReads(fd_);
   reader_.join();
   (void)::shutdown(fd_, SHUT_RDWR);
 }
@@ -117,7 +117,12 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
-    const auto count = ::recv(fd_, data, size, 0);
+#ifdef _WIN32
+    // See platform::StopSocketReads: wake periodically to observe closed_.
+    if (!platform::WaitReadable(fd_, std::chrono::milliseconds(50)))
+      continue;
+#endif
+    const auto count = platform::SocketRecv(fd_, data, size, 0);
     if (count < 0 && errno == EINTR)
       continue;
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -183,7 +188,7 @@ void WebSocket::Close(std::uint16_t code) {
   const std::array<char, 2> payload{static_cast<char>(code >> 8),
                                     static_cast<char>(code & 255)};
   (void)Send(8, std::string_view(payload.data(), payload.size()));
-  (void)::shutdown(fd_, SHUT_RD);
+  platform::StopSocketReads(fd_);
 }
 
 bool WebSocket::MarkClosed() {
