@@ -774,6 +774,16 @@ private:
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
+  /// Completion flag for Wait (coherent pinned memory, Tuning::flag_waits)
+  /// and its sequence.
+  std::uint32_t* done_flag_{nullptr};
+  mutable std::uint32_t done_counter_{0};
+  /// Waits for the stream: with Tuning::flag_waits spins on a completion
+  /// kernel's flag, which returns ~0.4 ms sooner than hipStreamSynchronize
+  /// after a large graph on Windows; falls back to hipStreamSynchronize
+  /// after 1 s (and so still reports a failed launch). Without the switch,
+  /// hipStreamSynchronize.
+  [[nodiscard]] bool Wait(const char* what, std::string* error_msg) const;
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

@@ -862,6 +862,47 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return ok;
 }
 
+std::uint32_t Session::MaxVerifyWidth() const noexcept {
+  return MtpEnabled() ? model_->executor_->max_speculative() : 1;
+}
+
+bool Session::TeacherForce(std::span<const std::int32_t> tokens,
+                           std::vector<float>* rows, std::string* error_msg,
+                           bool prefill) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
+  if (!valid_ || tokens_.empty() || rows == nullptr) {
+    AssignError(error_msg, "teacher forcing needs a synced session");
+    return false;
+  }
+  const std::size_t n = tokens.size();
+  if (n == 0 || (prefill ? MtpEnabled() : n > MaxVerifyWidth()) ||
+      tokens_.size() + n > ContextSize()) {
+    AssignError(error_msg, "teacher forcing width or context out of range");
+    return false;
+  }
+  rocm::Executor& exec = *model_->executor_;
+  const std::size_t vocab = model_->VocabSize();
+  rows->resize(n * vocab);
+  valid_ = false;
+  // The same Forward calls DecodeStep makes: a one-token decode, or a verify
+  // pass whose every row is kept (the draft head is never consulted).
+  // Prefill arithmetic is the same at every chunk width.
+  const auto mode = prefill  ? rocm::Executor::ForwardMode::kPrefill
+                    : n == 1 ? rocm::Executor::ForwardMode::kDecode
+                             : rocm::Executor::ForwardMode::kVerify;
+  if (!exec.Forward(*session_, tokens, static_cast<std::uint32_t>(n),
+                    rows->data(), mode, error_msg) ||
+      (mode == rocm::Executor::ForwardMode::kVerify &&
+       !exec.Rollback(*session_, static_cast<std::uint32_t>(n), error_msg))) {
+    return false;
+  }
+  std::copy_n(rows->data() + (n - 1) * vocab, vocab, logits_.begin());
+  tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+  valid_ = true;
+  return true;
+}
+
 struct Session::PendingDecode {
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;
@@ -885,6 +926,37 @@ struct Session::PendingDecode {
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
 };
+
+namespace {
+// ModelOptions::mtp_survival: sampled drafting stops once the chain is
+// unlikely to survive. Each proposal multiplies an acceptance estimate looked
+// up from the draft head's own top probability, and drafting ends when the
+// product falls below kMtpSurvivalFloor (the dropped proposal is not
+// verified). The decision uses only draft-side probabilities, so
+// rejection-sampling verification keeps the target distribution exact.
+// Table: P(accept | reached) by draft depth (first, later) and
+// top-probability bin, measured over 2130 full 7-draft cycles on Windows
+// (2026-09-25).
+constexpr std::array<float, 8> kMtpTopBins = {0.30F, 0.50F, 0.70F, 0.80F,
+                                              0.90F, 0.95F, 0.99F, 2.0F};
+constexpr std::array<std::array<float, 8>, 2> kMtpAcceptByTop = {{
+    {0.400F, 0.506F, 0.615F, 0.595F, 0.635F, 0.774F, 0.825F, 0.947F},
+    {0.337F, 0.484F, 0.522F, 0.584F, 0.640F, 0.711F, 0.702F, 0.935F},
+}};
+constexpr float kMtpSurvivalFloor = 0.40F;
+
+float MtpAcceptEstimate(std::size_t depth, const MtpProposal& proposal) {
+  float top = 0;
+  for (std::size_t i = 0; i < proposal.size; ++i) {
+    top = std::max(top, proposal.probabilities[i]);
+  }
+  std::size_t bin = 0;
+  while (bin + 1 < kMtpTopBins.size() && top >= kMtpTopBins[bin]) {
+    ++bin;
+  }
+  return kMtpAcceptByTop[depth == 0 ? 0 : 1][bin];
+}
+}  // namespace
 
 void Session::AppendDraft(PendingDecode& pending) {
   if (pending.sampled) {
@@ -984,9 +1056,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       sampler.config().uses_random_sampling() || batch_drafts.has_value()
           ? 0
           : occupancy;
+  // ModelOptions::mtp_survival: sampled single-session decoding drafts up to
+  // the limit and stops on the survival estimate (see kMtpSurvivalFloor);
+  // the width is an upper bound.
+  const bool survival = model_->options_.mtp_survival && !batch_drafts &&
+                        !defer_head && sampler.config().uses_random_sampling();
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+                 : survival   ? std::min<std::uint32_t>(
+                                  model_->options_.max_draft_tokens,
+                                  static_cast<std::uint32_t>(cap - 1))
                               : draft_length_.Choose(
                                     static_cast<std::uint32_t>(cap - 1),
                                     static_cast<std::uint32_t>(tokens_.size()),
@@ -1061,8 +1141,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   pending->draft = draft_token_;
   if (!defer_head) {
+    float alive = 1.0F;
     while (pending->chain.size() < width) {
       AppendDraft(*pending);
+      if (survival && !pending->proposals.empty()) {
+        const std::size_t depth = pending->proposals.size() - 1;
+        alive *= MtpAcceptEstimate(depth, pending->proposals.back());
+        // The first proposal is always kept (a speculative cycle).
+        if (depth > 0 && alive < kMtpSurvivalFloor) {
+          pending->chain.pop_back();
+          pending->proposals.pop_back();
+          pending->width = pending->chain.size();
+          break;
+        }
+      }
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
         break;

@@ -46,6 +46,12 @@ struct TextSpeculativeConfig {
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+  /// MTP opt-ins, all off by default. mtp_survival applies to
+  /// Qwen3.8-Flash-Next and Qwen3.6-35B-A3B; the draft vocabulary and prompt
+  /// lookup switches to Qwen3.6-35B-A3B (Flash-Next has its own, always on).
+  bool mtp_survival{false};
+  bool mtp_latin_draft_vocabulary{false};
+  bool prompt_lookup{false};
 };
 
 struct TextDiskCacheConfig {

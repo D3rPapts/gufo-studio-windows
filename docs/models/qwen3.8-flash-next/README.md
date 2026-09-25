@@ -88,6 +88,16 @@ All-copy batches retain full width; sampled proposal streams are unchanged.
 Timings report
 `lookup_n` / `lookup_n_accepted`.
 
+`--mtp-policy survival` (opt-in) changes only how many tokens a sampled
+single-session cycle drafts: drafting stops when the product of per-proposal
+acceptance estimates (from the draft head's top probability, by depth) falls
+below 0.40, instead of following the per-cycle length controller.
+Verification is unchanged, so sampled outputs keep the target distribution.
+On the earlier Windows fork it measured +8.7% over the default together with
+a Latin-text draft vocabulary; that vocabulary and the fork's opt-in prompt
+lookup are not part of Flash-Next here (the request draft vocabulary and the
+prompt lookup above replace them).
+
 The official template defaults to thinking on, `xhigh` effort and preserving
 prior reasoning. Use the [reasoning controls](../../SERVER.md#reasoning-controls)
 for explicit effort/thinking overrides. Native context is 262144. A larger

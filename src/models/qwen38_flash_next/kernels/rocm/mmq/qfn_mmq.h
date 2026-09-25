@@ -55,6 +55,11 @@ size_t qfn_mmq_q8_1_bytes(int N, int K);
 int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
                           hipStream_t stream);
 
+/// Deeper load prefetch in the HC down projection for 2-8 tokens (outputs
+/// are bit-identical; one token always keeps depth 2). Off by default; set
+/// before qfn_mmq_init so the decode kernels it preloads match.
+void qfn_mmq_set_hc_down_deep_prefetch(int enabled);
+
 // Exact decode arithmetic for 1–8 rows, or up to 32 ungated rows.
 // Wide projections (M >= 8192, K = 2560) accept up to 48 ungated rows.
 // The 320×10240 HC projection also accepts larger multiples of eight.

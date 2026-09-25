@@ -148,14 +148,33 @@ kernels tuned for the Windows compiler, and A3B's own runtime.
 
 Some behaviour changes were developed and measured on Windows only. They live
 in `src/core/platform/tuning.hpp`: each is on by default on Windows and off
-elsewhere, so Linux runs exactly the code it ran before. None changes model
-arithmetic. `GUFO_PLATFORM_TUNING` overrides the defaults on any platform, for
+elsewhere, so Linux runs exactly the code it ran before. The decode switches
+change timing and memory placement only. `GUFO_PLATFORM_TUNING` overrides the
+defaults on any platform, for
 example `GUFO_PLATFORM_TUNING=+prompt_checkpoint` to try one on Linux, or
 `GUFO_PLATFORM_TUNING=none` to run the Linux path on Windows.
 
 | Switch | What it does | Measured on Windows |
 | --- | --- | --- |
 | `prompt_checkpoint` | Qwen serving keeps a checkpoint before the generation suffix for every prompt, not only with tools or without preserved thinking | A client that re-sends the previous turn without its reasoning hits the cache instead of re-prefilling everything: follow-up TTFT 0.52 s at 82K context |
+| `copy_kernels` | Qwen3.8-Flash-Next decode copies (uploads, downloads, rollback, hidden carry) as small kernels instead of `hipMemcpyAsync` | A copy-engine hand-off costs ~30 us per graph node and ~150 us per compute/copy switch; rollback 8.5 -> ~2 ms, probe +7-8% with `recorded_rollback` |
+| `recorded_rollback` | The speculative state rollback replays as one recorded graph per kept length | (with `copy_kernels`, above) |
+| `keep_rollback_rows` | Rollback rows survive session resets and snapshot restores | Verify and rollback graphs are captured once per session instead of on every request |
+| `flush_before_wait` | `hipStreamQuery` before blocking on n-gram rows: HIP on Windows only submits queued launches at a flush | Draft-to-verify GPU idle 1.9 -> 1.15 ms per cycle |
+| `flag_waits` | Decode-sized passes wait on a completion flag in coherent pinned memory instead of `hipStreamSynchronize` | `hipStreamSynchronize` returns ~0.4 ms late after a large graph |
+| `fused_hc_down` | The HC mixer down projection prefetches deeper for 2-8 tokens (its SiLU scale is already fused into the up projection's quantization upstream) | Part of the decode gain below |
+| `hot_first_upload` | Weights read on every token are uploaded before the routed experts | GEMVs on memory allocated late run 6-22% slower on Windows; placement only |
+
+Measured on the earlier Windows fork (before the rebase onto current upstream,
+which since does sampled verification from GPU candidate lists on every
+platform), all decode switches on against all off (the Linux path):
+`gufo bench --logit-eval` dumps are bit-identical at all 4418 positions, and a
+fixed-seed sampled decode produces byte-identical text. All off decodes
+7.6-9.5% slower on Windows (sampled probe, prose / code / reasoning 32.0 /
+34.3 / 44.1 against 34.5 / 37.2 / 48.3 tok/s). `prompt_checkpoint` is the
+exception to identical text: splitting prefill at the generation suffix
+changes rounding the way a different prefill chunk size does, so sampled texts
+differ from an unsplit prefill, as equally valid samples.
 
 ## Memory
 

@@ -22,6 +22,7 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
+#include "src/core/platform/tuning.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -179,6 +180,46 @@ void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
     (void)madvise(data + skip, pages / workers * page, MADV_POPULATE_WRITE);
   }
   (void)madvise(data + skip, length, MADV_HUGEPAGE);
+}
+
+/// The Windows-validated switches (src/core/platform/tuning.hpp). Each is
+/// off by default outside Windows, which then runs the upstream code.
+const platform::Tuning& Tune() {
+  return platform::PlatformTuning();
+}
+
+/// Pinned buffers the host reads after a Wait: with flag waits the host
+/// does not synchronize the stream, so they must be coherent (GPU writes
+/// visible without a flush).
+unsigned ResultHostFlags() {
+  return Tune().flag_waits ? hipHostMallocCoherent : hipHostMallocDefault;
+}
+
+/// Copy between device memory and pinned host memory: with
+/// Tuning::copy_kernels a kernel that reads or writes the pinned pages
+/// directly (a hipMemcpyAsync hand-off to the copy engine costs ~30 us per
+/// graph node on Windows), otherwise hipMemcpyAsync.
+bool CopyPinned(const void* src, void* dst, std::size_t bytes,
+                hipMemcpyKind kind, hipStream_t stream, const char* what,
+                std::string* error_msg) {
+  if (Tune().copy_kernels) {
+    CopyMapped(src, dst, bytes, stream);
+    return Check(hipGetLastError(), what, error_msg);
+  }
+  return Check(hipMemcpyAsync(dst, src, bytes, kind, stream), what, error_msg);
+}
+
+/// Device-to-device float copy: with Tuning::copy_kernels a kernel on the
+/// compute queue (no cross-engine wait), otherwise hipMemcpyAsync.
+bool CopyFloats(const float* src, float* dst, std::size_t count,
+                hipStream_t stream, const char* what, std::string* error_msg) {
+  if (Tune().copy_kernels) {
+    CopyDevice(src, dst, count, stream);
+    return Check(hipGetLastError(), what, error_msg);
+  }
+  return Check(hipMemcpyAsync(dst, src, count * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream),
+               what, error_msg);
 }
 
 }  // namespace
@@ -852,15 +893,22 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   return checkpoint;
 }
 
+/// Graph key of a recorded speculative rollback (Tuning::recorded_rollback);
+/// the low bits hold the kept token count.
+constexpr std::uint64_t kRollbackKey = std::uint64_t{1} << 48;
+
 void Session::TrimRollback(std::uint32_t depth) noexcept {
   if (depth >= rollback_depth_)
     return;
   // Keep graphs whose rows still exist. Deeper verifier graphs capture
-  // discarded pointers; ordinary decode and MTP graphs do not.
+  // discarded pointers, as do recorded rollbacks keeping more than `depth`
+  // tokens (they read rows 0..keep-1); ordinary decode and MTP graphs do not.
   for (auto it = graphs_.begin(); it != graphs_.end();) {
-    if ((it->first & (std::uint64_t{1} << 32)) != 0 &&
-        (it->first & (std::uint64_t{1} << 40)) == 0 &&
-        (it->first & 0xFFFFU) > depth + 1) {
+    const bool rollback = (it->first & kRollbackKey) != 0;
+    if ((rollback && (it->first & 0xFFFFU) > depth) ||
+        (!rollback && (it->first & (std::uint64_t{1} << 32)) != 0 &&
+         (it->first & (std::uint64_t{1} << 40)) == 0 &&
+         (it->first & 0xFFFFU) > depth + 1)) {
       (void)hipGraphExecDestroy(it->second);
       it = graphs_.erase(it);
     } else {
@@ -891,7 +939,9 @@ void Session::Reset(bool reuse_mtp) {
   // addresses also retains the graphs; freeing it at every cache reassignment
   // makes later MTP requests allocate and record those shapes again. Its full
   // bound is already included in speculative SessionBytes and AllocatedBytes.
-  if (!reuse_mtp || !mtp_enabled_)
+  // Tuning::keep_rollback_rows retains them on every reset, so the verify
+  // and rollback graphs that point at them are captured once per session.
+  if ((!reuse_mtp || !mtp_enabled_) && !Tune().keep_rollback_rows)
     TrimRollback(0);
   snapshot_lineage_.reset();
   position_ = 0;
@@ -958,6 +1008,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
       options.max_speculative, 1, e->options_.max_logit_rows);
+  qfn_mmq_set_hc_down_deep_prefetch(Tune().fused_hc_down ? 1 : 0);
   if (qfn_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -1179,10 +1230,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                "pinned token buffer", error_msg) ||
         !Check(
             e->host_allocations_.Allocate(
-                &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
-                             c.vocab_size * sizeof(float)),
+                &logits,
+                static_cast<std::size_t>(e->options_.max_logit_rows) *
+                    c.vocab_size * sizeof(float),
+                ResultHostFlags()),
             "pinned logits buffer", error_msg)) {
       return nullptr;
+    }
+    if (Tune().flag_waits) {
+      void* done = nullptr;
+      if (!Check(e->host_allocations_.Allocate(&done, 64, hipHostMallocCoherent),
+                 "pinned completion flag", error_msg)) {
+        return nullptr;
+      }
+      e->done_flag_ = static_cast<std::uint32_t*>(done);
+      *e->done_flag_ = 0;
     }
     void* counts = nullptr;
     if (!Check(e->host_allocations_.Allocate(
@@ -1229,10 +1291,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
     if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
-                                             sizeof(std::int32_t)),
+                                             sizeof(std::int32_t),
+                                             ResultHostFlags()),
                "pinned draft token", error_msg) ||
         !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
-                                             sizeof(MtpCandidateLogits)),
+                                             sizeof(MtpCandidateLogits),
+                                             ResultHostFlags()),
                "pinned draft candidates", error_msg)) {
       return nullptr;
     }
@@ -2268,7 +2332,47 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   return ple_pending_;
 }
 
+bool Executor::Wait(const char* what, std::string* error_msg) const {
+  // After a many-node graph, hipStreamSynchronize returns ~0.7 ms after the
+  // last kernel on Windows (the runtime's completion bookkeeping); a flag
+  // written by a kernel queued behind the work is seen after ~0.3 ms. The
+  // flag exists with Tuning::flag_waits only.
+  if (done_flag_ == nullptr) {
+    return Check(hipStreamSynchronize(stream_), what, error_msg);
+  }
+  if (++done_counter_ == 0) {
+    ++done_counter_;
+  }
+  const std::uint32_t want = done_counter_;
+  SignalDone(done_flag_, want, stream_);
+  if (!Check(hipGetLastError(), what, error_msg)) {
+    return false;
+  }
+  (void)hipStreamQuery(stream_);  // submit: launches are batched until a flush
+  const auto start = std::chrono::steady_clock::now();
+  const volatile std::uint32_t* flag = done_flag_;
+  while (*flag != want) {
+    if (std::chrono::steady_clock::now() - start > std::chrono::seconds(1)) {
+      return Check(hipStreamSynchronize(stream_), what, error_msg);
+    }
+    std::this_thread::yield();
+  }
+  return true;
+}
+
 bool Executor::WaitPle(std::string* error_msg) const {
+  // Tuning::flush_before_wait: HIP on Windows batches launches until a
+  // flush. Without one, the layers queued before this wait (the decode
+  // prefix graph, eager prefill layers) would only start at the next
+  // synchronization, leaving the GPU idle for the whole n-gram wait.
+  // hipStreamQuery submits them without blocking; it is illegal while a
+  // graph is being captured (it would invalidate it).
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  if (Tune().flush_before_wait && ple_pending_ &&
+      hipStreamIsCapturing(stream_, &capture) == hipSuccess &&
+      capture == hipStreamCaptureStatusNone) {
+    (void)hipStreamQuery(stream_);
+  }
   bool ok = ple_pending_;
   if (ok && prefetch_.claimed != 0) {
     FinishPrefetch();
@@ -2895,10 +2999,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     if (draft != nullptr)
       RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
                     draft->mtp_.draft_ids, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
-            "draft token download", error_msg)) {
+    if (!CopyPinned(s_.mtp_token, mtp_token_host_, sizeof(std::int32_t),
+                    hipMemcpyDeviceToHost, stream_, "draft token download",
+                    error_msg)) {
       return false;
     }
   }
@@ -2907,9 +3010,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                   kMtpCandidates * sizeof(std::uint32_t));
     const auto bytes =
         offsetof(MtpCandidateLogits, logits) + count * sizeof(float);
-    if (!Check(hipMemcpyAsync(mtp_candidates_host_, s_.mtp_ids, bytes,
-                              hipMemcpyDeviceToHost, stream_),
-               "draft candidates download", error_msg)) {
+    if (!CopyPinned(s_.mtp_ids, mtp_candidates_host_, bytes,
+                    hipMemcpyDeviceToHost, stream_, "draft candidates download",
+                    error_msg)) {
       return false;
     }
   }
@@ -2984,8 +3087,13 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
-  return !synchronize ||
-         Check(hipStreamSynchronize(stream_), "forward", error_msg);
+  if (!synchronize)
+    return true;
+  // Tuning::flag_waits: a decode-sized graph pass waits on a completion
+  // flag instead of synchronizing the stream (see Wait).
+  if (graph && done_flag_ != nullptr)
+    return Wait("forward", error_msg);
+  return Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -3171,13 +3279,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            bool embeddings_ready) const {
   const Config& c = config();
   if (first_layer == 0) {
-    if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                              sizeof(Session::Control), hipMemcpyHostToDevice,
-                              stream_),
-               "control upload", error_msg) ||
-        !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                              hipMemcpyHostToDevice, stream_),
-               "token upload", error_msg)) {
+    if (!CopyPinned(control_host_, session.control_, sizeof(Session::Control),
+                    hipMemcpyHostToDevice, stream_, "control upload",
+                    error_msg) ||
+        !CopyPinned(tokens_host_, s_.tokens, n * sizeof(std::int32_t),
+                    hipMemcpyHostToDevice, stream_, "token upload",
+                    error_msg)) {
       return false;
     }
     EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
@@ -3310,12 +3417,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       checkpoint && checkpoint->tokens < n ? n - checkpoint->tokens : n,
       options_.max_speculative);
   if (session.mtp_enabled_ &&
-      !Check(hipMemcpyAsync(
-                 session.mtp_.target_hidden,
-                 s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
-                 static_cast<std::size_t>(kept) * c.HcDim() * sizeof(float),
-                 hipMemcpyDeviceToDevice, stream_),
-             "hidden keep", error_msg)) {
+      !CopyFloats(s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
+                  session.mtp_.target_hidden,
+                  static_cast<std::size_t>(kept) * c.HcDim(), stream_,
+                  "hidden keep", error_msg)) {
     return false;
   }
   if (n_logits > 0) {
@@ -3329,11 +3434,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
     if (download_logits &&
-        !Check(hipMemcpyAsync(logits_host_, s_.logits,
-                              static_cast<std::size_t>(n_logits) *
-                                  c.vocab_size * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
-               "logits download", error_msg)) {
+        !CopyPinned(
+            s_.logits, logits_host_,
+            static_cast<std::size_t>(n_logits) * c.vocab_size * sizeof(float),
+            hipMemcpyDeviceToHost, stream_, "logits download", error_msg)) {
       return false;
     }
   }
@@ -3356,12 +3460,11 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   }
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
-      !Check(hipMemcpyAsync(
-                 logits_host_,
-                 VerificationLogits() +
-                     static_cast<std::size_t>(keep - 1) * c.vocab_size,
-                 c.vocab_size * sizeof(float), hipMemcpyDeviceToHost, stream_),
-             "frontier download", error_msg)) {
+      !CopyPinned(VerificationLogits() +
+                      static_cast<std::size_t>(keep - 1) * c.vocab_size,
+                  logits_host_, c.vocab_size * sizeof(float),
+                  hipMemcpyDeviceToHost, stream_, "frontier download",
+                  error_msg)) {
     return false;
   }
   if (keep == n && logits == nullptr) {
@@ -3371,29 +3474,35 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
     const std::size_t slot = keep - 1;
-    for (auto& l : session.linear_) {
-      if (l.state == nullptr) {
-        continue;
+    const auto restore = [&] {
+      for (auto& l : session.linear_) {
+        if (l.state == nullptr) {
+          continue;
+        }
+        RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
+                        c.ssm_num_v_heads, stream_);
+        if (!Check(hipGetLastError(), "state rollback", error_msg) ||
+            !CopyFloats(l.conv_snapshots.rows[slot], l.conv_state, conv_elems,
+                        stream_, "conv rollback", error_msg)) {
+          return false;
+        }
       }
-      RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
-                      c.ssm_num_v_heads, stream_);
-      if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
-                                conv_elems * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
-                 "conv rollback", error_msg)) {
-        return false;
-      }
+      return session.ple_history_ == nullptr ||
+             CopyFloats(
+                 session.ple_snapshots_.rows[slot], session.ple_history_,
+                 static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim(),
+                 stream_, "PLE rollback", error_msg);
+    };
+    // Tuning::recorded_rollback: ~2 operations per linear layer issued one
+    // by one cost ~9 ms on Windows, so they replay as one graph per kept
+    // length (the snapshot rows they read stay put until TrimRollback drops
+    // such graphs).
+    if (Tune().recorded_rollback ? !Run(session, kRollbackKey | keep, true,
+                                        restore, error_msg, false)
+                                 : !restore()) {
+      return false;
     }
     if (session.ple_history_ != nullptr) {
-      const std::size_t hist =
-          static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-      if (!Check(hipMemcpyAsync(
-                     session.ple_history_, session.ple_snapshots_.rows[slot],
-                     hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
-                 "PLE rollback", error_msg)) {
-        return false;
-      }
       session.ngram_ = session.ngram_snapshots_[slot];
     }
     session.position_ = session.spec_base_ + keep;
@@ -3404,7 +3513,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
             ? 0
             : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
-  if (!Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
+  if (!Wait("rollback", error_msg)) {
     return false;
   }
   if (logits != nullptr) {
@@ -3958,10 +4067,14 @@ bool Executor::RestoreSnapshot(Session& session,
   session.snapshot_lineage_.reset();
   // Every live state region is overwritten below. Retain only scratch that
   // the restored operation can use; this never allocates new rollback rows.
-  // Explicit reset and failed restoration still release all scratch.
-  const auto remaining = session.max_context_ - h.position;
-  session.TrimRollback(std::min({next_drafts, options_.max_speculative - 1,
-                                 remaining ? remaining - 1 : 0}));
+  // Explicit reset and failed restoration still release all scratch. With
+  // Tuning::keep_rollback_rows the rows stay (they are scratch the next
+  // verify rewrites), so the session's recorded graphs remain valid.
+  if (!Tune().keep_rollback_rows) {
+    const auto remaining = session.max_context_ - h.position;
+    session.TrimRollback(std::min({next_drafts, options_.max_speculative - 1,
+                                   remaining ? remaining - 1 : 0}));
+  }
   // A borrowed restore may reuse its source slot. Keep recorded graphs, but
   // let unrecorded shapes run eagerly once in the restored request before
   // recording them, just as they would in a fresh execution slot.
@@ -4378,13 +4491,11 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                                 stream_),
                  "MTP trace download", error_msg);
   };
-  if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                            sizeof(Session::Control), hipMemcpyHostToDevice,
-                            stream_),
-             "control upload", error_msg) ||
-      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
-             "token upload", error_msg)) {
+  if (!CopyPinned(control_host_, session.control_, sizeof(Session::Control),
+                  hipMemcpyHostToDevice, stream_, "control upload",
+                  error_msg) ||
+      !CopyPinned(tokens_host_, s_.tokens, n * sizeof(std::int32_t),
+                  hipMemcpyHostToDevice, stream_, "token upload", error_msg)) {
     return false;
   }
   EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
@@ -4560,9 +4671,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       return false;
   }
   const float* last = s_.mtp_res + tail_last;
-  if (!Check(hipMemcpyAsync(session.mtp_.h, last, hc_dim * sizeof(float),
-                            hipMemcpyDeviceToDevice, stream_),
-             "MTP hidden carry", error_msg)) {
+  if (!CopyFloats(last, session.mtp_.h, hc_dim, stream_, "MTP hidden carry",
+                  error_msg)) {
     return false;
   }
   return (!token && !candidates) ||

@@ -13,6 +13,7 @@
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/tuning.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -86,6 +87,9 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  /// Layer() leaves the routed experts for a later Experts() pass
+  /// (Tuning::hot_first_upload).
+  bool defer_experts{false};
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -384,9 +388,9 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
+    if (!defer_experts) {
+      Experts(l, d);
+    }
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -398,13 +402,31 @@ struct Uploader {
     return d;
   }
 
+  void Experts(const LayerWeights& l, DeviceLayer& d) {
+    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
+    d.ffn_up_exps = Copy(l.ffn_up_exps);
+    d.ffn_down_exps = Copy(l.ffn_down_exps);
+  }
+
   Uploaded Model(const ModelWeights& w, const MtpWeights* mtp,
                  std::uint32_t trunk_shards) {
     Uploaded u;
-    u.token_embd = Head(w.token_embd);
-    u.output =
-        w.output.data == w.token_embd.data ? u.token_embd : Head(w.output);
+    // Tuning::hot_first_upload: allocation order decides placement. Once
+    // most of the GPU memory is taken, later allocations get slower memory
+    // (up to ~20% lower GEMV bandwidth at the tail on gfx1151 under
+    // Windows). Everything read in full on every token goes first: the
+    // output head, then every dense projection (target and MTP). The routed
+    // experts follow (each byte is read by a few percent of tokens), and the
+    // token embedding, a row gather, comes last. The measuring walk uses the
+    // same order, so both request the same bytes.
+    const bool hot_first = platform::PlatformTuning().hot_first_upload;
+    const bool tied = w.output.data == w.token_embd.data;
+    if (tied || !hot_first) {
+      u.token_embd = Head(w.token_embd);
+    }
+    u.output = tied ? u.token_embd : Head(w.output);
     u.hc_head = Mixer(w.hc_head);
+    defer_experts = hot_first;
     u.layers.reserve(w.layers.size());
     for (const auto& l : w.layers) {
       u.layers.push_back(Layer(l));
@@ -415,6 +437,21 @@ struct Uploader {
     if (mtp != nullptr) {
       shard_base = trunk_shards;
       u.mtp = Layer(mtp->block);
+    }
+    if (hot_first) {
+      defer_experts = false;
+      shard_base = 0;
+      for (std::size_t i = 0; i < w.layers.size() && ok; ++i) {
+        Experts(w.layers[i], u.layers[i]);
+      }
+      if (mtp != nullptr && ok) {
+        shard_base = trunk_shards;
+        Experts(mtp->block, u.mtp);
+        shard_base = 0;
+      }
+      if (!tied) {
+        u.token_embd = Head(w.token_embd);
+      }
     }
     return u;
   }

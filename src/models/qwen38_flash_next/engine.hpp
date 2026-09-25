@@ -57,6 +57,11 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
+  /// Opt-in (serve --mtp-policy survival): sampled single-session drafting
+  /// stops on a chain-survival estimate from the draft head's own confidence
+  /// instead of the length controller. Verification is unchanged, so outputs
+  /// keep the target distribution; only the proposal count changes.
+  bool mtp_survival = false;
 };
 
 class Session;
@@ -158,6 +163,17 @@ public:
                                  double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
+  /// Appends `tokens` through the decode arithmetic: one token as a decode
+  /// step, more as a fully accepted speculative verification (at most
+  /// MaxVerifyWidth()). With `prefill`, through the prompt arithmetic
+  /// instead (a session without MTP). `rows` receives every token's
+  /// next-token logits (tokens.size() * vocab). For numerical A/B of the
+  /// kernels.
+  [[nodiscard]] bool TeacherForce(std::span<const std::int32_t> tokens,
+                                  std::vector<float>* rows,
+                                  std::string* error_msg = nullptr,
+                                  bool prefill = false);
+  [[nodiscard]] std::uint32_t MaxVerifyWidth() const noexcept;
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};

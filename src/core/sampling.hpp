@@ -170,6 +170,21 @@ public:
   /// Retains the full-row sampler's FP64 filtering and normalization.
   [[nodiscard]] SamplingDistribution DistributionFromCandidates(
       std::span<const LogitCandidate> logits) const;
+  /// Distribution(logits) computed from a candidate list instead of the full
+  /// row: `values`/`ids` are a correct top-N of the row's logits (by value,
+  /// any tie order). Exact whenever it returns a value: it needs top_k > 0,
+  /// temperature > 0, no active penalties or constraint, and a list that
+  /// provably holds every token of the top-k (the k-th value strictly above
+  /// the list's last, or a list that already contains every finite logit).
+  /// Otherwise it returns nothing and callers use the full row.
+  [[nodiscard]] std::optional<SamplingDistribution> DistributionFromTop(
+      std::span<const float> values, std::span<const TokenId> ids,
+      std::size_t vocab) const;
+  /// Sample(logits) from a candidate list (see DistributionFromTop), with the
+  /// same pending-draw handling and RNG use. Nothing when not applicable.
+  [[nodiscard]] std::optional<TokenId> SampleFromTop(
+      std::span<const float> values, std::span<const TokenId> ids,
+      std::size_t vocab);
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);

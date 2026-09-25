@@ -624,13 +624,15 @@ extern "C" int qfn_mmq_quantize_q8_1(
 }
 
 // The 320-row HC down projection has too few waves to hide its long K
-// loads. Fetch two iterations together, retaining the MMVQ sum order.
-template<int tokens, bool grouped = false>
+// loads. Fetch `prefetch` iterations together (2 by default; deeper with
+// Tuning::fused_hc_down, see kHcDownPrefetch), retaining the MMVQ sum order:
+// every lane still accumulates its blocks in ascending order.
+template<int tokens, bool grouped = false, int prefetch = 2>
 __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
         const block_q8_0* __restrict__ weights,
         const block_q8_1* __restrict__ input, float* __restrict__ output) {
     constexpr int blocks = 10240 / QK8_0;
-    constexpr int prefetch = 2;
+    static_assert(blocks % (8 * prefetch) == 0, "prefetch must tile K");
     if constexpr (grouped) {
         input += size_t(blockIdx.y) * tokens * blocks;
         output += size_t(blockIdx.y) * tokens * 320;
@@ -687,12 +689,31 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
     }
 }
 
+// Deeper prefetch for small token counts; register use grows with both.
+// One token stays at 2 (it keeps its pinned scalar order either way).
+// The FMA chain of two or more tokens is bit-identical at any depth.
+template<int tokens>
+constexpr int kHcDownPrefetch =
+    tokens == 1 ? 2 : (tokens <= 2 ? 8 : (tokens <= 4 ? 5 : 4));
+
+// The deeper prefetch is a Windows-validated switch (Tuning::fused_hc_down,
+// set by the executor before qfn_mmq_init); off, every token count keeps the
+// original depth 2.
+static bool g_hc_down_deep_prefetch = false;
+
+extern "C" void qfn_mmq_set_hc_down_deep_prefetch(int enabled) {
+    g_hc_down_deep_prefetch = enabled != 0;
+}
+
 template<int tokens = 1>
 static int prepare_hc_down() {
     hipFuncAttributes attributes{};
-    if (hipFuncGetAttributes(
-            &attributes,
-            reinterpret_cast<const void*>(qfn_q8_hc_down_kernel<tokens, false>)) != hipSuccess)
+    const void* kernel =
+        g_hc_down_deep_prefetch
+            ? reinterpret_cast<const void*>(
+                  qfn_q8_hc_down_kernel<tokens, false, kHcDownPrefetch<tokens>>)
+            : reinterpret_cast<const void*>(qfn_q8_hc_down_kernel<tokens, false>);
+    if (hipFuncGetAttributes(&attributes, kernel) != hipSuccess)
         return -2;
     if constexpr (tokens < MMVQ_MAX_BATCH_SIZE)
         return prepare_hc_down<tokens + 1>();
@@ -711,9 +732,14 @@ template<int tokens = 1>
 static void launch_q8_hc_down(const void* weights, const void* input,
                               float* output, int rows, hipStream_t stream) {
     if (rows == tokens) {
-        qfn_q8_hc_down_kernel<tokens><<<320, 32, 0, stream>>>(
-            static_cast<const block_q8_0*>(weights),
-            static_cast<const block_q8_1*>(input), output);
+        const auto* w = static_cast<const block_q8_0*>(weights);
+        const auto* x = static_cast<const block_q8_1*>(input);
+        if (g_hc_down_deep_prefetch) {
+            qfn_q8_hc_down_kernel<tokens, false, kHcDownPrefetch<tokens>>
+                <<<320, 32, 0, stream>>>(w, x, output);
+        } else {
+            qfn_q8_hc_down_kernel<tokens><<<320, 32, 0, stream>>>(w, x, output);
+        }
     } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
         launch_q8_hc_down<tokens + 1>(weights, input, output, rows, stream);
     }

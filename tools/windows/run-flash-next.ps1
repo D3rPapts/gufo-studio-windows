@@ -6,6 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\windows\run-flash-next.ps1 -Draft mtp3    # MTP capped at 3 drafts
 #   powershell -ExecutionPolicy Bypass -File tools\windows\run-flash-next.ps1 -Draft off     # autoregressive baseline
 #   powershell -ExecutionPolicy Bypass -File tools\windows\run-flash-next.ps1 -Mode bench    # pp/tg at depths 0..128K
+#   ... -Survival   the opt-in survival draft policy (docs\models\qwen3.8-flash-next)
 #
 # Files come from the Hugging Face cache (see docs\WINDOWS.md for the
 # download); -Snapshot points at another copy of unsloth/Qwen3.8-Flash-Next-GGUF.
@@ -15,6 +16,7 @@ param(
   [ValidateSet("on", "off")] [string]$Think = "on",
   [ValidateSet("mtp", "mtp3", "off")] [string]$Draft = "mtp",
   [switch]$Greedy,
+  [switch]$Survival,
   [int]$Context = 262144,
   [int]$Port = 8080,
   [string]$Snapshot = "",
@@ -71,6 +73,9 @@ $speculative = switch ($Draft) {
   "mtp" { @("--speculative", "mtp", "--mtp-model", $MtpModel) }
   "mtp3" { @("--speculative", "mtp", "--mtp-model", $MtpModel, "--draft-tokens", "3") }
   "off" { @() }
+}
+if ($Draft -ne "off" -and $Mode -eq "serve") {
+  if ($Survival) { $speculative += @("--mtp-policy", "survival") }
 }
 
 if ($Mode -eq "serve") {
