@@ -430,8 +430,9 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
     message->thought = reasoning->get_str();
   }
 
+  // SDK message objects serialize an absent field as null.
   const json::Value* tool_calls = value.find("tool_calls");
-  if (tool_calls == nullptr) {
+  if (tool_calls == nullptr || tool_calls->is_null()) {
     return true;
   }
   if (message->role != tokenization::ChatRole::kAssistant ||
@@ -987,6 +988,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
         value != nullptr && !value->is_null()) {
       if ((unsupported == "logprobs" && value->is_bool() &&
            !value->as_bool()) ||
+          (unsupported == "top_logprobs" && value->is_number() &&
+           value->as_double() == 0.0) ||
           (unsupported == "modalities" && value->is_array() &&
            value->size() == 1 && value->items().front().is_string() &&
            value->items().front().str() == "text"))
