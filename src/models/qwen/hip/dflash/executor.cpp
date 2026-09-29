@@ -1000,6 +1000,15 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   }
   TraceTensor(trace, "embedding", d_block_hidden_, block_count * hidden_size,
               stream_);
+  // Diagnostics (GUFO_QWEN27_PROFILE=2): GPU time of this block by part.
+  const bool gpu_timeline = qwen27::GpuTimeline::Enabled();
+  auto& timeline = qwen27::GpuTimeline::Draft();
+  const auto mark = [&](qwen27::GpuPart part) {
+    if (gpu_timeline)
+      timeline.Mark(stream_, part);
+  };
+  if (gpu_timeline)
+    timeline.Begin(stream_);
 
   // Five DFlash-2 decoder blocks.
   for (std::size_t i = 0; i < df_cfg.num_layers; ++i) {
@@ -1017,15 +1026,18 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         d_block_hidden_, static_cast<const float*>(layer.attn_norm.data),
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
     emit("attn_norm", d_block_normed_, hidden_size);
+    mark(qwen27::GpuPart::kOther);
 
     RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
                  d_dynamic_coefficients_, block_count, dynamic_size,
                  hidden_size);
+    mark(qwen27::GpuPart::kSsmProj);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_block_normed_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.attention_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 0, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("attn_conv_in", d_conv_hidden_, hidden_size);
 
     RunBlockGemm(layer.attn_q, d_conv_hidden_, d_q_, block_count, q_dim,
@@ -1034,6 +1046,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
                  hidden_size);
     RunBlockGemm(layer.attn_v, d_conv_hidden_, d_v_block_, block_count, kv_dim,
                  hidden_size);
+    mark(qwen27::GpuPart::kAttnProj);
 
     NormalizeAndRotateQK(d_q_, d_k_block_,
                          static_cast<const float*>(layer.attn_q_norm.data),
@@ -1051,16 +1064,19 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         static_cast<std::uint32_t>(num_kv_heads),
         static_cast<std::uint32_t>(head_dim), scale, stream_,
         history_capacity_);
+    mark(qwen27::GpuPart::kAttnCore);
     emit("attention", d_attn_out_, q_dim);
 
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,
                  hidden_size, q_dim);
+    mark(qwen27::GpuPart::kAttnProj);
     emit("attn_output", d_fused_features_, hidden_size);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_fused_features_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.attention_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 1, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("attn_conv_out", d_conv_hidden_, hidden_size);
 
     LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
@@ -1070,16 +1086,19 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     LaunchBatchedRMSNorm(
         d_block_hidden_, static_cast<const float*>(layer.ffn_norm.data),
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+    mark(qwen27::GpuPart::kOther);
     emit("ffn_norm", d_block_normed_, hidden_size);
 
     RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
                  d_dynamic_coefficients_, block_count, dynamic_size,
                  hidden_size);
+    mark(qwen27::GpuPart::kSsmProj);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_block_normed_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.ffn_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 0, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("ffn_conv_in", d_conv_hidden_, hidden_size);
 
     RunBlockGemm(layer.ffn_gate, d_conv_hidden_, d_ffn_gate_, block_count,
@@ -1088,8 +1107,10 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
                  intermediate_size, hidden_size);
     kernels::LaunchDFlashSiLUMul(d_ffn_gate_, d_ffn_up_,
                                  block_count * intermediate_size, stream_);
+    mark(qwen27::GpuPart::kFfnGateUp);
     RunBlockGemm(layer.ffn_down, d_ffn_gate_, d_ffn_down_, block_count,
                  hidden_size, intermediate_size);
+    mark(qwen27::GpuPart::kFfnDown);
     emit("ffn_down", d_ffn_down_, hidden_size);
 
     kernels::LaunchDFlashGroupedDynamicConv(
@@ -1101,6 +1122,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
 
     LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
                              block_count, hidden_size, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("output", d_block_hidden_, hidden_size);
     if (qwen27::FlushInterval() != 0)
       (void)hipStreamQuery(stream_);
@@ -1111,6 +1133,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
   TraceTensor(trace, "normalized", d_block_normed_, block_count * hidden_size,
               stream_);
+  mark(qwen27::GpuPart::kOther);
 
   std::vector<tokenization::TokenId> tokens(draft_count, 0);
   RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
@@ -1122,6 +1145,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
                draft_count, vocab_size, hidden_size);
   TraceTensor(trace, "logits", d_logits_, draft_count * vocab_size, stream_);
+  mark(qwen27::GpuPart::kHead);
 
   if (temperature > 0.0F) {
     const auto uniform_copy = hipMemcpyAsync(
@@ -1146,6 +1170,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
           : nullptr,
       sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
       stream_);
+  mark(qwen27::GpuPart::kSelector);
   // The pageable downloads below block until the GPU is done.
   profile.Enqueued();
 
@@ -1192,6 +1217,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   if (hipStreamSynchronize(stream_) != hipSuccess) {
     throw std::runtime_error("DFlash GPU block synchronization failed");
   }
+  if (gpu_timeline)
+    timeline.Collect(qwen27::ProfileState::Get().draft_gpu);
 
   return tokens;
 }
