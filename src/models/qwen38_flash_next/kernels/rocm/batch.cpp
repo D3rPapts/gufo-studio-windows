@@ -175,6 +175,9 @@ void Executor::CombineBatch(float* res, const float* gamma,
 
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                                std::string* error) const {
+  if (!UsePrimaryStream(error)) {
+    return false;
+  }
   const Config& c = config();
   DropReadyQ8();
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
@@ -453,6 +456,9 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
 
 bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                         std::string* error) const {
+  if (!UsePrimaryStream(error)) {
+    return false;
+  }
   selected_logits_ = nullptr;
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions ||
       items.size() > options_.max_batch) {
@@ -795,6 +801,9 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
+  if (!UsePrimaryStream(error)) {
+    return false;
+  }
   selected_logits_ = nullptr;
   DropReadyQ8();
   const Config& c = config();

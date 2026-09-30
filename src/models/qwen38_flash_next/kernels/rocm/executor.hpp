@@ -597,7 +597,20 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  hipStream_t stream_{nullptr};
+  /// The stream launches go to. On Windows a submission waits for the
+  /// retirement of the previous submission on its own stream (~0.45 us per
+  /// node: ~0.8 ms after a verify body), while another stream starts at
+  /// once. So with Tuning::flag_waits decode-sized work alternates between
+  /// two streams: every completed flag wait (the host has seen all earlier
+  /// launches finish) hands the next launch to the other stream, and the two
+  /// never overlap. Prefill, batched decoding and snapshots use the primary
+  /// stream (the BLAS handles are bound to it). stream() is the current one,
+  /// so work its callers queue stays ordered with the executor's own.
+  mutable hipStream_t stream_{nullptr};
+  hipStream_t primary_stream_{nullptr};
+  hipStream_t alt_stream_{nullptr};  ///< only with Tuning::flag_waits
+  /// Back to the primary stream, after draining the current one.
+  [[nodiscard]] bool UsePrimaryStream(std::string* error_msg) const;
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
