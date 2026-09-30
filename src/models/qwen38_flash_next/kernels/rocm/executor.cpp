@@ -25,6 +25,7 @@
 #include "src/core/platform/tuning.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/trace.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -2348,6 +2349,16 @@ bool Executor::Wait(const char* what, std::string* error_msg) const {
   if (!Check(hipGetLastError(), what, error_msg)) {
     return false;
   }
+  return WaitFlag(want, what, error_msg);
+}
+
+bool Executor::WaitBumped(const char* what, std::string* error_msg) const {
+  // The flag counts bumps and absolute signals alike (see Wait).
+  return WaitFlag(++done_counter_, what, error_msg);
+}
+
+bool Executor::WaitFlag(std::uint32_t want, const char* what,
+                        std::string* error_msg) const {
   (void)hipStreamQuery(stream_);  // submit: launches are batched until a flush
   const auto start = std::chrono::steady_clock::now();
   const volatile std::uint32_t* flag = done_flag_;
@@ -3021,7 +3032,16 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
-                   bool synchronize) const {
+                   bool synchronize, bool bump) const {
+  // `bump` (Tuning::flag_waits): the work ends with BumpDone, captured as the
+  // graph's last node, and the caller waits with WaitBumped.
+  const auto run_body = [&] {
+    if (!body())
+      return false;
+    if (bump)
+      BumpDone(done_flag_, stream_);
+    return true;
+  };
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3035,7 +3055,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       // after rollback storage was released. Queue this pass first, then
       // record identical commands while the GPU executes it. Short prefix
       // and draft graphs keep their existing route. No second pass is launched.
-      if (synchronize && (key & (std::uint64_t{1} << 40)) == 0) {
+      if ((synchronize || bump) && (key & (std::uint64_t{1} << 40)) == 0) {
         auto dispatch = std::tie(
             moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
             q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
@@ -3044,7 +3064,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
-        if (!body())
+        if (!run_body())
           return false;
         // Producer readiness and alternating scratch addresses must match
         // the executed pass when the graph records its kernel arguments.
@@ -3059,7 +3079,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               "graph capture", error_msg)) {
         return false;
       }
-      const bool ok = body();
+      const bool ok = run_body();
       if (!Check(hipStreamEndCapture(stream_, &captured), "graph capture end",
                  error_msg) ||
           !ok) {
@@ -3067,6 +3087,12 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
           (void)hipGraphDestroy(captured);
         }
         return false;
+      }
+      if (Tl().Enabled()) {
+        std::size_t nodes = 0;
+        (void)hipGraphGetNodes(captured, nullptr, &nodes);
+        std::fprintf(stderr, "qwen38_flash_next: graph %016llx: %zu nodes\n",
+                     static_cast<unsigned long long>(key), nodes);
       }
       const bool instantiated =
           Check(hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0),
@@ -3082,18 +3108,13 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       return false;
     }
   } else {
-    if (!body()) {
+    if (!run_body()) {
       return false;
     }
     session.warmed_.insert(key);
   }
-  if (!synchronize)
-    return true;
-  // Tuning::flag_waits: a decode-sized graph pass waits on a completion
-  // flag instead of synchronizing the stream (see Wait).
-  if (graph && done_flag_ != nullptr)
-    return Wait("forward", error_msg);
-  return Check(hipStreamSynchronize(stream_), "forward", error_msg);
+  return !synchronize ||
+         Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -3172,12 +3193,18 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
   }
   const auto ngram = session.ngram_;
+  // Tuning::flush_before_wait: a decode-sized pass whose layers before PLE
+  // run as a prefix starts that prefix before hashing the n-gram rows and
+  // submitting their reads, so the host work overlaps its GPU time (the
+  // prefix reads no n-gram rows).
+  const bool fetch_late = Tune().flush_before_wait && c.ple_layer > 0 &&
+                          !prefill_phase && n <= kVecBatch;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
       AssignError(error_msg, "n-gram table is not open");
       return false;
     }
-    if (!PleFetch(session, tokens, speculative, error_msg)) {
+    if (!fetch_late && !PleFetch(session, tokens, speculative, error_msg)) {
       return false;
     }
   }
@@ -3224,6 +3251,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Both pieces use the same stream and arithmetic as the unsplit graph.
   const std::uint32_t first_layer =
       graph && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
+  const bool traced = Tl().Enabled() && graph;
+  if (traced) {
+    Tl().Gpu(stream_, Timeline::kVerifyBegin, n);
+  }
   if (first_layer > 0) {
     const auto prefix = [&] {
       return ForwardBody(session, n, 0, false, speculative, sparse, start_pos,
@@ -3233,6 +3264,22 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     if (!Run(session, key | kPrefixKey, graph, prefix, error_msg, false)) {
       return false;
     }
+  }
+  if (fetch_late) {
+    // Submit the queued prefix (HIP on Windows batches launches until a
+    // flush; illegal while a graph is being captured), then fetch.
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    if (first_layer > 0 &&
+        hipStreamIsCapturing(stream_, &capture) == hipSuccess &&
+        capture == hipStreamCaptureStatusNone) {
+      (void)hipStreamQuery(stream_);
+    }
+    if (!PleFetch(session, tokens, speculative, error_msg)) {
+      return false;
+    }
+  }
+  if (traced) {
+    Tl().Gpu(stream_, Timeline::kPrefixEnd, n);
   }
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
@@ -3244,8 +3291,23 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  if (!Run(session, key, graph, body, error_msg)) {
+  // Tuning::flag_waits: a decode-sized pass raises a completion flag as its
+  // graph's last node and waits on it instead of synchronizing the stream.
+  const bool flag_wait = graph && done_flag_ != nullptr;
+  if (traced) {
+    Tl().Gpu(stream_, Timeline::kBodyBegin, n);
+  }
+  const bool ran =
+      Run(session, key, graph, body, error_msg, !flag_wait, flag_wait);
+  if (ran && traced) {
+    Tl().Gpu(stream_, Timeline::kVerifyEnd, n);
+  }
+  if (!ran || (flag_wait && !WaitBumped("forward", error_msg))) {
     return false;
+  }
+  if (traced) {
+    Tl().Host(Timeline::kSynced);
+    Tl().MaybeReport(stream_);
   }
   if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
@@ -3459,6 +3521,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
         std::min(session.blocks_, end / c.compress_ratio), session.blocks_);
   }
   session.spec_tokens_ = 0;
+  Tl().Gpu(stream_, Timeline::kRollBegin, keep);
   if (logits != nullptr &&
       !CopyPinned(VerificationLogits() +
                       static_cast<std::size_t>(keep - 1) * c.vocab_size,
@@ -3468,6 +3531,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     return false;
   }
   if (keep == n && logits == nullptr) {
+    Tl().Gpu(stream_, Timeline::kRollEnd, keep);
     return true;
   }
   if (keep < n) {
@@ -3513,9 +3577,11 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
             ? 0
             : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
+  Tl().Gpu(stream_, Timeline::kRollEnd, keep);
   if (!Wait("rollback", error_msg)) {
     return false;
   }
+  Tl().Host(Timeline::kSynced);
   if (logits != nullptr) {
     std::copy_n(logits_host_, c.vocab_size, logits);
   }
@@ -4459,8 +4525,23 @@ bool Executor::MtpForward(Session& session,
                    graph ? graph_pool : pool, hidden_source, output.trace,
                    output.kv_only, subset);
   };
-  if (!Run(session, key, graph, body, error_msg)) {
+  // Tuning::flag_waits: as in Forward, the draft graph raises the flag.
+  const bool flag_wait = graph && done_flag_ != nullptr;
+  const bool traced = Tl().Enabled() && graph;
+  if (traced) {
+    Tl().Gpu(stream_, Timeline::kMtpBegin, n);
+  }
+  if (!Run(session, key, graph, body, error_msg, !flag_wait, flag_wait)) {
     return false;
+  }
+  if (traced) {
+    Tl().Gpu(stream_, Timeline::kMtpEnd, n);
+  }
+  if (flag_wait && !WaitBumped("MTP forward", error_msg)) {
+    return false;
+  }
+  if (traced) {
+    Tl().Host(Timeline::kSynced);
   }
   if (output.token != nullptr) {
     *output.token = *mtp_token_host_;

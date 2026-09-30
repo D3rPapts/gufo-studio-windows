@@ -584,9 +584,11 @@ private:
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
+  /// `bump` (Tuning::flag_waits): the body ends with BumpDone (inside a
+  /// captured graph), and the caller waits with WaitBumped instead.
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
-           bool synchronize = true) const;
+           bool synchronize = true, bool bump = false) const;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -784,6 +786,10 @@ private:
   /// after 1 s (and so still reports a failed launch). Without the switch,
   /// hipStreamSynchronize.
   [[nodiscard]] bool Wait(const char* what, std::string* error_msg) const;
+  /// Waits for work that ended with BumpDone (see Run).
+  [[nodiscard]] bool WaitBumped(const char* what, std::string* error_msg) const;
+  [[nodiscard]] bool WaitFlag(std::uint32_t want, const char* what,
+                              std::string* error_msg) const;
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
