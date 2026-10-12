@@ -5655,15 +5655,16 @@ __launch_bounds__(256) __global__
           const std::int32_t dst = rows_out[bucket_begin + t];
           if (dst >= 0) {
             const int idx = (r / 16) * plane + (flat / kRows) * stride + r % 16;
-            // Preserve the separate projection epilogue's F32 evaluation
-            // order before narrowing. Fast-math can otherwise regroup the
-            // products and change an F16 rounding tie.
+            // The separate projections' epilogue narrows up * SiluF(gate):
+            // gate's Silu product rounds first, then up scales it. Keep that
+            // F32 order here — regrouping as (up * gate) * sigmoid(gate)
+            // changes an F16 rounding tie and a chunk taking the other route
+            // would disagree at the last bit.
             __half values[2];
 #pragma unroll
             for (int v = 0; v < 2; ++v) {
-              float product = base[idx + v + 4 * plane] * base[idx + v];
-              asm volatile("" : "+v"(product));
-              float value = product * SigmoidF(base[idx + v]);
+              float value =
+                  base[idx + v + 4 * plane] * SiluF(base[idx + v]);
               asm volatile("" : "+v"(value));
               values[v] = __float2half(value);
             }
@@ -6366,7 +6367,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const __half* xn = nullptr, __half* mixed_half = nullptr,
     void* mixed_q8 = nullptr, const float* conv_w = nullptr,
     float* conv_out = nullptr, AttentionProjectionOutput attention = {},
-    std::uint32_t checkpoint_tokens = 0, std::size_t input_stride = 0) {
+    std::uint32_t checkpoint_tokens = 0, std::size_t input_stride = 0,
+    const std::uint32_t* token_offset = nullptr) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
@@ -6417,13 +6419,31 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   // BF16 replaces a library GEMM whose 32-token tile g starts its K loop
   // (g % 4) * 4 blocks in and wraps. A block takes the four tiles of one
   // rotation class, one per token wave, so every dot product keeps the
-  // library's order.
+  // library's order. The 512-token slabs are aligned to ABSOLUTE positions —
+  // `token_offset` names the device word holding the batch's first position —
+  // so a block's class equals the absolute (token / 32) % 4 class of every
+  // token it serves, and any chunk of a prompt places a token on the same K
+  // chain a single-pass prefill used. A constant shift cannot do this: at a
+  // start position that is not a multiple of 32 the floor division carries
+  // and part of each slab would rotate on the wrong class.
   const int bf16_class = kBf16 ? static_cast<int>(blockIdx.x % 4) : 0;
+  const int batch_start =
+      kBf16 && token_offset != nullptr ? static_cast<int>(*token_offset) : 0;
+  const int slab_abs =
+      ((batch_start + static_cast<int>(blockIdx.x / 4) * 512) / 512) * 512;
+  if constexpr (kBf16) {
+    // Whole slabs entirely before or past the batch only exist because the
+    // grid is sized without the start position; they hold no tokens.
+    if (slab_abs + 512 <= batch_start ||
+        slab_abs >= batch_start + static_cast<int>(batch)) {
+      return;
+    }
+  }
   const int k_rotation = kBf16 ? (bf16_class * 4) % num_kb : 0;
   const auto token_of = [&](int local) {
     if constexpr (kBf16) {
       static_assert(BN == 128 && WN == 4 && kRowGroup == 1);
-      return (static_cast<int>(blockIdx.x / 4) * 512) + (bf16_class * 32) +
+      return slab_abs - batch_start + (bf16_class * 32) +
              ((local / 32) * 128) + (local % 32);
     } else {
       return t_block + local;
@@ -6456,10 +6476,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   for (int p = 0; p < kBPer; ++p) {
     const int idx = (p * 256) + tid;
     const int t = token_of(idx / BK);
-    b_ptr[p] =
-        idx < kBUnits && t < static_cast<int>(batch)
-            ? x + (static_cast<std::size_t>(t) * (kStrided ? input_stride : k))
-            : nullptr;
+    b_ptr[p] = idx < kBUnits && t >= 0 && t < static_cast<int>(batch)
+                   ? x + (static_cast<std::size_t>(t) * (kStrided ? input_stride : k))
+                   : nullptr;
   }
   uint4 a_codes[kAPer][2];
   uint4 a_half[kRawWeights ? kAPer : 1][4];
@@ -7104,15 +7123,21 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
 }
 
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
-                   std::size_t m, std::size_t k, hipStream_t stream) {
+                   std::size_t m, std::size_t k, hipStream_t stream,
+                   const std::uint32_t* token_offset) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
-  // Four blocks, one per K rotation class, cover each 512 tokens.
+  // Four blocks, one per K rotation class, cover each 512-token slab. The
+  // slabs align to absolute positions (the kernel reads the batch's first
+  // position), so the grid carries one extra slab to cover the front
+  // partial one; slabs that end up token-free exit immediately.
   hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
                                          false, false, true>),
-                     dim3(((batch + 511) / 512) * 4, (m + 63) / 64),
+                     dim3(((batch + 511) / 512 + 1) * 4, (m + 63) / 64),
                      dim3(kThreads), 0, stream, w,
-                     static_cast<const __half*>(x), out, batch, m, k);
+                     static_cast<const __half*>(x), out, batch, m, k,
+                     nullptr, nullptr, nullptr, nullptr, nullptr,
+                     AttentionProjectionOutput{}, 0, 0, token_offset);
   return true;
 }
 
