@@ -86,17 +86,21 @@ RAM, disk and restart settings once their contracts pass.
 | `responses` | SDK buffered, streaming and async Responses |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
-| `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery |
+| `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
+| `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
 | `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
+| `tool-streaming` | Incremental argument arrival and exact assembly in Chat/Responses/Messages; stable IDs, literal framing, thinking, stopped/limited calls and successful retries |
 | `reasoning-separator` | No leading separator newlines after reasoning in Chat/Responses, plain/tools/JSON; exact streamed/buffered text, warm retry, continuation and thinking-off paragraph breaks |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `messages-tools` | Messages `tool_use` call, `tool_result` replay with cache reuse, buffered and streamed events, and an uncached Chat control of the same prompt |
+| `messages-count-tokens` | Counts match complete Messages prompt usage with system/history, Unicode, all tool choices and thinking; cold/warm cache counts, no inference side effects, over-context sizing and request errors |
+| `messages-image-counts` | Image counts match buffered/streamed Messages usage, including tool results, warm caches, PNG/JPEG/WebP, multiple images, Unicode and over-context sizing; no inference side effects; text-only models reject image counts and generation. Requires `--expected-input-modalities text,image` with a projector, or `text` for capability rejection checks |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
@@ -133,6 +137,12 @@ For `image-inputs` and `image-count`, pass the model's `--mmproj`. Both use smal
 fixed images and are included in `all` only with that option. `image-count`
 restarts the server for disk replay; its first four cases are 1/16-image timing
 controls usable on older main with `--through-case image-count:image_count_control_16_True`.
+
+`tool-images` also requires `--mmproj`. For matched existing-behavior timing
+controls on main, stop at
+`--through-case tool-images:tool_images_control_complete`; full candidate runs
+continue into the newly supported image-bearing tool outputs. A text-only
+model must not qualify the image suite by skipping its assertions.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
@@ -184,6 +194,27 @@ commands in disposable fixtures using isolated Pi configuration. Use `--passes 1
 for a focused check; the default five passes matches the reported debug workload.
 `--conversation --context-file FILE` additionally tests retained long history.
 
+For Claude Code sessions over `/v1/messages`, run `claude_code_agent.py` with
+`--base-url`, `--model`, `--claude /path/to/claude`, `--server-log` and a fresh
+`--output` directory outside any project that has a `CLAUDE.md` (the CLI would
+read it). It runs the real CLI non-interactively with its `Read`, `Write`,
+`Edit` and `Bash` tools allowed, an isolated home and configuration, and every
+model alias mapped to `--model`, through the same recording proxy. The
+`simple`, `tools`, `edit` and `literal-protocol` tasks match Pi's and are
+verified the same way: files and generated code directly, the CLI's
+stream-json transcript for tool use and framing leaks, and the server log for
+completed requests and cache reuse on every later agent turn. Claude Code ends
+each request with a `system` message whose copy differs in the next request,
+so later turns reuse the prompt up to that message, not the whole previous
+prompt.
+
+For image tool results, explicitly select `--case image-read --passes 1` with
+a vision-capable model. The task opens a fixture through Pi's real `read`
+tool and checks both the returned image pixels and the model's color answer.
+Run with `--api openai-responses` and `--api openai-completions` to check both
+client transports; retain the wire requests to inspect the image placement.
+This image task is excluded from the default text-task list.
+
 For a conversation that **actually grows past 200K tokens through tool results**,
 run `agent_long.py --agent pi|opencode --executable PATH --base-url URL
 --model NAME --output DIR --min-context 201000 --complex-tools --stress-turns 20`
@@ -197,6 +228,19 @@ the previous prompt plus generated tokens; transcripts
 and phase timings are retained. No synthetic system-padding counts as growth.
 If Pi omits a reasoning-only reply, the report identifies that history change
 and verifies reuse through the measured pre-generation boundary instead.
+Use `--resume PREVIOUS_OUTPUT` to continue either client's retained session,
+including after a server restart. To test cancellation, add `--interrupt tool`
+or `--interrupt thinking` to a resumed run. The harness sends SIGINT only after
+observing that phase in a live stream and records the interruption separately.
+Then resume that output directory without `--interrupt`. The harness preserves
+the unfinished task and its files, and requires successful tool execution and
+state/digest checks without repeating committed changes. An interrupted run
+alone is not a pass. Resume prompts distinguish completed calls for this task
+from earlier transactions; the checks still require the file read and catalog
+query, even when the model could infer their contents from earlier tasks.
+Use `--interrupt-after-tools 5` with `--complex-tools --interrupt tool` to
+interrupt the receipt after the transaction has committed. Resuming must
+preserve the committed revision and finish the receipt without another apply.
 
 `opencode_agent.py` runs real opencode (`--opencode PATH`, default on `PATH`)
 against a local server with `--base-url`, `--model` and a fresh `--output`.
@@ -240,9 +284,11 @@ not a real client's summary generation or retention under RAM/disk pressure.
 The [card 01 results](../../docs/cache-redesign/cards/01-functional-coverage.md#results)
 record all scenario families, including failures on the legacy cache.
 
-Run `cache-transforms` with a roomy RAM budget in its own invocation. The
-tool-bearing template can have a longer assistant opening than the plain
-conversation; the suite checks zero-prefill retries without adding pressure.
+Run `cache-transforms` with a roomy RAM budget in its own invocation. Its
+retried prompts end with a user turn after a tool result, and Qwen templates
+place the stable boundary before such a turn, so under pressure an unchanged
+retry prefills that turn as well as the assistant opening. The suite therefore
+checks zero-prefill retries without adding pressure.
 `cache-pressure` instead runs explicitly with `--cache-ram-bytes 2147483648`,
 `--context 32768`, and `--sessions 2` (also supports one session, with sequential
 children). It verifies that background requests published at least twice the

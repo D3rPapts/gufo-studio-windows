@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "src/cache/identity.hpp"
@@ -28,6 +29,9 @@ public:
   // Invalidation/destruction cannot refuse release. Preserve or retire every
   // borrower and finish all preservation transfers/readers before returning.
   virtual void BeforeRelease(ComponentId, Rows first, Rows end) noexcept = 0;
+  // Called exactly once after a successful Invalidate, even on an empty slot.
+  // All borrowers have been preserved/retired and all readers drained first.
+  virtual void AfterReset() noexcept {}
 };
 
 // Model-owned execution storage, held by the runner. The guard outlives the
@@ -60,6 +64,11 @@ public:
   [[nodiscard]] virtual std::unique_ptr<Slot> CreateSlot(MutationGuard&) = 0;
   [[nodiscard]] virtual std::vector<ComponentPosition> Positions(
       const Slot&) const = 0;
+  // Pure host query: strictly increasing token boundaries of the planned
+  // prefill passes, ending at end. No execution or state mutation. The caller
+  // may insert exact required captures; optional captures can reuse this plan.
+  [[nodiscard]] virtual std::vector<Rows> PlanPrefill(const Slot&, Rows first,
+                                                      Rows end) const = 0;
 
   // Prepare one complete restore, including an exact shorter frontier. On the
   // host, allocate/check capacity and guard every range that will be replaced
@@ -91,6 +100,25 @@ public:
   [[nodiscard]] virtual Completion LoadPrivate(Slot&, ComponentId,
                                                std::span<const std::byte>,
                                                Stream&) = 0;
+  // Bounded private-state serialization. Offsets address the descriptor's
+  // private_bytes representation; loads may arrive in non-overlapping pieces.
+  // Defaults support a whole buffer only. Continuation adapters must override
+  // these for arbitrary pieces and validate complete coverage, including when
+  // one device tensor crosses a piece boundary.
+  [[nodiscard]] virtual Completion CapturePrivatePiece(
+      const Slot& slot, ComponentId id, std::size_t offset,
+      std::span<std::byte> bytes, Stream& stream) {
+    if (offset != 0)
+      throw std::invalid_argument("private capture requires piece support");
+    return CapturePrivate(slot, id, bytes, stream);
+  }
+  [[nodiscard]] virtual Completion LoadPrivatePiece(
+      Slot& slot, ComponentId id, std::size_t offset,
+      std::span<const std::byte> bytes, Stream& stream) {
+    if (offset != 0)
+      throw std::invalid_argument("private restore requires piece support");
+    return LoadPrivate(slot, id, bytes, stream);
+  }
   // Requires an active BeginRestore. Outside a restore (including after a
   // successful Validate), throw std::logic_error without changing the slot.
   // Check complete loads and exactly one position per component, not

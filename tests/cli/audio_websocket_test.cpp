@@ -10,6 +10,7 @@
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/tts_service.hpp"
+#include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
 
@@ -120,9 +121,71 @@ private:
     }
   }
 };
+
+// The server's receive timeout is an idle limit. A client that only listens
+// to streamed output must stay connected; a silent session closes cleanly.
+std::array<int, 2> SocketPair() {
+  std::array<int, 2> fds{};
+#if defined(_WIN32)
+  // Windows has no socketpair: meet over loopback TCP instead.
+  net::EnsureSocketRuntimeStarted();
+  const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(listener >= 0);
+  sockaddr_in address{.sin_family = AF_INET, .sin_port = 0};
+  assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+  assert(::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) == 0);
+  assert(::listen(listener, 1) == 0);
+  sockaddr_in bound{};
+  int length = sizeof(bound);
+  assert(::getsockname(listener, reinterpret_cast<sockaddr*>(&bound),
+                       &length) == 0);
+  fds[1] = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(fds[1] >= 0);
+  assert(::connect(fds[1], reinterpret_cast<sockaddr*>(&bound),
+                   sizeof(bound)) == 0);
+  fds[0] = ::accept(listener, nullptr, nullptr);
+  assert(fds[0] >= 0);
+  net::CloseSocket(listener);
+#else
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+#endif
+  return fds;
+}
+void ListeningClientIsNotIdle() {
+  std::array<int, 2> fds = SocketPair();
+  assert(net::SetSocketTimeouts(fds[0], 300));
+  assert(net::SetSocketTimeouts(fds[1], 3'000));
+  {
+    WebSocket socket(fds[0], {});
+    // Unmasked final binary frame with a five-byte payload.
+    const auto expected = std::string("\x82\x05", 2) + "audio";
+    const auto streaming_until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+    while (std::chrono::steady_clock::now() < streaming_until) {
+      assert(socket.SendBinary("audio"));
+      std::string frame(expected.size(), '\0');
+      const auto received = ::recv(fds[1], frame.data(),
+                                   static_cast<int>(frame.size()), MSG_WAITALL);
+      assert(received == static_cast<decltype(received)>(frame.size()));
+      assert(frame == expected);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    assert(!socket.cancelled());
+    std::array<char, 4> close{};
+    assert(::recv(fds[1], close.data(), static_cast<int>(close.size()),
+                  MSG_WAITALL) == 4);
+    assert(std::string_view(close.data(), close.size()) ==
+           std::string_view("\x88\x02\x03\xE9", 4));
+    assert(socket.cancelled());
+  }
+  net::CloseSocket(fds[0]);
+  net::CloseSocket(fds[1]);
+}
 }  // namespace
 
 int main() {
+  ListeningClientIsNotIdle();
   std::atomic<int> tts_calls{0}, asr_calls{0};
   std::atomic<bool> entered{false}, cancelled{false};
   auto tts = std::make_shared<TtsService>(TtsServiceOptions{

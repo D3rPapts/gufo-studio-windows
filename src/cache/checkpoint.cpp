@@ -64,8 +64,8 @@ void ValidatePayload(const Payload& payload, const PayloadRequest& request) {
               !payload.BorrowedFrom()
           ? ResourceCategory::kBackingMaterialized
           : request.category;
-  if (!payload.Owner() || payload.Bytes() < request.bytes ||
-      payload.Category() != expected ||
+  if (!payload.IsValid() || (!payload.BorrowedFrom() && !payload.Owner()) ||
+      payload.Bytes() < request.bytes || payload.Category() != expected ||
       (request.category == ResourceCategory::kPrivateState &&
        payload.BorrowedFrom()))
     throw std::invalid_argument(
@@ -111,48 +111,70 @@ Payload Payload::Committed(ResourceCharge charge,
   result.category_ = info.category;
   return result;
 }
-Payload Payload::Borrowed(ResourceReservation reservation,
-                          std::shared_ptr<const void> owner,
-                          BorrowedLocation location) {
+Payload Payload::Borrowed(std::shared_ptr<BorrowedRows> rows) {
+  if (!rows || !rows->IsValid())
+    throw std::invalid_argument("invalid managed borrowed rows");
   Payload result;
-  result.reservation_ = std::move(reservation);
-  result.owner_ = std::move(owner);
-  const auto info = result.reservation_.Info();
-  if (!result.owner_ || !location.slot.value || !location.generation ||
-      !info.assigned_backing || !info.reserved ||
-      (info.category != ResourceCategory::kBackingAssigned &&
-       info.category != ResourceCategory::kPrivateTail))
-    throw std::invalid_argument(
-        "borrowed payload requires assigned spill backing");
-  result.bytes_ = info.bytes;
-  result.category_ = info.category;
-  result.borrowed_ = location;
+  result.bytes_ = rows->Bytes();
+  result.category_ = rows->Category();
+  result.rows_ = std::move(rows);
   return result;
+}
+RowPin Payload::PinRows(std::stop_token stop) const {
+  if (rows_)
+    return rows_->Pin(stop);
+  RowPin pin;
+  pin.charge_ = charge_;
+  pin.owner_ = owner_;
+  return pin;
+}
+bool Payload::IsValid() const {
+  return rows_ ? rows_->IsValid() : bool(owner_);
+}
+bool CheckpointComponent::IsValid() const {
+  for (const auto& chunk : chunks)
+    if (!chunk.Storage().IsValid())
+      return false;
+  return (!tail || tail->IsValid()) &&
+         (!private_state || private_state->IsValid());
+}
+bool Checkpoint::IsValid() const {
+  for (const auto& component : components_)
+    if (!component.IsValid())
+      return false;
+  return true;
 }
 Payload& Payload::operator=(Payload&& other) noexcept {
   if (this != &other) {
+    rows_.reset();
     owner_.reset();
-    reservation_ = {};
     charge_ = {};
     charge_ = std::move(other.charge_);
-    reservation_ = std::move(other.reservation_);
     bytes_ = other.bytes_;
     category_ = other.category_;
-    borrowed_ = other.borrowed_;
     owner_ = std::move(other.owner_);
+    rows_ = std::move(other.rows_);
   }
   return *this;
 }
 PersistencePin Payload::PinPersistence() const {
-  return borrowed_ ? reservation_.PinPersistence() : charge_.PinPersistence();
+  if (rows_)
+    return rows_->PinPersistence();
+  return charge_.PinPersistence();
 }
 ChunkReference::ChunkReference(std::shared_ptr<detail::Chunk> chunk, Kind kind,
-                               PersistencePin pin)
-    : chunk_(std::move(chunk)), kind_(kind), pin_(std::move(pin)) {
+                               PersistencePin pin, RowPin rows_pin)
+    : chunk_(std::move(chunk)),
+      kind_(kind),
+      pin_(std::move(pin)),
+      rows_pin_(std::move(rows_pin)) {
   ++chunk_->references[static_cast<std::size_t>(kind_)];
 }
 ChunkReference::ChunkReference(const ChunkReference& other)
-    : chunk_(other.chunk_), kind_(other.kind_), pin_(other.pin_) {
+    : chunk_(other.chunk_),
+      kind_(other.kind_),
+      pin_(other.pin_),
+      rows_pin_(other.rows_pin_.Clone()) {
   if (chunk_)
     ++chunk_->references[static_cast<std::size_t>(kind_)];
 }
@@ -166,13 +188,15 @@ ChunkReference& ChunkReference::operator=(const ChunkReference& other) {
 ChunkReference::ChunkReference(ChunkReference&& other) noexcept
     : chunk_(std::move(other.chunk_)),
       kind_(other.kind_),
-      pin_(std::move(other.pin_)) {}
+      pin_(std::move(other.pin_)),
+      rows_pin_(std::move(other.rows_pin_)) {}
 ChunkReference& ChunkReference::operator=(ChunkReference&& other) noexcept {
   if (this != &other) {
     Release();
     chunk_ = std::move(other.chunk_);
     kind_ = other.kind_;
     pin_ = std::move(other.pin_);
+    rows_pin_ = std::move(other.rows_pin_);
   }
   return *this;
 }
@@ -180,6 +204,7 @@ ChunkReference::~ChunkReference() {
   Release();
 }
 void ChunkReference::Release() noexcept {
+  rows_pin_ = {};
   pin_ = {};
   if (chunk_) {
     --chunk_->references[static_cast<std::size_t>(kind_)];
@@ -209,11 +234,13 @@ ChunkReferences ChunkReference::References() const {
   return {r[0].load(), r[1].load(), r[2].load()};
 }
 ChunkReference ChunkReference::PinReader() const {
-  return ChunkReference(chunk_, Kind::kReader);
+  return ChunkReference(chunk_, Kind::kReader, {}, chunk_->storage.PinRows());
 }
 ChunkReference ChunkReference::PinPersistence() const {
+  auto rows_pin = chunk_->storage.PinRows();
   auto pin = chunk_->storage.PinPersistence();
-  return ChunkReference(chunk_, Kind::kPersistence, std::move(pin));
+  return ChunkReference(chunk_, Kind::kPersistence, std::move(pin),
+                        std::move(rows_pin));
 }
 LineageId Checkpoint::Lineage() const {
   return lineage_->id;
@@ -253,6 +280,8 @@ ExecutionHistory ExecutionHistory::Cold(
 }
 ExecutionHistory ExecutionHistory::Restored(ResourceLedger& ledger,
                                             const Checkpoint& checkpoint) {
+  if (!checkpoint.IsValid())
+    throw std::invalid_argument("cannot inherit a retired checkpoint");
   std::vector<ComponentDescriptor> descriptors;
   descriptors.reserve(checkpoint.components_.size());
   for (const auto& c : checkpoint.components_)
@@ -402,6 +431,8 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
           chunk->metadata = metadata_reservation.Convert();
           entries.push_back({chunk->metadata, d.id, first, chunk});
         }
+        if (!chunk->storage.IsValid())
+          throw std::invalid_argument("cannot publish retired checkpoint rows");
         component.chunks.push_back(ChunkReference(
             std::move(chunk), ChunkReference::Kind::kCheckpoint));
       }
@@ -449,6 +480,44 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
   entries_metadata_ = std::move(entries_metadata);
   tokens_metadata_ = std::move(tokens_metadata);
   return checkpoint;
+}
+std::size_t ExecutionHistory::NewPayloadBytes(
+    std::span<const ComponentPosition> positions) const {
+  if (positions.size() != descriptors_.size())
+    throw std::invalid_argument("incomplete capture positions");
+  std::size_t bytes = 0;
+  for (std::size_t i = 0; i < descriptors_.size(); ++i) {
+    const auto& d = descriptors_[i];
+    if (std::count_if(positions.begin(), positions.end(),
+                      [&](const auto& p) { return p.id == d.id; }) != 1)
+      throw std::invalid_argument("capture needs unique component positions");
+    const auto p = *std::find_if(positions.begin(), positions.end(),
+                                 [&](const auto& p) { return p.id == d.id; });
+    if (!positions_.empty() && p.valid_rows < positions_[i].valid_rows)
+      throw std::invalid_argument("capture estimate rewound without restore");
+    if (d.kind == ComponentKind::kPrivateState) {
+      bytes = Add(bytes, d.state_bytes);
+      continue;
+    }
+    const auto full = p.valid_rows - p.valid_rows % d.rows_per_chunk;
+    (void)Bytes(p.valid_rows, d.row_bytes);
+    bytes = Add(bytes, Bytes(p.valid_rows - full, d.row_bytes));
+    for (Rows first = 0; first < full; first += d.rows_per_chunk) {
+      bool shared = false;
+      for (const auto& e : entries_)
+        if (e.component == d.id && e.first == first) {
+          if (const auto chunk = e.chunk.lock()) {
+            if (!chunk->storage.IsValid())
+              throw std::invalid_argument("cannot estimate retired rows");
+            shared = true;
+          }
+          break;
+        }
+      if (!shared)
+        bytes = Add(bytes, Bytes(d.rows_per_chunk, d.row_bytes));
+    }
+  }
+  return bytes;
 }
 void ExecutionHistory::Prune() {
   // Destroy expired control blocks before releasing their accounting. Clearing

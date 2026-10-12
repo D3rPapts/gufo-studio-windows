@@ -98,7 +98,15 @@ WebSocket::WebSocket(int fd, std::string buffered)
   (void)net::SetNoDelay(fd_);
   // Bound backpressure from a client that stops consuming audio. Read timeout
   // stays at the server's idle timeout.
-  (void)net::SetSocketTimeouts(fd_, 5'000);
+  (void)net::SetSendTimeout(fd_, 5'000);
+  // A client that only listens to streamed output is not idle while the
+  // stream keeps sending; keep it past the receive timeout.
+  const auto recv_timeout = net::SocketRecvTimeoutMs(fd_);
+  if (recv_timeout >= 0) {
+    idle_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::milliseconds(recv_timeout));
+  }
+  last_send_ = std::chrono::steady_clock::now().time_since_epoch().count();
   reader_ = std::jthread([this] { ReadLoop(); });
 }
 
@@ -126,6 +134,22 @@ bool WebSocket::Read(char* data, std::size_t size) {
     const auto count = ::recv(fd_, data, static_cast<int>(size), 0);
     if (count < 0 && errno == EINTR)
       continue;
+    if (count < 0 &&
+#if defined(_WIN32)
+        (WSAGetLastError() == WSAETIMEDOUT ||
+         WSAGetLastError() == WSAEWOULDBLOCK)) {
+#else
+        (errno == EAGAIN || errno == EWOULDBLOCK)) {
+#endif
+      // A client that only listens to streamed output is not idle.
+      const std::chrono::steady_clock::duration since_send(
+          std::chrono::steady_clock::now().time_since_epoch().count() -
+          last_send_.load());
+      if (since_send < idle_)
+        continue;
+      Close(1001);
+      return false;
+    }
     if (count <= 0)
       return false;
     data += count;
@@ -159,6 +183,7 @@ bool WebSocket::Send(std::uint8_t opcode, std::string_view bytes) {
         return false;
       }
       part.remove_prefix(static_cast<std::size_t>(count));
+      last_send_ = std::chrono::steady_clock::now().time_since_epoch().count();
     }
   }
   return true;

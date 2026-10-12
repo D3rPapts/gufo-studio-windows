@@ -49,6 +49,9 @@ public:
   [[nodiscard]] std::unique_ptr<Slot> CreateSlot(MutationGuard&) override;
   [[nodiscard]] std::vector<ComponentPosition> Positions(
       const Slot&) const override;
+  [[nodiscard]] std::vector<Rows> PlanPrefill(const Slot&, Rows first,
+                                              Rows end) const override;
+  void SetPrefillPassRows(Rows rows);
   void BeginRestore(Slot&, std::span<const ComponentPosition>) override;
   [[nodiscard]] Completion CapturePrivate(const Slot&, ComponentId,
                                           std::span<std::byte>,
@@ -61,6 +64,13 @@ public:
   [[nodiscard]] Completion LoadPrivate(Slot&, ComponentId,
                                        std::span<const std::byte>,
                                        Stream&) override;
+  [[nodiscard]] Completion CapturePrivatePiece(const Slot&, ComponentId,
+                                               std::size_t,
+                                               std::span<std::byte>,
+                                               Stream&) override;
+  [[nodiscard]] Completion LoadPrivatePiece(Slot&, ComponentId, std::size_t,
+                                            std::span<const std::byte>,
+                                            Stream&) override;
   [[nodiscard]] bool Validate(Slot&,
                               std::span<const ComponentPosition>) override;
   [[nodiscard]] bool Invalidate(Slot&) noexcept override;
@@ -71,6 +81,8 @@ public:
   void Append(Slot&, std::span<const Token> target,
               std::span<const Token> draft);
   [[nodiscard]] std::uint64_t RecurrentHash(const Slot&) const;
+  // Isolate host guard overhead and row-range tests without fixture mutation.
+  void GuardRows(Slot&, ComponentId, Rows first, Rows end);
   void FailNextAllocation() noexcept;
   void FailNextTransfer() noexcept;
 
@@ -81,6 +93,7 @@ private:
                                       std::function<TransferResult()>);
   bool fail_allocation_{false};
   bool fail_transfer_{false};
+  Rows prefill_pass_rows_{2048};
 };
 
 }  // namespace gufo::cache::testing

@@ -1,5 +1,7 @@
+#if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -356,6 +358,8 @@ void CompletionOwnership() {
 }
 
 void ReentrantWaitFailsImmediately() {
+#if !defined(_WIN32)
+  // fork() crash isolation is POSIX-only.
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
@@ -372,6 +376,7 @@ void ReentrantWaitFailsImmediately() {
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+#endif
 }
 void InputBoundaries() {
   const Identity image_a{1, 2, 3}, image_b{4, 5, 6};

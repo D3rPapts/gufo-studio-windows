@@ -102,4 +102,34 @@ bool SetSocketTimeouts(Socket socket, int timeout_ms) noexcept {
 #endif
 }
 
+bool SetSendTimeout(Socket socket, int timeout_ms) noexcept {
+#if defined(_WIN32)
+  DWORD ms = static_cast<DWORD>(timeout_ms);
+  return setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+                    reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+#else
+  timeval tv{};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  return ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+long long SocketRecvTimeoutMs(Socket socket) noexcept {
+#if defined(_WIN32)
+  DWORD ms = 0;
+  int size = sizeof(ms);
+  if (getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&ms),
+                 &size) != 0)
+    return -1;
+  return static_cast<long long>(ms);
+#else
+  timeval tv{};
+  socklen_t size = sizeof(tv);
+  if (::getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, &size) != 0)
+    return -1;
+  return static_cast<long long>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
+#endif
+}
+
 }  // namespace gufo::net

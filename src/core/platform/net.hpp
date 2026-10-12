@@ -53,6 +53,13 @@ bool SetNoDelay(Socket socket) noexcept;
 /// Set receive/send timeouts in milliseconds; returns false on failure.
 bool SetSocketTimeouts(Socket socket, int timeout_ms) noexcept;
 
+/// Set only the send timeout in milliseconds; the receive timeout stays at
+/// the caller's idle limit. Returns false on failure.
+bool SetSendTimeout(Socket socket, int timeout_ms) noexcept;
+
+/// Read the receive timeout back in milliseconds; -1 when unset or on error.
+long long SocketRecvTimeoutMs(Socket socket) noexcept;
+
 }  // namespace gufo::net
 
 #endif  // GUFO_CORE_PLATFORM_NET_HPP_
