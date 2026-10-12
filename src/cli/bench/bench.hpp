@@ -30,6 +30,12 @@ struct BenchOptions {
   /// Colon-separated schedules of comma-separated widths, `p`-prefixed for
   /// prompt arithmetic (`--logit-schedules 1:2,4:p8`).
   std::string logit_schedules{"1"};
+  /// Continuation-cache boundary check (`--checkpoint-eval`): compare the
+  /// next-token row after TEXT between a fresh prefill, a prefix+suffix
+  /// split and a restored prefix checkpoint.
+  std::string checkpoint_eval_path;
+  /// Prefix depths for --checkpoint-eval.
+  std::string checkpoint_boundaries{"600"};
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;

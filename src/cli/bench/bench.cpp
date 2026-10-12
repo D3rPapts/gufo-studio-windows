@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -188,6 +189,15 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                    "comma-separated widths per schedule, p-prefixed for "
                    "prompt arithmetic (default: 1)",
                    "Validation", &opt.logit_schedules);
+  parser.AddOption(
+      "", "--checkpoint-eval", "TEXT",
+      "Compare the next-token row after TEXT between a fresh prefill, a "
+      "prefix+suffix split and a restored prefix checkpoint (Flash-Next)",
+      "Validation", &opt.checkpoint_eval_path);
+  parser.AddOption(
+      "", "--checkpoint-boundaries", "LIST",
+      "Comma-separated prefix depths for --checkpoint-eval (default: 600)",
+      "Validation", &opt.checkpoint_boundaries);
 
   const auto parse_speculative_backend =
       [&opt, &speculative_explicit](std::string_view, std::string_view value,
@@ -1044,6 +1054,120 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
   return 0;
 }
 
+/// The next-token row of a session that just finished a prompt: the logits,
+/// their argmax and the top-1 margin over the runner-up.
+struct BoundaryRow {
+  std::vector<float> logits;
+  std::size_t top1{0};
+  float margin{0};
+};
+
+BoundaryRow CaptureBoundaryRow(
+    const models::qwen38_flash_next::Session& session) {
+  const auto logits = session.Logits();
+  BoundaryRow row;
+  row.logits.assign(logits.begin(), logits.end());
+  std::vector<std::size_t> order(row.logits.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::partial_sort(order.begin(), order.begin() + 2, order.end(),
+                    [&row](std::size_t a, std::size_t b) {
+                      return row.logits[a] > row.logits[b];
+                    });
+  row.top1 = order[0];
+  row.margin = row.logits[order[0]] - row.logits[order[1]];
+  return row;
+}
+
+float MaxAbsDelta(std::span<const float> a, std::span<const float> b) {
+  float max_delta = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    max_delta = std::max(max_delta, std::abs(a[i] - b[i]));
+  return max_delta;
+}
+
+// Continuation-cache boundary exactness: the serving cache restores a
+// checkpoint of the previous turn's prefix and prefills only the suffix,
+// so a reused turn's next-token row is computed over a different prefill
+// split than a fresh full prefill. For every boundary depth this feeds the
+// same prompt three ways — a fresh full Sync, a prefix-then-whole Sync in
+// one session, and a prefix checkpoint restored into a second session —
+// and compares the resulting next-token rows.
+int RunFlashNextCheckpointEval(models::qwen38_flash_next::Model& model,
+                               const BenchOptions& options) {
+  std::ifstream in(options.checkpoint_eval_path, std::ios::binary);
+  if (!in) {
+    std::cerr << "Error: cannot read " << options.checkpoint_eval_path << '\n';
+    return 1;
+  }
+  const std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  const auto tokens = model.Tokenize(text);
+  const auto boundaries =
+      ParseCommaSeparatedSizes(options.checkpoint_boundaries);
+  if (tokens.size() < 4 || !boundaries || boundaries->empty()) {
+    std::cerr << "Error: checkpoint-eval needs a longer text and at least "
+                 "one boundary\n";
+    return 1;
+  }
+  for (const auto boundary : *boundaries) {
+    if (boundary <= 1 || boundary + 1 >= tokens.size()) {
+      std::cerr << "Error: boundary " << boundary << " is outside the text ("
+                << tokens.size() << " tokens)\n";
+      return 1;
+    }
+  }
+  const std::uint32_t context = static_cast<std::uint32_t>(tokens.size() + 1);
+  std::string error;
+  std::cout << "[Checkpoint Eval] " << tokens.size() << " tokens, "
+            << boundaries->size() << " boundary depth(s)\n";
+  auto fresh = model.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                   context, &error);
+  if (!fresh || !fresh->Sync(tokens, &error)) {
+    std::cerr << "Error: checkpoint-eval fresh prefill: " << error << '\n';
+    return 1;
+  }
+  const BoundaryRow fresh_row = CaptureBoundaryRow(*fresh);
+  for (const auto boundary : *boundaries) {
+    auto chunked = model.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                       context, &error);
+    if (!chunked || !chunked->Sync(std::span(tokens).first(boundary), &error)) {
+      std::cerr << "Error: checkpoint-eval prefix prefill: " << error << '\n';
+      return 1;
+    }
+    auto snapshot = chunked->SaveSnapshot(&error);
+    if (!snapshot) {
+      std::cerr << "Error: checkpoint-eval capture: " << error << '\n';
+      return 1;
+    }
+    if (!chunked->Sync(tokens, &error)) {
+      std::cerr << "Error: checkpoint-eval suffix prefill: " << error << '\n';
+      return 1;
+    }
+    const BoundaryRow chunked_row = CaptureBoundaryRow(*chunked);
+    auto restored = model.CreateSession(
+        gufo::core::SessionMode::kAutoregressive, context, &error);
+    if (!restored || !restored->RestoreSnapshot(*snapshot, &error) ||
+        !restored->Sync(tokens, &error)) {
+      std::cerr << "Error: checkpoint-eval restore: " << error << '\n';
+      return 1;
+    }
+    const BoundaryRow restored_row = CaptureBoundaryRow(*restored);
+    const bool restore_exact =
+        chunked_row.logits.size() == restored_row.logits.size() &&
+        std::memcmp(chunked_row.logits.data(), restored_row.logits.data(),
+                    chunked_row.logits.size() * sizeof(float)) == 0;
+    const float split_delta = MaxAbsDelta(fresh_row.logits, chunked_row.logits);
+    std::cout << "[Checkpoint Eval] boundary " << boundary << ": top1 "
+              << fresh_row.top1 << " (margin " << fresh_row.margin << ") vs "
+              << chunked_row.top1 << " (margin " << chunked_row.margin
+              << "), split max|d| " << std::scientific << std::setprecision(3)
+              << split_delta << std::defaultfloat << std::setprecision(6)
+              << ", restored "
+              << (restore_exact ? "bit-identical to split" : "DIFFERS") << '\n';
+  }
+  return 0;
+}
+
 int RunQwen38FlashNextBenchmark(
     const BenchOptions& options,
     const std::shared_ptr<const core::GgufReader>& reader,
@@ -1073,7 +1197,9 @@ int RunQwen38FlashNextBenchmark(
        std::max<std::size_t>(max_depth, 16) + max_generation + 1,
        options.validate_prefill_tokens + 1,
        // Logit-eval texts are short; 32K covers any sensible corpus.
-       options.logit_eval_path.empty() ? std::size_t{0} : std::size_t{32768}});
+       options.logit_eval_path.empty() ? std::size_t{0} : std::size_t{32768},
+       options.checkpoint_eval_path.empty() ? std::size_t{0}
+                                            : std::size_t{32768}});
   const bool mtp = options.speculative_backend == "mtp";
   if (!options.speculative_backend.empty() && !mtp) {
     std::cerr << "Error: Qwen3.8-Flash-Next supports only --speculative mtp "
@@ -1122,6 +1248,9 @@ int RunQwen38FlashNextBenchmark(
 
   if (!options.logit_eval_path.empty()) {
     return RunFlashNextLogitEval(*model, options);
+  }
+  if (!options.checkpoint_eval_path.empty()) {
+    return RunFlashNextCheckpointEval(*model, options);
   }
 
   // Repeat a fixed token pattern for reproducible timing. It uses far fewer
