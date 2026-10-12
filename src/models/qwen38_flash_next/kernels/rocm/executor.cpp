@@ -2383,8 +2383,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
+    // Every prefill takes the fused projection: its KV quantization must be
+    // the only one a cache row can see, or a chunk below the wide-batch
+    // threshold would write rows a long prefill reads differently (observed
+    // as split-vs-whole logit deltas on the IQ4_XS q8_0-q4_k caches). The
+    // wide route was verified bit-identical to the separate path for F16
+    // caches, so F16 bytes do not change.
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !projections_ready && prefill_phase &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
