@@ -7041,7 +7041,9 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope,
                       KvDtypes kv_dtypes) {
-  if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
+  // Any prefill batch takes the fused path (decode keeps the separate
+  // route): the KV quantization must not depend on the prefill chunk size.
+  if (n_tokens < 1 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
