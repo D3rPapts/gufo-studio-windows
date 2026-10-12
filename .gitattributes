@@ -1,0 +1,2 @@
+# Reference templates are byte-compared; never let autocrlf re-mangle them.
+*.jinja text eol=lf
