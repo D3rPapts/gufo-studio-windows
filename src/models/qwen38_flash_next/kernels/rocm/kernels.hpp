@@ -476,14 +476,17 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
 /// false, launching nothing, when the geometry is not the model's 24 x 256
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
-bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
-                         const void* v_cache, const std::uint32_t* mask,
-                         std::uint32_t mask_words, float* out,
-                         std::uint32_t n_tokens, std::uint32_t start_pos,
-                         std::uint32_t heads, std::uint32_t kv_heads,
-                         std::uint32_t d, std::uint32_t ratio,
-                         hipStream_t stream, bool last_only = false,
-                         KvDtypes kv_dtypes = {});
+/// `lead` selection rows precede the batch at `lead_mask`: they align the
+/// packed query groups to absolute positions so a chunk starting mid-group
+/// unions the same four selections a full pass unions. Zero keeps the
+/// launch-relative grouping.
+bool WmmaCausalAttention(
+    const float* q, const float* gate, const void* k_cache, const void* v_cache,
+    const std::uint32_t* mask, std::uint32_t mask_words, float* out,
+    std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t heads,
+    std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+    hipStream_t stream, bool last_only = false, KvDtypes kv_dtypes = {},
+    const std::uint32_t* lead_mask = nullptr, std::uint32_t lead = 0);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

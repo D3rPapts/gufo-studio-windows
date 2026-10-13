@@ -33,6 +33,11 @@ namespace gufo::models::qwen38_flash_next::rocm {
 /// covers.
 inline constexpr std::uint32_t kBatchSessions = 8;
 inline constexpr std::uint32_t kDecodeRows = 8;
+/// Selection rows a partial first sparse group needs beyond its batch (the
+/// packed query groups cover four absolute positions). Doubled in the
+/// per-session tails, which shift by fewer rows than they keep.
+inline constexpr std::uint32_t kAttentionMaskLead = 3;
+inline constexpr std::uint32_t kAttentionMaskTail = 2 * kAttentionMaskLead;
 
 class Executor;
 class SnapshotAllocator;
@@ -112,6 +117,15 @@ public:
 
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  /// Position the attention layers' selection tails end at (0 = none).
+  [[nodiscard]] std::uint32_t MaskTailPosition() const noexcept {
+    for (const auto& at : attention_) {
+      if (at.mask_tail != nullptr) {
+        return at.mask_tail_position;
+      }
+    }
+    return 0;
+  }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
@@ -157,6 +171,14 @@ private:
     unsigned char* v_cache{nullptr};
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
+    /// Final batches' selection bitmaps, [kAttentionMaskTail][mask_words]:
+    /// rows [0,3) keep the last sparse positions' selections (the leading
+    /// partial group of the next chunk unions them so its key tiles match a
+    /// full pass), rows [3,6) stage the shift when a batch keeps fewer than
+    /// three rows. Null keeps launch-relative grouping (the draft block,
+    /// which never restarts mid-prompt). Snapshotted: rows [0,3) only.
+    std::uint32_t* mask_tail{nullptr};
+    std::uint32_t mask_tail_position{0};  ///< position the tail ends at
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -542,6 +564,19 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
+  /// Assembles the sparse attention lead rows of one launch: the selection
+  /// bitmaps of the absolute positions a partial first group unions but this
+  /// batch does not carry. Rows of earlier chunks come from the tail staged
+  /// at mask_lead[3,6); `tail_live` must be captured before the call's tail
+  /// refresh.
+  void AssembleMaskLead(Session::AttentionState& s, bool tail_live,
+                        std::uint32_t start_pos, std::uint32_t launch_pos,
+                        std::uint32_t lead) const;
+  /// Rebuilds one captured layer's selection tail at the checkpoint frontier
+  /// (start_pos + tokens) from the capture batch's mask rows. Runs right
+  /// after the layer's attention, while its mask rows are still in scratch.
+  void FixCheckpointMaskTail(PrefillCheckpoint& checkpoint, std::uint32_t layer,
+                             std::uint32_t start_pos) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -633,6 +668,11 @@ private:
     float* iq;
     float* ik;
     std::uint32_t* mask;
+    /// Selection rows preceding the batch rows of `mask`: rows [0,3) are the
+    /// assembled lead of a sparse launch whose absolute start misses the
+    /// group alignment, rows [3,6) stage the previous chunk's tail across
+    /// the same call's tail refresh.
+    std::uint32_t* mask_lead;
     float* scores;
     float* ctx;
     float* attn_partials;  ///< split-key partials of a narrow batch

@@ -8,12 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <limits>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -811,6 +811,31 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
       view.mtp_.residual_valid = false;
   }
   view.ngram_ = source.ngram_;
+  // The view owns its selection tails: the source's tails keep moving with
+  // the source's own chunks, while this checkpoint continues from the
+  // capture point and its payload must reproduce that point's tails.
+  if (!Check(hipStreamSynchronize(stream_), "checkpoint capture drain",
+             error_msg)) {
+    return nullptr;
+  }
+  for (auto& at : view.attention_) {
+    if (at.mask_tail == nullptr) {
+      continue;
+    }
+    auto* tail = Alloc<std::uint32_t>(
+        view.allocations_, kAttentionMaskTail * mask_words_, error_msg);
+    if (tail == nullptr) {
+      return nullptr;
+    }
+    if (!Check(
+            hipMemcpy(tail, at.mask_tail,
+                      kAttentionMaskLead * mask_words_ * sizeof(std::uint32_t),
+                      hipMemcpyDeviceToDevice),
+            "checkpoint selection tail copy", error_msg)) {
+      return nullptr;
+    }
+    at.mask_tail = tail;
+  }
   std::vector<std::uint32_t> rows(std::size_t{prefix} * c.ple_heads);
   if (c.ple_layer >= 0)
     HashNgramRows(c, view.ngram_, tokens.first(prefix), rows);
@@ -1040,7 +1065,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   const std::size_t attention_floats =
       T * (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
            c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim +
-           e->mask_words_);
+           e->mask_words_) +
+      2 * kAttentionMaskLead * e->mask_words_;
   const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
   // Linear/full attention and routed experts run sequentially on stream_.
   // Their intermediates die before the next stage, including batched rows,
@@ -1080,7 +1106,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.v = take(T * c.AttentionKvDim());
   s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
   s.ik = take(T * c.indexer_head_dim);
-  s.mask = reinterpret_cast<std::uint32_t*>(take(T * e->mask_words_));
+  s.mask_lead = reinterpret_cast<std::uint32_t*>(
+      take((T + 2 * kAttentionMaskLead) * e->mask_words_));
+  s.mask = s.mask_lead + std::size_t{2 * kAttentionMaskLead} * e->mask_words_;
   s.ctx = take(T * c.AttentionQDim());
   // Keep score/selection traffic near the device cache size. Captured
   // verification still needs all its rows at the maximum context.
@@ -1324,6 +1352,11 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
           static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
               c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
+      // Selection rows the next chunk's partial first sparse group unions.
+      // Zeroed: reads before the first tail is taken fall back to the
+      // launch-relative grouping, never to stale selections.
+      at.mask_tail = Alloc<std::uint32_t>(a, kAttentionMaskTail * mask_words_,
+                                          error_msg, &s->allocated_bytes_);
     }
   }
   if (c.ple_layer >= 0) {
@@ -1436,7 +1469,10 @@ std::size_t Executor::SessionBytes(
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * (state + rollback_state)) *
              sizeof(float) +
-         attention * (kv + index) + sizeof(Session::Control) +
+         attention * (kv + index +
+                      std::size_t{kAttentionMaskTail} * mask_words_ *
+                          sizeof(std::uint32_t)) +
+         sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
@@ -2210,11 +2246,10 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
         static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
         sizeof(float);
     for (std::uint32_t row = 0; row < n; ++row) {
-      if (!Ple(l, session, 1,
-               res + static_cast<std::size_t>(row) * c.HcDim(), speculative,
-               error_msg, true, checkpoint,
-               s_.ple_emb + static_cast<std::size_t>(row) *
-                                c.PleEmbeddingDim())) {
+      if (!Ple(l, session, 1, res + static_cast<std::size_t>(row) * c.HcDim(),
+               speculative, error_msg, true, checkpoint,
+               s_.ple_emb +
+                   static_cast<std::size_t>(row) * c.PleEmbeddingDim())) {
         return false;
       }
       // Snapshot the rolling history after each row: rows[keep - 1] must be
@@ -2368,6 +2403,79 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
 
+void Executor::AssembleMaskLead(Session::AttentionState& s, bool tail_live,
+                                std::uint32_t start_pos,
+                                std::uint32_t launch_pos,
+                                std::uint32_t lead) const {
+  // Fills the lead rows a partial first sparse group unions: the selection
+  // bitmaps of the absolute positions just before the batch. Rows of earlier
+  // chunks come from the tail staged at mask_lead[3,6) before this call's
+  // tail refresh; a stale tail (a rewind skipped the batch that would have
+  // produced it) degrades to zero rows, the launch-relative grouping, never
+  // to stale selections.
+  const std::size_t row_bytes =
+      std::size_t{mask_words_} * sizeof(std::uint32_t);
+  for (std::uint32_t i = 0; i < lead; ++i) {
+    const std::uint32_t absolute = launch_pos - lead + i;
+    auto* dst = s_.mask_lead + std::size_t{i} * mask_words_;
+    if (absolute >= start_pos) {
+      (void)hipMemcpyAsync(
+          dst, s_.mask + std::size_t{absolute - start_pos} * mask_words_,
+          row_bytes, hipMemcpyDeviceToDevice, stream_);
+    } else if (tail_live && absolute + kAttentionMaskLead >= start_pos) {
+      (void)hipMemcpyAsync(
+          dst,
+          s_.mask_lead + std::size_t{kAttentionMaskLead + absolute -
+                                     (start_pos - kAttentionMaskLead)} *
+                             mask_words_,
+          row_bytes, hipMemcpyDeviceToDevice, stream_);
+    } else {
+      (void)hipMemsetAsync(dst, 0, row_bytes, stream_);
+    }
+  }
+}
+
+void Executor::FixCheckpointMaskTail(PrefillCheckpoint& checkpoint,
+                                     std::uint32_t layer,
+                                     std::uint32_t start_pos) const {
+  // The checkpoint continues from start_pos + tokens, so its tail must hold
+  // the frontier's preceding selections: rows of the capture batch from its
+  // mask rows, earlier rows from the tails the checkpoint took over at
+  // capture time. Staged through the lead scratch, which this layer's
+  // attention has finished with. A frontier at or below the selection budget
+  // mirrors a pass ending there: its final batch never runs sparse
+  // selection, so its tail stays untouched.
+  auto& view = *checkpoint.state;
+  const std::uint32_t frontier = start_pos + checkpoint.tokens;
+  auto& at = view.attention_[layer];
+  if (at.mask_tail == nullptr || frontier <= config().indexer_top_k) {
+    return;
+  }
+  const std::size_t row_bytes =
+      std::size_t{mask_words_} * sizeof(std::uint32_t);
+  if (frontier < kAttentionMaskLead) {
+    // Before the first aligned group a tail never matters (every launch at
+    // or below the budget starts on the group alignment).
+    at.mask_tail_position = 0;
+    return;
+  }
+  (void)hipMemcpyAsync(s_.mask_lead, at.mask_tail,
+                       kAttentionMaskLead * row_bytes, hipMemcpyDeviceToDevice,
+                       stream_);
+  for (std::uint32_t i = 0; i < kAttentionMaskLead; ++i) {
+    const std::uint32_t absolute = frontier - kAttentionMaskLead + i;
+    const std::uint32_t* src =
+        absolute >= start_pos
+            ? s_.mask + std::size_t{absolute - start_pos} * mask_words_
+            : s_.mask_lead +
+                  std::size_t{absolute - (start_pos - kAttentionMaskLead)} *
+                      mask_words_;
+    (void)hipMemcpyAsync(at.mask_tail + std::size_t{i} * mask_words_, src,
+                         row_bytes, hipMemcpyDeviceToDevice, stream_);
+  }
+  at.mask_tail_position = frontier;
+}
+
 bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          const float* x, float* out, std::uint32_t n_tokens,
                          const std::uint32_t* pos,
@@ -2390,11 +2498,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     // wide route was verified bit-identical to the separate path for F16
     // caches, so F16 bytes do not change.
     const bool fused_projection =
-        !projections_ready && prefill_phase &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
-        l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
-        c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
-        c.rotary_dim == 64;
+        !projections_ready && prefill_phase && n_tokens <= options_.max_batch &&
+        DenseF16Route(l.attn_qkv, n_tokens) && l.attn_qkv.rows == 13312 &&
+        l.attn_qkv.cols == 2560 && c.num_heads == 24 && c.num_kv_heads == 2 &&
+        c.head_dim == 256 && c.rotary_dim == 64;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
@@ -2460,6 +2567,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               index_capacity, stream_);
   }
   const std::uint32_t* mask = nullptr;
+  bool tail_live = false;  ///< the tail this call's lead rows may read
   if (sparse) {
     if (!Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
       return false;
@@ -2504,6 +2612,45 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                    c.compress_ratio, c.indexer_top_k / c.compress_ratio,
                    mask_words_, max_blocks, stream_, live);
     }
+    // Keep this batch's final selections for the next chunk's partial first
+    // sparse group: it must union the same four queries' masks a full pass
+    // unions. Rows [0,3) hold the tail, [3,6) stage the shift when a batch
+    // keeps fewer rows than the tail. The stamp rejects stale tails after
+    // rewinds; decode steps never retake it (a replayed graph cannot move
+    // the host stamp, so their rows would desync the window).
+    // The tail this same call reads for its own lead rows is staged at
+    // mask_lead[3,6) first: the refresh below runs before attend().
+    tail_live = s.mask_tail != nullptr && s.mask_tail_position == start_pos;
+    if (tail_live && prefill_phase) {
+      (void)hipMemcpyAsync(
+          s_.mask_lead + kAttentionMaskLead * mask_words_, s.mask_tail,
+          kAttentionMaskLead * mask_words_ * sizeof(std::uint32_t),
+          hipMemcpyDeviceToDevice, stream_);
+    }
+    if (s.mask_tail != nullptr && prefill_phase) {
+      const std::size_t row_bytes =
+          std::size_t{mask_words_} * sizeof(std::uint32_t);
+      const std::uint32_t keep = std::min(kAttentionMaskLead, n_tokens);
+      if (keep == kAttentionMaskLead) {
+        (void)hipMemcpyAsync(
+            s.mask_tail,
+            s_.mask + std::size_t{n_tokens - kAttentionMaskLead} * mask_words_,
+            kAttentionMaskLead * row_bytes, hipMemcpyDeviceToDevice, stream_);
+      } else {
+        (void)hipMemcpyAsync(s.mask_tail + kAttentionMaskLead * mask_words_,
+                             s.mask_tail, kAttentionMaskLead * row_bytes,
+                             hipMemcpyDeviceToDevice, stream_);
+        (void)hipMemcpyAsync(
+            s.mask_tail,
+            s.mask_tail + (kAttentionMaskLead + keep) * mask_words_,
+            (kAttentionMaskLead - keep) * row_bytes, hipMemcpyDeviceToDevice,
+            stream_);
+        (void)hipMemcpyAsync(
+            s.mask_tail + std::size_t{kAttentionMaskLead - keep} * mask_words_,
+            s_.mask, keep * row_bytes, hipMemcpyDeviceToDevice, stream_);
+      }
+      s.mask_tail_position = start_pos + n_tokens;
+    }
     mask = s_.mask;
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
@@ -2521,6 +2668,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // batch that crosses it, so each position's key sweep (and its rounding)
   // does not depend on where the prefill chunks fall. The sparse part goes
   // first: it is the launch that can be refused.
+  constexpr std::uint32_t kPackedQueryRows = 4;  // kernel kWmmaRatio
   const auto attend = [&](std::uint32_t first, std::uint32_t rows, bool last) {
     const std::uint32_t pos = start_pos + first;
     const std::uint32_t dense_rows = mask != nullptr && pos < c.indexer_top_k
@@ -2529,6 +2677,18 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     const auto at = [&](std::uint32_t row) {
       return std::size_t{first + row} * c.AttentionQDim();
     };
+    // A launch whose absolute start misses the packed group alignment leads
+    // with the preceding positions' selections, so its first group unions
+    // the same four queries a full pass unions and every row keeps the full
+    // pass's key-tile partition. Launches without a tail (the draft block)
+    // keep the launch-relative grouping.
+    std::uint32_t lead = 0;
+    if (mask != nullptr && s.mask_tail != nullptr) {
+      lead = (pos + dense_rows) % kPackedQueryRows;
+      if (lead != 0) {
+        AssembleMaskLead(s, tail_live, start_pos, pos + dense_rows, lead);
+      }
+    }
     return (dense_rows == rows ||
             WmmaCausalAttention(
                 s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
@@ -2537,13 +2697,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last, options_.kv_dtypes)) &&
+                c.compress_ratio, stream_, last, options_.kv_dtypes,
+                lead != 0 ? s_.mask_lead : nullptr, lead)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
             WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
                                 c.head_dim, c.compress_ratio, stream_, last,
-                                options_.kv_dtypes));
+                                options_.kv_dtypes, nullptr, 0));
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -3146,8 +3307,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           last_attention, false, true,
                           checkpoint ? checkpoint->tokens : 0)) {
       return false;
+    } else if (checkpoint != nullptr && sparse) {
+      // Freeze the layer's frontier tail while its mask rows are still in
+      // scratch; the checkpoint continues from the capture point.
+      FixCheckpointMaskTail(*checkpoint, il, start_pos);
     }
-
     const float* next_norm =
         il + 1 < c.num_layers
             ? (c.IsPleLayer(il + 1) ? nullptr
@@ -3246,8 +3410,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // weights are read once.
       for (std::uint32_t row = 0; row < n_logits; ++row) {
         if (!HcMix(head,
-                   s_.res +
-                       (skip + static_cast<std::size_t>(row)) * c.HcDim(),
+                   s_.res + (skip + static_cast<std::size_t>(row)) * c.HcDim(),
                    false,
                    s_.mixed + static_cast<std::size_t>(row) * c.hidden_size,
                    nullptr, 1, error_msg)) {
@@ -3351,7 +3514,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
-                                             'N', 'A', 'P', '6'};
+                                             'N', 'A', 'P', '7'};
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -3378,6 +3541,8 @@ struct SnapshotHeader {
   std::uint32_t hidden_rows;
   std::uint32_t image_count;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
+  std::uint32_t mask_words;          ///< selection bitmap words per query
+  std::uint32_t mask_tail_position;  ///< position the selection tails end at
   std::uint64_t payload_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
@@ -3401,6 +3566,9 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.ple_elems = c.ple_layer >= 0 ? c.PleConvHistory() * c.HcDim() : 0;
   h.has_mtp = has_mtp ? 1 : 0;
   h.position = session.position();
+  h.mask_words =
+      ((c.context_length + c.compress_ratio - 1) / c.compress_ratio + 31) / 32;
+  h.mask_tail_position = session.MaskTailPosition();
   h.image_count = std::ranges::count_if(
       session.VisionLayout().images,
       [&](const auto& image) { return image.offset < h.position; });
@@ -3416,7 +3584,8 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
          h.kv_v_dtype == mine.kv_v_dtype &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
-         h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
+         h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp &&
+         h.mask_words == mine.mask_words;
 }
 
 /// Per-token bytes of one serialized K or V section in `h`'s format.
@@ -3542,6 +3711,20 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
         !region(mtp != nullptr ? mtp->target_hidden : nullptr,
                 std::uint64_t{h.hidden_rows} * h.hc_dim * sizeof(float),
                 "kept trunk rows")) {
+      return 0;
+    }
+  }
+  // The selection tails ride last, monolithic: every restore uploads them in
+  // full, and they never count as a session's retained cache rows.
+  const std::uint64_t tail_bytes =
+      std::uint64_t{kAttentionMaskLead} * h.mask_words * sizeof(std::uint32_t);
+  for (std::uint32_t il = 0; il < h.num_layers; ++il) {
+    if (((il + 1) % h.full_attention_interval) != 0) {
+      continue;
+    }
+    const auto* at = attention(il);
+    if (!region(session != nullptr ? at->mask_tail : nullptr, tail_bytes,
+                "selection tails")) {
       return 0;
     }
   }
@@ -3777,6 +3960,9 @@ bool Executor::RestoreSnapshot(Session& session,
     AssignError(error_msg, "unpooled indexer rows exceed the ring capacity");
     return false;
   }
+  // h.mask_tail_position may exceed h.position after a reset plus a short
+  // re-prefill; the tail is then simply unusable (the per-launch stamp guard
+  // never matches), so it needs no validation here.
   if (h.payload_bytes != payload.size() ||
       WalkSnapshot(h, nullptr,
                    [](void*, std::uint64_t, std::uint64_t, const char*,
@@ -4023,6 +4209,11 @@ bool Executor::RestoreSnapshot(Session& session,
   session.RestoreVisionLayout(layout, stream_);
   session.position_ = h.position;
   session.blocks_ = h.blocks;
+  for (auto& at : session.attention_) {
+    if (at.mask_tail != nullptr) {
+      at.mask_tail_position = h.mask_tail_position;
+    }
+  }
   session.mtp_.position = h.mtp_position;
   session.mtp_.blocks = h.mtp_blocks;
   session.mtp_.residual_valid = h.mtp_residual_valid != 0;

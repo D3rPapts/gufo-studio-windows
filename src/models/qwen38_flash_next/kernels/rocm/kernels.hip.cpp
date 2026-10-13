@@ -2462,9 +2462,8 @@ __global__ void PrepareAttentionKernel(
                             float value) {
     const float amax = WaveMax(fabsf(value));
     const std::size_t row_base = std::size_t(*start_pos + t) * plane_row_bytes;
-    cache[row_base + head * d + index] =
-        static_cast<signed char>(
-            __float2int_rn(value * (amax > 0.0f ? 127.0f / amax : 0.0f)));
+    cache[row_base + head * d + index] = static_cast<signed char>(
+        __float2int_rn(value * (amax > 0.0f ? 127.0f / amax : 0.0f)));
     if (lane == 0)
       *reinterpret_cast<__half*>(cache + row_base + kv_width +
                                  (head * (d / 32) + (index >> 5)) * 2) =
@@ -2494,9 +2493,8 @@ __global__ void PrepareAttentionKernel(
         store_q8(v_cache, v_row_bytes, head, tid,
                  row[2 * width + kv_width + head * d + tid]);
       else
-        reinterpret_cast<__half*>(v_cache)[std::size_t(*start_pos + t) *
-                                               kv_width +
-                                           head * d + tid] =
+        reinterpret_cast<__half*>(
+            v_cache)[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
             __float2half(row[2 * width + kv_width + head * d + tid]);
     }
   }
@@ -2542,13 +2540,12 @@ __global__ void PrepareAttentionKernel(
         store_q8(k_cache, k_row_bytes, head, tid, lo);
         store_q8(k_cache, k_row_bytes, head, tid + half, hi);
       } else {
-        reinterpret_cast<__half*>(k_cache)[std::size_t(*start_pos + t) *
-                                               kv_width +
-                                           head * d + tid] = __float2half(lo);
-        reinterpret_cast<__half*>(k_cache)[std::size_t(*start_pos + t) *
-                                               kv_width +
-                                           head * d + tid + half] =
-            __float2half(hi);
+        reinterpret_cast<__half*>(
+            k_cache)[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
+            __float2half(lo);
+        reinterpret_cast<__half*>(
+            k_cache)[std::size_t(*start_pos + t) * kv_width + head * d + tid +
+                     half] = __float2half(hi);
       }
     }
     if (tid >= rotary && tid < d) {
@@ -2557,9 +2554,8 @@ __global__ void PrepareAttentionKernel(
       else if constexpr (kKvQ8)
         store_q8(k_cache, k_row_bytes, head, tid, norm[j][tid]);
       else
-        reinterpret_cast<__half*>(k_cache)[std::size_t(*start_pos + t) *
-                                               kv_width +
-                                           head * d + tid] =
+        reinterpret_cast<__half*>(
+            k_cache)[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
             __float2half(norm[j][tid]);
     }
   }
@@ -2604,11 +2600,11 @@ __global__ void StoreKvKernel(const float* src, unsigned char* cache,
     }
     return;
   }
-  const std::size_t out_row =
-      static_cast<std::size_t>(*start_pos + t) *
-      (kKvQ8 ? row_dim + (row_dim / 32) * 2 : row_dim);
+  const std::size_t out_row = static_cast<std::size_t>(*start_pos + t) *
+                              (kKvQ8 ? row_dim + (row_dim / 32) * 2 : row_dim);
   if constexpr (!kKvQ8) {
-    const std::size_t out_elem = static_cast<std::size_t>(*start_pos + t) * row_dim;
+    const std::size_t out_elem =
+        static_cast<std::size_t>(*start_pos + t) * row_dim;
     for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
       reinterpret_cast<__half*>(cache)[out_elem + i] =
           __float2half(src[static_cast<std::size_t>(t) * row_dim + i]);
@@ -3919,7 +3915,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const unsigned char* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
-    std::uint32_t first_query_group = 0) {
+    std::uint32_t first_query_group = 0,
+    const std::uint32_t* __restrict__ lead_mask = nullptr,
+    std::uint32_t lead = 0) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -3953,10 +3951,16 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 
   // Keep the two KV heads of nearby queries together in the launch order.
   // This improves cache reuse without changing any query's key sweep.
+  // Query groups follow absolute positions: `lead` selection rows that
+  // precede the batch (the previous chunk's tail, staged by the caller) let
+  // a chunk starting mid-group union the same four queries' masks a full
+  // pass unions, so every row's key-tile partition matches the full pass.
+  // The leading phantom queries of the first group compute no output.
   const std::uint32_t linear = blockIdx.y * gridDim.x + blockIdx.x;
   const std::uint32_t query_group =
       first_query_group + (kPackHeads ? linear / kWmmaKvHeads : blockIdx.x);
-  const std::uint32_t query_start = query_group * kQueryRows;
+  const std::uint32_t query_start =
+      query_group * kQueryRows - (kPackHeads ? lead : 0);
   const std::uint32_t kv_head =
       kPackHeads ? linear % kWmmaKvHeads : blockIdx.y / (kWmmaGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
@@ -4057,6 +4061,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   if (sparse) {
     // Consecutive word ranges per thread make the prefix scan preserve
     // increasing block order, including ties and the always-visible tail.
+    // The unsigned difference wraps for a first group's lead rows, so
+    // live_rows counts them plus the batch's own rows.
     const unsigned live_rows = min(kQueryRows, n_tokens - query_start);
     const unsigned word_count = (n_blocks + 31) / 32;
     const unsigned words_per_thread = (word_count + 255) / 256;
@@ -4074,7 +4080,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 #pragma unroll
         for (unsigned r = 0; r < kMaskRows; ++r) {
           if (r < live_rows) {
-            row_words[j][r] = mask[size_t(query_start + r) * mask_words + w];
+            const int row = static_cast<int>(query_start) + static_cast<int>(r);
+            row_words[j][r] =
+                row < 0 ? lead_mask[size_t(row + static_cast<int>(lead)) *
+                                        mask_words +
+                                    w]
+                        : mask[size_t(row) * mask_words + w];
             bits |= row_words[j][r];
           }
         }
@@ -4216,10 +4227,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const uint2 packed =
         *reinterpret_cast<const uint2*>(row + kv_head * kHeadDim + d8);
     const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
-        row + kWmmaKvWidth +
-        (kv_head * (kHeadDim / 32) + (d8 >> 5)) * 2);
-    const __half2 scale2 =
-        __half2half2(__builtin_bit_cast(__half, scale_bits));
+        row + kWmmaKvWidth + (kv_head * (kHeadDim / 32) + (d8 >> 5)) * 2);
+    const __half2 scale2 = __half2half2(__builtin_bit_cast(__half, scale_bits));
     uint4 out;
     CodesToHalves(packed.x ^ 0x80808080U, magic2, scale2, zero2,
                   *reinterpret_cast<__half2*>(&out),
@@ -4258,8 +4267,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                       : make_uint4(0u, 0u, 0u, 0u);
       } else {
         dst[j] = live ? *reinterpret_cast<const uint4*>(
-                            src + (static_cast<std::size_t>(kv_head) *
-                                       kHeadDim * 2) +
+                            src +
+                            (static_cast<std::size_t>(kv_head) * kHeadDim * 2) +
                             ((j * 8) * 2))
                       : make_uint4(0u, 0u, 0u, 0u);
       }
@@ -4998,80 +5007,109 @@ constexpr std::size_t kQ5KBlockBytes = 176;
 // IQ4_NL codebook, both carried as byte + 128 so the kernel's signed-byte
 // magic (-1152) decodes them; the grid stays in global memory (L2-cached).
 __device__ const std::uint32_t kIq3sGridCarry[512] = {
-    0x01010101U, 0x01010103U, 0x01010105U, 0x0101010bU, 0x0101010fU, 0x01010301U, 0x01010303U,
-    0x01010305U, 0x01010309U, 0x0101030dU, 0x01010501U, 0x01010503U, 0x0101050bU, 0x01010707U,
-    0x01010901U, 0x01010905U, 0x0101090bU, 0x0101090fU, 0x01010b03U, 0x01010b07U, 0x01010d01U,
-    0x01010d05U, 0x01010f03U, 0x01010f09U, 0x01010f0fU, 0x01030101U, 0x01030103U, 0x01030105U,
-    0x01030109U, 0x01030301U, 0x01030303U, 0x0103030bU, 0x01030501U, 0x01030507U, 0x0103050fU,
-    0x01030703U, 0x0103070bU, 0x01030909U, 0x01030d03U, 0x01030d0bU, 0x01030f05U, 0x01050101U,
-    0x01050103U, 0x0105010bU, 0x0105010fU, 0x01050301U, 0x01050307U, 0x0105030dU, 0x01050503U,
-    0x0105050bU, 0x01050701U, 0x01050709U, 0x01050905U, 0x0105090bU, 0x0105090fU, 0x01050b03U,
-    0x01050b07U, 0x01050f01U, 0x01050f07U, 0x01070107U, 0x01070303U, 0x0107030bU, 0x01070501U,
-    0x01070505U, 0x01070703U, 0x01070707U, 0x0107070dU, 0x01070909U, 0x01070b01U, 0x01070b05U,
-    0x01070d0fU, 0x01070f03U, 0x01070f0bU, 0x01090101U, 0x01090307U, 0x0109030fU, 0x01090503U,
-    0x01090509U, 0x01090705U, 0x01090901U, 0x01090907U, 0x01090b03U, 0x01090f01U, 0x010b0105U,
-    0x010b0109U, 0x010b0501U, 0x010b0505U, 0x010b050dU, 0x010b0707U, 0x010b0903U, 0x010b090bU,
-    0x010b090fU, 0x010b0d0dU, 0x010b0f07U, 0x010d010dU, 0x010d0303U, 0x010d0307U, 0x010d0703U,
-    0x010d0b05U, 0x010d0f03U, 0x010f0101U, 0x010f0105U, 0x010f0109U, 0x010f0501U, 0x010f0505U,
-    0x010f050dU, 0x010f0707U, 0x010f0b01U, 0x010f0b09U, 0x03010101U, 0x03010103U, 0x03010105U,
-    0x03010109U, 0x03010301U, 0x03010303U, 0x03010307U, 0x0301030bU, 0x0301030fU, 0x03010501U,
-    0x03010505U, 0x03010703U, 0x03010709U, 0x0301070dU, 0x03010b09U, 0x03010b0dU, 0x03010d03U,
-    0x03010f05U, 0x03030101U, 0x03030103U, 0x03030107U, 0x0303010dU, 0x03030301U, 0x03030309U,
-    0x03030503U, 0x03030701U, 0x03030707U, 0x03030903U, 0x03030b01U, 0x03030b05U, 0x03030f01U,
-    0x03030f0dU, 0x03050101U, 0x03050305U, 0x0305030bU, 0x0305030fU, 0x03050501U, 0x03050509U,
-    0x03050705U, 0x03050901U, 0x03050907U, 0x03050b0bU, 0x03050d01U, 0x03050f05U, 0x03070103U,
-    0x03070109U, 0x0307010fU, 0x03070301U, 0x03070307U, 0x03070503U, 0x0307050fU, 0x03070701U,
-    0x03070709U, 0x03070903U, 0x03070d05U, 0x03070f01U, 0x03090107U, 0x0309010bU, 0x03090305U,
-    0x03090309U, 0x03090703U, 0x03090707U, 0x03090905U, 0x0309090dU, 0x03090b01U, 0x03090b09U,
-    0x030b0103U, 0x030b0301U, 0x030b0307U, 0x030b0503U, 0x030b0701U, 0x030b0705U, 0x030b0b03U,
-    0x030d0501U, 0x030d0509U, 0x030d050fU, 0x030d0909U, 0x030d090dU, 0x030f0103U, 0x030f0107U,
-    0x030f0301U, 0x030f0305U, 0x030f0503U, 0x030f070bU, 0x030f0903U, 0x030f0d05U, 0x030f0f01U,
-    0x05010101U, 0x05010103U, 0x05010107U, 0x0501010bU, 0x0501010fU, 0x05010301U, 0x05010305U,
-    0x05010309U, 0x0501030dU, 0x05010503U, 0x05010507U, 0x0501050fU, 0x05010701U, 0x05010705U,
-    0x05010903U, 0x05010907U, 0x0501090bU, 0x05010b01U, 0x05010b05U, 0x05010d0fU, 0x05010f01U,
-    0x05010f07U, 0x05010f0bU, 0x05030101U, 0x05030105U, 0x05030301U, 0x05030307U, 0x0503030fU,
-    0x05030505U, 0x0503050bU, 0x05030703U, 0x05030709U, 0x05030905U, 0x05030b03U, 0x05050103U,
-    0x05050109U, 0x0505010fU, 0x05050503U, 0x05050507U, 0x05050701U, 0x0505070fU, 0x05050903U,
-    0x05050b07U, 0x05050b0fU, 0x05050f03U, 0x05050f09U, 0x05070101U, 0x05070105U, 0x0507010bU,
-    0x05070303U, 0x05070505U, 0x05070509U, 0x05070703U, 0x05070707U, 0x05070905U, 0x05070b01U,
-    0x05070d0dU, 0x05090103U, 0x0509010fU, 0x05090501U, 0x05090507U, 0x05090705U, 0x0509070bU,
-    0x05090903U, 0x05090f05U, 0x05090f0bU, 0x050b0109U, 0x050b0303U, 0x050b0505U, 0x050b070fU,
-    0x050b0901U, 0x050b0b07U, 0x050b0f01U, 0x050d0101U, 0x050d0105U, 0x050d010fU, 0x050d0503U,
-    0x050d0b0bU, 0x050d0d03U, 0x050f010bU, 0x050f0303U, 0x050f050dU, 0x050f0701U, 0x050f0907U,
-    0x050f0b01U, 0x07010105U, 0x07010303U, 0x07010307U, 0x0701030bU, 0x0701030fU, 0x07010505U,
-    0x07010703U, 0x07010707U, 0x0701070bU, 0x07010905U, 0x07010909U, 0x0701090fU, 0x07010b03U,
-    0x07010d07U, 0x07010f03U, 0x07030103U, 0x07030107U, 0x0703010bU, 0x07030309U, 0x07030503U,
-    0x07030507U, 0x07030901U, 0x07030d01U, 0x07030f05U, 0x07030f0dU, 0x07050101U, 0x07050305U,
-    0x07050501U, 0x07050705U, 0x07050709U, 0x07050b01U, 0x07070103U, 0x07070301U, 0x07070309U,
-    0x07070503U, 0x07070507U, 0x0707050fU, 0x07070701U, 0x07070903U, 0x07070907U, 0x0707090fU,
-    0x07070b0bU, 0x07070f07U, 0x07090107U, 0x07090303U, 0x0709030dU, 0x07090505U, 0x07090703U,
-    0x07090b05U, 0x07090d01U, 0x07090d09U, 0x070b0103U, 0x070b0301U, 0x070b0305U, 0x070b050bU,
-    0x070b0705U, 0x070b0909U, 0x070b0b0dU, 0x070b0f07U, 0x070d030dU, 0x070d0903U, 0x070f0103U,
-    0x070f0107U, 0x070f0501U, 0x070f0505U, 0x070f070bU, 0x09010101U, 0x09010109U, 0x09010305U,
-    0x09010501U, 0x09010509U, 0x0901050fU, 0x09010705U, 0x09010903U, 0x09010b01U, 0x09010f01U,
-    0x09030105U, 0x0903010fU, 0x09030303U, 0x09030307U, 0x09030505U, 0x09030701U, 0x0903070bU,
-    0x09030907U, 0x09030b03U, 0x09030b0bU, 0x09050103U, 0x09050107U, 0x09050301U, 0x0905030bU,
-    0x09050503U, 0x09050707U, 0x09050901U, 0x09050b0fU, 0x09050d05U, 0x09050f01U, 0x09070109U,
-    0x09070303U, 0x09070307U, 0x09070501U, 0x09070505U, 0x09070703U, 0x0907070bU, 0x09090101U,
-    0x09090105U, 0x09090509U, 0x0909070fU, 0x09090901U, 0x09090f03U, 0x090b010bU, 0x090b010fU,
-    0x090b0503U, 0x090b0d05U, 0x090d0307U, 0x090d0709U, 0x090d0d01U, 0x090f0301U, 0x090f030bU,
-    0x090f0701U, 0x090f0907U, 0x090f0b03U, 0x0b010105U, 0x0b010301U, 0x0b010309U, 0x0b010505U,
-    0x0b010901U, 0x0b010909U, 0x0b01090fU, 0x0b010b05U, 0x0b010d0dU, 0x0b010f09U, 0x0b030103U,
-    0x0b030107U, 0x0b03010bU, 0x0b030305U, 0x0b030503U, 0x0b030705U, 0x0b030f05U, 0x0b050101U,
-    0x0b050303U, 0x0b050507U, 0x0b050701U, 0x0b05070dU, 0x0b050b07U, 0x0b070105U, 0x0b07010fU,
-    0x0b070301U, 0x0b07050fU, 0x0b070909U, 0x0b070b03U, 0x0b070d0bU, 0x0b070f07U, 0x0b090103U,
-    0x0b090109U, 0x0b090501U, 0x0b090705U, 0x0b09090dU, 0x0b0b0305U, 0x0b0b050dU, 0x0b0b0b03U,
-    0x0b0b0b07U, 0x0b0d0905U, 0x0b0f0105U, 0x0b0f0109U, 0x0b0f0505U, 0x0d010303U, 0x0d010307U,
-    0x0d01030bU, 0x0d010703U, 0x0d010707U, 0x0d010d01U, 0x0d030101U, 0x0d030501U, 0x0d03050fU,
-    0x0d030d09U, 0x0d050305U, 0x0d050709U, 0x0d050905U, 0x0d050b0bU, 0x0d050d05U, 0x0d050f01U,
-    0x0d070101U, 0x0d070309U, 0x0d070503U, 0x0d070901U, 0x0d09050bU, 0x0d090907U, 0x0d090d05U,
-    0x0d0b0101U, 0x0d0b0107U, 0x0d0b0709U, 0x0d0b0d01U, 0x0d0d010bU, 0x0d0d0901U, 0x0d0f0303U,
-    0x0d0f0307U, 0x0f010101U, 0x0f010109U, 0x0f01010fU, 0x0f010501U, 0x0f010505U, 0x0f01070dU,
-    0x0f010901U, 0x0f010b09U, 0x0f010d05U, 0x0f030105U, 0x0f030303U, 0x0f030509U, 0x0f030907U,
-    0x0f03090bU, 0x0f050103U, 0x0f050109U, 0x0f050301U, 0x0f05030dU, 0x0f050503U, 0x0f050701U,
-    0x0f050b03U, 0x0f070105U, 0x0f070705U, 0x0f07070bU, 0x0f070b07U, 0x0f090103U, 0x0f09010bU,
-    0x0f090307U, 0x0f090501U, 0x0f090b01U, 0x0f0b0505U, 0x0f0b0905U, 0x0f0d0105U, 0x0f0d0703U,
-    0x0f0f0101U,
+    0x01010101U, 0x01010103U, 0x01010105U, 0x0101010bU, 0x0101010fU,
+    0x01010301U, 0x01010303U, 0x01010305U, 0x01010309U, 0x0101030dU,
+    0x01010501U, 0x01010503U, 0x0101050bU, 0x01010707U, 0x01010901U,
+    0x01010905U, 0x0101090bU, 0x0101090fU, 0x01010b03U, 0x01010b07U,
+    0x01010d01U, 0x01010d05U, 0x01010f03U, 0x01010f09U, 0x01010f0fU,
+    0x01030101U, 0x01030103U, 0x01030105U, 0x01030109U, 0x01030301U,
+    0x01030303U, 0x0103030bU, 0x01030501U, 0x01030507U, 0x0103050fU,
+    0x01030703U, 0x0103070bU, 0x01030909U, 0x01030d03U, 0x01030d0bU,
+    0x01030f05U, 0x01050101U, 0x01050103U, 0x0105010bU, 0x0105010fU,
+    0x01050301U, 0x01050307U, 0x0105030dU, 0x01050503U, 0x0105050bU,
+    0x01050701U, 0x01050709U, 0x01050905U, 0x0105090bU, 0x0105090fU,
+    0x01050b03U, 0x01050b07U, 0x01050f01U, 0x01050f07U, 0x01070107U,
+    0x01070303U, 0x0107030bU, 0x01070501U, 0x01070505U, 0x01070703U,
+    0x01070707U, 0x0107070dU, 0x01070909U, 0x01070b01U, 0x01070b05U,
+    0x01070d0fU, 0x01070f03U, 0x01070f0bU, 0x01090101U, 0x01090307U,
+    0x0109030fU, 0x01090503U, 0x01090509U, 0x01090705U, 0x01090901U,
+    0x01090907U, 0x01090b03U, 0x01090f01U, 0x010b0105U, 0x010b0109U,
+    0x010b0501U, 0x010b0505U, 0x010b050dU, 0x010b0707U, 0x010b0903U,
+    0x010b090bU, 0x010b090fU, 0x010b0d0dU, 0x010b0f07U, 0x010d010dU,
+    0x010d0303U, 0x010d0307U, 0x010d0703U, 0x010d0b05U, 0x010d0f03U,
+    0x010f0101U, 0x010f0105U, 0x010f0109U, 0x010f0501U, 0x010f0505U,
+    0x010f050dU, 0x010f0707U, 0x010f0b01U, 0x010f0b09U, 0x03010101U,
+    0x03010103U, 0x03010105U, 0x03010109U, 0x03010301U, 0x03010303U,
+    0x03010307U, 0x0301030bU, 0x0301030fU, 0x03010501U, 0x03010505U,
+    0x03010703U, 0x03010709U, 0x0301070dU, 0x03010b09U, 0x03010b0dU,
+    0x03010d03U, 0x03010f05U, 0x03030101U, 0x03030103U, 0x03030107U,
+    0x0303010dU, 0x03030301U, 0x03030309U, 0x03030503U, 0x03030701U,
+    0x03030707U, 0x03030903U, 0x03030b01U, 0x03030b05U, 0x03030f01U,
+    0x03030f0dU, 0x03050101U, 0x03050305U, 0x0305030bU, 0x0305030fU,
+    0x03050501U, 0x03050509U, 0x03050705U, 0x03050901U, 0x03050907U,
+    0x03050b0bU, 0x03050d01U, 0x03050f05U, 0x03070103U, 0x03070109U,
+    0x0307010fU, 0x03070301U, 0x03070307U, 0x03070503U, 0x0307050fU,
+    0x03070701U, 0x03070709U, 0x03070903U, 0x03070d05U, 0x03070f01U,
+    0x03090107U, 0x0309010bU, 0x03090305U, 0x03090309U, 0x03090703U,
+    0x03090707U, 0x03090905U, 0x0309090dU, 0x03090b01U, 0x03090b09U,
+    0x030b0103U, 0x030b0301U, 0x030b0307U, 0x030b0503U, 0x030b0701U,
+    0x030b0705U, 0x030b0b03U, 0x030d0501U, 0x030d0509U, 0x030d050fU,
+    0x030d0909U, 0x030d090dU, 0x030f0103U, 0x030f0107U, 0x030f0301U,
+    0x030f0305U, 0x030f0503U, 0x030f070bU, 0x030f0903U, 0x030f0d05U,
+    0x030f0f01U, 0x05010101U, 0x05010103U, 0x05010107U, 0x0501010bU,
+    0x0501010fU, 0x05010301U, 0x05010305U, 0x05010309U, 0x0501030dU,
+    0x05010503U, 0x05010507U, 0x0501050fU, 0x05010701U, 0x05010705U,
+    0x05010903U, 0x05010907U, 0x0501090bU, 0x05010b01U, 0x05010b05U,
+    0x05010d0fU, 0x05010f01U, 0x05010f07U, 0x05010f0bU, 0x05030101U,
+    0x05030105U, 0x05030301U, 0x05030307U, 0x0503030fU, 0x05030505U,
+    0x0503050bU, 0x05030703U, 0x05030709U, 0x05030905U, 0x05030b03U,
+    0x05050103U, 0x05050109U, 0x0505010fU, 0x05050503U, 0x05050507U,
+    0x05050701U, 0x0505070fU, 0x05050903U, 0x05050b07U, 0x05050b0fU,
+    0x05050f03U, 0x05050f09U, 0x05070101U, 0x05070105U, 0x0507010bU,
+    0x05070303U, 0x05070505U, 0x05070509U, 0x05070703U, 0x05070707U,
+    0x05070905U, 0x05070b01U, 0x05070d0dU, 0x05090103U, 0x0509010fU,
+    0x05090501U, 0x05090507U, 0x05090705U, 0x0509070bU, 0x05090903U,
+    0x05090f05U, 0x05090f0bU, 0x050b0109U, 0x050b0303U, 0x050b0505U,
+    0x050b070fU, 0x050b0901U, 0x050b0b07U, 0x050b0f01U, 0x050d0101U,
+    0x050d0105U, 0x050d010fU, 0x050d0503U, 0x050d0b0bU, 0x050d0d03U,
+    0x050f010bU, 0x050f0303U, 0x050f050dU, 0x050f0701U, 0x050f0907U,
+    0x050f0b01U, 0x07010105U, 0x07010303U, 0x07010307U, 0x0701030bU,
+    0x0701030fU, 0x07010505U, 0x07010703U, 0x07010707U, 0x0701070bU,
+    0x07010905U, 0x07010909U, 0x0701090fU, 0x07010b03U, 0x07010d07U,
+    0x07010f03U, 0x07030103U, 0x07030107U, 0x0703010bU, 0x07030309U,
+    0x07030503U, 0x07030507U, 0x07030901U, 0x07030d01U, 0x07030f05U,
+    0x07030f0dU, 0x07050101U, 0x07050305U, 0x07050501U, 0x07050705U,
+    0x07050709U, 0x07050b01U, 0x07070103U, 0x07070301U, 0x07070309U,
+    0x07070503U, 0x07070507U, 0x0707050fU, 0x07070701U, 0x07070903U,
+    0x07070907U, 0x0707090fU, 0x07070b0bU, 0x07070f07U, 0x07090107U,
+    0x07090303U, 0x0709030dU, 0x07090505U, 0x07090703U, 0x07090b05U,
+    0x07090d01U, 0x07090d09U, 0x070b0103U, 0x070b0301U, 0x070b0305U,
+    0x070b050bU, 0x070b0705U, 0x070b0909U, 0x070b0b0dU, 0x070b0f07U,
+    0x070d030dU, 0x070d0903U, 0x070f0103U, 0x070f0107U, 0x070f0501U,
+    0x070f0505U, 0x070f070bU, 0x09010101U, 0x09010109U, 0x09010305U,
+    0x09010501U, 0x09010509U, 0x0901050fU, 0x09010705U, 0x09010903U,
+    0x09010b01U, 0x09010f01U, 0x09030105U, 0x0903010fU, 0x09030303U,
+    0x09030307U, 0x09030505U, 0x09030701U, 0x0903070bU, 0x09030907U,
+    0x09030b03U, 0x09030b0bU, 0x09050103U, 0x09050107U, 0x09050301U,
+    0x0905030bU, 0x09050503U, 0x09050707U, 0x09050901U, 0x09050b0fU,
+    0x09050d05U, 0x09050f01U, 0x09070109U, 0x09070303U, 0x09070307U,
+    0x09070501U, 0x09070505U, 0x09070703U, 0x0907070bU, 0x09090101U,
+    0x09090105U, 0x09090509U, 0x0909070fU, 0x09090901U, 0x09090f03U,
+    0x090b010bU, 0x090b010fU, 0x090b0503U, 0x090b0d05U, 0x090d0307U,
+    0x090d0709U, 0x090d0d01U, 0x090f0301U, 0x090f030bU, 0x090f0701U,
+    0x090f0907U, 0x090f0b03U, 0x0b010105U, 0x0b010301U, 0x0b010309U,
+    0x0b010505U, 0x0b010901U, 0x0b010909U, 0x0b01090fU, 0x0b010b05U,
+    0x0b010d0dU, 0x0b010f09U, 0x0b030103U, 0x0b030107U, 0x0b03010bU,
+    0x0b030305U, 0x0b030503U, 0x0b030705U, 0x0b030f05U, 0x0b050101U,
+    0x0b050303U, 0x0b050507U, 0x0b050701U, 0x0b05070dU, 0x0b050b07U,
+    0x0b070105U, 0x0b07010fU, 0x0b070301U, 0x0b07050fU, 0x0b070909U,
+    0x0b070b03U, 0x0b070d0bU, 0x0b070f07U, 0x0b090103U, 0x0b090109U,
+    0x0b090501U, 0x0b090705U, 0x0b09090dU, 0x0b0b0305U, 0x0b0b050dU,
+    0x0b0b0b03U, 0x0b0b0b07U, 0x0b0d0905U, 0x0b0f0105U, 0x0b0f0109U,
+    0x0b0f0505U, 0x0d010303U, 0x0d010307U, 0x0d01030bU, 0x0d010703U,
+    0x0d010707U, 0x0d010d01U, 0x0d030101U, 0x0d030501U, 0x0d03050fU,
+    0x0d030d09U, 0x0d050305U, 0x0d050709U, 0x0d050905U, 0x0d050b0bU,
+    0x0d050d05U, 0x0d050f01U, 0x0d070101U, 0x0d070309U, 0x0d070503U,
+    0x0d070901U, 0x0d09050bU, 0x0d090907U, 0x0d090d05U, 0x0d0b0101U,
+    0x0d0b0107U, 0x0d0b0709U, 0x0d0b0d01U, 0x0d0d010bU, 0x0d0d0901U,
+    0x0d0f0303U, 0x0d0f0307U, 0x0f010101U, 0x0f010109U, 0x0f01010fU,
+    0x0f010501U, 0x0f010505U, 0x0f01070dU, 0x0f010901U, 0x0f010b09U,
+    0x0f010d05U, 0x0f030105U, 0x0f030303U, 0x0f030509U, 0x0f030907U,
+    0x0f03090bU, 0x0f050103U, 0x0f050109U, 0x0f050301U, 0x0f05030dU,
+    0x0f050503U, 0x0f050701U, 0x0f050b03U, 0x0f070105U, 0x0f070705U,
+    0x0f07070bU, 0x0f070b07U, 0x0f090103U, 0x0f09010bU, 0x0f090307U,
+    0x0f090501U, 0x0f090b01U, 0x0f0b0505U, 0x0f0b0905U, 0x0f0d0105U,
+    0x0f0d0703U, 0x0f0f0101U,
 };
 
 __device__ const std::uint32_t kIq4NlCarry[4] = {
@@ -5079,12 +5117,12 @@ __device__ const std::uint32_t kIq4NlCarry[4] = {
 
 template<WeightType kType>
 __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
-  return kType == WeightType::kQ4_K   ? (k / 256) * sizeof(Q4KBlock)
-         : kType == WeightType::kQ5_K ? (k / 256) * kQ5KBlockBytes
-         : kType == WeightType::kQ5_1 ? (k / 32) * sizeof(Q5_1Block)
-         : kType == WeightType::kIQ3_S ? (k / 256) * sizeof(IQ3SBlock)
+  return kType == WeightType::kQ4_K     ? (k / 256) * sizeof(Q4KBlock)
+         : kType == WeightType::kQ5_K   ? (k / 256) * kQ5KBlockBytes
+         : kType == WeightType::kQ5_1   ? (k / 32) * sizeof(Q5_1Block)
+         : kType == WeightType::kIQ3_S  ? (k / 256) * sizeof(IQ3SBlock)
          : kType == WeightType::kIQ4_NL ? (k / 32) * sizeof(IQ4NLBlock)
-                                      : (k / 32) * sizeof(Q8_0Block);
+                                        : (k / 32) * sizeof(Q8_0Block);
 }
 
 /// Bit `s` of each of the four bytes of `w`, packed into bits 0-3.
@@ -5468,9 +5506,9 @@ __launch_bounds__(256) __global__
     }
   }
 
-  const __half2 magic = __floats2half2_rn(
-      kQ8 || kIQ4NL || kIQ3S ? -1152.0F : -1024.0F,
-      kQ8 || kIQ4NL || kIQ3S ? -1152.0F : -1024.0F);
+  const __half2 magic =
+      __floats2half2_rn(kQ8 || kIQ4NL || kIQ3S ? -1152.0F : -1024.0F,
+                        kQ8 || kIQ4NL || kIQ3S ? -1152.0F : -1024.0F);
   const auto compute_stage = [&]() {
     uint4 raw[kWaveRowTiles][BK];
     if constexpr (!kQ8) {
@@ -5549,8 +5587,7 @@ __launch_bounds__(256) __global__
           for (int j = 0; j < 8; ++j) {
             const std::uint32_t qs_byte =
                 ((j < 4 ? r.x : r.y) >> (8 * (j & 3))) & 0xFFU;
-            const std::uint32_t idx =
-                qs_byte | (((qh >> j) & 1U) << 8);
+            const std::uint32_t idx = qs_byte | (((qh >> j) & 1U) << 8);
             const std::uint32_t g = Vadd4(kIq3sGridCarry[idx], 0x80808080U);
             const std::uint32_t sb = (r.z >> (8 * (j >> 1))) & 0xFFU;
             const std::uint32_t bits =
@@ -5594,7 +5631,9 @@ __launch_bounds__(256) __global__
         }
         // A short expert bucket has no output in the remaining token
         // tiles, so omit their WMMA work.
-        if constexpr ((kPair || ((kQ5 || kQ8 || kIQ3S || kIQ4NL) && BN >= 48)) && kTokTiles > 1) {
+        if constexpr ((kPair ||
+                       ((kQ5 || kQ8 || kIQ3S || kIQ4NL) && BN >= 48)) &&
+                      kTokTiles > 1) {
           if (j >= live_tok_tiles)
             continue;
         }
@@ -5663,8 +5702,7 @@ __launch_bounds__(256) __global__
             __half values[2];
 #pragma unroll
             for (int v = 0; v < 2; ++v) {
-              float value =
-                  base[idx + v + 4 * plane] * SiluF(base[idx + v]);
+              float value = base[idx + v + 4 * plane] * SiluF(base[idx + v]);
               asm volatile("" : "+v"(value));
               values[v] = __float2half(value);
             }
@@ -5832,7 +5870,6 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 }
 
 }  // namespace
-
 
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
@@ -6205,14 +6242,14 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
     case WeightType::kIQ3_S:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-          rows_out, swiglu_gate, out, out_half, m, k, nullptr);
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k, nullptr);
       return true;
     case WeightType::kIQ4_NL:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kIQ4_NL, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-          rows_out, swiglu_gate, out, out_half, m, k, nullptr);
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k, nullptr);
       return true;
     default:
       return false;
@@ -6443,8 +6480,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   const auto token_of = [&](int local) {
     if constexpr (kBf16) {
       static_assert(BN == 128 && WN == 4 && kRowGroup == 1);
-      return slab_abs - batch_start + (bf16_class * 32) +
-             ((local / 32) * 128) + (local % 32);
+      return slab_abs - batch_start + (bf16_class * 32) + ((local / 32) * 128) +
+             (local % 32);
     } else {
       return t_block + local;
     }
@@ -6476,9 +6513,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   for (int p = 0; p < kBPer; ++p) {
     const int idx = (p * 256) + tid;
     const int t = token_of(idx / BK);
-    b_ptr[p] = idx < kBUnits && t >= 0 && t < static_cast<int>(batch)
-                   ? x + (static_cast<std::size_t>(t) * (kStrided ? input_stride : k))
-                   : nullptr;
+    b_ptr[p] =
+        idx < kBUnits && t >= 0 && t < static_cast<int>(batch)
+            ? x + (static_cast<std::size_t>(t) * (kStrided ? input_stride : k))
+            : nullptr;
   }
   uint4 a_codes[kAPer][2];
   uint4 a_half[kRawWeights ? kAPer : 1][4];
@@ -6775,23 +6813,23 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               const std::size_t row_base =
                   static_cast<std::size_t>(*attention.position + tok) *
                   (kvwidth + kvwidth / 16);
-              auto* codes = static_cast<unsigned char*>(cache) + row_base +
-                            head * dim;
-              codes[col] =
-                  static_cast<signed char>(__float2int_rn(v[c] * id));
+              auto* codes =
+                  static_cast<unsigned char*>(cache) + row_base + head * dim;
+              codes[col] = static_cast<signed char>(__float2int_rn(v[c] * id));
               if (lane_id == 0)
-                *reinterpret_cast<__half*>(static_cast<unsigned char*>(cache) +
-                                           row_base + kvwidth +
-                                           (head * 8 + c) * 2) =
-                    __float2half_rn(amax / 127.0F);
+                *reinterpret_cast<__half*>(
+                    static_cast<unsigned char*>(cache) + row_base + kvwidth +
+                    (head * 8 + c) * 2) = __float2half_rn(amax / 127.0F);
             } else if (key) {
-              static_cast<__half*>(attention.keys)[std::size_t(
-                  *attention.position + tok) * kvwidth + head * dim + col] =
-                  __float2half_rn(v[c]);
+              static_cast<__half*>(
+                  attention
+                      .keys)[std::size_t(*attention.position + tok) * kvwidth +
+                             head * dim + col] = __float2half_rn(v[c]);
             } else {
-              static_cast<__half*>(attention.values)[std::size_t(
-                  *attention.position + tok) * kvwidth + head * dim + col] =
-                  __float2half_rn(v[c]);
+              static_cast<__half*>(
+                  attention.values)[std::size_t(*attention.position + tok) *
+                                        kvwidth +
+                                    head * dim + col] = __float2half_rn(v[c]);
             }
           }
           if constexpr (kVQ4K) {
@@ -7066,12 +7104,11 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
           input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr,
           nullptr, nullptr, output);
     } else {
-      hipLaunchKernelGGL(
-          (DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false, true, false,
-                              false, false, true>),
-          dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
-          input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr,
-          nullptr, nullptr, output);
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false,
+                                             true, false, false, false, true>),
+                         dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
+                         stream, weights, input, nullptr, n_tokens, 13312, 2560,
+                         nullptr, nullptr, nullptr, nullptr, nullptr, output);
     }
   } else {
     // One 256-row tile per query, gate, key or value head (52). Four row
@@ -7082,8 +7119,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
     hipLaunchKernelGGL(
         (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
         dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
-        input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
-        nullptr, output);
+        input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr,
+        nullptr, nullptr, output);
   }
   return true;
 }
@@ -7137,8 +7174,8 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
                                          false, false, true>),
                      dim3(((batch + 511) / 512 + 1) * 4, (m + 63) / 64),
                      dim3(kThreads), 0, stream, w,
-                     static_cast<const __half*>(x), out, batch, m, k,
-                     nullptr, nullptr, nullptr, nullptr, nullptr,
+                     static_cast<const __half*>(x), out, batch, m, k, nullptr,
+                     nullptr, nullptr, nullptr, nullptr,
                      AttentionProjectionOutput{}, 0, 0, token_offset);
   return true;
 }
@@ -7692,11 +7729,12 @@ bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
                          std::uint32_t n_tokens, std::uint32_t start_pos,
                          std::uint32_t heads, std::uint32_t kv_heads,
                          std::uint32_t d, std::uint32_t ratio,
-                         hipStream_t stream, bool last_only,
-                         KvDtypes kv_dtypes) {
+                         hipStream_t stream, bool last_only, KvDtypes kv_dtypes,
+                         const std::uint32_t* lead_mask, std::uint32_t lead) {
   if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
       d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
-      (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
+      (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
+      (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
     return false;
   }
   const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
@@ -7705,10 +7743,18 @@ bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
   const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
   if (mask != nullptr) {
     constexpr std::uint32_t kPackedQueries = 4;
+    // last_only computes the absolute-aligned group containing the batch's
+    // final row: with lead rows prepended it starts up to three rows before
+    // the launch-relative tile (the same tile when lead is zero).
+    const std::uint32_t last_row = n_tokens - 1;
     const std::uint32_t first_group =
-        last_only ? (n_tokens - 1) / kPackedQueries : 0;
+        last_only ? (last_row + lead - ((lead + last_row) % kPackedQueries)) /
+                        kPackedQueries
+                  : 0;
+    // The lead rows extend the first group to the full pass's absolute
+    // query alignment, so its grid carries one extra group at most.
     const dim3 grid(
-        (n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
+        (lead + n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
         kWmmaKvHeads);
     // At deep sparse windows, staging the current V before fetching the
     // next one shortens their overlapping register lifetimes.
@@ -7720,37 +7766,39 @@ bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
               (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true,
                                          true, true>),
               grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-              mask_words, out, start_pos, n_tokens, first_group);
+              mask_words, out, start_pos, n_tokens, first_group, lead_mask,
+              lead);
         } else {
           hipLaunchKernelGGL(
               (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, false,
                                          true, true>),
               grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-              mask_words, out, start_pos, n_tokens, first_group);
+              mask_words, out, start_pos, n_tokens, first_group, lead_mask,
+              lead);
         }
       } else if (late_v) {
-        hipLaunchKernelGGL(
-            (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true,
-                                       true>),
-            grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-            mask_words, out, start_pos, n_tokens, first_group);
+        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
+                                                      true, true, true>),
+                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                           first_group, lead_mask, lead);
       } else {
-        hipLaunchKernelGGL(
-            (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, false,
-                                       true>),
-            grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-            mask_words, out, start_pos, n_tokens, first_group);
+        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
+                                                      true, false, true>),
+                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                           first_group, lead_mask, lead);
       }
     } else if (late_v) {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
           grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-          mask_words, out, start_pos, n_tokens, first_group);
+          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
     } else {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-          mask_words, out, start_pos, n_tokens, first_group);
+          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
     }
     return true;
   }

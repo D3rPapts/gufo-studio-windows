@@ -234,8 +234,9 @@ public:
   /// 17: KV cache sections may be planar Q8_0 (kv_dtype header field).
   /// 18: K/V planes carry separate dtypes (kv_v_dtype header field); Q4_K
   /// value planes.
+  /// 19: per-layer sparse selection tails (partial-group chunk invariance).
   static constexpr std::uint32_t kSnapshotPayloadVersion =
-      18;  /// Bytes a snapshot of the current context occupies.
+      19;  /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
       std::uint32_t position) const;
