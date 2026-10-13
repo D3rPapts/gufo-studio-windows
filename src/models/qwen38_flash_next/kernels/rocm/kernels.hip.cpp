@@ -4269,7 +4269,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         dst[j] = live ? *reinterpret_cast<const uint4*>(
                             src +
                             (static_cast<std::size_t>(kv_head) * kHeadDim * 2) +
-                            ((j * 8) * 2))
+                            ((v_slice + (j * 8)) * 2))
                       : make_uint4(0u, 0u, 0u, 0u);
       }
     }

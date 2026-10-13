@@ -1311,10 +1311,39 @@ int main() {
     CheckQ8Attention(3, 90000, 0x51ED0003U);
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
-    CheckPreparation(1, 0, 64);
-    CheckPreparation(8, 4096, 64);
-    CheckPreparation(65, 131069, 64);
-    CheckPreparation(7, 131069, 256);
+    // The wide-batch sparse cases run before the F16 query-preparation cases
+    // below, which hit this toolchain's pre-existing 1-ULP drift and would
+    // otherwise abort before them.
+    struct Case {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool masked;
+      bool sparse;
+      bool bounded{false};
+    };
+    const Case cases[] = {
+        {4, 4096, false, false},      {3, 9000, true, true},
+        {100, 0, false, false},       {64, 37, false, false},
+        {100, 0, true, false},        {77, 51, true, false},
+        {96, 4096, true, true},       {70, 8000, true, true},
+        {512, 2048, true, true},      {1024, 2048, true, true, true},
+        {5, 32765, true, true, true}, {7, 65533, true, true, true},
+        {5, 131069, true, true},      {7, 131069, true, true, true},
+        {17, 2047, true, true, true}};
+    std::uint32_t seed = 0x1234ABCDU;
+    for (const Case& c : cases) {
+      const double worst = Compare(c.n_tokens, c.start_pos, c.masked, seed++,
+                                   c.sparse, c.bounded);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << (c.masked ? (c.sparse ? " sparse" : " masked") : " dense")
+                << " worst absolute error " << worst << '\n';
+      // The reference accumulates FP32 probabilities; the WMMA route rounds
+      // Q and P to FP16, so the contract is a small absolute envelope on
+      // values of order one.
+      if (worst >= 2e-2) {
+        throw std::runtime_error("WMMA attention exceeds its error envelope");
+      }
+    }
     // Structured selections against the sparse path's 1024-block compaction
     // windows and 64-block key tiles. At 131069 the last 512 blocks sit in
     // the final window; 262141 spans all 64 windows of the native context,
@@ -1390,35 +1419,10 @@ int main() {
       CheckStructured("ratio-1-alternating", n, 8189, alternating,
                       structured_seed++, 1);
     }
-    struct Case {
-      std::uint32_t n_tokens;
-      std::uint32_t start_pos;
-      bool masked;
-      bool sparse;
-      bool bounded{false};
-    };
-    const Case cases[] = {
-        {4, 4096, false, false},      {3, 9000, true, true},
-        {100, 0, false, false},       {64, 37, false, false},
-        {100, 0, true, false},        {77, 51, true, false},
-        {96, 4096, true, true},       {70, 8000, true, true},
-        {5, 32765, true, true, true}, {7, 65533, true, true, true},
-        {5, 131069, true, true},      {7, 131069, true, true, true},
-        {17, 2047, true, true, true}};
-    bool ok = true;
-    std::uint32_t seed = 0x1234ABCDU;
-    for (const Case& c : cases) {
-      const double worst = Compare(c.n_tokens, c.start_pos, c.masked, seed++,
-                                   c.sparse, c.bounded);
-      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
-                << (c.masked ? (c.sparse ? " sparse" : " masked") : " dense")
-                << " worst absolute error " << worst << '\n';
-      // The reference accumulates FP32 probabilities; the WMMA route rounds
-      // Q and P to FP16, so the contract is a small absolute envelope on
-      // values of order one.
-      ok = ok && worst < 2e-2;
-    }
-    return ok ? 0 : 1;
+    CheckPreparation(1, 0, 64);
+    CheckPreparation(8, 4096, 64);
+    CheckPreparation(65, 131069, 64);
+    CheckPreparation(7, 131069, 256);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
