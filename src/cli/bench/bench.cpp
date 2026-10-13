@@ -1134,7 +1134,7 @@ int RunFlashNextCheckpointEval(models::qwen38_flash_next::Model& model,
       std::cerr << "Error: checkpoint-eval prefix prefill: " << error << '\n';
       return 1;
     }
-    auto snapshot = chunked->SaveSnapshot(&error);
+    auto snapshot = chunked->SaveAlignedSnapshot(&error);
     if (!snapshot) {
       std::cerr << "Error: checkpoint-eval capture: " << error << '\n';
       return 1;

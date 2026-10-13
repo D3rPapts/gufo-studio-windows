@@ -715,6 +715,7 @@ bool ContinuationAdapter::Validate(
   session.draft_length_ = policy;
   session.draft_token_ = 0;
   session.stats_ = {};
+  session.rewind_.reset();
   session.valid_ = true;
   state.restoring = false;
   state.coverage.clear();

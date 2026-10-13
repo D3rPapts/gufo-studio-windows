@@ -247,6 +247,14 @@ public:
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr,
       SnapshotMode mode = SnapshotMode::kBorrowed) const;
+  /// Continuation-cache capture: the payload's context ends on the sparse
+  /// group boundary this model's prefill arithmetic is exact at, so a
+  /// restored session re-prefills at most one group of tokens to reach the
+  /// original frontier. Falls back to SaveSnapshot when the live context is
+  /// already aligned or no aligned point was kept for it.
+  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveAlignedSnapshot(
+      std::string* error_msg = nullptr,
+      SnapshotMode mode = SnapshotMode::kBorrowed) const;
   [[nodiscard]] bool OwnsSnapshot(
       const SessionSnapshot& snapshot) const noexcept;
   /// Replaces this session's context with a snapshot of the same model.
@@ -267,7 +275,9 @@ private:
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
             double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {});
+            std::span<const std::int32_t> after = {},
+            std::uint32_t rewind_boundary = 0,
+            std::unique_ptr<SessionSnapshot>* rewind_out = nullptr);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -318,6 +328,14 @@ private:
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
+  /// Group-aligned rewind point of the last prefill: taken when the pass
+  /// ended inside a sparse group, consumed by the next continuing Sync.
+  /// The packed sparse attention of a pass that ends mid-group unions fewer
+  /// query masks than a pass that runs through, so those trailing rows can
+  /// never match a fresh prefill; restoring here and re-prefilling the tail
+  /// keeps every continuation on the exact single-pass arithmetic.
+  std::unique_ptr<SessionSnapshot> rewind_;
+  std::uint32_t rewind_full_{0};  ///< frontier the rewind point was taken at
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 
@@ -339,6 +357,8 @@ public:
   /// Materializes borrowed rows; may throw on a failed device transfer.
   [[nodiscard]] std::span<const std::uint8_t> bytes() const;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
+  /// Tokens the restored session would own, from the payload header.
+  [[nodiscard]] std::uint32_t ValidContext() const;
 
 private:
   explicit SessionSnapshot(std::uint64_t size);

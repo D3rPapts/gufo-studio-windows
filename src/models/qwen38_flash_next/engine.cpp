@@ -295,6 +295,7 @@ void Session::Reset() {
   if (continuation_hooks_)
     continuation_hooks_->BeforeReset();
   valid_ = false;
+  rewind_.reset();
   session_->Reset();
   tokens_.clear();
   hidden_base_ = 0;
@@ -412,6 +413,25 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
   return snapshot;
 }
 
+std::unique_ptr<SessionSnapshot> Session::SaveAlignedSnapshot(
+    std::string* error_msg, SnapshotMode mode) const {
+  // The kept rewind point is the same pass's state one group earlier.
+  if (rewind_ && valid_ && rewind_full_ == tokens_.size()) {
+    auto clone =
+        std::unique_ptr<SessionSnapshot>(new SessionSnapshot(rewind_->size_));
+    // The rewind point borrows this session's live rows and this session
+    // consumes the point on its next continuing Sync, writing past the
+    // group. The clone therefore materializes every row instead of
+    // borrowing what the source is about to rewrite.
+    if (!rewind_->CopyTo({clone->data_.get(), clone->size_})) {
+      AssignError(error_msg, "aligned snapshot materialization failed");
+      return nullptr;
+    }
+    return clone;
+  }
+  return SaveSnapshot(error_msg, mode);
+}
+
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
   if (continuation_hooks_)
@@ -428,6 +448,18 @@ std::uint64_t SessionSnapshot::DeviceBytes() const {
   return deferred_ ? deferred_->DeviceBytes() : 0;
 }
 
+std::uint32_t SessionSnapshot::ValidContext() const {
+  if (size_ < sizeof(SessionSnapshotHeader)) {
+    return 0;
+  }
+  SessionSnapshotHeader header{};
+  std::memcpy(&header, data_.get(), sizeof(header));
+  if (header.magic != kSessionSnapshotMagic) {
+    return 0;
+  }
+  return header.token_count;
+}
+
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
   if (continuation_hooks_)
@@ -438,6 +470,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
 bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                                   const rocm::SnapshotState* deferred,
                                   std::string* error_msg) {
+  rewind_.reset();
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {
     AssignError(error_msg, "session snapshot is truncated");
@@ -611,7 +644,9 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
-                   double* capture_ms, std::span<const std::int32_t> after) {
+                   double* capture_ms, std::span<const std::int32_t> after,
+                   std::uint32_t rewind_boundary,
+                   std::unique_ptr<SessionSnapshot>* rewind_out) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
@@ -627,11 +662,19 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill
                               : rocm::Executor::ForwardMode::kDecode;
     std::unique_ptr<rocm::PrefillCheckpoint> capture;
-    if (checkpoint && boundary > tokens_.size() &&
-        boundary <= tokens_.size() + n) {
+    // A resume capture freezes the caller's boundary and its kept tail rows
+    // feed the draft block. A rewind capture only freezes the group-aligned
+    // point, so it must not move the hidden-row window.
+    const bool resume = checkpoint != nullptr && boundary > tokens_.size() &&
+                        boundary <= tokens_.size() + n;
+    const bool rewind = rewind_out != nullptr &&
+                        rewind_boundary > tokens_.size() &&
+                        rewind_boundary <= tokens_.size() + n;
+    if (resume || rewind) {
+      const auto point = resume ? boundary : rewind_boundary;
       capture = exec.MakePrefillCheckpoint(
-          *session_, chunk,
-          static_cast<std::uint32_t>(boundary - tokens_.size()), error_msg);
+          *session_, chunk, static_cast<std::uint32_t>(point - tokens_.size()),
+          error_msg);
       if (!capture)
         return false;
     }
@@ -645,23 +688,25 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                       capture.get(), next)) {
       return false;
     }
-    const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
+    const auto kept =
+        resume && capture && capture->tokens < n ? n - capture->tokens : n;
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n -
         std::min<std::size_t>(kept, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     if (capture) {
+      const auto point = resume ? boundary : rewind_boundary;
       const auto started = std::chrono::steady_clock::now();
-      *checkpoint = SaveSnapshotImpl(
-          *capture->state,
-          std::span<const std::int32_t>(tokens_).first(boundary),
+      auto& out = resume ? *checkpoint : *rewind_out;
+      out = SaveSnapshotImpl(
+          *capture->state, std::span<const std::int32_t>(tokens_).first(point),
           capture->logits, capture->hidden_rows, error_msg,
           SnapshotMode::kBorrowed);
       if (capture_ms)
         *capture_ms += std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - started)
                            .count();
-      if (!*checkpoint)
+      if (!out)
         return false;
     }
     off += n;
@@ -708,6 +753,19 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   }
   if (!valid_)
     Reset();
+  // The packed sparse attention of a pass that ends inside a group unions
+  // fewer query masks than a pass that runs through, so rows of the trailing
+  // group can never match a fresh prefill. A kept rewind point restores the
+  // exact state before that group and this Sync re-prefills its tail.
+  if (rewind_ && rewind_full_ == tokens_.size() && !tokens_.empty()) {
+    auto stale = std::move(rewind_);
+    const auto stats = stats_;
+    if (!RestoreSnapshotImpl({stale->data_.get(), stale->size_},
+                             stale->deferred_.get(), error_msg)) {
+      return false;
+    }
+    stats_ = stats;
+  }
   // Recurrent state cannot be rewound, so any divergence restarts the
   // session; an extension only feeds the new tail.
   std::size_t common = 0;
@@ -723,9 +781,28 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
     common = 0;
   }
   valid_ = false;
+  // A plain prefill that ends inside a sparse group keeps an aligned rewind
+  // point for the next continuing Sync (the capture borrows live rows and
+  // copies nothing). SyncThrough's explicit capture keeps its own boundary.
+  // Below the selection budget every query takes the dense tiles, whose
+  // arithmetic a short tail already matches, so no point is kept and
+  // continuation snapshots stay prefill-free.
+  std::unique_ptr<SessionSnapshot> rewind_capture;
+  std::uint32_t rewind_boundary = 0;
+  const auto& c = model_->config();
+  const auto frontier = static_cast<std::uint32_t>(prompt.size());
+  if (checkpoint == nullptr && c.compress_ratio > 1 &&
+      frontier > c.indexer_top_k && frontier % c.compress_ratio != 0) {
+    rewind_boundary = frontier - frontier % c.compress_ratio;
+  }
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
-                       checkpoint, capture_ms, next);
+                       checkpoint, capture_ms, next, rewind_boundary,
+                       rewind_boundary == 0 ? nullptr : &rewind_capture);
   valid_ = ok;
+  if (ok && rewind_capture) {
+    rewind_ = std::move(rewind_capture);
+    rewind_full_ = frontier;
+  }
   return ok;
 }
 
@@ -848,8 +925,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   if (MtpEnabled() && cap > 1 && !batch_drafts && sampler.config().seed < 0 &&
       !sampler.config().uses_random_sampling() &&
       !sampler.config().penalties_enabled()) {
-    const MtpBatchController::Row row{
-        &draft_length_, static_cast<std::uint32_t>(cap - 1)};
+    const MtpBatchController::Row row{&draft_length_,
+                                      static_cast<std::uint32_t>(cap - 1)};
     learned = model_->batch_policy_.Choose(
         std::span<const MtpBatchController::Row>(&row, 1),
         static_cast<std::uint32_t>(tokens_.size()));
@@ -1063,9 +1140,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
     if (!exec.Rollback(*session_, keep, error_msg, nullptr, false)) {
       return false;
     }
-  } else if (!exec.Rollback(*session_, keep, error_msg,
-                            gpu_verification && !cpu_rows ? logits_.data()
-                                                          : nullptr)) {
+  } else if (!exec.Rollback(
+                 *session_, keep, error_msg,
+                 gpu_verification && !cpu_rows ? logits_.data() : nullptr)) {
     return false;
   }
   if (!gpu_verification || cpu_rows) {

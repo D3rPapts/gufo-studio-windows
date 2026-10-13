@@ -2984,12 +2984,16 @@ public:
       QwenFlashNextSession::SnapshotMode mode) const {
     const auto& qfn = RequireQwenFlashNextState(state);
     std::string error;
-    auto snapshot = qfn.session().SaveSnapshot(&error, mode);
+    // Continuation reuse re-prefills the at most one-group tail the aligned
+    // capture gives up, so a restored turn stays on the exact single-pass
+    // prefill arithmetic.
+    auto snapshot = qfn.session().SaveAlignedSnapshot(&error, mode);
     if (snapshot == nullptr) {
       throw std::runtime_error("Qwen3.8-Flash-Next snapshot failed: " + error);
     }
+    const auto position = snapshot->ValidContext();
     return std::make_unique<QwenFlashNextTextRunnerSnapshot>(
-        model_, std::move(snapshot), qfn.position());
+        model_, std::move(snapshot), position);
   }
 
   void RestoreOrFork(TextRunnerState& state,
