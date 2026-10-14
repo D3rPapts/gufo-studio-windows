@@ -5,10 +5,14 @@
 #include <cstdint>
 
 #if defined(_WIN32)
+// clang-format off
+// winsock2.h must precede windows.h (which would pull in winsock 1), and
+// iphlpapi.h needs windows.h first; keep the chain unsorted.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+// clang-format on
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
