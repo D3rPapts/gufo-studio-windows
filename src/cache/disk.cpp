@@ -1817,9 +1817,12 @@ void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
   Fd file(openat(directory, DiskFileName(payload.file).c_str(),
                  O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
   struct stat status{};
-  if (file.Get() >= 0 && fstat(file.Get(), &status) == 0 && Regular(status))
+  if (file.Get() >= 0 && fstat(file.Get(), &status) == 0 && Regular(status)) {
+#if !defined(_WIN32)
     (void)posix_fadvise(file.Get(), 0, static_cast<off_t>(bytes),
                         POSIX_FADV_WILLNEED);
+#endif
+  }
 }
 DiskReadStats DiskStore::ReadPayload(
     const DiskSnapshot& snapshot, bool private_file, const DiskPayload& payload,

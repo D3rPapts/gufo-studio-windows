@@ -145,9 +145,23 @@ if (GUFO_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_link_options(-fsanitize=address,undefined)
 endif()
 
+if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # CMake drives lld-link directly, which skips the clang-cl driver and its
+  # runtime selection. Code using __builtin_cpu_supports (the disk CRC
+  # dispatch) needs the builtins' __cpu_model at link time.
+  get_filename_component(GUFO_LLVM_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(GUFO_LLVM_DIR "${GUFO_LLVM_DIR}" DIRECTORY)
+  file(GLOB GUFO_CLANG_RT_BUILTINS
+       "${GUFO_LLVM_DIR}/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+  if (GUFO_CLANG_RT_BUILTINS)
+    list(GET GUFO_CLANG_RT_BUILTINS 0 GUFO_CLANG_RT_BUILTINS)
+    add_link_options("${GUFO_CLANG_RT_BUILTINS}")
+  endif()
+endif()
+
 if (WIN32)
   # Platform layer: WinSock (net), process memory counters (logging).
-  set(GUFO_PLATFORM_LIBS ws2_32)
+  set(GUFO_PLATFORM_LIBS ws2_32 iphlpapi)
 endif()
 
 add_subdirectory(src/cache)

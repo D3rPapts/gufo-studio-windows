@@ -511,9 +511,56 @@ void ReusedConversationOutlivesOneUseRequests() {
   conversation.push_back(9);
   assert(turn(conversation) == 16);
 }
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+#if defined(_WIN32)
+    std::string candidate;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      candidate = (std::filesystem::temp_directory_path() /
+                   ("gufo-component-cache-test-" +
+                    std::to_string(::GetCurrentProcessId()) + "-" +
+                    std::to_string(attempt)))
+                      .string();
+      std::error_code create_error;
+      if (std::filesystem::create_directory(candidate, create_error)) {
+        path_ = candidate;
+        return;
+      }
+    }
+    throw std::runtime_error("failed to create component cache directory");
+#else
+    std::string pattern = (std::filesystem::temp_directory_path() /
+                           "gufo-component-cache-test-XXXXXX")
+                              .string();
+    const char* created = ::mkdtemp(pattern.data());
+    if (created == nullptr) {
+      throw std::runtime_error("failed to create component cache directory");
+    }
+    path_ = created;
+#endif
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
+
 void RestartAndCorruption() {
-  char pattern[] = "/tmp/gufo-component-serving-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -595,8 +642,8 @@ void FailedCaptureKeepsPublishedBoundary() {
   assert(runner->adapter->RecurrentHash(restored_state.slot) == hash);
 }
 void DiskBudgetEvictsAnUnpinnedConversation() {
-  char pattern[] = "/tmp/gufo-component-budget-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1024,
                                         .staging_capacity_bytes = 7};
@@ -632,8 +679,8 @@ std::uintmax_t ManagedBytes(const std::filesystem::path& directory) {
   return bytes;
 }
 void LoweredDiskBudgetEvictsOldestAtStartup() {
-  char pattern[] = "/tmp/gufo-component-lowered-budget-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                   .capacity_bytes = 1 << 20,
                                   .staging_capacity_bytes = 7};
@@ -665,8 +712,8 @@ void LoweredDiskBudgetEvictsOldestAtStartup() {
   std::filesystem::remove_all(directory);
 }
 void OrphansLeaveBeforeCheckpoints() {
-  char pattern[] = "/tmp/gufo-component-orphan-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                   .capacity_bytes = 1 << 20,
                                   .staging_capacity_bytes = 7};
@@ -698,8 +745,8 @@ void OrphansLeaveBeforeCheckpoints() {
   std::filesystem::remove_all(directory);
 }
 void StagingIsInternal() {
-  char pattern[] = "/tmp/gufo-component-staging-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   // The legacy option is ignored: even a value below one four-byte row
   // still writes and restores through the internal staging buffer.
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
@@ -740,8 +787,8 @@ void StagingCountsAgainstRamCeiling() {
       return resources;
     }
   };
-  char pattern[] = "/tmp/gufo-component-ceiling-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   // Pinned staging and RAM share the ceiling: an explicit 4 MiB beside the
   // internal 1 MiB of staging commits 3 MiB, whatever the ignored option says.
   for (const std::size_t option : {std::size_t{0}, std::size_t{4} << 20}) {
@@ -771,8 +818,8 @@ void DiskDirectoryHasOneOwner() {
       return resources;
     }
   };
-  char pattern[] = "/tmp/gufo-component-owner-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -799,8 +846,8 @@ void DiskDirectoryHasOneOwner() {
   std::filesystem::remove_all(directory);
 }
 void GridDoesNotSuppressFirstDiskPrompt() {
-  char pattern[] = "/tmp/gufo-component-spacing-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -840,8 +887,8 @@ void GridDoesNotSuppressFirstDiskPrompt() {
   std::filesystem::remove_all(directory);
 }
 void NearTailDiskBranchSurvivesRestart() {
-  char pattern[] = "/tmp/gufo-component-branch-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7};
@@ -879,8 +926,8 @@ void NearTailDiskBranchSurvivesRestart() {
   std::filesystem::remove_all(directory);
 }
 void UnbackedDeepRowsSurviveDiskRestart() {
-  char pattern[] = "/tmp/gufo-component-deep-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 8,
