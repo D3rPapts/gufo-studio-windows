@@ -1125,10 +1125,9 @@ __global__ void HcCombineMoeF16Kernel(
         // gamma with explicit single multiplies, so a deferred combine and
         // an immediate one that pre-applied its residual agree bit for bit
         // regardless of compiler contraction choices.
-        const float4 g = float4{__fmul_rn(scale[s], gm.x),
-                                __fmul_rn(scale[s], gm.y),
-                                __fmul_rn(scale[s], gm.z),
-                                __fmul_rn(scale[s], gm.w)};
+        const float4 g =
+            float4{__fmul_rn(scale[s], gm.x), __fmul_rn(scale[s], gm.y),
+                   __fmul_rn(scale[s], gm.z), __fmul_rn(scale[s], gm.w)};
         n = float4{__fmul_rn(v[s][c].x, g.x), __fmul_rn(v[s][c].y, g.y),
                    __fmul_rn(v[s][c].z, g.z), __fmul_rn(v[s][c].w, g.w)};
         __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;

@@ -25,8 +25,8 @@ namespace {
 // once, like MAP_POPULATE; registering keeps them out of the compacting
 // large-page path hipHostMalloc would take.
 void* CommitPages(std::size_t bytes) {
-  void* data = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
-                            PAGE_READWRITE);
+  void* data =
+      VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   if (data == nullptr)
     return nullptr;
   if (hipHostRegister(data, bytes, hipHostRegisterDefault) != hipSuccess) {

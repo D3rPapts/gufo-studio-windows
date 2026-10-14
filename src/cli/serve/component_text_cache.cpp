@@ -1,8 +1,8 @@
 #include "src/cli/serve/component_text_cache.hpp"
 
 #if defined(_WIN32)
-#include <windows.h>
 #include <bcrypt.h>
+#include <windows.h>
 #pragma comment(lib, "bcrypt")
 #else
 #include <sys/random.h>

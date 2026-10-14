@@ -1624,11 +1624,13 @@ bool ParseListenAddress(const std::string& host, int port,
     ipv6->sin6_family = AF_INET6;
     ipv6->sin6_port = network_port;
     ipv6->sin6_scope_id =
-        std::ranges::all_of(scope, [](char character) {
-          return std::isdigit(static_cast<unsigned char>(character));
-        })
-            ? static_cast<std::uint32_t>(std::strtoul(scope.c_str(), nullptr,
-                                                      10))
+        std::ranges::all_of(
+            scope,
+            [](char character) {
+              return std::isdigit(static_cast<unsigned char>(character));
+            })
+            ? static_cast<std::uint32_t>(
+                  std::strtoul(scope.c_str(), nullptr, 10))
             : ::if_nametoindex(scope.c_str());
     *length = sizeof(sockaddr_in6);
     return true;
