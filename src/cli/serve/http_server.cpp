@@ -8,6 +8,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -1582,7 +1583,102 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
           .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
 }
 
+// Numeric literals only, so the listener never depends on name resolution.
+// IPv4 is parsed strictly, without inet_aton shorthand such as `127.1`; IPv6
+// goes through getaddrinfo so link-local scopes (`fe80::1%eth0`) resolve.
+bool ParseListenAddress(const std::string& host, int port,
+                        sockaddr_storage* address, socklen_t* length) {
+  *address = {};
+  // Bracketed literals are a URI convention, not a listen host; Winsock's
+  // getaddrinfo would accept them and glibc would not.
+  if (host.find('[') != std::string::npos ||
+      host.find(']') != std::string::npos)
+    return false;
+  const auto network_port = htons(static_cast<std::uint16_t>(port));
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    ipv4->sin_port = network_port;
+    *length = sizeof(sockaddr_in);
+    return true;
+  }
+  addrinfo hints{};
+  hints.ai_family = AF_INET6;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_NUMERICHOST;
+  addrinfo* result = nullptr;
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+    // Another host's interface name in a link-local scope (`fe80::1%eth0` on
+    // a machine without it) still names a well-formed listener; validate the
+    // address part and resolve the zone best effort. An unknown zone fails
+    // at bind() with the usual error instead of here.
+    const auto zone = host.rfind('%');
+    if (zone == std::string::npos)
+      return false;
+    const std::string bare = host.substr(0, zone);
+    const std::string scope = host.substr(zone + 1);
+    auto* ipv6 = reinterpret_cast<sockaddr_in6*>(address);
+    if (scope.empty() ||
+        ::inet_pton(AF_INET6, bare.c_str(), &ipv6->sin6_addr) != 1)
+      return false;
+    ipv6->sin6_family = AF_INET6;
+    ipv6->sin6_port = network_port;
+    ipv6->sin6_scope_id =
+        std::ranges::all_of(scope, [](char character) {
+          return std::isdigit(static_cast<unsigned char>(character));
+        })
+            ? static_cast<std::uint32_t>(std::strtoul(scope.c_str(), nullptr,
+                                                      10))
+            : ::if_nametoindex(scope.c_str());
+    *length = sizeof(sockaddr_in6);
+    return true;
+  }
+  const bool parsed = result != nullptr && result->ai_family == AF_INET6 &&
+                      result->ai_addrlen <= sizeof(sockaddr_storage);
+  if (parsed) {
+    std::memcpy(address, result->ai_addr, result->ai_addrlen);
+    reinterpret_cast<sockaddr_in6*>(address)->sin6_port = network_port;
+    *length = static_cast<socklen_t>(result->ai_addrlen);
+  }
+  ::freeaddrinfo(result);
+  return parsed;
+}
+
+// Client IDs key per-client scheduling, so one client keeps one ID whichever
+// listener it reaches: an IPv4 peer of a dual-stack `::` listener arrives as
+// `::ffff:a.b.c.d` and is reported as `a.b.c.d`. Empty when unavailable.
+std::string PeerAddress(int client_fd) {
+  sockaddr_storage peer{};
+  socklen_t length = sizeof(peer);
+  if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &length) !=
+      0)
+    return {};
+  if (peer.ss_family == AF_INET6) {
+    const auto& ipv6 = reinterpret_cast<const sockaddr_in6&>(peer);
+    if (IN6_IS_ADDR_V4MAPPED(&ipv6.sin6_addr)) {
+      sockaddr_in ipv4{};
+      ipv4.sin_family = AF_INET;
+      ipv4.sin_port = ipv6.sin6_port;
+      std::memcpy(&ipv4.sin_addr, &ipv6.sin6_addr.s6_addr[12],
+                  sizeof(ipv4.sin_addr));
+      std::memcpy(&peer, &ipv4, sizeof(ipv4));
+      length = sizeof(ipv4);
+    }
+  }
+  char text[NI_MAXHOST]{};
+  if (::getnameinfo(reinterpret_cast<const sockaddr*>(&peer), length, text,
+                    sizeof(text), nullptr, 0, NI_NUMERICHOST) != 0)
+    return {};
+  return text;
+}
+
 }  // namespace
+
+bool IsListenAddress(const std::string& host) {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  return ParseListenAddress(host, 0, &address, &length);
+}
 
 // ---------------------------------------------------------------------------
 // HttpRequest
@@ -1694,19 +1790,19 @@ bool HttpServer::start(std::string* error) {
     }
     return false;
   }
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
+  sockaddr_storage addr{};
+  socklen_t addr_length = 0;
   if (port_ < 0 || port_ > 65535 ||
-      ::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+      !ParseListenAddress(host_, port_, &addr, &addr_length)) {
     if (error != nullptr) {
       *error =
-          "host must be an IPv4 address and port must be between 0 and 65535";
+          "host must be an IPv4 or IPv6 address and port must be between "
+          "0 and 65535";
     }
     return false;
   }
-  addr.sin_port = htons(static_cast<unsigned short>(port_));
   platform::IgnoreSocketPipeSignal();
-  listen_fd_ = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+  listen_fd_ = static_cast<int>(::socket(addr.ss_family, SOCK_STREAM, 0));
   if (listen_fd_ < 0) {
     if (error != nullptr)
       *error = "socket() failed";
@@ -1715,9 +1811,21 @@ bool HttpServer::start(std::string* error) {
   const int yes = 1;
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&yes), sizeof(yes));
+  // `::` serves IPv4 clients too. Set it explicitly: the kernel default
+  // follows net.ipv6.bindv6only, which differs between hosts.
+  if (addr.ss_family == AF_INET6) {
+    const int no = 0;
+    if (::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY,
+                     reinterpret_cast<const char*>(&no), sizeof(no)) != 0) {
+      if (error != nullptr)
+        *error = "setsockopt(IPV6_V6ONLY) failed";
+      net::CloseSocket(listen_fd_);
+      listen_fd_ = -1;
+      return false;
+    }
+  }
 
-  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-      0) {
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
@@ -1733,7 +1841,7 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   if (port_ == 0) {
-    sockaddr_in bound{};
+    sockaddr_storage bound{};
     socklen_t length = sizeof(bound);
     if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound),
                       &length) != 0) {
@@ -1744,7 +1852,9 @@ bool HttpServer::start(std::string* error) {
       listen_fd_ = -1;
       return false;
     }
-    port_ = ntohs(bound.sin_port);
+    port_ = ntohs(bound.ss_family == AF_INET6
+                      ? reinterpret_cast<sockaddr_in6&>(bound).sin6_port
+                      : reinterpret_cast<sockaddr_in&>(bound).sin_port);
   }
   return true;
 }
@@ -1762,7 +1872,9 @@ void HttpServer::run(bool handle_signals) {
                             "configure HTTP listener");
   Logger::Info(
       "server",
-      "event=listening address=http://" + host_ + ":" + std::to_string(port_) +
+      "event=listening address=http://" +
+          (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
+          ":" + std::to_string(port_) +
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
@@ -2008,13 +2120,8 @@ void HttpServer::handle_connection(int client_fd) {
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
   static std::atomic<std::uint64_t> next_request{0};
-  sockaddr_in peer{};
-  socklen_t peer_size = sizeof(peer);
-  char peer_address[INET_ADDRSTRLEN]{};
-  if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer),
-                    &peer_size) == 0 &&
-      ::inet_ntop(AF_INET, &peer.sin_addr, peer_address, sizeof(peer_address)))
-    req.client_id = peer_address;
+  if (auto peer = PeerAddress(client_fd); !peer.empty())
+    req.client_id = std::move(peer);
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
   // Set for routes `--trace` records; `traced_stream` collects the body bytes
   // a streaming reply delivered.

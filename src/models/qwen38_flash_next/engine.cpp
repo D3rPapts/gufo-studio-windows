@@ -645,7 +645,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
                    double* capture_ms, std::span<const std::int32_t> after,
-                   std::uint32_t rewind_boundary,
+                   const PrefillCapture& consume, std::uint32_t rewind_boundary,
                    std::unique_ptr<SessionSnapshot>* rewind_out) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
@@ -664,14 +664,19 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     std::unique_ptr<rocm::PrefillCheckpoint> capture;
     // A resume capture freezes the caller's boundary and its kept tail rows
     // feed the draft block. A rewind capture only freezes the group-aligned
-    // point, so it must not move the hidden-row window.
+    // point, so it must not move the hidden-row window. A component capture
+    // freezes the caller's boundary too; the consumer reads the checkpoint
+    // arena synchronously before the next native pass reuses it.
     const bool resume = checkpoint != nullptr && boundary > tokens_.size() &&
                         boundary <= tokens_.size() + n;
     const bool rewind = rewind_out != nullptr &&
                         rewind_boundary > tokens_.size() &&
                         rewind_boundary <= tokens_.size() + n;
-    if (resume || rewind) {
-      const auto point = resume ? boundary : rewind_boundary;
+    const bool consume_here =
+        consume && boundary > tokens_.size() && boundary <= tokens_.size() + n;
+    if (resume || rewind || consume_here) {
+      const auto point =
+          rewind && !resume && !consume_here ? rewind_boundary : boundary;
       capture = exec.MakePrefillCheckpoint(
           *session_, chunk, static_cast<std::uint32_t>(point - tokens_.size()),
           error_msg);
@@ -688,26 +693,35 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                       capture.get(), next)) {
       return false;
     }
-    const auto kept =
-        resume && capture && capture->tokens < n ? n - capture->tokens : n;
+    // A boundary capture gives its tail rows to the checkpoint, so the draft
+    // window follows the boundary; a rewind capture keeps the full window.
+    const auto kept = (resume || consume_here) && capture && capture->tokens < n
+                          ? n - capture->tokens
+                          : n;
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n -
         std::min<std::size_t>(kept, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     if (capture) {
-      const auto point = resume ? boundary : rewind_boundary;
+      const auto point =
+          rewind && !resume && !consume_here ? rewind_boundary : boundary;
       const auto started = std::chrono::steady_clock::now();
-      auto& out = resume ? *checkpoint : *rewind_out;
-      out = SaveSnapshotImpl(
-          *capture->state, std::span<const std::int32_t>(tokens_).first(point),
-          capture->logits, capture->hidden_rows, error_msg,
-          SnapshotMode::kBorrowed);
-      if (capture_ms)
-        *capture_ms += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - started)
-                           .count();
-      if (!out)
-        return false;
+      if (consume_here && !resume && !rewind) {
+        consume(*capture);
+      } else {
+        auto& out = resume ? *checkpoint : *rewind_out;
+        out = SaveSnapshotImpl(
+            *capture->state,
+            std::span<const std::int32_t>(tokens_).first(point),
+            capture->logits, capture->hidden_rows, error_msg,
+            SnapshotMode::kBorrowed);
+        if (capture_ms)
+          *capture_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+        if (!out)
+          return false;
+      }
     }
     off += n;
   }
@@ -739,10 +753,27 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
   return SyncImpl(prompt, error_msg, boundary, checkpoint, capture_ms);
 }
 
+bool Session::SyncThroughComponents(std::span<const std::int32_t> prompt,
+                                    std::uint32_t boundary,
+                                    const PrefillCapture& capture,
+                                    std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
+  if (!capture || boundary == 0 || boundary > prompt.size() ||
+      prompt.size() - boundary > 8 || boundary <= tokens_.size()) {
+    AssignError(
+        error_msg,
+        "component checkpoint must extend the frontier in the text tail");
+    return false;
+  }
+  return SyncImpl(prompt, error_msg, boundary, nullptr, nullptr, {}, capture);
+}
+
 bool Session::SyncImpl(std::span<const std::int32_t> prompt,
                        std::string* error_msg, std::uint32_t boundary,
                        std::unique_ptr<SessionSnapshot>* checkpoint,
-                       double* capture_ms, std::span<const std::int32_t> next) {
+                       double* capture_ms, std::span<const std::int32_t> next,
+                       const PrefillCapture& capture) {
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -796,7 +827,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
     rewind_boundary = frontier - frontier % c.compress_ratio;
   }
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
-                       checkpoint, capture_ms, next, rewind_boundary,
+                       checkpoint, capture_ms, next, capture, rewind_boundary,
                        rewind_boundary == 0 ? nullptr : &rewind_capture);
   valid_ = ok;
   if (ok && rewind_capture) {
