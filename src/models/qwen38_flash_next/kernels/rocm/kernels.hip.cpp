@@ -1052,12 +1052,16 @@ __global__ void HcCombineMoeF16Kernel(
           // storing and reloading the intermediate residual.
           asm volatile("" : "+v"(r.x), "+v"(r.y), "+v"(r.z), "+v"(r.w));
         }
-        v[s][c] = float4{r.x + b.x * w[s], r.y + b.y * w[s], r.z + b.z * w[s],
-                         r.w + b.w * w[s]};
+        // Same explicit fused form as HcApplyDeferredKernel, so the stream
+        // weights fold identically whether the residual update ran in its
+        // own kernel or stayed in registers.
+        v[s][c] = float4{__fmaf_rn(b.x, w[s], r.x), __fmaf_rn(b.y, w[s], r.y),
+                         __fmaf_rn(b.z, w[s], r.z), __fmaf_rn(b.w, w[s], r.w)};
         *reinterpret_cast<float4*>(dst + e) = v[s][c];
-        if constexpr (kPrior) {
-          // Keep the existing compiled square-accumulation order when the
-          // preceding residual FMA stays in registers instead of memory.
+        {
+          // One explicit accumulation order for both paths: a deferred
+          // combine and an immediate one that pre-applied its residual must
+          // fold identical squares whatever the compiler contracts.
           const float4 n = v[s][c];
           if (s == 3) {
             ss[s] = __fmaf_rn(n.w, n.w, ss[s]);
@@ -1075,9 +1079,6 @@ __global__ void HcCombineMoeF16Kernel(
             ss[s] = __fmaf_rn(n.z, n.z, ss[s]);
             ss[s] = __fmaf_rn(n.w, n.w, ss[s]);
           }
-        } else {
-          ss[s] += v[s][c].x * v[s][c].x + v[s][c].y * v[s][c].y +
-                   v[s][c].z * v[s][c].z + v[s][c].w * v[s][c].w;
         }
       }
     }
@@ -1120,16 +1121,16 @@ __global__ void HcCombineMoeF16Kernel(
       float4 n{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
-        if constexpr (kPrior) {
-          const float4 g =
-              float4{__fmul_rn(gm.x, scale[s]), __fmul_rn(gm.y, scale[s]),
-                     __fmul_rn(gm.z, scale[s]), __fmul_rn(gm.w, scale[s])};
-          n = float4{v[s][c].x * g.x, v[s][c].y * g.y, v[s][c].z * g.z,
-                     v[s][c].w * g.w};
-        } else {
-          n = float4{v[s][c].x * scale[s] * gm.x, v[s][c].y * scale[s] * gm.y,
-                     v[s][c].z * scale[s] * gm.z, v[s][c].w * scale[s] * gm.w};
-        }
+        // Both branches round identically by construction: (v * scale) *
+        // gamma with explicit single multiplies, so a deferred combine and
+        // an immediate one that pre-applied its residual agree bit for bit
+        // regardless of compiler contraction choices.
+        const float4 g = float4{__fmul_rn(scale[s], gm.x),
+                                __fmul_rn(scale[s], gm.y),
+                                __fmul_rn(scale[s], gm.z),
+                                __fmul_rn(scale[s], gm.w)};
+        n = float4{__fmul_rn(v[s][c].x, g.x), __fmul_rn(v[s][c].y, g.y),
+                   __fmul_rn(v[s][c].z, g.z), __fmul_rn(v[s][c].w, g.w)};
         __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
         const __half2 lo = __floats2half2_rn(n.x, n.y);
         const __half2 hi = __floats2half2_rn(n.z, n.w);

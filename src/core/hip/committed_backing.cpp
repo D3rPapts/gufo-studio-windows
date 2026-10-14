@@ -1,7 +1,11 @@
 #include "src/core/hip/committed_backing.hpp"
 
 #include <hip/hip_runtime.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +20,26 @@ namespace {
 // Ordinary anonymous pages, then pinned. hipHostMalloc asks the kernel for
 // high-order pages: when most host RAM belongs to the GPU, that compacts
 // memory and stalls running kernels for up to seconds per GiB. Zero-filled.
+#if defined(_WIN32)
+// VirtualAlloc with MEM_COMMIT hands back zero-filled committed pages at
+// once, like MAP_POPULATE; registering keeps them out of the compacting
+// large-page path hipHostMalloc would take.
+void* CommitPages(std::size_t bytes) {
+  void* data = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
+                            PAGE_READWRITE);
+  if (data == nullptr)
+    return nullptr;
+  if (hipHostRegister(data, bytes, hipHostRegisterDefault) != hipSuccess) {
+    VirtualFree(data, 0, MEM_RELEASE);
+    return nullptr;
+  }
+  return data;
+}
+void ReleasePages(void* data, std::size_t) {
+  (void)hipHostUnregister(data);
+  VirtualFree(data, 0, MEM_RELEASE);
+}
+#else
 void* CommitPages(std::size_t bytes) {
   void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
@@ -31,6 +55,7 @@ void ReleasePages(void* data, std::size_t bytes) {
   (void)hipHostUnregister(data);
   munmap(data, bytes);
 }
+#endif
 }  // namespace
 struct BackingState {
   cache::ResourceCharge metadata;
