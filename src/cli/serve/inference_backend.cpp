@@ -4503,6 +4503,7 @@ bool InferenceBackend::load(std::shared_ptr<models::qwen35moe::Model> model,
   }
   try {
     auto new_state = std::make_shared<Impl::State>();
+    new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<Qwen35MoeTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp ||
