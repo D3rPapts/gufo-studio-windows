@@ -798,16 +798,12 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
         case GGML_TYPE_Q5_1:
           // Down projection slots have independent inputs. Wider row tiles
           // reuse each short input without changing its dot-product sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            if (tokens > 20) {
-              launch_moe<GGML_TYPE_Q5_1, 8>(
+          // One instantiation for every width keeps a slot's output
+          // bit-identical between single-token decode and batched verify.
+          if (k == 640 && experts_used == 1) {
+            launch_moe<GGML_TYPE_Q5_1, 8>(
                   weights, input, ids, output, k, rows, tokens, experts_used,
                   input_stride, stream, dst_slots);
-            } else {
-              launch_moe<GGML_TYPE_Q5_1, 4>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            }
             break;
           }
             launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
@@ -815,8 +811,9 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
             break;
         case GGML_TYPE_Q8_0:
           // Down projection slots have independent inputs. Four rows reuse
-          // each short input across more weights without changing its sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
+          // each short input across more weights without changing its sum;
+          // see Q5_1 above for the width-stable dispatch.
+          if (k == 640 && experts_used == 1) {
             launch_moe<GGML_TYPE_Q8_0, 4>(weights, input, ids, output, k, rows,
                                           tokens, experts_used, input_stride,
                                           stream, dst_slots);

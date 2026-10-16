@@ -700,8 +700,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
         // numerical value must match, including subnormal F16 values.
         if (!std::isfinite(a) || !std::isfinite(b) || a != b) {
           throw std::runtime_error(
-              "paired routed SwiGLU differs at " + std::to_string(i) + ": " +
-              std::to_string(a) + " vs " + std::to_string(b));
+              "paired routed SwiGLU differs at slot " + std::to_string(i / m) +
+              " row " + std::to_string(i % m) + ": " + std::to_string(a) +
+              " vs " + std::to_string(b));
         }
       }
       const auto guard = Download(d_pair + slots * m, kHalfGuard);
@@ -808,12 +809,12 @@ void CheckVectorGrouping(bool down = false) {
   for (int rows : {down ? 2560 : 64, down ? 2561 : 65}) {
     std::vector<Experts> weights, paired_weights;
     if (down) {
+      // Q6_K has no down view: its 256-element blocks do not divide the
+      // 640-element expert FFN, and the loader rejects Q6_K expert tensors.
       weights = {MakeQ5_1(experts, rows, cols, 17),
-                 MakeQ8_0(experts, rows, cols, 23),
-                 MakeQ6K(experts, rows, cols, 29)};
+                 MakeQ8_0(experts, rows, cols, 23)};
       paired_weights = {MakeQ5_1(experts, rows, cols, 79),
-                        MakeQ8_0(experts, rows, cols, 83),
-                        MakeQ6K(experts, rows, cols, 89)};
+                        MakeQ8_0(experts, rows, cols, 83)};
     } else {
       weights = {
           MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
@@ -891,10 +892,26 @@ void CheckVectorGrouping(bool down = false) {
           throw std::runtime_error("batched routed vector launch failed");
         const auto output = check_output(batch, n);
         if (std::memcmp(reference.data() + guard, output.data() + guard,
-                        n * used * rows * sizeof(float)) != 0)
+                        n * used * rows * sizeof(float)) != 0) {
+          for (int t = 0; t < n; ++t) {
+            for (int j = 0; j < used; ++j) {
+              for (int rr = 0; rr < rows; ++rr) {
+                const std::size_t o =
+                    (static_cast<std::size_t>(t) * used + j) * rows + rr;
+                if (reference[guard + o] != output[guard + o]) {
+                  throw std::runtime_error(
+                      "routed vector grouping changed format " +
+                      std::to_string(f) + " width " + std::to_string(n) +
+                      " at token " + std::to_string(t) + " slot " +
+                      std::to_string(j) + " row " + std::to_string(rr));
+                }
+              }
+            }
+          }
           throw std::runtime_error("routed vector grouping changed format " +
                                    std::to_string(f) + " width " +
                                    std::to_string(n));
+        }
       }
       for (int n : {1, 4, 7}) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
@@ -1012,10 +1029,8 @@ void CheckPairedMmq() {
 
 int main() {
   try {
-    if (std::getenv("QFN_SKIP_VEC_GROUPING") == nullptr) {
-      CheckVectorGrouping();
-      CheckVectorGrouping(true);
-    }
+    CheckVectorGrouping();
+    CheckVectorGrouping(true);
     CheckPairedMmq();
     bool ok = true;
     // Gate/up view: 64 experts, top-10, 640 x 2560 Q4_K.

@@ -5436,22 +5436,24 @@ __launch_bounds__(256) __global__
   constexpr int kRows = kPair ? BM / 2 : BM;
   const int r_block = static_cast<int>(blockIdx.x) * kRows;
 
-  // A paired wave owns eight gate rows and their matching eight up rows.
-  // Its halves load the two 16-byte chunks of each row's nibble group;
-  // each chunk carries one K16 fragment in both K32 blocks. Separate
-  // projections use row=tid/2+128u and chunk=tid%2 instead.
+  // A paired wave owns sixteen rows of one projection: waves 0-3 the gate
+  // rows, waves 4-7 the matching up rows, so each wave's WMMA tile covers a
+  // complete 16-row group and the epilogue's gate plane w / up plane w+4
+  // layout holds. Its lane halves load the two 16-byte chunks of each row's
+  // nibble group; each chunk carries one K16 fragment in both K32 blocks.
+  // Separate projections use row=tid/2+128u and chunk=tid%2 instead.
   const int f_c = kPair ? half_id : tid & 1;
   const std::uint8_t* f_ptr[kWaveRowTiles];
   bool f_live[kWaveRowTiles];
   uint4 f_header[kWaveRowTiles];
 #pragma unroll
   for (int u = 0; u < kWaveRowTiles; ++u) {
-    const int r =
-        r_block + (kPair ? wave_id * 8 + sub_lane % 8 : (tid >> 1) + (u * 128));
+    const int r = r_block + (kPair ? (wave_id & 3) * 16 + sub_lane
+                                   : (tid >> 1) + (u * 128));
     f_live[u] = r < m_i;
     const std::uint8_t* weights = w_expert;
     if constexpr (kPair) {
-      if ((sub_lane & 8) != 0) {
+      if ((wave_id & 4) != 0) {
         weights = static_cast<const std::uint8_t*>(w_up) +
                   static_cast<std::size_t>(expert) * m * row_bytes;
       }
