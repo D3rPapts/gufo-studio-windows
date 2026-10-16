@@ -247,6 +247,11 @@ jobs:
           Copy-Item "$env:BUILD_DIR\*.dll" $pkg
           Copy-Item "$env:BUILD_DIR\rocblas" $pkg -Recurse
           Copy-Item "$env:BUILD_DIR\hipblaslt" $pkg -Recurse
+          # gufo.exe imports the MSVC CRT and the LLVM OpenMP runtime, and
+          # libomp140.x86_64.dll only comes with Visual Studio: ship them
+          # app-local so the archive runs on a machine without either
+          # (provenance in tools/windows/redist/README.md).
+          Copy-Item "tools/windows/redist/*.dll" $pkg
           # Package with .NET's ZipFile writer, not `tar --format zip`:
           # bsdtar marks every file entry with the streaming data-descriptor
           # flag (general-purpose bit 3), which Windows Explorer's zip
@@ -258,6 +263,9 @@ jobs:
           [System.IO.Compression.ZipFile]::CreateFromDirectory($pkg, "$pkg.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
           $entries = tar -tf "$pkg.zip"
           foreach ($required in @('gufo.exe', 'gufo-server.exe', 'MIOpen.dll',
+                                  'libomp140.x86_64.dll', 'vcruntime140.dll',
+                                  'vcruntime140_1.dll', 'msvcp140.dll',
+                                  'msvcp140_atomic_wait.dll',
                                   'rocblas/library/', 'hipblaslt/library/')) {
             if (-not ($entries | Where-Object { $_ -like "*$required*" })) {
               throw "package is missing $required"

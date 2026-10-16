@@ -120,3 +120,7 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Vendored Microsoft runtime DLLs shipped in the Windows package
+# (provenance in tools/windows/redist/README.md)
+!tools/windows/redist/*.dll
