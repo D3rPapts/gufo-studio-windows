@@ -817,13 +817,17 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   // copies nothing). SyncThrough's explicit capture keeps its own boundary.
   // Below the selection budget every query takes the dense tiles, whose
   // arithmetic a short tail already matches, so no point is kept and
-  // continuation snapshots stay prefill-free.
+  // continuation snapshots stay prefill-free. Image sessions keep no
+  // checkpoints at all, so they skip the rewind instead of failing the pass
+  // on the capture's rejection — the same gate PrefillCheckpointBytes
+  // applies to the explicit capture.
   std::unique_ptr<SessionSnapshot> rewind_capture;
   std::uint32_t rewind_boundary = 0;
   const auto& c = model_->config();
   const auto frontier = static_cast<std::uint32_t>(prompt.size());
   if (checkpoint == nullptr && c.compress_ratio > 1 &&
-      frontier > c.indexer_top_k && frontier % c.compress_ratio != 0) {
+      frontier > c.indexer_top_k && frontier % c.compress_ratio != 0 &&
+      session_->VisionLayout().images.empty()) {
     rewind_boundary = frontier - frontier % c.compress_ratio;
   }
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
