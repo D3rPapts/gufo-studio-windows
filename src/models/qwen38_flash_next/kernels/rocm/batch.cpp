@@ -5,6 +5,7 @@
 #include "qfn_ggml_stubs.h"
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -444,7 +445,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       if (!item.session->CheckCancellation(nullptr))
         continue;
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
-                   item.output.candidates != nullptr, nullptr, false, error) ||
+                   item.output.candidates != nullptr,
+                   UseDraftSubset(*item.session, item.output.draft_subset)
+                       ? item.session
+                       : nullptr,
+                   nullptr, false, error) ||
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
@@ -467,15 +472,43 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       std::construct_at(batch_candidates_host_ + i);
   }
   const auto n = static_cast<std::uint32_t>(items.size());
-  const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
+  // Each request keeps the head it chose. A small-head row's logits are the
+  // prefix rows then the table rows, kSmall wide. When every row reads the
+  // small head they go through one projection over the shared prefix, then
+  // one over each request's own table. A mixed batch reads the full head
+  // anyway, so all rows go through it once (main's cost) and each small-head
+  // row gathers its table rows from its own full logits.
+  const auto& prefix_head = model_->draft_output();
+  const auto& full_head = model_->output();
+  const std::size_t vocab = full_head.rows;
+  const std::size_t prefix = prefix_head.rows;
+  const std::size_t kSmall = prefix + kMtpDraftExtraRows;
+  std::array<std::uint32_t, kBatchSessions> slot{};
+  std::uint32_t subset_rows = 0;
+  for (std::uint32_t i = 0; i < n; ++i)
+    subset_rows +=
+        UseDraftSubset(*items[i].session, items[i].output.draft_subset);
+  // The prefix projection lands in the buffer's tail, then moves to its rows.
+  if (subset_rows != 0 &&
+      subset_rows * (kSmall + prefix) + (n - subset_rows) * vocab >
+          kBatchSessions * vocab)
+    subset_rows = 0;
+  const bool mixed = subset_rows != 0 && subset_rows != n;
+  for (std::uint32_t i = 0, a = 0, b = subset_rows; i < n; ++i)
+    slot[i] = subset_rows != 0 && UseDraftSubset(*items[i].session,
+                                                 items[i].output.draft_subset)
+                  ? a++
+                  : b++;
   // Greedy proposals only rank candidates the target verifies exactly, so an
   // all-greedy round can score the exact Q4_0 copy of the head — the full
   // rows when nothing is seeded, or each session's gathered top-512 from the
   // round that seeded this cycle. Sampled sessions need the full Q8 head for
   // exact p/q verification, so any candidate request keeps the dense path.
-  const bool shortlist_ok = s_.mtp_short_row_bytes != 0 &&
-                            !draft_output.empty() &&
-                            n <= options_.max_logit_rows;
+  // A round with small-head requests scores those through their tables and
+  // never touches the Q4_0 shortlist machinery.
+  const bool shortlist_ok =
+      subset_rows == 0 && s_.mtp_short_row_bytes != 0 &&
+      !draft_output.empty() && n <= options_.max_logit_rows;
   bool all_greedy = true;
   for (const auto& item : items)
     all_greedy = all_greedy && item.output.candidates == nullptr;
@@ -498,13 +531,27 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
   // consume. The caller only asks when another round will follow.
   const bool seed = seed_shortlist && shortlist_ok && all_greedy &&
                     !use_shortlist && batch_shortlist_count_ == 0;
+  const auto rows_of = [&](std::uint32_t i) {
+    if (subset_rows == 0 && use_shortlist)
+      return static_cast<std::uint32_t>(kMtpDraftShortlist);
+    return static_cast<std::uint32_t>(slot[i] < subset_rows ? kSmall : vocab);
+  };
+  const auto logits_of = [&](std::uint32_t i) -> float* {
+    if (subset_rows == 0 && use_shortlist)
+      return batch_logits_ + std::size_t{i} * kMtpDraftShortlist;
+    if (mixed)
+      return batch_logits_ + slot[i] * vocab;
+    return slot[i] < subset_rows ? batch_logits_ + slot[i] * kSmall
+                                 : batch_logits_ + subset_rows * kSmall +
+                                       (slot[i] - subset_rows) * vocab;
+  };
   const Scratch base = s_;
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
     for (std::size_t i = 0; i < n; ++i) {
       RmsNormRows(items[i].session->mtp_.h, head.norm.f32(),
-                  base.xn + std::size_t{i} * config().HcDim(), 1,
+                  base.xn + std::size_t{slot[i]} * config().HcDim(), 1,
                   config().HcDim(), config().hc_count, config().rms_eps,
                   stream_);
     }
@@ -513,7 +560,40 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       return false;
     if (!AnyActive(items))
       return true;
-    if (use_shortlist) {
+    static_assert(kMtpDraftExtraRows <= 1024, "GatherDraftLogits is one block");
+    if (subset_rows != 0) {
+      if (mixed) {
+        if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+          return false;
+        for (std::uint32_t i = 0; i < n; ++i) {
+          if (slot[i] < subset_rows)
+            GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
+                              static_cast<std::uint32_t>(prefix),
+                              kMtpDraftExtraRows, stream_);
+        }
+      } else {
+        float* staged = batch_logits_ + kBatchSessions * vocab -
+                        std::size_t{subset_rows} * prefix;
+        if (!DenseBatch(prefix_head, base.mixed, staged, subset_rows, error) ||
+            !Check(
+                hipMemcpy2DAsync(batch_logits_, kSmall * sizeof(float), staged,
+                                 prefix * sizeof(float), prefix * sizeof(float),
+                                 subset_rows, hipMemcpyDeviceToDevice, stream_),
+                error))
+          return false;
+        for (std::uint32_t i = 0; i < n; ++i) {
+          if (slot[i] >= subset_rows)
+            continue;
+          const Session& session = *items[i].session;
+          if (!Dense(DraftTable(session),
+                     base.mixed + std::size_t{slot[i]} * full_head.cols,
+                     logits_of(i) + prefix, 1, error))
+            return false;
+          MaskDraftLogits(logits_of(i) + prefix, session.mtp_.draft_ids,
+                          kMtpDraftExtraRows, stream_);
+        }
+      }
+    } else if (use_shortlist) {
       // One Q4_0 GEMV over every session's gathered rows: token t reads the
       // expert (shortlist slice) its session was seeded into.
       for (std::size_t i = 0; i < n; ++i)
@@ -579,10 +659,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
         continue;
+      const auto rows = rows_of(i);
+      const std::int32_t* table =
+          slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
+      const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
-        const auto rows = use_shortlist ? kMtpDraftShortlist : output.rows;
-        Argmax(batch_logits_ + std::size_t{i} * rows, s_.mtp_argmax,
-               s_.mtp_token, 1, rows, stream_);
+        Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+        if (table != nullptr)
+          RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
+                        static_cast<std::uint32_t>(prefix), table, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
                                   s_.mtp_token, sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
@@ -590,8 +675,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
           return false;
         continue;
       }
-      MtpTopCandidates(batch_logits_ + std::size_t{i} * output.rows, s_.mtp_ids,
-                       s_.mtp_scratch_ids, s_.mtp_scores, output.rows, stream_);
+      MtpTopCandidates(logits_of(i), s_.mtp_ids, s_.mtp_scratch_ids,
+                       s_.mtp_scores, rows, stream_);
+      if (table != nullptr)
+        RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
+                      static_cast<std::uint32_t>(prefix), table, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),

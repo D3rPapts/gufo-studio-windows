@@ -199,6 +199,10 @@ private:
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
     bool residual_valid{false};
+    /// The request's draft table (draft_vocab.hpp): kMtpDraftExtraRows
+    /// output() rows and their token IDs, -1 for an empty slot.
+    std::uint8_t* draft_rows{nullptr};
+    std::int32_t* draft_ids{nullptr};
   };
 
   mutable bool cancelled_{false};
@@ -349,6 +353,9 @@ public:
     /// Prefill needs only persistent KV. A subsequent full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
+    /// Draft through the small head (the output() prefix plus the
+    /// session's draft table) when the model has one.
+    bool draft_subset{false};
   };
   struct MtpHeadItem {
     Session* session;
@@ -359,6 +366,14 @@ public:
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
   };
+  /// Copies output() rows `ids` into the session's draft table from slot
+  /// `first` on. Enqueued on stream(); never during graph capture.
+  [[nodiscard]] bool AppendDraftRows(Session& session, std::uint32_t first,
+                                     std::span<const std::int32_t> ids,
+                                     std::string* error_msg) const;
+  /// Empties the session's draft table from slot `first` on.
+  [[nodiscard]] bool ClearDraftRows(Session& session, std::uint32_t first,
+                                    std::string* error_msg) const;
   /// Runs independent short predictor chains with shared projections and
   /// private attention caches, positions and carried hidden states.
   [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
@@ -593,13 +608,26 @@ private:
                   std::uint32_t n_tokens, std::string* error_msg) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
-  /// Selects the greedy token or compact candidates from full MTP logits.
-  /// A non-null `chain_out` keeps the argmax on the device (chained drafts).
-  /// With `shortlist` the greedy argmax ranks only the gathered draft-head
-  /// rows of the catch-up distribution's shortlist (chained steps only).
+  /// Whether a draft of `session` requesting the small head gets it.
+  bool UseDraftSubset(const Session& session, bool requested) const noexcept {
+    return requested && !model_->draft_output().empty() &&
+           session.mtp_.draft_rows != nullptr;
+  }
+  /// The session's draft table as a weight of kMtpDraftExtraRows rows.
+  DeviceTensor DraftTable(const Session& session) const noexcept;
+  /// Small-head draft logits: prefix rows, then the table rows with empty
+  /// slots at -infinity.
+  bool DraftLogits(const Session& session, const float* x, float* logits,
+                   std::string* error_msg) const;
+  /// Selects the greedy token or compact candidates from MTP draft logits.
+  /// With `draft`, the logits come from that session's small head and the
+  /// returned IDs are remapped to token IDs. A non-null `chain_out` keeps
+  /// the argmax on the device (chained drafts). With `shortlist` the greedy
+  /// argmax ranks only the gathered draft-head rows of the catch-up
+  /// distribution's shortlist (chained steps only).
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool candidates, std::int32_t* chain_out, bool shortlist,
-               std::string* error_msg) const;
+               bool candidates, const Session* draft, std::int32_t* chain_out,
+               bool shortlist, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -614,8 +642,8 @@ private:
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
                const std::int32_t* embed_tokens = nullptr,
-               std::int32_t* chain_out = nullptr,
-               bool shortlist_head = false) const;
+               std::int32_t* chain_out = nullptr, bool shortlist_head = false,
+               bool draft_subset = false) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.

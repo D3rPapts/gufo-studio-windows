@@ -26,6 +26,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/device_headroom.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 
 namespace qfn::testing {
 std::atomic<std::size_t> reported_device_free_limit{
@@ -1382,6 +1383,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
+    if (!model_->draft_output().empty()) {
+      s->mtp_.draft_rows = Alloc<std::uint8_t>(
+          a,
+          std::size_t{kMtpDraftExtraRows} * model_->output_row_bytes() + 4096,
+          error_msg, &s->allocated_bytes_);
+      s->mtp_.draft_ids = Alloc<std::int32_t>(a, kMtpDraftExtraRows, error_msg,
+                                              &s->allocated_bytes_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1393,7 +1402,80 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
   }
+  // The table starts with the special tokens; every other slot is empty.
+  if (s->mtp_.draft_rows != nullptr &&
+      (!ClearDraftRows(*s, 0, error_msg) ||
+       !AppendDraftRows(*s, 0, model_->draft_specials(), error_msg) ||
+       !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
+    return nullptr;
+  }
   return s;
+}
+
+bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
+                               std::span<const std::int32_t> ids,
+                               std::string* error_msg) const {
+  if (ids.empty())
+    return true;
+  if (session.owner_ != this || session.mtp_.draft_rows == nullptr ||
+      first > kMtpDraftExtraRows || ids.size() > kMtpDraftExtraRows - first) {
+    AssignError(error_msg, "invalid draft table append");
+    return false;
+  }
+  const auto& output = model_->output();
+  const std::size_t row_bytes = model_->output_row_bytes();
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] < 0 || static_cast<std::uint32_t>(ids[i]) >= output.rows) {
+      AssignError(error_msg, "draft table token out of range");
+      return false;
+    }
+    // The ID goes by value, so no host buffer has to outlive the call.
+    if (!Check(hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
+                              static_cast<const std::uint8_t*>(output.data) +
+                                  static_cast<std::size_t>(ids[i]) * row_bytes,
+                              row_bytes, hipMemcpyDeviceToDevice, stream_),
+               "draft table row", error_msg) ||
+        !Check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(
+                                     session.mtp_.draft_ids + first + i),
+                                 ids[i], 1, stream_),
+               "draft table id", error_msg))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
+                              std::string* error_msg) const {
+  if (session.owner_ != this || session.mtp_.draft_ids == nullptr ||
+      first > kMtpDraftExtraRows) {
+    AssignError(error_msg, "invalid draft table clear");
+    return false;
+  }
+  // Stale rows stay; an ID of -1 masks the slot.
+  return first == kMtpDraftExtraRows ||
+         Check(
+             hipMemsetAsync(session.mtp_.draft_ids + first, 0xFF,
+                            (kMtpDraftExtraRows - first) * sizeof(std::int32_t),
+                            stream_),
+             "draft table clear", error_msg);
+}
+
+DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
+  DeviceTensor table = model_->output();
+  table.data = session.mtp_.draft_rows;
+  table.rows = kMtpDraftExtraRows;
+  return table;
+}
+
+bool Executor::DraftLogits(const Session& session, const float* x,
+                           float* logits, std::string* error_msg) const {
+  const auto& prefix = model_->draft_output();
+  if (!Dense(prefix, x, logits, 1, error_msg) ||
+      !Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
+    return false;
+  MaskDraftLogits(logits + prefix.rows, session.mtp_.draft_ids,
+                  kMtpDraftExtraRows, stream_);
+  return true;
 }
 
 bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
@@ -1479,7 +1561,13 @@ std::size_t Executor::SessionBytes(
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
-                        sizeof(float)
+                        sizeof(float) +
+                    (model_->draft_output().empty()
+                         ? 0
+                         : std::size_t{kMtpDraftExtraRows} *
+                                   (model_->output_row_bytes() +
+                                    sizeof(std::int32_t)) +
+                               4096)
               : 0);
 }
 
@@ -2994,39 +3082,55 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::int32_t* chain_out, bool shortlist,
+                       bool candidates, const Session* draft,
+                       std::int32_t* chain_out, bool shortlist,
                        std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
-  const DeviceTensor& draft_output = model_->output_draft();
+  const DeviceTensor& q4_draft = model_->output_draft();
+  const std::uint32_t prefix = model_->draft_output().rows;
+  const std::uint32_t rows =
+      draft != nullptr ? prefix + kMtpDraftExtraRows
+                       : shortlist ? kMtpDraftShortlist : output.rows;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
-  const auto head_rows = shortlist ? kMtpDraftShortlist : output.rows;
-  if (!draft_output.empty()) {
+  bool logits_ok = false;
+  if (draft != nullptr) {
+    logits_ok = DraftLogits(*draft, s_.mixed, s_.logits, error_msg);
+  } else if (!q4_draft.empty()) {
     // The Q4_0 draft head rides the routed vector GEMV with one "expert"
     // spanning every row; its logits only rank proposals, which the target
     // verifies exactly. A chained step ranks the gathered shortlist rows,
     // so a shortlist miss can lower acceptance but never change the output.
-    if (qfn_mmq_moe_vec(
-            GGML_TYPE_Q4_0, shortlist ? s_.mtp_short_w : draft_output.data,
-            s_.mixed, s_.mtp_zero_ids, s_.logits, static_cast<int>(head_rows),
-            static_cast<int>(output.cols), 1, 1, 1, stream_, nullptr,
-            nullptr) != 0) {
+    logits_ok =
+        qfn_mmq_moe_vec(GGML_TYPE_Q4_0,
+                        shortlist ? s_.mtp_short_w : q4_draft.data, s_.mixed,
+                        s_.mtp_zero_ids, s_.logits, static_cast<int>(rows),
+                        static_cast<int>(output.cols), 1, 1, 1, stream_,
+                        nullptr, nullptr) == 0;
+    if (!logits_ok)
       AssignError(error_msg, "Q4_0 draft head GEMV failed");
-      return false;
-    }
-  } else if (!Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  } else {
+    logits_ok = Dense(output, s_.mixed, s_.logits, 1, error_msg);
+  }
+  if (!logits_ok) {
     return false;
   }
-  if (candidates)
+  const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
+  if (candidates) {
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
-                     output.rows, stream_);
+                     draft != nullptr ? rows : output.rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids, stream_);
+  }
   if (token) {
     // A chained draft step keeps its argmax on the device: the next step
     // embeds it and the verify pass never needs it on the host.
     Argmax(s_.logits, s_.mtp_argmax,
-           chain_out != nullptr ? chain_out : s_.mtp_token, 1, head_rows,
-           stream_);
+           chain_out != nullptr ? chain_out : s_.mtp_token, 1, rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
+                    draft->mtp_.draft_ids, stream_);
     if (chain_out == nullptr &&
         !Check(
             hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
@@ -3036,7 +3140,6 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     }
   }
   if (candidates) {
-    const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
     static_assert(offsetof(MtpCandidateLogits, logits) ==
                   kMtpCandidates * sizeof(std::uint32_t));
     const auto bytes =
@@ -4485,18 +4588,22 @@ bool Executor::MtpForward(Session& session,
   const bool graph = output.trace == nullptr && hidden_source == nullptr &&
                      n <= kVecBatch && pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
+  // Captured graphs bake in the head; key on the one this draft reads.
+  const bool subset = UseDraftSubset(session, output.draft_subset) &&
+                      (output.token != nullptr || output.candidates != nullptr);
   const std::uint64_t key =
       static_cast<std::uint64_t>(n) |
       (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
       (std::uint64_t{1} << 40) |
       (std::uint64_t{output.token != nullptr} << 41) |
       (std::uint64_t{output.candidates != nullptr} << 43) |
-      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45);
+      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45) |
+      (std::uint64_t{subset} << 46);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
                    output.candidates != nullptr, error_msg,
                    graph ? graph_pool : pool, hidden_source, output.trace,
-                   output.kv_only);
+                   output.kv_only, nullptr, nullptr, false, subset);
   };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
@@ -4655,7 +4762,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        std::uint32_t pool_grid, const float* hidden_source,
                        MtpTrace* trace, bool kv_only,
                        const std::int32_t* embed_tokens,
-                       std::int32_t* chain_out, bool shortlist_head) const {
+                       std::int32_t* chain_out, bool shortlist_head,
+                       bool draft_subset) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -4863,8 +4971,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, chain_out,
-                 shortlist_head, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates,
+                 draft_subset ? &session : nullptr, chain_out, shortlist_head,
+                 error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

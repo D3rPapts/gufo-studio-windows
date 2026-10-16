@@ -55,12 +55,14 @@ constexpr short kPollIn = POLLRDNORM;
 constexpr short kPollErr = POLLERR;
 constexpr short kPollHup = POLLHUP;
 constexpr int kShutdownBoth = SD_BOTH;
+constexpr int kShutdownWrite = SD_SEND;
 #else
 using PollDescriptor = struct pollfd;
 constexpr short kPollIn = POLLIN;
 constexpr short kPollErr = POLLERR;
 constexpr short kPollHup = POLLHUP;
 constexpr int kShutdownBoth = SHUT_RDWR;
+constexpr int kShutdownWrite = SHUT_WR;
 #endif
 
 // Diagnostics for the connection whose request read failed: the recv() result
@@ -1675,6 +1677,113 @@ std::string PeerAddress(int client_fd) {
 }
 
 }  // namespace
+
+LoadingResponder::LoadingResponder(const std::string& host, int port) {
+  net::EnsureSocketRuntimeStarted();
+  sockaddr_storage addr{};
+  socklen_t addr_length = 0;
+  if (port <= 0 || port > 65535 ||
+      !ParseListenAddress(host, port, &addr, &addr_length))
+    return;
+  const int fd = static_cast<int>(::socket(addr.ss_family, SOCK_STREAM, 0));
+  if (fd < 0)
+    return;
+  // Match HttpServer::start, which binds the same address after stop().
+  const int yes = 1;
+  const int no = 0;
+#if defined(_WIN32)
+  // SO_REUSEADDR would let the real server double-bind this held port; the
+  // exclusive option is what makes the hold observable to it until stop().
+  if (::setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char*>(&yes), sizeof(yes)) != 0) {
+    net::CloseSocket(fd);
+    return;
+  }
+#else
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
+#endif
+  if ((addr.ss_family == AF_INET6 &&
+       ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&no),
+                    sizeof(no)) != 0) ||
+      ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
+      ::listen(fd, 16) < 0) {
+#if defined(_WIN32)
+    const int error = ::WSAGetLastError();
+#else
+    const int error = errno;
+#endif
+    Logger::Debug("server", "event=loading_listener_unavailable host=" + host +
+                                " port=" + std::to_string(port) +
+                                " errno=" + std::to_string(error));
+    net::CloseSocket(fd);
+    return;
+  }
+  listen_fd_ = fd;
+  thread_ = std::thread([this] { serve(); });
+}
+
+LoadingResponder::~LoadingResponder() {
+  stop();
+}
+
+void LoadingResponder::stop() {
+  stopped_.store(true, std::memory_order_release);
+  if (thread_.joinable())
+    thread_.join();
+  if (listen_fd_ >= 0) {
+    net::CloseSocket(listen_fd_);
+    listen_fd_ = -1;
+  }
+}
+
+void LoadingResponder::serve() {
+  HttpResponse loading = Err(503, "Service Unavailable", "Loading model",
+                             "unavailable_error", "loading");
+  loading.headers.emplace_back("Retry-After", "1");
+  const std::string reply = BuildResponse(loading);
+  // One connection at a time is enough for probes. Read the request head
+  // before replying so closing does not reset an unread request, but bound
+  // the wait: a client that connects and sends nothing must not delay stop().
+  constexpr auto kRequestWait = std::chrono::milliseconds(500);
+  while (!stopped_.load(std::memory_order_acquire)) {
+    PollDescriptor listener{};
+    listener.fd = listen_fd_;
+    listener.events = kPollIn;
+    listener.revents = 0;
+    if (net::PollSocket(&listener, 1, 100) <= 0)
+      continue;
+    const int client_fd =
+        static_cast<int>(::accept(listen_fd_, nullptr, nullptr));
+    if (client_fd < 0)
+      continue;
+    std::string head;
+    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           !stopped_.load(std::memory_order_acquire)) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now())
+              .count();
+      PollDescriptor client{};
+      client.fd = client_fd;
+      client.events = kPollIn;
+      client.revents = 0;
+      if (remaining <= 0 ||
+          net::PollSocket(&client, 1, static_cast<int>(remaining)) <= 0)
+        break;
+      char buffer[2048];
+      const int received = ReceiveAll(client_fd, buffer, sizeof(buffer));
+      if (received <= 0)
+        break;
+      head.append(buffer, static_cast<std::size_t>(received));
+    }
+    (void)SendAll(client_fd, reply);
+    (void)::shutdown(client_fd, kShutdownWrite);
+    net::CloseSocket(client_fd);
+  }
+}
 
 bool IsListenAddress(const std::string& host) {
   sockaddr_storage address{};

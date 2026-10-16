@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
@@ -122,6 +123,12 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  /// MTP drafts may use the small head (draft_vocab.hpp).
+  bool draft_subset_{false};
+  /// Special tokens at the start of every session's draft table.
+  std::uint32_t draft_specials_{0};
+  /// Prefix and special tokens: always in the small head.
+  [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
   friend class Session;
   friend class ContinuationAdapter;
@@ -226,6 +233,8 @@ public:
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
     std::uint64_t accepted{0};
+    /// Cycles whose draft scored the small head (draft_vocab.hpp).
+    std::uint64_t small_head_cycles{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -236,8 +245,9 @@ public:
   /// 18: K/V planes carry separate dtypes (kv_v_dtype header field); Q4_K
   /// value planes.
   /// 19: per-layer sparse selection tails (partial-group chunk invariance).
-  static constexpr std::uint32_t kSnapshotPayloadVersion =
-      19;  /// Bytes a snapshot of the current context occupies.
+  /// 20: MTP drafts scored over the request vocabulary (upstream 17).
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
+  /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
       std::uint32_t position) const;
@@ -301,7 +311,8 @@ private:
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
-                    MtpCandidateLogits* candidates = nullptr);
+                    MtpCandidateLogits* candidates = nullptr,
+                    bool draft_subset = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
@@ -343,6 +354,14 @@ private:
   /// keeps every continuation on the exact single-pass arithmetic.
   std::unique_ptr<SessionSnapshot> rewind_;
   std::uint32_t rewind_full_{0};  ///< frontier the rewind point was taken at
+  /// This request's draft vocabulary; the device table follows it.
+  MtpDraftVocab draft_vocab_;
+  bool draft_vocab_stale_{false};
+  std::vector<std::int32_t> draft_added_;
+  /// After the token history is replaced: the table restarts from it.
+  void ForgetDraftVocab() noexcept { draft_vocab_stale_ = true; }
+  /// Brings the draft table up to the committed tokens.
+  bool SyncDraftVocab(std::string* error_msg);
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 
