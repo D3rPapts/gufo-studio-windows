@@ -1045,8 +1045,8 @@ void PublishedResidentCheckpointKeepsDiskStep() {
   // A published checkpoint that is still resident restores from RAM, so its
   // lookup candidate carries no disk description. The next capture within
   // the step must still be refused.
-  char pattern[] = "/tmp/gufo-component-step-test-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp;
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
                                         .staging_capacity_bytes = 7,
