@@ -32,7 +32,7 @@ if (ENGINE_ENABLE_HIP)
     COMPILE_OPTIONS "-Xclang;-ffp-contract=off")
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops)
+      select_ops snapshot_copy)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 

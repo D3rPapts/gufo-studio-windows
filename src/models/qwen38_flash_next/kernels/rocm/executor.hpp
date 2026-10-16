@@ -634,7 +634,8 @@ private:
                    std::uint32_t start_pos, std::uint32_t pool_grid,
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
-                   PrefillCheckpoint* checkpoint = nullptr) const;
+                   PrefillCheckpoint* checkpoint = nullptr,
+                   bool embeddings_ready = false) const;
   /// Appends the verify pass's per-row argmax and its pinned download to
   /// the kVerifyGreedy body (also its captured graph).
   bool GreedyArgmaxNodes(std::uint32_t n_logits, std::string* error_msg) const;
