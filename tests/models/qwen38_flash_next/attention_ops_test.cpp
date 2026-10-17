@@ -1133,7 +1133,7 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
   // Per-token kernel: FP32 dequant products, single-block and split forms.
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
                nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
-               kRatio, nullptr,
+               kRatio, nullptr, nullptr, nullptr, 0,
                qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0});
   q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
   constexpr std::uint32_t kSplits = 8;
@@ -1142,7 +1142,7 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
                               kSplits * (kDim + 2));
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_split.get(),
                d_partials.get(), kSplits, n_tokens, d_pos.get(), kHeads,
-               kKvHeads, kDim, kRatio, nullptr,
+               kKvHeads, kDim, kRatio, nullptr, nullptr, nullptr, 0,
                qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ8_0});
   q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
   CheckHip(hipDeviceSynchronize(), "q8 per-token attention");
@@ -1365,7 +1365,7 @@ void CheckQ4KAttention(std::uint32_t n_tokens, std::uint32_t start_pos,
 
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
                nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
-               kRatio, nullptr,
+               kRatio, nullptr, nullptr, nullptr, 0,
                qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K});
   q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
   constexpr std::uint32_t kSplits = 8;
@@ -1374,7 +1374,7 @@ void CheckQ4KAttention(std::uint32_t n_tokens, std::uint32_t start_pos,
                               kSplits * (kDim + 2));
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_split.get(),
                d_partials.get(), kSplits, n_tokens, d_pos.get(), kHeads,
-               kKvHeads, kDim, kRatio, nullptr,
+               kKvHeads, kDim, kRatio, nullptr, nullptr, nullptr, 0,
                qk::KvDtypes{qk::KvCacheDtype::kQ8_0, qk::KvCacheDtype::kQ4_K});
   q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
   CheckHip(hipDeviceSynchronize(), "q4k per-token attention");
