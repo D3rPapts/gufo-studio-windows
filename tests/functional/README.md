@@ -197,6 +197,7 @@ RAM, disk and restart settings once their contracts pass.
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
+| `tool-choice-cache` | Required/auto/omitted transitions preserve the complete generated call, unchanged-choice controls, prompt-token equality and zero-prefill retries |
 | `tool-native-types` | Focused subset: enum/const/inferred string types, literal delimiters and exact continuation reuse after new literal tool markers; Chat/Responses, text/images |
 | `tool-schema-edges` | Wildcard JSON types, conditional fields, impossible schemas, nested metadata and required-call timing; both APIs, cache, stops and sampled peers |
 | `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
@@ -454,6 +455,28 @@ short-peer/deep-history pattern reported in #542; the system-only oversized
 fixture cannot establish that behavior.
 Known cache-work failures exit nonzero and retain controls/evidence; they are
 not skipped, marked as expected passes, or fixed in this test-only card.
+
+Publication-wait regression #617 uses the same process-local fault library,
+filtered to hold a manifest after its payload is written. It checks both an
+expired recomputation budget and publication before that budget expires:
+
+```sh
+nix develop -c python3 tests/functional/publication_wait.py \
+  --output /tmp/publication-wait --fault-library build/cpu-test/libcache_disk_faults.so -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
+```
+
+The runner uses a fresh 8 GiB disk tier and a 1 GiB RAM budget unless explicitly
+set, requires an actual over-RAM publication and disk restore, and retains all
+HTTP requests/responses and timings. It removes its own cache after each case.
+Use `--case bound --expect cap` only for a matched pre-fix main timing control;
+candidate correctness uses the default `bounded` expectation. The bound case
+schedules release after 130 seconds and releases earlier if the waiter finishes;
+the child-only helper has a longer safety timeout. The publication case waits
+for the scheduler's actual park before starting its 250 ms release timer, then
+checks the matching request/checkpoint release before its deadline and a disk
+restore. These checks stay outside hosted CI and the routine API suites.
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;
