@@ -48,8 +48,8 @@ public:
   Encoder& operator=(const Encoder&) = delete;
   [[nodiscard]] const std::string& identity() const;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
-  /// Upload the weights now instead of in the first Encode. Repeated calls
-  /// keep the existing upload.
+  /// Upload the weights and run the one-time encoder warm-up now instead of
+  /// in the first Encode. Repeated calls keep the existing upload.
   void Upload();
   /// Serialized by the owning model scheduler. Pixel grid is already resized.
   /// Uploads the weights if Upload has not; scratch is bounded by image

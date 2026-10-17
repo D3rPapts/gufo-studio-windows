@@ -324,6 +324,7 @@ struct Encoder::Impl {
   hipblasHandle_t blas{nullptr};
   std::unique_ptr<gufo::hip::HipblasLtGemm> lt;
   bool uploaded{false};
+  bool warmed{false};
 
   Impl(const std::filesystem::path& path, std::uint32_t width)
       : output_width(width) {
@@ -572,6 +573,17 @@ std::size_t Encoder::ResidentBytes() const noexcept {
 }
 void Encoder::Upload() {
   impl_->Upload();
+  if (std::exchange(impl_->warmed, true))
+    return;
+  // The first Encode initializes lazy BLAS plans, loads library code objects
+  // and grows the device heap by tens of MiB. Run one small encode inside the
+  // prepare step so the first image request neither stalls on that work nor
+  // moves resident memory past the uploaded weights.
+  const core::Image image{
+      .width = 256,
+      .height = 256,
+      .pixels = std::vector<std::uint8_t>(std::size_t{256} * 256 * 3, 128)};
+  (void)Encode(image);
 }
 Encoder::Embedding::~Embedding() {
   if (data_ != nullptr)
