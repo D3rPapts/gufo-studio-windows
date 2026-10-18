@@ -7,7 +7,7 @@ follows below the separator.
 **Getting started:** download a ready-made build from the
 [Releases page](https://github.com/endyjasmi/gufo/releases), unzip the
 `gufo-<version>-windows-gfx1151-<commit>.zip` asset (for example
-`gufo-0.8.0-windows-gfx1151-1b2da4a.zip`) and run `gufo.exe` from the
+`gufo-0.17.1-windows-gfx1151-eaf9bec.zip`) and run `gufo.exe` from the
 extracted folder — no installation needed. Every update to the port
 publishes its own release, so older builds stay available. A recent AMD
 graphics driver is required.
@@ -32,7 +32,7 @@ the `.cache` paths below resolve; the loader finds the remaining shards
 and the MTP predictor automatically:
 
 ```pwsh
-.\Downloads\gufo-0.8.0-windows-gfx1151-1b2da4a\gufo.exe serve llm --model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\38bb39ee97821de2c9009abb7e93950eec396e66\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --speculative mtp `
+.\Downloads\gufo-0.17.1-windows-gfx1151-eaf9bec\gufo.exe serve llm --model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\38bb39ee97821de2c9009abb7e93950eec396e66\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --speculative mtp `
   --served-model-name qwen3.8-flash-next `
   --context 262144 --sessions 2 `
   --cache-ram-bytes 8589934592 `
