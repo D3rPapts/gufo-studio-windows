@@ -6,6 +6,7 @@ if (ENGINE_ENABLE_HIP AND NOT WIN32)
   target_link_libraries(cache_backing_test PRIVATE gufo_cache_hip gufo_cache_fake)
   target_compile_options(cache_backing_test PRIVATE -UNDEBUG)
   target_link_options(cache_backing_test PRIVATE
+    -Wl,--wrap=madvise
     -Wl,--wrap=hipHostMalloc -Wl,--wrap=hipMalloc
     -Wl,--wrap=hipHostRegister -Wl,--wrap=hipMallocManaged
     -Wl,--wrap=hipStreamCreateWithFlags -Wl,--wrap=hipEventCreateWithFlags
@@ -13,7 +14,9 @@ if (ENGINE_ENABLE_HIP AND NOT WIN32)
     -Wl,--wrap=hipEventQuery -Wl,--wrap=hipEventSynchronize
     -Wl,--wrap=hipStreamSynchronize)
   add_test(NAME cache_backing_test COMMAND cache_backing_test)
-  set_tests_properties(cache_backing_test PROPERTIES
+  add_test(NAME cache_backing_restricted_test
+    COMMAND cache_backing_test --deny-long-term-pins)
+  set_tests_properties(cache_backing_test cache_backing_restricted_test PROPERTIES
     LABELS "hip;gpu;gfx1151;cache" TIMEOUT 60)
 endif()
 target_link_libraries(gufo_cache_fake PUBLIC gufo_cache)
@@ -84,10 +87,10 @@ set_tests_properties(cache_idle_spill_test PROPERTIES LABELS "cpu;cache" TIMEOUT
 # Linux-only: fault injection wraps libc symbols and the crash cases
 # fork(); the probe layer reads /proc/self/fd.
 if (NOT WIN32)
-add_executable(cache_disk_test disk_test.cpp)
-target_link_libraries(cache_disk_test PRIVATE gufo_cache)
-target_link_options(cache_disk_test PRIVATE -Wl,--wrap=read -Wl,--wrap=pread)
-add_test(NAME cache_disk_test COMMAND cache_disk_test)
+add_executable(cache_disk_test disk_test.cpp)
+target_link_libraries(cache_disk_test PRIVATE gufo_cache)
+target_link_options(cache_disk_test PRIVATE -Wl,--wrap=read -Wl,--wrap=pread)
+add_test(NAME cache_disk_test COMMAND cache_disk_test)
 set_tests_properties(cache_disk_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 endif()
 
@@ -108,11 +111,11 @@ if (GUFO_BUILD_TOOLS)
 endif()
 
 if (NOT WIN32)
-add_executable(cache_disk_publication_test disk_publication_test.cpp)
-target_link_libraries(cache_disk_publication_test PRIVATE gufo_cache)
-target_link_options(cache_disk_publication_test PRIVATE
-  -Wl,--wrap=fsync -Wl,--wrap=write -Wl,--wrap=unlinkat)
-add_test(NAME cache_disk_publication_test COMMAND cache_disk_publication_test)
+add_executable(cache_disk_publication_test disk_publication_test.cpp)
+target_link_libraries(cache_disk_publication_test PRIVATE gufo_cache)
+target_link_options(cache_disk_publication_test PRIVATE
+  -Wl,--wrap=fsync -Wl,--wrap=write -Wl,--wrap=unlinkat)
+add_test(NAME cache_disk_publication_test COMMAND cache_disk_publication_test)
 set_tests_properties(cache_disk_publication_test PROPERTIES LABELS "cpu;cache" TIMEOUT 60)
 endif()
 if (GUFO_BUILD_TOOLS)
