@@ -6192,8 +6192,13 @@ __launch_bounds__(256) __global__
             // Chunk word layout from the fetch: {qs[0..4), qs[4..8),
             // signs[0..4), 0}; grid group j covers elements 4j..4j+3 with its
             // 9-bit index (qs byte j plus qh bit j) and sign nibble j/2's
-            // bits 4*(j%2)..+3. Codes stay +128-carried so the -1152 magic
-            // decodes them; the sign flips to 128 - g.
+            // bits 4*(j%2)..+3. The grid word holds raw code values, and the
+            // -1152 magic consumes +128-carried codes, so a positive element
+            // carries as v ^ 0x80 (exact below 128) and a negated one as
+            // 128 - v, the mod-256 add (v ^ 0xff) + 0x81 per byte. The sign
+            // nibble spreads to per-byte masks through 0x00204081 (bit b of
+            // the nibble lands on byte b's bit 0, every cross term falls off
+            // the 0x01010101 mask) the way Q5_1's high bits do.
             const uint4 r = raw[u][kb];
             const std::uint32_t qh = s_high[(kb * BM) + row];
 #pragma unroll
@@ -6201,13 +6206,14 @@ __launch_bounds__(256) __global__
               const std::uint32_t qs_byte =
                   ((j < 4 ? r.x : r.y) >> (8 * (j & 3))) & 0xFFU;
               const std::uint32_t idx = qs_byte | (((qh >> j) & 1U) << 8);
-              const std::uint32_t g = Vadd4(kIq3sGridCarry[idx], 0x80808080U);
-              const std::uint32_t sb = (r.z >> (8 * (j >> 1))) & 0xFFU;
-              const std::uint32_t bits =
-                  (j & 1U) == 0U ? sb & 0x0FU : (sb >> 4) & 0x0FU;
+              const std::uint32_t g = kIq3sGridCarry[idx];
+              const std::uint32_t sgn =
+                  (r.z >> (8 * (j >> 1) + 4 * (j & 1))) & 0xFU;
               const std::uint32_t mask =
-                  Vnez4(((bits & 0x3U) << 7) | ((bits & 0xCU) << 21));
-              nib[j] = g ^ ((g ^ Vneg4(g)) & mask);
+                  ((sgn * 0x00204081U) & 0x01010101U) * 0xFFU;
+              const std::uint32_t carried = g ^ 0x80808080U;
+              const std::uint32_t neg = Vadd4(g ^ 0xFFFFFFFFU, 0x81818181U);
+              nib[j] = carried ^ ((carried ^ neg) & mask);
             }
           } else {
             // Q4_K / Q5_K: elements 0-15 of K block kb0 + kb are the low
