@@ -7,43 +7,58 @@ follows below the separator.
 **Getting started:** download a ready-made build from the
 [Releases page](https://github.com/endyjasmi/gufo/releases), unzip the
 `gufo-<version>-windows-gfx1151-<commit>.zip` asset (for example
-`gufo-0.17.1-windows-gfx1151-eaf9bec.zip`) and run `gufo.exe` from the
+`gufo-0.17.1-windows-gfx1151-9146837.zip`) and run `gufo.exe` from the
 extracted folder — no installation needed. Every update to the port
 publishes its own release, so older builds stay available. A recent AMD
 graphics driver is required.
 
-**Next, download a model.** The `hf` command ships with Hugging Face's
-Python package (`pip install -U huggingface_hub`). This fetches the
-Qwen3.8 Flash-Next UD-Q4_K_XL GGUF (four shards), the shared MTP predictor
-and the vision projector into the default Hugging Face cache
-(`.cache\huggingface\hub` in your user profile); see the
-[model guide](docs/models/qwen3.8-flash-next/README.md) for other quants
-and the full file list:
+**Then download a recommended model.** Two are recommended and qualified on
+this port; both run at the full 262,144-token context with MTP speculative
+decoding and accept images. The `hf` command ships with Hugging Face's
+Python package (`pip install -U huggingface_hub`); it fetches into the
+default Hugging Face cache (`.cache\huggingface\hub` in your user profile).
+Run PowerShell from your user profile folder so the `.cache` paths below
+resolve. The model guides list every supported file:
+[Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) (also cached
+in the smaller UD-IQ4_XS variant) and
+[Ornith-1.5-35B](docs/models/ornith-1.5-35b/README.md) (also cached in
+Q8_0).
+
+**Qwen3.8 Flash-Next** — the benchmark flagship (MTP drafting up to 7
+tokens, hybrid attention). Download the UD-Q4_K_XL GGUF (four shards), the
+shared Q8_0 MTP predictor and the BF16 vision projector at the verified
+revision:
 
 ```pwsh
 hf download unsloth/Qwen3.8-Flash-Next-GGUF `
-  --revision 38bb39ee97821de2c9009abb7e93950eec396e66 `
+  --revision 766911a6b7369840a91dbcd95f9f997acaab6cd6 `
   --include "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" "mmproj-BF16.gguf"
 ```
 
 Then serve it with MTP speculative decoding at the full 256K context for
-two concurrent sessions. Run PowerShell from your user profile folder so
-the `.cache` paths below resolve; the loader finds the remaining shards
-and the MTP predictor automatically:
+two concurrent sessions (every flag below verified against the 0.17.1
+build; the loader finds the remaining shards automatically):
 
 ```pwsh
-.\Downloads\gufo-0.17.1-windows-gfx1151-eaf9bec\gufo.exe serve llm --model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\38bb39ee97821de2c9009abb7e93950eec396e66\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --speculative mtp `
+.\Downloads\gufo-0.17.1-windows-gfx1151-9146837\gufo.exe serve llm --model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\766911a6b7369840a91dbcd95f9f997acaab6cd6\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --speculative mtp `
+  --mtp-model .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\766911a6b7369840a91dbcd95f9f997acaab6cd6\MTP\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf `
+  --mmproj .\.cache\huggingface\hub\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\766911a6b7369840a91dbcd95f9f997acaab6cd6\mmproj-BF16.gguf `
   --served-model-name qwen3.8-flash-next `
   --context 262144 --sessions 2 `
   --cache-ram-bytes 8589934592 `
-  --cache-disk .\.cache\gufo-qwen4exp `
+  --cache-disk .\.cache\gufo-qwen4exp2 `
   --cache-disk-bytes 21474836480 `
-  --cache-disk-staging-bytes 8589934592 `
   --temperature 1 --top-p 0.95 --top-k 20 --min-p 0 `
   --think on --reasoning-effort xhigh --preserve-thinking on `
   --repeat-penalty 1 --frequency-penalty 0 --presence-penalty 0 `
   --host 0.0.0.0 --port 11434 --log-progress --kv-cache q8_0-q4_k
 ```
+
+The `--mtp-model` and `--mmproj` sidecars are named explicitly here because
+the Hugging Face cache layout keeps them outside the target's folder; omit
+both when they sit beside the model file. Drop `--cache-ram-bytes` and
+`--cache-disk`/`--cache-disk-bytes` for the simplest setup (auto budgets);
+the disk cache is restart-safe and one process owns it at a time.
 
 The `--kv-cache` option shrinks the attention KV cache so deep 256K
 sessions fit in memory: `q8_0` stores both planes as Q8_0 blocks (about
@@ -51,7 +66,33 @@ half the bytes), and `q8_0-q4_k` stores Q8_0 keys with Q4_K super-block
 values (9,984 bytes per token vs 24,576 for F16, −59%). Both are lossy
 and off by default; `f16` (the default) keeps full precision. Snapshots
 and disk-cache entries are not shared across cache modes, so toggling
-the option re-prefills existing conversations once.
+the option re-prefills existing conversations once. This option is
+Flash-Next only.
+
+**Ornith-1.5-35B-A3B** — 35B parameters, 3B active (256 routed experts),
+its MTP draft block is trained into the model file itself, so no predictor
+sidecar is needed. Download the Q4_K_M GGUF and the BF16 vision projector
+at the verified revision (`Ornith-1.5-35B-Q8_0.gguf` runs natively too):
+
+```pwsh
+hf download ornith-ai/Ornith-1.5-35B-A3B-GGUF `
+  --revision 12393612fd4f730ff5aadc23e9b8f9648aa49ceb `
+  --include "Ornith-1.5-35B-Q4_K_M.gguf" "mmproj-Ornith-1.5-35B-BF16.gguf"
+```
+
+Serve it the same way; the in-file MTP block is picked up by
+`--speculative mtp` and the vision projector is discovered beside the
+model (all flags verified against the 0.17.1 build):
+
+```pwsh
+.\Downloads\gufo-0.17.1-windows-gfx1151-9146837\gufo.exe serve llm --model .\.cache\huggingface\hub\models--ornith-ai--Ornith-1.5-35B-A3B-GGUF\snapshots\12393612fd4f730ff5aadc23e9b8f9648aa49ceb\Ornith-1.5-35B-Q4_K_M.gguf --speculative mtp `
+  --served-model-name ornith-1.5-35b `
+  --context 262144 --sessions 2 `
+  --temperature 1 --top-p 0.95 --top-k 20 --min-p 0 `
+  --think on --reasoning-effort xhigh --preserve-thinking on `
+  --repeat-penalty 1 --frequency-penalty 0 --presence-penalty 0 `
+  --host 0.0.0.0 --port 11434 --log-progress
+```
 
 When the server is up, point OpenAI-compatible clients at
 `http://localhost:11434/v1` (see the [API contract](docs/SERVER.md)).
