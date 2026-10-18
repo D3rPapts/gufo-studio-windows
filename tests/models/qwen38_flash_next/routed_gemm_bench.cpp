@@ -294,7 +294,7 @@ Result RunLayer(const Preset& preset, const std::vector<std::uint32_t>& counts,
   auto* d_out = Alloc<__half>(std::size_t{slots} * kHidden);
   CheckHip(hipDeviceSynchronize(), "setup");
 
-  const auto gate_run = [&](bool with_swiglu) {
+  const auto gate_run = [&](const void* w, bool with_swiglu) {
     float* swiglu = nullptr;
     float* out_f = nullptr;
     __half* out_h = nullptr;
@@ -304,7 +304,7 @@ Result RunLayer(const Preset& preset, const std::vector<std::uint32_t>& counts,
     } else {
       out_f = d_gate_out;
     }
-    if (!q::RoutedF16Gemm(d_gate, preset.gate.type, d_x, d_tiles, down_tiles,
+    if (!q::RoutedF16Gemm(w, preset.gate.type, d_x, d_tiles, down_tiles,
                           separate_rows, d_bounds, d_rows_token, d_rows_slot,
                           swiglu, out_f, out_h, kFf, kHidden, nullptr))
       throw std::runtime_error("gate GEMM rejected");
@@ -319,13 +319,13 @@ Result RunLayer(const Preset& preset, const std::vector<std::uint32_t>& counts,
           throw std::runtime_error("gated GEMM rejected");
         return;
       }
-      gate_run(false);
-      gate_run(true);
+      gate_run(d_gate, false);
+      gate_run(d_up, true);
       return;
     }
     // IQ3_S: separate gate then fused-swiglu up, over the wide 64-row map.
-    gate_run(false);
-    gate_run(true);
+    gate_run(d_gate, false);
+    gate_run(d_up, true);
   };
   const auto down = [&] {
     if (!q::RoutedF16Gemm(d_down, preset.down.type, d_mid, d_tiles, down_tiles,

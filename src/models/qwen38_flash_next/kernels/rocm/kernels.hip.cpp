@@ -5901,24 +5901,54 @@ __launch_bounds__(256) __global__
         // One 16-byte chunk per K block: {qs[8], signs[4], 0, 0}; the
         // 256-block's (d, scales) header is staged like Q4_K's. Rows are
         // 110 bytes, so every load is 2-byte aligned at best.
-        const int kb = kb0 + f_c;
-        const auto* blk = f_ptr[u] + ((kb / 8) * 110);
-        const int c = kb % 8;
-        if (kb0 % 8 == 0) {
-          std::uint16_t d16 = 0;
-          std::uint32_t sc = 0;
-          __builtin_memcpy(&d16, blk, 2);
-          __builtin_memcpy(&sc, blk + 106, 4);
-          f_header[u] = make_uint4(d16, sc, 0u, 0u);
+        if constexpr (kPair) {
+          // Stage kb0 = 8g + 2*code_group spans blocks kb0 and kb0 + 1, and
+          // each half reassembles its 16-element strip of both into one
+          // chunk {qs(kb0), qs(kb0+1), signs, qh nibbles}: grid groups
+          // 4f_c..+4 of a block are qs bytes 4f_c..+4, sign bytes 2f_c..+2
+          // and qh bits 4f_c..+4. The separate decode's per-group read then
+          // consumes the chunk unchanged once the fragment picks its half
+          // of each word.
+          const int c0 = code_group * 2;
+          const auto* blk = f_ptr[u] + (static_cast<std::size_t>(kb0 / 8) * 110);
+          if (c0 == 0) {
+            std::uint16_t d16 = 0;
+            std::uint32_t sc = 0;
+            __builtin_memcpy(&d16, blk, 2);
+            __builtin_memcpy(&sc, blk + 106, 4);
+            f_header[u] = make_uint4(d16, sc, 0u, 0u);
+          }
+          const int s = 4 * f_c;
+          std::uint32_t qs0 = 0, qs1 = 0, sg0 = 0, sg1 = 0, q0 = 0, q1 = 0;
+          __builtin_memcpy(&qs0, blk + 2 + 8 * c0 + s, 4);
+          __builtin_memcpy(&qs1, blk + 2 + 8 * (c0 + 1) + s, 4);
+          __builtin_memcpy(&sg0, blk + 74 + 4 * c0 + 2 * f_c, 2);
+          __builtin_memcpy(&sg1, blk + 74 + 4 * (c0 + 1) + 2 * f_c, 2);
+          __builtin_memcpy(&q0, blk + 66 + c0, 1);
+          __builtin_memcpy(&q1, blk + 66 + c0 + 1, 1);
+          f_codes[u] = make_uint4(qs0, qs1, sg0 | (sg1 << 16),
+                                  ((q0 >> s) & 0xFU) | (((q1 >> s) & 0xFU) << 4));
+          f_sb32[u] = c0 + f_c;
+        } else {
+          const int kb = kb0 + f_c;
+          const auto* blk = f_ptr[u] + ((kb / 8) * 110);
+          const int c = kb % 8;
+          if (kb0 % 8 == 0) {
+            std::uint16_t d16 = 0;
+            std::uint32_t sc = 0;
+            __builtin_memcpy(&d16, blk, 2);
+            __builtin_memcpy(&sc, blk + 106, 4);
+            f_header[u] = make_uint4(d16, sc, 0u, 0u);
+          }
+          std::uint32_t qs0 = 0, qs1 = 0, sg = 0, qh = 0;
+          __builtin_memcpy(&qs0, blk + 2 + 8 * c, 4);
+          __builtin_memcpy(&qs1, blk + 6 + 8 * c, 4);
+          __builtin_memcpy(&sg, blk + 74 + 4 * c, 4);
+          __builtin_memcpy(&qh, blk + 66 + c, 1);
+          f_codes[u] = make_uint4(qs0, qs1, sg, qh);
+          f_high[u] = qh;
+          f_sb32[u] = c;
         }
-        std::uint32_t qs0 = 0, qs1 = 0, sg = 0, qh = 0;
-        __builtin_memcpy(&qs0, blk + 2 + 8 * c, 4);
-        __builtin_memcpy(&qs1, blk + 6 + 8 * c, 4);
-        __builtin_memcpy(&sg, blk + 74 + 4 * c, 4);
-        __builtin_memcpy(&qh, blk + 66 + c, 1);
-        f_codes[u] = make_uint4(qs0, qs1, sg, qh);
-        f_high[u] = qh;
-        f_sb32[u] = c;
       } else {
         constexpr int kBlockChunks = kQ5K ? 11 : 9;
         constexpr int kCodeChunk = kQ5K ? 3 : 1;
@@ -6102,19 +6132,43 @@ __launch_bounds__(256) __global__
               __half2, half_id == kb ? own_scale[u] : peer_scale[u]);
           const __half2 scale2 = __low2half2(sb);
           const __half2 bias2 = __high2half2(sb);
-          const uint4 codes = own_codes[u];
-          const std::uint32_t words[4] = {codes.x, codes.y, codes.z, codes.w};
-          const std::uint32_t high =
-              kQ5K ? ((half_id == kb ? own_high[u] : peer_high[u]) >>
-                      (16U * half_id))
-                   : 0U;
           __half2 h[8];
+          if constexpr (kIQ3S) {
+            // The chunk holds this half's strip of both stage blocks:
+            // fragment kb decodes qs bytes kb*4..+4 (x/y), the sign nibbles
+            // at byte 2kb..+2 (z) and qh nibble kb (w); the strip exchange
+            // below then pairs them like the nibble formats.
+            const uint4 r = own_codes[u];
+            const std::uint32_t qh = (r.w >> (4U * kb)) & 0xFU;
 #pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            std::uint32_t nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
-            if constexpr (kQ5K)
-              nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
-            CodesToHalves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+            for (int t = 0; t < 4; ++t) {
+              const std::uint32_t qs_byte =
+                  ((kb == 0 ? r.x : r.y) >> (8 * t)) & 0xFFU;
+              const std::uint32_t idx = qs_byte | (((qh >> t) & 1U) << 8);
+              const std::uint32_t g = kIq3sGridCarry[idx];
+              const std::uint32_t sgn =
+                  (r.z >> (8 * (2 * kb + (t >> 1)) + 4 * (t & 1))) & 0xFU;
+              const std::uint32_t mask =
+                  ((sgn * 0x00204081U) & 0x01010101U) * 0xFFU;
+              const std::uint32_t carried = g ^ 0x80808080U;
+              const std::uint32_t neg = Vadd4(g ^ 0xFFFFFFFFU, 0x81818181U);
+              CodesToHalves(carried ^ ((carried ^ neg) & mask), magic, scale2,
+                            bias2, h[2 * t], h[2 * t + 1]);
+            }
+          } else {
+            const uint4 codes = own_codes[u];
+            const std::uint32_t words[4] = {codes.x, codes.y, codes.z, codes.w};
+            const std::uint32_t high =
+                kQ5K ? ((half_id == kb ? own_high[u] : peer_high[u]) >>
+                        (16U * half_id))
+                     : 0U;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              std::uint32_t nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
+              if constexpr (kQ5K)
+                nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+              CodesToHalves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+            }
           }
           v16h own;
           __builtin_memcpy(&own, &h[0], 32);
@@ -7097,6 +7151,12 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
     case WeightType::kQ5_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out, m, k, up);
+      return true;
+    case WeightType::kIQ3_S:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ3_S, 128, BN, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
           rows_out, nullptr, nullptr, out, m, k, up);
       return true;

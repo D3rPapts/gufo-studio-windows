@@ -2996,10 +2996,12 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
                                                    : WeightType::kQ4_K;
-    // The paired gate/up kernel only stages the Q4_K/Q5_K block layouts;
-    // IQ3_S runs the two projections separately with the same fused SwiGLU.
-    const bool pair_ok =
-        gate_type == WeightType::kQ4_K || gate_type == WeightType::kQ5_K;
+    // The paired gate/up kernel stages the Q4_K/Q5_K block layouts and, for
+    // IQ3_S, reassembles each half's 16-element strip of the stage's two
+    // blocks into the chunk layout the separate decode consumes.
+    const bool pair_ok = gate_type == WeightType::kQ4_K ||
+                         gate_type == WeightType::kQ5_K ||
+                         gate_type == WeightType::kIQ3_S;
     // Wide batches build 64-row tiles for the down projection (and the
     // paired gate/up path); the separate projections reuse that map rather
     // than the narrow one, which the wide batch never populates.
