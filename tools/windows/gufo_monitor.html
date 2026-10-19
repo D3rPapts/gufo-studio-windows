@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gufo monitor</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1d2228; --muted: #67707b; --line: #e2e5ea;
+  --accent: #2f6fde; --prefill: #d9822b; --decode: #2e9e5b; --idle: #9aa3ad; --warn: #c94343;
+  --bar: #edf0f3;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121418; --card: #1b1e24; --text: #e6e8eb; --muted: #959ca6; --line: #2b2f37;
+    --accent: #6a9cf0; --prefill: #f0a050; --decode: #4cc27c; --idle: #6c747e; --warn: #ef6b6b;
+    --bar: #262a31;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121418; --card: #1b1e24; --text: #e6e8eb; --muted: #959ca6; --line: #2b2f37;
+  --accent: #6a9cf0; --prefill: #f0a050; --decode: #4cc27c; --idle: #6c747e; --warn: #ef6b6b;
+  --bar: #262a31;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 16px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+h1 { font-size: 18px; margin: 0; }
+.muted { color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.stat .label { font-size: 12px; color: var(--muted); }
+.stat .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat .sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stat canvas { width: 100%; height: 34px; display: block; margin-top: 6px; }
+.bar { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; margin-top: 6px; position: relative; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.bar > b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--warn); }
+.servers { display: grid; gap: 12px; margin-top: 12px; }
+.server h2 { font-size: 15px; margin: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--idle); }
+.slot { display: grid; grid-template-columns: 74px 1fr; gap: 10px; align-items: center; padding: 8px 0;
+  border-top: 1px solid var(--line); }
+.slot:first-of-type { border-top: 0; }
+.badge { font-size: 12px; font-weight: 600; text-align: center; padding: 3px 0; border-radius: 6px;
+  color: #fff; background: var(--idle); }
+.badge.prefill { background: var(--prefill); } .badge.decode { background: var(--decode); }
+.badge.start { background: var(--accent); }
+.slot .bar > i.prefill { background: var(--prefill); } .slot .bar > i.decode { background: var(--decode); }
+.line { font-variant-numeric: tabular-nums; }
+.tput { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 6px 0 4px;
+  font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; margin-top: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 4px 6px; border-top: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; }
+th:first-child, td:first-child, td.l, th.l { text-align: left; }
+tr.miss td { color: var(--warn); }
+button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 6px;
+  padding: 3px 8px; cursor: pointer; font: inherit; font-size: 12px; }
+.down { color: var(--muted); font-size: 13px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>gufo monitor</h1>
+    <div><span id="clock" class="muted"></span> <button id="theme">테마</button></div>
+  </header>
+  <section class="grid" id="system"></section>
+  <section class="servers" id="servers"></section>
+  <p class="muted" style="font-size:12px">빨간 줄: 2만 토큰 이상인데 절반 넘게 다시 prefill한 요청(캐시 미스). GPU 메모리 막대의 빨간 선: 안전 한계 93.4 GiB.</p>
+</main>
+<script>
+const SAFE_GIB = 93.4, CARVE_GIB = 96, HIST = 300;
+const hist = { util: [], ded: [], ram: [] };
+const prev = {};   // per port/slot: last sample for rates
+const GiB = 2 ** 30;
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => n == null || isNaN(n) ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+$("theme").onclick = () => {
+  const cur = document.documentElement.dataset.theme ||
+    (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch (e) {}
+};
+
+function spark(canvas, data, max, color) {
+  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d"); g.scale(dpr, dpr);
+  if (data.length < 2) return;
+  g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+  data.forEach((v, i) => {
+    const x = w * i / (HIST - 1) + (w - w * (data.length - 1) / (HIST - 1));
+    const y = h - 2 - (h - 4) * Math.min(1, v / max);
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  });
+  g.stroke();
+}
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const push = (a, v) => { a.push(v); if (a.length > HIST) a.shift(); };
+
+function renderSystem(s) {
+  if (!s) { $("system").innerHTML = '<div class="card muted">시스템 카운터 수집 중…</div>'; return; }
+  const eng = s.engines || {};
+  const [busyName, busy] = Object.entries(eng).sort((a, b) => b[1] - a[1])[0] || ["-", 0];
+  const util = Math.min(100, busy), ded = s.gpu_ded / GiB, sh = s.gpu_shared / GiB, ram = s.ram_avail_mb / 1024;
+  push(hist.util, util); push(hist.ded, ded); push(hist.ram, ram);
+  $("system").innerHTML = `
+    <div class="card stat"><div class="label">GPU 사용률</div><div class="value">${fmt(util)}%</div>
+      <div class="sub">가장 바쁜 엔진: ${esc(busyName)}</div><canvas id="c-util"></canvas></div>
+    <div class="card stat"><div class="label">GPU 전용 메모리</div><div class="value">${fmt(ded, 1)} GiB</div>
+      <div class="sub">공유 ${fmt(sh, 1)} GiB · 한계 ${SAFE_GIB}</div>
+      <div class="bar"><i style="width:${Math.min(100, ded / CARVE_GIB * 100)}%;background:${ded > SAFE_GIB ? css("--warn") : css("--accent")}"></i><b style="left:${SAFE_GIB / CARVE_GIB * 100}%"></b></div>
+      <canvas id="c-ded"></canvas></div>
+    <div class="card stat"><div class="label">여유 RAM</div><div class="value" style="color:${ram < 4 ? css("--warn") : "inherit"}">${fmt(ram, 1)} GB</div>
+      <div class="sub">16GB 이상 권장</div><canvas id="c-ram"></canvas></div>
+    <div class="card stat"><div class="label">커밋</div><div class="value">${fmt(s.commit / 1e9, 1)} GB</div>
+      <div class="sub">한계 ${fmt(s.commit_limit / 1e9, 1)} GB</div>
+      <div class="bar"><i style="width:${s.commit / s.commit_limit * 100}%"></i></div></div>
+    <div class="card stat"><div class="label">페이지 파일</div><div class="value">${fmt(s.pagefile_pct, 2)}%</div>
+      <div class="sub" style="color:${s.pages_out > 50 ? css("--warn") : "inherit"}">쓰기 ${fmt(s.pages_out)} 페이지/초</div></div>`;
+  spark($("c-util"), hist.util, 100, css("--accent"));
+  spark($("c-ded"), hist.ded, CARVE_GIB, css("--accent"));
+  spark($("c-ram"), hist.ram, 32, css("--decode"));
+}
+
+function slotView(port, sl, now) {
+  const key = port + "/" + sl.id, p = prev[key];
+  const nt = sl.next_token?.[0] || {};
+  const todo = Math.max(0, sl.n_prompt_tokens - sl.n_prompt_tokens_cache);
+  const done = sl.n_prompt_tokens_processed, dec = nt.n_decoded || 0;
+  let phase = "idle", label = "대기", body = '<span class="muted">요청 없음</span>';
+  if (sl.is_processing) {
+    let rate = null;
+    const same = p && p.task === sl.id_task;
+    if (dec > 0) {
+      phase = "decode"; label = "decode";
+      if (same && now > p.t) rate = (dec - p.dec) / (now - p.t);
+      body = `<div class="line">${fmt(dec)} 토큰 생성 · ${rate != null ? fmt(rate, 1) + " tok/s" : "…"}
+        <span class="muted">· 프롬프트 ${fmt(sl.n_prompt_tokens)} (캐시 ${fmt(sl.n_prompt_tokens_cache)})</span></div>`;
+    } else if (done < todo) {
+      phase = "prefill"; label = "prefill";
+      if (same && now > p.t) rate = (done - p.done) / (now - p.t);
+      const eta = rate > 0 ? (todo - done) / rate : null;
+      const hit = sl.n_prompt_tokens ? sl.n_prompt_tokens_cache / sl.n_prompt_tokens * 100 : 0;
+      body = `<div class="line">${fmt(done)} / ${fmt(todo)} (${fmt(done / Math.max(1, todo) * 100)}%) ·
+        ${rate != null ? fmt(rate) + " tok/s" : "…"}${eta != null ? " · 남은 시간 " + fmt(eta) + "초" : ""}
+        <span class="muted">· 캐시 ${fmt(sl.n_prompt_tokens_cache)} (${fmt(hit)}%)</span></div>
+        <div class="bar"><i class="prefill" style="width:${done / Math.max(1, todo) * 100}%"></i></div>`;
+    } else {
+      phase = "start"; label = "준비";
+      body = `<div class="line">캐시 복원 또는 첫 토큰 대기 · 프롬프트 ${fmt(sl.n_prompt_tokens)} (캐시 ${fmt(sl.n_prompt_tokens_cache)})</div>`;
+    }
+  }
+  prev[key] = { task: sl.id_task, t: now, done, dec };
+  return `<div class="slot"><div class="badge ${phase}">${label}</div><div>${body}</div></div>`;
+}
+
+function serverView(sv, now) {
+  if (!sv.up) return `<div class="card server"><h2><span class="dot"></span>${sv.port}${sv.name ? " · " + esc(sv.name) : ""}</h2>
+    <div class="down">실행 중 아님</div></div>`;
+  const m = sv.metrics || {}, busy = (sv.slots || []).some((s) => s.is_processing);
+  const pk = "m" + sv.port, pm = prev[pk];
+  let pr = null, dr = null;
+  if (pm && now > pm.t) {
+    pr = (m.prompt_tokens_total - pm.p) / (now - pm.t);
+    dr = (m.tokens_predicted_total - pm.d) / (now - pm.t);
+  }
+  prev[pk] = { t: now, p: m.prompt_tokens_total, d: m.tokens_predicted_total };
+  const acc = m.spec_decode_num_draft_tokens_total ? m.spec_decode_num_accepted_tokens_total / m.spec_decode_num_draft_tokens_total * 100 : null;
+  const rows = (sv.recent || []).map((r) => {
+    const prompt = +r.prompt_tokens, pre = +r.prefill_tokens;
+    const miss = prompt > 20000 && pre > prompt / 2;
+    return `<tr class="${miss ? "miss" : ""}"><td>${esc(r.time)}</td><td>${fmt(prompt)}</td>
+      <td>${fmt(prompt ? r.cached_tokens / prompt * 100 : 0)}%</td><td>${fmt(pre)}</td>
+      <td>${fmt(r.queue_ms / 1000, 1)}</td><td>${fmt(r.ttft_ms / 1000, 1)}</td><td>${fmt(r.generated_tokens)}</td>
+      <td>${fmt(r.prefill_tps)}</td><td>${fmt(r.decode_tps, 1)}</td><td class="l">${esc(r.cache_miss_reason || r.finish || "")}</td></tr>`;
+  }).join("");
+  return `<div class="card server">
+    <h2><span class="dot" style="background:${busy ? css("--decode") : css("--idle")}"></span>${sv.port}${sv.name ? " · " + esc(sv.name) : ""}
+      <span class="muted" style="font-weight:400;font-size:12px">${esc(sv.model || "")} · 세션 ${sv.slots.length}</span></h2>
+    <div class="tput"><span>지금 prefill ${pr != null ? fmt(pr) : "–"} tok/s</span><span>지금 decode ${dr != null ? fmt(dr, 1) : "–"} tok/s</span>
+      <span>대기 요청 ${fmt(m.requests_deferred)}</span><span>MTP 채택률 ${acc != null ? fmt(acc) + "%" : "–"}</span>
+      <span>KV 사용 ${fmt((m.kv_cache_usage_ratio || 0) * 100)}%</span></div>
+    ${sv.slots.map((s) => slotView(sv.port, s, now)).join("")}
+    ${rows ? `<div class="table-wrap"><table><thead><tr><th>시각</th><th>프롬프트</th><th>캐시</th><th>prefill</th>
+      <th>대기 s</th><th>첫 토큰 s</th><th>생성</th><th>prefill t/s</th><th>decode t/s</th><th class="l">비고</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>` : ""}
+  </div>`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api", { cache: "no-store" });
+    const d = await r.json();
+    renderSystem(d.system);
+    const live = d.servers.filter((s) => s.up), off = d.servers.filter((s) => !s.up);
+    $("servers").innerHTML = live.map((s) => serverView(s, d.t)).join("") +
+      (off.length ? `<div class="muted" style="font-size:12px">꺼져 있음: ${off.map((s) => s.port + (s.name ? " " + esc(s.name) : "")).join(", ")}</div>` : "");
+    $("clock").textContent = new Date(d.t * 1000).toLocaleTimeString();
+  } catch (e) {
+    $("clock").textContent = "모니터 서버에 연결할 수 없음";
+  }
+  setTimeout(tick, 1000);
+}
+tick();
+</script>
+</body>
+</html>
