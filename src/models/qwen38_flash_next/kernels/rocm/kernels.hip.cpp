@@ -1059,9 +1059,13 @@ __global__ void HcCombineMoeF16Kernel(
                          __fmaf_rn(b.z, w[s], r.z), __fmaf_rn(b.w, w[s], r.w)};
         *reinterpret_cast<float4*>(dst + e) = v[s][c];
         {
-          // One explicit accumulation order for both paths: a deferred
-          // combine and an immediate one that pre-applied its residual must
-          // fold identical squares whatever the compiler contracts.
+          // One square-accumulation order for every instantiation. The
+          // deferred path must stay bit-identical to the separate-store
+          // path, and fast-math reorders a plain `ss += x*x + ...`
+          // differently per template instantiation (gfx1151 stream 3), so
+          // the two would start from sums differing in the last F32 bits
+          // and disagree in the Q8 block scales. The pinned order is the
+          // compiled order of the separate-store build this defers.
           const float4 n = v[s][c];
           if (s == 3) {
             ss[s] = __fmaf_rn(n.w, n.w, ss[s]);
@@ -1121,13 +1125,9 @@ __global__ void HcCombineMoeF16Kernel(
       float4 n{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
-        // Both branches round identically by construction: (v * scale) *
-        // gamma with explicit single multiplies, so a deferred combine and
-        // an immediate one that pre-applied its residual agree bit for bit
-        // regardless of compiler contraction choices.
         const float4 g =
-            float4{__fmul_rn(scale[s], gm.x), __fmul_rn(scale[s], gm.y),
-                   __fmul_rn(scale[s], gm.z), __fmul_rn(scale[s], gm.w)};
+            float4{__fmul_rn(gm.x, scale[s]), __fmul_rn(gm.y, scale[s]),
+                   __fmul_rn(gm.z, scale[s]), __fmul_rn(gm.w, scale[s])};
         n = float4{__fmul_rn(v[s][c].x, g.x), __fmul_rn(v[s][c].y, g.y),
                    __fmul_rn(v[s][c].z, g.z), __fmul_rn(v[s][c].w, g.w)};
         __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;

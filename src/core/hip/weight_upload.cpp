@@ -22,6 +22,8 @@
 #include <unistd.h>
 #endif
 
+#include "src/core/hip/host_allocations.hpp"
+
 namespace gufo::hip {
 namespace {
 
@@ -95,6 +97,7 @@ struct WeightUpload::State {
   };
 
   std::vector<Shard> shards;
+  HostAllocations host_allocations;
   std::array<Slot, kReaders> slots{};
   std::vector<std::jthread> readers;
   std::mutex mutex;
@@ -116,9 +119,6 @@ struct WeightUpload::State {
     for (auto& slot : slots) {
       if (slot.stream != nullptr) {
         (void)hipStreamDestroy(slot.stream);
-      }
-      if (slot.buffer != nullptr) {
-        (void)hipHostFree(slot.buffer);
       }
     }
     for (const auto& shard : shards) {
@@ -288,7 +288,8 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
 #endif
   }
   for (auto& slot : s.slots) {
-    if (hipHostMalloc(&slot.buffer, kChunkBytes + kAlignment) != hipSuccess ||
+    if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
+            hipSuccess ||
         hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
             hipSuccess) {
       s.Fail("weight upload staging allocation failed");
