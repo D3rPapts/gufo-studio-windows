@@ -433,6 +433,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+    // The chained greedy cycle's device token ring and its pinned download.
+    const std::size_t chain_rows = e->options_.max_speculative + 2;
+    s.mtp_chain = Alloc<std::int32_t>(a, chain_rows, error_msg);
+    if (!Check(hipHostMalloc(&e->mtp_chain_host_,
+                             chain_rows * sizeof(std::int32_t)),
+               "pinned draft chain", error_msg) ||
+        !Check(hipHostMalloc(
+                   &e->mtp_predictions_host_,
+                   (e->options_.max_speculative + 1) * sizeof(ArgmaxCandidate)),
+               "pinned greedy predictions", error_msg)) {
+      return nullptr;
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1441,7 +1453,7 @@ bool Executor::CopyDFlashFeatures(const Session& session, std::uint32_t rows,
 }
 
 bool Executor::MtpHead(const DeviceTensor& head_norm, const float* res,
-                       bool token, bool candidates,
+                       bool token, bool candidates, std::int32_t* chain_out,
                        std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
   RmsNormRows(res, head_norm.f32(), s_.mixed, 1, config().hidden_size, 1,
@@ -1455,8 +1467,13 @@ bool Executor::MtpHead(const DeviceTensor& head_norm, const float* res,
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
                      output.rows, stream_);
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (!Check(
+    // A chained draft step keeps its argmax on the device: the next step
+    // embeds it and the verify pass never needs it on the host.
+    Argmax(s_.logits, s_.mtp_argmax,
+           chain_out != nullptr ? chain_out : s_.mtp_token, 1, output.rows,
+           stream_);
+    if (chain_out == nullptr &&
+        !Check(
             hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
                            hipMemcpyDeviceToHost, stream_),
             "draft token download", error_msg)) {
@@ -1530,7 +1547,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg) const {
-  const bool speculative = mode == ForwardMode::kVerify;
+  const bool speculative =
+      mode == ForwardMode::kVerify || mode == ForwardMode::kVerifyGreedy;
+  const bool greedy_argmax = mode == ForwardMode::kVerifyGreedy;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
   const Config& c = config();
@@ -1580,10 +1599,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{greedy_argmax} << 45);
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
-                       start_pos, 0, c.num_layers, error_msg);
+                       greedy_argmax, start_pos, 0, c.num_layers, error_msg);
   };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
@@ -1607,8 +1627,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t n_logits, bool download_logits,
-                           bool speculative, std::uint32_t start_pos,
-                           std::uint32_t first_layer, std::uint32_t end_layer,
+                           bool speculative, bool greedy_argmax,
+                           std::uint32_t start_pos, std::uint32_t first_layer,
+                           std::uint32_t end_layer,
                            std::string* error_msg) const {
   const Config& c = config();
   if (first_layer == 0) {
@@ -1701,6 +1722,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                   c.vocab_size * sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
                "logits download", error_msg)) {
+      return false;
+    }
+    // Greedy verification ranks every verified row inside the graph, the
+    // frontier included: its argmax is the next cycle's anchor, so the
+    // frontier logits never reach the host.
+    if (greedy_argmax && !GreedyArgmaxNodes(n_logits, error_msg)) {
       return false;
     }
   }
@@ -2049,6 +2076,47 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                error_msg);
 }
 
+bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
+                                 std::string* error_msg) const {
+  // Appended to the kVerifyGreedy body: ranks every verified row including
+  // the frontier and parks the candidates in pinned memory for
+  // ReadGreedyPredictions(). Runs inside capture like any other node. The
+  // frontier row's argmax is the next cycle's greedy anchor.
+  if (n_logits < 1 || s_.mtp_ids == nullptr) {
+    return true;
+  }
+  const auto rows = n_logits;
+  if (rows > kArgmaxParts) {
+    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
+    return false;
+  }
+  const auto vocab = config().vocab_size;
+  gufo::hip::LaunchBatchedGPUArgmax(
+      VerificationLogits(), s_.mtp_ids, rows, vocab,
+      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
+       MtpCandidateWorkspaceSize(vocab)},
+      stream_);
+  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
+                         vocab, stream_);
+  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
+                              rows * sizeof(ArgmaxCandidate),
+                              hipMemcpyDeviceToHost, stream_),
+               "greedy MTP predictions download", error_msg);
+}
+
+bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
+                                     std::string* error_msg) const {
+  if (predictions.empty() || mtp_predictions_host_ == nullptr ||
+      predictions.size_bytes() >
+          (options_.max_speculative + 1) * sizeof(ArgmaxCandidate)) {
+    AssignError(error_msg, "invalid greedy MTP prediction read");
+    return false;
+  }
+  std::memcpy(predictions.data(), mtp_predictions_host_,
+              predictions.size_bytes());
+  return true;
+}
+
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
                           std::int32_t hidden_row, MtpOutput output,
@@ -2118,9 +2186,104 @@ bool Executor::MtpForward(Session& session,
   return true;
 }
 
+bool Executor::MtpDraftChain(Session& session,
+                             std::span<const std::int32_t> replay,
+                             std::int32_t hidden_row, std::uint32_t proposals,
+                             std::string* error_msg) const {
+  const Config& c = config();
+  const auto m = static_cast<std::uint32_t>(replay.size());
+  if (session.owner_ != this || m == 0 || proposals == 0 ||
+      proposals + 1 > options_.max_speculative ||
+      std::any_of(replay.begin(), replay.end(), [&](auto t) {
+        return t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size;
+      })) {
+    AssignError(error_msg, "invalid MTP draft chain request");
+    return false;
+  }
+  if (!session.CheckCancellation(error_msg))
+    return false;
+  if (!session.mtp_enabled_) {
+    AssignError(error_msg, "no MTP block loaded");
+    return false;
+  }
+  if (hidden_row < 0 ||
+      static_cast<std::uint32_t>(hidden_row) + m > options_.max_speculative) {
+    AssignError(error_msg, "MTP chain outside the kept hidden rows");
+    return false;
+  }
+  const std::uint32_t pos = session.mtp_.position;
+  // The catch-up consumes `m` positions and every chained step one more;
+  // the last proposal needs no further draft position.
+  if (pos + m + proposals - 1 > session.max_context_) {
+    AssignError(error_msg, "MTP context is full");
+    return false;
+  }
+  ++session.mutation_epoch_;
+  // Stage the catch-up tokens; the anchor (their last row) also feeds the
+  // captured chain[0] upload below. Pinned sources the graph nodes point at.
+  std::copy(replay.begin(), replay.end(), tokens_host_);
+  control_host_->position = session.position_;
+  control_host_->mtp_position = pos;
+  control_host_->hidden_row = hidden_row;
+  // The chain queues every node for one synchronization at the end, so the
+  // per-node launch submission hides behind the previous cycle's GPU work.
+  // Capturing one graph per (catch-up rows, proposals) shape instead would
+  // pay an instantiate stall inside a decode cycle on every new shape, which
+  // short requests pay repeatedly as the width adapts; measured over the
+  // first 128 generated tokens, eager submission wins.
+  const bool graph = false;
+  const std::uint64_t key = static_cast<std::uint64_t>(m) |
+                            (static_cast<std::uint64_t>(proposals) << 8) |
+                            (std::uint64_t{1} << 40) |
+                            (std::uint64_t{1} << 41) | (std::uint64_t{1} << 46);
+  Session::Control* control = session.control_;
+  auto* mtp_position_word = &reinterpret_cast<std::uint32_t*>(control)[1];
+  auto* hidden_row_word = &reinterpret_cast<std::int32_t*>(control)[2];
+  const auto body = [&] {
+    // chain[0] is the anchor: the last replay row, staged in pinned memory.
+    if (!Check(hipMemcpyAsync(s_.mtp_chain, tokens_host_ + m - 1,
+                              sizeof(std::int32_t), hipMemcpyHostToDevice,
+                              stream_),
+               "chain anchor upload", error_msg)) {
+      return false;
+    }
+    // Catch-up: the replay rows produce the first proposal's argmax.
+    if (!MtpBody(session, m, pos, true, false, error_msg, nullptr, nullptr,
+                 nullptr, s_.mtp_chain + 1)) {
+      return false;
+    }
+    // The catch-up consumed m draft positions; every later step one more.
+    MtpAdvanceControl(mtp_position_word, hidden_row_word, m, stream_);
+    for (std::uint32_t i = 1; i < proposals; ++i) {
+      if (!MtpBody(session, 1, pos + m + i - 1, true, false, error_msg, nullptr,
+                   nullptr, s_.mtp_chain + i, s_.mtp_chain + i + 1)) {
+        return false;
+      }
+      MtpAdvanceControl(mtp_position_word, hidden_row_word, 1, stream_);
+    }
+    return Check(hipMemcpyAsync(mtp_chain_host_, s_.mtp_chain,
+                                (proposals + 1) * sizeof(std::int32_t),
+                                hipMemcpyDeviceToHost, stream_),
+                 "draft chain download", error_msg);
+  };
+  if (!Run(session, key, graph, body, error_msg)) {
+    return false;
+  }
+  // The chain uploads its anchor from tokens_host_[m-1] at replay start.
+  session.mtp_.position = pos + m + proposals - 1;
+  return true;
+}
+
+std::span<const std::int32_t> Executor::ChainTokens(
+    std::uint32_t proposals) const noexcept {
+  return std::span(mtp_chain_host_, proposals + 1);
+}
+
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        bool token, bool candidates, std::string* error_msg,
-                       const float* hidden_source, MtpTrace* trace) const {
+                       const float* hidden_source, MtpTrace* trace,
+                       const std::int32_t* embed_tokens,
+                       std::int32_t* chain_out) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::size_t final_row = static_cast<std::size_t>(n - 1) * c.hidden_size;
@@ -2132,17 +2295,24 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                                 stream_),
                  "MTP trace download", error_msg);
   };
-  if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                            sizeof(Session::Control), hipMemcpyHostToDevice,
-                            stream_),
-             "control upload", error_msg) ||
-      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
-             "token upload", error_msg)) {
-    return false;
+  if (embed_tokens != nullptr) {
+    // A chained step: the control block already advanced on the device and
+    // the token comes from the previous step's argmax. No host staging.
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                embed_tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
+  } else {
+    if (!Check(hipMemcpyAsync(session.control_, control_host_,
+                              sizeof(Session::Control), hipMemcpyHostToDevice,
+                              stream_),
+               "control upload", error_msg) ||
+        !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "token upload", error_msg)) {
+      return false;
+    }
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   // MTP embeds shifted token IDs. Visual information arrives in the trunk
   // hidden stream; image embeddings belong only to the target input.
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
@@ -2241,8 +2411,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  return (!token && !candidates) ||
-         MtpHead(l.nextn_head_norm, last, token, candidates, error_msg);
+  return (!token && !candidates) || MtpHead(l.nextn_head_norm, last, token,
+                                            candidates, chain_out, error_msg);
 }
 
 }  // namespace gufo::models::qwen35moe::rocm

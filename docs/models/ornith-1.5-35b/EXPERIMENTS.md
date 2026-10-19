@@ -52,7 +52,7 @@
   ground truth for this artifact: it diverges from our F32 oracle at a
   0.6-logit near-tie where the GPU matches the oracle; use the oracle
   gates in QUALITY.md for Q8_0 comparisons.
-- 2026-10-01 Q6_K decode GEMV pass (retained): the vendored mmvq gained
+- 2026-10-19 Q6_K decode GEMV pass (retained): the vendored mmvq gained
   Q6_K (vec_dot, VDR, `mul_mat_vec_moe_dispatch`, `qfn_mmq_moe_vec`
   whitelist) and `VecSupported` admits Q6_K, so `CopyDequantOne` parts
   (LM head, routed Q6_K downs, mixed shared-expert downs) keep a raw
@@ -79,3 +79,50 @@
   split breaks the producer-consumer layout agreement; per-part tensors
   would also need Q8_0 prefill copies. The head dominates the win
   (microbench: head shape 2.34 → 1.86 ms/token at 225 GB/s).
+- 2026-10-19 chained greedy MTP (retained): ported Flash-Next's
+  device-side draft chain. The catch-up and every greedy proposal run as
+  one submission that feeds each step's argmax into the next step's
+  embedding, so the k per-draft stream synchronizations and host round
+  trips collapse into one chain download; the chain is submitted eagerly
+  (its launch submission hides behind the previous cycle's GPU work —
+  per-shape graph capture instead stalls a decode cycle on every new
+  (catch-up, proposals) shape). Verification gained `kVerifyGreedy`:
+  the batched argmax over all verified rows including the frontier rides
+  the verify graph into pinned memory, which removes the per-cycle
+  frontier download and the separate predictions synchronization, and
+  the next anchor comes from the frontier argmax via `DeferSample`.
+  Two synchronizations remain per cycle (chain, verify). Retuned
+  `mtp_costs.hpp` to the chained per-width cycle costs measured at
+  2048-token depth (C1/context-0 ladder 15.5/19.5/22.5/27.5/34/41/49/56.5
+  ms for widths 1-8; context slope and cohort shape keep the Flash-Next
+  measurements), warmed the acceptance prior with the draft's real
+  profile (~90% first proposal, decaying with depth) and stepped the
+  probe one width at a time so probe failures land on the deep depths
+  the short-width scores do not read. Interleaved same-binary A/B at
+  2a289ca, greedy completions hash-identical to the AR reference on
+  every row (lossless property intact; AR and pp within noise):
+  Q4_K_M MTP tg128 98.6 → 101.9 (+3.3%), tg512 105.4 → 110.4 (+4.7%);
+  Q8_0 MTP tg128 82.5 → 84.4 (+2.4%), tg512 86.4 → 86.8 (+0.4%). The
+  mtp_sampling policy test now asserts probe-reaches-limit and a
+  score-optimal steady width under full acceptance (the depth-decaying
+  priors keep unobserved deep widths pessimistic, so the steady choice
+  under perfect acceptance is the cost-optimal width rather than the
+  limit; consecutive full acceptances still probe to the limit first).
+  Rejected variants, both bit-exact but slower: a proposal shortlist
+  (gather kMtpDraftShortlist head rows once per cycle, rank chained
+  steps over them) — Flash-Next's 512-row net collapses depth>=1
+  acceptance on this 248k vocabulary and the candidate reduction kernel
+  cannot Keep > its 1024-wide tile (each pass would grow), so every
+  chained step ranks the full head; and reading the verify tokens
+  straight from the device chain ring (one synchronization per cycle) —
+  the width controller's acceptance evidence shifted and settled d1-heavy
+  on both artifacts (Q4_K_M tg128 66.5 tok/s). Prefill is untouched:
+  pp2048 stays at the WMMA routed tier and the 2026-10-01 pass's
+  arithmetic. Prefill decomposition, Q4_K_M pp512/2048/8192 =
+  2193/2935/2782 tok/s: ~78 ms per 2048-token chunk is the fixed
+  all-expert weight scan (18.1 GB at ~230 GB/s, already at the measured
+  memory roofline) and the marginal ~0.30-0.37 ms/token runs the routed
+  F16 gate/up/down GEMMs and the hybrid attention far below the WMMA
+  peak — the per-token marginal, not the weight scan, is the prefill
+  lever, and it needs a stage profile (routed-tier tile efficiency
+  versus GDN/GQA scaling) before the next kernel change.

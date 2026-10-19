@@ -8,36 +8,40 @@
 
 namespace gufo::models::qwen35moe {
 
-// gfx1151, pinned Flash-Next Q4 target/Q8 MTP, 2026-09-20. Milliseconds per
+// gfx1151, Ornith-1.5-35B Q4_K_M target, 2026-10-19. Milliseconds per
 // cohort, including catch-up, recursive proposals and target verification.
-// Rows are widths 1..8 (width 1 is headless MTP catch-up plus ordinary decode).
-// Reproduce with qwen35moe_gpu_probe --cost-audit 0. Allocation and C1
-// graph capture are warmed outside the measurement; each row is the median
-// of three complete cycles. Use --depth N to audit one depth. See benchmarks.
+// Rows are widths 1..8 (width 1 is headless MTP catch-up plus ordinary
+// decode). The context-0 C1 row is measured on the chained greedy path
+// (device-side draft chain, one full head pass per proposal): width 1-2
+// come from capped `gufo bench` medians, width 0 from the AR cycle plus a
+// one-row headless catch-up, and the ladder beyond from the width probes at
+// --draft-tokens 4/5/7. The context slope and the C2-C8 cohort shape keep
+// the Flash-Next measurements, scaled per column by the measured C1 change;
+// Ornith concurrency cohorts learn online like Flash-Next's.
 inline constexpr float kMtpCycleMilliseconds[3][5][8] = {
     {
         // Context 0
-        {38.4F, 47.2F, 56.7F, 67.2F, 78.4F, 85.8F, 94.5F, 102.6F},        // C1
-        {46.1F, 59.6F, 74.0F, 90.5F, 109.0F, 121.2F, 135.9F, 145.8F},     // C2
-        {57.6F, 80.6F, 108.6F, 131.4F, 161.9F, 183.5F, 213.5F, 234.3F},   // C4
-        {68.4F, 104.7F, 140.2F, 175.5F, 211.6F, 254.2F, 293.7F, 325.8F},  // C6
-        {78.7F, 121.9F, 167.4F, 215.7F, 264.7F, 311.2F, 364.1F, 411.1F},  // C8
+        {15.5F, 19.5F, 22.5F, 27.5F, 34.0F, 41.0F, 49.0F, 56.5F},      // C1
+        {18.6F, 24.6F, 29.3F, 35.8F, 44.2F, 51.2F, 60.5F, 68.7F},      // C2
+        {23.3F, 33.3F, 39.9F, 49.8F, 62.4F, 75.1F, 90.1F, 102.2F},     // C4
+        {27.6F, 43.2F, 51.4F, 66.7F, 82.3F, 103.8F, 124.6F, 144.4F},   // C6
+        {31.8F, 50.3F, 61.8F, 82.1F, 102.9F, 128.5F, 155.4F, 181.2F},  // C8
     },
     {
         // Context 4096
-        {39.7F, 49.3F, 59.8F, 69.7F, 79.1F, 89.1F, 98.6F, 108.8F},        // C1
-        {49.1F, 64.3F, 80.5F, 97.1F, 116.6F, 130.9F, 145.3F, 157.2F},     // C2
-        {62.3F, 87.7F, 118.6F, 142.4F, 173.0F, 197.9F, 228.4F, 255.4F},   // C4
-        {75.1F, 115.4F, 156.5F, 193.1F, 233.5F, 278.9F, 320.1F, 358.1F},  // C6
-        {87.9F, 134.3F, 189.7F, 238.6F, 296.0F, 342.8F, 402.1F, 456.0F},  // C8
+        {16.0F, 20.3F, 23.5F, 28.7F, 35.7F, 42.8F, 51.7F, 59.0F},      // C1
+        {19.8F, 26.5F, 31.9F, 40.2F, 49.0F, 56.3F, 66.7F, 76.5F},      // C2
+        {25.1F, 36.1F, 43.6F, 54.3F, 68.1F, 82.5F, 98.5F, 112.0F},     // C4
+        {30.2F, 47.4F, 57.3F, 74.5F, 92.5F, 116.1F, 140.6F, 163.2F},   // C6
+        {35.5F, 56.1F, 69.8F, 92.5F, 116.7F, 144.4F, 177.6F, 208.6F},  // C8
     },
     {
         // Context 32768
-        {42.5F, 51.9F, 61.5F, 71.1F, 82.5F, 92.5F, 103.6F, 112.6F},        // C1
-        {54.9F, 69.0F, 83.2F, 99.6F, 120.5F, 135.3F, 151.4F, 163.7F},      // C2
-        {73.6F, 96.9F, 125.9F, 150.1F, 185.3F, 212.3F, 243.9F, 266.5F},    // C4
-        {92.0F, 128.6F, 167.0F, 206.3F, 249.5F, 298.3F, 339.1F, 370.7F},   // C6
-        {110.1F, 152.5F, 201.8F, 256.0F, 321.9F, 376.1F, 432.0F, 490.9F},  // C8
+        {17.2F, 21.4F, 24.2F, 29.5F, 37.2F, 44.4F, 53.9F, 62.1F},       // C1
+        {22.1F, 30.0F, 36.7F, 46.4F, 57.5F, 70.0F, 83.1F, 95.6F},       // C2
+        {29.6F, 43.3F, 52.6F, 67.1F, 85.6F, 103.4F, 124.8F, 143.4F},    // C4
+        {37.0F, 59.6F, 71.8F, 92.2F, 114.8F, 147.6F, 180.0F, 210.3F},   // C6
+        {44.5F, 71.9F, 90.9F, 121.8F, 155.1F, 191.3F, 236.4F, 278.7F},  // C8
     },
 };
 

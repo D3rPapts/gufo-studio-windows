@@ -359,6 +359,12 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
 
+/// Advances the draft control block after one chained draft stage: the draft
+/// position moves by `count` tokens and `hidden_row` falls back to the
+/// carried residual. Graph-safe.
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::int32_t* hidden_row,
+                       std::uint32_t count, hipStream_t stream);
+
 }  // namespace gufo::models::qwen35moe::rocm
 
 #endif  // GUFO_MODELS_QWEN35MOE_KERNELS_ROCM_KERNELS_HPP_

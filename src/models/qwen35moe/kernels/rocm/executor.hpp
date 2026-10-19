@@ -162,7 +162,7 @@ public:
       std::uint32_t rollback_depth) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
-  enum class ForwardMode { kDecode, kVerify, kPrefill };
+  enum class ForwardMode { kDecode, kVerify, kVerifyGreedy, kPrefill };
 
   /// Appends `tokens` (at most max_batch) to the session and returns the
   /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
@@ -229,6 +229,19 @@ public:
                                 std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg,
                                 const float* hidden_source = nullptr) const;
+  /// Runs the catch-up over `replay` rows and then `proposals` greedy draft
+  /// steps as one device-side chain: every step embeds the previous step's
+  /// argmax, so the host round trip happens once, after the last proposal.
+  /// The pinned chain is readable through ChainTokens() until the next
+  /// chained cycle. Graph-captured like MtpForward.
+  [[nodiscard]] bool MtpDraftChain(Session& session,
+                                   std::span<const std::int32_t> replay,
+                                   std::int32_t hidden_row,
+                                   std::uint32_t proposals,
+                                   std::string* error_msg) const;
+  /// The last MtpDraftChain's tokens: the anchor plus one proposal per step.
+  [[nodiscard]] std::span<const std::int32_t> ChainTokens(
+      std::uint32_t proposals) const noexcept;
   /// Leading kept trunk rows, for independent predictor qualification.
   [[nodiscard]] bool CopyTrunkHidden(const Session& session,
                                      std::span<float> hidden,
@@ -247,6 +260,17 @@ public:
   /// Plain greedy verification keeps full logit rows on the GPU.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
+
+  /// A kVerifyGreedy Forward ranks every verified row, the frontier
+  /// included, inside its graph and parks the candidates in pinned memory;
+  /// this copies them out after the Forward's synchronization.
+  [[nodiscard]] bool ReadGreedyPredictions(
+      std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
+
+  /// The kVerifyGreedy body's tail: batched argmax over all verified rows
+  /// into the pinned prediction buffer. Graph-safe.
+  [[nodiscard]] bool GreedyArgmaxNodes(std::uint32_t n_logits,
+                                       std::string* error_msg) const;
 
   /// A session's complete context as one host byte payload: recurrent state,
   /// KV caches up to the position, and the draft block's caches plus the
@@ -367,16 +391,20 @@ private:
   /// The plain residual update: res += block_out.
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
+  /// A chained step (`chain_out`) parks its argmax on the device.
   bool MtpHead(const DeviceTensor& head_norm, const float* res, bool token,
-               bool candidates, std::string* error_msg) const;
+               bool candidates, std::int32_t* chain_out,
+               std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
-                   bool download_logits, bool speculative,
+                   bool download_logits, bool speculative, bool greedy_argmax,
                    std::uint32_t start_pos, std::uint32_t first_layer,
                    std::uint32_t end_layer, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg,
-               const float* hidden_source, MtpTrace* trace) const;
+               const float* hidden_source, MtpTrace* trace,
+               const std::int32_t* embed_tokens = nullptr,
+               std::int32_t* chain_out = nullptr) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -454,6 +482,9 @@ private:
     std::uint32_t* mtp_ids;
     std::uint32_t* mtp_scratch_ids;
     float* mtp_scores;
+    /// [anchor + proposals] device token ring of a chained greedy cycle:
+    /// each step embeds its predecessor's argmax and writes its own.
+    std::int32_t* mtp_chain;
   };
   mutable Scratch s_{};
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
@@ -499,6 +530,13 @@ private:
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
+  /// Pinned anchor + draft proposals written by the captured MtpDraftChain
+  /// download; readable without a synchronization after the chain's
+  /// hipStreamSynchronize.
+  std::int32_t* mtp_chain_host_{nullptr};
+  /// Pinned per-row argmax candidates written by the captured kVerifyGreedy
+  /// body; ReadGreedyPredictions() copies them after the Forward syncs.
+  ArgmaxCandidate* mtp_predictions_host_{nullptr};
   // What s_.x_q8t / s_.x_half currently hold (input pointer, rows, cols,
   // and the half type), so a projection over the same rows skips its
   // activation pass. Cleared whenever the source buffer is rewritten.

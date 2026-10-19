@@ -783,6 +783,9 @@ struct Session::PendingDecode {
   bool sampled{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
+  /// The chain was drafted on the device (MtpDraftChain); its tokens came
+  /// from the executor's pinned download instead of host-side proposals.
+  bool greedy_pinned{false};
   std::size_t width{0};
   std::optional<sampling::SamplerState> draft_sampler;
   std::uint64_t draft_rng{0};
@@ -823,13 +826,29 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
   const auto committed = static_cast<std::uint32_t>(tokens_.size());
+  // Pure greedy single-session cycles pick their width from the same runtime
+  // cost controller the batch path uses (one row): live cycle timings replace
+  // the static cost table, so cheaper cycles widen speculation. Seeded
+  // requests replay their exact widths (and tokens) across restores, sampled
+  // requests keep the acceptance-history policy and its fixed cost table for
+  // seeded replay.
+  std::optional<std::uint32_t> learned;
+  if (MtpEnabled() && cap > 1 && !batch_drafts && sampler.config().seed < 0 &&
+      !sampler.config().uses_random_sampling() &&
+      !sampler.config().penalties_enabled()) {
+    const MtpBatchController::Row row{&draft_length_,
+                                      static_cast<std::uint32_t>(cap - 1)};
+    learned = model_->batch_policy_.Choose(
+        std::span<const MtpBatchController::Row>(&row, 1), committed);
+  }
   const std::size_t width =
       DFlashEnabled() && cap > 1
           ? 1 + dflash_length_.Choose(static_cast<std::uint32_t>(cap - 1),
                                       committed)
       : MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts
-                     ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+                 : learned
+                     ? std::min<std::uint32_t>(*learned, cap - 1)
                      : draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
                                             committed))
           : cap;
@@ -857,6 +876,37 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
   const bool gpu_verification = gpu_greedy;
   if (!DFlashEnabled()) {
+    // Greedy MTP keeps every draft token on the device: the catch-up and
+    // all proposals run as one chained submission and the trunk verify
+    // consumes the chain's device token ring. The host round trip happens
+    // once, when the verify pass synchronizes.
+    bool chained = false;
+    if (!defer_head && gpu_greedy && !sampled) {
+      std::vector<std::int32_t> replay;
+      std::int32_t replay_row = 0;
+      if (!DraftReplay(anchor, &replay, &replay_row, error_msg)) {
+        return false;
+      }
+      if (!replay.empty() && !exec.MtpDraftChain(*session_, replay, replay_row,
+                                                 width - 1, error_msg)) {
+        return false;
+      }
+      if (!replay.empty()) {
+        const auto tokens = exec.ChainTokens(width - 1);
+        pending->chain.assign(tokens.begin(), tokens.end());
+        chained = true;
+      }
+    }
+    if (chained) {
+      pending->width = width;
+      pending->base = base;
+      pending->speculative = true;
+      pending->sampled = sampled;
+      pending->gpu_greedy = gpu_greedy;
+      pending->gpu_verification = gpu_verification;
+      pending->greedy_pinned = true;
+      return true;
+    }
     if (!defer_head &&
         !DraftCatchUp(anchor, true, error_msg,
                       sampled ? &pending->candidates : nullptr)) {
@@ -939,12 +989,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
   auto& sampler = *request.sampler;
   auto* result = request.result;
   auto& exec = *model_->executor_;
-  const auto& chain = pending.chain;
-  const auto& proposals = pending.proposals;
   const auto base = pending.base;
   const bool sampled = pending.sampled;
   const bool gpu_greedy = pending.gpu_greedy;
   const bool gpu_verification = pending.gpu_verification;
+  const auto& chain = pending.chain;
+  const auto& proposals = pending.proposals;
   const auto anchor = chain.front();
   const auto k = static_cast<std::uint32_t>(chain.size());
   const auto vocab = model_->VocabSize();
@@ -974,9 +1024,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
-  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
+  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens + 1> greedy{};
   if (gpu_greedy &&
-      !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), error_msg)) {
+      !(pending.greedy_pinned
+            ? exec.ReadGreedyPredictions(std::span(greedy).first(k), error_msg)
+            : exec.GreedyMtpPredictions(std::span(greedy).first(k - 1),
+                                        error_msg))) {
     return false;
   }
   std::uint32_t keep = 1;
@@ -1027,8 +1080,15 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
-  if (!exec.Rollback(*session_, keep, error_msg,
-                     gpu_verification ? logits_.data() : nullptr)) {
+  if (pending.greedy_pinned) {
+    // The frontier row's argmax rode inside the verify graph: the next
+    // anchor needs no frontier download, and a fully accepted chain skips
+    // the rollback drain entirely.
+    if (!exec.Rollback(*session_, keep, error_msg, nullptr)) {
+      return false;
+    }
+  } else if (!exec.Rollback(*session_, keep, error_msg,
+                            gpu_verification ? logits_.data() : nullptr)) {
     return false;
   }
   if (!gpu_verification) {
@@ -1064,7 +1124,11 @@ bool Session::FinishDecode(const DecodeRequest& request,
     // then, retaining this session's target hidden rows across interleaving.
     exec.MtpRewind(*session_, base);
   }
-  if (correction) {
+  if (pending.greedy_pinned && !result->stop) {
+    // The next cycle's anchor is the verify graph's frontier argmax; the
+    // chained path guarantees an unmodified argmax can be selected.
+    sampler.DeferSample(static_cast<sampling::TokenId>(greedy[keep - 1].index));
+  } else if (correction) {
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
@@ -1082,6 +1146,15 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  // Greedy MTP cycle durations feed the width controller exactly like
+  // batched cycles do; seeded and sampled requests never observe into it,
+  // so replayed widths and tokens stay deterministic.
+  const bool timed = MtpEnabled() && sampler.config().seed < 0 &&
+                     !sampler.config().uses_random_sampling() &&
+                     !sampler.config().penalties_enabled();
+  const auto cycle_start = timed ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+  const auto cycle_context = static_cast<std::uint32_t>(tokens_.size());
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg)) {
     return false;
@@ -1095,12 +1168,25 @@ bool Session::DecodeStep(std::size_t max_tokens,
                                              : verify_logits_.data();
   if (!model_->executor_->Forward(
           *session_, pending.chain, pending.chain.size(), logits,
-          pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                              : rocm::Executor::ForwardMode::kDecode,
+          pending.speculative
+              ? (pending.greedy_pinned
+                     ? rocm::Executor::ForwardMode::kVerifyGreedy
+                     : rocm::Executor::ForwardMode::kVerify)
+              : rocm::Executor::ForwardMode::kDecode,
           error_msg)) {
     return false;
   }
   const bool ok = FinishDecode(request, pending, error_msg);
+  if (ok && timed) {
+    model_->batch_policy_.Observe(
+        1, cycle_context,
+        pending.speculative
+            ? static_cast<std::uint32_t>(pending.chain.size() - 1)
+            : 0,
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count());
+  }
   valid_ = ok;
   return ok;
 }

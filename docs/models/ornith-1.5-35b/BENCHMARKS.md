@@ -11,6 +11,17 @@ run fills them).
 
 [Quality and measurement details](QUALITY.md)
 
+> 2026-10-19: the chained greedy MTP pass supersedes the single-user MTP
+> rows below (tables are driver-rendered and not yet re-rendered on
+> Windows). Same host and method, interleaved same-binary A/B against
+> 2a289ca, greedy completions hash-identical to the isolated AR reference
+> on every row: Q4_K_M pp2048 2946-2951 (unchanged), AR tg128 69.4-69.5
+> (unchanged), MTP tg128 98.6 → 101.9 (+3.3%), MTP tg512 105.4 → 110.4
+> (+4.7%); Q8_0 pp2048 3101-3102 and AR tg128 52.6 (unchanged), MTP
+> tg128 82.5 → 84.4 (+2.4%), MTP tg512 86.4 → 86.8 (+0.4%). The whole
+> table moved since the 2026-10-01 note (upstream merges: AR tg128
+> 69.4, MTP tg128 98.6 at 2a289ca). · [Experiments](EXPERIMENTS.md)
+>
 > 2026-10-01: the Q6_K decode pass supersedes the single-user AR/MTP rows
 > below (tables are driver-rendered and not yet re-rendered on Windows):
 > native pp2048 2922 +/- 27, tg128 AR 64.79 +/- 0.44, tg128 MTP 88.48 +/-

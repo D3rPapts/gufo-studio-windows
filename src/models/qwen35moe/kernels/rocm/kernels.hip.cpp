@@ -4926,6 +4926,21 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                      base, alt, row, dst, width);
 }
 
+__global__ void MtpAdvanceControlKernel(std::uint32_t* mtp_position,
+                                        std::int32_t* hidden_row,
+                                        std::uint32_t count) {
+  if (threadIdx.x == 0) {
+    *mtp_position += count;
+    *hidden_row = -1;
+  }
+}
+
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::int32_t* hidden_row,
+                       std::uint32_t count, hipStream_t stream) {
+  hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
+                     mtp_position, hidden_row, count);
+}
+
 void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, hipStream_t stream) {

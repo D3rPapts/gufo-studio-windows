@@ -71,10 +71,13 @@ public:
     }
     // A fully accepted chain supplies no observations for its tail. Probe
     // farther rather than permanently treating those depths as the prior.
+    // One step at a time: a probe's rejection lands at its own depth, and a
+    // shallow probe depth keeps that failure off the depths the short-width
+    // scores read, where it would otherwise collapse the width for cycles.
     state_.probe_depth = 0;
     if (accepted == drafted && drafted < limit_) {
       if (drafted >= state_.explored_depth || state_.probe_delay == 0) {
-        state_.probe_depth = std::min<std::uint32_t>(2 * drafted, limit_);
+        state_.probe_depth = std::min<std::uint32_t>(drafted + 1, limit_);
         state_.probe_delay = 16;
       } else {
         --state_.probe_delay;
@@ -94,8 +97,22 @@ public:
   }
 
   void Reset() noexcept {
-    state_.successes.fill(1.5F);
-    state_.failures.fill(0.5F);
+    // Cold-start acceptance prior of the in-file quantization-aware draft:
+    // ~90% for the first two proposals on typical text (63-79% in the
+    // serving tables, 76-91% on the bench prompt), decaying with depth as
+    // the draft's agreement with the target diverges. A flat neutral 0.75
+    // prior spends the first ~30 cycles of every session recovering
+    // evidence the retuned cycle costs already imply, and a flat 0.9 one
+    // overreaches into depths whose real acceptance is half that, whose
+    // failures then collapse the early widths the same way.
+    static constexpr float kPriorSuccess[kMaxMtpDraftTokens] = {
+        4.5F, 4.5F, 3.5F, 2.75F, 2.25F, 2.0F, 1.75F};
+    static constexpr float kPriorFailure[kMaxMtpDraftTokens] = {
+        0.5F, 0.5F, 1.5F, 2.25F, 2.75F, 3.0F, 3.25F};
+    for (std::size_t depth = 0; depth < kMaxMtpDraftTokens; ++depth) {
+      state_.successes[depth] = kPriorSuccess[depth];
+      state_.failures[depth] = kPriorFailure[depth];
+    }
     state_.retry_tokens = 0;
     state_.probe_depth = 0;
     state_.explored_depth = 0;

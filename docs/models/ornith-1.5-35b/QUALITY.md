@@ -94,6 +94,25 @@
   single-mtp,multi-ar,multi-mtp`, then `render --no-charts`.
   Windows needs the `servers.py` terminate fallback (no process groups).
 
+## Chained MTP gates (2026-10-19)
+
+- Every greedy MTP completion (Q4_K_M and Q8_0, tg128 r3 and tg512,
+  interleaved same-binary A/B) hash-matches the isolated AR reference;
+  the lossless property is unchanged by the device-side draft chain and
+  the `kVerifyGreedy` frontier argmax. AR and pp2048 move within noise.
+- `qwen35moe.mtp_sampling` covers the new width-controller semantics
+  (probe-reaches-limit under full acceptance, score-optimal steady
+  width, restore/backoff invariants). `qwen35moe.config`,
+  `qwen35moe.gdn_ops` pass; `qwen35moe.attention_ops` fails only its
+  documented pre-existing 2-ulp replay preparation case. Snapshot
+  payloads are unchanged: the chain and prediction buffers are
+  executor scratch, and the controller state rides the existing
+  `MtpLengthState` (old payloads restore unchanged).
+- Width-controller costs (`mtp_costs.hpp`) are now Ornith-measured for
+  the chained path; the served greedy C1 path additionally learns cycle
+  costs online (seeded, sampled and penalty-greedy requests keep the
+  static table and the fixed policy for deterministic replay).
+
 ## Q6_K decode kernel gates (2026-10-01)
 
 - Kernel vs exact host dequant over real artifact weights: the LM head's
