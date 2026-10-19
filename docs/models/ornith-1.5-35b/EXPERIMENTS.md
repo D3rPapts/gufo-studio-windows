@@ -116,13 +116,36 @@
   chained step ranks the full head; and reading the verify tokens
   straight from the device chain ring (one synchronization per cycle) —
   the width controller's acceptance evidence shifted and settled d1-heavy
-  on both artifacts (Q4_K_M tg128 66.5 tok/s). Prefill is untouched:
-  pp2048 stays at the WMMA routed tier and the 2026-10-01 pass's
-  arithmetic. Prefill decomposition, Q4_K_M pp512/2048/8192 =
-  2193/2935/2782 tok/s: ~78 ms per 2048-token chunk is the fixed
-  all-expert weight scan (18.1 GB at ~230 GB/s, already at the measured
-  memory roofline) and the marginal ~0.30-0.37 ms/token runs the routed
-  F16 gate/up/down GEMMs and the hybrid attention far below the WMMA
-  peak — the per-token marginal, not the weight scan, is the prefill
-  lever, and it needs a stage profile (routed-tier tile efficiency
-  versus GDN/GQA scaling) before the next kernel change.
+  on both artifacts (Q4_K_M tg128 66.5 tok/s). Prefill keeps the
+  2026-10-01 pass's WMMA routed arithmetic; see the 2026-10-19 device
+  dispatch entry below for its stage profile.
+- 2026-10-19 device-side routed dispatch (retained): temporary hipEvent
+  stage spans around the prefill showed every layer stopping at the
+  expert-counts readback — `hipEventSynchronize(counts_ready_)` plus a
+  three-pass host tile-map build and upload, up to 676 ms of host wall
+  per 2048-token chunk. The readback was not the wall-clock limiter (the
+  host was waiting on the GPU), but it serialized every layer and it was
+  the only host round trip left in the chunk. The maps now build on the
+  device: one 256-thread `RoutedTileMaps` kernel compacts each map's
+  (expert, row tile) entries from the device-side expert counts and pads
+  the rest of a fixed per-map capacity with 0xFFFFFFFF sentinels, and the
+  routed GEMM grids run at that capacity, skipping sentinels in-kernel —
+  no `n_tiles` crosses to the host and `RouteHints` reads nothing. The
+  count-dependent map refinements (the 128-row pair map and the
+  wide-down 48/64 choice) folded into fixed token-count-and-format
+  choices; their effect is inside the measured delta. Interleaved
+  same-binary A/B at b0d9209, greedy completions hash-identical to the
+  isolated AR reference on every row: pp2048 Q4_K_M 2951 → 3005 (+1.9%),
+  Q8_0 3102 → 3233 (+4.2% — the all-native artifact's heavier per-layer
+  dispatch made the readback costlier); AR tg and MTP tg unchanged within
+  noise. `gufo bench --validate-prefill 8` passes (cosine 0.9995,
+  scalar_winner_rank 1); qwen35moe config/gdn/mtp_sampling pass and
+  attention_ops shows only its documented pre-existing 2-ulp replay
+  case. The corrected prefill stage profile (hipEvent spans, one
+  2048-token chunk ≈ 700 ms): GDN linear attention ~219 ms (31%), routed
+  gate/up+down F16 GEMMs ~165 ms (all 256 experts' weights read per
+  chunk at near the memory roofline), shared expert ~67 ms, GQA ~67 ms,
+  router ~17 ms, epilogue ~30 ms, compaction and norms ~20 ms — the
+  prefill is GPU-bound, and the next prefill levers are the GDN scan and
+  the shared-expert F16 GEMMs (~8-16 TFLOPS effective), not the host
+  path.

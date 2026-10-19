@@ -134,6 +134,15 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
 
+/// Builds up to three routed-GEMM launch maps from the device-side expert
+/// counts so no layer waits for a counts readback. Map m (token rows
+/// `rows.m`, 0 = unused) lands at `tiles` offset `caps[0] (+ caps[1])`,
+/// holds `caps.m` entries and packs live (expert | row tile << 16) tiles
+/// compactly from the front with 0xFFFFFFFF sentinels behind, which the
+/// capacity-sized GEMM grids skip. One block, 256 threads.
+void RoutedTileMaps(const std::uint32_t* counts, std::uint32_t experts,
+                    uint3 rows, uint3 caps, std::int32_t* tiles,
+                    hipStream_t stream);
 /// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
 /// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read
 /// and the whole K extent accumulates in F32. `tiles` (n_tiles entries)

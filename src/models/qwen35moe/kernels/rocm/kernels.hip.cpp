@@ -2965,6 +2965,11 @@ __launch_bounds__(256) __global__
       reinterpret_cast<uint4*>(lds + kCodeBytes + kHighBytes + kScaleBytes);
 
   const std::int32_t tile = tiles[blockIdx.y];
+  // A capacity-sized grid reads sentinel tiles past the real map: the
+  // device-built map pads it so the launch needs no host-side tile count.
+  if (tile == -1) {
+    return;
+  }
   const int expert = tile & 0xFFFF;
   const int t_local = (tile >> 16) * BN;
   const int bucket_begin = pad_bounds[expert];
@@ -3738,6 +3743,74 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
   hipLaunchKernelGGL(RoutedScatterKernel, dim3(Blocks(slots)), dim3(kThreads),
                      0, stream, ids, pad_bounds, cursors, rows_token, rows_slot,
                      static_cast<std::uint32_t>(slots), k);
+}
+
+// Builds the routed GEMMs' (expert | row tile << 16) launch maps on the
+// device so no layer waits for an expert-counts readback. One map per
+// `rows` component: map m lives at tiles[m == 0 ? 0 : caps.x (+: caps.y)]
+// and holds `caps.m` entries - the experts' real tiles compacted from the
+// front and 0xFFFFFFFF sentinels behind them, which the capacity-sized
+// GEMM grids skip. `rows.m == 0` marks an unused map (all sentinels).
+__global__ void RoutedTileMapsKernel(const std::uint32_t* __restrict__ counts,
+                                     std::uint32_t experts, uint3 rows,
+                                     uint3 caps,
+                                     std::int32_t* __restrict__ tiles) {
+  __shared__ std::uint32_t scan[3][257];
+  const std::uint32_t e = threadIdx.x;
+  const bool live = e < experts;
+  const std::uint32_t c = live ? counts[e] : 0;
+  std::uint32_t n[3];
+  const std::uint32_t rows_arr[3] = {rows.x, rows.y, rows.z};
+  const std::uint32_t caps_arr[3] = {caps.x, caps.y, caps.z};
+#pragma unroll
+  for (unsigned m = 0; m < 3; ++m) {
+    n[m] = live && rows_arr[m] != 0 ? (c + rows_arr[m] - 1) / rows_arr[m] : 0;
+    scan[m][e] = n[m];
+  }
+  __syncthreads();
+  for (std::uint32_t off = 1; off < experts; off <<= 1) {
+    std::uint32_t v[3];
+#pragma unroll
+    for (unsigned m = 0; m < 3; ++m) {
+      v[m] = scan[m][e] + (e >= off ? scan[m][e - off] : 0);
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned m = 0; m < 3; ++m) {
+      scan[m][e] = v[m];
+    }
+    __syncthreads();
+  }
+  std::uint32_t base = 0;
+#pragma unroll
+  for (unsigned m = 0; m < 3; ++m) {
+    if (live) {
+      const std::uint32_t begin = e > 0 ? scan[m][e - 1] : 0;
+      for (std::uint32_t j = 0; j < n[m]; ++j) {
+        tiles[base + begin + j] = static_cast<std::int32_t>(e | (j << 16));
+      }
+    }
+    base += caps_arr[m];
+  }
+  // Pad every map's unused capacity behind its last real tile.
+  __syncthreads();
+  const std::uint32_t total[3] = {scan[0][experts - 1], scan[1][experts - 1],
+                                  scan[2][experts - 1]};
+  base = 0;
+#pragma unroll
+  for (unsigned m = 0; m < 3; ++m) {
+    for (std::uint32_t i = total[m]; i < caps_arr[m]; ++i) {
+      tiles[base + i] = -1;
+    }
+    base += caps_arr[m];
+  }
+}
+
+void RoutedTileMaps(const std::uint32_t* counts, std::uint32_t experts,
+                    uint3 rows, uint3 caps, std::int32_t* tiles,
+                    hipStream_t stream) {
+  hipLaunchKernelGGL(RoutedTileMapsKernel, dim3(1), dim3(256), 0, stream,
+                     counts, experts, rows, caps, tiles);
 }
 
 template<int BN>

@@ -867,10 +867,10 @@ void Executor::RoutedHints(const DeviceTensor& w,
 
 bool Executor::RouteHints(std::uint32_t n_tokens,
                           std::string* error_msg) const {
-  // Every column tile past an expert's bucket still costs a dispatch and a
-  // full shared-memory reservation, so the grid is cut to the real largest
-  // bucket. Counts are downloaded before the shared expert; wait only for
-  // that download while the shared expert continues on the same stream.
+  // The launch maps are built on the device from the expert counts
+  // (RoutedTileMaps) and the GEMM grids run at a fixed capacity whose
+  // sentinel tail the kernel skips, so this stays count-free and the
+  // host never synchronizes with the layer's router.
   const Config& c = config();
   routed_max_rows_ = 0;
   routed_64_tiles_ = 0;
@@ -880,59 +880,9 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
-    return false;
-  }
-  // The F16 expert GEMM launches one block per (expert, row tile of its
-  // 16-padded bucket): the map is built here and uploaded ahead of the
-  // launches on the same stream.
-  std::uint32_t max_rows = 0;
-  std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
       static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
-  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-    const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
-    max_rows = std::max(max_rows, counts_host_[e]);
-    for (std::uint32_t j = 0;
-         j < (padded + routed_tile_rows_ - 1) / routed_tile_rows_; ++j) {
-      tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-    }
-  }
-  routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
-  routed_n_tiles_ = n_tiles;
-  // Append the 64-token map for gate/up and eligible down projections.
-  // Wide expert buckets also get a 128-token gate/up map: it amortizes
-  // weight decoding, while short buckets retain the cheaper 64-token tile.
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
-    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-      const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
-      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
-        tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-    }
-    routed_64_tiles_ = n_tiles - routed_n_tiles_;
-    routed_pair_offset_ = routed_n_tiles_;
-    routed_pair_tiles_ = routed_64_tiles_;
-    std::uint32_t tiles_128 = 0;
-    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-      tiles_128 += (counts_host_[e] + 127u) / 128u;
-    }
-    if (tiles_128 * 4 <= routed_64_tiles_ * 3) {
-      routed_pair_rows_ = 128;
-      routed_pair_offset_ = n_tiles;
-      routed_pair_tiles_ = tiles_128;
-      for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-        for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
-          tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-        }
-      }
-    }
-  }
-  routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
-      counts_host_, static_cast<int>(c.num_experts));
-  return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
-                                              n_tiles * sizeof(std::int32_t),
-                                              hipMemcpyHostToDevice, stream_),
-                               "routed tile map upload", error_msg);
+  return true;
 }
 
 bool Executor::Experts(const DeviceTensor& w, const float* x,
@@ -1242,14 +1192,6 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
-    if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                              c.num_experts * sizeof(std::uint32_t),
-                              hipMemcpyDeviceToHost, stream_),
-               "expert counts download", error_msg) ||
-        !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
-               error_msg)) {
-      return false;
-    }
   }
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
@@ -1344,49 +1286,57 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // IQ3_S runs the two projections separately with the same fused SwiGLU.
     const bool pair_ok =
         gate_type == WeightType::kQ4_K || gate_type == WeightType::kQ5_K;
-    const bool gated_ok =
-        pair_ok && n_tokens >= 1024 && routed_tile_rows_ == 48
-            ? RoutedGatedF16Gemm(
-                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
-                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
-            : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, nullptr, s_.gate_e, nullptr,
-                             c.expert_ff, c.hidden_size, stream_) &&
-               RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, s_.gate_e, nullptr, up_half,
-                             c.expert_ff, c.hidden_size, stream_));
-    if (!gated_ok) {
-      AssignError(error_msg, "routed F16 gate/up GEMM failed");
-      return false;
-    }
     const WeightType down_type =
         l.ffn_down_exps.type == GgmlType::kQ8_0     ? WeightType::kQ8_0
         : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
         : l.ffn_down_exps.type == GgmlType::kQ4_K   ? WeightType::kQ4_K
                                                     : WeightType::kQ5_1;
-    // Larger down tiles amortize weight decoding. Reuse the 64-token map
-    // when it has no more padded rows than the 48-token map. Q4_K tiles
-    // stop at 48 rows, so the wide map does not apply.
-    const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0 ||
-         down_type == WeightType::kIQ4_NL) &&
-        routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
-        routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
+    // The launch maps are built on the device from the expert counts: the
+    // tile rows follow the token count and weight formats alone, and the
+    // capacity-sized grids' sentinel tails are skipped in-kernel, so no
+    // stage reads the counts on the host.
+    const uint3 map_rows = make_uint3(
+        routed_tile_rows_,
+        pair_ok && n_tokens >= 1024 && routed_tile_rows_ == 48 ? 64U : 0U,
+        down_type == WeightType::kQ4_K
+            ? routed_tile_rows_
+            : (routed_tile_rows_ == 48 ? 64U : routed_tile_rows_));
+    const auto map_capacity = [&](std::uint32_t rows) {
+      return rows == 0 ? 0U : slots / rows + c.num_experts + 1;
+    };
+    const uint3 caps =
+        make_uint3(map_capacity(map_rows.x), map_capacity(map_rows.y),
+                   map_capacity(map_rows.z));
+    RoutedTileMaps(s_.expert_counts, c.num_experts, map_rows, caps,
+                   s_.routed_tiles, stream_);
+    const bool gated_ok =
+        map_rows.y != 0
+            ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                 gate_type, x_half, s_.routed_tiles + caps.x,
+                                 caps.y, map_rows.y, s_.routed_bounds,
+                                 s_.rows_token, s_.rows_slot, up_half,
+                                 c.expert_ff, c.hidden_size, stream_)
+            : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
+                             s_.routed_tiles, caps.x, map_rows.x,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             nullptr, s_.gate_e, nullptr, c.expert_ff,
+                             c.hidden_size, stream_) &&
+               RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
+                             s_.routed_tiles, caps.x, map_rows.x,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             s_.gate_e, nullptr, up_half, c.expert_ff,
+                             c.hidden_size, stream_));
+    if (!gated_ok) {
+      AssignError(error_msg, "routed F16 gate/up GEMM failed");
+      return false;
+    }
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
-                       s_.routed_tiles + (wide_down ? routed_n_tiles_ : 0),
-                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
-                       wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
-                       s_.rows_slot, s_.rows_slot, nullptr, nullptr,
-                       reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
-                       c.expert_ff, stream_)) {
+                       s_.routed_tiles + caps.x + caps.y, caps.z, map_rows.z,
+                       s_.routed_bounds, s_.rows_slot, s_.rows_slot, nullptr,
+                       nullptr, reinterpret_cast<__half*>(s_.down_e),
+                       c.hidden_size, c.expert_ff, stream_)) {
       AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }
