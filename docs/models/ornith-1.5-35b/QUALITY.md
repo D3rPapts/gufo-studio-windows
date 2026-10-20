@@ -157,3 +157,23 @@ values as the retained 2026-10-19 prefill pass. `qwen35moe.attention_ops`
 chunk cases (n=136 and n=2048, full vs chunked prefill against the
 per-token reference) are bit-exact (`differing=0 max=0`); the suite
 fails only its documented pre-existing 2-ulp replay preparation case.
+
+## Quantized KV gates (2026-10-20)
+
+The opt-in `--kv-cache q8_0` / `q8_0-q4_k` modes trade numerical
+fidelity for half the per-token KV bytes. Gates, all on ef4326e:
+`qwen35moe.attention_ops` gains an int8-dot oracle case — keys stored
+through the preparation's Q8_0 layout, queries quantized by the same
+kernel decode uses, and the gated context compared against dequantized
+float64 attention: worst absolute error 5.5e-6 (n=4@d4096, n=32@d9000);
+the case runs before the suite's documented pre-existing preparation
+failure. F16 mode stays bitwise: greedy completions hash-identical to
+the reference build at d0/d32K/d131072, both artifacts. Quantized mode
+on the bench prompt produces completions hash-identical to F16 at
+d32768 and d131072 (AR and MTP), and validate-prefill reports cosine
+0.999539, scalar_winner_rank 1 at d32768 — the same envelope as the
+F16 prefill. Natural-text probes: coherent and factually correct with
+minor near-tie phrasing drift versus F16; treat the modes as lossy and
+qualify quality-sensitive workloads on F16. Snapshots record both
+plane dtypes, so a quantized session never restores into an F16 one or
+vice versa.
