@@ -192,9 +192,37 @@
   per-tile LDS fragment loads (q and K re-read from `kv_lds`/`q_lds` per
   16-key tile for the WMMA operands): the q-in-LDS variant's +7% matches
   its added LDS traffic, and the 226-VGPR original and 180-VGPR variant
-  land within noise of each other. A redesign that keeps the WMMA
-  fragments in registers under ~128 VGPRs (or restructures the
-  fragment schedule) is the remaining prefill lever; until then the
-  long-context prefill slope is architectural for a dense-attention
-  model and the depth cost of one extra 2048-token chunk grows
-  ~16 µs/token of prefix.
+  land within noise of each other. A follow-up per-phase clock probe
+  (thread 0 of every block, summed per launch) refined that read: ~54%
+  of thread-0 cycles sit in the two inter-tile barriers — the block's
+  eight waves are imbalanced (S runs on only four waves, the four-lane
+  softmax on only waves 0-3), so each of the four per-tile barriers
+  waits on the slowest wave's serial path of roughly 2 µs per 16-key
+  tile, and every phase's cost reappears inside that path no matter
+  what the memory system does. A wave-balanced rewrite (four dim
+  quarters so all waves compute S, an eight-lane softmax, fragments in
+  registers under ~128 VGPRs) shortens the chain at best ~2-3x, which
+  still leaves prefill near -70% at 131K — well short of the -13.5%
+  Flash-Next reports, because Flash-Next's flat prefill reads its
+  indexer's top selection rather than the whole prefix. Reaching that
+  profile with dense attention would need an entirely different kernel
+  architecture (64-128 query rows per KV pass, register-resident
+  fragments); until then the long-context prefill slope is
+  architectural for this model and the depth cost of one extra
+  2048-token chunk grows ~16 µs/token of prefix.
+- 2026-10-20 deep MTP width controller (retained unchanged): a flat
+  optimistic acceptance prior (0.9 at every depth, probe build) moved
+  drafted/cycle only 2.34 → 2.45 at d131072 and cost 49.6 vs 50.6
+  tok/s, so the depth-decaying prior is not what limits deep widths.
+  The real constraint is the marginal cost of another verify row at
+  depth: the narrow trunk runs its vector kernels per row and the
+  per-token attention kernel reads the prefix per row (no cross-row KV
+  amortization below the 8-row vector contract), ~21 ms per row at
+  131K against ~22 ms of expected tokens — width 2-3 is the true
+  optimum, and the controller's extrapolated cost ladder (whose
+  depth slope and marginals are both several times off) lands there
+  through compensating errors. Batching verify rows through the wide
+  arithmetic would break the bitwise greedy equivalence the model's
+  lossless gate requires. Deep MTP already outruns the reference
+  profile: Ornith Q4_K_M MTP at 131K decodes 50.6 tok/s against
+  Flash-Next's reported 39.9 mixed-text row.
