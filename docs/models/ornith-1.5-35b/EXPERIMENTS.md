@@ -274,3 +274,20 @@
   upside at roughly +8% deep tg. All quantized-KV code is reverted
   again; the shipped build remains bf74834's F16 path plus
   documentation.
+- 2026-10-20 int8-dot quantized KV, landed as opt-in (`--kv-cache`):
+  the two numerics defects from the reverted attempt were found and
+  fixed — the query-scale fill wrote every block's scale to one shared
+  slot, and the Q8_0 value path consumed half2 bit patterns as float32 —
+  and a new F32-oracle case in `qwen35moe.attention_ops` now validates
+  the full int8-dot context against dequantized float64 attention
+  (worst absolute error 5.5e-6 at n=4 and n=32, both depths checked
+  before the suite's known preparation failure). With sound scores the
+  quantized mode is a small win everywhere it was measured: AR tg128
+  57.96 vs 57.41 at d32768 and 38.95 vs 37.85 at d131072, quantized
+  completions hash-identical to F16 on the bench prompt at both depths,
+  MTP parity at d131072 (50.4, same hash), pp2048 within session noise,
+  validate-prefill cosine 0.9995 rank 1, and natural-text probes remain
+  coherent (minor near-tie phrasing drift). KV bytes halve (2048 to
+  1072 per token for the 2x256 K+V planes), which compounds with the
+  deep-context memory story. The F16 default is untouched and bitwise;
+  the modes are opt-in only.
