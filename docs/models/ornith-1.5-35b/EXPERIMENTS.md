@@ -226,3 +226,28 @@
   lossless gate requires. Deep MTP already outruns the reference
   profile: Ornith Q4_K_M MTP at 131K decodes 50.6 tok/s against
   Flash-Next's reported 39.9 mixed-text row.
+- 2026-10-20 opt-in quantized KV (rejected and reverted): the full
+  Flash-Next KV machinery was ported and wired end to end — f16/q8_0/
+  q8_0-q4_k modes, fused-preparation quantized stores (including the
+  precise-math Q4_K sub-block search), quantized load paths in both the
+  per-token and WMMA attention kernels, executor allocation/rollback/
+  snapshot dtype fields, and the `--kv-cache` flag through bench,
+  prompt and serve — to test whether halved KV bytes flatten the
+  remaining decode slope. The F16 path stayed bitwise (every greedy
+  sha identical to bf74834 at d0/d4K/d131K), the quantized modes ran
+  correctly end to end, and the deep quantized outputs hash-identical
+  to F16 on the bench prompt (the pattern text tolerates the error),
+  but every quantized configuration measured SLOWER: Q4_K_M q8_0 AR
+  tg128 28.7 at d131072 per-key loads, 27.6 with the row loads batched
+  like the F16 path, against 37.1 for F16 — and pp2048 at d131072
+  fell 622 → 483 under the in-kernel dequant. The mechanism: the
+  decode reads the whole prefix per token, so the per-element
+  dequantize ALU (scalar convert+multiply per key per head) costs
+  more than the halved DRAM bytes save — effective KV bandwidth
+  collapsed to ~70 GB/s against the F16 path's ~215 GB/s. Flash-Next
+  quantizes KV profitably because its indexer reads ~2,048 of 131,072
+  keys per token; Ornith's dense attention has no such cut. An int8
+  dot-product route (quantized queries, v_dot4) would shrink the ALU
+  but is a separate kernel architecture. All quantized-KV code was
+  reverted; the shipped build is byte-identical to bf74834 plus the
+  2026-10-20 documentation.
