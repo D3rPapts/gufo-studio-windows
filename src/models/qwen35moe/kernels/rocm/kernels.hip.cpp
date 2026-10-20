@@ -66,6 +66,34 @@ __device__ __forceinline__ std::size_t RowBytes(WeightType type,
   return 0;
 }
 
+/// Lane i receives lane (i ^ offset)'s value, as __shfl_xor(v, offset) does
+/// across a wave32. On gfx1151 it is a DPP row_xmask (offsets below 16) or
+/// v_permlanex16 (16): a register move instead of an LDS crossbar round
+/// trip. Only the transport differs, so reductions stay bitwise; every lane
+/// must be active, as the shuffle's callers already require.
+__device__ __forceinline__ int XorLane(int v, int offset) {
+#if defined(__gfx1151__)
+  switch (offset) {
+    case 1:
+      return __builtin_amdgcn_update_dpp(0, v, 0x161, 0xF, 0xF, false);
+    case 2:
+      return __builtin_amdgcn_update_dpp(0, v, 0x162, 0xF, 0xF, false);
+    case 4:
+      return __builtin_amdgcn_update_dpp(0, v, 0x164, 0xF, 0xF, false);
+    case 8:
+      return __builtin_amdgcn_update_dpp(0, v, 0x168, 0xF, 0xF, false);
+    case 16:
+      return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false,
+                                          false);
+  }
+#endif
+  return __shfl_xor(v, offset);
+}
+
+__device__ __forceinline__ float XorLane(float v, int offset) {
+  return __builtin_bit_cast(float, XorLane(__builtin_bit_cast(int, v), offset));
+}
+
 /// Sum over one wave; every lane receives the total. The wave-per-row
 /// kernels split rows across lanes (gfx1151 runs wave32).
 __device__ __forceinline__ float WaveSum(float v) {
@@ -1152,16 +1180,16 @@ __global__ void StoreKvKernel(const float* src, __half* cache,
   }
 }
 
-/// grid (heads, queries), block 256 = head dim. Keys stream in tiles of 256
-/// positions: lane j scores key j of the tile, then lane d accumulates
-/// value column d with online softmax rescaling. In the sparse window the
-/// tiles are gathered from the query's selected blocks (compacted through
-/// LDS in windows of 1024 blocks), so the sweep costs the budget rather than
-/// the context.
-/// grid.z splits the key tiles round-robin across `gridDim.z` blocks; with
-/// more than one split each block writes (max, sum, unnormalized acc) to
+/// grid (heads / kGroup, queries), block 256 = head dim. A block serves
+/// kGroup query heads of one KV head, so every K and V row it loads feeds
+/// each head's unchanged arithmetic. Keys stream in tiles of 256 positions:
+/// wave w scores keys 32w..32w+31, then the same waves accumulate value
+/// columns with online softmax rescaling. grid.z splits the key tiles
+/// round-robin across `gridDim.z` blocks; with more than one split each
+/// block writes (max, sum, unnormalized acc) to
 /// `partials[(t * heads + h) * splits + z]` and AttentionMergeKernel
 /// combines them, otherwise the normalized row goes straight to `out`.
+template<std::uint32_t kGroup>
 __global__ void AttentionKernel(const float* q, const __half* k_cache,
                                 const __half* v_cache,
                                 const std::uint32_t* mask,
@@ -1170,45 +1198,72 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
                                 std::uint32_t heads, std::uint32_t kv_heads,
                                 std::uint32_t d, std::uint32_t ratio) {
   constexpr std::uint32_t kTile = 256;
-  constexpr std::uint32_t kWindow = 1024;  // blocks compacted per pass
   const std::uint32_t split = blockIdx.z;
   const std::uint32_t splits = gridDim.z;
-  __shared__ float qs[256];
-  __shared__ float p[kTile];
-  __shared__ float shared[32];
+  __shared__ float qs[kGroup][256];
+  __shared__ float p[kGroup][kTile];
+  __shared__ float shared[kGroup][8];
   __shared__ std::uint32_t keys[kTile];
-  __shared__ std::uint32_t list[kWindow];
-  __shared__ std::uint32_t wave_total[8];
-  const std::uint32_t h = blockIdx.x;
+  // A block serves kGroup query heads of one KV head: every K and V row it
+  // loads feeds each head's unchanged arithmetic.
+  const std::uint32_t h0 = blockIdx.x * kGroup;
   const std::uint32_t t = blockIdx.y;
   const std::uint32_t pos = *start_pos + t;
-  const std::uint32_t kvh = h / (heads / kv_heads);
+  const std::uint32_t kvh = h0 / (heads / kv_heads);
   const std::uint32_t n_kv = pos + 1;
-  // A zero ratio (no selection) uses the dense path, which never reads
-  // tail_start; keep the division defined.
-  const std::uint32_t tail_start = ratio != 0 ? (n_kv / ratio) * ratio : n_kv;
-  const std::uint32_t* words =
-      mask == nullptr ? nullptr
-                      : mask + static_cast<std::size_t>(t) * mask_words;
   const float scale = rsqrtf(static_cast<float>(d));
   const std::uint32_t i = threadIdx.x;
   const std::uint32_t lane = i & 31u;
   const std::uint32_t wave = i >> 5u;
-  qs[i] = i < d ? q[(static_cast<std::size_t>(t) * heads + h) * d + i] : 0.0f;
+  (void)mask;
+  (void)mask_words;
+  (void)ratio;
+#pragma unroll
+  for (std::uint32_t g = 0; g < kGroup; ++g) {
+    qs[g][i] = i < d ? q[(static_cast<std::size_t>(t) * heads + h0 + g) * d + i]
+                     : 0.0f;
+  }
   __syncthreads();
-  float m = -INFINITY;
-  float l = 0.0f;
+  float m[kGroup];
+  float l[kGroup];
+#pragma unroll
+  for (std::uint32_t g = 0; g < kGroup; ++g) {
+    m[g] = -INFINITY;
+    l[g] = 0.0f;
+  }
   // Every wave accumulates its own 32 keys of each tile into a partial
   // context row (eight dims per lane); the partials are summed at the end.
-  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float acc[kGroup][8] = {};
   const std::size_t kv_stride = static_cast<std::size_t>(kv_heads) * d;
   const __half* k_head = k_cache + kvh * d;
   const __half* v_head = v_cache + kvh * d;
 
-  // Loads eight contiguous halves as floats: one 16-byte load per lane, so a
-  // wave reads a whole 256-wide row at once.
-  const auto load8 = [&](const __half* row, float* out8) {
-    const uint4 packed = *reinterpret_cast<const uint4*>(row + (lane * 8));
+  // F16 rows are read eight contiguous halves per lane, one 16-byte load, so
+  // a wave reads a whole 256-wide row at once. A wave issues the rows of
+  // `kBatch` consecutive keys of its 32 before using any, so their loads
+  // overlap instead of each waiting out its own latency. Empty lanes read
+  // the last key's row and are never used; a batch with no key at all is
+  // skipped (returns false).
+  constexpr std::uint32_t kBatch = 8;
+  const auto load_batch = [&](const __half* head, std::uint32_t base,
+                              uint4* rows) {
+    bool any = false;
+#pragma unroll
+    for (std::uint32_t b = 0; b < kBatch; ++b) {
+      any = any || keys[base + b] < n_kv;
+    }
+    if (!any) {
+      return false;
+    }
+#pragma unroll
+    for (std::uint32_t b = 0; b < kBatch; ++b) {
+      const std::uint32_t j = min(keys[base + b], n_kv - 1);
+      rows[b] = *reinterpret_cast<const uint4*>(
+          head + (static_cast<std::size_t>(j) * kv_stride) + (lane * 8));
+    }
+    return true;
+  };
+  const auto unpack8 = [](const uint4& packed, float* out8) {
     const auto* h2 = reinterpret_cast<const __half2*>(&packed);
 #pragma unroll
     for (std::uint32_t j = 0; j < 4; ++j) {
@@ -1218,149 +1273,189 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     }
   };
 
+  // The block reductions of every head in one pass: each head keeps
+  // BlockMax/BlockSum's order (lane tree, then waves in order).
+  const auto group_max = [&](float* v) {
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        v[g] = fmaxf(v[g], XorLane(v[g], offset));
+      }
+    }
+    __syncthreads();
+    if (lane == 0) {
+#pragma unroll
+      for (std::uint32_t g = 0; g < kGroup; ++g)
+        shared[g][wave] = v[g];
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+      float total = -INFINITY;
+      for (std::uint32_t w = 0; w < 8; ++w) {
+        total = fmaxf(total, shared[g][w]);
+      }
+      v[g] = total;
+    }
+  };
+  const auto group_sum = [&](float* v) {
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        v[g] += XorLane(v[g], offset);
+      }
+    }
+    __syncthreads();
+    if (lane == 0) {
+#pragma unroll
+      for (std::uint32_t g = 0; g < kGroup; ++g)
+        shared[g][wave] = v[g];
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+      float total = 0.0f;
+      for (std::uint32_t w = 0; w < 8; ++w) {
+        total += shared[g][w];
+      }
+      v[g] = total;
+    }
+  };
+
   // One tile: lane i holds key position keys[i] (n_kv marks an empty lane).
   // Scores: wave w takes keys 32w..32w+31, a wave-wide dot product per key.
   // Values: the same split, eight dims per lane.
   const auto tile_step = [&]() {
-    float qv[8];
+    float qv[kGroup][8];
 #pragma unroll
-    for (std::uint32_t j = 0; j < 8; ++j) {
-      qv[j] = qs[(lane * 8) + j];
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+#pragma unroll
+      for (std::uint32_t j = 0; j < 8; ++j) {
+        qv[g][j] = qs[g][(lane * 8) + j];
+      }
     }
-    float s_mine = -INFINITY;
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const std::uint32_t j = keys[slot];
-      float dot = 0.0f;
-      if (j < n_kv) {
-        float kv[8];
-        load8(k_head + (static_cast<std::size_t>(j) * kv_stride), kv);
+    float s_mine[kGroup];
 #pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          dot += qv[x] * kv[x];
+    for (std::uint32_t g = 0; g < kGroup; ++g)
+      s_mine[g] = -INFINITY;
+    for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+      uint4 rows[kBatch];
+      if (!load_batch(k_head, (wave * 32) + k0, rows)) {
+        continue;
+      }
+#pragma unroll
+      for (std::uint32_t b = 0; b < kBatch; ++b) {
+        const std::uint32_t j = keys[(wave * 32) + k0 + b];
+        float kv[8];
+        unpack8(rows[b], kv);
+#pragma unroll
+        for (std::uint32_t g = 0; g < kGroup; ++g) {
+          // The plain accumulation form of the pre-batch kernel: the
+          // compiler's contraction of this loop is what the model's scores
+          // have always used, so the batched row reads stay bitwise.
+          float dot = 0.0f;
+#pragma unroll
+          for (std::uint32_t x = 0; x < 8; ++x) {
+            dot += qv[g][x] * kv[x];
+          }
+          dot = WaveSum(dot);
+          if (lane == k0 + b) {
+            s_mine[g] = j < n_kv ? dot * scale : -INFINITY;
+          }
         }
       }
-      dot = WaveSum(dot);
-      if (lane == kk) {
-        s_mine = j < n_kv ? dot * scale : -INFINITY;
+    }
+    float tile_max[kGroup];
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g)
+      tile_max[g] = s_mine[g];
+    group_max(tile_max);
+    float rescale[kGroup];
+    float tile_sum[kGroup];
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+      const float m_new = fmaxf(m[g], tile_max[g]);
+      rescale[g] = m[g] == -INFINITY ? 0.0f : __expf(m[g] - m_new);
+      const float pj =
+          s_mine[g] == -INFINITY ? 0.0f : __expf(s_mine[g] - m_new);
+      p[g][i] = pj;
+      tile_sum[g] = pj;
+      m[g] = m_new;
+    }
+    group_sum(tile_sum);
+#pragma unroll
+    for (std::uint32_t g = 0; g < kGroup; ++g) {
+      l[g] = l[g] * rescale[g] + tile_sum[g];
+#pragma unroll
+      for (std::uint32_t x = 0; x < 8; ++x) {
+        acc[g][x] *= rescale[g];
       }
     }
-    const float tile_max = BlockMax(s_mine, shared);
-    const float m_new = fmaxf(m, tile_max);
-    const float rescale = m == -INFINITY ? 0.0f : __expf(m - m_new);
-    const float pj = s_mine == -INFINITY ? 0.0f : __expf(s_mine - m_new);
-    p[i] = pj;
-    const float tile_sum = BlockSum(pj, shared);
-    l = l * rescale + tile_sum;
-#pragma unroll
-    for (std::uint32_t x = 0; x < 8; ++x) {
-      acc[x] *= rescale;
-    }
-    m = m_new;
     __syncthreads();
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const float w = p[slot];
-      if (w != 0.0f) {
-        float vv[8];
-        load8(v_head + (static_cast<std::size_t>(keys[slot]) * kv_stride), vv);
+    for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+      uint4 rows[kBatch];
+      if (!load_batch(v_head, (wave * 32) + k0, rows)) {
+        continue;
+      }
 #pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          acc[x] += w * vv[x];
+      for (std::uint32_t b = 0; b < kBatch; ++b) {
+        float vv[8];
+        unpack8(rows[b], vv);
+#pragma unroll
+        for (std::uint32_t g = 0; g < kGroup; ++g) {
+          const float w = p[g][(wave * 32) + k0 + b];
+          if (w != 0.0f) {
+#pragma unroll
+            for (std::uint32_t x = 0; x < 8; ++x) {
+              acc[g][x] = fmaf(w, vv[x], acc[g][x]);
+            }
+          }
         }
       }
     }
     __syncthreads();
   };
 
-  if (words == nullptr) {
-    for (std::uint32_t tile = split * kTile; tile < n_kv;
-         tile += kTile * splits) {
-      keys[i] = tile + i < n_kv ? tile + i : n_kv;
-      __syncthreads();
-      tile_step();
-    }
-  } else {
-    const std::uint32_t n_complete = tail_start / ratio;
-    const std::uint32_t lane = i & 31u;
-    const std::uint32_t wave = i >> 5u;
-    for (std::uint32_t w0 = 0; w0 < n_complete; w0 += kWindow) {
-      // Thread i owns blocks w0 + 4i .. +3 of the window: flag the selected
-      // ones and compact their indices with a block-wide exclusive scan.
-      std::uint32_t flags = 0;
-      std::uint32_t count = 0;
-      for (std::uint32_t k = 0; k < 4; ++k) {
-        const std::uint32_t b = w0 + (i * 4) + k;
-        const bool set = b < n_complete && ((words[b / 32] >> (b % 32)) & 1u);
-        flags |= (set ? 1u : 0u) << k;
-        count += set ? 1u : 0u;
-      }
-      std::uint32_t incl = count;
-      for (std::uint32_t off = 1; off < 32; off <<= 1) {
-        const std::uint32_t v = __shfl_up(incl, off);
-        incl += lane >= off ? v : 0u;
-      }
-      if (lane == 31) {
-        wave_total[wave] = incl;
-      }
-      __syncthreads();
-      std::uint32_t base = 0;
-      for (std::uint32_t w = 0; w < wave; ++w) {
-        base += wave_total[w];
-      }
-      std::uint32_t total = 0;
-      for (std::uint32_t w = 0; w < 8; ++w) {
-        total += wave_total[w];
-      }
-      std::uint32_t slot = base + incl - count;
-      for (std::uint32_t k = 0; k < 4; ++k) {
-        if ((flags >> k) & 1u) {
-          list[slot++] = w0 + (i * 4) + k;
-        }
-      }
-      __syncthreads();
-      for (std::uint32_t t0 = split * (kTile / ratio); t0 < total;
-           t0 += (kTile / ratio) * splits) {
-        const std::uint32_t entry = t0 + (i / ratio);
-        keys[i] = entry < total ? (list[entry] * ratio) + (i % ratio) : n_kv;
-        __syncthreads();
-        tile_step();
-      }
-      __syncthreads();
-    }
-    // The incomplete tail block is always visible.
-    if (tail_start < n_kv && split == 0) {
-      keys[i] = tail_start + i < n_kv ? tail_start + i : n_kv;
-      __syncthreads();
-      tile_step();
-    }
+  for (std::uint32_t tile = split * kTile; tile < n_kv;
+       tile += kTile * splits) {
+    keys[i] = tile + i < n_kv ? tile + i : n_kv;
+    __syncthreads();
+    tile_step();
   }
   // Sum the eight wave partials: wave w's lane holds dims 8*lane..+7.
   __shared__ float red[8][256];
 #pragma unroll
-  for (std::uint32_t x = 0; x < 8; ++x) {
-    red[wave][(lane * 8) + x] = acc[x];
-  }
-  __syncthreads();
-  float total = 0.0f;
-  for (std::uint32_t w = 0; w < 8; ++w) {
-    total += red[w][i];
-  }
-  if (splits == 1) {
-    if (i < d) {
-      out[(static_cast<std::size_t>(t) * heads + h) * d + i] = total / l;
+  for (std::uint32_t g = 0; g < kGroup; ++g) {
+    const std::uint32_t h = h0 + g;
+#pragma unroll
+    for (std::uint32_t x = 0; x < 8; ++x) {
+      red[wave][(lane * 8) + x] = acc[g][x];
     }
-    return;
-  }
-  float* part =
-      partials +
-      ((static_cast<std::size_t>(t) * heads + h) * splits + split) * (d + 2);
-  if (i < d) {
-    part[2 + i] = total;
-  }
-  if (i == 0) {
-    part[0] = m;
-    part[1] = l;
+    __syncthreads();
+    float total = 0.0f;
+    for (std::uint32_t w = 0; w < 8; ++w) {
+      total += red[w][i];
+    }
+    if (splits == 1) {
+      if (i < d) {
+        out[(static_cast<std::size_t>(t) * heads + h) * d + i] = total / l[g];
+      }
+    } else {
+      float* part =
+          partials +
+          ((static_cast<std::size_t>(t) * heads + h) * splits + split) *
+              (d + 2);
+      if (i < d) {
+        part[2 + i] = total;
+      }
+      if (i == 0) {
+        part[0] = m[g];
+        part[1] = l[g];
+      }
+    }
+    __syncthreads();  // red is rewritten by the next head
   }
 }
 
@@ -4877,10 +4972,24 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
   if (d != 256) {
     return;  // the kernel is written for the model's 256-wide heads
   }
+  // Query heads sharing a KV head share each block's K/V loads. Two per
+  // block keep enough blocks in flight for one or two rows; four suit wider
+  // verification batches (measured at d32K/d128K on the same kernel family).
+  if ((heads / kv_heads) % 4 != 0) {
+    return;
+  }
+  const std::uint32_t group = n_tokens <= 2 ? 2 : 4;
   const std::uint32_t z = partials != nullptr ? std::max(splits, 1u) : 1u;
-  hipLaunchKernelGGL(AttentionKernel, dim3(heads, n_tokens, z), dim3(kThreads),
-                     0, stream, q, k_cache, v_cache, mask, mask_words, out,
-                     partials, start_pos, heads, kv_heads, d, ratio);
+  const auto launch = [&](auto kernel) {
+    hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z), dim3(kThreads),
+                       0, stream, q, k_cache, v_cache, mask, mask_words, out,
+                       partials, start_pos, heads, kv_heads, d, ratio);
+  };
+  if (group == 2) {
+    launch(AttentionKernel<2>);
+  } else {
+    launch(AttentionKernel<4>);
+  }
   if (z > 1) {
     hipLaunchKernelGGL(AttentionMergeKernel, dim3(heads, n_tokens),
                        dim3(kThreads), 0, stream, partials, out, heads, d, z);

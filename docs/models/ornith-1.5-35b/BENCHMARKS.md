@@ -11,6 +11,15 @@ run fills them).
 
 [Quality and measurement details](QUALITY.md)
 
+> 2026-10-20: the grouped decode attention pass flattens the long-context
+> decode slope; the single-user depth tables below are new, and the
+> depth-0 rows supersede the notes above (Q4_K_M pp2048 2943, AR tg128
+> 70.4, MTP tg128 101.8; Q8_0 pp2048 3212, AR tg128 53.6, MTP tg128
+> 84.5). Greedy completions are hash-identical to the 27ad6a2 reference
+> build at every measured depth. The prefill depth slope is unchanged —
+> see [Experiments](EXPERIMENTS.md) for the rejected kernel variants.
+> · [Experiments](EXPERIMENTS.md)
+>
 > 2026-10-19: the chained greedy MTP pass and the device-side routed
 > dispatch supersede the single-user rows below (tables are
 > driver-rendered and not yet re-rendered on Windows). Same host and
@@ -23,6 +32,38 @@ run fills them).
 > (upstream merges: AR tg128 69.4, MTP tg128 98.6 at 2a289ca).
 > · [Experiments](EXPERIMENTS.md)
 >
+
+## Single user, long context (2026-10-20)
+
+Native `gufo bench`, one warmed sample per point, deterministic bench
+tokens, depth = cached prefix prepared before the timed region, context
+133376, C1. Build `feature/window-native` with the grouped decode
+attention; greedy completions hash-identical to the 27ad6a2 reference
+build at every row (AR and MTP, both artifacts). Prefill is
+autoregressive in every mode; MTP changes decode only.
+
+| Depth (tokens) | Q4_K_M pp2048 | Q4_K_M AR tg128 | Q4_K_M MTP tg128 | Q8_0 pp2048 | Q8_0 AR tg128 | Q8_0 MTP tg128 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 2943 | 70.4 | 101.8 | 3212 | 53.6 | 84.5 |
+| 4,096 | 2768 | 68.9 | 102.3 | 2949 | 52.3 | 80.5 |
+| 8,192 | 2496 | 66.8 | 99.7 | 2668 | 51.2 | 79.3 |
+| 12,288 | 2231 | 65.4 | 95.0 | 2380 | 50.3 | 76.1 |
+| 16,384 | 2060 | 62.9 | 95.9 | 2181 | 49.5 | 76.2 |
+| 32,768 | 1551 | 57.5 | 82.1 | 1612 | 45.4 | 69.2 |
+| 65,536 | 1040 | 49.3 | 68.6 | 1069 | 40.5 | 58.6 |
+| 131,072 | 622 | 37.1 | 50.6 | 637 | 32.5 | 46.0 |
+
+Against the 27ad6a2 reference build the decode rows at 131072 moved
+28.0 → 37.1 (Q4_K_M AR), 29.1 → 50.6 (Q4_K_M MTP), 24.6 → 32.5
+(Q8_0 AR), 29.4 → 46.0 (Q8_0 MTP); the AR degradation at 131K eases
+from −60% to −47% (Q4_K_M) and −50% to −39% (Q8_0), and MTP from −71%
+to −50% and −65% to −45%. Prefill rows are unchanged within session
+noise (the dense prefill attention slope is architectural — a dense
+model reads the whole prefix every chunk; the kernel-level variants
+rejected on the way are recorded in [Experiments](EXPERIMENTS.md)).
+For reference, Qwen3.8-Flash-Next (sparse-indexer attention, quantized
+KV) reports −13.5% pp and −1.6% AR tg at 131072 in its tables.
+
 > 2026-10-01: the Q6_K decode pass supersedes the single-user AR/MTP rows
 > below (tables are driver-rendered and not yet re-rendered on Windows):
 > native pp2048 2922 +/- 27, tg128 AR 64.79 +/- 0.44, tg128 MTP 88.48 +/-

@@ -140,3 +140,20 @@
   max_error 0 (prefill keeps the Q8_0/WMMA tier unchanged).
 - `qwen35moe.gdn_ops` passes; `qwen35moe.attention_ops` shows only its
   documented pre-existing 2-ulp replay signature.
+
+## Long-context depth gates (2026-10-20)
+
+Native bench sweeps at depths 0-131072 (context 133376, C1, one warmed
+sample per point, deterministic bench tokens) after the grouped decode
+attention landed. Every greedy completion is hash-identical to the
+27ad6a2 reference build at the same depth, for both artifacts and both
+AR and MTP — the decode attention change is bitwise and the long-context
+outputs did not move. AR and MTP completions stay hash-equal per depth
+and quant (the lossless property holds at 131K). MTP acceptance is
+depth-stable (82-84% of drafted, ~2.3 tokens per cycle at every depth);
+the deep MTP decode gain is throughput, not acceptance. `--validate-prefill 8`
+at d32768 reports cosine 0.999468, scalar_winner_rank 1 — the same
+values as the retained 2026-10-19 prefill pass. `qwen35moe.attention_ops`
+chunk cases (n=136 and n=2048, full vs chunked prefill against the
+per-token reference) are bit-exact (`differing=0 max=0`); the suite
+fails only its documented pre-existing 2-ulp replay preparation case.

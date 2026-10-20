@@ -149,3 +149,52 @@
   prefill is GPU-bound, and the next prefill levers are the GDN scan and
   the shared-expert F16 GEMMs (~8-16 TFLOPS effective), not the host
   path.
+- 2026-10-20 long-context decode attention (retained): the per-token
+  attention kernel now serves kGroup=2 query heads per block for decode
+  (4 for wider verification batches), so every K and V row a block loads
+  feeds both heads' unchanged arithmetic, and each wave issues the rows of
+  8 consecutive keys of its 32-key tile before using any, so their loads
+  overlap instead of each waiting out its own latency. The per-head block
+  reductions run in one pass (lane tree, then waves in order — the same
+  order BlockMax/BlockSum kept) over DPP row-xmask transports
+  (`XorLane`), and the lane's eight score products keep the plain
+  accumulation form the compiler has always contracted. Ported from the
+  evolved Flash-Next kernel (F16 dense path only; the mask/selection
+  branch was dead — every caller passes a null mask). Interleaved A/B at
+  27ad6a2, native bench, greedy completions hash-identical to the
+  reference build at every depth 0-131072 (AR and MTP): Q4_K_M AR tg128
+  69.7 → 70.4 at d0, 50.6 → 57.5 at d32K (+14%), 28.0 → 37.1 at d131K
+  (+33%); Q8_0 AR tg128 48.8 → 53.6 at d0 (+10%), 40.3 → 45.4 at d32K
+  (+13%), 24.6 → 32.5 at d131K (+32%). With MTP the same kernel serves
+  every verify row, and the deep rows gain the most: Q4_K_M MTP tg128
+  101.5 → 101.8 at d0, 66.2 → 82.1 at d32K (+24%), 47.9 → 68.6 at d64K
+  (+43%), 29.1 → 50.6 at d131K (+74%). The implied KV-read bandwidth of
+  depth slope rises from ~126 GB/s to ~215 GB/s against the ~240 GB/s
+  measured roofline. `qwen35moe.attention_ops` chunk cases stay
+  bit-exact; the suite fails only its documented pre-existing 2-ulp
+  replay case; `--validate-prefill 8` at d32K passes with the retained
+  values (cosine 0.999468, scalar_winner_rank 1). AR/MTP completions
+  remain hash-equal per depth and quant (the lossless property).
+- 2026-10-20 prefill long-context experiments (all rejected, reverted):
+  the depth slope of prefill is the dense WMMA causal sweep, and five
+  structural variants of that kernel all measured neutral-to-worse on
+  pp2048 at d32K/d131K: a launch-order swizzle that spreads concurrent
+  query groups over the prefix (bit-exact, +0%), 32-key tiles instead of
+  16 (halves the per-tile softmax and barrier rounds; +0%), split-K
+  (eight key-range blocks per query group with an LSUM partials merge;
+  -2%), moving the per-wave scaled-query fragments from registers to
+  LDS to cut the kernel from 226 to 180 VGPRs (+7%), and the same diet
+  with deferred V loads (+0%). Probes pin the limiter inside the tile
+  loop rather than memory or scheduling: with every global K/V load
+  removed the deep sweep still costs its time (attn 563 ms of a 1208 ms
+  d32K chunk, vs 591 ms with loads), and with the loop's block barriers
+  neutralized it only drops ~15%. The remaining cost tracks the
+  per-tile LDS fragment loads (q and K re-read from `kv_lds`/`q_lds` per
+  16-key tile for the WMMA operands): the q-in-LDS variant's +7% matches
+  its added LDS traffic, and the 226-VGPR original and 180-VGPR variant
+  land within noise of each other. A redesign that keeps the WMMA
+  fragments in registers under ~128 VGPRs (or restructures the
+  fragment schedule) is the remaining prefill lever; until then the
+  long-context prefill slope is architectural for a dense-attention
+  model and the depth cost of one extra 2048-token chunk grows
+  ~16 µs/token of prefix.
