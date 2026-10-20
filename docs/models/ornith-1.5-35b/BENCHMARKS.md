@@ -11,6 +11,24 @@ run fills them).
 
 [Quality and measurement details](QUALITY.md)
 
+> 2026-10-20 (later): batched speculative verification now reproduces the
+> single-session arithmetic past the 8-row vector contract (see
+> EXPERIMENTS.md), so multi-session MTP publishes again. Same host and
+> method, concurrency 1/2/4, prepared cohorts, greedy completions
+> hash-identical to the isolated AR reference on every published row.
+> Multi-user AR (this build): Q4_K_M 69.6/109.8/178.7 and Q8_0
+> 52.9/95.4/158.6 decode tok/s at C1/C2/C4. Multi-user MTP mixed
+> (this build): Q4_K_M 85.4/122.6/152.3 - the C2 and C4 rows the
+> 2026-09-29 run withheld now pass the gate - and Q8_0 63.9/104.3/155.0
+> (C4 +4.4% over the pre-fix build). Q8_0 repetition publishes
+> 63.5/106.2/148.4; the Q4_K_M repetition C1 gate cannot complete on
+> this build (the AR reference round's greedy continuation emits EOS at
+> ~102 of 128 tokens; see QUALITY.md). Four simultaneous 2048-token
+> cold prefills aggregate 2046-2089 tok/s at every session count
+> (prefill saturates the GPU; see EXPERIMENTS.md for the probe).
+> · [Experiments](EXPERIMENTS.md)
+> · [Quality](QUALITY.md)
+>
 > 2026-10-20: the grouped decode attention pass flattens the long-context
 > decode slope; the single-user depth tables below are new, and the
 > depth-0 rows supersede the notes above (Q4_K_M pp2048 2943, AR tg128

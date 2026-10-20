@@ -177,3 +177,21 @@ minor near-tie phrasing drift versus F16; treat the modes as lossy and
 qualify quality-sensitive workloads on F16. Snapshots record both
 plane dtypes, so a quantized session never restores into an F16 one or
 vice versa.
+
+## Batched-verify gates (2026-10-20)
+
+Co-batched speculative verification now reproduces the single-session
+arithmetic past the 8-row vector contract (batch paths read the decode
+kernels' native bytes; see EXPERIMENTS.md). Gates on the fixed build,
+prepared cohorts, greedy, versus the isolated AR reference: Q4_K_M
+multi-mixed MTP passes C1/C2/C4 (the C2/C4 rows the 2026-09-29 run
+withheld now publish), Q8_0 passes multi-mixed and multi-repetition
+C1-C4 on both workloads; every published completion is hash-identical
+to its isolated AR reference. F16 single-session paths are untouched
+(d0 MTP sha identical to the pre-fix build); `qwen35moe`
+config/mtp_sampling/gdn_ops pass and `qwen35moe.attention_ops` shows
+only its documented pre-existing 2-ulp replay preparation case.
+Known gap: the synthetic repetition workload's AR reference round on
+the Q4_K_M artifact stops at ~102 of 128 tokens (greedy EOS, see
+EXPERIMENTS.md), so that gate cannot complete on this build; not a
+batch-path defect (single-session, both modes agree).

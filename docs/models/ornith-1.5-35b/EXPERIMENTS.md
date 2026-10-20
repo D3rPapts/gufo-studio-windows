@@ -297,3 +297,62 @@
   sweep measurements. Treat `--kv-cache` as the deep-context and
   memory option; F16 remains the default and the mixed-workload pick.
   The F16 default is untouched and bitwise; the modes are opt-in only.
+- 2026-10-20 quantized KV on both artifacts (verification): the final
+  int8-dot build's `--kv-cache q8_0-q4_k` mode had only been swept on
+  the Q4_K_M artifact, and through the earlier dequant-based code at
+  that; both artifacts now verify end to end on the landed kernel.
+  Q4_K_M and Q8_0 each run AR and MTP at d0/d32768: within a mode AR
+  and MTP completions hash identically (the lossless property), and
+  the deep completions hash-identical to the F16 reference at d32768
+  on both artifacts (`d856f78e...`); d0 stays coherent with the
+  documented near-tie phrasing drift. Evidence:
+  `.bench-tmp/multi-sess/q*-kv8q4-*.log`.
+- 2026-10-20 batched verification on the single-session arithmetic
+  (retained): co-batched MTP verification beyond 8 total rows still
+  left the decode kernels for wide-batch views, and the chained-MTP
+  width controller now drafts wide enough that ordinary serving
+  cohorts cross that line — Q4_K_M multi-session MTP regressed from
+  publishing C2 (2026-09-29) to failing the greedy-equivalence gate
+  at C2 on this build. Three batch-path defects, all reading bytes
+  the isolated decode never reads: DenseBatch routed tensors with a
+  native view past the Q8_0 wide-batch copy (the Q6_K output head and
+  the mixed shared-expert downs among them), GatedDenseBatch
+  unconditionally on the prequantized Q8_0 view, and the MoeBatch
+  Q4_K shortcut reading the down stacks' requantized Q8_0 copies
+  while also pushing up to `rows x used` slot rows through a routed
+  vector contract of 64. The batch paths now read what the
+  single-session decode reads: DenseBatch native tensors run one
+  moe_vec pass over the artifact's own bytes for the whole batch (the
+  kernel quantizes each row independently, so 9-64 rows cost one
+  weight read and reproduce the decode arithmetic exactly),
+  GatedDenseBatch chunks the native gated kernel when native views
+  exist, and MoeBatch drops the Q4_K shortcut for the same
+  kDecodeRows-row chunks of MoeExperts the isolated session runs
+  (routed weight traffic follows the selected slots, so the chunks
+  re-read little). The E=1 zero ids buffer spans the batch instead of
+  kVecBatch. F16 mode is bitwise unchanged (single-session paths are
+  untouched; d0 MTP sha identical); `qwen35moe` config/mtp_sampling/
+  gdn_ops pass and attention_ops keeps only its documented 2-ulp
+  replay case. Greedy-equivalence gates, prepared cohorts, same
+  build: Q4_K_M mixed MTP C1 85.4, C2 122.6, C4 152.3 tok/s — C2 and
+  C4 pass the gate and publish where the 2026-09-29 run withheld C4
+  (and this build's controller drafts past the old 8-row line at C2);
+  Q8_0 mixed MTP C4 148.5 -> 155.0 (+4.4%) and repetition MTP
+  publishes C1-C4 (63.5/106.2/148.4); every AR row within noise.
+  Multi-session pp is already saturated: four simultaneous 2048-token
+  cold prefills aggregate 2046-2089 tok/s across sessions 1/2/4
+  against ~2050-2120 solo (the scheduler runs full-width prefill
+  chunks round-robin while no decode or capture waits). The
+  concurrent-arrival prefill divergence remains measured and unfixed:
+  2 of 4 sessions prefilled alongside others decoded different greedy
+  text than sequential arrival on the same build (capture-pending
+  prefills take 512-token slices, and prefill routes stay
+  width-sensitive); sequential or prepared cohorts are exact. One
+  workload note: the synthetic repetition prompt's greedy continuation
+  now emits EOS before the 128-token window on the Q4_K_M artifact
+  (the AR reference round reproduces it; the sharper Q6_K-head decode
+  shifted near-tie text, and a probe shows the model meta-framing the
+  synthetic passage instead of repeating it), so the multi-repetition
+  C1 gate cannot complete on this build; the Q8_0 artifact still
+  repeats and publishes all rows. Evidence: `.bench-tmp/multi-sess/`
+  (run logs, artifacts, `pp_probe.py`).
