@@ -251,3 +251,26 @@
   but is a separate kernel architecture. All quantized-KV code was
   reverted; the shipped build is byte-identical to bf74834 plus the
   2026-10-20 documentation.
+- 2026-10-20 int8-dot decode scores over quantized KV (attempted,
+  reverted): v_dot4_i32_i8 compiles on this toolchain via inline asm and
+  the full quantized-KV machinery was rebuilt around it — query rows
+  quantized to Q8_0 element layout per decode step, key scores as two
+  4-byte integer dots per lane rescaled by the query and key block
+  scales, values dequantized through the packed half2 code affine (Q8_0)
+  or a batched nibble unpack (Q4_K). The F16 instantiations stayed
+  bitwise (all greedy shas identical to the reference at d0/d32K/d131K),
+  and the quantized speed beat F16 on paper: tg128 58.5 at d32768 and
+  39.9 at d131072 against 57.4/37.1 for F16 — halved KV bytes with the
+  dequant ALU finally under the bandwidth cost. It does not ship: the
+  quantized outputs corrupt natural-text generation (meta-text drift on
+  the sky-blue probe, pattern collapse on the bench prompt), and one
+  real defect was found and fixed during triage (the query-scale fill
+  wrote every block's scale to one shared slot) — after which outputs
+  got worse, not better, so a second numerics defect remains and the
+  +7.5% was measured on unsound scores. Shipping a lossy mode requires
+  operator-level score validation against an F32 oracle (an int8
+  attention case in attention_ops) before its speed is meaningful; the
+  route is architecturally sound and the numbers above bound its
+  upside at roughly +8% deep tg. All quantized-KV code is reverted
+  again; the shipped build remains bf74834's F16 path plus
+  documentation.
