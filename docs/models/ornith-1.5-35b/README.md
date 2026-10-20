@@ -75,5 +75,8 @@ Q4_K_M target, measured points in [BENCHMARKS.md](BENCHMARKS.md)):
 - Dense Q4_K/Q6_K projections are host-dequantized to Q8_0 at load; routed
   Q4_K experts keep their native layout on the MMQ/WMMA tiers. Q8_0
   artifacts stream through unchanged and skip the dequant pass entirely.
+- Routed experts accept Q4_K/Q5_K/Q8_0/IQ3_S/IQ4_XS gate/up stacks and
+  Q4_K/Q5_K/Q6_K/Q5_1/Q8_0/IQ3_S/IQ4_XS/IQ4_NL down stacks; other formats
+  fail at load. Routers must be F32.
 - The current Windows port qualifies this model on a single Strix Halo
   gfx1151 host; Linux numbers land in BENCHMARKS.md once measured.

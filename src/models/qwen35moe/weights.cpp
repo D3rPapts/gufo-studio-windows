@@ -130,6 +130,11 @@ struct Binder {
     const auto experts = {GgmlType::kQ4_K,   GgmlType::kQ5_K,  GgmlType::kQ6_K,
                           GgmlType::kQ5_1,   GgmlType::kQ8_0,  GgmlType::kIQ3_S,
                           GgmlType::kIQ4_XS, GgmlType::kIQ4_NL};
+    // Routed gate/up run the gated vector kernels at decode and the F16
+    // WMMA pair at prefill; formats outside this set have no gate/up route
+    // and would fail mid-session, so reject them at load instead.
+    const auto gate_up = {GgmlType::kQ4_K,  GgmlType::kQ5_K, GgmlType::kQ8_0,
+                          GgmlType::kIQ3_S, GgmlType::kIQ4_XS};
 
     l.attn_norm = Get(p + "attn_norm.weight", hidden, 1, 1, {GgmlType::kF32});
     l.post_attention_norm =
@@ -170,9 +175,9 @@ struct Binder {
     l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1,
                    {GgmlType::kF32});
     l.ffn_gate_exps = Get(p + "ffn_gate_exps.weight", hidden, c.expert_ff,
-                          c.num_experts, experts);
+                          c.num_experts, gate_up);
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,
-                        c.num_experts, experts);
+                        c.num_experts, gate_up);
     l.ffn_down_exps = Get(p + "ffn_down_exps.weight", c.expert_ff, hidden,
                           c.num_experts, experts);
     l.shexp_gate_inp =
