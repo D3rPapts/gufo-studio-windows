@@ -10,6 +10,8 @@
 
 #include "src/models/qwen/vision/rope.hpp"
 
+#include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
+
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
 /// launch is asynchronous on `stream`. Weights referenced here are device
@@ -247,16 +249,23 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream);
 
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
-/// and writes the F16 caches. Returns false for heads wider than 256.
+/// and writes the caches in `kv_dtypes`' formats. Returns false for
+/// unsupported geometries.
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, __half* k_cache, __half* v_cache,
+                      float* gate, void* k_cache, void* v_cache,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false);
+                      bool prefill = false, KvDtypes kv_dtypes = {});
+
+/// Quantizes rotated query rows to the Q8_0 element layout for the int8-dot
+/// attention scores (one row = d code bytes + d/32 F16 scales).
+void QuantizeAttentionQ(const float* q, unsigned char* q8,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        std::uint32_t d, hipStream_t stream);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -276,12 +285,13 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
 /// across `splits` blocks per row and merged in a second launch.
-void Attention(const float* q, const __half* k_cache, const __half* v_cache,
-               const std::uint32_t* mask, std::uint32_t mask_words, float* out,
-               float* partials, std::uint32_t splits, std::uint32_t n_tokens,
+void Attention(const float* q, const unsigned char* q8, const void* k_cache,
+               const void* v_cache, const std::uint32_t* mask,
+               std::uint32_t mask_words, float* out, float* partials,
+               std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream);
+               hipStream_t stream, KvDtypes kv_dtypes = {});
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` must be null
@@ -290,13 +300,13 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// only the final dense query tile, retaining its key sweep and leaving
 /// earlier output rows untouched.
 bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
+                         const void* k_cache, const void* v_cache,
                          const std::uint32_t* mask, std::uint32_t mask_words,
                          float* out, std::uint32_t n_tokens,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only = false, KvDtypes kv_dtypes = {});
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

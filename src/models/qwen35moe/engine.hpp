@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/qwen35moe/kv_cache_mode.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
@@ -55,6 +56,9 @@ struct ModelOptions {
   /// DFlash proposal length policy; only used with dflash_model_path.
   speculative::DFlashDraftPolicy dflash_policy =
       speculative::DFlashDraftPolicy::kAdaptive;
+  /// Attention KV cache storage (F16 default; lossy modes trade numerical
+  /// fidelity for per-token bytes and are not snapshot-interchangeable).
+  KvCacheMode kv_cache_mode = KvCacheMode::kF16;
 };
 
 class Session;

@@ -722,11 +722,6 @@ std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
   std::string error;
-  if (opt.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
-    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
-                 "models\n";
-    return nullptr;
-  }
   const bool dflash = opt.speculative_backend == "dflash2";
   if (opt.force_cpu ||
       (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp" &&
@@ -751,6 +746,8 @@ std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
       .max_draft_tokens = opt.draft_tokens,
       .vision_model_path = opt.vision_model_path,
       .dflash_model_path = dflash ? opt.dflash_model_path : std::string{},
+      .kv_cache_mode =
+          static_cast<models::qwen35moe::KvCacheMode>(opt.kv_cache_mode),
   };
   if (dflash && !opt.draft_policy.empty()) {
     try {

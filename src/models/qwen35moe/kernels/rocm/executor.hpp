@@ -5,6 +5,8 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -74,8 +76,10 @@ private:
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
-    __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
-    __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+    /// [max_context] rows of KvRowBytes(kv_heads*d, dtype) bytes in the
+    /// executor's configured key/value formats.
+    std::byte* k_cache{nullptr};
+    std::byte* v_cache{nullptr};
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -85,8 +89,8 @@ private:
     std::int32_t hidden_row;     ///< kept trunk row the draft reads, or -1
   };
   struct MtpState {
-    __half* k_cache{nullptr};
-    __half* v_cache{nullptr};
+    std::byte* k_cache{nullptr};
+    std::byte* v_cache{nullptr};
     float* h{nullptr};              ///< [hidden] carried draft residual
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
@@ -141,6 +145,9 @@ public:
     /// Trunk layer outputs (zero-based) captured for the DFlash draft.
     /// Empty disables capture; sessions still choose per-session use.
     std::vector<std::uint32_t> dflash_tap_layers;
+    /// Attention KV cache storage formats (F16 by default; lossy modes
+    /// shrink the per-token bytes and are not snapshot-interchangeable).
+    KvDtypes kv_dtypes{};
   };
 
   ~Executor();
@@ -446,6 +453,7 @@ private:
     float* k;
     float* v;
     float* ctx;
+    unsigned char* q8;  ///< quantized query rows (Q8_0 key plane only)
     float* attn_partials;  ///< split-key partials of a narrow batch
     // moe
     float* router;

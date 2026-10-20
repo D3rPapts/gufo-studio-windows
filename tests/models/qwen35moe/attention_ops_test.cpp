@@ -294,7 +294,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
   const std::uint32_t* mask_ptr = masked ? d_mask.get() : nullptr;
 
-  q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
+  q::Attention(d_q.get(), nullptr, d_k.get(), d_v.get(), mask_ptr, mask_words,
                d_ref.get(), nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads,
                kDim, kRatio, nullptr);
   q::SigmoidMul(d_ref.get(), d_gate.get(), q_count, nullptr);
@@ -305,8 +305,8 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     HipBuffer<float> d_split(q_count);
     HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
                                 kSplits * (kDim + 2));
-    q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
-                 d_split.get(), d_partials.get(), kSplits, n_tokens,
+    q::Attention(d_q.get(), nullptr, d_k.get(), d_v.get(), mask_ptr,
+                 mask_words, d_split.get(), d_partials.get(), kSplits, n_tokens,
                  d_pos.get(), kHeads, kKvHeads, kDim, kRatio, nullptr);
     q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
     CheckHip(hipDeviceSynchronize(), "split attention");
@@ -430,10 +430,183 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+/// Validates the int8-dot decode score path against an F32 oracle: keys are
+/// stored through the fused preparation's Q8_0 layout, queries quantized by
+/// QuantizeAttentionQ, and the Attention output (q8 branch) must track a
+/// dequantized float64 reference within the quantization envelope.
+void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
+                   std::uint32_t seed) {
+  const std::uint32_t n_kv = start_pos + n_tokens;
+  const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
+  const std::size_t k_row_bytes = kKvWidth + (kKvWidth / 32) * 2;
+  const std::size_t q_row_bytes = kDim + (kDim / 32) * 2;
+
+  const auto qv = MakeValues(q_count, seed, 2.0F);
+  const auto kf = MakeValues(static_cast<std::size_t>(n_kv) * kKvWidth,
+                             seed ^ 0xAAAAU, 1.0F);
+  const auto vf = MakeValues(static_cast<std::size_t>(n_kv) * kKvWidth,
+                             seed ^ 0x3333U, 1.0F);
+  const auto gate = MakeValues(q_count, seed ^ 0x5555U, 3.0F);
+
+  // Quantize the keys/values to the cache's Q8_0 row layout on the host,
+  // keeping the dequantized floats as the oracle's operands.
+  std::vector<unsigned char> k_bytes(static_cast<std::size_t>(n_kv) *
+                                     k_row_bytes);
+  std::vector<unsigned char> v_bytes(static_cast<std::size_t>(n_kv) *
+                                     k_row_bytes);
+  std::vector<float> kd(n_kv * kKvWidth), vd(n_kv * kKvWidth);
+  auto quant_row = [](const float* src, std::size_t elems,
+                      unsigned char* dst) {
+    for (std::size_t blk = 0; blk < elems; blk += 32) {
+      float amax = 0.0F;
+      for (std::uint32_t j = 0; j < 32; ++j) {
+        amax = std::fmax(amax, std::fabs(src[blk + j]));
+      }
+      const float d = amax > 0.0F ? amax / 127.0F : 0.0F;
+      auto* codes = reinterpret_cast<signed char*>(dst + blk);
+      auto* scale = reinterpret_cast<__half*>(dst + elems + (blk / 32) * 2);
+      *scale = __float2half_rn(d);
+      for (std::uint32_t j = 0; j < 32; ++j) {
+        const float x = src[blk + j];
+        codes[j] = static_cast<signed char>(
+            std::lrint(x * (d > 0.0F ? 1.0F / d : 0.0F)));
+      }
+    }
+  };
+  for (std::size_t row = 0; row < n_kv; ++row) {
+    quant_row(kf.data() + row * kKvWidth, kKvWidth,
+              k_bytes.data() + row * k_row_bytes);
+    quant_row(vf.data() + row * kKvWidth, kKvWidth,
+              v_bytes.data() + row * k_row_bytes);
+    for (std::size_t e = 0; e < kKvWidth; ++e) {
+      const auto* kc = reinterpret_cast<const signed char*>(
+          k_bytes.data() + row * k_row_bytes + e);
+      const auto* vc = reinterpret_cast<const signed char*>(
+          v_bytes.data() + row * k_row_bytes + e);
+      const float kd_scale = __half2float(*reinterpret_cast<const __half*>(
+          k_bytes.data() + row * k_row_bytes + kKvWidth + (e / 32) * 2));
+      const float vd_scale = __half2float(*reinterpret_cast<const __half*>(
+          v_bytes.data() + row * k_row_bytes + kKvWidth + (e / 32) * 2));
+      kd[row * kKvWidth + e] = static_cast<float>(kc[0]) * kd_scale;
+      vd[row * kKvWidth + e] = static_cast<float>(vc[0]) * vd_scale;
+    }
+  }
+
+  HipBuffer<float> d_q(q_count);
+  HipBuffer<unsigned char> d_q8(static_cast<std::size_t>(n_tokens) *
+                                kHeads * q_row_bytes);
+  HipBuffer<unsigned char> d_k(k_bytes.size());
+  HipBuffer<unsigned char> d_v(v_bytes.size());
+  HipBuffer<float> d_gate(q_count);
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<float> d_out(q_count);
+  Upload(&d_q, qv);
+  Upload(&d_gate, gate);
+  Upload(&d_k, k_bytes);
+  Upload(&d_v, v_bytes);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+
+  q::QuantizeAttentionQ(d_q.get(), d_q8.get(), n_tokens, kHeads, kDim,
+                        nullptr);
+  CheckHip(hipDeviceSynchronize(), "quantize q ready");
+  q::Attention(d_q.get(), d_q8.get(), d_k.get(), d_v.get(), nullptr, 0,
+               d_out.get(), nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads,
+               kDim, kRatio, nullptr,
+               {gufo::models::qwen35moe::KvDtypes{
+                   .key = gufo::models::qwen35moe::KvCacheDtype::kQ8_0,
+                   .value =
+                       gufo::models::qwen35moe::KvCacheDtype::kQ8_0}});
+  q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
+  CheckHip(hipDeviceSynchronize(), "q8 attention ready");
+  const auto out = Download(&d_out, static_cast<std::uint32_t>(q_count));
+
+  // Download the quantized queries for the oracle.
+  std::vector<unsigned char> q8(static_cast<std::size_t>(n_tokens) * kHeads *
+                                q_row_bytes);
+  CheckHip(hipMemcpy(q8.data(), d_q8.get(), q8.size(), hipMemcpyDeviceToHost),
+           "download q8");
+  std::vector<float> qd(q_count);
+  for (std::size_t row = 0; row < static_cast<std::size_t>(n_tokens) * kHeads;
+       ++row) {
+    for (std::size_t e = 0; e < kDim; ++e) {
+      const auto* qc = reinterpret_cast<const signed char*>(
+          q8.data() + row * q_row_bytes + e);
+      const float qd_scale = __half2float(*reinterpret_cast<const __half*>(
+          q8.data() + row * q_row_bytes + kDim + (e / 32) * 2));
+      qd[row * kDim + e] = static_cast<float>(qc[0]) * qd_scale;
+    }
+  }
+
+  // F32 oracle: per query row, the exact attention over dequantized operands
+  // (scale folded as the kernels do).
+  const float attention_scale = 1.0F / std::sqrt(static_cast<float>(kDim));
+  double worst = 0.0;
+  for (std::uint32_t t = 0; t < n_tokens; ++t) {
+    for (std::uint32_t kvh = 0; kvh < kKvHeads; ++kvh) {
+      for (std::uint32_t g = 0; g < kHeads / kKvHeads; ++g) {
+        const std::uint32_t h = kvh * (kHeads / kKvHeads) + g;
+        const std::size_t q_row =
+            (static_cast<std::size_t>(t) * kHeads + h) * kDim;
+        double m = -INFINITY;
+        std::vector<double> scores(n_kv);
+        for (std::uint32_t key = 0; key < n_kv; ++key) {
+          if (key > start_pos + t) {
+            scores[key] = -INFINITY;
+            continue;
+          }
+          double dot = 0.0;
+          for (std::size_t e = 0; e < kDim; ++e) {
+            dot += static_cast<double>(qd[q_row + e]) *
+                   static_cast<double>(kd[static_cast<std::size_t>(key) *
+                                              kKvWidth +
+                                          kvh * kDim + e]);
+          }
+          scores[key] = dot * attention_scale;
+          m = std::fmax(m, scores[key]);
+        }
+        double sum = 0.0;
+        std::vector<double> weights(n_kv, 0.0);
+        for (std::uint32_t key = 0; key <= start_pos + t; ++key) {
+          weights[key] = std::exp(scores[key] - m);
+          sum += weights[key];
+        }
+        for (std::size_t e = 0; e < kDim; ++e) {
+          double acc = 0.0;
+          for (std::uint32_t key = 0; key <= start_pos + t; ++key) {
+            acc += weights[key] *
+                   static_cast<double>(
+                       vd[static_cast<std::size_t>(key) * kKvWidth +
+                          kvh * kDim + e]);
+          }
+          const float gate_value =
+              gate[(static_cast<std::size_t>(t) * kHeads + h) * kDim + e];
+          const float want = static_cast<float>(acc / sum) /
+                             (1.0F + std::exp(-gate_value));
+          const float got =
+              out[(static_cast<std::size_t>(t) * kHeads + h) * kDim + e];
+          worst = std::fmax(worst, std::fabs(static_cast<double>(got) -
+                                             static_cast<double>(want)));
+        }
+      }
+    }
+  }
+  std::cout << "q8 int8-dot attention n=" << n_tokens << " start=" << start_pos
+            << " worst absolute error " << worst << '\n';
+  // Both operands carry Q8_0 rounding; the envelope is a small multiple of
+  // the per-element code error accumulated over the dot products.
+  if (worst > 0.25) {
+    throw std::runtime_error("q8 int8-dot attention diverged from oracle");
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
+    // The int8-dot oracle first: the documented pre-existing preparation
+    // replay failure aborts the suite after these.
+    CheckQ8Scores(4, 4096, 0x1234ABCDU);
+    CheckQ8Scores(32, 9000, 0x1234ABCDU + 7);
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
     CheckPreparation(1, 0, 64);

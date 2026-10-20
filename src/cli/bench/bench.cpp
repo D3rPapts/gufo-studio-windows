@@ -1511,11 +1511,6 @@ int RunOrnithBenchmark(const BenchOptions& options,
     std::cerr << "Error: Ornith context is out of range\n";
     return 1;
   }
-  if (options.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
-    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
-                 "models\n";
-    return 1;
-  }
 
   std::string error;
   auto model = q35::Model::Load(
@@ -1525,6 +1520,8 @@ int RunOrnithBenchmark(const BenchOptions& options,
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .dflash_model_path =
               dflash ? options.dflash_model_path : std::string{},
+          .kv_cache_mode =
+              static_cast<q35::KvCacheMode>(options.kv_cache_mode),
       },
       &error);
   if (model == nullptr) {

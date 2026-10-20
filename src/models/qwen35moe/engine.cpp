@@ -1,5 +1,7 @@
 #include "src/models/qwen35moe/engine.hpp"
 
+#include "src/models/qwen35moe/kv_cache_mode.hpp"
+
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -166,6 +168,19 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
   }
   rocm::Executor::Options exec;
+  switch (options.kv_cache_mode) {
+    case KvCacheMode::kF16:
+      exec.kv_dtypes = {.key = KvCacheDtype::kF16, .value = KvCacheDtype::kF16};
+      break;
+    case KvCacheMode::kQ8_0:
+      exec.kv_dtypes = {.key = KvCacheDtype::kQ8_0,
+                        .value = KvCacheDtype::kQ8_0};
+      break;
+    case KvCacheMode::kQ8_0Q4K:
+      exec.kv_dtypes = {.key = KvCacheDtype::kQ8_0,
+                        .value = KvCacheDtype::kQ4_K};
+      break;
+  }
   exec.max_batch = m->PrefillCapacity();
   exec.max_logit_rows =
       m->mtp_weights_

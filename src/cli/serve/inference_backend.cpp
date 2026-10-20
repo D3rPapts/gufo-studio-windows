@@ -4082,10 +4082,6 @@ bool InferenceBackend::load(
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    if (kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
-      SetError(error, "--kv-cache applies only to Qwen3.8-Flash-Next models");
-      return false;
-    }
     const bool ornith_dflash =
         speculative_config.backend == TextSpeculativeBackend::kDFlash;
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -4137,6 +4133,8 @@ bool InferenceBackend::load(
                                      ? speculative_config.draft_model_path
                                      : std::string{},
             .dflash_policy = speculative_config.dflash_policy,
+            .kv_cache_mode =
+                static_cast<models::qwen35moe::KvCacheMode>(kv_cache_mode),
         },
         &load_error);
     if (model == nullptr) {
