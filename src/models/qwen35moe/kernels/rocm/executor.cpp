@@ -357,9 +357,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
              : nullptr;
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
-  s.zero_ids = Alloc<std::int32_t>(a, kVecBatch, error_msg);
+  // Batched projections index the E=1 expert table with these zeros for
+  // every row of the batch, so the buffer spans the batch, not kVecBatch.
+  s.zero_ids = Alloc<std::int32_t>(a, T, error_msg);
   if (s.zero_ids != nullptr) {
-    (void)hipMemset(s.zero_ids, 0, kVecBatch * sizeof(std::int32_t));
+    (void)hipMemset(s.zero_ids, 0, T * sizeof(std::int32_t));
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);

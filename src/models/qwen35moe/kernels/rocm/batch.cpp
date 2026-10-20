@@ -476,6 +476,22 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.native_data != nullptr) {
+    // Batched verification keeps the decode kernels' native-byte reads: the
+    // wide Q8_0 view beside a mixed-format tensor holds requantized weights
+    // (and a raw Q8_0 tensor's prequantized route reorders the activation
+    // quantization), so either shifts logits against the single-session
+    // reference and flips near-tie tokens. moe_vec quantizes each row
+    // independently of the batch, so one pass over the weights serves the
+    // whole batch with the decode path's arithmetic.
+    if (qfn_mmq_moe_vec(static_cast<int>(w.native_type), w.native_data, x,
+                        s_.zero_ids, out, static_cast<int>(w.rows),
+                        static_cast<int>(w.cols), static_cast<int>(rows), 1,
+                        1, stream_) != 0) {
+      return Fail(error, "batched native vector projection failed");
+    }
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);
@@ -508,14 +524,29 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                                const float* x, float* out, std::uint32_t rows,
                                std::string* error) const {
   const Scratch base = s_;
-  const bool q8 = up.type == core::GgmlType::kQ8_0 &&
+  // The single-session path reads native bytes below the tiled threshold;
+  // chunked batches keep that arithmetic so wide verification reproduces it
+  // per row instead of reading the requantized wide-batch view.
+  const bool native =
+      up.native_data != nullptr && gate.native_data != nullptr &&
+      up.native_type == gate.native_type && up.rows == gate.rows &&
+      up.cols == gate.cols;
+  const bool q8 = !native && up.type == core::GgmlType::kQ8_0 &&
                   gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
                   up.cols == gate.cols;
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     const auto n = std::min(kDecodeRows, rows - r);
-    if (q8) {
+    if (native) {
+      if (qfn_mmq_moe_gated_vec(
+              static_cast<int>(up.native_type), gate.native_data,
+              up.native_data, x + std::size_t{r} * up.cols, s_.zero_ids,
+              out + std::size_t{r} * up.rows, static_cast<int>(up.rows),
+              static_cast<int>(up.cols), static_cast<int>(n), 1, 1,
+              stream_) != 0)
+        return Fail(error, "batched native gated vector projection failed");
+    } else if (q8) {
       const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
                           qfn_mmq_q8_1_bytes(r, up.cols);
       if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, input,
@@ -549,25 +580,12 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
-      l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
-    // Share expert weights across request boundaries while retaining the
-    // scalar Q8 activation quantization and dot-product reduction.
-    if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
-                              l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
-                              base.ids, base.gate_e, c.expert_ff, c.hidden_size,
-                              rows, c.num_experts, c.num_experts_used,
-                              stream_) != 0 ||
-        qfn_mmq_moe_vec(
-            static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
-            base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
-            rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
-      return Fail(error, "batched routed vector projection failed");
-    MoeEpilogue(base.down_e, base.weights, base.shexp_out,
-                base.router + c.num_experts, c.num_experts + 1, out, rows,
-                c.num_experts_used, c.hidden_size, stream_);
-    return true;
-  }
+  // Every layer runs the single-session expert path on kDecodeRows-row
+  // chunks: the earlier full-batch Q4_K shortcut read the down projection's
+  // requantized Q8_0 view (the decode path reads native bytes) and could
+  // push more slot rows than the routed vector contract holds, and either
+  // shifted logits against the isolated reference. Routed weight traffic
+  // follows the selected slots, so the chunks re-read little.
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     UseScratch(RowScratch(base, r));
     const bool ok = MoeExperts(l, x + std::size_t{r} * c.hidden_size,
