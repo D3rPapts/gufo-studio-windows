@@ -64,6 +64,37 @@ rejected on the way are recorded in [Experiments](EXPERIMENTS.md)).
 For reference, Qwen3.8-Flash-Next (sparse-indexer attention, quantized
 KV) reports −13.5% pp and −1.6% AR tg at 131072 in its tables.
 
+## Single user, quantized KV (`--kv-cache q8_0`, 2026-10-20)
+
+Same host, method and build as the table above with the opt-in Q8_0
+key/value planes (`ef4326e`): the decode scores run as v_dot4 integer
+dots over the cache codes against per-step quantized queries. One
+warmed sample per point; the quantized completions are hash-identical
+to the F16 rows at every depth (the lossless greedy property holds in
+quant mode on this workload), and the oracle envelope is in
+[QUALITY.md](QUALITY.md).
+
+| Depth (tokens) | pp2048 | AR tg128 | MTP tg128 |
+| ---: | ---: | ---: | ---: |
+| 0 | 2970 | 69.2 | 87.0 |
+| 4,096 | 2693 | 67.8 | 103.0 |
+| 8,192 | 2407 | 63.2 | 98.0 |
+| 12,288 | 1904 | 59.5 | 94.6 |
+| 16,384 | 1754 | 59.5 | 96.7 |
+| 32,768 | 1274 | 55.1 | 85.6 |
+| 65,536 | 869 | 50.1 | 65.8 |
+| 131,072 | 493 | 38.9 | 51.1 |
+
+Read against the F16 table: the modes are a deep-context trade. Deep
+token generation gains (AR +4.8% at 131072, +1.7% at 65536; MTP +4.3%
+at 32768) and every KV-resident byte halves (2048 → 1072 per token),
+while shallow MTP pays the per-cycle query-quantization launches
+(−15% at d0) and deep prefill pays the fused kernel's in-kernel
+dequant (pp −21% at 131072). F16 stays the default and the
+mixed-workload pick; `--kv-cache q8_0` is the long-context and
+memory-constrained option. Snapshots record the plane dtypes, so
+quantized sessions never restore into F16 ones.
+
 > 2026-10-01: the Q6_K decode pass supersedes the single-user AR/MTP rows
 > below (tables are driver-rendered and not yet re-rendered on Windows):
 > native pp2048 2922 +/- 27, tg128 AR 64.79 +/- 0.44, tg128 MTP 88.48 +/-

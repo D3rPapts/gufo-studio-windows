@@ -285,9 +285,15 @@
   quantized mode is a small win everywhere it was measured: AR tg128
   57.96 vs 57.41 at d32768 and 38.95 vs 37.85 at d131072, quantized
   completions hash-identical to F16 on the bench prompt at both depths,
-  MTP parity at d131072 (50.4, same hash), pp2048 within session noise,
-  validate-prefill cosine 0.9995 rank 1, and natural-text probes remain
-  coherent (minor near-tie phrasing drift). KV bytes halve (2048 to
-  1072 per token for the 2x256 K+V planes), which compounds with the
-  deep-context memory story. The F16 default is untouched and bitwise;
-  the modes are opt-in only.
+  MTP near parity at d131072 (51.1 vs 50.6 in the full sweeps, same
+  hash), validate-prefill cosine 0.9995 rank 1, and natural-text probes
+  remain coherent (minor near-tie phrasing drift). KV bytes halve (2048
+  to 1072 per token for the 2x256 K+V planes). The full depth sweeps
+  scope the modes honestly: the win is deep — AR tg128 +4.8% and
+  +1.7% at d131072/d65536, MTP +4.3% at d32768 — while shallow batches
+  pay the per-cycle query-quantization launches (MTP d0 -15%, AR d0
+  -1.8%) and deep prefill pays the WMMA in-kernel dequant (pp2048 at
+  d131072 -21%), with mid-depth AR rows noisy between the paired and
+  sweep measurements. Treat `--kv-cache` as the deep-context and
+  memory option; F16 remains the default and the mixed-workload pick.
+  The F16 default is untouched and bitwise; the modes are opt-in only.
