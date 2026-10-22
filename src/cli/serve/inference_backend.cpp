@@ -1538,7 +1538,6 @@ public:
     RequireQwenState(state).PrepareCancellation();
   }
 
-
 private:
   [[nodiscard]] std::size_t MaximumDecodeBatchWidth() const noexcept {
     const std::size_t rows_per_session = dflash_model_ != nullptr ? 8 : 1;

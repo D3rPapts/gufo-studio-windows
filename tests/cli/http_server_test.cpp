@@ -795,28 +795,38 @@ void TestExpectContinue() {
     const int fd = server.Connect();
     const std::string head =
         "POST /echo HTTP/1.1\r\n" + expect + "\r\nContent-Length: 5\r\n\r\n";
-    assert(::send(fd, head.data(), head.size(), MSG_NOSIGNAL) ==
-           static_cast<ssize_t>(head.size()));
+    assert(net::SendNoSignal(fd, head.data(), head.size()) ==
+           static_cast<std::intptr_t>(head.size()));
     // The interim response arrives before any body byte is sent.
     const std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
     std::string response;
     char buffer[4096];
     while (response.size() < interim.size()) {
+#if defined(_WIN32)
+      const auto count = ::recv(
+          fd, buffer, static_cast<int>(interim.size() - response.size()), 0);
+#else
       const auto count = ::read(fd, buffer, interim.size() - response.size());
+#endif
       assert(count > 0);
       response.append(buffer, static_cast<std::size_t>(count));
     }
     assert(response == interim);
-    assert(::send(fd, "hello", 5, MSG_NOSIGNAL) == 5);
+    assert(net::SendNoSignal(fd, "hello", 5) == 5);
     response.clear();
     for (;;) {
+#if defined(_WIN32)
+      const auto count =
+          ::recv(fd, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
       const auto count = ::read(fd, buffer, sizeof(buffer));
+#endif
       assert(count >= 0);
       if (count == 0)
         break;
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     ExpectStatus(response, 200);
     assert(response.substr(response.find("\r\n\r\n") + 4) == "hello");
   }
