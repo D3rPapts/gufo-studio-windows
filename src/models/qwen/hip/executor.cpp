@@ -8,6 +8,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -214,6 +215,7 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
 }
 
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   CheckReset();
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);
@@ -225,6 +227,7 @@ void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
 }
 
 void QwenGpuExecutor::RestoreState() {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   CheckReset();
   models::qwen::ContinuationRestore restore(continuation_hooks_, true);
   if (arena_.IsSsmReplayCaptureActive())
@@ -245,6 +248,7 @@ void QwenGpuExecutor::FinishVerification() {
 
 void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
                                      std::uint32_t count) {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   const auto& config = weights_.config;
   auto scratch = arena_.GetScratchView();
   // The replay is one pass: it reads the restored (pinned) state and leaves it
@@ -395,6 +399,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
         "Qwen sampled verification proposal is malformed");
   }
 
+  qwen27::PhaseScope profile(qwen27::Phase::kVerifyRow);
   if (sampler.NeedsConstraintMask()) {
     const auto target = sampler.Distribution(CopyVerificationLogits(row));
     if (sampler.Uniform() * draft_token_probability <
@@ -426,6 +431,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
 
   QwenSampledVerificationResult result;
   std::uint32_t accepted = 0;
+  profile.Enqueued();
   HIP_CHECK(hipMemcpyAsync(&result.token, d_out_token, sizeof(result.token),
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipMemcpyAsync(&accepted, sampling_workspace_.speculative_accepted,

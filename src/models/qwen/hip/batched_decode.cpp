@@ -8,9 +8,11 @@
 #include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
 namespace gufo::hip {
@@ -29,6 +31,9 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
                       float* output, std::size_t batch_size,
                       std::size_t output_size, std::size_t input_size,
                       hipStream_t stream) {
+  if (TryLaunchVerifyGemm27(weight.type, weight.data, input, output,
+                            batch_size, output_size, input_size, stream))
+    return;
   if (SupportsExactSharedProjection(weight.type)) {
     LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                batch_size, output_size, input_size, stream);
@@ -439,6 +444,7 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
 std::vector<std::vector<tokenization::TokenId>>
 QwenGpuExecutor::ForwardVerificationBatch(
     std::span<const QwenGpuVerificationItem> items) {
+  qwen27::PhaseScope profile(qwen27::Phase::kVerify);
   for (const auto& item : items)
     if (item.executor)
       item.executor->CheckReset();
@@ -572,6 +578,13 @@ QwenGpuExecutor::ForwardVerificationBatch(
                            batch_size * sizeof(std::uint32_t),
                            hipMemcpyHostToDevice, arena_.stream));
   EmitDecodeRouteTelemetry(weights_, coordinator.policy_);
+  const bool gpu_timeline = qwen27::GpuTimeline::Enabled();
+  const auto mark = [&](qwen27::GpuPart part) {
+    if (gpu_timeline)
+      qwen27::GpuTimeline::Get().Mark(arena_.stream, part);
+  };
+  if (gpu_timeline)
+    qwen27::GpuTimeline::Get().Begin(arena_.stream);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights_.layers[layer_index];
@@ -583,6 +596,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          static_cast<const float*>(layer.attn_norm.data),
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena_.stream);
+    mark(qwen27::GpuPart::kOther);
 
     if (layer.is_full_attention) {
       LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
@@ -594,6 +608,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
       LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
                        scratch.attention.v.data(), batch_size, kv_size,
                        hidden_size, arena_.stream);
+      mark(qwen27::GpuPart::kAttnProj);
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -706,9 +721,11 @@ QwenGpuExecutor::ForwardVerificationBatch(
           }
         }
       }
+      mark(qwen27::GpuPart::kAttnCore);
       LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena_.stream);
+      mark(qwen27::GpuPart::kAttnProj);
     } else {
       LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
                        scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
@@ -716,6 +733,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
       LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
                        scratch.ssm.gate.data(), batch_size, ssm_inner_size,
                        hidden_size, arena_.stream);
+      mark(qwen27::GpuPart::kSsmProj);
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
                             hidden_size, arena_.stream);
@@ -732,10 +750,12 @@ QwenGpuExecutor::ForwardVerificationBatch(
           config.ssm_group_count, config.ssm_time_step_rank,
           config.ssm_state_size, config.SsmValueSize(), controls.row_stride,
           ssm_inner_size, arena_.stream, arena_.GetRecurrentStateStorage());
+      mark(qwen27::GpuPart::kSsmCore);
 
       LaunchProjection(layer.ssm_out, scratch.ssm.out.data(),
                        scratch.attention.output.data(), batch_size, hidden_size,
                        ssm_inner_size, arena_.stream);
+      mark(qwen27::GpuPart::kSsmProj);
     }
 
     LaunchBatchedResidualAdd(
@@ -745,12 +765,15 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          static_cast<const float*>(layer.ffn_norm.data),
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena_.stream);
+    mark(qwen27::GpuPart::kOther);
 
     LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
                         hidden_size, arena_.stream);
+    mark(qwen27::GpuPart::kFfnGateUp);
     LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
                      scratch.ffn.out.data(), batch_size, hidden_size,
                      intermediate_size, arena_.stream);
+    mark(qwen27::GpuPart::kFfnDown);
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
@@ -765,7 +788,10 @@ QwenGpuExecutor::ForwardVerificationBatch(
                                    hipMemcpyDeviceToDevice, arena_.stream));
       }
     }
+    qwen27::MaybeFlush(arena_.stream, layer_index);
   }
+  // The pageable hidden-state download below blocks until the GPU is done.
+  profile.Enqueued();
 
   for (std::size_t index = 0; index < items.size(); ++index) {
     const auto& item = items[index];
@@ -800,6 +826,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
       executor.last_hidden_offset_ = 0;
     }
   }
+  mark(qwen27::GpuPart::kOther);
   LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
                        static_cast<const float*>(weights_.output_norm.data),
                        scratch.decode.normed.data(), nullptr, batch_size,
@@ -809,6 +836,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
   auto* const d_out_tokens = scratch.decode.prompt_tokens.data();
   LaunchBatchedGPUArgmax(logits_buffer, d_out_tokens, batch_size, vocab_size,
                          scratch.ffn.out, arena_.stream);
+  mark(qwen27::GpuPart::kHead);
   std::array<tokenization::TokenId, kMaxRows> host_predictions{};
   HIP_CHECK(hipMemcpyAsync(host_predictions.data(), d_out_tokens,
                            batch_size * sizeof(tokenization::TokenId),
@@ -831,6 +859,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
     }
   }
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  if (gpu_timeline)
+    qwen27::GpuTimeline::Get().Collect(qwen27::ProfileState::Get().gpu);
   for (std::size_t row = 0; row < batch_size; ++row)
     (void)CheckedSampleToken(host_predictions[row], vocab_size);
   std::vector<std::vector<tokenization::TokenId>> predictions;
