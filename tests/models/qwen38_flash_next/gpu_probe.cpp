@@ -211,12 +211,8 @@ int main(int argc, char** argv) {
                  "--chain-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (cost_depth && !cost_audit && !chain_audit) {
-    std::fprintf(stderr, "--depth requires --cost-audit\n");
-    return 2;
-  }
-  if (sampled_head && !cost_audit) {
-    std::fprintf(stderr, "--sampled-head requires --cost-audit\n");
+  if ((cost_depth || sampled_head) && !cost_audit && !chain_audit) {
+    std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
   std::string error;
