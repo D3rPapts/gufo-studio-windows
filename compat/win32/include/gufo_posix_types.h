@@ -20,5 +20,8 @@ typedef unsigned int mode_t;
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 typedef unsigned long long rlim_t;
+/* Match struct stat's st_dev/st_ino (volume serial, 64-bit file index). */
+typedef unsigned long long dev_t;
+typedef unsigned long long ino_t;
 
 #endif /* GUFO_COMPAT_WIN32_POSIX_TYPES_H_ */

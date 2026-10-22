@@ -291,6 +291,10 @@ int msync(void* addr, size_t length, int flags);
 
 int renameat(int olddirfd, const char* oldpath, int newdirfd,
              const char* newpath);
+/* Only flags 0 and RENAME_NOREPLACE (<linux/fs.h>) are supported. */
+int renameat2(int olddirfd, const char* oldpath, int newdirfd,
+              const char* newpath, unsigned int flags);
+int mkdirat(int dirfd, const char* path, mode_t mode);
 int utimensat(int dirfd, const char* path, const struct timespec times[2],
               int flags);
 int futimens(int fd, const struct timespec times[2]);

@@ -1673,9 +1673,11 @@ LoadingResponder::LoadingResponder(const std::string& host, int port) {
   // Match HttpServer::start, which binds the same address after stop().
   const int yes = 1;
   const int no = 0;
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
   if ((addr.ss_family == AF_INET6 &&
-       ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) != 0) ||
+       ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&no), sizeof(no)) != 0) ||
       ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
       ::listen(fd, 16) < 0) {
     const int error = errno;
@@ -1713,10 +1715,13 @@ void LoadingResponder::serve() {
   // the wait: a client that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
-    pollfd listener{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+    pollfd listener{.fd = static_cast<decltype(pollfd::fd)>(listen_fd_),
+                    .events = POLLIN,
+                    .revents = 0};
     if (net::PollSocket(&listener, 1, 100) <= 0)
       continue;
-    const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    const int client_fd =
+        static_cast<int>(::accept(listen_fd_, nullptr, nullptr));
     if (client_fd < 0)
       continue;
     std::string head;
@@ -1727,7 +1732,9 @@ void LoadingResponder::serve() {
           std::chrono::duration_cast<std::chrono::milliseconds>(
               deadline - std::chrono::steady_clock::now())
               .count();
-      pollfd client{.fd = client_fd, .events = POLLIN, .revents = 0};
+      pollfd client{.fd = static_cast<decltype(pollfd::fd)>(client_fd),
+                    .events = POLLIN,
+                    .revents = 0};
       if (remaining <= 0 ||
           net::PollSocket(&client, 1, static_cast<int>(remaining)) <= 0)
         break;
@@ -1963,7 +1970,9 @@ void HttpServer::run(bool handle_signals) {
         break;
       }
     }
-    pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+    pollfd descriptor{.fd = static_cast<decltype(pollfd::fd)>(listen_fd_),
+                      .events = POLLIN,
+                      .revents = 0};
     const int ready = net::PollSocket(&descriptor, 1, 100);
     if (ready < 0 && errno != EINTR)
       throw std::system_error(errno, std::generic_category(),

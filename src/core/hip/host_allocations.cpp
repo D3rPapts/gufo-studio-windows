@@ -1,15 +1,26 @@
 #include "src/core/hip/host_allocations.hpp"
 
+#ifndef _WIN32
 #include <linux/io_uring.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <new>
 
 namespace gufo::hip {
 
+#ifdef _WIN32
+// No io_uring on Windows. hipHostMalloc memory is already page-locked by the
+// driver, so there is no extra kernel pin to hold.
+int PinHostPages(void*, std::size_t) noexcept {
+  return -1;
+}
+
+void UnpinHostPages(int) noexcept {}
+#else
 int PinHostPages(void* data, std::size_t bytes) noexcept {
   if (!data || !bytes)
     return -1;
@@ -44,6 +55,7 @@ void UnpinHostPages(int ring) noexcept {
     close(ring);
   }
 }
+#endif
 
 HostAllocations::~HostAllocations() {
   Reset();

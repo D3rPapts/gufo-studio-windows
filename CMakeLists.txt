@@ -44,7 +44,7 @@ if (WIN32)
   add_library(gufo_posix_compat STATIC
     compat/win32/posix.cpp
     compat/win32/spawn.cpp)
-  target_link_libraries(gufo_posix_compat PUBLIC ws2_32 psapi)
+  target_link_libraries(gufo_posix_compat PUBLIC ws2_32 psapi bcrypt)
   link_libraries(gufo_posix_compat)
 endif()
 find_package(ICU REQUIRED COMPONENTS uc i18n)
@@ -52,8 +52,16 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+if (WIN32)
+  # vcpkg ships CMake targets instead of pkg-config files; expose them under
+  # the pkg-config target name the rest of the build links against.
+  find_package(WebP CONFIG REQUIRED)
+  add_library(PkgConfig::WEBP INTERFACE IMPORTED)
+  target_link_libraries(PkgConfig::WEBP INTERFACE WebP::webp)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")

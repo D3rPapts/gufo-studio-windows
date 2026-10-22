@@ -24,6 +24,10 @@ extern "C" {
 #ifndef SIGCHLD
 #define SIGCHLD 17
 #endif
+/* Bus errors surface as SIGSEGV-style SEH exceptions on Windows. */
+#ifndef SIGBUS
+#define SIGBUS 7
+#endif
 
 typedef unsigned long sigset_t;
 struct sigaction {

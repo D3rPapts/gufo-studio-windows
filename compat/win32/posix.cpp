@@ -31,6 +31,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
+#include <bcrypt.h>
 
 #include <crtdbg.h>
 #include <direct.h>
@@ -43,8 +44,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <linux/fs.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/random.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -54,6 +59,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <new>
 #include <random>
 #include <string>
 #include <typeinfo>
@@ -890,6 +896,113 @@ int mkdir(const char* path, mode_t) {
   return 0;
 }
 
+int mkdirat(int dirfd, const char* path, mode_t) {
+  const std::wstring resolved = ResolveAt(dirfd, path);
+  if (resolved.empty()) {
+    errno = EBADF;
+    return -1;
+  }
+  if (!CreateDirectoryW(resolved.c_str(), nullptr)) {
+    return Fail(GetLastError());
+  }
+  return 0;
+}
+
+int renameat2(int olddirfd, const char* oldpath, int newdirfd,
+              const char* newpath, unsigned int flags) {
+  if (flags == 0) {
+    return renameat(olddirfd, oldpath, newdirfd, newpath);
+  }
+  if (flags != RENAME_NOREPLACE) {
+    errno = EINVAL;
+    return -1;
+  }
+  const std::wstring from = ResolveAt(olddirfd, oldpath);
+  const std::wstring to = ResolveAt(newdirfd, newpath);
+  if (from.empty() || to.empty()) {
+    errno = EBADF;
+    return -1;
+  }
+  // Without MOVEFILE_REPLACE_EXISTING the move fails atomically with
+  // ERROR_ALREADY_EXISTS, which maps to EEXIST like RENAME_NOREPLACE.
+  if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    return Fail(GetLastError());
+  }
+  return 0;
+}
+
+struct DIR {
+  HANDLE find = INVALID_HANDLE_VALUE;
+  int fd = -1;
+  bool pending = false;
+  WIN32_FIND_DATAW data{};
+  struct dirent entry{};
+};
+
+DIR* fdopendir(int fd) {
+  const std::wstring base = DirectoryPathOf(fd);
+  if (base.empty()) {
+    errno = EBADF;
+    return nullptr;
+  }
+  auto* dir = new (std::nothrow) DIR;
+  if (dir == nullptr) {
+    errno = ENOMEM;
+    return nullptr;
+  }
+  const std::wstring pattern =
+      base + (base.back() == L'\\' ? L"*" : L"\\*");
+  dir->find = FindFirstFileW(pattern.c_str(), &dir->data);
+  if (dir->find == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    delete dir;
+    Fail(error);
+    return nullptr;
+  }
+  dir->fd = fd;
+  dir->pending = true;
+  return dir;
+}
+
+struct dirent* readdir(DIR* dir) {
+  if (dir == nullptr) {
+    errno = EBADF;
+    return nullptr;
+  }
+  if (!dir->pending) {
+    if (!FindNextFileW(dir->find, &dir->data)) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_NO_MORE_FILES) {
+        Fail(error);
+      }
+      return nullptr;
+    }
+  }
+  dir->pending = false;
+  const std::string name = Narrow(dir->data.cFileName);
+  const size_t length =
+      name.size() < sizeof(dir->entry.d_name) ? name.size()
+                                              : sizeof(dir->entry.d_name) - 1;
+  memcpy(dir->entry.d_name, name.data(), length);
+  dir->entry.d_name[length] = '\0';
+  const DWORD attributes = dir->data.dwFileAttributes;
+  dir->entry.d_type = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) ? DT_LNK
+                      : (attributes & FILE_ATTRIBUTE_DIRECTORY)   ? DT_DIR
+                                                                  : DT_REG;
+  return &dir->entry;
+}
+
+int closedir(DIR* dir) {
+  if (dir == nullptr) {
+    errno = EBADF;
+    return -1;
+  }
+  FindClose(dir->find);
+  const int result = dir->fd >= 0 ? close(dir->fd) : 0;
+  delete dir;
+  return result;
+}
+
 int access(const char* path, int mode) {
   const DWORD attributes = GetFileAttributesW(Widen(path).c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -1577,7 +1690,35 @@ int sched_yield(void) {
   return 0;
 }
 
-long syscall(long, ...) {
+ssize_t getrandom(void* buffer, size_t length, unsigned int) {
+  // BCryptGenRandom takes a ULONG length; fill larger buffers in slices.
+  auto* bytes = static_cast<unsigned char*>(buffer);
+  size_t done = 0;
+  while (done < length) {
+    const ULONG chunk = static_cast<ULONG>(
+        length - done < 0x40000000u ? length - done : 0x40000000u);
+    if (BCryptGenRandom(nullptr, bytes + done, chunk,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+      errno = EIO;
+      return -1;
+    }
+    done += chunk;
+  }
+  return static_cast<ssize_t>(length);
+}
+
+long syscall(long number, ...) {
+  if (number == SYS_renameat2) {
+    va_list args;
+    va_start(args, number);
+    const int olddirfd = va_arg(args, int);
+    const char* oldpath = va_arg(args, const char*);
+    const int newdirfd = va_arg(args, int);
+    const char* newpath = va_arg(args, const char*);
+    const unsigned int flags = va_arg(args, unsigned int);
+    va_end(args);
+    return renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
+  }
   errno = ENOSYS;
   return -1;
 }
@@ -1650,7 +1791,8 @@ int sigaction(int sig, const struct sigaction* action,
   if (previous != nullptr) {
     memset(previous, 0, sizeof(*previous));
   }
-  if (sig == SIGPIPE || sig == SIGHUP || sig == SIGCHLD || sig == SIGUSR1) {
+  if (sig == SIGPIPE || sig == SIGHUP || sig == SIGCHLD || sig == SIGUSR1 ||
+      sig == SIGBUS) {
     return 0;  // Never delivered on Windows.
   }
   if (action == nullptr) {
