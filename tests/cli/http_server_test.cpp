@@ -598,8 +598,11 @@ void TestContentTrace() {
   }
   Trace::Close();
 
+#ifndef _WIN32
+  // Windows has no POSIX mode bits; the trace file inherits its directory ACL.
   assert((fs::status(path).permissions() & fs::perms::all) ==
          (fs::perms::owner_read | fs::perms::owner_write));
+#endif
   std::vector<gufo::json::Value> records;
   {
     std::ifstream input(path);
@@ -2357,7 +2360,8 @@ void TestDeviceLossWhileWriterBlocked() {
   });
   const int fd = server.Connect();
   const int receive_buffer = 1024;
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                      reinterpret_cast<const char*>(&receive_buffer),
                       sizeof(receive_buffer)) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
   assert(net::SendNoSignal(fd, request.data(), request.size()) ==
@@ -2401,7 +2405,13 @@ bool HasIpv6Loopback() {
 
 void TestListenAddresses() {
   using gufo::server::IsListenAddress;
-  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1", "fe80::1%lo"})
+#ifdef _WIN32
+  // Windows names link-local scopes by interface index, not name.
+  const char* const link_local = "fe80::1%1";
+#else
+  const char* const link_local = "fe80::1%lo";
+#endif
+  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1", link_local})
     assert(IsListenAddress(host));
   for (const char* host : {"", "localhost", "127.1", "[::1]", "bad.address"})
     assert(!IsListenAddress(host));

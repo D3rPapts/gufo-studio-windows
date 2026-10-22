@@ -106,6 +106,9 @@ WebSocket::~WebSocket() {
 }
 
 bool WebSocket::Read(char* data, std::size_t size) {
+#ifdef _WIN32
+  auto wait_start = std::chrono::steady_clock::now();
+#endif
   while (size != 0 && !closed_.load()) {
     if (offset_ < buffered_.size()) {
       const auto count = std::min(size, buffered_.size() - offset_);
@@ -115,12 +118,26 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
+    ssize_t count;
 #ifdef _WIN32
     // See platform::StopSocketReads: wake periodically to observe closed_.
-    if (!platform::WaitReadable(fd_, std::chrono::milliseconds(50)))
-      continue;
+    // The receive timeout never fires while waiting in slices, so apply the
+    // idle limit here as the EAGAIN a timed-out recv reports on Linux.
+    if (!platform::WaitReadable(fd_, std::chrono::milliseconds(50))) {
+      const auto now = std::chrono::steady_clock::now();
+      if (idle_ <= std::chrono::steady_clock::duration::zero() ||
+          now - wait_start < idle_)
+        continue;
+      wait_start = now;
+      errno = EAGAIN;
+      count = -1;
+    } else {
+      count = platform::SocketRecv(fd_, data, size, 0);
+      wait_start = std::chrono::steady_clock::now();
+    }
+#else
+    count = platform::SocketRecv(fd_, data, size, 0);
 #endif
-    const auto count = platform::SocketRecv(fd_, data, size, 0);
     if (count < 0 && errno == EINTR)
       continue;
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {

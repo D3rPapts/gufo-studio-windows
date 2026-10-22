@@ -1612,6 +1612,11 @@ bool ParseListenAddress(const std::string& host, int port,
     *length = sizeof(sockaddr_in);
     return true;
   }
+  // Every IPv6 literal has a colon and no URL brackets. Without this guard
+  // Winsock's getaddrinfo also accepts "" (a local address) and "[::1]".
+  if (host.find(':') == std::string::npos ||
+      host.find_first_of("[]") != std::string::npos)
+    return false;
   addrinfo hints{};
   hints.ai_family = AF_INET6;
   hints.ai_socktype = SOCK_STREAM;

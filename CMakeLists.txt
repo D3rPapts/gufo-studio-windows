@@ -357,8 +357,6 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   )
   target_compile_definitions(gufo-kernel-bench PRIVATE
     GUFO_REVISION="${GUFO_REVISION}")
-  target_include_directories(gufo-kernel-bench SYSTEM PRIVATE
-    ${ROCTX_INCLUDE_DIR})
   target_link_libraries(gufo-kernel-bench PRIVATE
     gufo_kernel_bench_support
     gufo_diagnostics

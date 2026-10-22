@@ -23,6 +23,44 @@ namespace net = gufo::net;
 using namespace gufo::server;
 namespace json = gufo::json;
 
+// A connected stream pair. Windows has no AF_UNIX socketpair; a loopback TCP
+// connection gives the same blocking stream semantics.
+bool ConnectedPair(std::array<int, 2>& fds) {
+#ifdef _WIN32
+  net::EnsureSocketRuntimeStarted();
+  const int listener = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+  if (listener < 0)
+    return false;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t length = sizeof(address);
+  bool ok =
+      ::bind(listener, reinterpret_cast<sockaddr*>(&address), length) == 0 &&
+      ::listen(listener, 1) == 0 &&
+      ::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                    &length) == 0;
+  int client = -1;
+  if (ok) {
+    client = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+    ok = client >= 0 &&
+         ::connect(client, reinterpret_cast<sockaddr*>(&address), length) == 0;
+  }
+  const int server =
+      ok ? static_cast<int>(::accept(listener, nullptr, nullptr)) : -1;
+  net::CloseSocket(listener);
+  if (server < 0) {
+    if (client >= 0)
+      net::CloseSocket(client);
+    return false;
+  }
+  fds = {server, client};
+  return true;
+#else
+  return ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0;
+#endif
+}
+
 class Client {
 public:
   Client(int port, std::string_view path, std::string first = {},
@@ -122,7 +160,7 @@ private:
 // to streamed output must stay connected; a silent session closes cleanly.
 void ListeningClientIsNotIdle() {
   std::array<int, 2> fds{};
-  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+  assert(ConnectedPair(fds));
   assert(net::SetSocketTimeouts(fds[0], 300));
   assert(net::SetSocketTimeouts(fds[1], 3'000));
   {
