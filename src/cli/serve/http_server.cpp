@@ -166,7 +166,8 @@ bool SendChunk(int fd, std::string_view data, std::string_view prefix = {}) {
 bool IsPeerDisconnected(int fd) noexcept {
   pollfd descriptor{
       .fd = static_cast<decltype(pollfd::fd)>(fd),
-      .events = POLLIN | POLLERR | POLLHUP,
+      // POLLERR/POLLHUP are always reported; WSAPoll rejects them in events.
+      .events = POLLIN,
       .revents = 0,
   };
 #ifdef POLLRDHUP
