@@ -1,5 +1,6 @@
 #include "src/core/platform/net.hpp"
 
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -44,8 +45,11 @@ int PollSocket(void* descriptors, std::uint32_t count, int timeout_ms) {
 
 std::intptr_t SendNoSignal(Socket socket, const void* data, std::size_t bytes) {
 #if defined(_WIN32)
-  return ::send(socket, static_cast<const char*>(data), static_cast<int>(bytes),
-                0);
+  // Winsock's send takes an int length; clamp each call so oversized buffers
+  // narrow safely. The send loops handle partial writes.
+  const int chunk = static_cast<int>(std::min<std::size_t>(
+      bytes, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+  return ::send(socket, static_cast<const char*>(data), chunk, 0);
 #else
 #ifdef MSG_NOSIGNAL
   return ::send(socket, data, bytes, MSG_NOSIGNAL);
@@ -88,17 +92,23 @@ bool SetNoDelay(Socket socket) noexcept {
 
 bool SetSocketTimeouts(Socket socket, int timeout_ms) noexcept {
 #if defined(_WIN32)
-  DWORD ms = static_cast<DWORD>(timeout_ms);
-  return setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
-                    reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0 &&
-         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
-                    reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+  const DWORD ms = static_cast<DWORD>(timeout_ms);
+  const bool received =
+      setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+  const bool sent =
+      setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+                 reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+  return received && sent;
 #else
   timeval tv{};
   tv.tv_sec = timeout_ms / 1000;
   tv.tv_usec = (timeout_ms % 1000) * 1000;
-  return ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
-         ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+  const bool received =
+      ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+  const bool sent =
+      ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+  return received && sent;
 #endif
 }
 

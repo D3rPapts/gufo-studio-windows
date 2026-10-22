@@ -64,7 +64,8 @@ bool SetSocketTimeouts(Socket socket, int timeout_ms) noexcept;
 /// the caller's idle limit. Returns false on failure.
 bool SetSendTimeout(Socket socket, int timeout_ms) noexcept;
 
-/// Read the receive timeout back in milliseconds; -1 when unset or on error.
+/// Read the receive timeout back in milliseconds; 0 means no timeout is
+/// set, -1 means the query failed.
 long long SocketRecvTimeoutMs(Socket socket) noexcept;
 
 }  // namespace gufo::net

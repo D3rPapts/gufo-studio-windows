@@ -10,9 +10,10 @@ namespace gufo::platform {
 std::size_t PageSizeBytes();
 
 /// Best-effort physically available memory in bytes. Linux reports
-/// MemAvailable (sysconf as fallback) clamped by the enclosing cgroup limit;
-/// Windows reports GlobalMemoryStatusEx available physical memory.
-/// Returns 0 when the OS cannot answer.
+/// sysconf(_SC_AVPHYS_PAGES) times the page size; Windows reports
+/// GlobalMemoryStatusEx available physical memory. Callers layer their own
+/// refinements (MemAvailable parsing, cgroup limits) on top. Returns 0
+/// when the OS cannot answer.
 std::uint64_t AvailableMemoryBytes();
 
 }  // namespace gufo::platform

@@ -226,7 +226,7 @@ bool IsPeerDisconnected(int fd) noexcept {
 #ifdef POLLRDHUP
   descriptor.events |= POLLRDHUP;
 #endif
-  const int ready = ::poll(&descriptor, 1, 0);
+  const int ready = net::PollSocket(&descriptor, 1, 0);
   if (ready <= 0)
     return false;
   if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)

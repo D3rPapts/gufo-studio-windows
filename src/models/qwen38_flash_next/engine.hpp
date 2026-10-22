@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,6 +57,11 @@ struct ModelOptions {
   /// both planes, or Q8_0 keys with Q4_K super-block values. Lossy beyond
   /// F16; snapshots of different modes are not interchangeable.
   KvCacheMode kv_cache_mode = KvCacheMode::kF16;
+  /// Static YaRN scaling, derived by the caller (serve, bench) from the
+  /// requested context via `RopeScalingForContext`. Empty leaves the
+  /// artifact's own setting, which is always off: no GGUF metadata key sets
+  /// it today.
+  std::optional<RopeScaling> rope_scaling{};
 };
 
 class Session;

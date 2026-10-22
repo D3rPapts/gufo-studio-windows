@@ -8,15 +8,19 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/cpu_ops.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace qk = gufo::models::qwen38_flash_next;
+namespace qfn = gufo::models::qwen38_flash_next;
 namespace {
 
 // The model's full-attention geometry: 24 query heads over 2 KV heads,
@@ -374,7 +378,7 @@ std::vector<float> DequantRowQ4_KHost(const unsigned char* src,
 }
 
 void CheckPreparation(std::uint32_t n, std::uint32_t start,
-                      std::uint32_t rotary) {
+                      std::uint32_t rotary, const qfn::YarnRope& yarn = {}) {
   constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
   const std::size_t count = static_cast<std::size_t>(n) * kQWidth;
   const std::size_t cache_rows = start + n + 2;
@@ -444,8 +448,10 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
                    1e-6F, nullptr);
     q::RmsNormRows(k.get(), k_gamma.get(), k.get(), n * kKvHeads, kDim, 1,
                    1e-6F, nullptr);
-    q::Rope(q_ref.get(), n, kHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
-    q::Rope(k.get(), n, kKvHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
+    q::Rope(q_ref.get(), n, kHeads, kDim, rotary, pos.get(), 1e7F, nullptr,
+            nullptr, yarn);
+    q::Rope(k.get(), n, kKvHeads, kDim, rotary, pos.get(), 1e7F, nullptr,
+            nullptr, yarn);
     q::StoreKv(k.get(), k_ref.get(), n, kKvWidth, pos.get(), nullptr);
     q::StoreKv(v.get(), v_ref.get(), n, kKvWidth, pos.get(), nullptr);
     CheckHip(hipDeviceSynchronize(), "preparation reference ready");
@@ -456,7 +462,8 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
       const bool supported = q::PrepareAttention(
           packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
           gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
-          rotary, pos.get(), 1e7F, 1e-6F, capture.stream);
+          rotary, pos.get(), 1e7F, 1e-6F, capture.stream, nullptr, false,
+          qfn::KvDtypes{}, yarn);
       CheckHip(hipStreamEndCapture(capture.stream, &capture.graph),
                "preparation capture end");
       if (!supported)
@@ -489,7 +496,8 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
                 k_gamma.get(), q_out.get() + std::size_t(off) * kQWidth,
                 gate_out.get() + std::size_t(off) * kQWidth, k_out.get(),
                 v_out.get(), std::min(chunk, n - off), kHeads, kKvHeads, kDim,
-                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true))
+                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true,
+                qfn::KvDtypes{}, yarn))
           throw std::runtime_error("prefill preparation rejected a short tail");
       }
       CheckHip(hipDeviceSynchronize(), "short prefill preparation");
@@ -502,22 +510,145 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
     }
   }
   std::cout << "attention preparation n=" << n << " start=" << start
-            << " rotary=" << rotary << ": exact, including graph positions\n";
+            << " rotary=" << rotary << " yarn=" << yarn.enabled
+            << ": exact, including graph positions\n";
+}
+
+qfn::YarnRope Yarn(float factor) {
+  return qfn::MakeYarnRope({.factor = factor, .original_context = 262144}, 64,
+                           1e7F);
+}
+
+// HF frequency of pair i in double (same ramp, 1/factor blend).
+double HfFrequency(float factor, std::uint32_t i) {
+  const double extrapolation = std::pow(1e7, -2.0 * i / 64.0);
+  if (factor == 1.0F)
+    return extrapolation;
+  const double ramp = std::clamp((double(i) - 14.0) / 8.0, 0.0, 1.0);
+  return extrapolation * (1.0 - ramp + ramp / factor);
+}
+
+// Unit input per pair: the Rope kernel's output is mscale * (cos, sin) of
+// the angle, so angle and scale are checked directly against HF.
+void CheckPhase(const std::vector<float>& out, const std::vector<double>& pos,
+                float factor, const char* label) {
+  const double mscale = factor == 1.0F ? 1.0 : 0.1 * std::log(factor) + 1.0;
+  for (std::uint32_t i = 0; i < 32; ++i) {
+    const double angle = pos[i] * HfFrequency(factor, i);
+    const double got = std::atan2(out[i + 32], out[i]);
+    const double diff = std::remainder(got - angle, 2.0 * std::numbers::pi);
+    const double magnitude = std::hypot(out[i], out[i + 32]);
+    if (std::abs(diff) > 1e-6 * angle + 1e-4 ||
+        std::abs(magnitude - mscale) > 1e-5 * mscale) {
+      throw std::runtime_error(
+          std::string(label) + ": pair " + std::to_string(i) + " angle error " +
+          std::to_string(diff) + " magnitude " + std::to_string(magnitude));
+    }
+  }
+  for (std::uint32_t i = 64; i < kDim; ++i)
+    if (out[i] != 0.25F)
+      throw std::runtime_error(std::string(label) + ": tail changed");
+}
+
+std::vector<float> UnitPairs() {
+  std::vector<float> host(kDim, 0.0F);
+  std::fill_n(host.begin(), 32, 1.0F);
+  std::fill(host.begin() + 64, host.end(), 0.25F);
+  return host;
+}
+
+void CheckYarnPhase(float factor, std::uint32_t position) {
+  HipBuffer<float> x(kDim);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, UnitPairs());
+  Upload(&pos, std::vector<std::uint32_t>{position});
+  q::Rope(x.get(), 1, 1, kDim, 64, pos.get(), 1e7F, nullptr, nullptr,
+          factor == 1.0F ? qfn::YarnRope{} : Yarn(factor));
+  CheckHip(hipDeviceSynchronize(), "phase rope");
+  CheckPhase(Download(&x, kDim), std::vector<double>(32, position), factor,
+             "rope phase");
+  std::cout << "rope phase factor=" << factor << " pos=" << position
+            << ": HF angle and mscale\n";
+}
+
+// mRoPE: pair i reads T, H or W exactly as qwen::vision::RopePosition does.
+void CheckYarnVisionPhase(float factor) {
+  const std::vector<std::int32_t> thw{300000, 200000, 250000};
+  HipBuffer<std::int32_t> positions(3);
+  CheckHip(hipMemcpy(positions.get(), thw.data(), 12, hipMemcpyHostToDevice),
+           "vision positions");
+  const gufo::models::qwen::vision::DeviceRope host_rope{positions.get(), 1, 0};
+  HipBuffer<gufo::models::qwen::vision::DeviceRope> rope(1);
+  CheckHip(hipMemcpy(rope.get(), &host_rope, sizeof(host_rope),
+                     hipMemcpyHostToDevice),
+           "vision rope");
+  HipBuffer<float> x(kDim);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, UnitPairs());
+  Upload(&pos, std::vector<std::uint32_t>{0});
+  q::Rope(x.get(), 1, 1, kDim, 64, pos.get(), 1e7F, nullptr, rope.get(),
+          Yarn(factor));
+  CheckHip(hipDeviceSynchronize(), "vision phase rope");
+  std::vector<double> coordinate(32);
+  for (std::uint32_t i = 0; i < 32; ++i) {
+    const int axis = i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0;
+    coordinate[i] = thw[axis];
+  }
+  CheckPhase(Download(&x, kDim), coordinate, factor, "vision rope phase");
+  std::cout << "vision rope phase factor=" << factor << ": per-axis YaRN\n";
+}
+
+// Relative RMS of the rotated dims, GPU Rope kernel versus cpu::Rope.
+double OracleRms(float factor, std::uint32_t position) {
+  const auto yarn = factor == 1.0F ? qfn::YarnRope{} : Yarn(factor);
+  const auto input = MakeValues(std::size_t(kHeads) * kDim, 0x5EED, 1.0F);
+  HipBuffer<float> x(input.size());
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, input);
+  Upload(&pos, std::vector<std::uint32_t>{position});
+  q::Rope(x.get(), 1, kHeads, kDim, 64, pos.get(), 1e7F, nullptr, nullptr,
+          yarn);
+  const auto gpu = Download(&x, input.size());
+  auto cpu = input;
+  qfn::cpu::Rope(cpu.data(), kHeads, kDim, 64, position, 1e7F, yarn);
+  double num = 0.0, den = 0.0;
+  for (std::uint32_t h = 0; h < kHeads; ++h)
+    for (std::uint32_t i = 0; i < 64; ++i) {
+      const auto k = std::size_t(h) * kDim + i;
+      num += (double(gpu[k]) - cpu[k]) * (double(gpu[k]) - cpu[k]);
+      den += double(cpu[k]) * cpu[k];
+    }
+  return std::sqrt(num / den);
+}
+
+void CheckOracleRms() {
+  for (const std::uint32_t position : {1000U, 300000U, 650000U}) {
+    const double off = OracleRms(1.0F, position);
+    const double on = OracleRms(2.5F, position);
+    std::cout << "rope vs CPU oracle pos=" << position << ": relative RMS off "
+              << off << " on " << on << '\n';
+    if ((position == 1000 && on > 1e-4) || on > 2.0 * off + 1e-5)
+      throw std::runtime_error("YaRN rope drifts from the CPU oracle");
+  }
 }
 
 /// FP64 gated attention over the keys each row can see: every key below
 /// pos + 1, or with a mask the selected complete blocks plus the incomplete
 /// tail block. An independent formula for the per-token kernel. Cache
 /// elements decode through `DecodeCache` (__half or float).
-inline float DecodeCache(__half value) { return __half2float(value); }
-inline float DecodeCache(float value) { return value; }
+inline float DecodeCache(__half value) {
+  return __half2float(value);
+}
+inline float DecodeCache(float value) {
+  return value;
+}
 
 template<typename KCache, typename VCache>
 std::vector<double> Fp64Attention(
     const std::vector<float>& qv, const std::vector<float>& gate,
-    const KCache& kh, const VCache& vh,
-    const std::uint32_t* mask, std::uint32_t mask_words, std::uint32_t n_tokens,
-    std::uint32_t start_pos, std::uint32_t ratio = kRatio) {
+    const KCache& kh, const VCache& vh, const std::uint32_t* mask,
+    std::uint32_t mask_words, std::uint32_t n_tokens, std::uint32_t start_pos,
+    std::uint32_t ratio = kRatio) {
   std::vector<double> out(static_cast<std::size_t>(n_tokens) * kQWidth);
   const double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
   std::vector<std::uint32_t> keys;
@@ -559,8 +690,8 @@ std::vector<double> Fp64Attention(
         double acc = 0.0;
         for (std::size_t k = 0; k < keys.size(); ++k) {
           acc += scores[k] *
-                 static_cast<double>(
-                     DecodeCache(vh[keys[k] * std::size_t{kKvWidth} + kv_head + d]));
+                 static_cast<double>(DecodeCache(
+                     vh[keys[k] * std::size_t{kKvWidth} + kv_head + d]));
         }
         const double g = static_cast<double>(gate[row + d]);
         out[row + d] = acc / sum / (1.0 + std::exp(-g));
@@ -573,10 +704,12 @@ std::vector<double> Fp64Attention(
 /// Runs the per-token reference and the fused WMMA route over the same
 /// cache and reports the worst absolute error of the gated context.
 double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
-               std::uint32_t seed, bool sparse = false, bool bounded = false) {
+               std::uint32_t seed, bool sparse = false, bool bounded = false,
+               std::uint32_t mask_words_override = 0) {
   const std::uint32_t n_kv = start_pos + n_tokens;
   const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
-  const std::uint32_t mask_words = (max_blocks + 31) / 32;
+  const std::uint32_t mask_words =
+      mask_words_override != 0 ? mask_words_override : (max_blocks + 31) / 32;
   const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
   const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
 
@@ -1024,8 +1157,10 @@ void CheckQ8Preparation(std::uint32_t n, std::uint32_t start) {
   Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F));
   auto qg = MakeValues(kDim, 37, 0.5F);
   auto kg = MakeValues(kDim, 91, 0.5F);
-  for (auto& x : qg) x += 1.0F;
-  for (auto& x : kg) x += 1.0F;
+  for (auto& x : qg)
+    x += 1.0F;
+  for (auto& x : kg)
+    x += 1.0F;
   Upload(&q_gamma, qg);
   Upload(&k_gamma, kg);
   Upload(&pos, std::vector<std::uint32_t>{start});
@@ -1063,15 +1198,17 @@ void CheckQ8Preparation(std::uint32_t n, std::uint32_t start) {
   const auto v_out_host = DownloadBytes(&v_out);
   for (std::size_t i = 0; i < cache_rows * row_bytes; ++i) {
     if (k_out_host[i] != k_ref_host[i]) {
-      std::cerr << "q8 key cache row " << i / row_bytes << " byte " << i % row_bytes
-                << " expected " << static_cast<int>(k_ref_host[i]) << " got "
+      std::cerr << "q8 key cache row " << i / row_bytes << " byte "
+                << i % row_bytes << " expected "
+                << static_cast<int>(k_ref_host[i]) << " got "
                 << static_cast<int>(k_out_host[i]) << '\n';
       throw std::runtime_error("q8 key cache differs from host quantization");
     }
     if (v_out_host[i] != v_ref_host[i]) {
       std::cerr << "q8 value cache row " << i / row_bytes << " byte "
-                << i % row_bytes << " expected " << static_cast<int>(v_ref_host[i])
-                << " got " << static_cast<int>(v_out_host[i]) << '\n';
+                << i % row_bytes << " expected "
+                << static_cast<int>(v_ref_host[i]) << " got "
+                << static_cast<int>(v_out_host[i]) << '\n';
       throw std::runtime_error("q8 value cache differs from host quantization");
     }
   }
@@ -1101,18 +1238,22 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
                         kh.data() + std::size_t{r} * row_bytes, kKvWidth);
     QuantizeRowQ8_0Host(vf.data() + std::size_t{r} * kKvWidth,
                         vh.data() + std::size_t{r} * row_bytes, kKvWidth);
-    const auto k32 = DequantRowQ8_0Host(
-        kh.data() + std::size_t{r} * row_bytes, kKvWidth, false);
-    const auto v32 = DequantRowQ8_0Host(
-        vh.data() + std::size_t{r} * row_bytes, kKvWidth, false);
-    const auto k16 = DequantRowQ8_0Host(
-        kh.data() + std::size_t{r} * row_bytes, kKvWidth, true);
-    const auto v16 = DequantRowQ8_0Host(
-        vh.data() + std::size_t{r} * row_bytes, kKvWidth, true);
-    std::copy(k32.begin(), k32.end(), kd_f32.begin() + std::size_t{r} * kKvWidth);
-    std::copy(v32.begin(), v32.end(), vd_f32.begin() + std::size_t{r} * kKvWidth);
-    std::copy(k16.begin(), k16.end(), kd_f16.begin() + std::size_t{r} * kKvWidth);
-    std::copy(v16.begin(), v16.end(), vd_f16.begin() + std::size_t{r} * kKvWidth);
+    const auto k32 = DequantRowQ8_0Host(kh.data() + std::size_t{r} * row_bytes,
+                                        kKvWidth, false);
+    const auto v32 = DequantRowQ8_0Host(vh.data() + std::size_t{r} * row_bytes,
+                                        kKvWidth, false);
+    const auto k16 = DequantRowQ8_0Host(kh.data() + std::size_t{r} * row_bytes,
+                                        kKvWidth, true);
+    const auto v16 = DequantRowQ8_0Host(vh.data() + std::size_t{r} * row_bytes,
+                                        kKvWidth, true);
+    std::copy(k32.begin(), k32.end(),
+              kd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v32.begin(), v32.end(),
+              vd_f32.begin() + std::size_t{r} * kKvWidth);
+    std::copy(k16.begin(), k16.end(),
+              kd_f16.begin() + std::size_t{r} * kKvWidth);
+    std::copy(v16.begin(), v16.end(),
+              vd_f16.begin() + std::size_t{r} * kKvWidth);
   }
 
   HipBuffer<float> d_q(q_count), d_gate(q_count);
@@ -1125,10 +1266,10 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
   Upload(&d_v, vh);
   Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
 
-  const auto exact32 = Fp64Attention(qv, gate, kd_f32, vd_f32, nullptr, 0,
-                                     n_tokens, start_pos);
-  const auto exact16 = Fp64Attention(qv, gate, kd_f16, vd_f16, nullptr, 0,
-                                     n_tokens, start_pos);
+  const auto exact32 =
+      Fp64Attention(qv, gate, kd_f32, vd_f32, nullptr, 0, n_tokens, start_pos);
+  const auto exact16 =
+      Fp64Attention(qv, gate, kd_f16, vd_f16, nullptr, 0, n_tokens, start_pos);
 
   // Per-token kernel: FP32 dequant products, single-block and split forms.
   q::Attention(d_q.get(), d_k.get(), d_v.get(), nullptr, 0, d_out.get(),
@@ -1175,8 +1316,8 @@ void CheckQ8Attention(std::uint32_t n_tokens, std::uint32_t start_pos,
     wmma_error = std::max(wmma_error, std::abs(wmma[i] - exact16[i]));
   }
   std::cout << "q8 attention n=" << n_tokens << " start=" << start_pos
-            << " fp64 error single " << single_error << " split "
-            << split_error << " wmma " << wmma_error << '\n';
+            << " fp64 error single " << single_error << " split " << split_error
+            << " wmma " << wmma_error << '\n';
   if (std::max(single_error, split_error) > 1e-4) {
     throw std::runtime_error("q8 per-token attention exceeds its FP64 limit");
   }
@@ -1419,6 +1560,8 @@ void CheckQ4KAttention(std::uint32_t n_tokens, std::uint32_t start_pos,
 
 }  // namespace
 
+void CheckWmmaLiveExtent();
+
 int main() {
   try {
     // The quantized cache cases run first: the F16 query-preparation cases
@@ -1469,6 +1612,19 @@ int main() {
         throw std::runtime_error("WMMA attention exceeds its error envelope");
       }
     }
+    CheckWmmaLiveExtent();
+    CheckPreparation(1, 0, 64);
+    CheckPreparation(8, 4096, 64);
+    CheckPreparation(65, 131069, 64);
+    CheckPreparation(7, 131069, 256);
+    CheckPreparation(8, 4096, 64, Yarn(1.5625F));
+    CheckPreparation(65, 300000, 64, Yarn(2.5F));
+    CheckYarnPhase(1.0F, 262143);  // off: sincosf accuracy at native depth
+    for (const float factor : {1.5625F, 2.5F, 4.0F})
+      for (const std::uint32_t position : {1000U, 300000U, 650000U})
+        CheckYarnPhase(factor, position);
+    CheckYarnVisionPhase(2.5F);
+    CheckOracleRms();
     // Structured selections against the sparse path's 1024-block compaction
     // windows and 64-block key tiles. At 131069 the last 512 blocks sit in
     // the final window; 262141 spans all 64 windows of the native context,
@@ -1521,6 +1677,9 @@ int main() {
         {"64-in-one-window", 131069, one_window},
         {"513-total", 131069, spread(513)},
         {"576-total", 131069, spread(576)},
+        // A YaRN-scaled capacity (409600 at factor 1.5625, 3200 mask words):
+        // chunks past the native 262144 tokens take this same kernel.
+        {"63-per-window-past-native", 409597, per_window(63)},
     };
     // Compacted selections: a short context that selects every block, then
     // the budgeted rows at increasing depth, up to the 160K decode target.
@@ -1552,12 +1711,65 @@ int main() {
       CheckStructured("ratio-1-alternating", n, 8189, alternating,
                       structured_seed++, 1);
     }
-    CheckPreparation(1, 0, 64);
-    CheckPreparation(8, 4096, 64);
-    CheckPreparation(65, 131069, 64);
-    CheckPreparation(7, 131069, 256);
+    struct Case2 {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool masked;
+      bool sparse;
+      bool bounded{false};
+    };
+    const Case2 cases2[] = {
+        {4, 4096, false, false},      {3, 9000, true, true},
+        {100, 0, false, false},       {64, 37, false, false},
+        {100, 0, true, false},        {77, 51, true, false},
+        {96, 4096, true, true},       {70, 8000, true, true},
+        {5, 32765, true, true, true}, {7, 65533, true, true, true},
+        {5, 131069, true, true},      {7, 131069, true, true, true},
+        {17, 2047, true, true, true}};
+    bool ok = true;
+    std::uint32_t seed2 = 0x1234ABCDU;
+    for (const Case2& c : cases2) {
+      const double worst = Compare(c.n_tokens, c.start_pos, c.masked, seed2++,
+                                   c.sparse, c.bounded);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << (c.masked ? (c.sparse ? " sparse" : " masked") : " dense")
+                << " worst absolute error " << worst << '\n';
+      // The reference accumulates FP32 probabilities; the WMMA route rounds
+      // Q and P to FP16, so the contract is a small absolute envelope on
+      // values of order one.
+      ok = ok && worst < 2e-2;
+    }
+    // A capacity wider than 262,144 (3,200 words at 409,600) keeps chunks
+    // whose visible extent fits 2,048 words on the fused kernel.
+    for (const auto& [n, start] :
+         {std::pair{5U, 131069U}, std::pair{4U, 262140U}}) {
+      const double worst = Compare(n, start, true, seed2++, true, true, 3200);
+      std::cout << "WMMA attention n=" << n << " start=" << start
+                << " stride=3200 worst absolute error " << worst << '\n';
+      ok = ok && worst < 2e-2;
+    }
+    return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
   }
+}
+
+void CheckWmmaLiveExtent() {
+  HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
+  HipBuffer<__half> k(kKvWidth), v(kKvWidth);
+  HipBuffer<std::uint32_t> mask(3200);
+  const auto accepts = [&](std::uint32_t n, std::uint32_t start,
+                           std::uint32_t words) {
+    return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
+                                  mask.get(), words, out.get(), n, start,
+                                  kHeads, kKvHeads, kDim, kRatio, nullptr);
+  };
+  // 262,141 + 4 visible tokens need 65,537 blocks = 2,049 words.
+  if (accepts(4, 262141, 3200))
+    throw std::runtime_error("WMMA accepted a live extent past 2048 words");
+  // A row stride narrower than the live extent is a caller error.
+  if (accepts(4, 131069, 1024))
+    throw std::runtime_error("WMMA accepted a stride below the live extent");
+  std::cout << "WMMA live extent: rejects past 262,144 visible tokens\n";
 }
