@@ -496,8 +496,7 @@ private:
     options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
     options.preserve_thinking =
         request.reasoning.preserve_thinking.value_or(false);
-    options.require_tool_call =
-        request.tool_choice == server::ChatRequest::ToolChoice::kRequired;
+    // tool_choice "required" is enforced on the parsed output (openai_chat).
     options.max_output_bytes =
         tokenization::RenderedPromptBoundBytes(m_->limit);
     return options;
