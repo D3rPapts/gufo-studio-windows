@@ -10,6 +10,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -1778,6 +1779,36 @@ def check_tool_edges(client, model, checks, sampling_preset=None):
             if sampling_preset == "deepseek4" and "tool" in order:
                 assert "text" not in order[order.index("tool"):], result
 
+    # The newline a model writes between parallel calls is layout, not a reply.
+    # The turn has no text, as with one call, with or without thinking (#673).
+    pair = [{"name": name, "description": f"Return {name[4:]}.",
+             "parameters": {"type": "object", "properties": {}}}
+            for name in ("get_alpha", "get_beta")]
+    prompt = "Call both tools in one parallel block: get_alpha and get_beta."
+    for effort in ("none", "low"):
+        for endpoint in ("chat", "responses"):
+            for stream in (False, True):
+                if endpoint == "chat":
+                    result = chat_result(client, dict(
+                        **common, messages=[{"role": "user", "content": prompt}],
+                        tools=[{"type": "function", "function": tool} for tool in pair],
+                        tool_choice="auto", parallel_tool_calls=True,
+                        reasoning_effort=effort, max_completion_tokens=1024), stream)
+                else:
+                    result = response_result(client, dict(
+                        **common, input=prompt,
+                        tools=[{"type": "function", **tool} for tool in pair],
+                        tool_choice="auto", parallel_tool_calls=True,
+                        reasoning={"effort": effort}, max_output_tokens=1024,
+                        store=False), stream)
+                name = f"parallel_separator_{endpoint}_{effort}_stream{stream}"
+                checks[name] = result
+                print(f"CHECK {name}", file=sys.stderr, flush=True)
+                assert result["finish"] == "tool_calls", result
+                assert sorted(call["function"]["name"] for call in result["tools"]) == [
+                    "get_alpha", "get_beta"], result
+                assert not result["text"] or result["text"].strip(), result
+
 
 def check_state_edges(client, model, checks, speculative, vision=False, server_log=None):
     """Mode proof and request-local grammar state across limits, errors and reuse."""
@@ -2709,6 +2740,8 @@ def main():
                         help="Expected loaded inputs for the discovery suite")
     parser.add_argument("--base-url", required=True, help="http://127.0.0.1:PORT/v1")
     parser.add_argument("--model", required=True, help="Gufo served model name")
+    parser.add_argument("--request-timeout", type=float, default=120,
+                        help="Finite positive SDK request deadline in seconds")
     parser.add_argument("--expect-reasoning", action="store_true")
     parser.add_argument("--suite", choices=("all", *SDK_SUITES), default="all")
     parser.add_argument("--vision", action="store_true",
@@ -2758,11 +2791,14 @@ def main():
     async def async_local_only(request):
         local_only(request)
 
+    if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
+        parser.error("--request-timeout must be finite and positive")
     options = dict(api_key="local-test", base_url=args.base_url, max_retries=0,
-                   timeout=120, _strict_response_validation=True)
+                   timeout=args.request_timeout, _strict_response_validation=True)
     report = {"sdk": openai.__version__, "model": args.model, "suite": args.suite,
               "vision": args.vision, "speculative": args.speculative,
               "sampling_preset": args.sampling_preset,
+              "request_timeout": args.request_timeout,
               "sampling_overrides": args.sampling_overrides, "suites": {},
               "through_case": args.through_case, "status": "running"}
     report["expected_input_modalities"] = args.expected_input_modalities

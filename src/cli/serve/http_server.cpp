@@ -312,6 +312,15 @@ std::optional<std::size_t> ParseContentLength(const HttpRequest& request) {
   return length.value_or(0);
 }
 
+/// RFC 9110 10.1.1: a client that sends "Expect: 100-continue" (curl does for
+/// bodies over 1 MiB) waits for an interim 100 response before the body.
+bool ExpectsContinue(const HttpRequest& request) {
+  return std::ranges::any_of(request.headers, [](const auto& header) {
+    return ToLower(header.first) == "expect" &&
+           ToLower(header.second) == "100-continue";
+  });
+}
+
 std::string CredentialHash(std::string_view value) {
   return crypto::Sha256Hex(std::span(
       reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
@@ -2405,9 +2414,14 @@ void HttpServer::handle_connection(int client_fd) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
-            ok = ReadN(body, client_fd, remaining);
-            if (!ok) {
-              read_failure = "body_read_failed";
+            // A HTTP/1.0 request's expectation is ignored (RFC 9110 10.1.1).
+            ok = !http11 || !ExpectsContinue(req) ||
+                 SendAll(client_fd, "HTTP/1.1 100 Continue\r\n\r\n");
+            if (ok) {
+              ok = ReadN(body, client_fd, remaining);
+              if (!ok) {
+                read_failure = "body_read_failed";
+              }
             }
           } else {
             ok = true;

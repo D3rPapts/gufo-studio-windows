@@ -221,6 +221,12 @@ public:
 private:
   QwenDFlashGpuExecutor(std::shared_ptr<const QwenDFlashGpuModel> model,
                         std::uint32_t max_context);
+  friend class models::qwen::ContinuationAdapter;
+  void CheckContinuation() const {
+    if (continuation_hooks_)
+      continuation_hooks_->BeforeExecution();
+  }
+  models::qwen::ContinuationHooks* continuation_hooks_{};
 
   bool InjectTargetContextChunk(std::span<const float> target_features,
                                 std::uint32_t position,
@@ -347,7 +353,15 @@ public:
       std::span<const std::uint8_t> payload) override;
 
   void Reset() noexcept override;
-  void BeginRequest() noexcept override { controller_.Reset(); }
+  void BeginRequest() noexcept override {
+    try {
+      CheckContinuation();
+      controller_.Reset();
+    } catch (...) {
+      if (continuation_hooks_)
+        continuation_hooks_->WriteFailed();
+    }
+  }
   /// The most recent verification has not yet injected these target rows.
   /// Discard them when the target returns to its saved verification frontier.
   void DiscardPendingTargetContext(std::uint32_t position);
@@ -355,9 +369,18 @@ public:
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept {
     return executor_->GetMemoryUsage();
   }
+  [[nodiscard]] std::uint32_t GetInjectedContextLength() const noexcept {
+    return executor_->GetInjectedContextLength();
+  }
 
 private:
   void InjectPendingFeatures(std::uint32_t position);
+  friend class models::qwen::ContinuationAdapter;
+  void CheckContinuation() const {
+    if (continuation_hooks_)
+      continuation_hooks_->BeforeExecution();
+  }
+  models::qwen::ContinuationHooks* continuation_hooks_{};
   [[nodiscard]] std::uint32_t PendingFeatureCount(std::uint32_t position) const;
   QwenDFlashGpuDraftBackend(std::unique_ptr<QwenDFlashGpuExecutor> executor,
                             QwenDFlashGpuDraftConfig config);
