@@ -193,7 +193,7 @@ gufo, passed in `CMAKE_CXX_FLAGS` (llama.cpp compiles HIP as CXX with
 
 | Idea | Source | Result |
 | --- | --- | --- |
-| Long draft-context injections through hipBLASLt BF16 | mikealanni/gufo `ef5b925d` | no gain: the 147,913-token prompt took 444.5 s to first token (333 tok/s) against 431.1 s before; reverted. The answer was identical. The prompt-cache fix landed in between and now stores twice as much, so the two effects are not separated |
+| Long draft-context injections through hipBLASLt BF16 | mikealanni/gufo `ef5b925d` | not applicable, reverted: it only runs when the draft's `fc.weight` is BF16, and in the DFlash2 Q4_K_M draft it is Q4_K, so the path never ran here. (A 147,913-token run with it built in took 444.5 s to first token against 431.1 s in the morning; that difference comes from other changes or noise, not from this commit.) |
 | MTP instead of DFlash2 for Qwen3.8-27B | gufo's own 27B MTP draft, as in mikealanni `7344cfb4` | slower: with `gufo prompt`, greedy, no penalties, 5 cases: DFlash2 + lookup 16.9-20.9 tok/s, MTP 13.6-15.4 tok/s, identical output. The HTTP server does not offer MTP for the 27B |
 
 MTP notes: Unsloth's 27B GGUFs carry the MTP layer as `blk.64.*` in Q8_0;
