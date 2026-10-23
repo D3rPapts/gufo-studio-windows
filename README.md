@@ -175,6 +175,29 @@ JSON output forced by a schema (`response_format`), in the OpenAI form and in
 llama.cpp's form. Set `max_tokens` with thinking on: one thinking run went to
 about 34K tokens.
 
+## Known limitations
+
+Measured on the test machine; see [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md)
+for the numbers.
+
+- **Short answers without thinking decode slower than llama.cpp:** about
+  19 tok/s against 20-23 tok/s. gufo's lead comes from prefill (about 2x)
+  and from long thinking runs.
+- **One request at a time.** A long request makes every other request wait
+  in the queue (once 10 minutes during a 23-minute request).
+- **Without `--repeat-penalty 1.05`, Qwen3.8-27B sometimes loops** into
+  endless lists. llama.cpp does the same with this model.
+- **Long context gets slow:** with 148K tokens in context, prefill drops to
+  343 tok/s and decode to 10.8 tok/s.
+- **`check.ps1` and `start.ps1` only look in fixed places:** the Hugging Face
+  cache, a `models` folder in or beside the checkout, `%USERPROFILE%\models`,
+  LM Studio's folders and `%LOCALAPPDATA%\llama.cpp`. Pass
+  `-ModelDir <folder>` for anything else (`start.ps1` remembers it).
+- **After installing CMake or Ninja with winget, open a new terminal**, or
+  `check.ps1` and `build.ps1` report them missing.
+- Plans and open questions are tracked in the
+  [issues](https://github.com/D3rPapts/gufo_windows/issues).
+
 ## Not tested here
 
 - Qwen3.8-Flash-Next, DeepSeek V4 Flash, Qwen3.6-35B-A3B, audio, image and
