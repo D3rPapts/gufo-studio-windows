@@ -4,6 +4,11 @@ This branch carries the Windows fork (pixmaate/gufo `main`, 41 commits) onto
 current upstream gufo-org/gufo (`7c81965`, "add the net leaf (#711)"). The
 older fork history stays untouched on `main`; nothing here rewrites it.
 
+**This document lists only what was run and measured on our machine.** The
+rest of the repository documentation comes from upstream gufo (Linux numbers)
+or from the pixmaate fork (Windows numbers from a 128 GB machine); we did not
+re-check those.
+
 ## Contributor
 
 The rebase, the fixes it needed, the measurements and this document were done
@@ -27,19 +32,26 @@ Fixes the rebase needed on Windows:
   `POLLERR`/`POLLHUP` in `events` with `WSAEINVAL`; only `POLLIN` is requested
   (they are always reported). This aborted `http_server_test`.
 - **Qwen weight upload** (`model_loader.cpp`): upstream keeps a registered
-  host copy of the weights, which on Windows lands in shared system memory and
-  stalled the 27B load. Weights now go straight to device memory
+  host copy of the weights; on our machine that filled system RAM and stalled
+  the 27B load. Weights now go straight to device memory
   (`hipMalloc`, 16 readers with `O_CONCURRENT_RANDOM`, `pread`,
   `hipMemcpyAsync`): 16.4 GiB in 2-3 s.
-- **A3B text runner**: dropped upstream's removed `require_tool_call` option;
-  `tool_choice: "required"` is enforced on the parsed output.
-- **Flash-Next device model**: Q6_K rows re-encoded as Q8_0 where the
-  kernels expect it (`token_embd`/`output` exempt).
+- **A3B text runner** (compiles; not run here): dropped upstream's removed
+  `require_tool_call` option; `tool_choice: "required"` is enforced on the
+  parsed output.
+- **Flash-Next device model** (compiles; not run here): Q6_K rows re-encoded
+  as Q8_0 where the kernels expect it (`token_embd`/`output` exempt).
+- **response_format like llama.cpp**: gufo rejected three forms that
+  llama.cpp accepts and our client sends: the schema directly under
+  `response_format` (`{"type":"json_object","schema":{...}}`), `json_schema`
+  without `name`, and `strict: true` with optional properties. All three are
+  now admitted and the schema is enforced; checked against the running
+  server. Rejected requests log their reason (`error_message=`).
 - `GUFO_QWEN27_UPSTREAM_ATTN=1` (diagnostic, off by default) falls back from
   the Windows verify attention to upstream's, for A/B checks. Measured equal.
 
-Flash-Next, DeepSeek and Qwen3.6-35B-A3B build but were not measured here: the
-test machine has 32 GB dedicated GPU memory; they need the 128 GB machine.
+Flash-Next, DeepSeek and Qwen3.6-35B-A3B are compiled into `gufo.exe` but
+were not run here. Only Qwen3.8-27B was tested.
 
 ## Measurement: Qwen3.8-27B against llama.cpp
 
@@ -62,15 +74,14 @@ JSON validated.
 
 Takeaways:
 
-- Prefill is about twice llama.cpp's; that and prompt lookup make gufo
-  20-30% faster end to end on this workload.
+- gufo prefill was about twice llama.cpp's (512-517 vs 256-257 tok/s), and
+  the total time for all cases was 20-30% lower.
 - Qwen3.8-27B tends to loop into endless lists (e.g. a `negative_prompt`
   array) on both servers. `--repeat-penalty 1.05` removed it (0 of 18 risky
   runs) without measurable cost.
 - No gain from: the Q8_0 draft, `--draft-policy fixed`, lookup cap 3/5,
   lookup length 10, flush 8, append mode, upstream verify attention, a
-  Q4_K_M target (slower; the kernels are tuned for UD-Q4_K_XL), prefill chunk
-  2048, 32K context.
+  Q4_K_M target (slower), prefill chunk 2048, 32K context.
 - llama.cpp ROCm/HIP builds (lemonade b1351 and a local HIP+rocWMMA build)
   prefill faster than its Vulkan build but decode 12-30% slower.
 - gufo's text at temperature 0 is byte-identical with and without speculative
@@ -118,9 +129,9 @@ draft at N tokens; `--draft-tokens` then sets the lookup length.
 | Run | Change | Think | Short | Prefill | Total | Loops | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | baseline | DFlash2, no prompt lookup | 29.8 | 18.4 | 518 | 446.4 s | 0 | starting point |
-| V1 | `LOOKUP=3`, `--draft-tokens 7` | 28.8 | 19.8 | 525 | 342.5 s | 0 | **works**: prompt lookup pays off on JSON/copy-heavy output |
+| V1 | `LOOKUP=3`, `--draft-tokens 7` | 28.8 | 19.8 | 525 | 342.5 s | 0 | **works**: short cases faster (19.8 vs 18.4), total 342.5 vs 446.4 s |
 | V1 repeat | same, 8 h later | 29.6 | 19.9 | 530 | 360.8 s | 0 | repeatable (see above) |
-| V2b | V1 with the Q8_0 draft | 28.8 | 19.1 | 525 | 380.7 s | 0 | no gain; Q8_0 draft is larger and not more accurate here |
+| V2b | V1 with the Q8_0 draft | 28.8 | 19.1 | 525 | 380.7 s | 0 | no gain |
 | V3b | V1 with `--draft-policy fixed` | 30.6 | 19.3 | 525 | 400.1 s | 0 | same as adaptive within noise |
 | V4 | lookup flush every 8 tokens | 27.3 | 18.9 | 528 | 390.3 s | 0 | slower |
 | V5 | lookup append mode | 29.1 | 19.6 | 528 | 394.9 s | 1 | no gain |
@@ -128,11 +139,11 @@ draft at N tokens; `--draft-tokens` then sets the lookup length.
 | V7 | `LOOKUP=5` | 28.2 | 18.9 | 525 | 377.9 s | 1 | slower than 4 |
 | V8 | V6 with upstream verify attention (`GUFO_QWEN27_UPSTREAM_ATTN=1`) | 29.7 | 19.1 | 524 | 351.3 s | 0 | equal: the Windows attention is neither faster nor slower here |
 | V9b | V6 with lookup length 10 | 28.9 | 19.6 | 525 | 352.3 s | 0 | no gain |
-| V10b | V6 with a Q4_K_M target | 27.7 | 18.0 | 529 | 466.3 s | 2 | slower; the Windows kernels are tuned for UD-Q4_K_XL |
-| A1 | V6 + `--prefill-chunk 2048` | 30.1 | 19.1 | 512 | 344.2 s | 0 | no effect (it only interleaves prefill with parallel requests) |
+| V10b | V6 with a Q4_K_M target | 27.7 | 18.0 | 529 | 466.3 s | 2 | slower |
+| A1 | V6 + `--prefill-chunk 2048` | 30.1 | 19.1 | 512 | 344.2 s | 0 | no effect |
 | A2 | V6 + `--repeat-penalty 1.05` | 29.7 | 19.2 | 517 | 349.3 s | 0 | **works**: no loops, same speed, text quality unchanged |
 | **A4 = "V6R"** | A2 repeated | 28.4 | 19.0 | 512 | 331.6 s | 0 | **confirmed, best setting** |
-| A5 | V6R + `--context 32768` | 30.0 | 19.0 | 513 | 364.6 s | 0 | no effect; context size is not a bottleneck |
+| A5 | V6R + `--context 32768` | 30.0 | 19.0 | 513 | 364.6 s | 0 | no effect |
 
 V2, V3, V9 and V10 were first run with their extra switches silently lost
 (`powershell -File script.ps1 -X 'a','b'` passes the list as one string
@@ -159,13 +170,12 @@ q8_0 KV cache, flash attention, 64K context.
 | L7 | L6 with `n=5` | 28.7 | 19.2 | 260 | 496.1 s | 2 | slower |
 | L8 | L6 with Q4_0 target | 29.3 | 21.6 | 311 | 415.7 s | 0 | faster prefill, but perplexity +7.3% on German/English text (4.15 vs 3.87), +1.4% on English docs: rejected for quality |
 | L9 | L6 with f16 KV cache | 29.9 | 21.4 | 256 | 498.1 s | 2 | no gain |
-| L10 | L6 with the UD-Q4_K_XL target | - | - | - | - | - | **fails**: out of memory; llama.cpp's memory fitting does not count the draft |
+| L10 | L6 with the UD-Q4_K_XL target | - | - | - | - | - | **fails**: system memory ran out during the run and the process was ended |
 | **A3** | L6 + `--repeat-penalty 1.05` | 28.3 | 20.3 | 257 | 431.1 s | 0 | **works**: best llama.cpp overall |
 
 The local HIP build needed the same `compat/win32/hip_include/cmath` shim as
 gufo, passed in `CMAKE_CXX_FLAGS` (llama.cpp compiles HIP as CXX with
-`-x hip` on Windows). The halo-box fork was not built: it has a known
-wrong-output bug.
+`-x hip` on Windows). The halo-box llama.cpp fork was not built or tested.
 
 ### What did not work during the rebase
 
@@ -174,11 +184,18 @@ wrong-output bug.
 - `WSAPoll` with `POLLERR|POLLHUP` in `events`: `WSAEINVAL`. Fixed.
 - Starting gufo from a PowerShell pipe or redirect hangs the caller (gufo
   inherits the pipe); use `Start-Process` with redirected files.
-- Qwen3.8-27B with thinking can occasionally run past 30K tokens; clients
-  should set `max_tokens` (about 8000 for this workload).
+- One thinking run went on to about 34K tokens; since then the client sets
+  `max_tokens` 8000 for thinking cases.
+
+### Long context
+
+gufo with V6R and `--context 155648` (152K) on the same 32 GB machine: a
+147,913-token prompt (gufo source code) was answered correctly; prefill
+343 tok/s (7.2 min), decode 10.8 tok/s at that depth, 35.8 GB GPU memory in
+use (part of it beyond the 32 GB carve-out). 256K was not tried.
 
 ### Not tried
 
 - Windows power mode "Best performance" (the machine ran "Balanced").
-- Flash-Next, DeepSeek and Qwen3.6-35B-A3B performance (need the 128 GB
-  machine).
+- Flash-Next, DeepSeek and Qwen3.6-35B-A3B (not run at all).
+- Concurrent requests (all measurements used one request at a time).

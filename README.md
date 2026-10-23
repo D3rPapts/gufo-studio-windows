@@ -1,5 +1,15 @@
 # Gufo: The ***Open Source*** Strix Halo AI engine 
 
+> [!IMPORTANT]
+> **This is gufo_windows**, a fork that carries the
+> [pixmaate Windows port](https://github.com/pixmaate/gufo) onto current
+> [upstream gufo](https://github.com/gufo-org/gufo). The README below is
+> upstream's: its models, numbers and release links are upstream's Linux
+> results and were not re-tested here. What this fork tested on Windows
+> (Qwen3.8-27B only, against llama.cpp) is in
+> [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md). Port and measurements by
+> Claude (Anthropic) in Claude Code. MIT, like upstream.
+
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>

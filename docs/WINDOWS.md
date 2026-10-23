@@ -1,5 +1,12 @@
 # Windows (native, gfx1151)
 
+> [!NOTE]
+> This page comes from the [pixmaate Windows fork](https://github.com/pixmaate/gufo).
+> Its measurements (Flash-Next, the 128 GB machine, the decode switches) and
+> its prebuilt releases are that fork's and were not re-tested in
+> gufo_windows. What gufo_windows tested is in
+> [WINDOWS-REBASE.md](WINDOWS-REBASE.md).
+
 Gufo builds and runs natively on Windows 11 x64 against AMD's TheRock ROCm
 distribution for gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S). No WSL. Linux
 builds are unaffected: the port lives in `compat/win32`, Windows-only files and
