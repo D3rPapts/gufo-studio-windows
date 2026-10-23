@@ -189,6 +189,21 @@ gufo, passed in `CMAKE_CXX_FLAGS` (llama.cpp compiles HIP as CXX with
 - One thinking run went on to about 34K tokens; since then the client sets
   `max_tokens` 8000 for thinking cases.
 
+### Ideas from other forks (2026-10-23)
+
+| Idea | Source | Result |
+| --- | --- | --- |
+| Long draft-context injections through hipBLASLt BF16 | mikealanni/gufo `ef5b925d` | no gain: the 147,913-token prompt took 444.5 s to first token (333 tok/s) against 431.1 s before; reverted. The answer was identical. The prompt-cache fix landed in between and now stores twice as much, so the two effects are not separated |
+| MTP instead of DFlash2 for Qwen3.8-27B | gufo's own 27B MTP draft, as in mikealanni `7344cfb4` | slower: with `gufo prompt`, greedy, no penalties, 5 cases: DFlash2 + lookup 16.9-20.9 tok/s, MTP 13.6-15.4 tok/s, identical output. The HTTP server does not offer MTP for the 27B |
+
+MTP notes: Unsloth's 27B GGUFs carry the MTP layer as `blk.64.*` in Q8_0;
+gufo's loader now accepts Q8_0 (and Q5_K), so `--mtp-model` can point at the
+model file itself. The verifier only drafts with MTP for greedy requests
+without penalties: any repeat or presence penalty, temperature above 0, a
+JSON schema or a reasoning budget makes the request "sampled", and the 27B
+MTP draft has no sampled proposals. `gufo prompt` applies Qwen's preset
+presence penalty unless `--presence-penalty 0` is given.
+
 ### Long context
 
 gufo with V6R and `--context 155648` (152K) on the same 32 GB machine: a
