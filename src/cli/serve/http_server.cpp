@@ -123,8 +123,11 @@ void RequestShutdown(int signal) noexcept {
 
 class ShutdownSignals {
 public:
-  ShutdownSignals() : guard_(&RequestShutdown) {
+  ShutdownSignals() {
+    // Reset before installation: a signal landing between the previous
+    // guard's uninstall and this store must not be erased afterwards.
     shutdown_signal.store(0, std::memory_order_relaxed);
+    guard_ = platform::ShutdownSignalGuard(&RequestShutdown);
   }
 
 private:
@@ -2064,6 +2067,7 @@ void HttpServer::run(bool handle_signals) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
         stop();
+        platform::NotifyShutdownHandled();
         break;
       }
     }

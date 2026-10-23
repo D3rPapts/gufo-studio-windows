@@ -1,9 +1,11 @@
 #include "src/core/platform/shutdown_signal.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -16,16 +18,34 @@ namespace {
 
 #if defined(_WIN32)
 using Handler = ShutdownSignalGuard::Handler;
-Handler g_active_handler = nullptr;
+// Read by the console-handler thread; the atomic plus the local-copy
+// pattern below keep an in-flight callback racing teardown well-defined:
+// a callback that loaded the pointer before teardown completes its single
+// atomic-store side effect on process-lifetime state, and one that loads
+// after the null store returns without calling.
+std::atomic<Handler> g_active_handler{nullptr};
+std::atomic<bool> g_cleanup_complete{false};
 
 BOOL WINAPI ConsoleEventRouter(DWORD event) noexcept {
-  if (g_active_handler == nullptr)
+  const Handler handler = g_active_handler.load(std::memory_order_acquire);
+  if (handler == nullptr)
     return FALSE;
   // Map console events onto their closest POSIX signal numbers so the
   // server sees one uniform "shutdown requested" value.
   const int mapped =
       (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT) ? SIGINT : SIGTERM;
-  g_active_handler(mapped);
+  handler(mapped);
+  if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+    return TRUE;
+  // CTRL_CLOSE/CTRL_LOGOFF/CTRL_SHUTDOWN terminate the process when this
+  // handler returns. Hold it while the server drains its workers, under
+  // the OS deadline (5 s for close events).
+  g_cleanup_complete.store(false, std::memory_order_release);
+  for (int waited_ms = 0; waited_ms < 4000; waited_ms += 10) {
+    if (g_cleanup_complete.load(std::memory_order_acquire))
+      return TRUE;
+    Sleep(10);
+  }
   return TRUE;
 }
 #endif
@@ -52,7 +72,7 @@ ShutdownSignalGuard& ShutdownSignalGuard::operator=(
 
 ShutdownSignalGuard::ShutdownSignalGuard(Handler handler) {
 #if defined(_WIN32)
-  g_active_handler = handler;
+  g_active_handler.store(handler, std::memory_order_release);
   if (!SetConsoleCtrlHandler(ConsoleEventRouter, TRUE)) {
     const DWORD error = GetLastError();
     g_active_handler = nullptr;
@@ -80,14 +100,20 @@ ShutdownSignalGuard::ShutdownSignalGuard(Handler handler) {
 ShutdownSignalGuard::~ShutdownSignalGuard() {
 #if defined(_WIN32)
   if (installed_) {
+    g_active_handler.store(nullptr, std::memory_order_release);
     SetConsoleCtrlHandler(ConsoleEventRouter, FALSE);
-    g_active_handler = nullptr;
   }
 #else
   if (installed_) {
     (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
     (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
   }
+#endif
+}
+
+void NotifyShutdownHandled() noexcept {
+#if defined(_WIN32)
+  g_cleanup_complete.store(true, std::memory_order_release);
 #endif
 }
 

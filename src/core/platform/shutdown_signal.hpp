@@ -37,6 +37,11 @@ private:
 #endif
 };
 
+/// Called by the server once its shutdown path finished draining workers.
+/// Releases the close/logoff/shutdown event handler's bounded wait so the
+/// process can exit before the OS deadline expires. No-op on POSIX.
+void NotifyShutdownHandled() noexcept;
+
 /// Ignore SIGPIPE for the process (POSIX); a no-op on Windows, where Winsock
 /// reports WSAECONNRESET instead of raising a signal.
 inline void IgnoreSocketPipeSignal() noexcept {
