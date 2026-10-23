@@ -227,6 +227,15 @@ for the numbers.
 [docs/WINDOWS.md](docs/WINDOWS.md) describes how the port works inside; its
 measurements come from the pixmaate fork and were not re-checked here.
 
+## Build from source
+
+On Windows, follow [Step by step](#step-by-step) above; `tools\windows\build.ps1`
+builds `build\release\gufo.exe`, and `-Preset gpu-test` adds the tests.
+[docs/WINDOWS.md](docs/WINDOWS.md) explains the toolchain and how the port
+works. The Linux build (Nix or system packages) is unchanged from upstream and
+was not tested here; its prerequisites are in
+[upstream's README](https://github.com/gufo-org/gufo#build-from-source).
+
 ## License
 
 Gufo's original code is [MIT licensed](LICENSE). Adapted code and
