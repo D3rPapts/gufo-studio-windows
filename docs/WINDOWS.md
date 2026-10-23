@@ -3,7 +3,8 @@
 Gufo builds and runs natively on Windows 11 x64 against AMD's TheRock ROCm
 distribution for gfx1151 (Ryzen AI Max+ 395 / Radeon 8060S). No WSL. Linux
 builds are unaffected: the port lives in `compat/win32`, Windows-only files and
-`_WIN32` branches.
+`_WIN32` branches. [WINDOWS-REBASE.md](WINDOWS-REBASE.md) describes the rebase
+onto current upstream and measures Qwen3.8-27B against llama.cpp.
 
 ## Prebuilt
 

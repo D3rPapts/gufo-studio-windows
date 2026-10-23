@@ -3,6 +3,7 @@
 #include <hip/hip_fp16.h>
 
 #include <cmath>
+#include <cstdlib>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 
@@ -303,6 +304,14 @@ bool TryLaunchVerifyAttention27(const float* q, const float* gate,
                                 std::uint32_t num_kv_heads,
                                 std::uint32_t head_dim, hipStream_t stream,
                                 std::span<float> scratch) {
+  // GUFO_QWEN27_UPSTREAM_ATTN=1: fall back to upstream's verification
+  // attention (#660) for an A/B comparison.
+  static const bool upstream = [] {
+    const char* value = std::getenv("GUFO_QWEN27_UPSTREAM_ATTN");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (upstream)
+    return false;
   // Same route conditions as production's shared-KV split-K verification
   // kernel (LaunchCausalDecodeAttention + LaunchSplitKAttentionHalfPartials).
   const std::size_t row_scratch =
