@@ -33,6 +33,12 @@ inline std::shared_ptr<const sampling::JsonConstraint> ParseResponseFormat(
   if (!format->is_object())
     invalid("'response_format' must be an object");
   const auto type = format->member_str("type");
+  // llama.cpp also takes the schema directly: {"type":"json_object" or
+  // "json_schema","schema":{...}}. Clients written against it send that form.
+  if ((type == "json_object" || type == "json_schema") &&
+      format->size() == 2 && format->find("schema") != nullptr)
+    return sampling::JsonConstraint::Compile(*format->find("schema"), false,
+                                             true);
   if (type == "text" || type == "json_object") {
     if (format->size() != 1)
       invalid("unexpected response_format member");
@@ -49,8 +55,10 @@ inline std::shared_ptr<const sampling::JsonConstraint> ParseResponseFormat(
         key != "strict")
       invalid("unexpected json_schema member");
   }
+  // OpenAI requires a name; llama.cpp does not, so a missing one is accepted.
   const auto name = specification->member_str("name");
-  if (name.empty() || name.size() > 64 ||
+  if ((specification->find("name") != nullptr && name.empty()) ||
+      name.size() > 64 ||
       !std::ranges::all_of(name, [](unsigned char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                (c >= '0' && c <= '9') || c == '_' || c == '-';
@@ -66,8 +74,16 @@ inline std::shared_ptr<const sampling::JsonConstraint> ParseResponseFormat(
   const auto* schema = specification->find("schema");
   if (!schema)
     invalid("json_schema.schema is required");
-  return sampling::JsonConstraint::Compile(*schema, strict && strict->as_bool(),
-                                           true);
+  const bool strict_schema = strict && strict->as_bool();
+  try {
+    return sampling::JsonConstraint::Compile(*schema, strict_schema, true);
+  } catch (const std::invalid_argument&) {
+    // llama.cpp ignores "strict"; a schema that only breaks the strict rules
+    // (optional properties) is enforced as written instead of rejected.
+    if (!strict_schema)
+      throw;
+  }
+  return sampling::JsonConstraint::Compile(*schema, false, true);
 }
 }  // namespace gufo::server
 

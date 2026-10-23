@@ -2780,6 +2780,25 @@ void TestStructuredResponseFormat() {
                !Accepts(*responses.response_format, R"({"name":"a","b":"1"})"),
            "Responses text.format admits typed additional properties");
   }
+  // As in llama.cpp: the schema directly under response_format, no
+  // json_schema.name, and strict schemas with optional properties (enforced
+  // as written).
+  for (const char* lenient :
+       {R"({"type":"json_object","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}})",
+        R"({"type":"json_schema","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}})",
+        R"({"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}})",
+        R"({"type":"json_schema","json_schema":{"name":"person","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"born":{"type":"integer"}},"required":["name"],"additionalProperties":false}}})"}) {
+    auto request = gufo::json::parse(
+        R"({"model":"test-model","messages":[{"role":"user","content":"Who?"}]})");
+    request["response_format"] = gufo::json::parse(lenient);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(request.dump()), backend);
+    Expect(response.status == 200 && backend.last_request.response_format &&
+               Accepts(*backend.last_request.response_format,
+                       R"({"name":"Nostradamus"})") &&
+               !Accepts(*backend.last_request.response_format, R"({"born":1503})"),
+           "llama.cpp-style response formats are admitted and enforced");
+  }
   body["stop"] = "END";
   Expect(gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
              200,

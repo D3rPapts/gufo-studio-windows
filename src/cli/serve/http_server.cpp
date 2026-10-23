@@ -2480,8 +2480,14 @@ void HttpServer::handle_connection(int client_fd) {
     if (resp.status >= 400) {
       try {
         const auto body = json::parse(resp.body);
-        if (const auto* error = body.find("error"))
+        if (const auto* error = body.find("error")) {
           resp.log_details += " error_code=" + error->member_str("code");
+          // The reason, so a rejected client request can be diagnosed from
+          // the log alone.
+          if (resp.status < 500)
+            resp.log_details +=
+                " error_message=" + json::Value(error->member_str("message")).dump();
+        }
       } catch (const std::exception&) {
         // The status remains useful for an endpoint returning a non-JSON error.
       }
