@@ -55,8 +55,10 @@ were not run here. Only Qwen3.8-27B was tested.
 
 ## Measurement: Qwen3.8-27B against llama.cpp
 
-Machine: Strix Halo (gfx1151), Windows 11, TheRock 10.0.0, 32 GB dedicated
-GPU memory. Model Qwen3.8-27B UD-Q4_K_XL (llama.cpp: Q4_K_M, since UD-Q4_K_XL
+Machine: GMKtec EVO-X2 (Strix Halo, gfx1151, 64 GB), in its normal
+performance mode (not the high-performance mode), Windows power plan
+"Balanced", Windows 11, TheRock 10.0.0, 32 GB dedicated GPU memory. Both
+servers ran under the same settings. Model Qwen3.8-27B UD-Q4_K_XL (llama.cpp: Q4_K_M, since UD-Q4_K_XL
 with a DFlash2 draft at 64K context does not fit 32 GB there), DFlash2
 Q4_K_M draft, 64K context.
 
@@ -196,6 +198,6 @@ use (part of it beyond the 32 GB carve-out). 256K was not tried.
 
 ### Not tried
 
-- Windows power mode "Best performance" (the machine ran "Balanced").
+- The EVO-X2's high-performance mode and Windows power mode "Best performance" (the machine ran its normal mode and "Balanced").
 - Flash-Next, DeepSeek and Qwen3.6-35B-A3B (not run at all).
 - Concurrent requests (all measurements used one request at a time).

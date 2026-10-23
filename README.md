@@ -21,8 +21,11 @@ licensed, like upstream.
 
 ## What was tested
 
-Machine: Ryzen AI MAX+ 395, Windows 11 Pro (build 26200), AMD driver
-32.0.32015.7029, 32 GB dedicated GPU memory, TheRock ROCm 10.0.0.
+Machine: **GMKtec EVO-X2** (Ryzen AI MAX+ 395, 64 GB: 32 GB dedicated GPU
+memory, 32 GB left to Windows), run in its **normal performance mode, not the
+high-performance mode**, Windows power plan "Balanced". Windows 11 Pro
+(build 26200), AMD driver 32.0.32015.7029, TheRock ROCm 10.0.0. llama.cpp
+and gufo ran under the same settings; the faster modes were not tried.
 
 Qwen3.8-27B UD-Q4_K_XL with the DFlash2 draft, against llama.cpp on the same
 machine, on a mix of German, English and strict JSON requests with and
@@ -204,7 +207,7 @@ for the numbers.
   video models (compiled into `gufo.exe`, never run on this machine).
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
-- Concurrent requests, Windows power mode "Best performance".
+- Concurrent requests; the EVO-X2's high-performance mode and Windows power mode "Best performance".
 
 [docs/WINDOWS.md](docs/WINDOWS.md) describes how the port works inside; its
 measurements come from the pixmaate fork and were not re-checked here.
