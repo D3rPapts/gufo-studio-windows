@@ -46,8 +46,24 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
   DWORD error = ERROR_SUCCESS;
   __try {
     const auto* touch = reinterpret_cast<volatile const std::uint8_t*>(begin);
-    for (std::size_t i = 0; i < bytes; i += page_size)
+    const auto* probe = reinterpret_cast<const std::uint8_t*>(begin);
+    for (std::size_t i = 0; i < bytes; i += page_size) {
+      // Query the protection before touching: an inaccessible page becomes
+      // the same reported failure the POSIX madvise path produces, without
+      // raising a hardware exception a worker thread would have to catch.
+      MEMORY_BASIC_INFORMATION information{};
+      if (VirtualQueryEx(GetCurrentProcess(), probe + i, &information,
+                         sizeof(information)) == 0 ||
+          (information.Protect & PAGE_GUARD) != 0 ||
+          (information.Protect &
+           (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+            PAGE_EXECUTE_WRITECOPY)) == 0) {
+        error = ERROR_NOACCESS;
+        break;
+      }
       static_cast<void>(touch[i]);
+    }
   } __except (PrefaultExceptionFilter(GetExceptionInformation(), begin, bytes,
                                       &error)) {
   }
@@ -95,7 +111,8 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
 #if defined(_WIN32)
   // Windows 8+; returns immediately, prefetching into the standby list.
   WIN32_MEMORY_RANGE_ENTRY entry{reinterpret_cast<void*>(begin), bytes};
-  PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+  (void)PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+
 #endif
   auto populate = [&] {
     while (failure.load(std::memory_order_relaxed) == 0) {
