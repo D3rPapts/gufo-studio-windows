@@ -276,9 +276,9 @@ void HashString(crypto::Sha256Hasher& hash, std::string_view value) {
 
 // The volume serial and file index identify the file as uniquely as
 // POSIX dev:ino; write and creation times plus size complete the stamp.
-std::string FileStamp(const std::string& path, std::size_t size) {
+std::string FileStamp(const std::filesystem::path& path, std::size_t size) {
   const HANDLE file =
-      CreateFileA(path.c_str(), GENERIC_READ,
+      CreateFileA(path.string().c_str(), GENERIC_READ,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   nullptr, OPEN_EXISTING, 0, nullptr);
   if (file == INVALID_HANDLE_VALUE)
