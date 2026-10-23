@@ -239,12 +239,15 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
   const bool attn_output = Is(m, k, 5120, 4096);
   const bool conv = Is(m, k, 1280, 5120);
   const bool fc = Is(m, k, 5120, 25600);
-  // Draft shapes at 2-5 rows from kernel-bench/kb27_sweep7 (2026-09-27).
+  // Draft shapes at 2-5 rows from kernel-bench/kb27_sweep7 (2026-09-27);
+  // conv, attn_kv, attn_q and attn_output replaced where tools/windows/
+  // verify-sweep (2026-10-23) measured them 5% or more faster.
   switch (batch) {
     case 2:
-      if (attn_q) return Launch<T, 2, 4, 4, 2>(w, x, y, m, k, stream);
-      if (attn_kv) return Launch<T, 2, 8, 3, 1, 2, 8>(w, x, y, m, k, stream);
-      if (conv) return Launch<T, 2, 8, 3, 1>(w, x, y, m, k, stream);
+      if (attn_q)
+        return Launch<T, 2, 8, 4, 1, 2, 8, 16>(w, x, y, m, k, stream);
+      if (attn_kv) return Launch<T, 2, 8, 4, 2, 2, 4>(w, x, y, m, k, stream);
+      if (conv) return Launch<T, 2, 16, 4, 2, 2, 4>(w, x, y, m, k, stream);
       return false;
     case 3:
       if (ffn_down)
@@ -256,7 +259,7 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
       if (attn_kv) return Launch<T, 3, 8, 4, 2, 3, 1>(w, x, y, m, k, stream);
       if (attn_output)
         return Launch<T, 3, 8, 3, 1, 3, 4, 16>(w, x, y, m, k, stream);
-      if (conv) return Launch<T, 3, 4, 4, 1, 3, 8>(w, x, y, m, k, stream);
+      if (conv) return Launch<T, 3, 8, 4, 2, 3, 4>(w, x, y, m, k, stream);
       if (fc) return Launch<T, 3, 8, 4, 1, 1, 4, 16>(w, x, y, m, k, stream);
       return false;
     case 4:
@@ -266,8 +269,8 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
         return Launch<T, 4, 4, 4, 1, 4, 4, 16>(w, x, y, m, k, stream);
       if (attn_kv) return Launch<T, 4, 8, 4, 2, 4, 1>(w, x, y, m, k, stream);
       if (attn_output)
-        return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
-      if (conv) return Launch<T, 4, 4, 4, 1, 1>(w, x, y, m, k, stream);
+        return Launch<T, 4, 8, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
+      if (conv) return Launch<T, 4, 8, 4, 2, 4, 4>(w, x, y, m, k, stream);
       if (fc) return Launch<T, 4, 4, 4, 1, 4, 4, 16>(w, x, y, m, k, stream);
       return false;
     case 5:
@@ -277,15 +280,33 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
         return Launch<T, 5, 8, 4, 1, 5, 4, 16>(w, x, y, m, k, stream);
       if (attn_q)
         return Launch<T, 5, 4, 4, 1, 1, 4, 16>(w, x, y, m, k, stream);
-      if (attn_kv) return Launch<T, 5, 8, 4, 1, 5, 8>(w, x, y, m, k, stream);
+      if (attn_kv || conv)
+        return Launch<T, 5, 8, 4, 1, 1, 4>(w, x, y, m, k, stream);
       if (attn_output)
         return Launch<T, 5, 8, 4, 1, 1, 4, 16>(w, x, y, m, k, stream);
-      if (conv) return Launch<T, 5, 4, 4, 1, 1>(w, x, y, m, k, stream);
       if (fc) return Launch<T, 5, 4, 4, 1, 5, 4, 16>(w, x, y, m, k, stream);
       return false;
     default:
-      return false;
+      break;
   }
+  // 6-8 rows (verify-sweep 2026-10-23): the generic dispatch reads these at
+  // half speed; +24-55%. ffn_gate_up and ffn_down gain nothing here.
+  if (batch < 6 || batch > 8)
+    return false;
+  if (attn_q || attn_output) {
+    if (batch == 6)
+      return Launch<T, 6, 4, 4, 1, 6, 8, 16>(w, x, y, m, k, stream);
+    if (batch == 7)
+      return Launch<T, 7, 4, 4, 1, 7, 8, 16>(w, x, y, m, k, stream);
+    return Launch<T, 8, 4, 4, 1, 8, 8, 16>(w, x, y, m, k, stream);
+  }
+  if (attn_kv || conv) {
+    if (batch == 6) return Launch<T, 6, 8, 4, 1, 1, 4>(w, x, y, m, k, stream);
+    if (batch == 7)
+      return Launch<T, 7, 16, 4, 2, 7, 4>(w, x, y, m, k, stream);
+    return Launch<T, 8, 8, 4, 1, 1, 4>(w, x, y, m, k, stream);
+  }
+  return false;
 }
 
 // Target FFN projections at 2-8 rows (kb27 sweep, 2026-10-23, measured like

@@ -26,7 +26,9 @@ powershell -ExecutionPolicy Bypass -File tools\windows\verify-sweep\run.ps1 -Mod
 every projection used by at least `-MinLayers` layers at `-Batches` rows, and
 prints a table plus the winning shapes as `Launch<...>` lines. Options:
 `-Batches 3,4,5`, `-Rounds 9`, `-MinGain 5` (percent), `-Out sweep.log` for
-the raw lines.
+the raw lines. For a DFlash2 draft GGUF pass `-MinLayers 1`: the draft has
+only five layers, so some projections occur once. Its shapes go into
+`LaunchQ4K`, the draft block of `verify_gemm_27b.hip`.
 
 ## Method
 

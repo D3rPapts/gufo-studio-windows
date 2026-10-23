@@ -238,6 +238,32 @@ Greedy output hashes were identical after each round. The short-case means of
 single benchmark runs move by several percent between runs; the temperature-0
 row repeats exactly the same tokens and is the steadier comparison.
 
+A third round ran the sweep on the DFlash2 Q4_K_M draft (about 10% of a
+cycle). At 2-5 rows, the usual draft widths under `LOOKUP=4`, only the small
+matrices gained: `attn_conv_proj` 1280x5120 +7-19%, `attn_k`/`attn_v`
+1024x5120 +7-8% at 2 and 5 rows, `attn_q` +5% at 2 rows, `attn_output` +6%
+at 4 rows; `ffn_gate`/`ffn_up`/`ffn_down` already ran at 180-225 GB/s and
+gained nothing. At 6-8 rows the draft's `attn_q`, `attn_output`, `attn_k`/
+`attn_v` and `attn_conv_proj` had no shape at all and ran through the
+generic dispatch at half speed; the new shapes are +24-55% there. Greedy
+output hashes are identical (5 of 5). End to end the gain is too small to
+measure, so the question was whether the 6-8-row fix makes longer DFlash2
+drafts worth it:
+
+| benchmark set (one run each) | before, `LOOKUP=4` | draft shapes, `LOOKUP=4` | draft shapes, `LOOKUP=7` |
+| --- | --- | --- | --- |
+| film + thinking (4 runs, mean) | 29.9 tok/s | 30.2 tok/s | 31.8 tok/s |
+| short cases (7, mean) | 20.5 tok/s | 18.8 tok/s | 19.5 tok/s |
+| 17.5K prompt | 15.2 tok/s | 15.1 tok/s | 14.8 tok/s |
+| all cases, tokens / time | 24.5 tok/s | 24.8 tok/s | 25.1 tok/s |
+
+Within the noise of single runs (thinking lengths differed by up to 2x
+between runs); `LOOKUP=7` leads on the main case but is not confirmed, and
+the short cases were 5-8% slower with the new build in this run, also not
+confirmed. The
+planned temperature-0 comparison (old against new build, identical tokens)
+was not run. Production stays on `LOOKUP=4` with the new build.
+
 The sweep is in [tools/windows/verify-sweep](../tools/windows/verify-sweep/README.md),
 so another GGUF or quantization can be measured the same way.
 
