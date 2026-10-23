@@ -219,6 +219,28 @@ end-to-end output hashes are unchanged.
 | benchmark set, film + thinking | 27.6 tok/s | 29.0 tok/s |
 | benchmark set, short cases | 17.9 tok/s | 18.6 tok/s |
 
+A second round covered the FFN. At 2-8 rows the fused gate/up SwiGLU kernel
+does not apply (it starts at 14 rows), so the 39 layers whose gate and up
+share a format multiply one joined 34816x5120 matrix through the generic
+dispatch; the other 25 layers run two 17408x5120 halves. Exact shapes for
+the joined Q4_K/Q5_K/Q6_K/IQ4_XS matrices (+6-51%), IQ4_XS/Q4_K/Q6_K
+`ffn_down` (+10-50%) and the Q4_K/Q6_K halves (+8-46%) followed; the Q5_K
+and IQ4_XS shapes pixmaate had tuned were left as they were.
+
+| | start | projections | + FFN |
+| --- | --- | --- | --- |
+| cycle, short answers | ~133 ms | ~125 ms | ~121 ms |
+| `gufo prompt`, temperature 0, 5 cases | 16.9-20.9 tok/s | 17.1-21.4 tok/s | 17.8-22.2 tok/s |
+| benchmark set, film + thinking | 27.6 tok/s | 29.0 tok/s | 30.8 tok/s |
+| benchmark set, short cases | 17.9 tok/s | 18.6 tok/s | 19.0 tok/s |
+
+Greedy output hashes were identical after each round. The short-case means of
+single benchmark runs move by several percent between runs; the temperature-0
+row repeats exactly the same tokens and is the steadier comparison.
+
+The sweep is in [tools/windows/verify-sweep](../tools/windows/verify-sweep/README.md),
+so another GGUF or quantization can be measured the same way.
+
 The tuning only reshapes launches of the existing kernel, so it should carry
 to Linux on the same GPU, but it was measured on Windows with TheRock 10.0.0
 only.

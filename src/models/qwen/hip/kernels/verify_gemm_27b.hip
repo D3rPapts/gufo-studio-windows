@@ -288,6 +288,110 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
   }
 }
 
+// Target FFN projections at 2-8 rows (kb27 sweep, 2026-10-23, measured like
+// LaunchQ4KTarget; gains of 5% or more over the production path, which
+// includes the shapes above, are kept). "packed" is the joined 34816-row
+// gate/up matrix the decode uses when both halves share a format; "single"
+// is one 17408-row half; "down" the 17408-column down projection. Gains:
+// packed +6-51%, down +10-50%, single +8-46% at the listed widths.
+template<GgmlType T>
+bool LaunchFfnShape(const void* w, const float* x, float* y,
+                    std::size_t batch, std::size_t m, std::size_t k,
+                    hipStream_t stream) {
+  const bool packed = Is(m, k, 34816, 5120);
+  const bool single = Is(m, k, 17408, 5120);
+  const bool down = Is(m, k, 5120, 17408);
+  if (!packed && !single && !down)
+    return false;
+#define GUFO_VG(B, W, R, TL, S, M, LN)                                        \
+  return Launch<T, B, W, R, TL, S, M, LN>(w, x, y, m, k, stream)
+  // Six to eight rows: four waves of four rows in 16-lane groups.
+  const auto wide = [&]() {
+    switch (batch) {
+      case 6: GUFO_VG(6, 4, 4, 1, 6, 8, 16);
+      case 7: GUFO_VG(7, 4, 4, 1, 7, 8, 16);
+      default: GUFO_VG(8, 4, 4, 1, 8, 8, 16);
+    }
+  };
+  if constexpr (T == GgmlType::kIQ4_XS) {
+    if (down) {
+      switch (batch) {
+        case 2: GUFO_VG(2, 16, 4, 1, 2, 8, 16);
+        case 4: GUFO_VG(4, 4, 4, 1, 4, 8, 16);
+        case 5: GUFO_VG(5, 4, 4, 1, 5, 8, 16);
+        case 8: GUFO_VG(8, 4, 4, 1, 8, 4, 16);
+        case 6:
+        case 7: return wide();
+        default: return false;
+      }
+    }
+    if (packed) {
+      switch (batch) {
+        case 2: GUFO_VG(2, 16, 4, 1, 2, 8, 16);
+        case 3: GUFO_VG(3, 16, 4, 1, 3, 8, 16);
+        case 4: GUFO_VG(4, 8, 4, 1, 4, 8, 16);
+        case 5: GUFO_VG(5, 4, 4, 1, 5, 8, 16);
+        case 8: GUFO_VG(8, 4, 4, 1, 8, 4, 16);
+        case 6:
+        case 7: return wide();
+        default: return false;
+      }
+    }
+    return false;  // single: the gate shapes in LaunchIQ4XS stay faster
+  }
+  if constexpr (T == GgmlType::kQ4_K) {
+    if (packed) {
+      if (batch == 4) GUFO_VG(4, 8, 4, 1, 4, 8, 16);
+      if (batch == 5) GUFO_VG(5, 4, 4, 1, 5, 8, 16);
+      return batch >= 6 && wide();
+    }
+    if (single) {
+      switch (batch) {
+        case 4: GUFO_VG(4, 4, 4, 1, 4, 8, 16);
+        case 6: GUFO_VG(6, 4, 4, 1, 6, 4, 16);
+        case 7: GUFO_VG(7, 4, 4, 1, 7, 4, 16);
+        case 8: GUFO_VG(8, 4, 4, 1, 8, 8, 16);
+        default: return false;
+      }
+    }
+    if (batch == 7) GUFO_VG(7, 8, 4, 1, 7, 8, 16);
+    return batch >= 6 && wide();  // down
+  }
+  if constexpr (T == GgmlType::kQ5_K) {
+    if (packed) {
+      if (batch == 4) GUFO_VG(4, 8, 4, 1, 4, 4, 16);
+      if (batch == 5) GUFO_VG(5, 8, 4, 1, 5, 8, 16);
+      return batch >= 6 && wide();
+    }
+    if (batch != 5)
+      return false;  // the existing Q5_K shapes stay faster
+    if (single) GUFO_VG(5, 4, 4, 1, 5, 4, 16);
+    GUFO_VG(5, 4, 4, 1, 5, 8, 16);  // down
+  }
+  if constexpr (T == GgmlType::kQ6_K) {
+    if (packed) {
+      switch (batch) {
+        case 3: GUFO_VG(3, 8, 2, 1, 3, 8, 16);
+        case 4: GUFO_VG(4, 8, 4, 1, 4, 8, 16);
+        case 5: GUFO_VG(5, 8, 4, 1, 5, 8, 16);
+        default: return batch >= 6 && wide();
+      }
+    }
+    if (single) {
+      switch (batch) {
+        case 3: GUFO_VG(3, 16, 4, 1, 1, 4, 32);
+        case 4: GUFO_VG(4, 4, 4, 1, 4, 8, 16);
+        case 5: GUFO_VG(5, 8, 3, 1, 5, 4, 16);
+        case 8: GUFO_VG(8, 4, 4, 1, 8, 4, 16);
+        default: return batch >= 6 && wide();
+      }
+    }
+    return batch >= 6 && wide();  // down; 2-5 rows keep the draft shapes
+  }
+#undef GUFO_VG
+  return false;
+}
+
 }  // namespace
 
 bool TryLaunchVerifyGemm27(GgmlType type, const void* w, const float* x,
@@ -295,6 +399,26 @@ bool TryLaunchVerifyGemm27(GgmlType type, const void* w, const float* x,
                            std::size_t k, hipStream_t stream) {
   if (batch < 2 || batch > 8)
     return false;
+  switch (type) {
+    case GgmlType::kQ4_K:
+      if (LaunchFfnShape<GgmlType::kQ4_K>(w, x, y, batch, m, k, stream))
+        return true;
+      break;
+    case GgmlType::kQ5_K:
+      if (LaunchFfnShape<GgmlType::kQ5_K>(w, x, y, batch, m, k, stream))
+        return true;
+      break;
+    case GgmlType::kQ6_K:
+      if (LaunchFfnShape<GgmlType::kQ6_K>(w, x, y, batch, m, k, stream))
+        return true;
+      break;
+    case GgmlType::kIQ4_XS:
+      if (LaunchFfnShape<GgmlType::kIQ4_XS>(w, x, y, batch, m, k, stream))
+        return true;
+      break;
+    default:
+      break;
+  }
   switch (type) {
     case GgmlType::kQ5_K:
       return LaunchQ5K(w, x, y, batch, m, k, stream);
