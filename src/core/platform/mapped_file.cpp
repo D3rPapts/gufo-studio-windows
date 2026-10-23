@@ -1,6 +1,9 @@
 #include "src/core/platform/mapped_file.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <limits>
 #include <utility>
 
 #if defined(_WIN32)
@@ -20,17 +23,31 @@ std::string FormatWindowsError(const char* what, DWORD code) {
   return std::string(what) + " failed with Windows error " +
          std::to_string(code);
 }
+
+HANDLE OpenForRead(const std::filesystem::path& path, DWORD flags) {
+  return CreateFileW(path.c_str(), GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     nullptr, OPEN_EXISTING, flags, nullptr);
+}
+#else
+std::string FormatErrno(const char* what, int code) {
+  return std::string(what) + ": " + std::strerror(code);
+}
 #endif
 
 }  // namespace
 
 ReadOnlyMappedFile::ReadOnlyMappedFile(ReadOnlyMappedFile&& other) noexcept
-    : ReadOnlyMappedFile(other.data_, other.size_, other.handle_,
-                         other.mapping_) {
-  other.data_ = nullptr;
-  other.size_ = 0;
-  other.handle_ = nullptr;
-  other.mapping_ = nullptr;
+    : data_(other.data_),
+      size_(other.size_),
+#if defined(_WIN32)
+      handle_(other.handle_),
+      mapping_(other.mapping_)
+#else
+      fd_(other.fd_)
+#endif
+{
+  other.Reset();
 }
 
 ReadOnlyMappedFile& ReadOnlyMappedFile::operator=(
@@ -39,12 +56,13 @@ ReadOnlyMappedFile& ReadOnlyMappedFile::operator=(
     Close();
     data_ = other.data_;
     size_ = other.size_;
+#if defined(_WIN32)
     handle_ = other.handle_;
     mapping_ = other.mapping_;
-    other.data_ = nullptr;
-    other.size_ = 0;
-    other.handle_ = nullptr;
-    other.mapping_ = nullptr;
+#else
+    fd_ = other.fd_;
+#endif
+    other.Reset();
   }
   return *this;
 }
@@ -54,12 +72,21 @@ ReadOnlyMappedFile::~ReadOnlyMappedFile() {
 }
 
 int ReadOnlyMappedFile::PlatformDescriptor() const noexcept {
-#if !defined(_WIN32)
-  return handle_ != nullptr
-             ? static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_))
-             : -1;
-#else
+#if defined(_WIN32)
   return -1;
+#else
+  return fd_;
+#endif
+}
+
+void ReadOnlyMappedFile::Reset() noexcept {
+  data_ = nullptr;
+  size_ = 0;
+#if defined(_WIN32)
+  handle_ = nullptr;
+  mapping_ = nullptr;
+#else
+  fd_ = -1;
 #endif
 }
 
@@ -74,16 +101,13 @@ void ReadOnlyMappedFile::Close() noexcept {
 #else
   if (data_ != nullptr)
     munmap(const_cast<std::uint8_t*>(data_), size_);
-  if (handle_ != nullptr)
-    ::close(static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_)));
+  if (fd_ >= 0)
+    ::close(fd_);
 #endif
-  data_ = nullptr;
-  size_ = 0;
-  handle_ = nullptr;
-  mapping_ = nullptr;
+  Reset();
 }
 
-ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::string& path,
+ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::filesystem::path& path,
                                             std::string* error) {
   const auto fail = [&](std::string message) {
     if (error != nullptr)
@@ -91,25 +115,25 @@ ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::string& path,
     return ReadOnlyMappedFile();
   };
 #if defined(_WIN32)
-  const HANDLE file =
-      CreateFileA(path.c_str(), GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
   if (file == INVALID_HANDLE_VALUE)
-    return fail(FormatWindowsError("CreateFileA", GetLastError()));
+    return fail(FormatWindowsError("CreateFileW", GetLastError()));
   LARGE_INTEGER file_size{};
   if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0) {
     const DWORD code = GetLastError();
     CloseHandle(file);
     return fail(FormatWindowsError("GetFileSizeEx", code));
   }
+  if (file_size.QuadPart == 0) {
+    CloseHandle(file);
+    return fail("file is empty");
+  }
   const HANDLE mapping =
-      CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (mapping == nullptr) {
     const DWORD code = GetLastError();
     CloseHandle(file);
-    return fail(FormatWindowsError("CreateFileMappingA", code));
+    return fail(FormatWindowsError("CreateFileMappingW", code));
   }
   void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
   if (view == nullptr) {
@@ -118,35 +142,39 @@ ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::string& path,
     CloseHandle(file);
     return fail(FormatWindowsError("MapViewOfFile", code));
   }
-  return ReadOnlyMappedFile(static_cast<const std::uint8_t*>(view),
-                            static_cast<std::size_t>(file_size.QuadPart), file,
-                            mapping);
+  ReadOnlyMappedFile result;
+  result.data_ = static_cast<const std::uint8_t*>(view);
+  result.size_ = static_cast<std::size_t>(file_size.QuadPart);
+  result.handle_ = file;
+  result.mapping_ = mapping;
+  return result;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return fail("cannot open " + path + ": " + std::to_string(errno));
+    return fail(FormatErrno("cannot open", errno));
   struct stat st{};
   if (::fstat(fd, &st) != 0 || st.st_size < 0) {
     const int code = errno;
     ::close(fd);
-    return fail("cannot stat " + path + ": " + std::to_string(code));
+    return fail(FormatErrno("cannot stat", code));
   }
   if (st.st_size == 0) {
     ::close(fd);
-    return fail("file is empty: " + path);
+    return fail("file is empty");
   }
-  void* view = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ,
-                      MAP_PRIVATE, fd, 0);
+  const auto size = static_cast<std::size_t>(st.st_size);
+  void* view = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (view == MAP_FAILED) {
     const int code = errno;
     ::close(fd);
-    return fail("cannot mmap " + path + ": " + std::to_string(code));
+    return fail(FormatErrno("cannot mmap", code));
   }
-  ::madvise(view, static_cast<std::size_t>(st.st_size), MADV_SEQUENTIAL);
-  return ReadOnlyMappedFile(
-      static_cast<const std::uint8_t*>(view),
-      static_cast<std::size_t>(st.st_size),
-      reinterpret_cast<void*>(static_cast<std::uintptr_t>(fd)), nullptr);
+  (void)::madvise(view, size, MADV_SEQUENTIAL);
+  ReadOnlyMappedFile result;
+  result.data_ = static_cast<const std::uint8_t*>(view);
+  result.size_ = size;
+  result.fd_ = fd;
+  return result;
 #endif
 }
 
@@ -163,13 +191,9 @@ std::size_t SystemPageSize() noexcept {
 #endif
 }
 
-bool RawMappedFile::Open(const char* path) noexcept {
+bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
 #if defined(_WIN32)
-  const HANDLE file =
-      CreateFileA(path, GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
   if (file == INVALID_HANDLE_VALUE)
     return false;
   LARGE_INTEGER file_size{};
@@ -178,7 +202,7 @@ bool RawMappedFile::Open(const char* path) noexcept {
     return false;
   }
   const HANDLE section =
-      CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
     CloseHandle(file);
     return false;
@@ -191,11 +215,13 @@ bool RawMappedFile::Open(const char* path) noexcept {
   }
   data = view;
   size = static_cast<std::size_t>(file_size.QuadPart);
+  view_base = view;
+  view_size = size;
   this->file = file;
   this->section = section;
   return true;
 #else
-  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
     return false;
   struct stat status{};
@@ -203,36 +229,43 @@ bool RawMappedFile::Open(const char* path) noexcept {
     ::close(fd);
     return false;
   }
-  void* mapping = ::mmap(nullptr, static_cast<std::size_t>(status.st_size),
-                         PROT_READ, MAP_PRIVATE, fd, 0);
+  const auto file_size = static_cast<std::size_t>(status.st_size);
+  void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
   ::close(fd);
   if (mapping == MAP_FAILED)
     return false;
-  ::madvise(mapping, static_cast<std::size_t>(status.st_size), MADV_SEQUENTIAL);
+  (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
   data = mapping;
-  size = static_cast<std::size_t>(status.st_size);
+  size = file_size;
+  view_base = mapping;
+  view_size = file_size;
   return true;
 #endif
 }
 
-bool RawMappedFile::OpenRange(const char* path, std::uint64_t offset,
+bool RawMappedFile::OpenRange(const std::filesystem::path& path,
+                              std::uint64_t offset,
                               std::size_t length) noexcept {
-#if defined(_WIN32)
-  const HANDLE file =
-      CreateFileA(path, GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-  if (file == INVALID_HANDLE_VALUE)
+  if (length == 0)
     return false;
+#if defined(_WIN32)
   SYSTEM_INFO info{};
   GetSystemInfo(&info);
   const std::uint64_t granularity =
       info.dwAllocationGranularity != 0 ? info.dwAllocationGranularity : 65536;
+#else
+  const std::uint64_t granularity = SystemPageSize();
+#endif
   const std::uint64_t base = offset - (offset % granularity);
   const std::uint64_t span = offset - base + length;
+  if (span > (std::numeric_limits<std::size_t>::max)())
+    return false;
+#if defined(_WIN32)
+  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
+  if (file == INVALID_HANDLE_VALUE)
+    return false;
   const HANDLE section =
-      CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
     CloseHandle(file);
     return false;
@@ -245,56 +278,49 @@ bool RawMappedFile::OpenRange(const char* path, std::uint64_t offset,
     CloseHandle(file);
     return false;
   }
-  data = static_cast<std::uint8_t*>(view) + (offset - base);
-  size = length;
   this->file = file;
   this->section = section;
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return false;
+  void* view = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ,
+                      MAP_PRIVATE, fd, static_cast<off_t>(base));
+  ::close(fd);
+  if (view == MAP_FAILED)
+    return false;
+  (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
+#endif
+  data = static_cast<std::uint8_t*>(view) + (offset - base);
+  size = length;
   view_base = view;
   view_size = static_cast<std::size_t>(span);
   return true;
-#else
-  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return false;
-  void* mapping = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd,
-                         static_cast<off_t>(offset));
-  ::close(fd);
-  if (mapping == MAP_FAILED)
-    return false;
-  ::madvise(mapping, length, MADV_SEQUENTIAL);
-  data = mapping;
-  size = length;
-  return true;
-#endif
 }
 
 void RawMappedFile::Close() noexcept {
 #if defined(_WIN32)
   if (view_base != nullptr)
     UnmapViewOfFile(view_base);
-  else if (data != nullptr)
-    UnmapViewOfFile(data);
   if (section != nullptr)
     CloseHandle(static_cast<HANDLE>(section));
   if (file != nullptr)
     CloseHandle(static_cast<HANDLE>(file));
   file = nullptr;
   section = nullptr;
-  view_base = nullptr;
-  view_size = 0;
 #else
-  if (data != nullptr)
-    munmap(data, size);
+  if (view_base != nullptr)
+    munmap(view_base, view_size);
 #endif
   data = nullptr;
   size = 0;
+  view_base = nullptr;
+  view_size = 0;
 }
 
-PlatformFile OpenReadFile(const std::string& path) noexcept {
+PlatformFile OpenReadFile(const std::filesystem::path& path) noexcept {
 #if defined(_WIN32)
-  return CreateFileA(path.c_str(), GENERIC_READ,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  return OpenForRead(path, FILE_ATTRIBUTE_NORMAL);
 #else
   return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 #endif
@@ -324,15 +350,18 @@ std::size_t ReadFileAt(PlatformFile file, void* output, std::size_t bytes,
   OVERLAPPED overlapped{};
   overlapped.Offset = static_cast<DWORD>(offset);
   overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+  // ReadFile takes a DWORD count; larger requests return a short read.
+  const DWORD request = bytes < MAXDWORD ? static_cast<DWORD>(bytes) : MAXDWORD;
   DWORD read_bytes = 0;
-  if (!ReadFile(static_cast<HANDLE>(file), output, static_cast<DWORD>(bytes),
-                &read_bytes, &overlapped)) {
+  if (!ReadFile(static_cast<HANDLE>(file), output, request, &read_bytes,
+                &overlapped)) {
     return 0;
   }
   return read_bytes;
 #else
-  return static_cast<std::size_t>(
-      ::pread(file, output, bytes, static_cast<off_t>(offset)));
+  const ssize_t read_bytes =
+      ::pread(file, output, bytes, static_cast<off_t>(offset));
+  return read_bytes > 0 ? static_cast<std::size_t>(read_bytes) : 0;
 #endif
 }
 

@@ -148,7 +148,7 @@ struct GgufMappedRegion {
   /// Borrowed descriptor, valid for the reader lifetime; -1 for memory images
   /// and on Windows, where unbuffered readers reopen `source_path` instead.
   int file_descriptor{-1};
-  std::string source_path;
+  std::filesystem::path source_path{};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -242,7 +242,7 @@ private:
   const std::uint8_t* data_{nullptr};
   std::size_t size_{0};
   std::filesystem::path source_path_;
-  std::vector<platform::ReadOnlyMappedFile> mappings_;
+  platform::ReadOnlyMappedFile mapping_;
 
   std::uint32_t version_{0};
   std::uint64_t alignment_{32};

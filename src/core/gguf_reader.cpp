@@ -62,7 +62,7 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
     : data_(other.data_),
       size_(other.size_),
       source_path_(std::move(other.source_path_)),
-      mappings_(std::move(other.mappings_)),
+      mapping_(std::move(other.mapping_)),
       version_(other.version_),
       alignment_(other.alignment_),
       metadata_(std::move(other.metadata_)),
@@ -76,14 +76,14 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
 
 GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
   if (this != &other) {
-    mappings_.clear();
+    mapping_.Close();
     shards_.clear();
     mapped_regions_.clear();
 
     data_ = other.data_;
     size_ = other.size_;
     source_path_ = std::move(other.source_path_);
-    mappings_ = std::move(other.mappings_);
+    mapping_ = std::move(other.mapping_);
     version_ = other.version_;
     alignment_ = other.alignment_;
     metadata_ = std::move(other.metadata_);
@@ -94,7 +94,6 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
 
     other.data_ = nullptr;
     other.size_ = 0;
-    other.mappings_.clear();
   }
   return *this;
 }
@@ -123,7 +122,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
 std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
     const std::filesystem::path& path, std::string* error_msg) {
   std::string open_error;
-  auto mapping = platform::ReadOnlyMappedFile::Open(path.string(), &open_error);
+  auto mapping = platform::ReadOnlyMappedFile::Open(path, &open_error);
   if (!mapping.valid()) {
     if (error_msg != nullptr) {
       *error_msg =
@@ -136,7 +135,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
   reader->data_ = mapping.data();
   reader->size_ = mapping.size();
   reader->source_path_ = path;
-  reader->mappings_.push_back(std::move(mapping));
+  reader->mapping_ = std::move(mapping);
 
   try {
     if (!reader->ParseHeaders(error_msg)) {
@@ -149,10 +148,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
       *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
-  reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_,
-       reader->mappings_.front().PlatformDescriptor(),
-       reader->source_path_.string()});
+  reader->mapped_regions_.push_back({reader->data_, reader->size_,
+                                     reader->mapping_.PlatformDescriptor(),
+                                     reader->source_path_});
   return reader;
 }
 
@@ -256,12 +254,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
   combined->mapped_regions_.reserve(split_count);
 
   for (const auto& shard : shards) {
-    combined->mapped_regions_.push_back(
-        {shard->data_, shard->size_,
-         shard->mappings_.empty()
-             ? -1
-             : shard->mappings_.front().PlatformDescriptor(),
-         shard->source_path_.string()});
+    combined->mapped_regions_.push_back({shard->data_, shard->size_,
+                                         shard->mapping_.PlatformDescriptor(),
+                                         shard->source_path_});
     for (const auto& tensor : shard->tensors_) {
       if (combined->tensor_index_.contains(tensor.name)) {
         if (error_msg != nullptr) {
@@ -299,7 +294,6 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
   }
 
   auto reader = std::unique_ptr<GgufReader>(new GgufReader());
-  reader->mappings_.clear();
   reader->data_ = static_cast<const std::uint8_t*>(data);
   reader->size_ = size;
 
