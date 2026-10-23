@@ -295,10 +295,12 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
 QwenDFlashGpuModel::QwenDFlashGpuModel(
     std::shared_ptr<const core::GgufReader> dflash_reader,
     std::shared_ptr<const void> target_lifetime,
+    const tokenization::QwenTokenizer* target_tokenizer,
     speculative::QwenDFlashWeights weights, std::vector<void*> allocations,
     std::size_t packed_weight_bytes)
     : dflash_reader_(std::move(dflash_reader)),
       target_lifetime_(std::move(target_lifetime)),
+      target_tokenizer_(target_tokenizer),
       weights_(std::move(weights)),
       allocations_(std::move(allocations)),
       packed_weight_bytes_(packed_weight_bytes) {}
@@ -324,6 +326,7 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
   target.config = target_model->GetConfig();
   target.token_embedding = target_model->GetWeights().token_embd;
   target.output = target_model->GetWeights().output;
+  target.tokenizer = &target_model->GetTokenizer();
   return Create(std::move(dflash_reader), target,
                 std::move(target_model) /* lifetime */, error_msg);
 }
@@ -333,7 +336,7 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     const QwenDFlashGpuModel::TiedTarget& target,
     std::shared_ptr<const void> target_lifetime, std::string* error_msg) {
   if (dflash_reader == nullptr || target.token_embedding.data == nullptr ||
-      target.output.data == nullptr) {
+      target.output.data == nullptr || target.tokenizer == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "DFlash reader and target GPU model are required";
     }
@@ -399,8 +402,8 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     }
 
     return std::shared_ptr<const QwenDFlashGpuModel>(new QwenDFlashGpuModel(
-        std::move(dflash_reader), target_lifetime, std::move(weights),
-        std::move(allocations), packed_bytes));
+        std::move(dflash_reader), target_lifetime, target.tokenizer,
+        std::move(weights), std::move(allocations), packed_bytes));
   } catch (const std::exception& ex) {
     for (void* ptr : allocations) {
       if (ptr != nullptr)

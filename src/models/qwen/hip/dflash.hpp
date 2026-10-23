@@ -108,12 +108,15 @@ public:
   QwenDFlashGpuModel(QwenDFlashGpuModel&&) = delete;
   QwenDFlashGpuModel& operator=(QwenDFlashGpuModel&&) = delete;
 
-  /// The target-side tied weights a draft borrows: device pointers for the
-  /// shared embedding table and LM head plus the topology they must match.
+  /// The target-side state a draft borrows: device pointers for the shared
+  /// embedding table and LM head, the topology they must match, and the
+  /// target's tokenizer for special-token lookups. The caller keeps the
+  /// tokenizer alive for as long as the draft model exists.
   struct TiedTarget {
     core::ModelConfig config;
     models::QwenTensorRef token_embedding;
     models::QwenTensorRef output;
+    const tokenization::QwenTokenizer* tokenizer{nullptr};
   };
 
   [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
@@ -143,7 +146,7 @@ public:
   }
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
       const noexcept {
-    return target_model_->GetTokenizer();
+    return *target_tokenizer_;
   }
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
@@ -152,12 +155,14 @@ public:
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
                      std::shared_ptr<const void> target_lifetime,
+                     const tokenization::QwenTokenizer* target_tokenizer,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
   std::shared_ptr<const void> target_lifetime_;
+  const tokenization::QwenTokenizer* target_tokenizer_{nullptr};
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};

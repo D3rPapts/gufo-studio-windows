@@ -615,7 +615,7 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
       prompt_tokens.back(), current_pos, count, temperature, sample_uniforms,
       nullptr, temperature > 0.0F ? &proposal.candidate_ids : nullptr,
       temperature > 0.0F ? &proposal.candidate_probabilities : nullptr, {},
-      sampler);
+      nullptr, sampler);
 
   proposal.tokens = proposed_tokens_;
   proposal_active_ = !proposal.tokens.empty();

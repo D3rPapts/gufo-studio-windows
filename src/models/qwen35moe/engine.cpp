@@ -143,6 +143,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     target.config.hidden_size = c.hidden_size;
     target.config.vocab_size = c.vocab_size;
     target.config.num_layers = c.num_layers;
+    target.tokenizer = m->tokenizer_.get();
     const auto& embedding = m->device_->token_embd();
     const auto& head = m->device_->output();
     // The draft reads the tables in their native quantized layout: the

@@ -316,7 +316,7 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           request.temperature > 0.0F ? &proposal.candidate_ids : nullptr,
           request.temperature > 0.0F ? &proposal.candidate_probabilities
                                      : nullptr,
-          request.trace, request.sampler);
+          request.trace, nullptr, request.sampler);
     }
     return proposals;
   }

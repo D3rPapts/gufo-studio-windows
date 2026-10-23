@@ -23,6 +23,8 @@ namespace gufo::platform {
 #if defined(_WIN32)
 namespace detail {
 
+#if !defined(__HIP_DEVICE_COMPILE__)
+
 inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
                                    std::uintptr_t begin, std::size_t bytes,
                                    DWORD* error) noexcept {
@@ -69,6 +71,19 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
   }
   return error;
 }
+
+#else
+// The device pass of HIP translation units emits this header but can never
+// run it; SEH has no representation on the GPU target, so the device pass
+// sees a plain touch loop with the same signature.
+inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
+                              std::size_t page_size) noexcept {
+  const auto* touch = reinterpret_cast<volatile const std::uint8_t*>(begin);
+  for (std::size_t i = 0; i < bytes; i += page_size)
+    static_cast<void>(touch[i]);
+  return ERROR_SUCCESS;
+}
+#endif
 
 }  // namespace detail
 #endif
