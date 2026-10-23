@@ -28,11 +28,14 @@ PAGE = Path(__file__).resolve().with_name("gufo_monitor.html")
 # One PowerShell samples the counters each second and prints one JSON line.
 SAMPLER = r"""
 $ErrorActionPreference = 'SilentlyContinue'
+# The GPU counter sets keep their English names on localized Windows; the
+# memory and paging-file sets do not, so those come from WMI's PerfOS classes.
 $names = '\GPU Adapter Memory(*)\Dedicated Usage','\GPU Adapter Memory(*)\Shared Usage',
-  '\GPU Engine(*)\Utilization Percentage','\Memory\Available MBytes','\Memory\Committed Bytes',
-  '\Memory\Commit Limit','\Memory\Pages Output/sec','\Paging File(_Total)\% Usage'
+  '\GPU Engine(*)\Utilization Percentage'
 while ($true) {
   $s = (Get-Counter $names).CounterSamples
+  $mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+  $page = Get-CimInstance Win32_PerfFormattedData_PerfOS_PagingFile -Filter "Name='_Total'"
   $eng = @{}
   foreach ($x in ($s | Where-Object Path -like '*utilization percentage')) {
     $t = $x.InstanceName -replace '.*engtype_', ''
@@ -43,11 +46,11 @@ while ($true) {
     gpu_ded = ($s | Where-Object Path -like '*dedicated usage' | Measure-Object CookedValue -Maximum).Maximum
     gpu_shared = ($s | Where-Object Path -like '*shared usage' | Measure-Object CookedValue -Maximum).Maximum
     engines = $eng
-    ram_avail_mb = ($s | Where-Object Path -like '*available mbytes').CookedValue
-    commit = ($s | Where-Object Path -like '*committed bytes').CookedValue
-    commit_limit = ($s | Where-Object Path -like '*commit limit').CookedValue
-    pages_out = ($s | Where-Object Path -like '*pages output/sec').CookedValue
-    pagefile_pct = ($s | Where-Object Path -like '*% usage').CookedValue
+    ram_avail_mb = $mem.AvailableMBytes
+    commit = $mem.CommittedBytes
+    commit_limit = $mem.CommitLimit
+    pages_out = $mem.PagesOutputPersec
+    pagefile_pct = $page.PercentUsage
   }
   $o | ConvertTo-Json -Compress
   [Console]::Out.Flush()
@@ -96,7 +99,8 @@ def recent_requests(port, count=8):
     """The last completed chat requests in the newest log of this port."""
     if LOGS is None:
         return []
-    logs = sorted(LOGS.glob("gufo-%d-*.log" % port))
+    # --logs may also name one server's log file directly.
+    logs = [LOGS] if LOGS.is_file() else sorted(LOGS.glob("gufo-%d-*.log" % port))
     if not logs:
         return []
     with logs[-1].open("rb") as f:
@@ -164,7 +168,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to open it from other devices on the LAN")
     ap.add_argument("--servers", default="8080,8081,8082",
                     help="gufo ports, each optionally PORT=label (8080=Qwen,8081=Gemma 26B)")
-    ap.add_argument("--logs", type=Path, help="folder of the servers' gufo-PORT-*.log files")
+    ap.add_argument("--logs", type=Path,
+                    help="folder of the servers' gufo-PORT-*.log files, or one server's log file")
     a = ap.parse_args()
     global LOGS
     LOGS = a.logs

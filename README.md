@@ -178,6 +178,21 @@ JSON output forced by a schema (`response_format`), in the OpenAI form and in
 llama.cpp's form. Set `max_tokens` with thinking on: one thinking run went to
 about 34K tokens.
 
+### 7. Watch it (optional)
+
+`tools\windows\gufo_monitor.py` (from the akamotaco/gufo_win fork) is a
+read-only web page: prompt progress, decode tokens, the last requests with
+cache hits and time to first token, GPU utilisation, dedicated and shared GPU
+memory, free RAM, commit and page file. It needs Python 3.
+
+```powershell
+python tools\windows\gufo_monitor.py --port 8095 --servers 8080=Qwen3.8-27B --logs <path to the server log>
+```
+
+Then open `http://127.0.0.1:8095`. `--logs` takes the server's log file
+(stderr redirected to a file) or a folder of `gufo-PORT-*.log` files.
+Port 8090, the script's default, may be taken by other software.
+
 ## Known limitations
 
 Measured on the test machine; see [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md)
