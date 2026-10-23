@@ -1240,19 +1240,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
             "pinned control buffer", error_msg) ||
         !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
-        !Check(
-            e->host_allocations_.Allocate(
-                &logits,
-                static_cast<std::size_t>(e->options_.max_logit_rows) *
-                    c.vocab_size * sizeof(float),
-                ResultHostFlags()),
-            "pinned logits buffer", error_msg)) {
+        !Check(e->host_allocations_.Allocate(
+                   &logits,
+                   static_cast<std::size_t>(e->options_.max_logit_rows) *
+                       c.vocab_size * sizeof(float),
+                   ResultHostFlags()),
+               "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     if (Tune().flag_waits) {
       void* done = nullptr;
-      if (!Check(e->host_allocations_.Allocate(&done, 64, hipHostMallocCoherent),
-                 "pinned completion flag", error_msg)) {
+      if (!Check(
+              e->host_allocations_.Allocate(&done, 64, hipHostMallocCoherent),
+              "pinned completion flag", error_msg)) {
         return nullptr;
       }
       e->done_flag_ = static_cast<std::uint32_t*>(done);
@@ -1302,10 +1302,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
-                                             sizeof(std::int32_t),
-                                             ResultHostFlags()),
-               "pinned draft token", error_msg) ||
+    if (!Check(
+            e->host_allocations_.Allocate(
+                &e->mtp_token_host_, sizeof(std::int32_t), ResultHostFlags()),
+            "pinned draft token", error_msg) ||
         !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
                                              sizeof(MtpCandidateLogits),
                                              ResultHostFlags()),

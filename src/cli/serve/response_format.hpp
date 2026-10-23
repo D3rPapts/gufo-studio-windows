@@ -35,8 +35,8 @@ inline std::shared_ptr<const sampling::JsonConstraint> ParseResponseFormat(
   const auto type = format->member_str("type");
   // llama.cpp also takes the schema directly: {"type":"json_object" or
   // "json_schema","schema":{...}}. Clients written against it send that form.
-  if ((type == "json_object" || type == "json_schema") &&
-      format->size() == 2 && format->find("schema") != nullptr)
+  if ((type == "json_object" || type == "json_schema") && format->size() == 2 &&
+      format->find("schema") != nullptr)
     return sampling::JsonConstraint::Compile(*format->find("schema"), false,
                                              true);
   if (type == "text" || type == "json_object") {
@@ -58,8 +58,7 @@ inline std::shared_ptr<const sampling::JsonConstraint> ParseResponseFormat(
   // OpenAI requires a name; llama.cpp does not, so a missing one is accepted.
   const auto name = specification->member_str("name");
   if ((specification->find("name") != nullptr && name.empty()) ||
-      name.size() > 64 ||
-      !std::ranges::all_of(name, [](unsigned char c) {
+      name.size() > 64 || !std::ranges::all_of(name, [](unsigned char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                (c >= '0' && c <= '9') || c == '_' || c == '-';
       }))

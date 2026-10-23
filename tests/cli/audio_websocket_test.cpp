@@ -38,8 +38,8 @@ bool ConnectedPair(std::array<int, 2>& fds) {
   bool ok =
       ::bind(listener, reinterpret_cast<sockaddr*>(&address), length) == 0 &&
       ::listen(listener, 1) == 0 &&
-      ::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
-                    &length) == 0;
+      ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) ==
+          0;
   int client = -1;
   if (ok) {
     client = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));

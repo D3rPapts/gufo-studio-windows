@@ -1067,10 +1067,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                  : survival   ? std::min<std::uint32_t>(
                                   model_->options_.max_draft_tokens,
                                   static_cast<std::uint32_t>(cap - 1))
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size()),
-                                    pending->policy_concurrency))
+                            : draft_length_.Choose(
+                                  static_cast<std::uint32_t>(cap - 1),
+                                  static_cast<std::uint32_t>(tokens_.size()),
+                                  pending->policy_concurrency))
           : cap;
   if (width == 0) {
     result->stop = true;

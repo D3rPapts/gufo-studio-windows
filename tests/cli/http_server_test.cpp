@@ -786,7 +786,8 @@ void TestExpectContinue() {
     std::string response;
     char buffer[4096];
     while (response.size() < interim.size()) {
-      const auto count = gufo::platform::SocketRead(fd, buffer, interim.size() - response.size());
+      const auto count = gufo::platform::SocketRead(
+          fd, buffer, interim.size() - response.size());
       assert(count > 0);
       response.append(buffer, static_cast<std::size_t>(count));
     }

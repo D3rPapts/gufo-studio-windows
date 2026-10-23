@@ -2486,7 +2486,8 @@ void HttpServer::handle_connection(int client_fd) {
           // the log alone.
           if (resp.status < 500)
             resp.log_details +=
-                " error_message=" + json::Value(error->member_str("message")).dump();
+                " error_message=" +
+                json::Value(error->member_str("message")).dump();
         }
       } catch (const std::exception&) {
         // The status remains useful for an endpoint returning a non-JSON error.
