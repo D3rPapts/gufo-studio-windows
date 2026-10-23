@@ -105,10 +105,77 @@ bool LaunchIQ4XS(const void* w, const float* x, float* y, std::size_t batch,
   return false;
 }
 
+// Target Q4_K and Q6_K projections of UD-Q4_K_XL (kb27 sweep, 2026-10-23):
+// real weights rotated through >= 512 MiB of copies so no run reads from the
+// Infinity Cache, nine alternating rounds, median, every shape bit-identical
+// to the production dispatch. Gains at 3-8 rows: attn_qkv +13-50%,
+// attn_gate +21-50%, attn_q +13-48%, ssm_out/attn_output +15-53%; at 2 rows
+// only attn_gate (+12%) and ssm_out/attn_output (+8%) changed.
+bool LaunchQ4KTarget(const void* w, const float* x, float* y,
+                     std::size_t batch, std::size_t m, std::size_t k,
+                     hipStream_t stream) {
+  constexpr auto T = GgmlType::kQ4_K;
+  if (Is(m, k, 10240, 5120)) {  // attn_qkv
+    switch (batch) {
+      case 3: return Launch<T, 3, 16, 4, 1, 3, 4, 16>(w, x, y, m, k, stream);
+      case 4: return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
+      case 5: return Launch<T, 5, 4, 4, 1, 5, 8, 16>(w, x, y, m, k, stream);
+      case 6: return Launch<T, 6, 4, 4, 1, 6, 8, 16>(w, x, y, m, k, stream);
+      case 7: return Launch<T, 7, 4, 4, 1, 7, 8, 16>(w, x, y, m, k, stream);
+      case 8: return Launch<T, 8, 4, 4, 1, 8, 8, 16>(w, x, y, m, k, stream);
+      default: return false;
+    }
+  }
+  if (Is(m, k, 6144, 5120)) {  // attn_gate
+    switch (batch) {
+      case 2: return Launch<T, 2, 8, 4, 2, 2, 4>(w, x, y, m, k, stream);
+      case 3: return Launch<T, 3, 8, 4, 1, 3, 8, 16>(w, x, y, m, k, stream);
+      case 4: return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
+      case 5: return Launch<T, 5, 8, 4, 2, 5, 4>(w, x, y, m, k, stream);
+      case 6: return Launch<T, 6, 4, 4, 1, 6, 4, 16>(w, x, y, m, k, stream);
+      case 7: return Launch<T, 7, 4, 4, 1, 7, 4, 16>(w, x, y, m, k, stream);
+      case 8: return Launch<T, 8, 4, 4, 1, 8, 4, 16>(w, x, y, m, k, stream);
+      default: return false;
+    }
+  }
+  if (Is(m, k, 12288, 5120)) {  // attn_q
+    switch (batch) {
+      case 3: return Launch<T, 3, 4, 4, 1, 3, 4, 16>(w, x, y, m, k, stream);
+      case 4: return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
+      case 5: return Launch<T, 5, 4, 4, 1, 5, 8, 16>(w, x, y, m, k, stream);
+      case 6: return Launch<T, 6, 4, 4, 1, 6, 4, 16>(w, x, y, m, k, stream);
+      case 7: return Launch<T, 7, 4, 4, 1, 7, 4, 16>(w, x, y, m, k, stream);
+      case 8: return Launch<T, 8, 4, 4, 1, 8, 4, 16>(w, x, y, m, k, stream);
+      default: return false;
+    }
+  }
+  return false;
+}
+
+bool LaunchQ6KTarget(const void* w, const float* x, float* y,
+                     std::size_t batch, std::size_t m, std::size_t k,
+                     hipStream_t stream) {
+  constexpr auto T = GgmlType::kQ6_K;
+  if (!Is(m, k, 5120, 6144))  // ssm_out, attn_output
+    return false;
+  switch (batch) {
+    case 2: return Launch<T, 2, 4, 4, 1, 2, 4, 16>(w, x, y, m, k, stream);
+    case 3: return Launch<T, 3, 16, 4, 1, 1, 4>(w, x, y, m, k, stream);
+    case 4: return Launch<T, 4, 4, 4, 1, 4, 4, 16>(w, x, y, m, k, stream);
+    case 5: return Launch<T, 5, 4, 4, 1, 5, 8, 16>(w, x, y, m, k, stream);
+    case 6: return Launch<T, 6, 4, 4, 1, 6, 8, 16>(w, x, y, m, k, stream);
+    case 7: return Launch<T, 7, 4, 4, 1, 7, 8, 16>(w, x, y, m, k, stream);
+    case 8: return Launch<T, 8, 4, 4, 1, 8, 8, 16>(w, x, y, m, k, stream);
+    default: return false;
+  }
+}
+
 // Output head (shared by verification and the draft) and attention V.
 bool LaunchQ6K(const void* w, const float* x, float* y, std::size_t batch,
                std::size_t m, std::size_t k, hipStream_t stream) {
   constexpr auto T = GgmlType::kQ6_K;
+  if (LaunchQ6KTarget(w, x, y, batch, m, k, stream))
+    return true;
   const bool head = Is(m, k, 248320, 5120);
   const bool attn_v = Is(m, k, 1024, 5120);
   const bool ffn_down = Is(m, k, 5120, 17408);  // DFlash2 draft layers
@@ -139,22 +206,32 @@ bool LaunchQ6K(const void* w, const float* x, float* y, std::size_t batch,
       return false;
     case 6:
       if (head) return Launch<T, 6, 16, 4, 1, 6, 4, 16>(w, x, y, m, k, stream);
-      return false;
+      break;
     case 7:
       if (head) return Launch<T, 7, 16, 4, 1, 7, 4, 16>(w, x, y, m, k, stream);
-      return false;
+      break;
     case 8:
       if (head) return Launch<T, 8, 16, 4, 1, 8, 8, 16>(w, x, y, m, k, stream);
-      return false;
+      break;
     default:
       return false;
   }
+  // attn_k/attn_v at 6-8 rows (kb27 sweep 2026-10-23, see LaunchQ6KTarget):
+  // +36-42%; 2-5 rows keep the attn_v shapes above.
+  if (Is(m, k, 1024, 5120)) {
+    if (batch == 6) return Launch<T, 6, 8, 4, 2, 6, 4>(w, x, y, m, k, stream);
+    if (batch == 7) return Launch<T, 7, 8, 4, 2, 7, 4>(w, x, y, m, k, stream);
+    return Launch<T, 8, 8, 4, 2, 8, 4>(w, x, y, m, k, stream);
+  }
+  return false;
 }
 
 // DFlash2 Q4_K_M draft.
 bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
                std::size_t m, std::size_t k, hipStream_t stream) {
   constexpr auto T = GgmlType::kQ4_K;
+  if (LaunchQ4KTarget(w, x, y, batch, m, k, stream))
+    return true;
   const bool ffn_down = Is(m, k, 5120, 17408);
   const bool ffn_gate_up = Is(m, k, 17408, 5120);
   const bool attn_q = Is(m, k, 4096, 5120);

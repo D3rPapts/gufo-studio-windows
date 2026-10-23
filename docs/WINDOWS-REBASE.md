@@ -196,6 +196,33 @@ gufo, passed in `CMAKE_CXX_FLAGS` (llama.cpp compiles HIP as CXX with
 | Long draft-context injections through hipBLASLt BF16 | mikealanni/gufo `ef5b925d` | not applicable, reverted: it only runs when the draft's `fc.weight` is BF16, and in the DFlash2 Q4_K_M draft it is Q4_K, so the path never ran here. (A 147,913-token run with it built in took 444.5 s to first token against 431.1 s in the morning; that difference comes from other changes or noise, not from this commit.) |
 | MTP instead of DFlash2 for Qwen3.8-27B | gufo's own 27B MTP draft, as in mikealanni `7344cfb4` | slower: with `gufo prompt`, greedy, no penalties, 5 cases: DFlash2 + lookup 16.9-20.9 tok/s, MTP 13.6-15.4 tok/s, identical output. The HTTP server does not offer MTP for the 27B |
 
+### Verification projection geometries (2026-10-23)
+
+The cycle profile (`GUFO_QWEN27_PROFILE=2`) put 85% of a short-answer cycle
+in the target verification pass, and the SSM and attention projections there
+read their weights at about 130 GB/s against 165 GB/s for the FFN and 204
+GB/s for the head. The Windows verification geometries
+(`verify_gemm_27b.hip`) covered the Q5_K and IQ4_XS target shapes but not
+the target's Q4_K `attn_qkv`/`attn_gate`/`attn_q` and Q6_K
+`ssm_out`/`attn_output`/`attn_k`, which fell back to the generic dispatch.
+
+A sweep with real UD-Q4_K_XL weights (rotated through >= 512 MiB of copies so
+no run reads from the 32 MB Infinity Cache, nine alternating rounds, median)
+found exact geometries 13-53% faster per projection at 3-8 rows. Every
+candidate was compared bit for bit with the production dispatch; greedy
+end-to-end output hashes are unchanged.
+
+| | before | after |
+| --- | --- | --- |
+| SSM projections per cycle | 28.0 ms | 23.5 ms |
+| attention projections per cycle | 8.8 ms | 7.6 ms |
+| benchmark set, film + thinking | 27.6 tok/s | 29.0 tok/s |
+| benchmark set, short cases | 17.9 tok/s | 18.6 tok/s |
+
+The tuning only reshapes launches of the existing kernel, so it should carry
+to Linux on the same GPU, but it was measured on Windows with TheRock 10.0.0
+only.
+
 MTP notes: Unsloth's 27B GGUFs carry the MTP layer as `blk.64.*` in Q8_0;
 gufo's loader now accepts Q8_0 (and Q5_K), so `--mtp-model` can point at the
 model file itself. The verifier only drafts with MTP for greedy requests
