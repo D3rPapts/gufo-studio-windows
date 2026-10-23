@@ -99,3 +99,86 @@ no repeat penalty) was run again 8 hours later. Same 10 cases:
 Decode and prefill speeds repeat within 5% (most within 2%). Total time does
 not repeat as closely (342.5 s vs 372.0 s) because the sampled thinking runs
 differ in length (1874 vs 2605 tokens for film-think). All answers were valid.
+
+## Everything tried, and what came of it
+
+Columns: decode tok/s averaged over the film + thinking runs; decode tok/s
+averaged over the 7 short cases; prefill tok/s on the 17.5K prompt; total
+time of all cases (thinking cases measured twice count as their mean, so
+every row is the same 10 cases); runs that looped into an endless list or
+produced broken JSON. Totals move by ±10% with how long the model thinks;
+decode and prefill are the reliable numbers.
+
+### gufo
+
+All runs: Qwen3.8-27B UD-Q4_K_XL, DFlash2 Q4_K_M draft, 64K context unless
+noted. `GUFO_QWEN27_LOOKUP=N` enables prompt lookup and caps the DFlash2
+draft at N tokens; `--draft-tokens` then sets the lookup length.
+
+| Run | Change | Think | Short | Prefill | Total | Loops | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline | DFlash2, no prompt lookup | 29.8 | 18.4 | 518 | 446.4 s | 0 | starting point |
+| V1 | `LOOKUP=3`, `--draft-tokens 7` | 28.8 | 19.8 | 525 | 342.5 s | 0 | **works**: prompt lookup pays off on JSON/copy-heavy output |
+| V1 repeat | same, 8 h later | 29.6 | 19.9 | 530 | 360.8 s | 0 | repeatable (see above) |
+| V2b | V1 with the Q8_0 draft | 28.8 | 19.1 | 525 | 380.7 s | 0 | no gain; Q8_0 draft is larger and not more accurate here |
+| V3b | V1 with `--draft-policy fixed` | 30.6 | 19.3 | 525 | 400.1 s | 0 | same as adaptive within noise |
+| V4 | lookup flush every 8 tokens | 27.3 | 18.9 | 528 | 390.3 s | 0 | slower |
+| V5 | lookup append mode | 29.1 | 19.6 | 528 | 394.9 s | 1 | no gain |
+| **V6** | `LOOKUP=4`, `--draft-tokens 7` | **30.5** | 19.0 | 519 | 389.1 s | 0 | **works**: fastest decode on the main case |
+| V7 | `LOOKUP=5` | 28.2 | 18.9 | 525 | 377.9 s | 1 | slower than 4 |
+| V8 | V6 with upstream verify attention (`GUFO_QWEN27_UPSTREAM_ATTN=1`) | 29.7 | 19.1 | 524 | 351.3 s | 0 | equal: the Windows attention is neither faster nor slower here |
+| V9b | V6 with lookup length 10 | 28.9 | 19.6 | 525 | 352.3 s | 0 | no gain |
+| V10b | V6 with a Q4_K_M target | 27.7 | 18.0 | 529 | 466.3 s | 2 | slower; the Windows kernels are tuned for UD-Q4_K_XL |
+| A1 | V6 + `--prefill-chunk 2048` | 30.1 | 19.1 | 512 | 344.2 s | 0 | no effect (it only interleaves prefill with parallel requests) |
+| A2 | V6 + `--repeat-penalty 1.05` | 29.7 | 19.2 | 517 | 349.3 s | 0 | **works**: no loops, same speed, text quality unchanged |
+| **A4 = "V6R"** | A2 repeated | 28.4 | 19.0 | 512 | 331.6 s | 0 | **confirmed, best setting** |
+| A5 | V6R + `--context 32768` | 30.0 | 19.0 | 513 | 364.6 s | 0 | no effect; context size is not a bottleneck |
+
+V2, V3, V9 and V10 were first run with their extra switches silently lost
+(`powershell -File script.ps1 -X 'a','b'` passes the list as one string
+`"a,b"`), so they measured V1/V6 again. They are excluded; V2b, V3b, V9b
+and V10b are the valid reruns, checked against the server's real command line.
+
+Exactness: at temperature 0, gufo's text is byte-identical without
+speculation, with the Q4_K_M draft + lookup and with the Q8_0 draft + lookup
+(11.1 vs 20.2 tok/s).
+
+### llama.cpp
+
+Same workload, same port, same client. Model Qwen3.8-27B Q4_K_M unless noted,
+q8_0 KV cache, flash attention, 64K context.
+
+| Run | Build and change | Think | Short | Prefill | Total | Loops | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | Vulkan (winget b11560) + MTP draft (previous production) | 28.2 | 23.3 | 256 | 487.0 s | 1 | reference |
+| L2 | L1 + `-ub 2048` | 27.8 | 22.5 | 244 | 472.8 s | 2 | no gain |
+| L3 | ROCm build (lemonade b1351) + MTP | 19.8 | 16.5 | 342 | 629.3 s | 2 | **fails**: faster prefill, decode 30% slower |
+| L4 | local HIP + rocWMMA build of upstream (970b51c) + MTP | 24.7 | 19.0 | 334 | 506.2 s | 0 | **fails**: faster prefill, decode 12% slower |
+| L5 | L1 with MTP `n=2` | 25.6 | 22.1 | 257 | 600.1 s | 3 | slower |
+| **L6** | Vulkan + `--spec-type draft-dflash` with the DFlash2 draft | **29.1** | 22.2 | 260 | 447.2 s | 1 | **works**: best llama.cpp decode |
+| L7 | L6 with `n=5` | 28.7 | 19.2 | 260 | 496.1 s | 2 | slower |
+| L8 | L6 with Q4_0 target | 29.3 | 21.6 | 311 | 415.7 s | 0 | faster prefill, but perplexity +7.3% on German/English text (4.15 vs 3.87), +1.4% on English docs: rejected for quality |
+| L9 | L6 with f16 KV cache | 29.9 | 21.4 | 256 | 498.1 s | 2 | no gain |
+| L10 | L6 with the UD-Q4_K_XL target | - | - | - | - | - | **fails**: out of memory; llama.cpp's memory fitting does not count the draft |
+| **A3** | L6 + `--repeat-penalty 1.05` | 28.3 | 20.3 | 257 | 431.1 s | 0 | **works**: best llama.cpp overall |
+
+The local HIP build needed the same `compat/win32/hip_include/cmath` shim as
+gufo, passed in `CMAKE_CXX_FLAGS` (llama.cpp compiles HIP as CXX with
+`-x hip` on Windows). The halo-box fork was not built: it has a known
+wrong-output bug.
+
+### What did not work during the rebase
+
+- Upstream's weight loader on Windows (host-registered copy): filled system
+  RAM and stalled. Replaced, see above.
+- `WSAPoll` with `POLLERR|POLLHUP` in `events`: `WSAEINVAL`. Fixed.
+- Starting gufo from a PowerShell pipe or redirect hangs the caller (gufo
+  inherits the pipe); use `Start-Process` with redirected files.
+- Qwen3.8-27B with thinking can occasionally run past 30K tokens; clients
+  should set `max_tokens` (about 8000 for this workload).
+
+### Not tried
+
+- Windows power mode "Best performance" (the machine ran "Balanced").
+- Flash-Next, DeepSeek and Qwen3.6-35B-A3B performance (need the 128 GB
+  machine).
