@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,6 +20,42 @@
 #endif
 
 namespace gufo::platform {
+#if defined(_WIN32)
+namespace detail {
+
+inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
+                                   std::uintptr_t begin, std::size_t bytes,
+                                   DWORD* error) noexcept {
+  const auto* record = exception->ExceptionRecord;
+  if ((record->ExceptionCode != EXCEPTION_IN_PAGE_ERROR &&
+       record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) ||
+      record->NumberParameters < 2)
+    return EXCEPTION_CONTINUE_SEARCH;
+  const auto address = record->ExceptionInformation[1];
+  if (address < begin || address - begin >= bytes)
+    return EXCEPTION_CONTINUE_SEARCH;
+  *error = record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR ? ERROR_READ_FAULT
+                                                            : ERROR_NOACCESS;
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Keep SEH in a helper with no C++ objects requiring stack unwinding. Faults
+// must be caught on the worker that touches the mapping, before joining it.
+inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
+                              std::size_t page_size) noexcept {
+  DWORD error = ERROR_SUCCESS;
+  __try {
+    const auto* touch = reinterpret_cast<volatile const std::uint8_t*>(begin);
+    for (std::size_t i = 0; i < bytes; i += page_size)
+      static_cast<void>(touch[i]);
+  } __except (PrefaultExceptionFilter(GetExceptionInformation(), begin, bytes,
+                                      &error)) {
+  }
+  return error;
+}
+
+}  // namespace detail
+#endif
 
 /// Populate an existing readable mapping before HIP registration or upload.
 /// Parallel faults expose disk queue depth without making another weight copy.
@@ -40,7 +77,7 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
 #else
   const long page_size = ::sysconf(_SC_PAGESIZE);
 #endif
-  if (!data || page_size == 0)
+  if (!data || page_size <= 0)
     throw std::invalid_argument("invalid mapped weight range");
   const auto address = reinterpret_cast<std::uintptr_t>(data);
   if (bytes > std::numeric_limits<std::uintptr_t>::max() - address)
@@ -59,8 +96,6 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
   // Windows 8+; returns immediately, prefetching into the standby list.
   WIN32_MEMORY_RANGE_ENTRY entry{reinterpret_cast<void*>(begin), bytes};
   PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
-  volatile const std::uint8_t* touch =
-      reinterpret_cast<volatile const std::uint8_t*>(begin);
 #endif
   auto populate = [&] {
     while (failure.load(std::memory_order_relaxed) == 0) {
@@ -70,9 +105,10 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
       const auto offset = index * kChunkBytes;
       const auto span = std::min(kChunkBytes, bytes - offset);
 #if defined(_WIN32)
-      // Confirm the prefetched pages are resident and readable.
-      for (std::size_t i = 0; i < span; i += page_size)
-        static_cast<void>(touch[offset + i]);
+      if (const DWORD error =
+              detail::TouchMappedPages(begin + offset, span, page_size);
+          error != ERROR_SUCCESS)
+        failure.store(static_cast<int>(error), std::memory_order_relaxed);
 #else
       if (::madvise(reinterpret_cast<void*>(begin + offset), span,
                     MADV_POPULATE_READ) != 0)
@@ -87,9 +123,15 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
     populate();
     // Join before a caller can register, upload, or unmap any of these pages.
   }
-  if (const int code = failure.load(); code != 0)
+  if (const int code = failure.load(); code != 0) {
+#if defined(_WIN32)
+    throw std::system_error(code, std::system_category(),
+                            "cannot read mapped weights");
+#else
     throw std::system_error(code, std::generic_category(),
                             "cannot read mapped weights");
+#endif
+  }
 }
 
 }  // namespace gufo::platform

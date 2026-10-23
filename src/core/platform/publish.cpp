@@ -1,6 +1,7 @@
 #include "src/core/platform/publish.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -30,14 +31,14 @@ std::string WindowsErrorText(const char* what) {
 // --- FileLock ---------------------------------------------------------------
 
 FileLock::FileLock(FileLock&& other) noexcept : handle_(other.handle_) {
-  other.handle_ = nullptr;
+  other.handle_ = detail::kInvalidPublicationHandle;
 }
 
 FileLock& FileLock::operator=(FileLock&& other) noexcept {
   if (this != &other) {
     Release();
     handle_ = other.handle_;
-    other.handle_ = nullptr;
+    other.handle_ = detail::kInvalidPublicationHandle;
   }
   return *this;
 }
@@ -47,16 +48,16 @@ FileLock::~FileLock() {
 }
 
 void FileLock::Release() noexcept {
-  if (handle_ == nullptr)
+  if (handle_ == detail::kInvalidPublicationHandle)
     return;
 #if defined(_WIN32)
   HANDLE file = static_cast<HANDLE>(handle_);
   // Byte-range locks are released by closing any handle to the file.
   CloseHandle(file);
 #else
-  ::close(static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_)));
+  ::close(handle_);
 #endif
-  handle_ = nullptr;
+  handle_ = detail::kInvalidPublicationHandle;
 }
 
 FileLock FileLock::Acquire(const std::string& path) {
@@ -83,7 +84,7 @@ FileLock FileLock::Acquire(const std::string& path) {
     ::close(fd);
     throw std::system_error(error, std::generic_category(), "lock file");
   }
-  return FileLock(reinterpret_cast<void*>(static_cast<std::uintptr_t>(fd)));
+  return FileLock(fd);
 #endif
 }
 
@@ -91,7 +92,7 @@ FileLock FileLock::Acquire(const std::string& path) {
 
 AtomicPublishedFile::AtomicPublishedFile(AtomicPublishedFile&& other) noexcept
     : handle_(other.handle_), temporary_(std::move(other.temporary_)) {
-  other.handle_ = nullptr;
+  other.handle_ = detail::kInvalidPublicationHandle;
   other.temporary_.clear();
 }
 
@@ -101,7 +102,7 @@ AtomicPublishedFile& AtomicPublishedFile::operator=(
     Discard();
     handle_ = other.handle_;
     temporary_ = std::move(other.temporary_);
-    other.handle_ = nullptr;
+    other.handle_ = detail::kInvalidPublicationHandle;
     other.temporary_.clear();
   }
   return *this;
@@ -112,13 +113,13 @@ AtomicPublishedFile::~AtomicPublishedFile() {
 }
 
 void AtomicPublishedFile::Discard() noexcept {
-  if (handle_ != nullptr) {
+  if (handle_ != detail::kInvalidPublicationHandle) {
 #if defined(_WIN32)
     CloseHandle(static_cast<HANDLE>(handle_));
 #else
-    ::close(static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_)));
+    ::close(handle_);
 #endif
-    handle_ = nullptr;
+    handle_ = detail::kInvalidPublicationHandle;
   }
   std::error_code ignored;
   if (!temporary_.empty())
@@ -154,8 +155,7 @@ AtomicPublishedFile AtomicPublishedFile::Create(
   const int fd = ::mkstemp(temporary.data());
   if (fd < 0)
     return fail("cannot create temporary file: " + std::to_string(errno));
-  return AtomicPublishedFile(
-      reinterpret_cast<void*>(static_cast<std::uintptr_t>(fd)), temporary);
+  return AtomicPublishedFile(fd, temporary);
 #endif
 }
 
@@ -177,9 +177,7 @@ bool AtomicPublishedFile::Write(const void* data, std::size_t bytes,
       return fail(WindowsErrorText("write temporary file"));
     written += chunk;
 #else
-    const ssize_t count =
-        ::write(static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_)),
-                cursor + written, bytes - written);
+    const ssize_t count = ::write(handle_, cursor + written, bytes - written);
     if (count < 0 && errno == EINTR)
       continue;
     if (count <= 0)
@@ -204,7 +202,7 @@ bool AtomicPublishedFile::Commit(const std::filesystem::path& final_path,
   const std::string source = temporary_.string();
   // Release the handle without deleting so the replace can proceed.
   CloseHandle(static_cast<HANDLE>(handle_));
-  handle_ = nullptr;
+  handle_ = detail::kInvalidPublicationHandle;
   temporary_.clear();
   if (!MoveFileExA(source.c_str(), final_path.string().c_str(),
                    MOVEFILE_REPLACE_EXISTING)) {
@@ -214,7 +212,7 @@ bool AtomicPublishedFile::Commit(const std::filesystem::path& final_path,
   }
   return true;
 #else
-  const int fd = static_cast<int>(reinterpret_cast<std::uintptr_t>(handle_));
+  const int fd = handle_;
   if (::fsync(fd) != 0)
     return fail("cannot flush temporary file: " + std::to_string(errno));
   std::error_code rename_error;
@@ -223,16 +221,21 @@ bool AtomicPublishedFile::Commit(const std::filesystem::path& final_path,
     return fail("cannot replace file");
   // Persist the rename itself.
   temporary_.clear();
-  handle_ = nullptr;
+  handle_ = detail::kInvalidPublicationHandle;
   ::close(fd);
-  if (const auto parent = final_path.parent_path(); !parent.empty()) {
-    const int directory =
-        ::open(parent.string().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory >= 0) {
-      (void)::fsync(directory);
-      ::close(directory);
-    }
-  }
+  const auto parent = final_path.has_parent_path() ? final_path.parent_path()
+                                                   : std::filesystem::path(".");
+  const int directory =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0)
+    return fail("file replaced, but cannot open containing directory: " +
+                std::to_string(errno));
+  const int result = ::fsync(directory);
+  const int directory_error = errno;
+  ::close(directory);
+  if (result != 0)
+    return fail("file replaced, but cannot flush containing directory: " +
+                std::to_string(directory_error));
   return true;
 #endif
 }
