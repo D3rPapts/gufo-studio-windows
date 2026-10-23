@@ -193,7 +193,7 @@ void PrepareVision(
   }
   const auto uploaded = Clock::now();
   std::size_t heap_free = 0, heap_total = 0;
-  (void)hipMemGetInfo(&heap_free, &heap_total);
+  (void)gufo::platform::DeviceMemoryInfo(&heap_free, &heap_total);
   using Milliseconds = std::chrono::duration<double, std::milli>;
   Logger::Info("loader",
                "event=vision_prepared resident_bytes=" +
@@ -912,14 +912,19 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               // Pinned host pages come out of the same device heap that
               // session and scratch allocations draw on; keep its dispatch
               // reserve so they do not fall back to managed memory.
+              // hipMemGetInfo double-counts memory beyond the carve-out on
+              // Windows; DeviceMemoryInfo asks the WDDM budget there.
               std::size_t heap_free = 0, heap_total = 0;
               const bool heap_fits =
-                  hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+                  gufo::platform::DeviceMemoryInfo(&heap_free, &heap_total) ==
+                      hipSuccess &&
                   hip::HeapFitsAboveReserve(heap_free, bytes);
               if (ceiling >= bytes && heap_fits) {
                 limited->active = false;
                 return true;
               }
+              std::size_t hip_free = 0, hip_total = 0;
+              (void)hipMemGetInfo(&hip_free, &hip_total);
               if (!limited->active)
                 Logger::Warn(
                     "cache",
@@ -929,7 +934,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                                               : "device_heap_reserve ") +
                         "segment_bytes=" + std::to_string(bytes) +
                         " host_headroom_bytes=" + std::to_string(ceiling) +
-                        " device_heap_free_bytes=" + std::to_string(heap_free));
+                        " device_heap_free_bytes=" + std::to_string(heap_free) +
+                        " hip_reported_free_bytes=" + std::to_string(hip_free));
               limited->active = true;
               limited->refused = now;
               return false;
