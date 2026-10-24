@@ -375,6 +375,58 @@ void TestCancellationClosesUpstream() {
       WaitUntil([&closed] { return closed->load(); }, std::chrono::seconds(2)));
 }
 
+void TestSlowHeadAcrossPollSlices() {
+  // `gufo serve` sends a non-streamed reply's status line only once the
+  // reply is complete. A head that arrives after several poll slices (and,
+  // in production, after minutes) must still be relayed, not answered 502.
+  FakeWorker fake([](int fd) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    const std::string body = "late";
+    SendAll(fd,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body);
+  });
+
+  const UpstreamTarget target{"127.0.0.1", fake.port()};
+  const HttpResponse response =
+      ProxyToWorker(target, MakeRequest("POST", "/v1/chat/completions", "{}"));
+  assert(response.status == 200);
+  assert(Drain(response) == "late");
+}
+
+void TestCancelWhileAwaitingHead() {
+  // A client that leaves while the worker is still generating ends the wait
+  // within about one poll slice and closes the upstream connection, so the
+  // worker can cancel its request.
+  auto closed = std::make_shared<std::atomic<bool>>(false);
+  FakeWorker fake([closed](int fd) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    char buffer[64];
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto count = ::recv(fd, buffer, sizeof(buffer), 0);
+      if (count == 0) {
+        closed->store(true);
+        return;
+      }
+    }
+  });
+
+  auto request = MakeRequest("POST", "/v1/chat/completions", "{}");
+  const auto started = std::chrono::steady_clock::now();
+  request.is_cancelled = [started] {
+    return std::chrono::steady_clock::now() - started >
+           std::chrono::milliseconds(300);
+  };
+  const UpstreamTarget target{"127.0.0.1", fake.port()};
+  const HttpResponse response = ProxyToWorker(target, request);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  assert(response.status == 502);
+  assert(elapsed < std::chrono::milliseconds(2500));
+  assert(
+      WaitUntil([&closed] { return closed->load(); }, std::chrono::seconds(2)));
+}
+
 void TestWorkerEofMidBody() {
   FakeWorker fake([](int fd) {
     SendAll(fd,
@@ -421,6 +473,8 @@ int main() {
   TestSsePassthrough();
   TestConnectRefused();
   TestCancellationClosesUpstream();
+  TestSlowHeadAcrossPollSlices();
+  TestCancelWhileAwaitingHead();
   TestWorkerEofMidBody();
   TestCorruptChunkSizeEndsStreaming();
   std::cout << "All router proxy tests passed.\n";
