@@ -993,9 +993,11 @@ Executor::~Executor() {
     (void)hipEventDestroy(counts_ready_);
   }
   if (alt_stream_ != nullptr) {
+    qfn_mmq_release_stream(alt_stream_);
     (void)hipStreamDestroy(alt_stream_);
   }
   if (primary_stream_ != nullptr) {
+    qfn_mmq_release_stream(primary_stream_);
     (void)hipStreamDestroy(primary_stream_);
   }
 }

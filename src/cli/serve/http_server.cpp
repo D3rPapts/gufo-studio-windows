@@ -38,6 +38,8 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/embedding_service.hpp"
+#include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -51,6 +53,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
+#include "src/core/platform/shutdown_signal.hpp"
 #include "src/core/platform/socket.hpp"
 #include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -70,30 +73,14 @@ void RequestShutdown(int signal) noexcept {
 class ShutdownSignals {
 public:
   ShutdownSignals() {
+    // Reset before installation: a signal landing between the previous
+    // guard's uninstall and this store must not be erased afterwards.
     shutdown_signal.store(0, std::memory_order_relaxed);
-    struct sigaction action{};
-    action.sa_handler = RequestShutdown;
-    ::sigemptyset(&action.sa_mask);
-    if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0)
-      throw std::system_error(errno, std::generic_category(),
-                              "install SIGINT handler");
-    if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
-      const int error = errno;
-      (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-      throw std::system_error(error, std::generic_category(),
-                              "install SIGTERM handler");
-    }
+    guard_ = platform::ShutdownSignalGuard(&RequestShutdown);
   }
-  ~ShutdownSignals() {
-    (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
-    (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
-  }
-  ShutdownSignals(const ShutdownSignals&) = delete;
-  ShutdownSignals& operator=(const ShutdownSignals&) = delete;
 
 private:
-  struct sigaction previous_interrupt_{};
-  struct sigaction previous_terminate_{};
+  platform::ShutdownSignalGuard guard_;
 };
 
 // ---------------------------------------------------------------------------
@@ -789,7 +776,8 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images,
+                        const EmbeddingService* embeddings) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -857,6 +845,15 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["created"] = Now();
     model["owned_by"] = "operator-supplied-qwen";
     model["capability"] = "image";
+    data.push_back(std::move(model));
+  }
+  if (embeddings != nullptr && embeddings->ready()) {
+    json::Value model = json::Value::object();
+    model["id"] = embeddings->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-gemma";
+    model["capability"] = "embedding";
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -1801,7 +1798,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TtsService> tts,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
-                       std::shared_ptr<ImageService> images)
+                       std::shared_ptr<ImageService> images,
+                       std::shared_ptr<EmbeddingService> embeddings)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1809,6 +1807,7 @@ HttpServer::HttpServer(std::string host, int port,
       tts_(std::move(tts)),
       asr_(std::move(asr)),
       images_(std::move(images)),
+      embeddings_(std::move(embeddings)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
@@ -1882,7 +1881,7 @@ bool HttpServer::start(std::string* error) {
     }
     return false;
   }
-  (void)::signal(SIGPIPE, SIG_IGN);
+  platform::IgnoreSocketPipeSignal();
   listen_fd_ = ::socket(addr.ss_family, SOCK_STREAM, 0);
   if (listen_fd_ < 0) {
     if (error != nullptr)
@@ -1973,6 +1972,7 @@ void HttpServer::run(bool handle_signals) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
         stop();
+        platform::NotifyShutdownHandled();
         break;
       }
     }
@@ -2100,7 +2100,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||
-                       (asr_ != nullptr && asr_->ready()) || images_ != nullptr;
+                       (asr_ != nullptr && asr_->ready()) ||
+                       (embeddings_ != nullptr && embeddings_->ready()) ||
+                       images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2113,6 +2115,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = asr_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
+    } else if (embeddings_ != nullptr && embeddings_->ready()) {
+      body["model"] = embeddings_->model_id();
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
@@ -2123,7 +2127,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), embeddings_.get());
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2167,6 +2171,23 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     }
     return HandleAudioAsrApiRequest(req, *asr_);
   }
+  // Handled before the route table. An embedding-only server has no text
+  // backend, and the stub route below must not shadow the service when a
+  // backend exists.
+  if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path)) {
+    if (device_lost())
+      return DeviceLost();
+    if (!embeddings_->ready()) {
+      return Err(503, "Service Unavailable",
+                 "EmbeddingGemma 2 service is not ready", "server_error",
+                 "embedding_service_unavailable");
+    }
+    auto response = HandleEmbeddingsApiRequest(req, *embeddings_);
+    // The request that finds the device lost runs the shutdown hook.
+    if (device_lost())
+      return DeviceLost();
+    return response;
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2179,7 +2200,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 bool HttpServer::device_lost() {
-  if (backend_ == nullptr || !backend_->device_lost())
+  const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
+                    (embeddings_ != nullptr && embeddings_->device_lost());
+  if (!lost)
     return false;
   if (options_.on_device_lost &&
       !device_lost_reported_.exchange(true, std::memory_order_acq_rel)) {
