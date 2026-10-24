@@ -24,6 +24,7 @@ class TtsService;
 class AsrService;
 class ImageService;
 class EmbeddingService;
+class OmniService;
 class WebSocket;
 
 struct HttpRequest {
@@ -134,6 +135,9 @@ public:
 
   void add(const std::string& method, const std::string& path, Handler handler);
 
+  /// Serves the Qwen3-Omni captioner; call before start().
+  void set_omni(std::shared_ptr<OmniService> omni) { omni_ = std::move(omni); }
+
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
 
@@ -168,6 +172,7 @@ private:
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
+  std::shared_ptr<OmniService> omni_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

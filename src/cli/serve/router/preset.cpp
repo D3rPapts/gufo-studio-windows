@@ -11,7 +11,8 @@ namespace gufo::router {
 namespace {
 
 constexpr std::string_view kModalities[] = {"llm", "video", "image", "tts",
-                                            "asr", "embedding", "external"};
+                                            "asr", "embedding", "omni",
+                                            "external"};
 
 bool IsKnownModality(std::string_view modality) {
   for (const auto candidate : kModalities) {

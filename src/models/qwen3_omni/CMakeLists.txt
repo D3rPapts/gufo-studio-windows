@@ -7,6 +7,7 @@ if (NOT ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_qwen3_omni STATIC EXCLUDE_FROM_ALL
+  captioner.cpp
   model.cpp
   reference.cpp
   hip/audio_encoder.cpp
@@ -28,3 +29,11 @@ set_target_properties(gufo-omni PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 target_compile_options(gufo-omni PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O2>)
 target_link_libraries(gufo-omni PRIVATE gufo_qwen3_omni)
+
+# `gufo serve omni`: the captioner inside the main binary, which already
+# carries DeepSeek's definition of the MMQ host hook.
+option(GUFO_WITH_OMNI "Serve Qwen3-Omni-30B-A3B-Captioner from gufo" ON)
+if (GUFO_WITH_OMNI)
+  target_link_libraries(gufo PRIVATE gufo_qwen3_omni)
+  target_compile_definitions(gufo PRIVATE GUFO_HAVE_QWEN3_OMNI=1)
+endif()
