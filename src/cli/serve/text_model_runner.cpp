@@ -969,21 +969,22 @@ struct TextRunnerPool::Request::Impl {
   // take the disk spacing allowance of the complete turn, and it gives way
   // first under memory pressure. Like a grid point it must add a whole
   // interval to the reused prefix. As for a shared checkpoint, a planned
-  // capture or the prompt end this close makes prefilling the gap cheaper
-  // than another copy of the state.
+  // capture just before it makes prefilling the gap cheaper than another
+  // copy of the state. Captures after it hold the question, which the next
+  // request replaces, so they never make it redundant, however short the
+  // question is.
   void PlanInstructionsCheckpoint(std::size_t position) {
     constexpr std::size_t interval = 2048;
     constexpr auto slack = TextRunnerPool::Request::kSharedCheckpointSlack;
     if (position <= prefill_offset || position - prefill_offset < interval ||
-        position >= prompt.size() || prompt.size() - position <= slack)
+        position >= prompt.size())
       return;
     const auto capabilities = runner->Descriptor().capabilities;
     if (!capabilities.incremental_prefill || !capabilities.prefix_reuse ||
         !capabilities.snapshot || !capabilities.fork)
       return;
     const auto near = [&](std::size_t planned) {
-      return planned != 0 && (planned > position ? planned - position
-                                                 : position - planned) <= slack;
+      return planned != 0 && planned <= position && position - planned <= slack;
     };
     if (near(snapshot_tokens.size()) || near(stable_prefix_position) ||
         std::ranges::any_of(checkpoints, near) ||

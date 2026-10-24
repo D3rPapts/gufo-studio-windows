@@ -1462,17 +1462,22 @@ void TestInstructionsCheckpointServesANewQuestion() {
     return cached;
   };
 
-  for (const bool instructions : {false, true}) {
+  // A short question too: captures after the instructions hold the question.
+  for (const auto [instructions, question] :
+       {std::pair<bool, std::size_t>{false, 200},
+        {true, 200},
+        {false, 15},
+        {true, 15}}) {
     auto stats = std::make_shared<FakeStats>();
     TextRunnerPool pool(
         std::make_shared<LongSnapshotRunner>(stats, 64, 256, 4096), 1);
-    const auto first = ask(5000, 200, 2);
+    const auto first = ask(5000, question, 2);
     (void)run(pool, first, instructions ? 5000 : 0);
     const auto captures = stats->snapshot_captures;
     Expect(run(pool, first, instructions ? 5000 : 0) == first.size() &&
                stats->snapshot_captures == captures,
            "an unchanged retry still reuses the complete prompt");
-    const auto second = ask(5000, 200, 3);
+    const auto second = ask(5000, question, 3);
     Expect(run(pool, second, instructions ? 5000 : 0) ==
                (instructions ? 5000u : 4096u),
            instructions
@@ -1480,10 +1485,10 @@ void TestInstructionsCheckpointServesANewQuestion() {
                : "without the boundary a new question restores a grid point");
   }
 
-  // Short instructions, or a question this close to the prompt end, keep no
+  // Short instructions, or a grid checkpoint just before their end, keep no
   // extra copy: prefilling the gap costs less.
   for (const auto [instructions, question] :
-       {std::pair<std::size_t, std::size_t>{1500, 200}, {5000, 40}}) {
+       {std::pair<std::size_t, std::size_t>{1500, 200}, {4100, 200}}) {
     std::size_t captures[2]{};
     for (const bool boundary : {false, true}) {
       auto stats = std::make_shared<FakeStats>();
