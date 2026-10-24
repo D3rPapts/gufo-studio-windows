@@ -91,7 +91,7 @@ NgramTable::~NgramTable() {
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, const std::string& source_path,
+    int file_descriptor, const std::filesystem::path& source_path,
     std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
     core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
@@ -122,13 +122,13 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   // The handle must be asynchronous: ReadFile with a non-null OVERLAPPED on
   // a synchronous handle is undefined, and the worker pool relies on
   // concurrent in-flight reads.
-  HANDLE overlapped = CreateFileA(
-      source_path.c_str(), GENERIC_READ,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+  HANDLE overlapped =
+      CreateFileW(source_path.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
   if (overlapped == INVALID_HANDLE_VALUE) {
     if (error_msg != nullptr) {
-      *error_msg = "cannot open bound n-gram table: " + source_path;
+      *error_msg = "cannot open bound n-gram table: " + source_path.string();
     }
     return nullptr;
   }
@@ -363,9 +363,9 @@ void NgramTable::Worker() {
           base_offset_ + std::uint64_t{batch[i].row} * row_bytes_;
       p.offset = offset;
       p.begin = direct_ ? offset & ~std::uint64_t(kPage - 1) : offset;
-      const std::uint64_t end =
-          direct_ ? (offset + row_bytes_ + kPage - 1) & ~std::uint64_t(kPage - 1)
-                  : offset + row_bytes_;
+      const std::uint64_t end = direct_ ? (offset + row_bytes_ + kPage - 1) &
+                                              ~std::uint64_t(kPage - 1)
+                                        : offset + row_bytes_;
       p.length = static_cast<std::size_t>(end - p.begin);
       p.needed = static_cast<std::size_t>(offset - p.begin) + row_bytes_;
       p.row = batch[i].row;
@@ -377,9 +377,9 @@ void NgramTable::Worker() {
       p.overlapped.OffsetHigh = static_cast<DWORD>(p.begin >> 32);
       p.overlapped.hEvent = p.event;
       ResetEvent(p.event);
-      const BOOL submitted = ReadFile(static_cast<HANDLE>(file_handle_), p.base,
-                                      static_cast<DWORD>(p.length), nullptr,
-                                      &p.overlapped);
+      const BOOL submitted =
+          ReadFile(static_cast<HANDLE>(file_handle_), p.base,
+                   static_cast<DWORD>(p.length), nullptr, &p.overlapped);
       if (submitted || GetLastError() == ERROR_IO_PENDING) {
         ++live;
       } else {
