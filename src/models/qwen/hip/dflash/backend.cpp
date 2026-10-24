@@ -461,13 +461,15 @@ std::optional<speculative::DraftProposal> QwenDFlashGpuDraftBackend::TryLookup(
       controller_.State() <
       std::min(3.0F, static_cast<float>(config_.max_draft_tokens));
   const auto minimum =
-      !sampled && weak_neural ? Lookup::kMinMatch : Lookup::kSampledMinMatch;
+      !sampled && weak_neural
+          ? Lookup::kMinMatch
+          : qwen27::LookupStrictMinMatch(Lookup::kSampledMinMatch);
   const auto state = lookup_.Save();
   if (state.resume == Lookup::kNoState &&
       tokens.size() - state.request_start < minimum)
     return std::nullopt;
   const auto committed = tokens.first(position);
-  lookup_.Extend(committed, sampled);
+  lookup_.Extend(committed, sampled && !qwen27::LookupIndexesGenerated());
   const auto cap = std::min(limit, config_.max_draft_tokens);
   const auto match =
       lookup_.Find(committed, tokens.last(1), minimum, [&](std::size_t start) {
