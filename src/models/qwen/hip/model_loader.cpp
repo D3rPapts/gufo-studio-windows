@@ -2,6 +2,7 @@
 #include <sys/mman.h>
 #ifdef _WIN32
 #include <fcntl.h>
+#include <io.h>
 #include <unistd.h>
 #endif
 
@@ -155,8 +156,13 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
                          .size = source.size};
     (void)hipMemset(static_cast<std::uint8_t*>(device) + source.size, 0,
                     kTailMargin);
-    const auto path = "/proc/self/fd/" + std::to_string(source.file_descriptor);
-    fds[i] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
+    // The mapping hands out a HANDLE; the shim reopens CRT descriptors.
+    const int borrowed = platform::CrtDescriptorOf(source.file_descriptor);
+    if (borrowed >= 0) {
+      const auto path = "/proc/self/fd/" + std::to_string(borrowed);
+      fds[i] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
+      (void)::_close(borrowed);
+    }
     if (fds[i] < 0) {
       fail("cannot reopen GGUF shard " + std::to_string(i) + ": " +
            std::strerror(errno));
@@ -248,7 +254,7 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
   }
 #ifdef _WIN32
   if (std::ranges::all_of(source_regions, [](const auto& region) {
-        return region.file_descriptor >= 0;
+        return platform::FileValid(region.file_descriptor);
       })) {
     return UploadDeviceRegions(source_regions, weight_regions, error_msg);
   }

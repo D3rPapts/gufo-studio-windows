@@ -734,7 +734,12 @@ static const char *hip_model_range_ptr_from_fd(
         const gufo::core::GgufMappedRegion region{
             .data = model_map,
             .size = static_cast<size_t>(g_model_registered_size),
+#ifdef _WIN32
+            // The region carries a HANDLE; g_model_fd is a CRT descriptor.
+            .file_descriptor = reinterpret_cast<void *>(_get_osfhandle(g_model_fd)),
+#else
             .file_descriptor = g_model_fd,
+#endif
         };
         g_model_uploader = gufo::hip::WeightUpload::Create({&region, 1}, &error);
     }

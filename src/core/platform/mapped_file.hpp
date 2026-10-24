@@ -9,6 +9,20 @@
 
 namespace gufo::platform {
 
+/// Positional-read file handle: int fd on POSIX, HANDLE on Windows.
+#if defined(_WIN32)
+using PlatformFile = void*;
+#else
+using PlatformFile = int;
+#endif
+
+/// The invalid PlatformFile value.
+#if defined(_WIN32)
+inline constexpr PlatformFile kInvalidFile = nullptr;
+#else
+inline constexpr PlatformFile kInvalidFile = -1;
+#endif
+
 /// Access hint for a mapping. kSequential tells the OS the mapping is read
 /// front to back once; kNone leaves the access pattern to the OS.
 enum class MapHint { kNone, kSequential };
@@ -36,11 +50,9 @@ public:
   std::size_t size() const noexcept { return size_; }
   bool valid() const noexcept { return data_ != nullptr; }
 
-  /// Borrowed file descriptor backing the mapping, -1 for an empty view.
-  /// On Windows a CRT descriptor of the same file, which the compat layer
-  /// reopens through "/proc/self/fd/N". Valid for the lifetime of this
-  /// object.
-  int PlatformDescriptor() const noexcept;
+  /// Borrowed file handle backing the mapping; invalid for an empty view.
+  /// Valid for the lifetime of this object.
+  PlatformFile PlatformHandle() const noexcept;
 
   void Close() noexcept;
 
@@ -52,7 +64,6 @@ private:
 #if defined(_WIN32)
   void* handle_ = nullptr;   // HANDLE of the file
   void* mapping_ = nullptr;  // HANDLE of the section
-  int crt_fd_ = -1;          // CRT descriptor of a duplicate file handle
 #else
   int fd_ = -1;
 #endif
@@ -90,13 +101,6 @@ struct RawMappedFile {
 /// OS page size, never zero.
 std::size_t SystemPageSize() noexcept;
 
-/// Positional-read file handle: int fd on POSIX, HANDLE on Windows.
-#if defined(_WIN32)
-using PlatformFile = void*;
-#else
-using PlatformFile = int;
-#endif
-
 /// Opens `path` read-only; check FileValid() before use. On failure,
 /// `error` (when given) receives the reason.
 PlatformFile OpenReadFile(const std::filesystem::path& path,
@@ -108,6 +112,24 @@ std::size_t ReadFileAt(PlatformFile file, void* output, std::size_t bytes,
                        std::uint64_t offset) noexcept;
 /// Total file size, or nullopt when it cannot be determined.
 std::optional<std::uint64_t> FileSizeBytes(PlatformFile file) noexcept;
+
+/// Duplicates the handle of `file` without re-resolving any path. POSIX
+/// shares the open file description; Windows shares the file object. Returns
+/// kInvalidFile on failure.
+PlatformFile DuplicateFile(PlatformFile file) noexcept;
+
+/// Reopens `file` with unbuffered (direct) I/O, creating an independent
+/// description from the retained handle without resolving the original,
+/// replaceable pathname. Returns kInvalidFile when direct I/O is unavailable;
+/// callers then fall back to buffered reads.
+PlatformFile ReopenUnbuffered(PlatformFile file) noexcept;
+
+#if defined(_WIN32)
+/// A CRT descriptor of its own for ile (a duplicated handle), or -1; the
+/// caller closes it with _close. Lets POSIX-style loaders on the compat layer
+/// reopen the file through "/proc/self/fd/N".
+int CrtDescriptorOf(PlatformFile file) noexcept;
+#endif
 
 }  // namespace gufo::platform
 

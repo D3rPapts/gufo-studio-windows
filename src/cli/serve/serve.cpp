@@ -554,7 +554,7 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
     ArgParser parser(std::string(program_name) + " serve embedding",
-                     "Serve EmbeddingGemma 2 text embeddings.");
+                     "Serve EmbeddingGemma 2 text and image embeddings.");
     AddEmbeddingOptions(parser, &model, &name);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
@@ -654,8 +654,9 @@ void PrintServeHelp(std::string_view program_name,
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
     parser.AddOption("", "--served-model-name", "ID",
-                     "Model identifier exposed by the OpenAI API", "Model",
-                     &served_model_name);
+                     "Model identifier exposed by the OpenAI API (repeatable; "
+                     "the first is primary)",
+                     "Model", &served_model_name);
     parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
@@ -812,7 +813,7 @@ void PrintServeHelp(std::string_view program_name,
       << "  tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n"
       << "  asr       Serve Qwen3-ASR transcription "
          "(/v1/audio/transcriptions)\n"
-      << "  embedding Serve EmbeddingGemma 2 text embeddings "
+      << "  embedding Serve EmbeddingGemma 2 text and image embeddings "
          "(/v1/embeddings)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
@@ -1005,7 +1006,7 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
     ArgParser parser("gufo serve embedding",
-                     "Serve EmbeddingGemma 2 text embeddings.");
+                     "Serve EmbeddingGemma 2 text and image embeddings.");
     AddEmbeddingOptions(parser, &model, &name);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
@@ -1228,7 +1229,7 @@ int RunServe(std::span<const char* const> args) {
   } else {
     // Default to LLM server
     std::string model;
-    std::string served_model_name;
+    std::vector<std::string> served_model_names;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -1277,9 +1278,22 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
-    llm_parser.AddOption("", "--served-model-name", "ID",
-                         "Model identifier exposed by the OpenAI API", "Model",
-                         &served_model_name);
+    llm_parser.AddCustomOption(
+        "", "--served-model-name", "ID",
+        "Model identifier exposed by the OpenAI API (repeatable; the first "
+        "is primary)",
+        "Model",
+        [&served_model_names](std::string_view, std::string_view value,
+                              std::string* err) {
+          if (std::ranges::find(served_model_names, value) !=
+              served_model_names.end()) {
+            *err = "duplicate --served-model-name";
+            return false;
+          }
+          if (!value.empty())
+            served_model_names.emplace_back(value);
+          return true;
+        });
     llm_parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
@@ -1589,7 +1603,7 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
-    backend->set_model_id(served_model_name);
+    backend->set_model_ids(std::move(served_model_names));
     // As `gufo --version` prints it; CMake defines both for this target.
     backend->set_served_artifact(model,
                                  GUFO_RELEASE_VERSION " (" GUFO_REVISION ")");
@@ -1631,12 +1645,19 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
             : "off";
+    std::string served_names;
+    if (const auto ids = backend->model_ids(); ids.size() > 1) {
+      served_names = " served_names=" + ids.front();
+      for (std::size_t i = 1; i < ids.size(); ++i)
+        served_names += "," + ids[i];
+    }
     load_log.Complete(
         "model=" + backend->model_id() +
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
+        served_names);
   }
 
   // run() joins every request thread, so no hook call outlives it.

@@ -8,9 +8,9 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-
 #include <fcntl.h>
 #include <io.h>
+#include <cstdint>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -45,8 +45,7 @@ ReadOnlyMappedFile::ReadOnlyMappedFile(ReadOnlyMappedFile&& other) noexcept
       size_(other.size_),
 #if defined(_WIN32)
       handle_(other.handle_),
-      mapping_(other.mapping_),
-      crt_fd_(other.crt_fd_)
+      mapping_(other.mapping_)
 #else
       fd_(other.fd_)
 #endif
@@ -63,7 +62,6 @@ ReadOnlyMappedFile& ReadOnlyMappedFile::operator=(
 #if defined(_WIN32)
     handle_ = other.handle_;
     mapping_ = other.mapping_;
-    crt_fd_ = other.crt_fd_;
 #else
     fd_ = other.fd_;
 #endif
@@ -76,9 +74,9 @@ ReadOnlyMappedFile::~ReadOnlyMappedFile() {
   Close();
 }
 
-int ReadOnlyMappedFile::PlatformDescriptor() const noexcept {
+PlatformFile ReadOnlyMappedFile::PlatformHandle() const noexcept {
 #if defined(_WIN32)
-  return crt_fd_;
+  return handle_;
 #else
   return fd_;
 #endif
@@ -90,7 +88,6 @@ void ReadOnlyMappedFile::Reset() noexcept {
 #if defined(_WIN32)
   handle_ = nullptr;
   mapping_ = nullptr;
-  crt_fd_ = -1;
 #else
   fd_ = -1;
 #endif
@@ -104,8 +101,6 @@ void ReadOnlyMappedFile::Close() noexcept {
     CloseHandle(static_cast<HANDLE>(mapping_));
   if (handle_ != nullptr)
     CloseHandle(static_cast<HANDLE>(handle_));
-  if (crt_fd_ >= 0)
-    _close(crt_fd_);
 #else
   if (data_ != nullptr)
     munmap(const_cast<std::uint8_t*>(data_), size_);
@@ -155,16 +150,6 @@ ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::filesystem::path& path,
   result.size_ = static_cast<std::size_t>(file_size.QuadPart);
   result.handle_ = file;
   result.mapping_ = mapping;
-  // A descriptor for the loaders that read shards without the mapping. Best
-  // effort: without one they fall back to the mapped bytes.
-  HANDLE duplicate = nullptr;
-  if (DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(),
-                      &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-    result.crt_fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(duplicate),
-                                     _O_RDONLY | _O_BINARY);
-    if (result.crt_fd_ < 0)
-      CloseHandle(duplicate);
-  }
   return result;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -455,6 +440,51 @@ std::optional<std::uint64_t> FileSizeBytes(PlatformFile file) noexcept {
   if (::fstat(file, &status) != 0 || status.st_size < 0)
     return std::nullopt;
   return static_cast<std::uint64_t>(status.st_size);
+#endif
+}
+
+PlatformFile DuplicateFile(PlatformFile file) noexcept {
+  if (!FileValid(file))
+    return kInvalidFile;
+#if defined(_WIN32)
+  HANDLE copy = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(file),
+                       GetCurrentProcess(), &copy, 0, FALSE,
+                       DUPLICATE_SAME_ACCESS))
+    return kInvalidFile;
+  return copy;
+#else
+  return ::fcntl(file, F_DUPFD_CLOEXEC, 0);
+#endif
+}
+
+#if defined(_WIN32)
+int CrtDescriptorOf(PlatformFile file) noexcept {
+  const PlatformFile copy = DuplicateFile(file);
+  if (!FileValid(copy))
+    return -1;
+  const int fd =
+      ::_open_osfhandle(reinterpret_cast<std::intptr_t>(copy), _O_RDONLY);
+  if (fd < 0)
+    CloseFile(copy);
+  return fd;
+}
+#endif
+
+PlatformFile ReopenUnbuffered(PlatformFile file) noexcept {
+  if (!FileValid(file))
+    return kInvalidFile;
+#if defined(_WIN32)
+  // ReOpenFile fails when the desired share mode conflicts with the original
+  // open; callers fall back to buffered I/O.
+  HANDLE reopened = ReOpenFile(static_cast<HANDLE>(file), GENERIC_READ,
+                               FILE_SHARE_READ, FILE_FLAG_NO_BUFFERING);
+  return reopened == INVALID_HANDLE_VALUE ? kInvalidFile : reopened;
+#else
+  // Reopening the retained descriptor creates an independent O_DIRECT file
+  // description without resolving the original, replaceable pathname.
+  const auto path = "/proc/self/fd/" + std::to_string(file);
+  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
 #endif
 }
 

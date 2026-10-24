@@ -8,6 +8,9 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
@@ -126,9 +129,18 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
-    m->ngram_ = NgramTable::Open(
-        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, error_msg);
+    const auto file = m->reader_->GetMappedRegions()[t.shard].file_descriptor;
+#ifdef _WIN32
+    // NgramTable borrows a POSIX descriptor and reopens its own.
+    const int borrowed = platform::CrtDescriptorOf(file);
+    m->ngram_ = NgramTable::Open(borrowed, t.file_offset, t.rows,
+                                 c.ple_head_dim, t.type, error_msg);
+    if (borrowed >= 0)
+      (void)::_close(borrowed);
+#else
+    m->ngram_ = NgramTable::Open(file, t.file_offset, t.rows, c.ple_head_dim,
+                                 t.type, error_msg);
+#endif
     if (!m->ngram_) {
       return nullptr;
     }

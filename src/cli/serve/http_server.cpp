@@ -670,6 +670,15 @@ struct CompatibilityAllowances {
   bool tools{false};
 };
 
+// The served name a validated request selected; responses echo it. A request
+// without one is answered under the primary name.
+std::string RequestedModel(const json::Value& body,
+                           const TextGenerationBackend& backend) {
+  const auto* model = body.find("model");
+  return model != nullptr && model->is_string() ? model->str()
+                                                : backend.model_id();
+}
+
 // Validate the text subset before dispatch so a client never gets an answer
 // to a different request. Responses also supports streamed output.
 std::optional<HttpResponse> ReadCompatibilityOptions(
@@ -682,7 +691,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
+    if (!backend.serves_model(model->str()))
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -781,9 +790,10 @@ HttpResponse ListModels(TextGenerationBackend* backend,
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
-  if (backend != nullptr) {
+  for (const auto& id :
+       backend != nullptr ? backend->model_ids() : std::vector<std::string>{}) {
     json::Value model = json::Value::object();
-    model["id"] = backend->model_id();
+    model["id"] = id;
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
@@ -937,7 +947,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       req.client_id, stop_sequences, return_progress, cache_prompt);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
-  const std::string model = b.model_id();
+  const std::string model = RequestedModel(body, b);
   if (stream) {
     auto stream_log = std::make_shared<HttpResponse::StreamLog>();
     return {
@@ -1142,7 +1152,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1287,7 +1298,8 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1788,6 +1800,10 @@ std::string HttpRequest::query_param(const std::string& key) const {
 
 struct HttpServer::ConnectionWorker {
   int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
+  // Set after the final response is written. The server reads nothing more,
+  // so the connection only logs and closes and no longer counts toward the
+  // limit.
+  std::atomic<bool> response_sent{false};
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -2010,12 +2026,16 @@ void HttpServer::run(bool handle_signals) {
     bool overloaded = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
+      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
+          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
+            return !existing->response_sent.load(std::memory_order_acquire);
+          }));
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= options_.max_connections;
+                   serving >= options_.max_connections;
       if (!overloaded) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd);
+          handle_connection(client_fd, worker_ptr->response_sent);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
             gufo::platform::CloseConnection(worker_ptr->fd);
@@ -2216,7 +2236,8 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-void HttpServer::handle_connection(int client_fd) {
+void HttpServer::handle_connection(int client_fd,
+                                   std::atomic<bool>& response_sent) {
   (void)net::SetSocketTimeouts(client_fd, 120'000);
 
   const auto start_time = std::chrono::steady_clock::now();
@@ -2492,6 +2513,7 @@ void HttpServer::handle_connection(int client_fd) {
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
+    response_sent.store(true, std::memory_order_release);
     std::string outcome = connected ? "completed" : "disconnected";
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
@@ -2550,6 +2572,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2568,6 +2591,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2583,6 +2607,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.
   (void)device_lost();

@@ -21,6 +21,15 @@
 
 namespace gufo::platform {
 
+// Close-on-exec socket-type flag; Windows sockets have none and stay
+// inheritable.
+#ifdef _WIN32
+inline constexpr int kSocketCloexec = 0;
+#else
+inline constexpr int kSocketCloexec = SOCK_CLOEXEC;
+#endif
+
+
 #ifdef _WIN32
 namespace detail {
 /// Maps the last Winsock error onto errno so POSIX error checks keep working.

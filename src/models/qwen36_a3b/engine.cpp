@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #include <fcntl.h>
+#include <io.h>
 #include <unistd.h>
 #endif
 
@@ -90,8 +91,13 @@ bool UploadRegions(std::span<const core::GgufMappedRegion> src,
       break;
     }
     (void)hipMemset(static_cast<std::uint8_t*>(dst[i]) + src[i].size, 0, kTail);
-    const auto path = "/proc/self/fd/" + std::to_string(src[i].file_descriptor);
-    fds[i] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
+    // The mapping hands out a HANDLE; the shim reopens CRT descriptors.
+    const int borrowed = platform::CrtDescriptorOf(src[i].file_descriptor);
+    if (borrowed >= 0) {
+      const auto path = "/proc/self/fd/" + std::to_string(borrowed);
+      fds[i] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
+      (void)::_close(borrowed);
+    }
     if (fds[i] < 0) {
       fail(std::string("cannot reopen GGUF: ") + std::strerror(errno));
       break;
