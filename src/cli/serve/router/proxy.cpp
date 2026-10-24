@@ -57,8 +57,19 @@ bool IsHopByHop(std::string_view name) {
 }
 
 bool IsDroppedRequestHeader(std::string_view name) {
+  // Expect: the front has already received the whole body. Forwarded, it
+  // makes the worker answer "100 Continue" before the real response.
   return IsHopByHop(name) || IEquals(name, "Authorization") ||
-         IEquals(name, "Host") || IEquals(name, "Content-Length");
+         IEquals(name, "Host") || IEquals(name, "Content-Length") ||
+         IEquals(name, "Expect") || IEquals(name, "TE") ||
+         IEquals(name, "Proxy-Connection");
+}
+
+/// An interim 1xx head (100 Continue, 103 Early Hints) that precedes the
+/// final one. 101 switches protocols and is final for this exchange.
+bool IsInterimHead(std::string_view data) {
+  return data.size() >= 12 && data.starts_with("HTTP/1.") && data[8] == ' ' &&
+         data[9] == '1' && data.substr(9, 3) != "101";
 }
 
 std::string Trim(std::string value) {
@@ -234,6 +245,12 @@ bool ReadHead(int fd, const gufo::server::HttpRequest& front,
       return false;
     }
     header_end = data.find("\r\n\r\n");
+    // Relayed as final, an interim head would hand the client the real
+    // response as its body.
+    while (header_end != std::string::npos && IsInterimHead(data)) {
+      data.erase(0, header_end + 4);
+      header_end = data.find("\r\n\r\n");
+    }
   }
   std::vector<std::string> lines;
   std::size_t pos = 0;
