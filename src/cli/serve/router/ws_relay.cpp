@@ -88,7 +88,7 @@ int ConnectTo(const UpstreamTarget& target, std::string* error) {
     if (::connect(fd, info->ai_addr, info->ai_addrlen) == 0) {
       break;
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     fd = -1;
   }
   ::freeaddrinfo(results);
@@ -394,46 +394,46 @@ bool RelayWebSocket(const UpstreamTarget& target,
   if (!net::SetSendTimeout(worker_fd,
                            static_cast<int>(kHandshakeBudget.count()))) {
     failure = std::strerror(errno);
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     return false;
   }
   const std::string key = FreshKey();
   if (!SendAll(worker_fd, BuildHandshake(target, key))) {
     failure = "failed to send the websocket handshake";
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     return false;
   }
   std::string head;
   std::string remainder;
   if (!ReadHead(worker_fd, &head, &remainder, &failure)) {
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     return false;
   }
   if (HandshakeStatus(head) != 101) {
     failure = "worker answered the upgrade with status " +
               std::to_string(HandshakeStatus(head));
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     return false;
   }
   const std::string expected = AcceptFor(key);
   const std::string offered = HeadValue(head, "Sec-WebSocket-Accept");
   if (expected.empty() || offered != expected) {
     failure = "worker sent a wrong Sec-WebSocket-Accept";
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     return false;
   }
 
   // Bytes a worker pipelined with its 101 head belong to the client and must
   // reach the front before the raw pump, exactly like the HTTP remainder.
   if (!WriteToFront(front_fd, front, remainder)) {
-    ::close(worker_fd);
+    net::CloseSocket(worker_fd);
     front.MarkClosed();
     return true;
   }
 
   // Bytes that arrived with the upgrade request belong to the worker stream.
   Pump(front_fd, worker_fd, front, std::move(pending));
-  ::close(worker_fd);
+  net::CloseSocket(worker_fd);
   front.MarkClosed();
   return true;
 }

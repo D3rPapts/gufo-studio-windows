@@ -114,7 +114,7 @@ int ConnectTo(const UpstreamTarget& target, std::string* error) {
     if (::connect(fd, info->ai_addr, info->ai_addrlen) == 0) {
       break;
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     fd = -1;
   }
   ::freeaddrinfo(results);
@@ -320,7 +320,7 @@ struct SocketCell {
   void Close() {
     const int owned = fd.exchange(-1);
     if (owned >= 0) {
-      ::close(owned);
+      net::CloseSocket(owned);
     }
   }
 };

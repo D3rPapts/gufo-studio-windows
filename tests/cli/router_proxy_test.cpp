@@ -20,6 +20,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/proxy.hpp"
+#include "src/core/platform/net.hpp"
 
 namespace {
 
@@ -27,6 +28,15 @@ using gufo::router::ProxyToWorker;
 using gufo::router::UpstreamTarget;
 using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
+
+// Winsock sockets close with closesocket(); ::close() fails on them.
+void CloseSocket(int fd) {
+#ifdef _WIN32
+  ::closesocket(static_cast<SOCKET>(fd));
+#else
+  ::close(fd);
+#endif
+}
 
 std::string LowerCase(std::string value) {
   for (char& c : value) {
@@ -80,9 +90,17 @@ struct CapturedRequest {
 };
 
 void SetRecvTimeout(int fd, int milliseconds) {
+#ifdef _WIN32
+  // Winsock takes the receive timeout in milliseconds.
+  const DWORD timeout = static_cast<DWORD>(milliseconds);
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                      reinterpret_cast<const char*>(&timeout),
+                      sizeof(timeout)) == 0);
+#else
   const timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
   assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
          0);
+#endif
 }
 
 void SendAll(int fd, std::string_view payload) {
@@ -108,7 +126,8 @@ public:
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(listen_fd_ >= 0);
     const int reuse = 1;
-    assert(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse,
+    assert(::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
+                        reinterpret_cast<const char*>(&reuse),
                         sizeof(reuse)) == 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -128,7 +147,7 @@ public:
     if (thread_.joinable()) {
       thread_.join();
     }
-    ::close(listen_fd_);
+    CloseSocket(listen_fd_);
   }
 
   FakeWorker(const FakeWorker&) = delete;
@@ -150,7 +169,7 @@ private:
     if (ReadRequest(fd)) {
       responder_(fd);
     }
-    ::close(fd);
+    CloseSocket(fd);
   }
 
   bool ReadRequest(int fd) {
@@ -254,7 +273,7 @@ int ClosedPort() {
   assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
          0);
   const int port = ntohs(address.sin_port);
-  ::close(fd);
+  CloseSocket(fd);
   return port;
 }
 
@@ -375,6 +394,58 @@ void TestCancellationClosesUpstream() {
       WaitUntil([&closed] { return closed->load(); }, std::chrono::seconds(2)));
 }
 
+void TestSlowHeadAcrossPollSlices() {
+  // `gufo serve` sends a non-streamed reply's status line only once the
+  // reply is complete. A head that arrives after several poll slices (and,
+  // in production, after minutes) must still be relayed, not answered 502.
+  FakeWorker fake([](int fd) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    const std::string body = "late";
+    SendAll(fd,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body);
+  });
+
+  const UpstreamTarget target{"127.0.0.1", fake.port()};
+  const HttpResponse response =
+      ProxyToWorker(target, MakeRequest("POST", "/v1/chat/completions", "{}"));
+  assert(response.status == 200);
+  assert(Drain(response) == "late");
+}
+
+void TestCancelWhileAwaitingHead() {
+  // A client that leaves while the worker is still generating ends the wait
+  // within about one poll slice and closes the upstream connection, so the
+  // worker can cancel its request.
+  auto closed = std::make_shared<std::atomic<bool>>(false);
+  FakeWorker fake([closed](int fd) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    char buffer[64];
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto count = ::recv(fd, buffer, sizeof(buffer), 0);
+      if (count == 0) {
+        closed->store(true);
+        return;
+      }
+    }
+  });
+
+  auto request = MakeRequest("POST", "/v1/chat/completions", "{}");
+  const auto started = std::chrono::steady_clock::now();
+  request.is_cancelled = [started] {
+    return std::chrono::steady_clock::now() - started >
+           std::chrono::milliseconds(300);
+  };
+  const UpstreamTarget target{"127.0.0.1", fake.port()};
+  const HttpResponse response = ProxyToWorker(target, request);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  assert(response.status == 502);
+  assert(elapsed < std::chrono::milliseconds(2500));
+  assert(
+      WaitUntil([&closed] { return closed->load(); }, std::chrono::seconds(2)));
+}
+
 void TestWorkerEofMidBody() {
   FakeWorker fake([](int fd) {
     SendAll(fd,
@@ -417,11 +488,22 @@ void TestCorruptChunkSizeEndsStreaming() {
 }
 
 int main() {
+  gufo::net::EnsureSocketRuntimeStarted();  // WSAStartup on Windows
+  std::cerr << "TestEchoRoundTrip\n";
   TestEchoRoundTrip();
+  std::cerr << "TestSsePassthrough\n";
   TestSsePassthrough();
+  std::cerr << "TestConnectRefused\n";
   TestConnectRefused();
+  std::cerr << "TestCancellationClosesUpstream\n";
   TestCancellationClosesUpstream();
+  std::cerr << "TestSlowHeadAcrossPollSlices\n";
+  TestSlowHeadAcrossPollSlices();
+  std::cerr << "TestCancelWhileAwaitingHead\n";
+  TestCancelWhileAwaitingHead();
+  std::cerr << "TestWorkerEofMidBody\n";
   TestWorkerEofMidBody();
+  std::cerr << "TestCorruptChunkSizeEndsStreaming\n";
   TestCorruptChunkSizeEndsStreaming();
   std::cout << "All router proxy tests passed.\n";
   return 0;
