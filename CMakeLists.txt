@@ -401,6 +401,7 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_service.cpp
   src/cli/serve/embeddings_api.cpp
   src/cli/serve/embedding_service.cpp
+  src/cli/serve/omni_api.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
