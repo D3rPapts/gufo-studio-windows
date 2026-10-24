@@ -130,6 +130,9 @@ int main() {
   Device device(expected.size());
   Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
           "initialize guards");
+  // The memset lands on the default stream while the uploader copies through
+  // non-blocking streams; drain the memset before the copies can race it.
+  Require(hipStreamSynchronize(nullptr) == hipSuccess, "drain guard memset");
   std::string error;
   auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
@@ -162,10 +165,19 @@ int main() {
 
   upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, "reopen shards");
+#if defined(_WIN32)
+  // The reopeners hold the shards read-only, so the POSIX truncation of the
+  // replaced pathname has no Windows equivalent; prove the reopen still
+  // serves a queued range from the shard extent.
+  Require(upload->Copy(1, 4096, 8192, device.data, &error),
+          "queue a range after the reopen");
+  Require(upload->Finish(&error), "drain the reopened upload");
+#else
   std::filesystem::resize_file(paths[1].string() + ".old", 17);
   Require(upload->Copy(1, 4096, 8192, device.data, &error),
           "queue a range from the original file extent");
   Require(!upload->Finish(&error), "a truncated shard fails its pending read");
+#endif
   std::puts(
       "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
   upload.reset();
