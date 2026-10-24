@@ -8,6 +8,9 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
+#include <fcntl.h>
+#include <io.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -42,7 +45,8 @@ ReadOnlyMappedFile::ReadOnlyMappedFile(ReadOnlyMappedFile&& other) noexcept
       size_(other.size_),
 #if defined(_WIN32)
       handle_(other.handle_),
-      mapping_(other.mapping_)
+      mapping_(other.mapping_),
+      crt_fd_(other.crt_fd_)
 #else
       fd_(other.fd_)
 #endif
@@ -59,6 +63,7 @@ ReadOnlyMappedFile& ReadOnlyMappedFile::operator=(
 #if defined(_WIN32)
     handle_ = other.handle_;
     mapping_ = other.mapping_;
+    crt_fd_ = other.crt_fd_;
 #else
     fd_ = other.fd_;
 #endif
@@ -73,7 +78,7 @@ ReadOnlyMappedFile::~ReadOnlyMappedFile() {
 
 int ReadOnlyMappedFile::PlatformDescriptor() const noexcept {
 #if defined(_WIN32)
-  return -1;
+  return crt_fd_;
 #else
   return fd_;
 #endif
@@ -85,6 +90,7 @@ void ReadOnlyMappedFile::Reset() noexcept {
 #if defined(_WIN32)
   handle_ = nullptr;
   mapping_ = nullptr;
+  crt_fd_ = -1;
 #else
   fd_ = -1;
 #endif
@@ -98,6 +104,8 @@ void ReadOnlyMappedFile::Close() noexcept {
     CloseHandle(static_cast<HANDLE>(mapping_));
   if (handle_ != nullptr)
     CloseHandle(static_cast<HANDLE>(handle_));
+  if (crt_fd_ >= 0)
+    _close(crt_fd_);
 #else
   if (data_ != nullptr)
     munmap(const_cast<std::uint8_t*>(data_), size_);
@@ -147,6 +155,16 @@ ReadOnlyMappedFile ReadOnlyMappedFile::Open(const std::filesystem::path& path,
   result.size_ = static_cast<std::size_t>(file_size.QuadPart);
   result.handle_ = file;
   result.mapping_ = mapping;
+  // A descriptor for the loaders that read shards without the mapping. Best
+  // effort: without one they fall back to the mapped bytes.
+  HANDLE duplicate = nullptr;
+  if (DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(),
+                      &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+    result.crt_fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(duplicate),
+                                     _O_RDONLY | _O_BINARY);
+    if (result.crt_fd_ < 0)
+      CloseHandle(duplicate);
+  }
   return result;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
