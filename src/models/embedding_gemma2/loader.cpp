@@ -1,10 +1,5 @@
 #include "src/models/embedding_gemma2/loader.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +10,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::embedding_gemma2 {
 namespace {
@@ -30,22 +26,11 @@ public:
   MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] bool Open(const std::filesystem::path& path) {
-    struct stat status{};
-    if (stat(path.c_str(), &status) != 0 || status.st_size <= 0) {
+    if (!mapped_.Open(path, platform::MapHint::kNone)) {
       return false;
     }
-    const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (descriptor < 0) {
-      return false;
-    }
-    void* mapping = mmap(nullptr, static_cast<std::size_t>(status.st_size),
-                         PROT_READ, MAP_PRIVATE, descriptor, 0);
-    close(descriptor);
-    if (mapping == MAP_FAILED) {
-      return false;
-    }
-    data_ = mapping;
-    size_ = static_cast<std::size_t>(status.st_size);
+    data_ = mapped_.data;
+    size_ = mapped_.size;
     return true;
   }
 
@@ -57,12 +42,13 @@ public:
 private:
   void Reset() noexcept {
     if (data_ != nullptr) {
-      (void)munmap(data_, size_);
+      mapped_.Close();
       data_ = nullptr;
       size_ = 0;
     }
   }
 
+  platform::RawMappedFile mapped_;
   void* data_{nullptr};
   std::size_t size_{0};
 };
