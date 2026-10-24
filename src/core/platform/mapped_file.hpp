@@ -36,8 +36,10 @@ public:
   std::size_t size() const noexcept { return size_; }
   bool valid() const noexcept { return data_ != nullptr; }
 
-  /// Borrowed POSIX file descriptor backing the mapping; -1 on Windows and
-  /// for an empty view. Valid for the lifetime of this object.
+  /// Borrowed file descriptor backing the mapping, -1 for an empty view.
+  /// On Windows a CRT descriptor of the same file, which the compat layer
+  /// reopens through "/proc/self/fd/N". Valid for the lifetime of this
+  /// object.
   int PlatformDescriptor() const noexcept;
 
   void Close() noexcept;
@@ -50,6 +52,7 @@ private:
 #if defined(_WIN32)
   void* handle_ = nullptr;   // HANDLE of the file
   void* mapping_ = nullptr;  // HANDLE of the section
+  int crt_fd_ = -1;          // CRT descriptor of a duplicate file handle
 #else
   int fd_ = -1;
 #endif
