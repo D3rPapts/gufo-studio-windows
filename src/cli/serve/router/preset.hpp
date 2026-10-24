@@ -15,7 +15,8 @@ struct PresetModel {
   std::vector<std::string> argv;  // worker args, e.g. {"--model", "/x.gguf"}
   /// external only: the program to start instead of `gufo serve`. It gets
   /// argv plus `--host 127.0.0.1 --port N` and must answer GET /health with
-  /// 200 once ready, as llama-server does.
+  /// 200 once ready, as llama-server does. An `args` key puts leading
+  /// positional arguments first (`args = serve llm` for another gufo build).
   std::string command;
 };
 

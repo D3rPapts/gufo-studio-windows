@@ -446,6 +446,28 @@ void TestCancelWhileAwaitingHead() {
       WaitUntil([&closed] { return closed->load(); }, std::chrono::seconds(2)));
 }
 
+void TestInterimContinueIsSkipped() {
+  // Clients such as .NET send `Expect: 100-continue` with larger bodies. The
+  // front already holds the whole body, so the header is not forwarded; a
+  // worker that still answers 100 Continue first must not have that interim
+  // head relayed as final, or the client reads the real response as a body.
+  FakeWorker fake([](int fd) {
+    const std::string body = "final";
+    SendAll(fd, "HTTP/1.1 100 Continue\r\n\r\n");
+    SendAll(fd,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body);
+  });
+
+  auto request = MakeRequest("POST", "/v1/chat/completions", "{}");
+  request.headers.emplace_back("Expect", "100-continue");
+  const UpstreamTarget target{"127.0.0.1", fake.port()};
+  const HttpResponse response = ProxyToWorker(target, request);
+  assert(response.status == 200);
+  assert(Drain(response) == "final");
+  assert(fake.Last().Header("expect").empty());
+}
+
 void TestWorkerEofMidBody() {
   FakeWorker fake([](int fd) {
     SendAll(fd,
@@ -495,6 +517,7 @@ int main() {
   TestCancellationClosesUpstream();
   TestSlowHeadAcrossPollSlices();
   TestCancelWhileAwaitingHead();
+  TestInterimContinueIsSkipped();
   TestWorkerEofMidBody();
   TestCorruptChunkSizeEndsStreaming();
   std::cout << "All router proxy tests passed.\n";

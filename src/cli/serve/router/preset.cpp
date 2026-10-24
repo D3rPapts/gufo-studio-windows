@@ -111,6 +111,20 @@ bool LoadPreset(const std::filesystem::path& file,
         command = ResolvePathValue(value, models_dir, "model");
         continue;
       }
+      if (external && key == "args") {
+        // Leading positional arguments, e.g. "serve llm" to run another gufo
+        // build. Space-separated; no quoting.
+        std::vector<std::string> leading;
+        std::size_t begin = 0;
+        while ((begin = value.find_first_not_of(' ', begin)) !=
+               std::string::npos) {
+          const auto end = value.find(' ', begin);
+          leading.emplace_back(value.substr(begin, end - begin));
+          begin = end;
+        }
+        argv.insert(argv.begin(), leading.begin(), leading.end());
+        continue;
+      }
       if (value == "true") {
         argv.push_back("--" + key);
       } else if (value == "false") {
@@ -127,7 +141,10 @@ bool LoadPreset(const std::filesystem::path& file,
         return SectionError(section, "external sections need 'command'",
                             error);
       }
-      if (!std::filesystem::exists(command)) {
+      // Non-throwing: an app execution alias or a denied path is an error
+      // message, not a crash.
+      std::error_code exists_error;
+      if (!std::filesystem::exists(command, exists_error)) {
         return SectionError(section, "command '" + command + "' not found",
                             error);
       }
