@@ -48,23 +48,24 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
   DWORD error = ERROR_SUCCESS;
   __try {
     const auto* touch = reinterpret_cast<volatile const std::uint8_t*>(begin);
-    const auto* probe = reinterpret_cast<const std::uint8_t*>(begin);
-    for (std::size_t i = 0; i < bytes; i += page_size) {
-      // Query the protection before touching: an inaccessible page becomes
-      // the same reported failure the POSIX madvise path produces, without
-      // raising a hardware exception a worker thread would have to catch.
-      MEMORY_BASIC_INFORMATION information{};
-      if (VirtualQueryEx(GetCurrentProcess(), probe + i, &information,
-                         sizeof(information)) == 0 ||
-          (information.Protect & PAGE_GUARD) != 0 ||
-          (information.Protect &
-           (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-            PAGE_EXECUTE_WRITECOPY)) == 0) {
-        error = ERROR_NOACCESS;
-        break;
-      }
-      static_cast<void>(touch[i]);
+    // One protection query per chunk, not per page: per-page queries livelock
+    // against a mass PrefetchVirtualMemory on ranges near the RAM ceiling
+    // (a 17.5 GiB mapping never completes 16-thread per-page queries; a
+    // single query per chunk completes in seconds). A region the query
+    // missed still faults inside the loop, where the SEH filter converts it
+    // into the same reported failure the POSIX madvise path produces.
+    MEMORY_BASIC_INFORMATION information{};
+    if (VirtualQueryEx(GetCurrentProcess(),
+                       reinterpret_cast<const void*>(begin), &information,
+                       sizeof(information)) == 0 ||
+        (information.Protect & PAGE_GUARD) != 0 ||
+        (information.Protect &
+         (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) {
+      error = ERROR_NOACCESS;
+    } else {
+      for (std::size_t i = 0; i < bytes; i += page_size)
+        static_cast<void>(touch[i]);
     }
   } __except (PrefaultExceptionFilter(GetExceptionInformation(), begin, bytes,
                                       &error)) {
