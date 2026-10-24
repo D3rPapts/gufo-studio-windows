@@ -253,7 +253,7 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     // The mapping carries no POSIX descriptor on Windows; reopen the source
     // path, cached for throughput and unbuffered to skip the page cache.
     shard.file =
-        CreateFileA(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        CreateFileW(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                     nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (shard.file == INVALID_HANDLE_VALUE) {
       s.Fail("cannot read the mapped GGUF shard");
@@ -269,7 +269,7 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     }
     shard.size = static_cast<std::uint64_t>(size.QuadPart);
     shard.unbuffered =
-        CreateFileA(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        CreateFileW(region.source_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                     nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
 #else
     shard.fd = ::fcntl(region.file_descriptor, F_DUPFD_CLOEXEC, 0);
