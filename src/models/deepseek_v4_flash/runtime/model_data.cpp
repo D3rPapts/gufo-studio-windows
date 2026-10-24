@@ -499,7 +499,7 @@ static void model_close(ds4_model *m) {
     if (m->fd >= 0) close(m->fd);
 #endif
     memset(m, 0, sizeof(*m));
-    m->fd = -1;
+    m->fd = gufo::platform::kInvalidFile;
 }
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
@@ -591,7 +591,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 /* Open and map the GGUF once for resident ROCm tensor views. */
 static void model_open(ds4_model *m, const char *path) {
     memset(m, 0, sizeof(*m));
-    m->fd = -1;
+    m->fd = gufo::platform::kInvalidFile;
 
     if (!m->mapping.Open(path))
         ds4_die("cannot open or map model");
@@ -1605,7 +1605,7 @@ int ds4_dspark_open(ds4_dspark_model **out, const char *path) {
           ds4_xcalloc(1, sizeof(ds4_dspark_model))));
       auto* d = owned.get();
       d->model = static_cast<ds4_model*>(ds4_xcalloc(1, sizeof(ds4_model)));
-      d->model->fd = -1;
+      d->model->fd = gufo::platform::kInvalidFile;
 
       model_open(d->model, path);
       dspark_validate_metadata(d);
@@ -1778,7 +1778,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     e = static_cast<ds4_engine*>(ds4_xcalloc(1, sizeof(ds4_engine)));
     e->model = static_cast<ds4_model*>(ds4_xcalloc(1, sizeof(ds4_model)));
-    e->model->fd = -1;
+    e->model->fd = gufo::platform::kInvalidFile;
     e->weights = static_cast<ds4_weights*>(ds4_xcalloc(1, sizeof(ds4_weights)));
 
     model_open(e->model, opt->model_path);

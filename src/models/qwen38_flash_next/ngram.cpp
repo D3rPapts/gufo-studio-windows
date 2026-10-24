@@ -91,7 +91,7 @@ NgramTable::~NgramTable() {
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, const std::filesystem::path& source_path,
+    platform::PlatformFile file_descriptor, const std::filesystem::path& source_path,
     std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
     core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
@@ -134,7 +134,8 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   }
   t->file_handle_ = overlapped;
 #else
-  const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
+  const auto path =
+      "/proc/self/fd/" + std::to_string(static_cast<int>(file_descriptor));
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   t->direct_ = t->fd_ >= 0;
   if (t->fd_ < 0) {

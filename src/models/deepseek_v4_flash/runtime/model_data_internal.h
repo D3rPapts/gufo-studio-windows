@@ -72,7 +72,7 @@ struct ds4_tensor {
 };
 
 struct ds4_model {
-    int fd;
+    gufo::platform::PlatformFile fd;
     gufo::platform::RawMappedFile mapping;
     const uint8_t *map;
     uint64_t size;

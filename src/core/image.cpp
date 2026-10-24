@@ -3,20 +3,7 @@
 #include <curl/curl.h>
 #include <jpeglib.h>
 #include <png.h>
-
-#if defined(_WIN32)
-#include <ws2tcpip.h>
-#else
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
 #include <webp/decode.h>
-
-#if defined(_WIN32)
-constexpr int kSocketCloexec = 0;
-#else
-constexpr int kSocketCloexec = SOCK_CLOEXEC;
-#endif
 
 #include <algorithm>
 #include <array>
@@ -27,6 +14,8 @@ constexpr int kSocketCloexec = SOCK_CLOEXEC;
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#include "src/core/platform/socket.hpp"
 
 namespace gufo::core {
 namespace {
@@ -548,7 +537,8 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
         }
         if (!IsPublicImageAddress(ip))
           return CURL_SOCKET_BAD;
-        return ::socket(endpoint->family, endpoint->socktype | kSocketCloexec,
+        return ::socket(endpoint->family,
+                        endpoint->socktype | platform::kSocketCloexec,
                         endpoint->protocol);
       });
   struct Download {
