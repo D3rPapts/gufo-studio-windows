@@ -33,8 +33,13 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+
+#if defined(GUFO_HAVE_QWEN3_OMNI)
+#include "src/models/qwen3_omni/captioner.hpp"
+#endif
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -456,6 +461,33 @@ struct SpeechOptions {
   std::map<std::string, std::string> voice_lang_specs;
 };
 
+struct OmniOptions {
+  std::string model;
+  std::string mmproj;
+  std::size_t context{8192};
+  std::size_t max_tokens{1024};
+  std::string served_model_name{"qwen3-omni-captioner"};
+};
+
+void AddOmniOptions(ArgParser& parser, OmniOptions* options) {
+  parser.AddOption("-m", "--model", "PATH",
+                   "Qwen3-Omni-30B-A3B-Captioner text GGUF", "Model",
+                   &options->model);
+  parser.AddOption("", "--mmproj", "PATH",
+                   "Matching projector GGUF (audio tower)", "Model",
+                   &options->mmproj);
+  parser.AddOption("-c", "--context", "N",
+                   "Context capacity: audio tokens plus caption (default: "
+                   "8192)",
+                   "Model", &options->context);
+  parser.AddOption("-n", "--max-tokens", "N",
+                   "Caption length limit and default (default: 1024)",
+                   "Model", &options->max_tokens);
+  parser.AddOption("", "--served-model-name", "NAME",
+                   "Public API model ID (default: qwen3-omni-captioner)",
+                   "Model", &options->served_model_name);
+}
+
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
   parser.AddOption("-m", "--model", "DIR",
                    tts ? "Qwen3-TTS 12Hz 1.7B model directory"
@@ -563,6 +595,17 @@ void PrintServeHelp(std::string_view program_name,
                      "Storage", &video_ttl_seconds);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
+    parser.PrintHelp();
+    return;
+  }
+
+  if (subcommand == "omni") {
+    OmniOptions options;
+    ArgParser parser(std::string(program_name) + " serve omni",
+                     "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.");
+    AddOmniOptions(parser, &options);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
     return;
   }
@@ -790,7 +833,9 @@ void PrintServeHelp(std::string_view program_name,
          "/v1/images/edits)\n"
       << "  tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n"
       << "  asr       Serve Qwen3-ASR transcription "
-         "(/v1/audio/transcriptions)\n\n"
+         "(/v1/audio/transcriptions)\n"
+      << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
+         "(/v1/chat/completions with input_audio)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -884,14 +929,15 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image") {
+        arg == "image" || arg == "omni") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
       const std::string_view topic =
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
-          topic != "tts" && topic != "asr" && topic != "image") {
+          topic != "tts" && topic != "asr" && topic != "image" &&
+          topic != "omni") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -941,7 +987,8 @@ int RunServe(std::span<const char* const> args) {
     // (`--log-level=error`) suppresses this INFO startup diagnostic with the
     // rest of the boot sequence instead of leaking it before SetLevel ran.
     const auto profile = subcommand == "llm" ? diagnostics::QueueProfile::kText
-                         : (subcommand == "tts" || subcommand == "asr")
+                         : (subcommand == "tts" || subcommand == "asr" ||
+                            subcommand == "omni")
                              ? diagnostics::QueueProfile::kAudio
                              : diagnostics::QueueProfile::kUnmeasured;
     const auto plan =
@@ -975,6 +1022,7 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
   std::shared_ptr<server::ImageService> images;
+  std::shared_ptr<server::OmniService> omni;
 
   if (subcommand == "image") {
     std::filesystem::path model;
@@ -1158,6 +1206,67 @@ int RunServe(std::span<const char* const> args) {
           "model=" + asr->model_id() +
           " sessions=1 context_tokens=" + std::to_string(options.context));
     }
+  } else if (subcommand == "omni") {
+    OmniOptions options;
+    ArgParser parser("gufo serve omni",
+                     "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.");
+    AddOmniOptions(parser, &options);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", subcommand);
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (options.model.empty() || options.mmproj.empty()) {
+      std::cerr << "Error: --model <PATH> and --mmproj <PATH> are required "
+                   "for omni server\n";
+      return 2;
+    }
+    if (options.context < 64U || options.max_tokens == 0U) {
+      std::cerr << "Error: --context must be at least 64 and --max-tokens "
+                   "positive\n";
+      return 2;
+    }
+#if defined(GUFO_HAVE_QWEN3_OMNI)
+    ModelLoadLog load_log(subcommand, options.model);
+    std::string error;
+    std::shared_ptr<models::qwen3_omni::Captioner> captioner =
+        models::qwen3_omni::Captioner::Create(
+            {.model = options.model,
+             .mmproj = options.mmproj,
+             .backend = "gpu",
+             .context = options.context,
+             .threads = 0},
+            &error);
+    if (captioner == nullptr) {
+      std::cerr << "Error loading Qwen3-Omni captioner: " << error << '\n';
+      return 1;
+    }
+    omni = std::make_shared<server::OmniService>(server::OmniServiceOptions{
+        .model_id = options.served_model_name,
+        .context_tokens = options.context,
+        .max_tokens = options.max_tokens,
+        .runner =
+            [captioner](const models::qwen3_omni::CaptionRequest& request,
+                        const models::qwen3_omni::CancellationCheck& cancelled,
+                        models::qwen3_omni::CaptionResult* result,
+                        std::string* failure) {
+              return captioner->Caption(request, cancelled, result, failure);
+            },
+    });
+    load_log.Complete("model=" + omni->model_id() +
+                      " sessions=1 context_tokens=" +
+                      std::to_string(options.context));
+#else
+    std::cerr << "Error: this gufo build has no Qwen3-Omni support (needs "
+                 "HIP)\n";
+    return 1;
+#endif
   } else {
     // Default to LLM server
     std::string model;
@@ -1587,6 +1696,9 @@ int RunServe(std::span<const char* const> args) {
               },
       },
       images);
+  if (omni != nullptr) {
+    server.set_omni(omni);
+  }
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";

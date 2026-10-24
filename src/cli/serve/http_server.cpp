@@ -35,6 +35,8 @@
 #include <utility>
 
 #include "src/cli/serve/asr_service.hpp"
+#include "src/cli/serve/omni_api.hpp"
+#include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
@@ -789,7 +791,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images, const OmniService* omni) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -857,6 +859,22 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["created"] = Now();
     model["owned_by"] = "operator-supplied-qwen";
     model["capability"] = "image";
+    data.push_back(std::move(model));
+  }
+  if (omni != nullptr && omni->ready()) {
+    json::Value model = json::Value::object();
+    model["id"] = omni->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-qwen";
+    model["capability"] = "audio_caption";
+    if (omni->context_tokens() > 0)
+      model["context_length"] = omni->context_tokens();
+    json::Value input_modalities = json::Value::array();
+    input_modalities.push_back("audio");
+    json::Value architecture = json::Value::object();
+    architecture["input_modalities"] = std::move(input_modalities);
+    model["architecture"] = std::move(architecture);
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -2100,7 +2118,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||
-                       (asr_ != nullptr && asr_->ready()) || images_ != nullptr;
+                       (asr_ != nullptr && asr_->ready()) ||
+                       (omni_ != nullptr && omni_->ready()) ||
+                       images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2111,6 +2131,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = backend_->model_id();
     } else if (asr_ != nullptr && asr_->ready()) {
       body["model"] = asr_->model_id();
+    } else if (omni_ != nullptr && omni_->ready()) {
+      body["model"] = omni_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (images_ != nullptr) {
@@ -2123,7 +2145,14 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), omni_.get());
+  }
+  if (backend_ == nullptr && omni_ != nullptr && IsOmniApiPath(req.path)) {
+    if (!omni_->ready())
+      return Err(503, "Service Unavailable",
+                 "Qwen3-Omni captioner is not ready", "server_error",
+                 "omni_service_unavailable");
+    return HandleOmniApiRequest(req, *omni_);
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
