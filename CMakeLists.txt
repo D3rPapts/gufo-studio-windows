@@ -1347,3 +1347,7 @@ endif()
 if (BUILD_TESTING)
   include(cmake/Checks.cmake)
 endif()
+
+# Qwen3-Omni-30B-A3B-Captioner (GGUF arch qwen3vlmoe + qwen3a audio
+# projector): its runtime library and the gufo-omni driver.
+add_subdirectory(src/models/qwen3_omni)
