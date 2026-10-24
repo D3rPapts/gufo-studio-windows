@@ -100,6 +100,14 @@ struct HttpServerOptions {
   /// generation answer 503 `device_lost` from then on; the hook decides how the
   /// process exits.
   std::function<void()> on_device_lost{};
+  /// When set, handle_request returns dispatcher(request) immediately after
+  /// authentication; built-in health/model routes are skipped and the
+  /// constructor does not register model routes (null backend is then legal).
+  std::function<HttpResponse(const HttpRequest&)> dispatcher{};
+  /// The router front drains in-flight requests after a shutdown signal, so
+  /// the signal path only stops the listener there; established connections
+  /// stay usable until the caller's drain ends and the destructor stops.
+  bool graceful_shutdown{false};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
@@ -134,6 +142,12 @@ public:
   void run(bool handle_signals = false);
 
   void stop();
+
+  /// Stop accepting new connections only. When
+  /// HttpServerOptions::graceful_shutdown is set the shutdown-signal path
+  /// uses this instead of stop() so an external drain can keep serving the
+  /// established connections until it ends.
+  void stop_listening();
 
   [[nodiscard]] int port() const noexcept { return port_; }
 

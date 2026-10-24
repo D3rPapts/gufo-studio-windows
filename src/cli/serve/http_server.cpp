@@ -1815,7 +1815,9 @@ HttpServer::HttpServer(std::string host, int port,
   if (!options_.api_key.empty()) {
     api_key_hash_ = CredentialHash(options_.api_key);
   }
-  register_routes();
+  if (!options_.dispatcher) {
+    register_routes();
+  }
 }
 
 HttpServer::~HttpServer() {
@@ -1971,7 +1973,15 @@ void HttpServer::run(bool handle_signals) {
       if (signal != 0) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
-        stop();
+        // A graceful front (the router) keeps established connections for
+        // its own drain; stop() would shut their descriptors down and cut
+        // in-flight streams mid-relay. The destructor stops them once the
+        // drain has ended.
+        if (options_.graceful_shutdown) {
+          stop_listening();
+        } else {
+          stop();
+        }
         platform::NotifyShutdownHandled();
         break;
       }
@@ -2038,13 +2048,17 @@ void HttpServer::run(bool handle_signals) {
   reap_workers();
 }
 
-void HttpServer::stop() {
-  const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
-  if (!was_stopped && listen_fd_ >= 0) {
+void HttpServer::stop_listening() {
+  stopped_.store(true, std::memory_order_release);
+  if (listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
     (void)::shutdown(listen_fd_, SHUT_RDWR);
   }
+}
+
+void HttpServer::stop() {
+  stop_listening();
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
   {
@@ -2080,6 +2094,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                         "authentication_error", "invalid_api_key");
     response.headers.emplace_back("WWW-Authenticate", "Bearer");
     return response;
+  }
+  if (options_.dispatcher) {
+    return options_.dispatcher(req);
   }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe

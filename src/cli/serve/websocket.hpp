@@ -28,9 +28,10 @@ public:
   bool SendBinary(std::string_view bytes);
   void Close(std::uint16_t code = 1000);
   bool cancelled() const { return closed_.load(); }
+  bool MarkClosed();
+  bool DetachForRelay(int* fd, std::string* pending);
 
 private:
-  bool MarkClosed();
   void ReadLoop();
   bool Read(char* data, std::size_t size);
   bool Send(std::uint8_t opcode, std::string_view bytes);
@@ -42,6 +43,7 @@ private:
   // neither side has sent anything for this long.
   std::chrono::steady_clock::duration idle_{};
   std::atomic<std::chrono::steady_clock::rep> last_send_{0};
+  std::atomic<bool> detached_{false};
   std::mutex send_mutex_;
   std::mutex queue_mutex_;
   std::condition_variable ready_;
