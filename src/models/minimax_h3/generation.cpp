@@ -1,11 +1,5 @@
 #include "src/models/minimax_h3/generation.hpp"
 
-#if defined(_WIN32)
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -17,6 +11,7 @@
 #include <system_error>
 #include <utility>
 
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
@@ -141,8 +136,8 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(_getpid()) + "-" +
-                                        std::to_string(NextOutputNonce());
+                                        std::to_string(platform::ProcessId()) +
+                                        "-" + std::to_string(NextOutputNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);
     output.write(contents.data(),
@@ -201,9 +196,9 @@ bool WriteFramesAtomic(const std::filesystem::path& directory,
     return false;
   }
   const std::filesystem::path partial =
-      parent /
-      (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
+      parent / (directory.filename().string() + ".gufo-partial-" +
+                std::to_string(platform::ProcessId()) + "-" +
+                std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);
@@ -297,9 +292,9 @@ bool WriteLatentsAtomic(const std::filesystem::path& directory,
     return false;
   }
   const std::filesystem::path partial =
-      parent /
-      (directory.filename().string() + ".gufo-partial-" +
-       std::to_string(_getpid()) + "-" + std::to_string(NextOutputNonce()));
+      parent / (directory.filename().string() + ".gufo-partial-" +
+                std::to_string(platform::ProcessId()) + "-" +
+                std::to_string(NextOutputNonce()));
   std::filesystem::remove_all(partial, filesystem_error);
   filesystem_error.clear();
   std::filesystem::create_directories(partial, filesystem_error);

@@ -1,12 +1,5 @@
 #include "src/models/qwen_image_21/weights.hpp"
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -221,9 +214,14 @@ Weights::Weights(const std::filesystem::path& root) {
 void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
   auto* mapped = new platform::RawMappedFile();
-  if (!mapped->Open(path.string().c_str()) || mapped->size < 8) {
+  std::string open_error;
+  if (!mapped->Open(path, platform::MapHint::kNone, &open_error) ||
+      mapped->size < 8) {
     delete mapped;
-    throw std::runtime_error("invalid safetensors file " + path.string());
+    throw std::runtime_error(open_error.empty()
+                                 ? "invalid safetensors file " + path.string()
+                                 : "cannot open " + path.string() + ": " +
+                                       open_error);
   }
   const auto size = mapped->size;
   void* data = mapped->data;

@@ -1,15 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#if defined(_WIN32)
-#include <windows.h>
-#endif
-#if !defined(_WIN32)
-#include <sys/resource.h>
-#include <unistd.h>
-#endif
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
-#include "src/core/platform/mapped_file.hpp"
 #include <rocblas/rocblas.h>
 
 #include <algorithm>
@@ -25,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/audio_vae.hpp"
 #include "src/models/minimax_h3/audio_vae_ops.hip.hpp"
 #include "src/models/minimax_h3/json.hpp"
@@ -100,22 +94,9 @@ bool ValidateTarget(int* device, std::string* error) {
   return true;
 }
 
-struct Faults {
-  std::uint64_t minor{0};
-  std::uint64_t major{0};
-};
-
+using Faults = platform::PageFaults;
 Faults ReadFaults() {
-#if defined(_WIN32)
-  return {};  // No per-process fault counters on Windows.
-#else
-  struct rusage usage{};
-  if (getrusage(RUSAGE_SELF, &usage) != 0) {
-    return {};
-  }
-  return {static_cast<std::uint64_t>(usage.ru_minflt),
-          static_cast<std::uint64_t>(usage.ru_majflt)};
-#endif
+  return platform::ReadPageFaults();
 }
 
 std::uint64_t ReadSwapBytes() {
@@ -226,10 +207,11 @@ bool LoadTensor(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const platform::PlatformFile file = platform::OpenReadFile(
-      path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
   if (!platform::FileValid(file)) {
-    SetError(error, "cannot open MiniMax H3 AudioVAE shard " + path.string());
+    SetError(error, "cannot open MiniMax H3 AudioVAE shard " + path.string() +
+                        ": " + open_error);
     output->Reset();
     return false;
   }
@@ -246,8 +228,7 @@ bool LoadTensor(const ModelInventory& inventory,
     while (read_bytes < chunk) {
       const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes,
-          descriptor.file_offset + copied + read_bytes);
+          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
       if (result == 0) {
         SetError(error, "short read loading MiniMax H3 AudioVAE tensor " +
                             descriptor.name);

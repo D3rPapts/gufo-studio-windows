@@ -7,13 +7,6 @@
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,8 +26,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
 #include "src/core/mapped_prefetch.hpp"
+#include "src/core/platform/mapped_file.hpp"
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/prompt_encoder_ops.hip.hpp"
 
@@ -223,6 +216,7 @@ struct HostMapping {
   HostMapping& operator=(const HostMapping&) = delete;
   HostMapping(HostMapping&& other) noexcept
       : shard(std::move(other.shard)),
+        mapping_file(std::exchange(other.mapping_file, {})),
         host(std::exchange(other.host, nullptr)),
         bytes(std::exchange(other.bytes, 0)),
         file_offset(other.file_offset),
@@ -232,6 +226,7 @@ struct HostMapping {
     if (this != &other) {
       Release();
       shard = std::move(other.shard);
+      mapping_file = std::exchange(other.mapping_file, {});
       host = std::exchange(other.host, nullptr);
       bytes = std::exchange(other.bytes, 0);
       file_offset = other.file_offset;
@@ -257,8 +252,7 @@ struct HostMapping {
 
 std::vector<FileInterval> BuildIntervals(
     std::span<const TensorDescriptor* const> descriptors) {
-  const auto page_size =
-      static_cast<std::uint64_t>(platform::SystemPageSize());
+  const auto page_size = static_cast<std::uint64_t>(platform::SystemPageSize());
   std::vector<FileInterval> intervals;
   intervals.reserve(descriptors.size());
   for (const TensorDescriptor* descriptor : descriptors) {
@@ -349,9 +343,12 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       const auto length = static_cast<std::size_t>(length64);
       HostMapping mapping;
       mapping.shard = interval.shard;
-      if (!mapping.mapping_file.OpenRange(path.string().c_str(),
-                                          interval.begin, length)) {
-        result.error = "cannot map H3 text shard " + path.string();
+      std::string map_error;
+      if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
+                                          platform::MapHint::kNone,
+                                          &map_error)) {
+        result.error =
+            "cannot map H3 text shard " + path.string() + ": " + map_error;
         return result;
       }
       mapping.host = mapping.mapping_file.data;

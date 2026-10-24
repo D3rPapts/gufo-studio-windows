@@ -65,9 +65,11 @@ set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
 if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
   message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
 endif()
-# Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH.
+# Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH. As a
+# system prefix /opt/rocm is searched after CMAKE_PREFIX_PATH in the
+# environment, so a development shell's ROCm wins over the host's.
 if (EXISTS /opt/rocm)
-  list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+  list(APPEND CMAKE_SYSTEM_PREFIX_PATH /opt/rocm)
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -76,6 +78,7 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_package(rocm-core CONFIG QUIET)
   find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp REQUIRED)
   find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp REQUIRED)
   find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp REQUIRED)
@@ -129,6 +132,9 @@ add_subdirectory(src/models/qwen3_tts)
 
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
+
+# EmbeddingGemma 2 is a model-private BF16 text embedding runtime.
+add_subdirectory(src/models/embedding_gemma2)
 
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
@@ -209,6 +215,10 @@ if (ENGINE_ENABLE_HIP)
   target_sources(gufo_diagnostics PRIVATE
     src/core/hip/allocation_benchmark.hip)
   target_compile_definitions(gufo_diagnostics PRIVATE ENGINE_ENABLE_HIP=1)
+  if (rocm-core_FOUND)
+    target_compile_definitions(gufo_diagnostics PRIVATE
+      GUFO_ROCM_VERSION="${rocm-core_VERSION}")
+  endif()
   target_link_libraries(gufo_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
 endif()
 
@@ -216,6 +226,7 @@ add_library(gufo_core STATIC
   src/core/platform/mapped_file.cpp
   src/core/platform/net.cpp
   src/core/platform/shutdown_signal.cpp
+  src/core/platform/mapped_file.cpp
   src/core/platform/mapped_file.cpp
   src/core/platform/publish.cpp
   src/core/platform/os_info.cpp
@@ -234,7 +245,8 @@ add_library(gufo_core STATIC
   src/models/minimax_h3/dit.cpp
   src/models/minimax_h3/generation.cpp
   src/models/minimax_h3/json.cpp
-  src/models/minimax_h3/media.cpp
+  "$<$<PLATFORM_ID:Windows>:src/models/minimax_h3/media_windows.cpp>"
+  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/models/minimax_h3/media_posix.cpp>"
   src/models/minimax_h3/prompt_encoder.cpp
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sampling.cpp
@@ -321,6 +333,8 @@ add_library(gufo_http STATIC
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
   src/cli/serve/asr_service.cpp
+  src/cli/serve/embeddings_api.cpp
+  src/cli/serve/embedding_service.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
@@ -334,7 +348,7 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -364,7 +378,7 @@ target_compile_definitions(gufo PRIVATE
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
 endif()
-target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
+target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
 
 if (WIN32)
   add_custom_target(gufo-server ALL
@@ -459,6 +473,8 @@ if (BUILD_TESTING)
   gufo_qwen3_asr_register_tests()
   gufo_qwen_image_21_register_tests()
 
+  add_subdirectory(tests/models/embedding_gemma2)
+
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES
     LABELS "cpu"
@@ -494,6 +510,9 @@ if (BUILD_TESTING)
   add_test(NAME gufo_serve_tts_help COMMAND gufo serve tts --help)
   set_tests_properties(gufo_serve_tts_help PROPERTIES
     LABELS "cpu;server;cli;qwen3-tts")
+  add_test(NAME gufo_serve_embedding_help COMMAND gufo serve embedding --help)
+  set_tests_properties(gufo_serve_embedding_help PROPERTIES
+    LABELS "cpu;server;cli;embedding-gemma2")
 
   add_test(NAME strix_serve_help COMMAND gufo serve --help)
   set_tests_properties(strix_serve_help PROPERTIES LABELS "cpu;server;cli")

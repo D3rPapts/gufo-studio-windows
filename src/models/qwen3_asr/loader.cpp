@@ -1,12 +1,5 @@
 #include "src/models/qwen3_asr/loader.hpp"
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -35,11 +28,15 @@ public:
   MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] bool Open(const std::filesystem::path& path) {
-    if (!mapped_.Open(path.string().c_str()))
+    if (!mapped_.Open(path, platform::MapHint::kSequential, &open_error_))
       return false;
     data_ = mapped_.data;
     size_ = mapped_.size;
     return true;
+  }
+
+  [[nodiscard]] const std::string& open_error() const noexcept {
+    return open_error_;
   }
 
   [[nodiscard]] const std::byte* data() const noexcept {
@@ -55,6 +52,7 @@ private:
   }
 
   platform::RawMappedFile mapped_;
+  std::string open_error_;
   void* data_{nullptr};
   std::size_t size_{0};
 };
@@ -93,9 +91,11 @@ std::uint64_t ReadLittleEndian64(const std::byte* bytes) noexcept {
 
 bool LoadSafetensors(const std::filesystem::path& path, TensorStore* store,
                      std::vector<std::shared_ptr<void>>* mappings,
-                     std::vector<MappedRegion>* regions) {
+                     std::vector<MappedRegion>* regions, std::string* error) {
   auto mapping = std::make_shared<MappedFile>();
   if (!mapping->Open(path) || mapping->size() < 8U) {
+    if (error != nullptr && !mapping->open_error().empty())
+      *error = "cannot open " + path.string() + ": " + mapping->open_error();
     return false;
   }
   const std::uint64_t header_size = ReadLittleEndian64(mapping->data());
@@ -217,9 +217,12 @@ LoadResult LoadModelDirectory(const std::string& model_dir) {
   for (const std::string_view shard : {"model-00001-of-00002.safetensors",
                                        "model-00002-of-00002.safetensors"}) {
     const std::filesystem::path path = root / shard;
+    std::string load_error;
     if (!LoadSafetensors(path, result.store.get(), &result.mappings,
-                         &result.mapped_regions)) {
+                         &result.mapped_regions, &load_error)) {
       result.error = "qwen3_asr: cannot load " + path.string();
+      if (!load_error.empty())
+        result.error += ": " + load_error;
       return result;
     }
   }
