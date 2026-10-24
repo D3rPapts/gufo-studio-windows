@@ -489,21 +489,13 @@ void TestCorruptChunkSizeEndsStreaming() {
 
 int main() {
   gufo::net::EnsureSocketRuntimeStarted();  // WSAStartup on Windows
-  std::cerr << "TestEchoRoundTrip\n";
   TestEchoRoundTrip();
-  std::cerr << "TestSsePassthrough\n";
   TestSsePassthrough();
-  std::cerr << "TestConnectRefused\n";
   TestConnectRefused();
-  std::cerr << "TestCancellationClosesUpstream\n";
   TestCancellationClosesUpstream();
-  std::cerr << "TestSlowHeadAcrossPollSlices\n";
   TestSlowHeadAcrossPollSlices();
-  std::cerr << "TestCancelWhileAwaitingHead\n";
   TestCancelWhileAwaitingHead();
-  std::cerr << "TestWorkerEofMidBody\n";
   TestWorkerEofMidBody();
-  std::cerr << "TestCorruptChunkSizeEndsStreaming\n";
   TestCorruptChunkSizeEndsStreaming();
   std::cout << "All router proxy tests passed.\n";
   return 0;
