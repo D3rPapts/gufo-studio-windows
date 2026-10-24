@@ -226,8 +226,6 @@ add_library(gufo_core STATIC
   src/core/platform/mapped_file.cpp
   src/core/platform/net.cpp
   src/core/platform/shutdown_signal.cpp
-  src/core/platform/mapped_file.cpp
-  src/core/platform/mapped_file.cpp
   src/core/platform/publish.cpp
   src/core/platform/os_info.cpp
   src/core/platform/publish.cpp
