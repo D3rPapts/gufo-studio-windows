@@ -279,6 +279,62 @@ JSON schema or a reasoning budget makes the request "sampled", and the 27B
 MTP draft has no sampled proposals. `gufo prompt` applies Qwen's preset
 presence penalty unless `--presence-penalty 0` is given.
 
+### Upstream merge of 2026-10-24 and the prompt-lookup policy
+
+Twenty upstream commits merged (`win-merge-2026-10-24`), among them #705
+(faster DFlash2 drafting and verification, a new prompt lookup) and the
+platform leaves of upstream's own Windows port. Two Windows issues came with
+it:
+
+- `mapped_file` returns no descriptor on Windows, and the port's loaders read
+  shards through it. The 27B load fell back to the host-registered copy and
+  filled system RAM (16.9 GB RSS, 1.9 GB left, never ready). The mapping now
+  also holds a CRT descriptor (2b343d34).
+- #705's lookup replaces the port's opt-in `GUFO_QWEN27_LOOKUP` lookup.
+  `GUFO_QWEN27_LOOKUP=N` keeps capping DFlash2's own drafts at N.
+
+Workload as above (film character JSON with thinking, temperature 0.6,
+repeat penalty 1.05). 8 film runs per row unless marked * (4 runs); single
+runs vary by about ±2 tok/s with the reasoning length.
+
+| Build, settings | film + thinking | short cases | tokens / cycle | ms / cycle |
+| --- | ---: | ---: | ---: | ---: |
+| before the merge, `LOOKUP=4` (production) | 30.6-31.5 | 19.1 | 4.01-4.27 | 130-132 |
+| merge, upstream defaults * | 28.7 | 19.1 | 3.83 | 127 |
+| merge, `LOOKUP_MIN=12` * | 29.8 | | | |
+| merge, `LOOKUP_REASONING=1`, `_MIN=12` | 29.1 | | 3.79 | 131 |
+| merge, `LOOKUP_GENERATED=1`, `_MIN=12` | 30.5 | | 3.90 | 128 |
+| merge, `_GENERATED=1`, `_MIN=12`, `LOOKUP=5` | 31.9 | | 4.18 | 130 |
+| before the merge, `LOOKUP=7` | 31.8 | 20.6 | | |
+| **merge, `_GENERATED=1`, `_MIN=12`, `LOOKUP=7`** | **34.2** | **20.4** | 4.39 | 132 |
+
+Upstream's lookup copies for sampled requests only from their starting
+context and after 24 matching tokens. This answer restates its own earlier
+fields, so it loses copies; indexing just the finished reasoning does not
+recover them. With both knobs the merged build matches the old lookup, and
+only on top of #705's lookup does the longer DFlash2 cap pay off (+8 % on
+the main case, +7 % on short cases, prefill unchanged, all JSON valid). The
+old build gains 1 % from the same cap.
+
+The knobs: `GUFO_QWEN27_LOOKUP_MIN=N` (strict gate), `GUFO_QWEN27_LOOKUP_GENERATED=1`
+(sampled requests copy from their own generated text),
+`GUFO_QWEN27_LOOKUP_REASONING=1` (only the finished reasoning; no gain here).
+Defaults keep upstream's behaviour.
+
+### Router
+
+`gufo router` (PGoski's branch, ported in `win-router`) serves every model
+behind port 8081 with one loaded at a time: Qwen3.8-27B, Qwen3-Omni and the
+llama-server models through `external` sections. Windows changes:
+CreateProcessW workers in a kill-on-close job, sockets closed with
+`closesocket`, millisecond socket timeouts, a signal-free websocket hand-off.
+Two relay bugs found here are platform-neutral and went to PGoski/gufo#1: the
+response head was awaited for 30 s only (longer non-streamed replies got 502
+and the worker could be evicted mid-generation), and a forwarded
+`Expect: 100-continue` made the relay hand clients the previous answer.
+Switching on gfx1151: 27B cold 10.6 s, Omni 22.7 s, llama-server 4B 4.5 s;
+through the router the benchmark matches direct serving.
+
 ### Long context
 
 gufo with V6R and `--context 155648` (152K) on the same 32 GB machine: a
