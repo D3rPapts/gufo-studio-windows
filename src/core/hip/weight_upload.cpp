@@ -79,11 +79,14 @@ struct WeightUpload::State {
     // fell back to pageable memory.
     std::unique_ptr<std::byte[]> unpinned;
     hipStream_t stream{nullptr};
-    // One unbuffered description per reader, reopened when the reader moves
-    // to another shard: independent file objects keep concurrent readers off
-    // one synchronous handle.
-    platform::PlatformFile direct{platform::kInvalidFile};
-    std::uint32_t direct_shard{0xffffffffu};
+    // One independent description per reader, reopened when the reader moves
+    // to another shard: concurrent readers never queue on one synchronous
+    // handle. Cached reads are preferred because unbuffered reads of a file
+    // that is also mapped serialize (Windows NTFS); direct reads stay as the
+    // fallback and need alignment.
+    platform::PlatformFile reopened{platform::kInvalidFile};
+    std::uint32_t reopened_shard{0xffffffffu};
+    bool direct{false};
   };
   struct Task {
     std::uint32_t shard;
@@ -114,7 +117,7 @@ struct WeightUpload::State {
     // caller's destinations can be freed, even on a failed upload.
     readers.clear();
     for (auto& slot : slots) {
-      platform::CloseFile(slot.direct);
+      platform::CloseFile(slot.reopened);
       if (slot.stream != nullptr) {
         (void)hipStreamDestroy(slot.stream);
       }
@@ -146,23 +149,37 @@ struct WeightUpload::State {
     const void* payload = slot.buffer;
     std::error_code ec;
     bool read = false;
-    // Each reader keeps an unbuffered description of the shard it reads, so
+    // Each reader keeps an independent description of the shard it reads, so
     // concurrent readers never queue on one synchronous handle: Windows
-    // serializes synchronous I/O per file object, not per process.
-    if (slot.direct_shard != task.shard) {
-      platform::CloseFile(slot.direct);
-      slot.direct = platform::kInvalidFile;
-      slot.direct_shard = task.shard;
+    // serializes synchronous I/O per file object, not per process. Cached
+    // reads go first because unbuffered reads of a file that is also mapped
+    // serialize (NTFS); direct reads remain the fallback.
+    if (slot.reopened_shard != task.shard) {
+      platform::CloseFile(slot.reopened);
+      slot.reopened = platform::kInvalidFile;
+      slot.reopened_shard = task.shard;
     }
-    if (!platform::FileValid(slot.direct)) {
-      slot.direct = platform::ReopenUnbuffered(shard.fd);
+    if (!platform::FileValid(slot.reopened)) {
+      slot.reopened = platform::ReopenCached(shard.fd);
+      slot.direct = false;
+      if (!platform::FileValid(slot.reopened)) {
+        slot.reopened = platform::ReopenUnbuffered(shard.fd);
+        slot.direct = true;
+      }
     }
-    if (platform::FileValid(slot.direct)) {
+    if (platform::FileValid(slot.reopened) && !slot.direct) {
+      read = ReadFully(slot.reopened, slot.buffer, task.offset, task.size,
+                       task.size, ec);
+      payload = slot.buffer;
+      if (!read) {
+        return "shard read failed: " + ec.message();
+      }
+    } else if (platform::FileValid(slot.reopened)) {
       const auto begin = task.offset & ~(kAlignment - 1);
       const auto skip = static_cast<std::size_t>(task.offset - begin);
       const auto length =
           (skip + task.size + kAlignment - 1) & ~(kAlignment - 1);
-      read = ReadFully(slot.direct, slot.buffer, begin, length,
+      read = ReadFully(slot.reopened, slot.buffer, begin, length,
                        skip + task.size, ec);
       payload = static_cast<const char*>(slot.buffer) + skip;
       if (!read && ec != std::errc::invalid_argument &&

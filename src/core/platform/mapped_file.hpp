@@ -124,6 +124,15 @@ PlatformFile DuplicateFile(PlatformFile file) noexcept;
 /// callers then fall back to buffered reads.
 PlatformFile ReopenUnbuffered(PlatformFile file) noexcept;
 
+/// Reopens `file` for buffered (page-cached) positional reads through a fresh
+/// file object: concurrent readers do not share one synchronous handle, and
+/// the pages stay shared with any mapping of the same file. On POSIX the
+/// result is an independent buffered description; on Windows the handle
+/// carries a random-access hint for the interleaved chunk walks of parallel
+/// readers. Returns kInvalidFile when the reopen is refused; callers then
+/// fall back to ReopenUnbuffered or shared reads.
+PlatformFile ReopenCached(PlatformFile file) noexcept;
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_MAPPED_FILE_HPP_

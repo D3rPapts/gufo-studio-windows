@@ -474,4 +474,24 @@ PlatformFile ReopenUnbuffered(PlatformFile file) noexcept {
 #endif
 }
 
+PlatformFile ReopenCached(PlatformFile file) noexcept {
+  if (!FileValid(file))
+    return kInvalidFile;
+#if defined(_WIN32)
+  // A fresh buffered file object keeps concurrent positional reads off one
+  // synchronous handle, and buffered reads stay fast where unbuffered reads
+  // of a file that is also mapped serialize. Random access matches the
+  // interleaved chunk walks of the parallel readers; no FILE_FLAG_OVERLAPPED
+  // is needed because every reader owns its own file object.
+  HANDLE reopened = ReOpenFile(static_cast<HANDLE>(file), GENERIC_READ,
+                               FILE_SHARE_READ, FILE_FLAG_RANDOM_ACCESS);
+  return reopened == INVALID_HANDLE_VALUE ? kInvalidFile : reopened;
+#else
+  // An independent buffered description; the page cache is shared with any
+  // mapping of the same file.
+  const auto path = "/proc/self/fd/" + std::to_string(file);
+  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
+}
+
 }  // namespace gufo::platform
