@@ -7,6 +7,8 @@
 #include <string_view>
 #include <system_error>
 
+#include "src/core/platform/env.hpp"
+
 namespace gufo::diagnostics {
 namespace {
 
@@ -140,15 +142,9 @@ void ApplyQueuePlan(const QueuePlan& plan) {
     return;
   }
   // Never clobbers an existing value; the operator case returns a zero cap.
-#if defined(_WIN32)
-  if (::getenv(kQueueCapEnvironment) == nullptr) {
-    (void)::_putenv(
-        (std::string(kQueueCapEnvironment) + "=" + std::to_string(plan.cap))
-            .c_str());
+  if (std::getenv(kQueueCapEnvironment) == nullptr) {
+    (void)platform::SetEnv(kQueueCapEnvironment, std::to_string(plan.cap));
   }
-#else
-  (void)::setenv(kQueueCapEnvironment, std::to_string(plan.cap).c_str(), 0);
-#endif
 }
 
 std::string DescribeQueuePlan(std::string_view kind, const QueuePlan& plan) {

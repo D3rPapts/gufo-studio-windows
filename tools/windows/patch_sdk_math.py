@@ -44,44 +44,45 @@ def patch_clang_version(version_dir: Path) -> bool:
     return changed
 
 
+def guard(text: str, snippets: list[str]) -> str:
+    # Each snippet is guarded once; already guarded ones are left alone, so
+    # the script stays idempotent across SDK and script versions.
+    for snippet in snippets:
+        if GUARD_OPEN + snippet in text or snippet not in text:
+            continue
+        text = text.replace(snippet, GUARD_OPEN + snippet + GUARD_CLOSE, 1)
+    return text
+
+
 def patch_headers(header_dir: Path) -> bool:
     changed = False
+    # Newer clang (24) also re-exports them with `using ::isgreater;`, which
+    # fails once the declarations are dropped; MSVC's <cmath> provides
+    # those names itself.
+    usings = [f"using ::{function};\n" for function in FUNCTIONS]
     header = header_dir / "__clang_cuda_math_forward_declares.h"
     if header.exists():
         text = header.read_text(encoding="utf-8")
-        if "GUFO_MSVC_CMATH_PATCH" not in text:
-            patched = text
-            for function in FUNCTIONS:
-                for type_name in TYPES:
-                    declaration = f"__DEVICE__ bool {function}({type_name}, {type_name});\n"
-                    guarded = GUARD_OPEN + declaration + GUARD_CLOSE
-                    if declaration in patched:
-                        patched = patched.replace(declaration, guarded, 1)
-            if patched != text:
-                header.write_text(patched, encoding="utf-8", newline="\n")
-                changed = True
-                print(f"patched declarations: {header}")
+        patched = guard(text, [f"__DEVICE__ bool {function}({type_name}, {type_name});\n"
+                               for function in FUNCTIONS for type_name in TYPES] + usings)
+        if patched != text:
+            header.write_text(patched, encoding="utf-8", newline="\n")
+            changed = True
+            print(f"patched declarations: {header}")
 
     header = header_dir / "__clang_hip_cmath.h"
     if header.exists():
         text = header.read_text(encoding="utf-8")
-        if "GUFO_MSVC_CMATH_PATCH" not in text:
-            patched = text
-            for function in FUNCTIONS:
-                for type_name in TYPES:
-                    definition = (
-                        f"__DEVICE__ __CONSTEXPR__ bool {function}"
-                        f"({type_name} __x, {type_name} __y) {{\n"
-                        f"  return __builtin_{function}(__x, __y);\n"
-                        f"}}\n"
-                    )
-                    guarded = GUARD_OPEN + definition + GUARD_CLOSE
-                    if definition in patched:
-                        patched = patched.replace(definition, guarded, 1)
-            if patched != text:
-                header.write_text(patched, encoding="utf-8", newline="\n")
-                changed = True
-                print(f"patched definitions: {header}")
+        definitions = [
+            f"__DEVICE__ __CONSTEXPR__ bool {function}({type_name} __x, {type_name} __y) {{\n"
+            f"  return __builtin_{function}(__x, __y);\n"
+            f"}}\n"
+            for function in FUNCTIONS for type_name in TYPES]
+        patched = guard(text, definitions + usings)
+        if patched != text:
+            header.write_text(patched, encoding="utf-8", newline="\n")
+            changed = True
+            print(f"patched definitions: {header}")
     return changed
 
 

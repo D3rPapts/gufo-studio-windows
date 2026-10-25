@@ -1,9 +1,5 @@
 #include "src/cli/serve/video_jobs.hpp"
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>

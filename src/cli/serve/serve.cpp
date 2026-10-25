@@ -1,12 +1,5 @@
 #include "src/cli/serve/serve.hpp"
 
-#if defined(_WIN32)
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -41,6 +34,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/platform/shutdown_signal.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -99,55 +93,9 @@ private:
   bool completed_{false};
 };
 
-#if !defined(_WIN32)
-// Reports a fatal signal on the way out. A driver or runtime failure during a
-// load can abort the process outright, which runs no destructor and no
-// terminate handler, leaving a log that stops at event=load_started. Only
-// async-signal-safe calls are allowed here, so the line is assembled by hand
-// and written straight to the descriptor.
-extern "C" void ReportFatalSignal(int number) {
-  static constexpr char kPrefix[] =
-      "[ERROR] [server] event=fatal_signal signal=";
-  char digits[8];
-  std::size_t length = 0;
-  int value = number;
-  if (value <= 0) {
-    digits[length++] = '0';
-  } else {
-    char reversed[8];
-    std::size_t count = 0;
-    while (value > 0 && count < sizeof(reversed)) {
-      reversed[count++] = static_cast<char>('0' + (value % 10));
-      value /= 10;
-    }
-    while (count > 0) {
-      digits[length++] = reversed[--count];
-    }
-  }
-  (void)::write(STDERR_FILENO, kPrefix, sizeof(kPrefix) - 1);
-  (void)::write(STDERR_FILENO, digits, length);
-  (void)::write(STDERR_FILENO, "\n", 1);
-  // Restore the default action and re-raise, so the exit status and any core
-  // dump still describe the original fault.
-  struct sigaction restore{};
-  restore.sa_handler = SIG_DFL;
-  (void)::sigemptyset(&restore.sa_mask);
-  (void)::sigaction(number, &restore, nullptr);
-  (void)::raise(number);
-}
-
 void InstallFatalSignalReporter() {
-  struct sigaction action{};
-  action.sa_handler = ReportFatalSignal;
-  (void)::sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESETHAND;
-  for (const int number : {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
-    (void)::sigaction(number, &action, nullptr);
-  }
+  platform::InstallFatalSignalReporter();
 }
-#else
-void InstallFatalSignalReporter() {}
-#endif
 
 // Installs a terminate handler that names the reason before the process dies.
 // A HIP or driver failure during a load throws, and an exception that reaches
@@ -561,7 +509,7 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
     ArgParser parser(std::string(program_name) + " serve embedding",
-                     "Serve EmbeddingGemma 2 text embeddings.");
+                     "Serve EmbeddingGemma 2 text and image embeddings.");
     AddEmbeddingOptions(parser, &model, &name);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
@@ -660,8 +608,9 @@ void PrintServeHelp(std::string_view program_name,
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
     parser.AddOption("", "--served-model-name", "ID",
-                     "Model identifier exposed by the OpenAI API", "Model",
-                     &served_model_name);
+                     "Model identifier exposed by the OpenAI API (repeatable; "
+                     "the first is primary)",
+                     "Model", &served_model_name);
     parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
@@ -821,7 +770,7 @@ void PrintServeHelp(std::string_view program_name,
       << "  tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n"
       << "  asr       Serve Qwen3-ASR transcription "
          "(/v1/audio/transcriptions)\n"
-      << "  embedding Serve EmbeddingGemma 2 text embeddings "
+      << "  embedding Serve EmbeddingGemma 2 text and image embeddings "
          "(/v1/embeddings)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
@@ -1014,7 +963,7 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
     ArgParser parser("gufo serve embedding",
-                     "Serve EmbeddingGemma 2 text embeddings.");
+                     "Serve EmbeddingGemma 2 text and image embeddings.");
     AddEmbeddingOptions(parser, &model, &name);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
@@ -1237,7 +1186,7 @@ int RunServe(std::span<const char* const> args) {
   } else {
     // Default to LLM server
     std::string model;
-    std::string served_model_name;
+    std::vector<std::string> served_model_names;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -1285,9 +1234,22 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
-    llm_parser.AddOption("", "--served-model-name", "ID",
-                         "Model identifier exposed by the OpenAI API", "Model",
-                         &served_model_name);
+    llm_parser.AddCustomOption(
+        "", "--served-model-name", "ID",
+        "Model identifier exposed by the OpenAI API (repeatable; the first "
+        "is primary)",
+        "Model",
+        [&served_model_names](std::string_view, std::string_view value,
+                              std::string* err) {
+          if (std::ranges::find(served_model_names, value) !=
+              served_model_names.end()) {
+            *err = "duplicate --served-model-name";
+            return false;
+          }
+          if (!value.empty())
+            served_model_names.emplace_back(value);
+          return true;
+        });
     llm_parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
@@ -1592,7 +1554,7 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
-    backend->set_model_id(served_model_name);
+    backend->set_model_ids(std::move(served_model_names));
     // As `gufo --version` prints it; CMake defines both for this target.
     backend->set_served_artifact(model,
                                  GUFO_RELEASE_VERSION " (" GUFO_REVISION ")");
@@ -1634,12 +1596,19 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
             : "off";
+    std::string served_names;
+    if (const auto ids = backend->model_ids(); ids.size() > 1) {
+      served_names = " served_names=" + ids.front();
+      for (std::size_t i = 1; i < ids.size(); ++i)
+        served_names += "," + ids[i];
+    }
     load_log.Complete(
         "model=" + backend->model_id() +
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
+        served_names);
   }
 
   // run() joins every request thread, so no hook call outlives it.

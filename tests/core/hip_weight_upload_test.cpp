@@ -1,16 +1,4 @@
-#if !defined(_WIN32)
-#include <fcntl.h>
-#endif
 #include <hip/hip_runtime.h>
-
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
-#if defined(_WIN32)
-#include <process.h>
-#include <windows.h>
-#endif
 
 #include <array>
 #include <cstdint>
@@ -23,6 +11,8 @@
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/mapped_file.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 using gufo::hip::WeightUpload;
 
@@ -35,32 +25,6 @@ void Require(bool ok, const std::string& message) {
   }
 }
 
-struct Files {
-  std::filesystem::path directory;
-  Files() {
-#if defined(_WIN32)
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      const auto candidate =
-          std::filesystem::temp_directory_path() /
-          ("gufo-weight-upload-" + std::to_string(::GetCurrentProcessId()) +
-           "-" + std::to_string(attempt));
-      std::error_code error;
-      if (std::filesystem::create_directory(candidate, error)) {
-        directory = candidate;
-        return;
-      }
-    }
-    Require(false, "mkdtemp");
-#else
-    char path[] = "/tmp/gufo-weight-upload-XXXXXX";
-    const char* result = ::mkdtemp(path);
-    Require(result != nullptr, "mkdtemp");
-    directory = result;
-#endif
-  }
-  ~Files() { std::filesystem::remove_all(directory); }
-};
-
 struct Device {
   void* data{nullptr};
   explicit Device(std::size_t size) {
@@ -72,9 +36,9 @@ struct Device {
 }  // namespace
 
 int main() {
-  Files files;
-  std::array<std::filesystem::path, 2> paths{files.directory / "first",
-                                             files.directory / "second"};
+  TemporaryDirectory files("gufo-weight-upload");
+  std::array<std::filesystem::path, 2> paths{files.path() / "first",
+                                             files.path() / "second"};
   std::array<std::vector<std::uint8_t>, 2> source;
   source[0].resize((35U << 20) + 4079);
   source[1].resize((2U << 20) + 39);
@@ -91,18 +55,13 @@ int main() {
 
   std::array<gufo::core::GgufMappedRegion, 2> regions;
   for (std::size_t i = 0; i < paths.size(); ++i) {
-#if defined(_WIN32)
-    // The Windows uploader binds by source_path; the descriptor-holds-the-
-    // inode defense against path replacement is a POSIX-only property.
-    regions[i] = {nullptr, source[i].size(), -1, paths[i].string()};
-#else
     regions[i] = {nullptr, source[i].size(),
-                  ::open(paths[i].c_str(), O_RDONLY | O_CLOEXEC)};
-    Require(regions[i].file_descriptor >= 0, "open original shard");
+                  gufo::platform::OpenReadFile(paths[i])};
+    Require(gufo::platform::FileValid(regions[i].file_descriptor),
+            "open original shard");
     std::filesystem::rename(paths[i], paths[i].string() + ".old");
     std::ofstream replacement(paths[i], std::ios::binary);
     replacement << "replacement must never supply model bytes";
-#endif
   }
   constexpr std::size_t guard = 64;
   std::vector<std::uint8_t> expected(guard, 0xa5);
@@ -165,24 +124,13 @@ int main() {
 
   upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, "reopen shards");
-#if defined(_WIN32)
-  // The reopeners hold the shards read-only, so the POSIX truncation of the
-  // replaced pathname has no Windows equivalent; prove the reopen still
-  // serves a queued range from the shard extent.
-  Require(upload->Copy(1, 4096, 8192, device.data, &error),
-          "queue a range after the reopen");
-  Require(upload->Finish(&error), "drain the reopened upload");
-#else
   std::filesystem::resize_file(paths[1].string() + ".old", 17);
   Require(upload->Copy(1, 4096, 8192, device.data, &error),
           "queue a range from the original file extent");
   Require(!upload->Finish(&error), "a truncated shard fails its pending read");
-#endif
   std::puts(
       "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
   upload.reset();
-#if !defined(_WIN32)
   for (const auto& region : regions)
-    ::close(region.file_descriptor);
-#endif
+    gufo::platform::CloseFile(region.file_descriptor);
 }

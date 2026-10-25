@@ -1,13 +1,4 @@
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
-#if defined(_WIN32)
-#include <windows.h>
-#endif
-
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +17,7 @@
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace {
 
@@ -45,38 +37,6 @@ void Expect(bool condition, const std::string& message) {
     std::exit(1);
   }
 }
-
-struct TemporaryDirectory {
-  TemporaryDirectory() {
-#if defined(_WIN32)
-    for (int attempt = 0; attempt < 64; ++attempt) {
-      const auto candidate =
-          std::filesystem::temp_directory_path() /
-          ("gufo-h3-runtime-" + std::to_string(::GetCurrentProcessId()) + "-" +
-           std::to_string(attempt));
-      std::error_code error;
-      if (std::filesystem::create_directory(candidate, error)) {
-        path = candidate;
-        return;
-      }
-    }
-    throw std::runtime_error("mkdtemp failed");
-#else
-    std::array<char, 64> pattern{};
-    std::strcpy(pattern.data(), "/tmp/gufo-h3-runtime-XXXXXX");
-    char* result = mkdtemp(pattern.data());
-    if (result == nullptr) {
-      throw std::runtime_error("mkdtemp failed");
-    }
-    path = result;
-#endif
-  }
-  ~TemporaryDirectory() {
-    std::error_code error;
-    std::filesystem::remove_all(path, error);
-  }
-  std::filesystem::path path;
-};
 
 struct TensorSpec {
   std::string name;
@@ -339,8 +299,8 @@ void TestStrictJson() {
 }
 
 void TestInspectionAndInventory() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   Expect(inventory.tensors().size() == 5, "all fixture tensors inspected");
   Expect(inventory.shards().size() == 4, "all fixture shards inspected");
@@ -357,8 +317,8 @@ void TestInspectionAndInventory() {
 }
 
 void TestUnknownArchitectureRejected() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   fixture.WriteIndexes(true);
   std::string error;
   const auto inventory = ModelInventory::Inspect(
@@ -370,8 +330,8 @@ void TestUnknownArchitectureRejected() {
 }
 
 void TestPinnedManifestRequiredByDefault() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   std::string error;
   const auto inventory = ModelInventory::Inspect(
       fixture.root, fixture.root / "source-manifest.json", &error);
@@ -383,8 +343,8 @@ void TestPinnedManifestRequiredByDefault() {
 }
 
 void TestDeviceCopyAndMappedResidency() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   FakeBackend backend;
   {
@@ -426,8 +386,8 @@ void TestDeviceCopyAndMappedResidency() {
 }
 
 void TestFailureInjectionIsTransactional() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   for (const ResidencyMode mode :
        {ResidencyMode::kMappedReadOnly, ResidencyMode::kDeviceCopy}) {
@@ -468,8 +428,8 @@ void TestFailureInjectionIsTransactional() {
 }
 
 void TestCancellationAndPhasePeaks() {
-  TemporaryDirectory temporary;
-  ModelFixture fixture(temporary.path);
+  TemporaryDirectory temporary("gufo-h3-runtime");
+  ModelFixture fixture(temporary.path());
   const ModelInventory inventory = InspectFixture(fixture);
   FakeBackend backend;
   CancellationToken cancelled;

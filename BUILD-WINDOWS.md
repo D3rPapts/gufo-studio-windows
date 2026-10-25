@@ -1,111 +1,131 @@
-# Building Gufo (Windows / Strix Halo) from my fork
+# Building Gufo (Windows / Strix Halo)
 
-This is the native Windows port of Gufo for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151). It is **not** an upstream-supported configuration — upstream targets Linux — so the build expects a specific toolchain layout. Follow the steps in order.
-
-**If you only want a ready-made binary:** no need to build anything. Grab `gufo-*-windows-gfx1151.zip` from this fork's [Releases page](https://github.com/endyjasmi/gufo/releases), unzip it, and run `gufo.exe` from the extracted folder (an AMD driver with ROCm support is required). The rest of this guide is for building from source.
+Windows x86-64 is a supported native build target for development, sharing
+the source tree of the Linux production build. Production packages are cut
+from the Linux build. The device toolchain differs: `clang-cl` and the HIP
+runtime come from a TheRock SDK, MSVC supplies the C++ standard library and
+the linker, and vcpkg supplies the libraries.
 
 ## 1. Prerequisites
 
-- **Hardware/driver:** AMD Strix Halo (gfx1151) with a recent AMD driver (current Adrenalin/PRO drivers work).
-- **Visual Studio 2022/18** with the "Desktop development with C++" workload (MSVC x64 — the device compiler comes from TheRock below, not VS).
-- **Git**, **CMake ≥ 3.29**, **Ninja** (VS bundles both under `Common7\IDE\CommonExtensions\Microsoft\CMake\bin`), **Python 3**.
-- **vcpkg** cloned somewhere fixed, e.g. `C:\vcpkg`:
+- **Hardware/driver:** AMD Strix Halo (gfx1151) with a current AMD graphics
+  driver. Hosted builds without a GPU need none.
+- **Visual Studio 2022 or 18** with the "Desktop development with C++"
+  workload (MSVC x64).
+- **Git**, **CMake ≥ 3.29**, **Ninja** (Visual Studio bundles both;
+  `vs-env.cmd` puts them on `PATH`) and **Python 3**.
+- **vcpkg**, a full clone (the manifest baseline resolves through its
+  history), with `VCPKG_ROOT` set to it:
 
   ```cmd
   git clone https://github.com/microsoft/vcpkg.git C:\vcpkg && C:\vcpkg\bootstrap-vcpkg.bat
+  setx VCPKG_ROOT C:\vcpkg
   ```
 
-- **TheRock HIP SDK** (the AMD ROCm development distribution built by the TheRock project) — a **Windows nightly distribution for gfx1151**, extracted to exactly **`C:\TheRock\build`**. The build presets hardcode `C:/TheRock/build`, so if you put it elsewhere, also update the compiler/prefix paths in `CMakePresets.json` (`windows-base` preset). Use a **nightly** build — the stable ROCm 7.x SDK runtimes currently crash (`hipStreamCreateWithFlags` hangs/segfaults) with shipping drivers.
+- **TheRock 10.0.0 for gfx1151**, `therock-dist-windows-gfx1151-10.0.0.tar.gz`
+  (sha256 `1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38`),
+  extracted anywhere, with `HIP_PATH` set to that directory:
+
+  ```cmd
+  mkdir C:\TheRock\build
+  tar -xzf therock-dist-windows-gfx1151-10.0.0.tar.gz -C C:\TheRock\build
+  setx HIP_PATH C:\TheRock\build
+  ```
+
+  AMD's index no longer serves 10.0.0; CI downloads it from the
+  [Windows port's mirror](https://github.com/endyjasmi/gufo/releases/tag/toolchain/therock-10.0.0).
+  It is the only SDK validated at full speed on gfx1151: later builds
+  (10.1.0 through at least the 10.2.0a nightlies of October 2026) compile
+  correct kernels that stall on this GPU, with decode up to hundreds of times
+  slower. The `windows-base` preset chain-loads
+  `cmake/toolchains/windows-therock.cmake`, which takes `clang-cl` and the
+  runtime from `HIP_PATH`.
 
 ## 2. Patch the SDK's HIP headers (once, and after every SDK reinstall)
 
-MSVC 14.40+ conflicts with Clang's HIP math headers. The repo ships an idempotent fixer:
+MSVC 14.40+ conflicts with Clang's HIP math headers. The repository ships an
+idempotent fixer, and configure stops with a pointer to it while the SDK is
+unpatched:
 
 ```cmd
-python tools\windows\patch_sdk_math.py C:\TheRock\build
+python tools\windows\patch_sdk_math.py %HIP_PATH%
 ```
 
-## 3. Clone
+## 3. Configure and build
 
 ```cmd
-git clone -b feature/window-native https://github.com/endyjasmi/gufo.git
-cd gufo
-```
-
-## 4. Fix the VS path in the env script
-
-`tools\windows\vs-env.cmd` hardcodes `C:\Program Files\Microsoft Visual Studio\18\Community\...`. If your VS is installed elsewhere (e.g. `2022` instead of `18`, or a different edition), edit that one `call ... vcvars64.bat` line to point at your `vcvars64.bat`.
-
-## 5. Configure + build
-
-```cmd
-tools\windows\vs-env.cmd cmake --preset windows-release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+tools\windows\vs-env.cmd cmake --preset windows-release
 tools\windows\vs-env.cmd cmake --build --preset windows-release
 ```
 
-(Adjust the vcpkg path to where you put it. First configure downloads dependencies via vcpkg. The build itself is a few minutes and produces `build\windows-release\gufo.exe` plus the staged ROCm DLLs.)
+`vs-env.cmd` finds Visual Studio with `vswhere`, loads the x64 environment and
+runs its arguments. From another `.bat` file, invoke it with `call`, or the
+calling script stops after it. The first configure builds the dependencies
+through vcpkg (ICU and OpenSSL take several minutes). The build produces
+`build\windows-release\gufo.exe` and `gufo-server.exe`, with the TheRock
+runtime DLLs and the `rocblas\` and `hipblaslt\` kernel libraries staged
+beside them.
 
-**The binary must stay in `build\windows-release\`** — it won't run from anywhere else.
-
-## 6. Copy the Tensile data directories (required — the build does not do this)
-
-The build stages the rocBLAS/hipBLASLt DLLs but **not** their kernel libraries. Without this step every GPU call fails with `rocBLAS error: Could not initialize Tensile host ... /rocblas/library`:
+For the host test suite, which needs no GPU:
 
 ```cmd
-xcopy /E /I C:\TheRock\build\bin\rocblas   build\windows-release\rocblas
-xcopy /E /I C:\TheRock\build\bin\hipblaslt build\windows-release\hipblaslt
+tools\windows\vs-env.cmd cmake --preset windows-cpu-test
+tools\windows\vs-env.cmd cmake --build --preset windows-cpu-test --target check-pr
 ```
 
-Re-do this whenever you rebuild into a fresh folder or reinstall the SDK.
+Some host suites stay Linux-only (they simulate `RLIMIT_FSIZE`, fork
+themselves or fault libc symbols); their targets are off on Windows and the
+Linux CI runs them.
 
-## 7. Verify
+**Faster rebuilds:** with `ccache` on `PATH`, CMake compiles C, C++ and HIP
+through it. Configure with embedded debug information, because ccache cannot
+cache objects that share a `/Zi` PDB:
+
+```cmd
+tools\windows\vs-env.cmd cmake --preset windows-release -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+```
+
+## 4. Verify
 
 ```cmd
 build\windows-release\gufo.exe diagnose
 ```
 
-Then run a real model (GGUF from Hugging Face, e.g. an unsloth Q4_K_XL build):
+On a Strix Halo it reports `x86_64-windows`, the gfx1151 GPU and ROCm 10.0.0.
+Then run a real model (a GGUF from Hugging Face, for example an unsloth
+UD-Q4_K_XL build):
 
 ```cmd
 build\windows-release\gufo.exe bench -p 2048 -n 128 <path\to\model.gguf>
-```
-
-## 8. Validating a new TheRock SDK before pointing releases at it
-
-The release workflow ships from a pinned SDK (`PINNED_SDK` in
-`.github/workflows/windows-release.yml`), not from the newest nightly, and
-falls back to the mirrored tarball in this repository's
-`toolchain/therock-*` release when AMD purges it from the nightly index.
-
-Never bump that pin on faith: a toolchain change can compile binaries that
-are *functionally correct but run orders of magnitude slower*, which a
-`--version` smoke test cannot catch — nightly `10.2.0a20261005` produced
-binaries that ran ~100x slower on gfx1151 (issue #1). Validate a candidate
-SDK end to end on device before publishing from it:
-
-1. Build locally with the candidate SDK (steps 5-6, pointing the presets at
-   the new SDK root).
-2. Run the bench from step 7 on a known model and compare against a build
-   from the current pin on the same machine, same session. Numbers within
-   ~10% are fine; a large drop means the SDK regressed — do not ship it.
-3. Serve a prompt through `/v1/chat/completions` and check `ttft_ms` and
-   `decode_tps` in the request log line.
-
-To serve:
-
-```cmd
 build\windows-release\gufo.exe serve --port 8080 llm --model <path\to\model.gguf> --context 4096
 ```
 
 Then `curl http://127.0.0.1:8080/ready` and POST to `/v1/chat/completions`.
 
+## CI
+
+[`.github/workflows/windows.yml`](.github/workflows/windows.yml) builds this
+recipe on a hosted `windows-latest` runner, with the SDK archive, the vcpkg
+packages and the compiler cache restored from the Actions cache, and runs
+`check-pr`. On a manual dispatch, the Windows Strix Halo Devlab runner then
+downloads the resulting bundle and runs `gufo diagnose`, the weight-free GPU
+tests, and one small model per family through
+[`tests/functional/family_smoke.py`](tests/functional/family_smoke.py):
+EmbeddingGemma 2, Qwen3-ASR, Qwen3-TTS and Qwen3.8-27B. Pull requests do not
+run that job yet: the runners' route to the Actions artifact store is too slow
+for the bundle ([#789](https://github.com/gufo-org/gufo/issues/789)).
+
 ## Gotchas
 
-- If linking fails with `failed to write output 'gufo.exe': permission denied`, a `gufo serve` process is still running — kill it and rebuild.
-- Don't move/copy `gufo.exe` out of `build\windows-release\` (or if you do, take the whole folder: `gufo.exe`, all DLLs, and the `rocblas\` and `hipblaslt\` directories).
-- If you reinstall or upgrade the TheRock SDK, re-run steps 2 and 6.
-- Don't run repo formatting tools on Windows; the CI toolchain differs.
-
----
-
-For reference: on a comparable machine the fresh build produced a **2.4 GB** `build\windows-release` folder and took about **4 minutes** after configure.
+- If linking fails with `failed to write output 'gufo.exe': permission
+  denied`, a `gufo serve` process is still running: stop it and rebuild.
+- Keep `gufo.exe` with its folder. The staged runtime DLLs resolve relative
+  to the executable, ahead of the older `amdhip64` the AMD driver installs in
+  System32; copy the whole folder (`gufo.exe`, the DLLs, `rocblas\` and
+  `hipblaslt\`).
+- After reinstalling or upgrading the SDK, rerun the patch in step 2 and
+  rebuild into a fresh build directory so the runtime stages again.
+- `gufo serve llm` with Qwen3.8-27B can fail with `std::bad_alloc` on
+  machines whose OS memory pool is small next to the GPU carve-out: the serve
+  path holds a second host copy of the weights. `gufo bench` and
+  `gufo prompt` load the weights once.

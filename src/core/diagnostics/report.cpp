@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <sstream>
 
+#include "src/core/platform/os_info.hpp"
+
 namespace gufo::diagnostics {
 
 namespace {
@@ -13,11 +15,7 @@ std::string CurrentIso8601Utc() {
   const auto now = std::chrono::system_clock::now();
   const auto time_t_now = std::chrono::system_clock::to_time_t(now);
   std::tm tm_utc{};
-#if defined(_WIN32)
-  gmtime_s(&tm_utc, &time_t_now);
-#else
-  gmtime_r(&time_t_now, &tm_utc);
-#endif
+  gufo::platform::UtcTime(time_t_now, &tm_utc);
 
   std::ostringstream oss;
   oss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");

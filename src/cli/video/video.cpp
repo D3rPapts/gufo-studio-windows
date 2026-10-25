@@ -1,9 +1,5 @@
 #include "src/cli/video/video.hpp"
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -12,6 +8,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string_view>
 #include <system_error>
 #include <thread>

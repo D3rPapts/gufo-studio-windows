@@ -228,7 +228,8 @@ def server(command, log_path, startup_timeout, environment=None):
                     process.send_signal(signal.SIGINT)
                 except ValueError:
                     # Windows Popen cannot deliver SIGINT; TerminateProcess
-                    # still reaps the server.
+                    # still reaps the server, but graceful shutdown is never
+                    # exercised there.
                     process.terminate()
                 try:
                     process.wait(timeout=30)

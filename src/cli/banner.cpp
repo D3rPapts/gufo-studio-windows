@@ -1,16 +1,12 @@
 #include "src/cli/banner.hpp"
 
-#if defined(_WIN32)
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string_view>
+
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::cli {
 
@@ -49,11 +45,7 @@ void PrintStartupBanner(std::string_view version,
     return;
   printed = true;
 
-#if defined(_WIN32)
-  if (::_isatty(::_fileno(stderr)) == 0 || SuppressesBanner(options))
-#else
-  if (::isatty(STDERR_FILENO) == 0 || SuppressesBanner(options))
-#endif
+  if (!platform::StderrIsTerminal() || SuppressesBanner(options))
     return;
 
   const bool color = std::getenv("NO_COLOR") == nullptr;

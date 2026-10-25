@@ -1190,9 +1190,8 @@ void TestAutomaticTools() {
         std::vector<float> after_call(259, -INFINITY);
         after_call['a'] = 1;
         after_call[256] = 0;
-        // Copy outside assert: MSVC's macro cannot parse auto(...) inside.
-        auto sampled = sampler;
-        assert(sampled.Sample(after_call) == 256);
+        auto snapshot = sampler;
+        assert(snapshot.Sample(after_call) == 256);
         sampler.Accept(257);  // Empty pieces preserve the ordinary path.
         sampler.Accept(256);  // Natural EOS is allowed without another call.
         sampler = before_call;

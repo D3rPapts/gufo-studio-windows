@@ -1,16 +1,5 @@
 #include "src/cli/serve/component_text_cache.hpp"
 
-#if defined(_WIN32)
-// clang-format off
-// bcrypt.h needs windows.h's LONG/ULONG first; keep the order.
-#include <windows.h>
-#include <bcrypt.h>
-// clang-format on
-#pragma comment(lib, "bcrypt")
-#else
-#include <sys/random.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -26,6 +15,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 namespace {
@@ -238,16 +228,8 @@ struct ComponentTextCache::Impl {
     crypto::Sha256Hasher hash;
     hash.Update(identity);
     digest = hash.Finish();
-#if defined(_WIN32)
-    if (BCryptGenRandom(nullptr, nonce.data(),
-                        static_cast<unsigned long>(nonce.size()),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+    if (!platform::FillRandomBytes(nonce))
       throw std::runtime_error("cannot obtain cache publication nonce");
-#else
-    if (getrandom(nonce.data(), nonce.size(), 0) !=
-        static_cast<ssize_t>(nonce.size()))
-      throw std::runtime_error("cannot obtain cache publication nonce");
-#endif
     index.Register(identity, resources->adapter->Components(), digest);
     if (options) {
       const auto row_bytes =

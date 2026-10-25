@@ -35,9 +35,38 @@ find_program(GUFO_CCACHE_PROGRAM NAMES ccache)
 if (GUFO_CCACHE_PROGRAM)
   set(CMAKE_C_COMPILER_LAUNCHER "${GUFO_CCACHE_PROGRAM}")
   set(CMAKE_CXX_COMPILER_LAUNCHER "${GUFO_CCACHE_PROGRAM}")
+  # Newer CMake gives clang-cl gcc-style depfiles (-clang:-MD), which ccache
+  # rejects as unsupported; /showIncludes is cacheable.
+  if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(GUFO_CCACHE_CLANG_CL ON)
+    foreach(lang C CXX)
+      set(CMAKE_DEPFILE_FLAGS_${lang} "/showIncludes")
+      set(CMAKE_${lang}_DEPFILE_FORMAT msvc)
+    endforeach()
+  endif()
   message(STATUS "gufo: compiling C and CXX through ${GUFO_CCACHE_PROGRAM}")
 else()
   message(STATUS "gufo: ccache not found, compiling without a launcher")
+endif()
+
+# Windows host checks build only the OS leaves, the CPU cache library and
+# their portable tests. The rest of the tree targets Linux only.
+option(GUFO_PLATFORM_ONLY
+  "Build only the platform leaves, the CPU cache and their portable tests" OFF)
+if (GUFO_PLATFORM_ONLY)
+  find_package(Threads REQUIRED)
+  add_compile_options(-Wall -Wextra -Wpedantic -UNDEBUG)
+  add_subdirectory(src/core/platform)
+  add_subdirectory(src/cache)
+  include(CTest)
+  if (BUILD_TESTING)
+    if (NOT WIN32)
+      find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    endif()
+    include(cmake/PlatformTests.cmake)
+    add_subdirectory(tests/cache)
+  endif()
+  return()
 endif()
 find_package(ICU REQUIRED COMPONENTS uc i18n)
 find_package(Threads REQUIRED)
@@ -74,6 +103,13 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
+  # clang-cl compiles HIP like C++ on Windows, so ccache covers it there.
+  if (GUFO_CCACHE_CLANG_CL)
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${GUFO_CCACHE_PROGRAM}")
+    set(CMAKE_DEPFILE_FLAGS_HIP "/showIncludes")
+    set(CMAKE_HIP_DEPFILE_FORMAT msvc)
+    message(STATUS "gufo: compiling HIP through ${GUFO_CCACHE_PROGRAM}")
+  endif()
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
@@ -87,12 +123,10 @@ if (ENGINE_ENABLE_HIP)
     # The AMD driver installs an older amdhip64 into System32 that shadows
     # the TheRock runtime on the DLL search path; executables must carry the
     # matching runtime beside them (the exe directory precedes System32).
+    # ROCM_PATH comes from cmake/toolchains/windows-therock.cmake (HIP_PATH).
     file(GLOB GUFO_HIP_RUNTIME_DLLS "${ROCM_PATH}/bin/*.dll")
     if (NOT GUFO_HIP_RUNTIME_DLLS)
-      file(GLOB GUFO_HIP_RUNTIME_DLLS "C:/TheRock/build/bin/*.dll")
-    endif()
-    if (NOT GUFO_HIP_RUNTIME_DLLS)
-      message(FATAL_ERROR "Cannot locate TheRock runtime DLLs for the Windows HIP build")
+      message(FATAL_ERROR "No HIP runtime DLLs under ROCM_PATH=${ROCM_PATH}/bin")
     endif()
     message(STATUS "gufo: staging ${GUFO_HIP_RUNTIME_DLLS}")
   endif()
@@ -123,7 +157,7 @@ endif()
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
-# Ornith-1.5-35B (qwen35moe) — Flash-Next-lineage hybrid MoE; shares the
+# Ornith-1.5-35B (qwen35moe) - Flash-Next-lineage hybrid MoE; shares the
 # vendored qfn_mmq kernel build.
 add_subdirectory(src/models/qwen35moe)
 
@@ -133,7 +167,7 @@ add_subdirectory(src/models/qwen3_tts)
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
 
-# EmbeddingGemma 2 is a model-private BF16 text embedding runtime.
+# EmbeddingGemma 2 is a model-private BF16 text/image embedding runtime.
 add_subdirectory(src/models/embedding_gemma2)
 
 # Compiler warnings and sanitizers
@@ -155,19 +189,37 @@ if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   # CMake drives lld-link directly, which skips the clang-cl driver and its
   # runtime selection. Code using __builtin_cpu_supports (the disk CRC
   # dispatch) needs the builtins' __cpu_model at link time.
-  get_filename_component(GUFO_LLVM_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  get_filename_component(GUFO_LLVM_DIR "${GUFO_LLVM_DIR}" DIRECTORY)
-  file(GLOB GUFO_CLANG_RT_BUILTINS
-       "${GUFO_LLVM_DIR}/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
-  if (GUFO_CLANG_RT_BUILTINS)
-    list(GET GUFO_CLANG_RT_BUILTINS 0 GUFO_CLANG_RT_BUILTINS)
+  # Ask the compiler in use for its runtime directory.
+  execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-runtime-dir
+                  OUTPUT_VARIABLE GUFO_CLANG_RT_DIR
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  set(GUFO_CLANG_RT_BUILTINS
+      "${GUFO_CLANG_RT_DIR}/clang_rt.builtins-x86_64.lib")
+  if (EXISTS "${GUFO_CLANG_RT_BUILTINS}")
     add_link_options("${GUFO_CLANG_RT_BUILTINS}")
+  else()
+    message(WARNING "clang_rt.builtins not found under '${GUFO_CLANG_RT_DIR}'")
+  endif()
+  if (ENGINE_ENABLE_HIP)
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+                    OUTPUT_VARIABLE GUFO_CLANG_RESOURCE_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    set(GUFO_HIP_CMATH "${GUFO_CLANG_RESOURCE_DIR}/include/__clang_hip_cmath.h")
+    if (EXISTS "${GUFO_HIP_CMATH}")
+      file(READ "${GUFO_HIP_CMATH}" GUFO_HIP_CMATH_CONTENT)
+      if (NOT GUFO_HIP_CMATH_CONTENT MATCHES "GUFO_MSVC_CMATH_PATCH")
+        message(FATAL_ERROR
+          "TheRock HIP math headers are not patched for MSVC 14.40+; run: "
+          "python tools/windows/patch_sdk_math.py")
+      endif()
+    endif()
   endif()
 endif()
 
 if (WIN32)
-  # Platform layer: WinSock (net), process memory counters (logging).
-  set(GUFO_PLATFORM_LIBS ws2_32 iphlpapi)
+  # Platform layer: WinSock (net), process memory counters (logging), BCrypt
+  # and the registry (os_info).
+  set(GUFO_PLATFORM_LIBS ws2_32 iphlpapi bcrypt advapi32)
 endif()
 
 add_subdirectory(src/cache)
@@ -208,6 +260,7 @@ add_library(gufo_diagnostics STATIC
   src/cli/diagnose/diagnose.cpp
 )
 target_include_directories(gufo_diagnostics PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(gufo_diagnostics PUBLIC gufo_platform)
 target_compile_definitions(gufo_diagnostics PRIVATE
   GUFO_REVISION="${GUFO_REVISION}")
 
@@ -222,25 +275,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
 endif()
 
-add_library(gufo_platform STATIC
-  src/core/platform/mapped_file.cpp
-  src/core/platform/mapped_file.cpp
-  src/core/platform/net.cpp
-  src/core/platform/shutdown_signal.cpp
-  src/core/platform/publish.cpp
-  src/core/platform/os_info.cpp
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/fs_posix.cpp>"
-  src/core/platform/publish.cpp
-  src/core/platform/shutdown_signal.cpp
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/pages_posix.cpp>"
-  "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/page_pin_linux.cpp>"
-  "$<$<PLATFORM_ID:Windows>:src/core/platform/fs_windows.cpp>"
-  "$<$<PLATFORM_ID:Windows>:src/core/platform/pages_windows.cpp>"
-  "$<$<PLATFORM_ID:Windows>:src/core/platform/page_pin_windows.cpp>")
-target_link_libraries(gufo_platform PUBLIC Threads::Threads)
-if (WIN32)
-  target_link_libraries(gufo_platform PUBLIC ${GUFO_PLATFORM_LIBS})
-endif()
+add_subdirectory(src/core/platform)
 
 add_library(gufo_core STATIC
   src/core/image.cpp
@@ -389,15 +424,14 @@ if (ENGINE_ENABLE_HIP)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
 
-if (WIN32)
+if (NOT WIN32)
   add_custom_target(gufo-server ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gufo>
-            ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
     DEPENDS gufo
   )
 else()
   add_custom_target(gufo-server ALL
-    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
     DEPENDS gufo
   )
 endif()
@@ -441,7 +475,7 @@ install(FILES LICENSE NOTICE THIRD_PARTY_NOTICES.md DESTINATION share/licenses/g
 install(DIRECTORY licenses/ DESTINATION share/licenses/gufo/third-party)
 install(FILES src/models/deepseek_v4_flash/LICENSE.ds4 DESTINATION share/licenses/gufo/third-party)
 if (NOT WIN32)
-  install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink gufo \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server\")")
+install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink gufo \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server\")")
 else()
   install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E copy \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo.exe\" \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server.exe\")")
 endif()
@@ -575,19 +609,32 @@ if (BUILD_TESTING)
   add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
   set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
 
+  # the trace suite simulates RLIMIT_FSIZE
+  if (NOT WIN32)
   add_executable(trace_test tests/cli/trace_test.cpp)
-  target_link_libraries(trace_test PRIVATE gufo_logging)
+  target_link_libraries(trace_test PRIVATE gufo_logging gufo_platform)
   add_test(NAME trace_test COMMAND trace_test)
   set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
+  endif()
 
+  # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
+  if (NOT WIN32)
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+
+  add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
+  target_link_libraries(http_server_signals_test PRIVATE gufo_http)
+  add_test(NAME http_server_signals_test COMMAND http_server_signals_test)
+  set_tests_properties(http_server_signals_test
+    PROPERTIES LABELS "cpu;server;http" TIMEOUT 60)
+
   add_executable(audio_websocket_test tests/cli/audio_websocket_test.cpp)
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)
   set_tests_properties(audio_websocket_test PROPERTIES LABELS "cpu;server;audio" TIMEOUT 30)
+  endif()
 
   add_test(NAME serve_cli_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/serve_test.py
@@ -610,7 +657,8 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/check_pr_title_test.py)
   set_tests_properties(check_pr_title_test PROPERTIES LABELS "cpu;docs" TIMEOUT 30)
 
-  if(ENGINE_ENABLE_HIP)
+  # It reads the gufo binary, which Windows does not build yet.
+  if(ENGINE_ENABLE_HIP AND TARGET gufo)
     # A compiler update can make a kernel spill with no source change. Clang 23
     # increased the scratch of the Q8 prefill GEMM from 0 to 480 bytes. This
     # test fails if a kernel uses more scratch than the baseline allows. It
@@ -672,6 +720,8 @@ if (BUILD_TESTING)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 
+  # the disk-store suite exercises permission faults with chmod and lstat
+  if (NOT WIN32)
   add_executable(continuation_disk_store_test
     tests/cli/continuation_disk_store_test.cpp
     src/cli/serve/continuation_disk_store.cpp
@@ -683,6 +733,7 @@ if (BUILD_TESTING)
     COMMAND continuation_disk_store_test)
   set_tests_properties(continuation_disk_store_test PROPERTIES
     LABELS "cpu;server;cache;disk;state;lifecycle")
+  endif()
 
   add_executable(logit_sampler_test tests/cli/logit_sampler_test.cpp)
   target_link_libraries(logit_sampler_test PRIVATE gufo_core)
@@ -797,6 +848,7 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_cache_workloads.py)
   set_tests_properties(cache_workloads_test PROPERTIES LABELS "cpu;server;functional")
+  # the fault runner needs the Linux-only gate library
   if (NOT WIN32)
   add_test(NAME cache_disk_faults_test
     COMMAND ${Python3_EXECUTABLE}
@@ -818,7 +870,7 @@ if (BUILD_TESTING)
     LABELS "cpu;tools;profiling")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
-  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics)
+  target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
   add_test(NAME gpu_queues_test COMMAND gpu_queues_test)
   set_tests_properties(gpu_queues_test PROPERTIES LABELS "cpu;diagnostics;serving")
 
@@ -838,17 +890,23 @@ if (BUILD_TESTING)
   set_tests_properties(allocation_benchmark_test PROPERTIES
     LABELS "gpu;hip;gfx1151;diagnostics;allocation;opt-c091")
 
+  # the prefetch fixture uses mkstemp and mmap
+  if (NOT WIN32)
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE gufo_core)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+  endif()
 
+  # the digest-cache case restores mtimes with utimensat
+  if (NOT WIN32)
   add_executable(gguf_identity_test tests/core/gguf_identity_test.cpp)
   target_link_libraries(gguf_identity_test PRIVATE gufo_core)
 
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
+  endif()
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)
@@ -981,15 +1039,15 @@ if (BUILD_TESTING)
   set_tests_properties(eval_http_test PROPERTIES
     LABELS "cpu;quality;eval;http;cli;server")
 
+  # The eval client fixture drives raw POSIX sockets directly.
+  if (NOT WIN32)
   add_executable(eval_http_client_test
     tests/quality/eval_http_client_test.cpp src/eval/http_client.cpp)
   target_include_directories(eval_http_client_test PRIVATE ${PROJECT_SOURCE_DIR})
   target_link_libraries(eval_http_client_test PRIVATE CURL::libcurl Threads::Threads)
-  if (WIN32)
-    target_link_libraries(eval_http_client_test PRIVATE ws2_32)
-  endif()
   add_test(NAME eval_http_client_test COMMAND eval_http_client_test)
   set_tests_properties(eval_http_client_test PROPERTIES LABELS "cpu;quality;eval;http")
+  endif()
 
   add_executable(kernel_bench_test tests/benchmarks/kernel_bench_test.cpp)
   target_link_libraries(kernel_bench_test PRIVATE gufo_kernel_bench_support)
@@ -997,6 +1055,8 @@ if (BUILD_TESTING)
   set_tests_properties(kernel_bench_test PROPERTIES
     LABELS "cpu;benchmarks;statistics;json")
 
+  # the publish suite drives descriptors through dup2
+  if (NOT WIN32)
   add_executable(platform_publish_test
     tests/core/platform_publish_test.cpp src/core/platform/publish.cpp)
   target_link_libraries(platform_publish_test PRIVATE Threads::Threads)
@@ -1005,24 +1065,17 @@ if (BUILD_TESTING)
   endif()
   add_test(NAME platform_publish_test COMMAND platform_publish_test)
   set_tests_properties(platform_publish_test PROPERTIES LABELS "cpu;platform")
+  endif()
 
+  # the prefault fixture maps pages with mmap
+  if (NOT WIN32)
   add_executable(platform_prefault_test tests/core/platform_prefault_test.cpp)
   target_link_libraries(platform_prefault_test PRIVATE Threads::Threads)
   add_test(NAME platform_prefault_test COMMAND platform_prefault_test)
   set_tests_properties(platform_prefault_test PROPERTIES LABELS "cpu;platform")
+  endif()
 
-  add_executable(platform_mapped_file_test
-    tests/core/platform_mapped_file_test.cpp src/core/platform/mapped_file.cpp)
-  add_test(NAME platform_mapped_file_test COMMAND platform_mapped_file_test)
-  set_tests_properties(platform_mapped_file_test PROPERTIES
-    LABELS "cpu;platform")
-  add_executable(platform_fs_test
-    tests/core/platform_fs_test.cpp
-    "$<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/fs_posix.cpp>"
-    "$<$<PLATFORM_ID:Windows>:src/core/platform/fs_windows.cpp>"
-    src/core/platform/mapped_file.cpp)
-  add_test(NAME platform_fs_test COMMAND platform_fs_test)
-  set_tests_properties(platform_fs_test PROPERTIES LABELS "cpu;platform")
+  include(cmake/PlatformTests.cmake)
 
   add_executable(hipblaslt_plan_cache_test
     tests/core/hipblaslt_plan_cache_test.cpp)

@@ -1,11 +1,3 @@
-#if !defined(_WIN32)
-#include <arpa/inet.h>
-#endif
-
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
 #include <webp/encode.h>
 
 #include <algorithm>
@@ -18,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "src/core/platform/net.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 

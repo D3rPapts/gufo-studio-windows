@@ -19,7 +19,8 @@ set(gufo_pr_targets
   platform_fs_test
   logit_sampler_test ggml_dequant_test
   quote_tracker_test
-  openai_chat_test http_server_test trace_test audio_websocket_test
+  openai_chat_test http_server_test http_server_signals_test trace_test
+  audio_websocket_test
   text_generation_scheduler_test
   component_text_cache_test text_model_runner_test continuation_disk_store_test
   bench_cli_test prompt_cli_test eval_http_client_test
@@ -27,40 +28,48 @@ set(gufo_pr_targets
   qwen27b_continuation_layout_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_rope_scaling_test
-  qwen35moe_config_test qwen35moe_mtp_sampling_test
   qwen38_flash_next_continuation_layout_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
   qwen3_asr_config_test qwen3_asr_audio_api_test
   embedding_gemma2_config_test embedding_gemma2_embeddings_api_test
+  embedding_gemma2_image_processor_test
   qwen3_tts_config_test qwen3_tts_audio_api_test
   qwen_image_21_test
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test)
 set(gufo_pr_tests ${gufo_pr_targets})
-if (WIN32)
-  # Linux-only hosted tests: the disk-store fault cases wrap libc symbols and
-  # fork(); the functional gate interposes fsync and reads /proc/self/fd.
-  list(REMOVE_ITEM gufo_pr_targets cache_disk_test cache_disk_publication_test)
-  list(REMOVE_ITEM gufo_pr_tests cache_disk_test cache_disk_publication_test
-    cache_disk_faults_test)
-endif()
 list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_rope_scaling_test
-  qwen35moe_config_test qwen35moe_mtp_sampling_test
   qwen38_flash_next_continuation_layout_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
-  "qwen35moe\\.config" "qwen35moe\\.mtp_sampling"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
   kernel_resources_parser_test check_docs_test check_pr_title_test)
+if (WIN32)
+  # Linux-only hosted suites: RLIMIT_FSIZE and fork()-based tests, the
+  # dup2/mmap/socket fixture tests, the permission-fault disk-store cases,
+  # the cache tests that fork or wrap libc symbols, and the 1,250-chunk
+  # per-file fsync stress in component_text_cache_test.
+  set(gufo_pr_linux_only
+    gguf_reader_test gguf_identity_test platform_publish_test
+    platform_prefault_test trace_test http_server_signals_test
+    http_server_test audio_websocket_test continuation_disk_store_test
+    component_text_cache_test eval_http_client_test cache_disk_faults_test
+    cache_boundary_test cache_adapter_test cache_slot_test cache_disk_test
+    cache_streaming_test cache_tiered_test cache_disk_publication_test)
+  list(REMOVE_ITEM gufo_pr_targets ${gufo_pr_linux_only})
+  list(REMOVE_ITEM gufo_pr_tests ${gufo_pr_linux_only})
+endif()
+
 list(JOIN gufo_pr_tests "|" gufo_pr_pattern)
 add_custom_target(check-pr
   COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error
     --timeout 60 -R "^(${gufo_pr_pattern})$"
-  DEPENDS gufo ${gufo_pr_targets} $<$<NOT:$<BOOL:${WIN32}>>:cache_disk_faults>
+  DEPENDS gufo ${gufo_pr_targets}
+    $<$<NOT:$<BOOL:${WIN32}>>:cache_disk_faults>
   USES_TERMINAL VERBATIM)

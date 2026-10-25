@@ -30,12 +30,7 @@
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/json.hpp"
-#if defined(_WIN32)
-// Upstream's POSIX environment helper, for the redirected-sink assertions.
-static void setenv(const char* name, const char* value, int) {
-  (void)_putenv_s(name, value);
-}
-#endif
+#include "src/core/platform/env.hpp"
 
 namespace {
 
@@ -2985,7 +2980,7 @@ int main() {
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
-  ::setenv("NO_COLOR", "1", 1);
+  gufo::platform::SetEnv("NO_COLOR", "1");
   TestProgressLoggingIsOptInAndBounded();
   TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();

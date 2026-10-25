@@ -1,14 +1,3 @@
-#if !defined(_WIN32)
-#include <arpa/inet.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -18,6 +7,7 @@
 #include <string_view>
 #include <thread>
 
+#include "src/core/platform/net.hpp"
 #include "src/eval/http_client.hpp"
 
 namespace {
@@ -30,11 +20,7 @@ void Expect(bool condition, std::string_view message) {
 }
 
 void CheckTransfer(bool post, std::string_view response, bool stalls) {
-#if defined(_WIN32)
-  const int listener = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
-#else
   const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-#endif
   Expect(listener >= 0, "create fixture socket");
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -49,30 +35,12 @@ void CheckTransfer(bool post, std::string_view response, bool stalls) {
       "read fixture port");
   std::binary_semaphore release(0);
   std::jthread server([&] {
-#if defined(_WIN32)
-    WSAPOLLFD pending{};
-    pending.fd = listener;
-    pending.events = POLLRDNORM;
-    Expect(WSAPoll(&pending, 1, 2000) == 1, "client connects");
-    const int peer = static_cast<int>(accept(listener, nullptr, nullptr));
-#else
     pollfd pending{listener, POLLIN, 0};
     Expect(poll(&pending, 1, 2000) == 1, "client connects");
     const int peer = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
-#endif
     Expect(peer >= 0, "accept client");
     char request[4096];
-    pending.fd = peer;
-    pending.revents = 0;
-#if defined(_WIN32)
-    Expect(WSAPoll(&pending, 1, 2000) == 1 &&
-               recv(peer, request, static_cast<int>(sizeof(request)), 0) > 0,
-           "client sends request");
-    if (!response.empty())
-      Expect(send(peer, response.data(), static_cast<int>(response.size()),
-                  0) == static_cast<int>(response.size()),
-             "send fixture response");
-#else
+    pending = {peer, POLLIN, 0};
     Expect(poll(&pending, 1, 2000) == 1 &&
                recv(peer, request, sizeof(request), 0) > 0,
            "client sends request");
@@ -80,15 +48,10 @@ void CheckTransfer(bool post, std::string_view response, bool stalls) {
       Expect(send(peer, response.data(), response.size(), MSG_NOSIGNAL) ==
                  static_cast<ssize_t>(response.size()),
              "send fixture response");
-#endif
     // Also bounds this test if the timeout regresses.
     if (stalls)
       (void)release.try_acquire_for(std::chrono::seconds(2));
-#if defined(_WIN32)
-    closesocket(peer);
-#else
     close(peer);
-#endif
   });
   const gufo::eval::HttpClient client(
       "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)), "",
@@ -97,11 +60,7 @@ void CheckTransfer(bool post, std::string_view response, bool stalls) {
       post ? client.PostJson("/completion", "{}") : client.Get("/models");
   release.release();
   server.join();
-#if defined(_WIN32)
-  closesocket(listener);
-#else
   close(listener);
-#endif
   if (stalls) {
     Expect(!result.transport_ok && result.transport_code == "request_timeout",
            "stalled request reports a bounded transport timeout");
@@ -117,13 +76,6 @@ void CheckTransfer(bool post, std::string_view response, bool stalls) {
 }  // namespace
 
 int main() {
-#if defined(_WIN32)
-  WSADATA wsa{};
-  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-    std::cerr << "WSAStartup failed\n";
-    return 1;
-  }
-#endif
   for (const bool post : {false, true}) {
     CheckTransfer(post, "", true);
     CheckTransfer(post, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",

@@ -34,7 +34,6 @@ class CheckDocsTest(unittest.TestCase):
             root = Path(directory)
             for name, text in files.items():
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
-                # newline="" keeps the fixture's exact line endings on Windows.
                 (root / name).write_text(text, newline="")
             paths = sorted(root.rglob("*.md"))
             return DOCS.check_links_and_anchors(root, paths)[1]

@@ -1,9 +1,5 @@
-#if defined(_WIN32)
-#include <process.h>
-#endif
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
+#include "src/cli/serve/video_jobs.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -28,8 +24,8 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
-#include "src/cli/serve/video_jobs.hpp"
 #include "src/core/json.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 namespace gufo::server {
@@ -178,8 +174,8 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     return false;
   }
   const std::filesystem::path partial = path.string() + ".gufo-partial-" +
-                                        std::to_string(_getpid()) + "-" +
-                                        std::to_string(NextFileNonce());
+                                        std::to_string(platform::ProcessId()) +
+                                        "-" + std::to_string(NextFileNonce());
   {
     std::ofstream output(partial, std::ios::binary | std::ios::trunc);
     output.write(contents.data(),

@@ -1,15 +1,7 @@
 #include "src/cli/serve/trace.hpp"
 
-#if !defined(_WIN32)
 #include <sys/resource.h>
 #include <unistd.h>
-#else
-#include <process.h>
-// Upstream's POSIX environment helper, for the NO_COLOR setup.
-static void setenv(const char* name, const char* value, int) {
-  (void)_putenv_s(name, value);
-}
-#endif
 
 #include <cassert>
 #include <csignal>
@@ -20,6 +12,7 @@ static void setenv(const char* name, const char* value, int) {
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/env.hpp"
 
 namespace {
 
@@ -41,7 +34,6 @@ std::vector<std::string> Lines(const fs::path& path) {
   return lines;
 }
 
-#if !defined(_WIN32)
 // A record cut short by a full disk or file-size limit is removed, so the next
 // record still starts its own line and the file stays valid JSON Lines.
 void TestPartialWriteIsRolledBack() {
@@ -75,33 +67,11 @@ void TestPartialWriteIsRolledBack() {
   assert(gufo::json::parse(lines[0]).member_str("event") == "before");
   assert(gufo::json::parse(lines[1]).member_str("event") == "after");
 }
-#endif
 
 }  // namespace
 
 int main() {
-  ::setenv("NO_COLOR", "1", 1);
-#if !defined(_WIN32)
+  gufo::platform::SetEnv("NO_COLOR", "1");
   TestPartialWriteIsRolledBack();
   std::cout << "Trace sink checks passed.\n";
-#else
-  // RLIMIT_FSIZE has no Windows equivalent, so the torn-record rollback
-  // cannot be simulated here; exercise the open/append/close path instead.
-  const auto path =
-      fs::temp_directory_path() /
-      ("gufo-trace-basic-" + std::to_string(_getpid()) + ".jsonl");
-  fs::remove(path);
-  assert(!Trace::Open(path.string()).has_value());
-  WriteRecord("before", "kept");
-  assert(Trace::Enabled());
-  Trace::Close();
-  assert(!Trace::Enabled());
-
-  const auto lines = Lines(path);
-  fs::remove(path);
-  assert(lines.size() == 1);
-  assert(gufo::json::parse(lines[0]).member_str("event") == "before");
-  std::cout << "Trace sink open/append/close checks passed; the torn-record "
-               "rollback path needs POSIX rlimits.\n";
-#endif
 }

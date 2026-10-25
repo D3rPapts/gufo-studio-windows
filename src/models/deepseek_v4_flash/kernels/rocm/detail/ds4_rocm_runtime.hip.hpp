@@ -1,4 +1,7 @@
+#include <chrono>
+
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/os_info.hpp"
 
 static const void *g_model_host_base;
 static uint64_t g_model_registered_size;
@@ -46,11 +49,6 @@ static int g_rocm_mmq_ready;
 #define DS4_ROCM_LT_ROUTE_DEFAULT_MASK 23
 #endif
 #ifdef __HIP_PLATFORM_AMD__
-#if defined(_WIN32)
-#include <chrono>
-#include <io.h>
-#endif
-
 #include "ds4_rocm_hipblaslt.hip.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #endif
@@ -607,14 +605,8 @@ static int hip_ok(hipError_t err, const char *what) {
 }
 
 static double hip_wall_sec(void) {
-#if defined(_WIN32)
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return std::chrono::duration<double>(now).count();
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-#endif
 }
 
 static int hip_model_load_progress_enabled(void) {
@@ -634,11 +626,7 @@ static void hip_model_load_progress_note(uint64_t cached_bytes) {
     const double now = hip_wall_sec();
     if (!g_model_load_progress_started) {
         g_model_load_progress_started = 1;
-#if defined(_WIN32)
-        g_model_load_progress_tty = _isatty(_fileno(stderr)) != 0;
-#else
-        g_model_load_progress_tty = isatty(STDERR_FILENO) != 0;
-#endif
+        g_model_load_progress_tty = gufo::platform::StderrIsTerminal() ? 1 : 0;
         g_model_load_progress_next = (g_model_load_progress_tty ? 2ull : 16ull) *
                                      1024ull * 1024ull * 1024ull;
         g_model_load_progress_last = now;

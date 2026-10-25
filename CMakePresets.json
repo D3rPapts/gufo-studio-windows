@@ -26,35 +26,12 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "VCPKG_MANIFEST_INSTALL": "ON",
-        "CMAKE_C_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_CXX_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_HIP_COMPILER": "C:/TheRock/build/lib/llvm/bin/clang-cl.exe",
-        "CMAKE_PREFIX_PATH": "C:/TheRock/build"
-      }
-    },
-    {
-      "name": "windows-release",
-      "displayName": "Windows Release",
-      "description": "Native Windows gfx1151 production build (MSVC + TheRock HIP SDK)",
-      "inherits": "windows-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "OFF",
-        "ENGINE_ENABLE_HIP": "ON"
-      }
-    },
-    {
-      "name": "windows-gpu-test",
-      "displayName": "Windows gfx1151 GPU Tests",
-      "description": "Native Windows GPU build with tests and tools",
-      "inherits": "windows-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "ON",
-        "GUFO_BUILD_TOOLS": "OFF"
+        "VCPKG_TARGET_TRIPLET": "x64-windows-release",
+        "VCPKG_HOST_TRIPLET": "x64-windows-release",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/windows-therock.cmake"
       }
     },
     {
@@ -66,6 +43,17 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "OFF"
+      }
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows Release",
+      "description": "Windows gfx1151 build used by the Devlab Windows checks",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "OFF",
+        "ENGINE_ENABLE_HIP": "ON"
       }
     },
     {
@@ -117,19 +105,14 @@
   ],
   "buildPresets": [
     {
-      "name": "windows-release",
-      "displayName": "Windows Release",
-      "configurePreset": "windows-release"
-    },
-    {
-      "name": "windows-gpu-test",
-      "displayName": "Windows gfx1151 GPU Tests",
-      "configurePreset": "windows-gpu-test"
-    },
-    {
       "name": "windows-cpu-test",
       "displayName": "Windows CPU Tests",
       "configurePreset": "windows-cpu-test"
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows Release",
+      "configurePreset": "windows-release"
     },
     {
       "name": "release",

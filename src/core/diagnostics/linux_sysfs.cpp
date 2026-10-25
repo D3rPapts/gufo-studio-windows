@@ -1,14 +1,12 @@
 #include "src/core/diagnostics/linux_sysfs.h"
 
-#if !defined(_WIN32)
-#include <sys/utsname.h>
-#endif
-
 #include <charconv>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <string_view>
+
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::diagnostics {
 
@@ -54,22 +52,18 @@ std::optional<std::string> LinuxSysfs::ReadFile(
 }
 
 std::optional<HostUnameInfo> LinuxSysfs::QueryUname() const {
-#if defined(_WIN32)
-  return std::nullopt;  // Kernel identity reporting is Linux-only for now.
-#else
   const auto version_opt = ReadFile(proc_root_ / "version");
-  struct utsname uts{};
-  if (uname(&uts) == 0) {
-    HostUnameInfo info;
-    info.sysname = uts.sysname;
-    info.nodename = uts.nodename;
-    info.release = uts.release;
-    info.version = version_opt ? *version_opt : uts.version;
-    info.machine = uts.machine;
-    return info;
+  const auto host = platform::QueryHostIdentity();
+  if (!host) {
+    return std::nullopt;
   }
-  return std::nullopt;
-#endif
+  HostUnameInfo info;
+  info.sysname = host->sysname;
+  info.nodename = host->nodename;
+  info.release = host->release;
+  info.version = version_opt ? *version_opt : host->version;
+  info.machine = host->machine;
+  return info;
 }
 
 std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {
