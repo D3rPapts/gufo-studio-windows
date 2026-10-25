@@ -547,6 +547,10 @@ Model::Model(const std::filesystem::path& root)
     : impl_(std::make_unique<Impl>(root)) {}
 Model::~Model() = default;
 
+const SamplingConfig& Model::sampling() const {
+  return impl_->weights.Sampling();
+}
+
 std::vector<std::uint32_t> Model::Tokenize(std::string_view text) const {
   return impl_->tokenizer.Encode(text);
 }
@@ -555,6 +559,10 @@ Result Model::Generate(const Request& request,
                        const CancellationCheck& cancelled,
                        const Observer& observer) {
   ValidateRequest(request);
+  const int steps = sampling().ResolveSteps(request.steps);
+  if (sampling().IsTurbo() && !request.images.empty())
+    throw std::invalid_argument(
+        "Turbo reference-image editing is deferred; use the base model");
   std::unique_lock lock(impl_->mutex);
   Cancel(cancelled);
   const auto start = Clock::now();
@@ -582,10 +590,10 @@ Result Model::Generate(const Request& request,
     auto latent = rt.Upload(noise, height * width, 64);
     rt.Observe(observer, "noise", latent);
     const auto denoise_start = Clock::now();
-    const auto sigmas = FlowSigmas(request.steps, height * width);
+    const auto sigmas = sampling().Sigmas(steps, height * width);
     if (observer.Wants("sigmas"))
       observer.write("sigmas", sigmas, 1, static_cast<int>(sigmas.size()));
-    for (int step = 0; step < request.steps; ++step) {
+    for (int step = 0; step < steps; ++step) {
       const auto velocity =
           Denoise(rt, context, latent, sigmas[step], step, cancelled, observer);
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);

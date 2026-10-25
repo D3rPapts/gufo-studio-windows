@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/models/qwen_image_21/model.hpp"
 
 namespace gufo::models::qwen_image_21 {
 
@@ -21,6 +22,8 @@ struct Weight {
 };
 
 json::Value ReadJson(const std::filesystem::path& path);
+SamplingConfig ReadSamplingConfig(const json::Value& index,
+                                  const json::Value& scheduler);
 
 class Weights {
 public:
@@ -29,6 +32,7 @@ public:
   bool Contains(std::string_view name) const;
   void Prefetch(std::string_view prefix) const;
   const json::Value& VaeConfig() const { return vae_config_; }
+  const SamplingConfig& Sampling() const { return sampling_; }
 
 private:
   void Load(const std::filesystem::path& file, const std::string& prefix);
@@ -36,6 +40,7 @@ private:
   std::vector<std::span<const std::byte>> regions_;
   std::map<std::string, Weight, std::less<>> weights_;
   json::Value vae_config_;
+  SamplingConfig sampling_;
 };
 
 }  // namespace gufo::models::qwen_image_21

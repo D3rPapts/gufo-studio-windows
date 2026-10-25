@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prompt", default="A red cube on a white table.")
     parser.add_argument("--size", type=int, default=64)
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--teacher-force", action="store_true",
@@ -31,6 +33,7 @@ def main():
     parser.add_argument("--skip-decode", action="store_true",
                         help="Compare denoising latents without running the VAE decoder")
     args = parser.parse_args()
+    width, height = args.width or args.size, args.height or args.size
     torch.set_num_threads(8)
     args.output.mkdir(parents=True, exist_ok=True)
     pipe = QwenImage21Pipeline.from_pretrained(
@@ -142,7 +145,7 @@ def main():
         layer.register_forward_hook(
             lambda module, inputs, out, i=i: compare(f"dit.{step[0]}.block.{i}", out)
         )
-    target_rows = (args.size // 16) ** 2
+    target_rows = (width // 16) * (height // 16)
     pipe.transformer.proj_out.register_forward_hook(
         lambda module, inputs, out: compare(f"dit.{step[0]}.output", out[:, -target_rows:])
     )
@@ -179,7 +182,7 @@ def main():
         kwargs["image"] = Image.open(args.image)
     with torch.inference_mode():
         result = pipe(
-            prompt=args.prompt, width=args.size, height=args.size,
+            prompt=args.prompt, width=width, height=height,
             num_inference_steps=args.steps, latents=latent,
             output_type="latent" if args.skip_decode else "pil",
             callback_on_step_end=callback, **kwargs
