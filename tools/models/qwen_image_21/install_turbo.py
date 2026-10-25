@@ -17,8 +17,11 @@ def main():
     parser.add_argument("--model-dir", type=Path, default=Path.home() / "models/Qwen-Image-2.1-Turbo")
     parser.add_argument("--python", default=sys.executable, help="Python interpreter with Pillow")
     args = parser.parse_args()
-    if os.getuid() == 0 or not re.fullmatch(r"sha256:[0-9a-f]{64}", args.image):
+    if os.getuid() == 0 or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", args.image):
         parser.error("run as the unprivileged user with a full immutable local image ID")
+    args.image = "sha256:" + args.image.removeprefix("sha256:")
+    args.model_dir = args.model_dir.expanduser().resolve()
+    subprocess.run([args.python, "-c", "from PIL import Image"], check=True)
     metadata = json.loads((args.model_dir / "model_index.json").read_text())
     if len(metadata.get("sample_sigmas", [])) != 8:
         parser.error("model directory has no eight-step Turbo schedule")

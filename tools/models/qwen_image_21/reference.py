@@ -21,6 +21,8 @@ from PIL import Image
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--model-revision", help="Verified checkpoint commit for the report")
+    parser.add_argument("--diffusers-revision", help="Pinned source commit for the report")
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prompt", default="A red cube on a white table.")
@@ -43,7 +45,10 @@ def main():
     records = {"reference": {"torch": torch.__version__,
                              "transformers": version("transformers"),
                              "diffusers": diffusers.__version__,
-                             "model_revision": Path(args.model).name,
+                             "model_revision": args.model_revision,
+                             "model_directory": Path(args.model).name,
+                             "model_index_sha256": hashlib.sha256((Path(args.model) / "model_index.json").read_bytes()).hexdigest(),
+                             "diffusers_revision": args.diffusers_revision,
                              "teacher_forced": args.teacher_force,
                              "decoded": not args.skip_decode}}
     step = [0]
