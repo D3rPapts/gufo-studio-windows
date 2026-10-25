@@ -190,6 +190,10 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
+          # The windows-base preset chain-loads
+          # cmake/toolchains/windows-therock.cmake, which resolves the SDK
+          # through HIP_PATH.
+          $env:HIP_PATH = $env:SDK_ROOT
           # Hand CMake the HIP root explicitly and put the SDK's bin on
           # PATH: CMake 4.4 cannot discover it by itself for some TheRock
           # layouts (neither the compiler's "Found HIP installation"
