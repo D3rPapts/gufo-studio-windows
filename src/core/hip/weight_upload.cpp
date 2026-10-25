@@ -5,8 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -22,6 +27,23 @@ namespace {
 constexpr std::size_t kAlignment = 4096;
 constexpr std::size_t kChunkBytes = 16ULL << 20;
 constexpr std::size_t kReaders = 16;
+
+// Test seams: force the degraded staging paths on machines where pinned
+// allocations and non-blocking streams succeed, so the fallbacks stay
+// exercised. Read per Create(), not cached, so tests can flip them mid-run.
+bool ForceUnpinnedStaging() {
+  return std::getenv("GUFO_TEST_UNPINNED_STAGING") != nullptr;
+}
+
+bool ForceSyncTransfers() {
+  return std::getenv("GUFO_TEST_SYNC_TRANSFERS") != nullptr;
+}
+
+void* AlignUp(void* data) {
+  auto address = reinterpret_cast<std::uintptr_t>(data);
+  address = (address + kAlignment - 1) & ~(kAlignment - 1);
+  return reinterpret_cast<void*>(address);
+}
 
 bool ReadFully(platform::PlatformFile fd, void* buffer, std::uint64_t offset,
                std::size_t length, std::size_t required, std::error_code& ec) {
@@ -53,6 +75,9 @@ struct WeightUpload::State {
   };
   struct Slot {
     void* buffer{nullptr};
+    // Owns the backing when the pinned allocation was rejected and the slot
+    // fell back to pageable memory.
+    std::unique_ptr<std::byte[]> unpinned;
     hipStream_t stream{nullptr};
     // One unbuffered description per reader, reopened when the reader moves
     // to another shard: independent file objects keep concurrent readers off
@@ -71,6 +96,7 @@ struct WeightUpload::State {
   HostAllocations host_allocations;
   std::array<Slot, kReaders> slots{};
   std::vector<std::jthread> readers;
+  std::vector<std::string> notices;
   std::mutex mutex;
   std::condition_variable changed;
   std::deque<Task> queue;
@@ -155,9 +181,14 @@ struct WeightUpload::State {
       platform::Advise(shard.fd, platform::AdviseHint::kDontNeed, task.offset,
                        task.size);
     }
-    auto status = hipMemcpyAsync(task.destination, payload, task.size,
-                                 hipMemcpyHostToDevice, slot.stream);
-    if (status == hipSuccess) {
+    // Without a stream (stream creation was rejected) the copy runs on the
+    // blocking default stream; hipMemcpy is its synchronous spelling.
+    auto status = slot.stream != nullptr
+                      ? hipMemcpyAsync(task.destination, payload, task.size,
+                                       hipMemcpyHostToDevice, slot.stream)
+                      : hipMemcpy(task.destination, payload, task.size,
+                                  hipMemcpyHostToDevice);
+    if (status == hipSuccess && slot.stream != nullptr) {
       status = hipStreamSynchronize(slot.stream);
     }
     if (status != hipSuccess) {
@@ -213,15 +244,66 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     }
     shard.size = info.size;
   }
-  for (auto& slot : s.slots) {
-    if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
-            hipSuccess ||
-        hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
-            hipSuccess) {
-      s.Fail("weight upload staging allocation failed");
+  // Machines can reject pinned allocations or extra streams outright (driver
+  // lockable-memory policy, hardware queue caps); degrade per slot instead of
+  // failing the whole load, and record a notice the caller can log.
+  std::size_t unpinned_slots = 0;
+  std::size_t sync_slots = 0;
+  std::string pinned_error;
+  std::string stream_error;
+  for (std::size_t index = 0; index < s.slots.size(); ++index) {
+    auto& slot = s.slots[index];
+    const auto pinned = ForceUnpinnedStaging()
+                            ? hipErrorOutOfMemory
+                            : s.host_allocations.Allocate(
+                                  &slot.buffer, kChunkBytes + kAlignment);
+    if (pinned == hipSuccess) {
+      continue;
+    }
+    // Aligned reads touch up to kChunkBytes + kAlignment bytes from the
+    // aligned base, so the raw allocation carries a second kAlignment for the
+    // AlignUp() shift.
+    slot.unpinned.reset(new (std::nothrow)
+                            std::byte[kChunkBytes + 2 * kAlignment]);
+    if (slot.unpinned == nullptr) {
+      s.Fail("weight upload staging buffer allocation failed (slot " +
+             std::to_string(index) + "): pinned reported " +
+             hipGetErrorString(pinned) +
+             "; the unpinned fallback exhausted host memory");
       s.Status(error);
       return nullptr;
     }
+    slot.buffer = AlignUp(slot.unpinned.get());
+    if (pinned_error.empty()) {
+      pinned_error = hipGetErrorString(pinned);
+    }
+    ++unpinned_slots;
+  }
+  for (auto& slot : s.slots) {
+    if (slot.buffer == nullptr) {
+      continue;
+    }
+    const auto stream =
+        ForceSyncTransfers()
+            ? hipErrorOutOfMemory
+            : hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking);
+    if (stream != hipSuccess) {
+      slot.stream = nullptr;
+      if (stream_error.empty()) {
+        stream_error = hipGetErrorString(stream);
+      }
+      ++sync_slots;
+    }
+  }
+  if (unpinned_slots != 0) {
+    s.notices.push_back(
+        "event=staging_unpinned count=" + std::to_string(unpinned_slots) +
+        " of " + std::to_string(s.slots.size()) + " hip_error=" + pinned_error);
+  }
+  if (sync_slots != 0) {
+    s.notices.push_back(
+        "event=staging_sync count=" + std::to_string(sync_slots) + " of " +
+        std::to_string(s.slots.size()) + " hip_error=" + stream_error);
   }
   try {
     for (auto& slot : s.slots) {
@@ -267,6 +349,12 @@ bool WeightUpload::Finish(std::string* error) {
   std::unique_lock lock(s.mutex);
   s.changed.wait(lock, [&] { return s.pending == 0; });
   return s.Status(error);
+}
+
+std::vector<std::string> WeightUpload::TakeNotices() {
+  auto& s = *state_;
+  std::lock_guard lock(s.mutex);
+  return std::exchange(s.notices, {});
 }
 
 }  // namespace gufo::hip

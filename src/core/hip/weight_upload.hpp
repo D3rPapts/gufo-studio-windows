@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "src/core/gguf_reader.hpp"
 
@@ -26,6 +27,10 @@ public:
             void* device, std::string* error);
   /// Waits for every queued copy, including on failure.
   bool Finish(std::string* error);
+  /// Returns and clears the diagnostics Create() recorded when staging could
+  /// not use pinned buffers or non-blocking streams and fell back instead.
+  /// Empty for a fully pinned, fully streamed upload; callers log the lines.
+  std::vector<std::string> TakeNotices();
 
 private:
   struct State;

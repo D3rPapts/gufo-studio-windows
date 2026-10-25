@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
@@ -726,6 +727,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   auto stager = hip::WeightUpload::Create(shards, error_msg);
   if (!stager) {
     return nullptr;
+  }
+  for (auto& notice : stager->TakeNotices()) {
+    server::Logger::Warn("loader", notice);
   }
   std::vector<Conversion> conversions;
   Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/env.hpp"
 #include "src/core/platform/mapped_file.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -95,6 +96,7 @@ int main() {
   std::string error;
   auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
+  Require(upload->TakeNotices().empty(), "a healthy staging records nothing");
   for (const auto& s : slices) {
     Require(
         upload->Copy(s.shard, s.offset, s.size,
@@ -128,9 +130,55 @@ int main() {
   Require(upload->Copy(1, 4096, 8192, device.data, &error),
           "queue a range from the original file extent");
   Require(!upload->Finish(&error), "a truncated shard fails its pending read");
-  std::puts(
-      "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
   upload.reset();
+
+  // Degraded staging: with pinned buffers and non-blocking streams forced
+  // off, the unpinned-buffer and synchronous-copy fallbacks must still move
+  // every byte, and Create must report the degradation exactly once. The
+  // failed-read phase truncated shard 1's original, so both originals are
+  // rewritten to their full source content first.
+  for (std::size_t shard = 0; shard < source.size(); ++shard) {
+    std::ofstream out(paths[shard].string() + ".old", std::ios::binary);
+    out.write(reinterpret_cast<const char*>(source[shard].data()),
+              static_cast<std::streamsize>(source[shard].size()));
+    Require(out.good(), "restore shard original");
+  }
+  Require(gufo::platform::SetEnv("GUFO_TEST_UNPINNED_STAGING", "1") &&
+              gufo::platform::SetEnv("GUFO_TEST_SYNC_TRANSFERS", "1"),
+          "set the degraded-staging seams");
+  slices.clear();
+  expected.assign(guard, 0xa5);
+  // Unaligned start spanning two staging chunks exercises the chunked path
+  // without streams or pinned memory.
+  slice(0, 4093, (17U << 20) + 123);
+  Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
+          "re-initialize guards");
+  Require(hipStreamSynchronize(nullptr) == hipSuccess, "drain guard memset");
+  upload = WeightUpload::Create(regions, &error);
+  Require(upload != nullptr, error);
+  const auto notices = upload->TakeNotices();
+  Require(notices.size() == 2, "both degraded-staging notices are recorded");
+  Require(notices[0].find("event=staging_unpinned") != std::string::npos,
+          "unpinned notice first");
+  Require(notices[1].find("event=staging_sync") != std::string::npos,
+          "synchronous-transfer notice second");
+  Require(upload->TakeNotices().empty(), "notices are consumed once");
+  for (const auto& s : slices) {
+    Require(
+        upload->Copy(s.shard, s.offset, s.size,
+                     static_cast<char*>(device.data) + s.destination, &error),
+        error);
+  }
+  Require(upload->Finish(&error), error);
+  actual.resize(expected.size());
+  Require(hipMemcpy(actual.data(), device.data, actual.size(),
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "download degraded-staging bytes");
+  Require(actual == expected, "degraded staging moves every byte");
+
+  std::puts(
+      "PASS: byte-exact upload, EOF, guards, bounds, failed-read drain and "
+      "degraded staging");
   for (const auto& region : regions)
     gufo::platform::CloseFile(region.file_descriptor);
 }

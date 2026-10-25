@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
@@ -657,6 +658,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   auto stager = hip::WeightUpload::Create(shards, error_msg);
   if (!stager) {
     return nullptr;
+  }
+  for (auto& notice : stager->TakeNotices()) {
+    server::Logger::Warn("loader", notice);
   }
   // Measure first: the placement is decided once, from the bytes this walk
   // will request of the device heap.

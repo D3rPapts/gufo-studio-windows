@@ -742,6 +742,10 @@ static const char *hip_model_range_ptr_from_fd(
         };
         g_model_uploader = gufo::hip::WeightUpload::Create({&region, 1}, &error);
     }
+    if (g_model_uploader) {
+        for (const auto& notice : g_model_uploader->TakeNotices())
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "%s\n", notice.c_str());
+    }
     if (!g_model_uploader ||
         !g_model_uploader->Copy(0, offset, bytes, dev, &error) ||
         (wait && !g_model_uploader->Finish(&error))) {
