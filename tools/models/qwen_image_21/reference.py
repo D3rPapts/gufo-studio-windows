@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import diffusers
 from diffusers import QwenImage21Pipeline
 from PIL import Image
 
@@ -41,7 +42,7 @@ def main():
     ).to("cuda")
     records = {"reference": {"torch": torch.__version__,
                              "transformers": version("transformers"),
-                             "diffusers": version("diffusers"),
+                             "diffusers": diffusers.__version__,
                              "model_revision": Path(args.model).name,
                              "teacher_forced": args.teacher_force,
                              "decoded": not args.skip_decode}}

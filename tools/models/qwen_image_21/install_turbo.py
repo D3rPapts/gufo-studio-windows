@@ -23,7 +23,7 @@ def main():
     if len(metadata.get("sample_sigmas", [])) != 8:
         parser.error("model directory has no eight-step Turbo schedule")
     inspected = json.loads(subprocess.check_output(["podman", "image", "inspect", args.image], text=True))[0]
-    if inspected["Id"] != args.image:
+    if inspected["Id"].removeprefix("sha256:") != args.image.removeprefix("sha256:"):
         raise RuntimeError("image identity mismatch")
     home = Path.home()
     bindir = home / ".local/bin"

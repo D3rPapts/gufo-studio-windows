@@ -201,7 +201,18 @@ Weights::Weights(const std::filesystem::path& root) {
   }
   const auto scheduler = ReadJson(root / "scheduler/scheduler_config.json");
   sampling_ = ReadSamplingConfig(index, scheduler);
-  const auto processor = ReadJson(root / "processor/preprocessor_config.json");
+  json::Value processor;
+  const auto legacy_processor = root / "processor/preprocessor_config.json";
+  if (std::filesystem::exists(legacy_processor)) {
+    processor = ReadJson(legacy_processor);
+  } else {
+    const auto combined = ReadJson(root / "processor/processor_config.json");
+    const auto* image_processor = combined.find("image_processor");
+    if (!image_processor || !image_processor->is_object())
+      throw std::runtime_error(
+          "missing Qwen-Image image processor configuration");
+    processor = *image_processor;
+  }
   for (auto [key, value] : {std::pair{"patch_size", 16},
                             {"temporal_patch_size", 2},
                             {"merge_size", 2}})
