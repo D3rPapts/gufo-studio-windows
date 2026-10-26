@@ -225,7 +225,11 @@ void Weights::Load(const std::filesystem::path& path,
   }
   const auto size = mapped->size;
   void* data = mapped->data;
-  auto owner = std::shared_ptr<void>(data, [mapped](void*) {
+  // A separate read handle lets WeightUpload stream tensors from the file
+  // without faulting the mapping into the process working set.
+  const auto file = platform::OpenReadFile(path);
+  auto owner = std::shared_ptr<void>(data, [mapped, file](void*) {
+    platform::CloseFile(file);
     mapped->Close();
     delete mapped;
   });
@@ -267,6 +271,8 @@ void Weights::Load(const std::filesystem::path& path,
       throw std::runtime_error("invalid tensor extent " + name);
     weight.data = static_cast<const char*>(data) + 8 + header_size + begin;
     weight.bytes = bytes;
+    weight.file = static_cast<std::uint32_t>(files_.size());
+    weight.offset = 8 + header_size + begin;
     ranges.emplace_back(begin, end);
     if (!weights_.emplace(prefix + name, std::move(weight)).second)
       throw std::runtime_error("duplicate tensor " + name);
@@ -282,6 +288,10 @@ void Weights::Load(const std::filesystem::path& path,
     throw std::runtime_error("unexpected safetensors data");
   mappings_.push_back(std::move(owner));
   regions_.emplace_back(static_cast<const std::byte*>(data), size);
+  files_.push_back({.data = data,
+                    .size = size,
+                    .file_descriptor = file,
+                    .source_path = path});
 }
 
 void Weights::Prefetch(std::string_view prefix) const {
@@ -300,6 +310,15 @@ void Weights::Prefetch(std::string_view prefix) const {
     if (end > begin)
       core::PrefaultMappedRange(region.data() + begin, end - begin);
   }
+}
+
+std::vector<std::pair<std::string_view, const Weight*>> Weights::Group(
+    std::string_view prefix) const {
+  std::vector<std::pair<std::string_view, const Weight*>> group;
+  for (auto it = weights_.lower_bound(prefix);
+       it != weights_.end() && it->first.starts_with(prefix); ++it)
+    group.emplace_back(it->first, &it->second);
+  return group;
 }
 
 const Weight& Weights::Get(std::string_view name) const {

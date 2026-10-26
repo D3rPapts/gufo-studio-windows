@@ -8,8 +8,11 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen_image_21/hip/bf16.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 
@@ -812,33 +815,84 @@ Matrix Runtime::UploadFloat(std::span<const float> values, int rows, int cols) {
 Matrix Runtime::Weight(std::string_view name) {
   if (auto it = device_weights_.find(name); it != device_weights_.end())
     return it->second;
-  // Fault complete active components in parallel instead of serial faults
-  // during each HIP upload. Text-to-image never needs the visual encoder.
+  // Load complete active components at once. Text-to-image never needs the
+  // visual encoder.
   for (const std::string_view prefix :
        {"transformer.", "text_encoder.model.language_model.",
         "text_encoder.model.visual.", "vae.encoder.", "vae.decoder."}) {
     if (name.starts_with(prefix) &&
         std::ranges::find(prefetched_groups_, prefix) ==
             prefetched_groups_.end()) {
-      weights_.Prefetch(prefix);
       prefetched_groups_.push_back(prefix);
+      // Without a readable file, fault the component in parallel instead of
+      // serial faults during each HIP upload.
+      if (!UploadGroup(prefix))
+        weights_.Prefetch(prefix);
       break;
     }
   }
+  if (auto it = device_weights_.find(name); it != device_weights_.end())
+    return it->second;
   const auto& w = weights_.Get(name);
+  auto target = Stage(w);
+  UploadMapped(target.raw.data ? target.raw.data : target.m.data, w.data,
+               w.bytes);
+  return Store(name, w, std::move(target));
+}
+
+Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
   const int rows = w.shape.empty() ? 1 : w.shape[0];
   const auto count = w.bytes / (w.bf16 ? 2 : 4);
   if (count / rows > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::runtime_error("Qwen-Image weight exceeds matrix dimensions");
-  const int cols = static_cast<int>(count / rows);
-  Matrix m = New(rows, cols);
-  if (w.bf16)
-    UploadMapped(m.data, w.data, w.bytes);
-  else {
-    auto raw = Raw(w.bytes);
-    UploadMapped(raw.data, w.data, w.bytes);
+  StagedWeight target{.m = New(rows, static_cast<int>(count / rows))};
+  if (!w.bf16)
+    target.raw = Raw(w.bytes);
+  return target;
+}
+
+// Streams a component from its safetensors files through WeightUpload's
+// bounded pinned buffers. Copying through the mapping faults every page into
+// the process working set first; on Windows those pages stay resident, so a
+// 31 GB model exhausts a 32 GB host beside the GPU carve-out.
+bool Runtime::UploadGroup(std::string_view prefix) {
+  std::string error;
+  auto uploader = gufo::hip::WeightUpload::Create(weights_.Files(), &error);
+  if (!uploader)
+    return false;
+  // Pool blocks handed out below may still be read by queued kernels, and the
+  // uploader copies on its own streams.
+  Synchronize();
+  std::vector<
+      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>>
+      staged;
+  for (const auto& [name, w] : weights_.Group(prefix)) {
+    if (device_weights_.contains(name))
+      continue;
+    auto target = Stage(*w);
+    void* destination = target.raw.data ? target.raw.data : target.m.data;
+    staged.emplace_back(name, w, std::move(target));
+    if (!uploader->Copy(w->file, w->offset, w->bytes, destination, &error))
+      break;
+  }
+  // Finish waits for every queued copy, also after a failed Copy, so the
+  // destinations stay valid until the uploader is gone.
+  if (!uploader->Finish(&error))
+    throw std::runtime_error("Qwen-Image weight upload failed: " + error);
+  for (auto& [name, w, target] : staged)
+    Store(name, *w, std::move(target));
+  return true;
+}
+
+Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
+                      StagedWeight target) {
+  Matrix m = std::move(target.m);
+  const int rows = m.rows, cols = m.cols;
+  const auto count = static_cast<std::size_t>(rows) * cols;
+  if (target.raw.data) {
     FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
-        reinterpret_cast<const float*>(raw.data), Ptr(m), count);
+        reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+    target.raw = {};
   }
   const bool packed_convolution = w.shape.size() == 4 && w.shape[2] == 3 &&
                                   w.shape[3] == 3 &&
