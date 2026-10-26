@@ -385,5 +385,24 @@
     "moodboard_typecheck": "passed",
     "moodboard_build": "passed"
   },
-  "scope": "Native BF16 editing at the checkpoint-supplied eight-step schedule. Single-reference matched-input checks and separate original-plus-mask full trajectories use shared noise tensors. These checks do not establish aesthetic parity with the base checkpoint."
+  "scope": "Native BF16 editing at the checkpoint-supplied eight-step schedule. Single-reference matched-input checks and separate original-plus-mask full trajectories use shared noise tensors. These checks do not establish aesthetic parity with the base checkpoint.",
+  "reproduction": {
+    "width": 256,
+    "height": 256,
+    "steps": 8,
+    "native_seed": 42,
+    "initial_noise": "Native observer noise.f32, provided to the independent reference; equal numeric seeds are not assumed equivalent.",
+    "inputs": [
+      {
+        "file": "turbo-editing-input.png",
+        "sha256": "b169e6acddb8cef2ae346c58f997f22f62a02ea0d56c40b9f0e18ef833188b45"
+      },
+      {
+        "file": "turbo-editing-mask.png",
+        "sha256": "b299ec645ed73e82ffb484fbd8dd61d4278513128dfa08e5546ea7ae78454332"
+      }
+    ],
+    "single_prompt": "Change the red cup to glossy cobalt blue, preserving its shape, table and lighting.",
+    "mask_prompt": "Use image 1 as the original and image 2 as a black-and-white editing mask. Add a fresh green pear in the white area to the right of the cup. Remove mask and guidance marks."
+  }
 }

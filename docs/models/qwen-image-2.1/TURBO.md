@@ -229,4 +229,11 @@ base checkpoint's image quality.
 
 [Machine-readable editing qualification](artifacts/turbo-editing-qualification.json)
 
+Reproduction fixtures: [original image](artifacts/turbo-editing-input.png) and
+[separate mask](artifacts/turbo-editing-mask.png). The qualification JSON records
+their SHA-256 hashes, exact prompts, native seed, dimensions and step count.
+Use the probe’s positional image plus repeated `--image` arguments, then pass
+the same ordered `--image` arguments to `reference.py` using the probe’s saved
+`noise.f32`.
+
 ![Native Gufo and pinned Diffusers editing comparisons](artifacts/turbo-editing-comparison.png)
