@@ -27,7 +27,7 @@ pkgs.dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.source" = "https://github.com/lfthht/gufo";
       "org.opencontainers.image.revision" = revision;
-      "org.opencontainers.image.description" = "Native BF16 Qwen Image 2.1 Turbo generation on gfx1151";
+      "org.opencontainers.image.description" = "Native BF16 Qwen Image 2.1 Turbo generation and editing on gfx1151";
     };
   };
 }

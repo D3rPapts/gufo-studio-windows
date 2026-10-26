@@ -52,7 +52,7 @@ def main():
                "--served-model-name", "Qwen-Image-2.1-Turbo"]
     unit = service_dir / "gufo-image-turbo.service"
     # systemd uses percent specifiers even inside quoted arguments.
-    unit.write_text("[Unit]\nDescription=Gufo Qwen Image 2.1 Turbo local generation API\nAfter=network.target\n\n"
+    unit.write_text("[Unit]\nDescription=Gufo Qwen Image 2.1 Turbo local generation and editing API\nAfter=network.target\n\n"
                     "[Service]\nType=simple\nExecStart=" + shlex.join(command).replace("%", "%%") +
                     "\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\n\n"
                     "[Install]\nWantedBy=default.target\n")

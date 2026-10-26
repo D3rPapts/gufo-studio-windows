@@ -560,9 +560,6 @@ Result Model::Generate(const Request& request,
                        const Observer& observer) {
   ValidateRequest(request);
   const int steps = sampling().ResolveSteps(request.steps);
-  if (sampling().IsTurbo() && !request.images.empty())
-    throw std::invalid_argument(
-        "Turbo reference-image editing is deferred; use the base model");
   std::unique_lock lock(impl_->mutex);
   Cancel(cancelled);
   const auto start = Clock::now();

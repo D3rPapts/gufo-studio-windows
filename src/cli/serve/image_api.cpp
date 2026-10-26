@@ -300,10 +300,6 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
   try {
     Parsed parsed;
     const bool edit = request.path == "/v1/images/edits";
-    if (edit && service.sampling().IsTurbo())
-      return Error(
-          400, "Turbo reference-image editing is deferred; use the base model",
-          "unsupported_operation");
     if (edit)
       parsed = Multipart(request);
     else {

@@ -30,7 +30,8 @@ def main():
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int, default=2)
-    parser.add_argument("--image", type=Path)
+    parser.add_argument("--image", type=Path, action="append",
+                        help="Ordered input reference; repeat for multi-image editing")
     parser.add_argument("--teacher-force", action="store_true",
                         help="Replay each official block with Gufo's saved block inputs")
     parser.add_argument("--skip-decode", action="store_true",
@@ -185,7 +186,7 @@ def main():
     latent = torch.from_numpy(noise).to(device="cuda", dtype=torch.bfloat16)
     kwargs = {}
     if args.image:
-        kwargs["image"] = Image.open(args.image)
+        kwargs["image"] = [Image.open(path).convert("RGBA") for path in args.image]
     with torch.inference_mode():
         result = pipe(
             prompt=args.prompt, width=width, height=height,

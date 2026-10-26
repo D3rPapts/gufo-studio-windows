@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "usage: qwen_image_21_probe MODEL_DIR OUTPUT_DIR [PROMPT] "
                  "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N] [--width "
-                 "N] [--height N]\n";
+                 "N] [--height N] [--image IMAGE ...]\n";
     return 2;
   }
   try {
@@ -35,6 +35,9 @@ int main(int argc, char** argv) {
                  i + 1 < argc) {
         const int value = std::stoi(argv[++i]);
         (option == "--width" ? request.width : request.height) = value;
+      } else if (option == "--image" && i + 1 < argc) {
+        request.images.push_back(
+            DecodeImage(gufo::core::ReadImageFile(argv[++i])));
       } else if (option == "--seed" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         const auto [end, error] = std::from_chars(

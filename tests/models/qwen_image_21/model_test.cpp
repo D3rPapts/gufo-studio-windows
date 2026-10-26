@@ -206,10 +206,12 @@ int main(int argc, char** argv) {
   http.body.resize(http.body.size() - 8);
   assert(gufo::server::HandleImageApiRequest(http, service).status == 400);
   int turbo_calls = 0;
+  std::vector<Request> turbo_requests;
   gufo::server::ImageService turbo_service(
       {}, "turbo-test",
       [&](const Request& request, const CancellationCheck&) {
-        assert(request.steps == 8 && request.images.empty());
+        assert(request.steps == 8);
+        turbo_requests.push_back(request);
         ++turbo_calls;
         return Result{image, {}};
       },
@@ -232,5 +234,72 @@ int main(int argc, char** argv) {
   assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
          400);
   assert(turbo_calls == 2);
+  // Editing shares the ordered-reference path, including RGBA, masks,
+  // background controls and independent outputs; only the schedule differs.
+  const auto edit_body = [&](const std::vector<Image>& inputs, int steps,
+                             const std::string& background, int count) {
+    std::string body;
+    for (const auto& input : inputs) {
+      const auto bytes = EncodePng(input);
+      body +=
+          "--boundary\r\nContent-Disposition: form-data; "
+          "name=\"image[]\"; filename=\"reference.png\"\r\n"
+          "Content-Type: image/png\r\n\r\n";
+      body.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      body += "\r\n";
+    }
+    std::vector<std::pair<std::string, std::string>> fields{
+        {"model", "turbo-test"},
+        {"prompt", "edit image one using image two"},
+        {"size", "256x256"},
+        {"seed", "77"},
+        {"background", background},
+        {"n", std::to_string(count)}};
+    if (steps >= 0)
+      fields.emplace_back("steps", std::to_string(steps));
+    for (const auto& [name, value] : fields)
+      body += "--boundary\r\nContent-Disposition: form-data; name=\"" + name +
+              "\"\r\n\r\n" + value + "\r\n";
+    return body + "--boundary--\r\n";
+  };
+  http.headers = {{"Content-Type", "multipart/form-data; boundary=boundary"}};
+  Image mask{
+      2,
+      2,
+      {255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255}};
+  for (const int steps : {-1, 8}) {
+    http.body = edit_body({image, mask}, steps, "transparent", 2);
+    const auto edited =
+        gufo::server::HandleImageApiRequest(http, turbo_service);
+    assert(edited.status == 200);
+    assert(gufo::json::parse(edited.body).find("data")->size() == 2);
+    for (std::size_t i = turbo_requests.size() - 2; i < turbo_requests.size();
+         ++i) {
+      const auto& captured = turbo_requests[i];
+      assert(captured.steps == 8 && captured.images.size() == 2);
+      assert(captured.images[0].rgba == image.rgba);
+      assert(captured.images[1].rgba == mask.rgba);
+      assert(captured.seed == 77 + i % 2);
+      assert(captured.prompt.find("RGBA image with transparency") !=
+             std::string::npos);
+    }
+  }
+  http.body = edit_body(std::vector<Image>(10, image), 8, "opaque", 1);
+  assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
+         200);
+  assert(turbo_requests.back().images.size() == 10);
+  const auto accepted = turbo_calls;
+  for (const int steps : {0, 7, 9, 40}) {
+    http.body = edit_body({image}, steps, "auto", 1);
+    assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
+           400);
+  }
+  http.body = edit_body(std::vector<Image>(11, image), 8, "auto", 1);
+  assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
+         400);
+  http.body = edit_body({}, 8, "auto", 1);
+  assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
+         400);
+  assert(turbo_calls == accepted);
   std::cout << "Qwen-Image image and schedule contracts passed\n";
 }
