@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <system_error>
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -54,6 +56,7 @@ std::unique_ptr<ExpertStream> ExpertStream::Create(
     state.slot_of.assign(num_experts, -1);
     state.expert_in.assign(slots, -1);
     state.used.assign(slots, 0);
+    state.uses.assign(num_experts, 0);
   }
   s->layers_ = std::move(layers);
   for (std::uint32_t i = 0; i < threads; ++i)
@@ -62,6 +65,8 @@ std::unique_ptr<ExpertStream> ExpertStream::Create(
 }
 
 ExpertStream::~ExpertStream() {
+  if (!profile_path_.empty())
+    (void)SaveProfile(profile_path_);
   {
     std::lock_guard lock(mutex_);
     stop_ = true;
@@ -141,6 +146,19 @@ bool ExpertStream::Map(std::uint32_t layer, std::span<std::int32_t> ids,
   const std::uint64_t now = ++tick_;
   stats_.routed += ids.size();
 
+  // Routing counts feed the eviction score; halving them every kAgeMaps calls
+  // lets the hot set follow the text.
+  constexpr std::uint32_t kAgeMaps = 256;
+  if (++state.maps >= kAgeMaps) {
+    state.maps = 0;
+    for (auto& count : state.uses)
+      count /= 2;
+  }
+  if (count_routing_)
+    for (const std::int32_t expert : ids)
+      if (expert >= 0 && static_cast<std::uint32_t>(expert) < num_experts_)
+        ++state.uses[expert];
+
   // Mark resident experts first, so loading never evicts one of this call's.
   std::vector<std::int32_t> missing;
   for (const std::int32_t expert : ids) {
@@ -169,12 +187,24 @@ bool ExpertStream::Map(std::uint32_t layer, std::span<std::int32_t> ids,
     std::vector<std::int32_t> targets;
     std::uint8_t* cursor = staging_;
     for (const std::int32_t expert : missing) {
-      // Least recently used slot not touched by this call.
-      std::int32_t victim = 0;
-      for (std::int32_t slot = 1; slot < static_cast<std::int32_t>(slots_);
+      // Lowest score among slots this call has not touched: the last use
+      // tick plus a bonus per aged routing count, so a frequently routed
+      // expert outlives a burst of one-off experts (LRU blended with LFU).
+      // Map() runs once per layer and token, so 2 * layers ticks are about
+      // two tokens of recency per counted use.
+      const std::uint64_t per_use = 2ULL * layers_.size();
+      const auto score = [&](std::int32_t slot) {
+        const std::int32_t held = state.expert_in[slot];
+        return state.used[slot] + (held < 0 ? 0 : per_use * state.uses[held]);
+      };
+      std::int32_t victim = -1;
+      for (std::int32_t slot = 0; slot < static_cast<std::int32_t>(slots_);
            ++slot)
-        if (state.used[slot] < state.used[victim])
+        if (state.used[slot] != now &&
+            (victim < 0 || score(slot) < score(victim)))
           victim = slot;
+      if (victim < 0)
+        victim = 0;
       if (state.used[victim] == now) {
         SetError(error_msg, "expert stream has no free slot");
         return false;
@@ -258,6 +288,90 @@ void ExpertStream::Report() {
   std::fflush(stderr);
   reported_ = stats_;
   report_at_ = now;
+  if (!profile_path_.empty())
+    (void)SaveProfile(profile_path_);
+}
+
+namespace {
+
+constexpr char kProfileMagic[4] = {'G', 'X', 'P', 'F'};
+constexpr std::uint32_t kProfileVersion = 1;
+
+}  // namespace
+
+bool ExpertStream::LoadProfile(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  char magic[4] = {};
+  std::uint32_t header[3] = {};
+  if (!in.read(magic, sizeof(magic)) ||
+      !in.read(reinterpret_cast<char*>(header), sizeof(header)) ||
+      std::memcmp(magic, kProfileMagic, sizeof(magic)) != 0 ||
+      header[0] != kProfileVersion || header[1] != state_.size() ||
+      header[2] != num_experts_)
+    return false;
+  std::vector<std::uint32_t> counts(state_.size() * num_experts_);
+  if (!in.read(reinterpret_cast<char*>(counts.data()),
+               static_cast<std::streamsize>(counts.size() * sizeof(counts[0]))))
+    return false;
+  for (std::size_t layer = 0; layer < state_.size(); ++layer)
+    std::copy_n(
+        counts.begin() + static_cast<std::ptrdiff_t>(layer * num_experts_),
+        num_experts_, state_[layer].uses.begin());
+  return true;
+}
+
+bool ExpertStream::SaveProfile(const std::filesystem::path& path) const {
+  std::error_code ec;
+  if (path.has_parent_path())
+    std::filesystem::create_directories(path.parent_path(), ec);
+  auto temporary = path;
+  temporary += ".tmp";
+  {
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    const std::uint32_t header[3] = {kProfileVersion,
+                                     static_cast<std::uint32_t>(state_.size()),
+                                     num_experts_};
+    out.write(kProfileMagic, sizeof(kProfileMagic));
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    for (const auto& state : state_)
+      out.write(reinterpret_cast<const char*>(state.uses.data()),
+                static_cast<std::streamsize>(state.uses.size() *
+                                             sizeof(state.uses[0])));
+    if (!out)
+      return false;
+  }
+  std::filesystem::rename(temporary, path, ec);
+  return !ec;
+}
+
+bool ExpertStream::Warm(hipStream_t stream, std::uint64_t* warmed,
+                        std::string* error_msg) {
+  *warmed = 0;
+  count_routing_ = false;
+  bool ok = true;
+  const std::uint32_t take = std::min(slots_, max_misses_);
+  for (std::uint32_t layer = 0; ok && layer < state_.size(); ++layer) {
+    const auto& uses = state_[layer].uses;
+    std::vector<std::int32_t> ids(num_experts_);
+    for (std::uint32_t e = 0; e < num_experts_; ++e)
+      ids[e] = static_cast<std::int32_t>(e);
+    std::stable_sort(
+        ids.begin(), ids.end(),
+        [&](std::int32_t a, std::int32_t b) { return uses[a] > uses[b]; });
+    std::size_t n = 0;
+    while (n < take && uses[ids[n]] > 0)
+      ++n;
+    ids.resize(n);
+    if (!ids.empty())
+      ok = Map(layer, ids, stream, error_msg);
+    *warmed += n;
+  }
+  count_routing_ = true;
+  if (ok && hipStreamSynchronize(stream) != hipSuccess) {
+    SetError(error_msg, "expert warm-up wait failed");
+    ok = false;
+  }
+  return ok;
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

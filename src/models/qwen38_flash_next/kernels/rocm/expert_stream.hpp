@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -66,7 +67,28 @@ public:
   [[nodiscard]] bool Map(std::uint32_t layer, std::span<std::int32_t> ids,
                          hipStream_t stream, std::string* error_msg = nullptr);
 
+  /// Routing counts that survive restarts. LoadProfile ignores a file of
+  /// another layer/expert shape; SaveProfile replaces the file atomically.
+  /// With a profile path set, the counts are also saved with every stats
+  /// report and on destruction.
+  bool LoadProfile(const std::filesystem::path& path);
+  bool SaveProfile(const std::filesystem::path& path) const;
+  void SetProfilePath(std::filesystem::path path) {
+    profile_path_ = std::move(path);
+  }
+  /// Loads each layer's most routed experts into its slots without counting
+  /// them as routing; returns the number of experts loaded.
+  [[nodiscard]] bool Warm(hipStream_t stream, std::uint64_t* warmed,
+                          std::string* error_msg = nullptr);
+
   [[nodiscard]] std::uint32_t slots() const noexcept { return slots_; }
+  [[nodiscard]] std::uint32_t max_misses() const noexcept {
+    return max_misses_;
+  }
+  [[nodiscard]] bool Resident(std::uint32_t layer,
+                              std::int32_t expert) const noexcept {
+    return state_[layer].slot_of[expert] >= 0;
+  }
   [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
@@ -74,6 +96,8 @@ private:
     std::vector<std::int32_t> slot_of;    ///< expert -> slot or -1.
     std::vector<std::int32_t> expert_in;  ///< slot -> expert or -1.
     std::vector<std::uint64_t> used;      ///< slot -> last use tick.
+    std::vector<std::uint32_t> uses;      ///< expert -> aged routing count.
+    std::uint32_t maps{0};                ///< Map() calls since the last aging.
   };
   struct Job {
     platform::PlatformFile file;
@@ -96,6 +120,8 @@ private:
   Stats stats_;
   /// Totals at the last stderr report (one line per 20 s of activity).
   Stats reported_;
+  std::filesystem::path profile_path_;
+  bool count_routing_{true};
   std::chrono::steady_clock::time_point report_at_{};
 
   std::uint8_t* staging_{nullptr};  ///< Pinned, max_misses * expert set.
