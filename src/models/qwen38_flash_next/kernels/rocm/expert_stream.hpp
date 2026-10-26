@@ -49,6 +49,8 @@ public:
     std::uint64_t misses{0};
     std::uint64_t bytes_read{0};
     double read_ms{0};
+    std::uint64_t prefetched{0};     ///< experts loaded ahead of Map()
+    std::uint64_t prefetch_hits{0};  ///< of those, routed by Map()
   };
 
   /// `files` own nothing: the caller keeps them open for the stream's life.
@@ -81,6 +83,18 @@ public:
   [[nodiscard]] bool Warm(hipStream_t stream, std::uint64_t* warmed,
                           std::string* error_msg = nullptr);
 
+  /// Starts background reads of `ids` (predicted experts of `layer`) into
+  /// free slots; Map(layer) uploads them before mapping. One prediction is
+  /// in flight at a time; returns false when none was started.
+  bool Prefetch(std::uint32_t layer, std::span<const std::int32_t> ids);
+  /// Adds per-expert routing counts of a prefill batch to the eviction
+  /// score, so the experts a prompt uses most stay for its continuation.
+  void AddUses(std::uint32_t layer, std::span<const std::uint32_t> rows) {
+    auto& uses = state_[layer].uses;
+    for (std::size_t e = 0; e < rows.size() && e < uses.size(); ++e)
+      uses[e] += rows[e];
+  }
+
   [[nodiscard]] std::uint32_t slots() const noexcept { return slots_; }
   [[nodiscard]] std::uint32_t max_misses() const noexcept {
     return max_misses_;
@@ -104,6 +118,7 @@ private:
     std::uint64_t offset;
     std::uint64_t bytes;
     std::uint8_t* destination;
+    bool prefetch{false};  ///< counted in prefetch_pending_
   };
 
   ExpertStream() = default;
@@ -122,6 +137,8 @@ private:
   Stats reported_;
   std::filesystem::path profile_path_;
   bool count_routing_{true};
+  std::uint64_t use_ticks_{0};  // 0 = pure LRU, measured fastest on .198
+  std::uint32_t age_maps_{256};
   std::chrono::steady_clock::time_point report_at_{};
 
   std::uint8_t* staging_{nullptr};  ///< Pinned, max_misses * expert set.
@@ -133,6 +150,17 @@ private:
   std::deque<Job> queue_;
   std::size_t pending_{0};
   bool failed_{false};
+  std::size_t prefetch_pending_{0};
+  bool prefetch_failed_{false};
+  struct PendingPrefetch {
+    bool active{false};
+    std::uint32_t layer{0};
+    std::vector<std::int32_t> experts, slots;
+  };
+  PendingPrefetch prefetch_;
+  std::uint8_t* prefetch_staging_{nullptr};  ///< Pinned, like staging_.
+  hipEvent_t prefetch_done_{nullptr};
+  bool FinishPrefetch(hipStream_t stream, std::string* error_msg);
   bool stop_{false};
   std::vector<std::thread> workers_;
 };
