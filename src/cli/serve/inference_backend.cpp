@@ -3836,7 +3836,7 @@ bool InferenceBackend::load(
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, resolved_speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
     const bool ornith_dflash =
