@@ -103,6 +103,10 @@ struct Conversion {
 struct Uploaded {
   DeviceTensor token_embd;
   DeviceTensor output;
+  /// Bytes of `output` in its uploaded layout: a dequantized Q6_K head
+  /// becomes wider Q8_0 rows, and row addressing (the MTP draft table)
+  /// must follow what the kernels read, not the file's layout.
+  std::size_t output_bytes{0};
   DeviceMixer hc_head;
   std::vector<DeviceLayer> layers;
   DeviceLayer mtp;
@@ -554,11 +558,17 @@ struct Uploader {
                  std::uint32_t trunk_shards) {
     Uploaded u;
     u.token_embd = Copy(w.token_embd);
-    u.output = w.output.data == w.token_embd.data
-                   ? u.token_embd
-                   : (w.output.type == core::GgmlType::kQ6_K
-                          ? CopyDequantQ8_0(w.output)
-                          : Copy(w.output));
+    if (w.output.data == w.token_embd.data) {
+      u.output = u.token_embd;
+      u.output_bytes = w.output.SizeBytes();
+    } else if (w.output.type == core::GgmlType::kQ6_K) {
+      u.output = CopyDequantQ8_0(w.output);
+      u.output_bytes =
+          w.output.rows * (w.output.cols / 32 * sizeof(quant::block_q8_0));
+    } else {
+      u.output = Copy(w.output);
+      u.output_bytes = w.output.SizeBytes();
+    }
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     for (const auto& l : w.layers) {
@@ -692,7 +702,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  m->output_bytes_ = uploaded.output_bytes;
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
