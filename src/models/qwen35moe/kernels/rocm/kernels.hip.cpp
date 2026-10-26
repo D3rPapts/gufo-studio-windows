@@ -9,9 +9,8 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "src/models/qwen35moe/mtp_sampling.hpp"
-
 #include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
+#include "src/models/qwen35moe/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
 
@@ -1547,8 +1546,7 @@ __device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
 /// offsets and the F16 scales trail.
 __global__ void QuantizeAttentionQKernel(const float* __restrict__ q,
                                          unsigned char* __restrict__ q8,
-                                         std::uint32_t heads,
-                                         std::uint32_t d) {
+                                         std::uint32_t heads, std::uint32_t d) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t h = blockIdx.y;
   const std::uint32_t tid = threadIdx.x;
@@ -1613,8 +1611,9 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
                 d + i * 2);
       }
     } else {
-      qs[g][i] = i < d ? q[(static_cast<std::size_t>(t) * heads + h0 + g) * d + i]
-                       : 0.0f;
+      qs[g][i] = i < d
+                     ? q[(static_cast<std::size_t>(t) * heads + h0 + g) * d + i]
+                     : 0.0f;
     }
   }
   __syncthreads();
@@ -1701,8 +1700,8 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
         qc[g][0] = *reinterpret_cast<const std::uint32_t*>(&qs8[g][lane * 8]);
         qc[g][1] =
             *reinterpret_cast<const std::uint32_t*>(&qs8[g][lane * 8 + 4]);
-        qsc[g] =
-            __half2float(*reinterpret_cast<const __half*>(&qs8[g][d + (lane >> 2) * 2]));
+        qsc[g] = __half2float(
+            *reinterpret_cast<const __half*>(&qs8[g][d + (lane >> 2) * 2]));
       } else {
 #pragma unroll
         for (std::uint32_t j = 0; j < 8; ++j) {
@@ -1742,8 +1741,7 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
 #pragma unroll
         for (std::uint32_t b = 0; b < kBatch; ++b) {
           const std::uint32_t j = keys[(wave * 32) + k0 + b];
-          const float ksc =
-              __half2float(__builtin_bit_cast(__half, ksb[b]));
+          const float ksc = __half2float(__builtin_bit_cast(__half, ksb[b]));
 #pragma unroll
           for (std::uint32_t g = 0; g < kGroup; ++g) {
             std::int32_t ip = 0;
@@ -1757,8 +1755,7 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
                 : "+v"(ip)
                 : "v"(static_cast<std::int32_t>(qc[g][1])),
                   "v"(static_cast<std::int32_t>(kc[b].y)));
-            const float dot =
-                WaveSum(static_cast<float>(ip) * (qsc[g] * ksc));
+            const float dot = WaveSum(static_cast<float>(ip) * (qsc[g] * ksc));
             if (lane == k0 + b) {
               s_mine[g] = j < n_kv ? dot * scale : -INFINITY;
             }
@@ -1862,8 +1859,7 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
           const std::uint32_t j = min(keys[(wave * 32) + k0 + b], n_kv - 1);
           if constexpr (kVQ4K) {
             const unsigned char* row = v_cache + j * v_row_bytes;
-            const unsigned char* scales =
-                row + kv_stride / 2 + head_data / 16;
+            const unsigned char* scales = row + kv_stride / 2 + head_data / 16;
             const unsigned jh = (lane >> 2) & 7u;
             vq4[b].x = *reinterpret_cast<const std::uint32_t*>(
                 row + head_data / 2 + lane * 4);
@@ -1874,7 +1870,8 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
           } else {
             const unsigned char* row = v_cache + j * v_row_bytes;
             if constexpr (kKvQ8) {
-              qvc[b] = *reinterpret_cast<const uint2*>(row + head_data + lane * 8);
+              qvc[b] =
+                  *reinterpret_cast<const uint2*>(row + head_data + lane * 8);
               vsb[b] = *reinterpret_cast<const std::uint16_t*>(
                   row + kv_stride + (kvh * (d / 32) + (lane >> 2)) * 2);
             } else {
@@ -1914,13 +1911,13 @@ __global__ void AttentionKernel(const float* q, const unsigned char* q8,
             } else if constexpr (kKvQ8) {
               const __half2 magic2 = __floats2half2_rn(-1152.0F, -1152.0F);
               const __half2 zero2 = __floats2half2_rn(0.0F, 0.0F);
-              const __half2 scale2 = __half2half2(
-                  __builtin_bit_cast(__half, vsb[b]));
+              const __half2 scale2 =
+                  __half2half2(__builtin_bit_cast(__half, vsb[b]));
               __half2 h01, h23, h45, h67;
-              CodesToHalves(qvc[b].x ^ 0x80808080U, magic2, scale2, zero2,
-                            h01, h23);
-              CodesToHalves(qvc[b].y ^ 0x80808080U, magic2, scale2, zero2,
-                            h45, h67);
+              CodesToHalves(qvc[b].x ^ 0x80808080U, magic2, scale2, zero2, h01,
+                            h23);
+              CodesToHalves(qvc[b].y ^ 0x80808080U, magic2, scale2, zero2, h45,
+                            h67);
               const float2 f01 = __half22float2(h01);
               const float2 f23 = __half22float2(h23);
               const float2 f45 = __half22float2(h45);
@@ -2680,10 +2677,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       if constexpr (kVQ4K) {
         if (live) {
           float vals[8];
-          LoadQ4K8(src + static_cast<std::size_t>(kv_head) * (kHeadDim / 2),
-                   src + kWmmaKvWidth / 2 +
-                       static_cast<std::size_t>(kv_head) * 16,
-                   v_slice + (j * 8), vals);
+          LoadQ4K8(
+              src + static_cast<std::size_t>(kv_head) * (kHeadDim / 2),
+              src + kWmmaKvWidth / 2 + static_cast<std::size_t>(kv_head) * 16,
+              v_slice + (j * 8), vals);
           auto* h2 = reinterpret_cast<__half2*>(&dst[j]);
           h2[0] = __floats2half2_rn(vals[0], vals[1]);
           h2[1] = __floats2half2_rn(vals[2], vals[3]);
@@ -2696,12 +2693,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         dst[j] = live ? load_q8_16(src, v_slice + (j * 8))
                       : make_uint4(0u, 0u, 0u, 0u);
       } else {
-        dst[j] = live ? *reinterpret_cast<const uint4*>(
-                            v_half +
-                            (static_cast<std::size_t>(key_position) *
-                             kWmmaKvWidth) +
-                            (j * 8))
-                      : make_uint4(0u, 0u, 0u, 0u);
+        dst[j] =
+            live ? *reinterpret_cast<const uint4*>(
+                       v_half +
+                       (static_cast<std::size_t>(key_position) * kWmmaKvWidth) +
+                       (j * 8))
+                 : make_uint4(0u, 0u, 0u, 0u);
       }
     }
   };
@@ -5672,14 +5669,14 @@ void Attention(const float* q, const unsigned char* q8, const void* k_cache,
   }
 }
 
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const void* k_cache, const void* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only, KvDtypes kv_dtypes) {
+bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
+                         const void* v_cache, const std::uint32_t* mask,
+                         std::uint32_t mask_words, float* out,
+                         std::uint32_t n_tokens, std::uint32_t start_pos,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t d, std::uint32_t ratio,
+                         hipStream_t stream, bool last_only,
+                         KvDtypes kv_dtypes) {
   if ((heads != 16 && heads != kWmmaQueryHeads) || kv_heads != kWmmaKvHeads ||
       d != kWmmaHeadDim || n_tokens == 0 ||
       (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {

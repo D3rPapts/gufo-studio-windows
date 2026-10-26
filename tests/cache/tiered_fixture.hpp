@@ -18,8 +18,8 @@ struct TieredDirectory {
   std::filesystem::path path;
   TieredDirectory() {
 #if defined(_WIN32)
-    const auto base = std::filesystem::temp_directory_path() /
-                      "gufo-tiered-test";
+    const auto base =
+        std::filesystem::temp_directory_path() / "gufo-tiered-test";
     for (unsigned attempt = 0;; ++attempt) {
       std::error_code create_error;
       const auto candidate =

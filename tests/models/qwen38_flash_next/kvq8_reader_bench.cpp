@@ -7,12 +7,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -51,7 +51,8 @@ T* DeviceBytes(std::size_t bytes) {
   return static_cast<T*>(p);
 }
 
-double TimeKernel(const char* label, int rounds, const std::function<void()>& run) {
+double TimeKernel(const char* label, int rounds,
+                  const std::function<void()>& run) {
   hipEvent_t begin, end;
   CheckHip(hipEventCreate(&begin), "event");
   CheckHip(hipEventCreate(&end), "event");
@@ -84,16 +85,17 @@ int main(int argc, char** argv) {
   const std::size_t kv_elems = std::size_t{n_kv} * kKvWidth;
   const std::size_t q_count = std::size_t{n_tokens} * kQWidth;
   const std::size_t f16_bytes = kv_elems * 2;
-  const std::size_t q8_bytes =
-      std::size_t{n_kv} * (kKvWidth + kKvWidth / 16);
+  const std::size_t q8_bytes = std::size_t{n_kv} * (kKvWidth + kKvWidth / 16);
 
   std::uint32_t seed = 12345;
   std::vector<float> qf(q_count), gf(q_count);
   for (float& v : qf) {
-    v = 4.0F * (static_cast<int>(NextRandom(&seed) & 0xFFFF) - 32768) / 32768.0F;
+    v = 4.0F * (static_cast<int>(NextRandom(&seed) & 0xFFFF) - 32768) /
+        32768.0F;
   }
   for (float& v : gf) {
-    v = 3.0F * (static_cast<int>(NextRandom(&seed) & 0xFFFF) - 32768) / 32768.0F;
+    v = 3.0F * (static_cast<int>(NextRandom(&seed) & 0xFFFF) - 32768) /
+        32768.0F;
   }
   std::vector<__half> kh(f16_bytes / 2), vh(f16_bytes / 2);
   for (std::size_t i = 0; i < kh.size(); ++i) {
@@ -119,8 +121,8 @@ int main(int argc, char** argv) {
            "upload k16");
   CheckHip(hipMemcpy(d_v16, vh.data(), f16_bytes, hipMemcpyHostToDevice),
            "upload v16");
-  CheckHip(
-      hipMemcpy(d_pos, &start_pos, 4, hipMemcpyHostToDevice), "upload pos");
+  CheckHip(hipMemcpy(d_pos, &start_pos, 4, hipMemcpyHostToDevice),
+           "upload pos");
 
   // Pack the F16 rows into the planar Q8_0 layout on the host so the Q8
   // reader sees a realistic (nonzero) scale region.

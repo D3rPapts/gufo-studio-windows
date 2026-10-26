@@ -221,8 +221,8 @@ struct Uploader {
       }
       offset += t->SizeBytes();
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
-                         kTailMargin, nullptr);
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
+                         nullptr);
     d.native_data = ptr;
     d.native_type = type;
     d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -287,10 +287,10 @@ struct Uploader {
           any_host = true;
           continue;
         }
-        if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) +
-                             source.first * row_dst_bytes,
-                         error)) {
+        if (!stager.Copy(
+                t->shard, t->file_offset, t->SizeBytes(),
+                static_cast<std::uint8_t*>(ptr) + source.first * row_dst_bytes,
+                error)) {
           Fail("Q8_0 upload failed for " + std::string(t->name));
           return d;
         }
@@ -347,11 +347,11 @@ struct Uploader {
         if (source.type == GgmlType::kQ8_0) {
           continue;
         }
-        if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
-                          source.first * row_dst_bytes,
-                      staged.data() + source.first * row_dst_bytes,
-                      source.rows * row_dst_bytes, hipMemcpyHostToDevice) !=
-            hipSuccess) {
+        if (hipMemcpy(
+                static_cast<std::uint8_t*>(ptr) + source.first * row_dst_bytes,
+                staged.data() + source.first * row_dst_bytes,
+                source.rows * row_dst_bytes,
+                hipMemcpyHostToDevice) != hipSuccess) {
           Fail("Q8_0 upload failed");
           return d;
         }
@@ -648,9 +648,9 @@ struct Uploader {
       // complete first. This is the final layer upload; the drain costs no
       // overlap with later work.
       if (!stager.Finish(error)) {
-        Fail("eh_proj upload failed" +
-             (error != nullptr && !error->empty() ? ": " + *error
-                                                  : std::string()));
+        Fail("eh_proj upload failed" + (error != nullptr && !error->empty()
+                                            ? ": " + *error
+                                            : std::string()));
         return d;
       }
       SplitMtpProjection(combined, d.nextn_fc_embedding, d.nextn_fc_hidden);

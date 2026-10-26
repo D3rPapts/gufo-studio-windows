@@ -5,8 +5,6 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
-#include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
-
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -23,6 +21,7 @@
 #include "src/models/qwen35moe/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen35moe/kernels/rocm/device_model.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
+#include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
 #include "src/models/qwen35moe/mtp_sampling.hpp"
 
 namespace gufo::models::qwen35moe {
@@ -453,7 +452,7 @@ private:
     float* k;
     float* v;
     float* ctx;
-    unsigned char* q8;  ///< quantized query rows (Q8_0 key plane only)
+    unsigned char* q8;     ///< quantized query rows (Q8_0 key plane only)
     float* attn_partials;  ///< split-key partials of a narrow batch
     // moe
     float* router;

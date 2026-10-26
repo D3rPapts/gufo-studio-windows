@@ -81,9 +81,9 @@ struct WeightUpload::State {
     hipStream_t stream{nullptr};
     // One independent description per reader, reopened when the reader moves
     // to another shard: concurrent readers never queue on one synchronous
-    // handle. Cached reads are preferred because unbuffered reads of a file
-    // that is also mapped serialize (Windows NTFS); direct reads stay as the
-    // fallback and need alignment.
+    // handle. Windows reopens cached overlapped because unbuffered reads of
+    // a file that is also mapped serialize (NTFS); Linux attempts direct
+    // reads, which need alignment.
     platform::PlatformFile reopened{platform::kInvalidFile};
     std::uint32_t reopened_shard{0xffffffffu};
     bool direct{false};
@@ -151,21 +151,16 @@ struct WeightUpload::State {
     bool read = false;
     // Each reader keeps an independent description of the shard it reads, so
     // concurrent readers never queue on one synchronous handle: Windows
-    // serializes synchronous I/O per file object, not per process. Cached
-    // reads go first because unbuffered reads of a file that is also mapped
-    // serialize (NTFS); direct reads remain the fallback.
+    // serializes synchronous I/O per file object, not per process. Windows
+    // reopens cached overlapped; Linux attempts direct I/O. When neither is
+    // available, reads fall through to the shared retained handle.
     if (slot.reopened_shard != task.shard) {
       platform::CloseFile(slot.reopened);
       slot.reopened = platform::kInvalidFile;
       slot.reopened_shard = task.shard;
     }
     if (!platform::FileValid(slot.reopened)) {
-      slot.reopened = platform::ReopenCached(shard.fd);
-      slot.direct = false;
-      if (!platform::FileValid(slot.reopened)) {
-        slot.reopened = platform::ReopenUnbuffered(shard.fd);
-        slot.direct = true;
-      }
+      slot.reopened = platform::ReopenRandomReadFile(shard.fd, slot.direct);
     }
     if (platform::FileValid(slot.reopened) && !slot.direct) {
       read = ReadFully(slot.reopened, slot.buffer, task.offset, task.size,

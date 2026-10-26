@@ -52,6 +52,9 @@ struct Prompt {
   std::vector<tokenization::TokenId> tokens;
   /// Frontier unchanged when an interrupted assistant is followed by a user.
   std::size_t stable_prefix_tokens{0};
+  /// End of the system or developer prompt directly before the final user
+  /// question, which the next request may keep. Zero when there is none.
+  std::size_t instructions_tokens{0};
   RopeLayout rope;
   std::vector<PreparedImage> images;
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,
@@ -61,7 +64,11 @@ struct Prompt {
       std::size_t token_count) const;
 };
 
-[[nodiscard]] core::Image ResizeImage(const core::Image& image);
+/// `kLow` limits both sides of the resized image to 512 pixels, which is at
+/// most 16 x 16 merged tokens, unless the model's minimum size is larger. It
+/// never exceeds the `kAuto` size. `kAuto` uses the model's full range.
+[[nodiscard]] core::Image ResizeImage(
+    const core::Image& image, tokenization::ChatMessage::ImageDetail detail);
 [[nodiscard]] Prompt Prepare(
     const tokenization::QwenTokenizer& tokenizer,
     std::span<const tokenization::ChatMessage> messages,

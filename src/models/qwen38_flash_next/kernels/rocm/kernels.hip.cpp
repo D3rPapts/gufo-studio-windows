@@ -9023,454 +9023,437 @@ std::uint32_t WmmaCausalAttentionContextLimit(std::uint32_t heads,
   return kWmmaMaxMaskWords * kWmmaRatio * 32;
 }
 
-    bool WmmaCausalAttention(
-        const float* q, const float* gate, const void* k_cache,
-        const void* v_cache, const std::uint32_t* mask,
-        std::uint32_t mask_words, float* out, std::uint32_t n_tokens,
-        std::uint32_t start_pos, std::uint32_t heads, std::uint32_t kv_heads,
-        std::uint32_t d, std::uint32_t ratio, hipStream_t stream,
-        bool last_only, KvDtypes kv_dtypes, const std::uint32_t* lead_mask,
-        std::uint32_t lead) {
-      if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
-          d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
-          (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
-          (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
-        return false;
-      }
-      const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
-      const auto* v_bytes = static_cast<const unsigned char*>(v_cache);
-      const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;
-      const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
-      if (mask != nullptr) {
-        // The kernel's union mask covers the LIVE visible extent; mask_words is
-        // only the row stride and may be wider when the session capacity
-        // exceeds 262,144 tokens.
-        const std::uint64_t live_blocks =
-            (std::uint64_t{start_pos} + n_tokens + kWmmaRatio - 1) / kWmmaRatio;
-        const std::uint64_t live_words = (live_blocks + 31) / 32;
-        if (live_words > kWmmaMaxMaskWords || live_words > mask_words)
-          return false;
-      }
-      if (mask != nullptr) {
-        constexpr std::uint32_t kPackedQueries = 4;
-        // last_only computes the absolute-aligned group containing the batch's
-        // final row: with lead rows prepended it starts up to three rows before
-        // the launch-relative tile (the same tile when lead is zero).
-        const std::uint32_t last_row = n_tokens - 1;
-        const std::uint32_t first_group =
-            last_only
-                ? (last_row + lead - ((lead + last_row) % kPackedQueries)) /
-                      kPackedQueries
-                : 0;
-        // The lead rows extend the first group to the full pass's absolute
-        // query alignment, so its grid carries one extra group at most.
-        const dim3 grid(
-            (lead + n_tokens + kPackedQueries - 1) / kPackedQueries -
-                first_group,
-            kWmmaKvHeads);
-        // At deep sparse windows, staging the current V before fetching the
-        // next one shortens their overlapping register lifetimes.
-        const bool late_v = start_pos >= 65536;
-        if (kv_q8) {
-          if (v_q4k) {
-            if (late_v) {
-              hipLaunchKernelGGL(
-                  (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
-                                             true, true, true>),
-                  grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
-                  mask, mask_words, out, start_pos, n_tokens, first_group,
-                  lead_mask, lead);
-            } else {
-              hipLaunchKernelGGL(
-                  (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
-                                             false, true, true>),
-                  grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
-                  mask, mask_words, out, start_pos, n_tokens, first_group,
-                  lead_mask, lead);
-            }
-          } else if (late_v) {
-            hipLaunchKernelGGL(
-                (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
-                                           true, true>),
-                grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
-                mask, mask_words, out, start_pos, n_tokens, first_group,
-                lead_mask, lead);
-          } else {
-            hipLaunchKernelGGL(
-                (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
-                                           false, true>),
-                grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
-                mask, mask_words, out, start_pos, n_tokens, first_group,
-                lead_mask, lead);
-          }
-        } else if (late_v) {
-          hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries,
-                                                        kWmmaKeys, true, true>),
-                             grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
-                             v_bytes, mask, mask_words, out, start_pos,
-                             n_tokens, first_group, lead_mask, lead);
+bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
+                         const void* v_cache, const std::uint32_t* mask,
+                         std::uint32_t mask_words, float* out,
+                         std::uint32_t n_tokens, std::uint32_t start_pos,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t d, std::uint32_t ratio,
+                         hipStream_t stream, bool last_only, KvDtypes kv_dtypes,
+                         const std::uint32_t* lead_mask, std::uint32_t lead) {
+  if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
+      d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
+      (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
+      (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
+    return false;
+  }
+  const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
+  const auto* v_bytes = static_cast<const unsigned char*>(v_cache);
+  const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;
+  const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
+  if (mask != nullptr) {
+    // The kernel's union mask covers the LIVE visible extent; mask_words is
+    // only the row stride and may be wider when the session capacity
+    // exceeds 262,144 tokens.
+    const std::uint64_t live_blocks =
+        (std::uint64_t{start_pos} + n_tokens + kWmmaRatio - 1) / kWmmaRatio;
+    const std::uint64_t live_words = (live_blocks + 31) / 32;
+    if (live_words > kWmmaMaxMaskWords || live_words > mask_words)
+      return false;
+  }
+  if (mask != nullptr) {
+    constexpr std::uint32_t kPackedQueries = 4;
+    // last_only computes the absolute-aligned group containing the batch's
+    // final row: with lead rows prepended it starts up to three rows before
+    // the launch-relative tile (the same tile when lead is zero).
+    const std::uint32_t last_row = n_tokens - 1;
+    const std::uint32_t first_group =
+        last_only ? (last_row + lead - ((lead + last_row) % kPackedQueries)) /
+                        kPackedQueries
+                  : 0;
+    // The lead rows extend the first group to the full pass's absolute
+    // query alignment, so its grid carries one extra group at most.
+    const dim3 grid(
+        (lead + n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
+        kWmmaKvHeads);
+    // At deep sparse windows, staging the current V before fetching the
+    // next one shortens their overlapping register lifetimes.
+    const bool late_v = start_pos >= 65536;
+    if (kv_q8) {
+      if (v_q4k) {
+        if (late_v) {
+          hipLaunchKernelGGL(
+              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true,
+                                         true, true>),
+              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+              mask_words, out, start_pos, n_tokens, first_group, lead_mask,
+              lead);
         } else {
           hipLaunchKernelGGL(
-              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>),
+              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, false,
+                                         true, true>),
               grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
               mask_words, out, start_pos, n_tokens, first_group, lead_mask,
               lead);
         }
-        return true;
-      }
-      const std::uint32_t first_group =
-          last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
-      const dim3 grid(
-          (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
-          kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
-      if (kv_q8) {
-        if (v_q4k) {
-          hipLaunchKernelGGL(
-              (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false,
-                                         false, true, true>),
-              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-              mask_words, out, start_pos, n_tokens, first_group);
-        } else {
-          hipLaunchKernelGGL(
-              (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false,
-                                         false, true>),
-              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-              mask_words, out, start_pos, n_tokens, first_group);
-        }
+      } else if (late_v) {
+        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
+                                                      true, true, true>),
+                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                           first_group, lead_mask, lead);
       } else {
-        hipLaunchKernelGGL(
-            (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
-            dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-            mask_words, out, start_pos, n_tokens, first_group);
+        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
+                                                      true, false, true>),
+                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                           first_group, lead_mask, lead);
       }
-      return true;
+    } else if (late_v) {
+      hipLaunchKernelGGL(
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
+          grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
+    } else {
+      hipLaunchKernelGGL(
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
+          dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
     }
-
-    __global__ void ExpertCountsKernel(
-        const std::int32_t* ids, std::uint32_t* counts, std::size_t slots) {
-      const std::size_t i =
-          blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-      if (i < slots && ids[i] >= 0) {
-        atomicAdd(counts + ids[i], 1u);
-      }
+    return true;
+  }
+  const std::uint32_t first_group =
+      last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
+  const dim3 grid(
+      (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
+      kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
+  if (kv_q8) {
+    if (v_q4k) {
+      hipLaunchKernelGGL((WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys,
+                                                    false, false, true, true>),
+                         grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                         v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                         first_group);
+    } else {
+      hipLaunchKernelGGL((WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys,
+                                                    false, false, true>),
+                         grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                         v_bytes, mask, mask_words, out, start_pos, n_tokens,
+                         first_group);
     }
+  } else {
+    hipLaunchKernelGGL(
+        (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
+        dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask, mask_words,
+        out, start_pos, n_tokens, first_group);
+  }
+  return true;
+}
 
-    void RouterTopK(const float* logits, std::uint32_t stride,
-                    std::int32_t* ids, float* weights, std::uint32_t n_tokens,
-                    std::uint32_t n_experts, std::uint32_t k,
-                    hipStream_t stream) {
-      if (n_experts <= 512) {
-        hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens),
-                           dim3(kThreads), 0, stream, logits, stride, ids,
-                           weights, n_experts, k);
-      } else {
-        hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens),
-                           dim3(kThreads), 0, stream, logits, stride, ids,
-                           weights, n_experts, k);
-      }
-    }
+__global__ void ExpertCountsKernel(const std::int32_t* ids,
+                                   std::uint32_t* counts, std::size_t slots) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < slots && ids[i] >= 0) {
+    atomicAdd(counts + ids[i], 1u);
+  }
+}
 
-    void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
-                      std::uint32_t n_tokens, std::uint32_t n_experts,
-                      std::uint32_t k, hipStream_t stream) {
-      (void)hipMemsetAsync(counts, 0, n_experts * sizeof(std::uint32_t),
-                           stream);
-      const std::size_t slots = static_cast<std::size_t>(n_tokens) * k;
-      hipLaunchKernelGGL(ExpertCountsKernel, dim3(Blocks(slots)),
-                         dim3(kThreads), 0, stream, ids, counts, slots);
-    }
+void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
+                float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
+                std::uint32_t k, hipStream_t stream) {
+  if (n_experts <= 512) {
+    hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens), dim3(kThreads),
+                       0, stream, logits, stride, ids, weights, n_experts, k);
+  } else {
+    hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
+                       0, stream, logits, stride, ids, weights, n_experts, k);
+  }
+}
 
-    void MoeEpilogue(const float* expert_out, const float* weights,
+void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                  std::uint32_t n_tokens, std::uint32_t n_experts,
+                  std::uint32_t k, hipStream_t stream) {
+  (void)hipMemsetAsync(counts, 0, n_experts * sizeof(std::uint32_t), stream);
+  const std::size_t slots = static_cast<std::size_t>(n_tokens) * k;
+  hipLaunchKernelGGL(ExpertCountsKernel, dim3(Blocks(slots)), dim3(kThreads), 0,
+                     stream, ids, counts, slots);
+}
+
+void MoeEpilogue(const float* expert_out, const float* weights,
+                 const float* shared, const float* gate,
+                 std::uint32_t gate_stride, float* out, std::uint32_t n_tokens,
+                 std::uint32_t k, std::uint32_t dim, hipStream_t stream) {
+  hipLaunchKernelGGL(MoeEpilogueKernel, dim3(n_tokens, Blocks(dim)),
+                     dim3(kThreads), 0, stream, expert_out, weights, shared,
+                     gate, gate_stride, out, k, dim);
+}
+
+void MoeEpilogueVec4(const float* expert_out, const float* weights,
                      const float* shared, const float* gate,
                      std::uint32_t gate_stride, float* out,
                      std::uint32_t n_tokens, std::uint32_t k, std::uint32_t dim,
                      hipStream_t stream) {
-      hipLaunchKernelGGL(MoeEpilogueKernel, dim3(n_tokens, Blocks(dim)),
-                         dim3(kThreads), 0, stream, expert_out, weights, shared,
-                         gate, gate_stride, out, k, dim);
-    }
+  if (dim % 4 != 0) {
+    MoeEpilogue(expert_out, weights, shared, gate, gate_stride, out, n_tokens,
+                k, dim, stream);
+    return;
+  }
+  hipLaunchKernelGGL(MoeEpilogueVec4Kernel<float>,
+                     dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0, stream,
+                     expert_out, weights, shared, gate, gate_stride, out, k,
+                     dim);
+}
 
-    void MoeEpilogueVec4(const float* expert_out, const float* weights,
-                         const float* shared, const float* gate,
-                         std::uint32_t gate_stride, float* out,
-                         std::uint32_t n_tokens, std::uint32_t k,
-                         std::uint32_t dim, hipStream_t stream) {
-      if (dim % 4 != 0) {
-        MoeEpilogue(expert_out, weights, shared, gate, gate_stride, out,
-                    n_tokens, k, dim, stream);
-        return;
-      }
-      hipLaunchKernelGGL(MoeEpilogueVec4Kernel<float>,
-                         dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0,
-                         stream, expert_out, weights, shared, gate, gate_stride,
-                         out, k, dim);
-    }
+void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
+                        const float* shared, const float* gate,
+                        std::uint32_t gate_stride, float* out,
+                        std::uint32_t n_tokens, std::uint32_t k,
+                        std::uint32_t dim, hipStream_t stream) {
+  hipLaunchKernelGGL(MoeEpilogueVec4Kernel<__half>,
+                     dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0, stream,
+                     expert_out, weights, shared, gate, gate_stride, out, k,
+                     dim);
+}
 
-    void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
-                            const float* shared, const float* gate,
-                            std::uint32_t gate_stride, float* out,
-                            std::uint32_t n_tokens, std::uint32_t k,
-                            std::uint32_t dim, hipStream_t stream) {
-      hipLaunchKernelGGL(MoeEpilogueVec4Kernel<__half>,
-                         dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0,
-                         stream, expert_out, weights, shared, gate, gate_stride,
-                         out, k, dim);
-    }
+void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
+               float* dst, std::uint32_t n_tokens, std::uint32_t width,
+               hipStream_t stream) {
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(base) |
+                        reinterpret_cast<std::uintptr_t>(alt) |
+                        reinterpret_cast<std::uintptr_t>(dst)) %
+                           16 ==
+                       0;
+  if (aligned && width % 4 == 0) {
+    hipLaunchKernelGGL(MtpHiddenVec4Kernel, dim3(n_tokens, Blocks(width / 4)),
+                       dim3(kThreads), 0, stream,
+                       reinterpret_cast<const float4*>(base),
+                       reinterpret_cast<const float4*>(alt), row,
+                       reinterpret_cast<float4*>(dst), width / 4);
+    return;
+  }
+  hipLaunchKernelGGL(MtpHiddenKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
+                     base, alt, row, dst, width);
+}
 
-    void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
-                   float* dst, std::uint32_t n_tokens, std::uint32_t width,
-                   hipStream_t stream) {
-      const bool aligned = (reinterpret_cast<std::uintptr_t>(base) |
-                            reinterpret_cast<std::uintptr_t>(alt) |
-                            reinterpret_cast<std::uintptr_t>(dst)) %
-                               16 ==
-                           0;
-      if (aligned && width % 4 == 0) {
-        hipLaunchKernelGGL(MtpHiddenVec4Kernel,
-                           dim3(n_tokens, Blocks(width / 4)), dim3(kThreads), 0,
-                           stream, reinterpret_cast<const float4*>(base),
-                           reinterpret_cast<const float4*>(alt), row,
-                           reinterpret_cast<float4*>(dst), width / 4);
-        return;
-      }
-      hipLaunchKernelGGL(MtpHiddenKernel, dim3(n_tokens), dim3(kThreads), 0,
-                         stream, base, alt, row, dst, width);
-    }
+__global__ void MtpAdvanceControlKernel(std::uint32_t* mtp_position,
+                                        std::uint32_t* mtp_blocks,
+                                        std::int32_t* hidden_row,
+                                        std::uint32_t count,
+                                        std::uint32_t top_k,
+                                        std::uint32_t compress_ratio) {
+  *mtp_position += count;
+  if (*mtp_position > top_k) {
+    *mtp_blocks = *mtp_position / compress_ratio;
+  }
+  *hidden_row = -1;
+}
 
-    __global__ void MtpAdvanceControlKernel(
-        std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
-        std::int32_t* hidden_row, std::uint32_t count, std::uint32_t top_k,
-        std::uint32_t compress_ratio) {
-      *mtp_position += count;
-      if (*mtp_position > top_k) {
-        *mtp_blocks = *mtp_position / compress_ratio;
-      }
-      *hidden_row = -1;
-    }
-
-    void MtpAdvanceControl(std::uint32_t* mtp_position,
-                           std::uint32_t* mtp_blocks, std::int32_t* hidden_row,
-                           std::uint32_t count, std::uint32_t top_k,
-                           std::uint32_t compress_ratio, hipStream_t stream) {
-      hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
-                         mtp_position, mtp_blocks, hidden_row, count, top_k,
-                         compress_ratio);
-    }
-
-    void MtpAddEmbedding(const float* embedding, float* residual,
-                         std::uint32_t n_tokens, std::uint32_t hidden,
-                         std::uint32_t streams, hipStream_t stream) {
-      const bool aligned = (reinterpret_cast<std::uintptr_t>(embedding) |
-                            reinterpret_cast<std::uintptr_t>(residual)) %
-                               16 ==
-                           0;
-      if (aligned && hidden % 4 == 0) {
-        hipLaunchKernelGGL(
-            MtpAddEmbeddingVec4Kernel,
-            dim3(n_tokens, Blocks(streams * hidden / 4)), dim3(kThreads), 0,
-            stream, reinterpret_cast<const float4*>(embedding),
-            reinterpret_cast<float4*>(residual), hidden / 4, streams);
-        return;
-      }
-      hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads),
-                         0, stream, embedding, residual, hidden, streams);
-    }
-
-    void Argmax(const float* logits, ArgmaxCandidate* scratch,
-                std::int32_t* out, std::uint32_t n_tokens, std::uint32_t vocab,
-                hipStream_t stream) {
-      hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
-                         dim3(kThreads), 0, stream, logits, scratch, vocab);
-      hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
-                         stream, logits, scratch, out, vocab);
-    }
-
-    void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
-                         float repeat, float frequency, float presence,
-                         PenaltyArgmaxCandidate* partial, ArgmaxCandidate* out,
-                         std::uint32_t rows, std::uint32_t vocab,
-                         hipStream_t stream) {
-      if (rows == 0 || rows > 7 || vocab == 0)
-        throw std::invalid_argument("invalid penalty argmax shape");
-      PenaltyArgmaxPartialKernel<<<dim3(kArgmaxParts, rows), kThreads, 0,
-                                   stream>>>(
-          logits, penalties, repeat, frequency, presence, partial, vocab);
-      PenaltyArgmaxFinishKernel<<<rows, kThreads, 0, stream>>>(logits, partial,
-                                                               out, vocab);
-    }
-
-    __global__ void MaskDraftLogitsKernel(
-        float* logits, const std::int32_t* table, std::uint32_t n) {
-      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n && table[i] < 0)
-        logits[i] = -INFINITY;
-    }
-
-    void MaskDraftLogits(float* logits, const std::int32_t* table,
-                         std::uint32_t n, hipStream_t stream) {
-      hipLaunchKernelGGL(MaskDraftLogitsKernel, dim3(Blocks(n)), dim3(kThreads),
-                         0, stream, logits, table, n);
-    }
-
-    __global__ void GatherDraftLogitsKernel(
-        float* logits, const std::int32_t* table, std::uint32_t prefix,
-        std::uint32_t n) {
-      // One block: every read finishes before any write, so the table rows can
-      // overwrite the logits they are gathered from.
-      const std::uint32_t i = threadIdx.x;
-      float value = -INFINITY;
-      if (i < n && table[i] >= 0)
-        value = logits[table[i]];
-      __syncthreads();
-      if (i < n)
-        logits[prefix + i] = value;
-    }
-
-    void GatherDraftLogits(float* logits, const std::int32_t* table,
-                           std::uint32_t prefix, std::uint32_t n,
-                           hipStream_t stream) {
-      hipLaunchKernelGGL(GatherDraftLogitsKernel, dim3(1), dim3(n), 0, stream,
-                         logits, table, prefix, n);
-    }
-
-    __global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
-                                        std::uint32_t prefix,
-                                        const std::int32_t* table) {
-      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n && ids[i] >= prefix)
-        ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
-    }
-
-    void RemapDraftIds(std::uint32_t* ids, std::uint32_t n,
-                       std::uint32_t prefix, const std::int32_t* table,
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
+                       std::int32_t* hidden_row, std::uint32_t count,
+                       std::uint32_t top_k, std::uint32_t compress_ratio,
                        hipStream_t stream) {
-      hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads),
-                         0, stream, ids, n, prefix, table);
-    }
+  hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
+                     mtp_position, mtp_blocks, hidden_row, count, top_k,
+                     compress_ratio);
+}
 
-    void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
-                                ArgmaxCandidate* out, std::uint32_t rows,
-                                std::uint32_t vocab, hipStream_t stream) {
-      hipLaunchKernelGGL(GatherArgmaxCandidatesKernel, dim3(Blocks(rows)),
-                         dim3(kThreads), 0, stream, logits, ids, out, rows,
-                         vocab);
-    }
+void MtpAddEmbedding(const float* embedding, float* residual,
+                     std::uint32_t n_tokens, std::uint32_t hidden,
+                     std::uint32_t streams, hipStream_t stream) {
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(embedding) |
+                        reinterpret_cast<std::uintptr_t>(residual)) %
+                           16 ==
+                       0;
+  if (aligned && hidden % 4 == 0) {
+    hipLaunchKernelGGL(
+        MtpAddEmbeddingVec4Kernel, dim3(n_tokens, Blocks(streams * hidden / 4)),
+        dim3(kThreads), 0, stream, reinterpret_cast<const float4*>(embedding),
+        reinterpret_cast<float4*>(residual), hidden / 4, streams);
+    return;
+  }
+  hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, embedding, residual, hidden, streams);
+}
 
-    template<unsigned Keep>
-    void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
-                             std::uint32_t* scratch_ids, float* scores,
-                             std::uint32_t vocab, hipStream_t stream) {
-      if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
-          vocab == 0) {
-        throw std::invalid_argument("invalid MTP candidate selection");
-      }
-      const auto tiles = [](std::uint32_t n) {
-        return 1U + (n - 1U) / kMtpCandidateTile;
-      };
-      unsigned passes = 1;
-      for (auto size = vocab; size > kMtpCandidateTile;
-           size = tiles(size) * Keep) {
-        ++passes;
-      }
-      // Choose the first buffer so the final pass always lands in `ids`.
-      auto* destination = passes % 2 != 0 ? ids : scratch_ids;
-      const std::uint32_t* source = nullptr;
-      auto size = vocab;
-      for (;;) {
-        const auto blocks = tiles(size);
-        hipLaunchKernelGGL((MtpCandidateTileKernel<Keep>), dim3(blocks),
-                           dim3(kThreads), 0, stream, logits, source,
-                           destination, blocks == 1 ? scores : nullptr, size,
-                           vocab);
-        if (blocks == 1) {
-          break;
-        }
-        size = blocks * Keep;
-        source = destination;
-        destination = destination == ids ? scratch_ids : ids;
-      }
-    }
+void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
+            std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
+                     dim3(kThreads), 0, stream, logits, scratch, vocab);
+  hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, logits, scratch, out, vocab);
+}
 
-    std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
-      const auto tiles = (vocab + 1023) / 1024;
-      return (tiles > 2 ? tiles : 2) * kMtpCandidates;
-    }
+void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
+                     float repeat, float frequency, float presence,
+                     PenaltyArgmaxCandidate* partial, ArgmaxCandidate* out,
+                     std::uint32_t rows, std::uint32_t vocab,
+                     hipStream_t stream) {
+  if (rows == 0 || rows > 7 || vocab == 0)
+    throw std::invalid_argument("invalid penalty argmax shape");
+  PenaltyArgmaxPartialKernel<<<dim3(kArgmaxParts, rows), kThreads, 0, stream>>>(
+      logits, penalties, repeat, frequency, presence, partial, vocab);
+  PenaltyArgmaxFinishKernel<<<rows, kThreads, 0, stream>>>(logits, partial, out,
+                                                           vocab);
+}
 
-    void VerificationCandidates(
-        const float* logits, GreedyPenaltyRows penalties, std::uint32_t* ids,
-        std::uint32_t* scratch_ids, sampling::LogitCandidate* out,
-        std::uint32_t rows, std::uint32_t vocab, hipStream_t stream) {
-      if (!logits || !ids || !scratch_ids || !out || !vocab || !rows ||
-          rows > 7)
-        throw std::invalid_argument("invalid verification candidate shape");
-      const auto stride = MtpCandidateWorkspaceSize(vocab);
-      const auto tiles = [](std::uint32_t n) { return 1U + (n - 1U) / 1024; };
-      auto size = vocab;
-      auto blocks = tiles(size);
-      VerificationCandidateTileKernel<true>
-          <<<dim3(blocks, rows), kThreads, 0, stream>>>(
-              logits, penalties, nullptr, ids, size, vocab, stride);
-      auto* source = ids;
-      auto* destination = scratch_ids;
-      while (blocks > 1) {
-        size = blocks * kMtpCandidates;
-        blocks = tiles(size);
-        VerificationCandidateTileKernel<false>
-            <<<dim3(blocks, rows), kThreads, 0, stream>>>(
-                logits, penalties, source, destination, size, vocab, stride);
-        std::swap(source, destination);
-      }
-      GatherVerificationCandidatesKernel<<<rows, kThreads, 0, stream>>>(
-          logits, penalties, source, out, vocab, stride);
-    }
+__global__ void MaskDraftLogitsKernel(float* logits, const std::int32_t* table,
+                                      std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && table[i] < 0)
+    logits[i] = -INFINITY;
+}
 
-    void MtpTopCandidates(const float* logits, std::uint32_t* ids,
-                          std::uint32_t* scratch_ids, float* scores,
-                          std::uint32_t vocab, hipStream_t stream) {
-      if (scores == nullptr)
-        throw std::invalid_argument("invalid MTP candidate scores");
-      SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores,
+void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
+                     hipStream_t stream) {
+  hipLaunchKernelGGL(MaskDraftLogitsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                     stream, logits, table, n);
+}
+
+__global__ void GatherDraftLogitsKernel(float* logits,
+                                        const std::int32_t* table,
+                                        std::uint32_t prefix, std::uint32_t n) {
+  // One block: every read finishes before any write, so the table rows can
+  // overwrite the logits they are gathered from.
+  const std::uint32_t i = threadIdx.x;
+  float value = -INFINITY;
+  if (i < n && table[i] >= 0)
+    value = logits[table[i]];
+  __syncthreads();
+  if (i < n)
+    logits[prefix + i] = value;
+}
+
+void GatherDraftLogits(float* logits, const std::int32_t* table,
+                       std::uint32_t prefix, std::uint32_t n,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(GatherDraftLogitsKernel, dim3(1), dim3(n), 0, stream,
+                     logits, table, prefix, n);
+}
+
+__global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
+                                    std::uint32_t prefix,
+                                    const std::int32_t* table) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && ids[i] >= prefix)
+    ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
+}
+
+void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
+                   const std::int32_t* table, hipStream_t stream) {
+  hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                     stream, ids, n, prefix, table);
+}
+
+void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
+                            ArgmaxCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(GatherArgmaxCandidatesKernel, dim3(Blocks(rows)),
+                     dim3(kThreads), 0, stream, logits, ids, out, rows, vocab);
+}
+
+template<unsigned Keep>
+void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
+                         std::uint32_t* scratch_ids, float* scores,
+                         std::uint32_t vocab, hipStream_t stream) {
+  if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
+      vocab == 0) {
+    throw std::invalid_argument("invalid MTP candidate selection");
+  }
+  const auto tiles = [](std::uint32_t n) {
+    return 1U + (n - 1U) / kMtpCandidateTile;
+  };
+  unsigned passes = 1;
+  for (auto size = vocab; size > kMtpCandidateTile; size = tiles(size) * Keep) {
+    ++passes;
+  }
+  // Choose the first buffer so the final pass always lands in `ids`.
+  auto* destination = passes % 2 != 0 ? ids : scratch_ids;
+  const std::uint32_t* source = nullptr;
+  auto size = vocab;
+  for (;;) {
+    const auto blocks = tiles(size);
+    hipLaunchKernelGGL((MtpCandidateTileKernel<Keep>), dim3(blocks),
+                       dim3(kThreads), 0, stream, logits, source, destination,
+                       blocks == 1 ? scores : nullptr, size, vocab);
+    if (blocks == 1) {
+      break;
+    }
+    size = blocks * Keep;
+    source = destination;
+    destination = destination == ids ? scratch_ids : ids;
+  }
+}
+
+std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
+  const auto tiles = (vocab + 1023) / 1024;
+  return (tiles > 2 ? tiles : 2) * kMtpCandidates;
+}
+
+void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
+                            std::uint32_t* ids, std::uint32_t* scratch_ids,
+                            sampling::LogitCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream) {
+  if (!logits || !ids || !scratch_ids || !out || !vocab || !rows || rows > 7)
+    throw std::invalid_argument("invalid verification candidate shape");
+  const auto stride = MtpCandidateWorkspaceSize(vocab);
+  const auto tiles = [](std::uint32_t n) { return 1U + (n - 1U) / 1024; };
+  auto size = vocab;
+  auto blocks = tiles(size);
+  VerificationCandidateTileKernel<true>
+      <<<dim3(blocks, rows), kThreads, 0, stream>>>(logits, penalties, nullptr,
+                                                    ids, size, vocab, stride);
+  auto* source = ids;
+  auto* destination = scratch_ids;
+  while (blocks > 1) {
+    size = blocks * kMtpCandidates;
+    blocks = tiles(size);
+    VerificationCandidateTileKernel<false>
+        <<<dim3(blocks, rows), kThreads, 0, stream>>>(
+            logits, penalties, source, destination, size, vocab, stride);
+    std::swap(source, destination);
+  }
+  GatherVerificationCandidatesKernel<<<rows, kThreads, 0, stream>>>(
+      logits, penalties, source, out, vocab, stride);
+}
+
+void MtpTopCandidates(const float* logits, std::uint32_t* ids,
+                      std::uint32_t* scratch_ids, float* scores,
+                      std::uint32_t vocab, hipStream_t stream) {
+  if (scores == nullptr)
+    throw std::invalid_argument("invalid MTP candidate scores");
+  SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores, vocab,
+                                      stream);
+}
+
+std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab) {
+  const auto tiles = (vocab + kMtpCandidateTile - 1) / kMtpCandidateTile;
+  return (tiles > 2 ? tiles : 2) * kMtpDraftShortlist;
+}
+
+void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
+                       std::uint32_t* scratch_ids, float* scores,
+                       std::uint32_t vocab, hipStream_t stream) {
+  if (scores == nullptr)
+    throw std::invalid_argument("invalid MTP draft shortlist scores");
+  SelectMtpCandidates<kMtpDraftShortlist>(logits, ids, scratch_ids, scores,
                                           vocab, stream);
-    }
+}
 
-    std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab) {
-      const auto tiles = (vocab + kMtpCandidateTile - 1) / kMtpCandidateTile;
-      return (tiles > 2 ? tiles : 2) * kMtpDraftShortlist;
-    }
+__global__ void GatherDraftHeadRowsKernel(const std::uint8_t* weights,
+                                          const std::uint32_t* ids,
+                                          uint4* gathered, std::uint32_t chunks,
+                                          std::uint32_t rows) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * chunks) {
+    return;
+  }
+  const std::uint32_t row = i / chunks;
+  const std::uint32_t chunk = i % chunks;
+  const auto* src = reinterpret_cast<const uint4*>(
+      weights + static_cast<std::size_t>(ids[row]) * chunks * 16);
+  gathered[i] = src[chunk];
+}
 
-    void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
-                           std::uint32_t* scratch_ids, float* scores,
-                           std::uint32_t vocab, hipStream_t stream) {
-      if (scores == nullptr)
-        throw std::invalid_argument("invalid MTP draft shortlist scores");
-      SelectMtpCandidates<kMtpDraftShortlist>(logits, ids, scratch_ids, scores,
-                                              vocab, stream);
-    }
+void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
+                         void* gathered, std::uint32_t row_bytes,
+                         std::uint32_t rows, hipStream_t stream) {
+  const auto chunks = row_bytes / 16;
+  const std::size_t count = std::size_t{rows} * chunks;
+  hipLaunchKernelGGL(
+      GatherDraftHeadRowsKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream,
+      static_cast<const std::uint8_t*>(weights), ids,
+      static_cast<uint4*>(gathered), static_cast<std::uint32_t>(chunks), rows);
+}
 
-    __global__ void GatherDraftHeadRowsKernel(
-        const std::uint8_t* weights, const std::uint32_t* ids, uint4* gathered,
-        std::uint32_t chunks, std::uint32_t rows) {
-      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i >= rows * chunks) {
-        return;
-      }
-      const std::uint32_t row = i / chunks;
-      const std::uint32_t chunk = i % chunks;
-      const auto* src = reinterpret_cast<const uint4*>(
-          weights + static_cast<std::size_t>(ids[row]) * chunks * 16);
-      gathered[i] = src[chunk];
-    }
-
-    void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
-                             void* gathered, std::uint32_t row_bytes,
-                             std::uint32_t rows, hipStream_t stream) {
-      const auto chunks = row_bytes / 16;
-      const std::size_t count = std::size_t{rows} * chunks;
-      hipLaunchKernelGGL(GatherDraftHeadRowsKernel, dim3(Blocks(count)),
-                         dim3(kThreads), 0, stream,
-                         static_cast<const std::uint8_t*>(weights), ids,
-                         static_cast<uint4*>(gathered),
-                         static_cast<std::uint32_t>(chunks), rows);
-    }
-
-  }  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::models::qwen38_flash_next::rocm

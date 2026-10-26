@@ -18,7 +18,7 @@ curl -sS http://127.0.0.1:8080/v1/embeddings \
   -d '{"model":"embeddinggemma-2","input":["task: search result | query: What causes the northern lights?"]}'
 ```
 
-The server returns L2-normalized mean-pooled vectors, so cosine similarity and dot product agree.  `input` is a string or an array of up to 2,048 strings or typed content objects, each at most 8,192 tokens including the `<bos>` and `<eos>` the tokenizer adds.  The server rejects token-array input because the vocabulary is the model's own.  `encoding_format` is `float` by default or `base64`.
+The server returns L2-normalized mean-pooled vectors, so cosine similarity and dot product agree.  `input` is a string or an array of up to 2,048 strings or typed content objects, each at most 8,192 tokens including the `<bos>` and `<eos>` the tokenizer adds.  Longer inputs return 400 `context_length_exceeded` unless the request sets `"truncate": true`, which keeps each input's first tokens.  The server rejects token-array input because the vocabulary is the model's own.  `encoding_format` is `float` by default or `base64`.
 
 ## Images
 
@@ -117,6 +117,6 @@ Loading uploads the 540 MB text backbone, unmaps the checkpoint so the weights s
 
 The first image request uploads the vision tower and projector; subsequent requests reuse them. Audio weights are never uploaded.
 
-Sequences from one request or from concurrent requests run one device batch at a time.  A batch packs up to 8,192 tokens, and a single request may span more than one batch.  Concurrent requests take turns in arrival order, one batch per turn, so a short request waits for at most one batch of a long one.  A device failure that a probe confirms answers 503 `device_lost` and shuts the server down for its supervisor to restart, as the text server does.  Attention is bidirectional, so there is no cache to reuse between requests.  Gufo checks for cancellation once the request reaches the device and between its device batches.  `--served-model-name` sets the public model ID.  Gufo supports only BF16 safetensors, not GGUF or quantized variants.
+One device batch of up to 8,192 tokens runs at a time.  Text requests that wait for the device share a batch, oldest first, and a lone request runs at once.  A request with images runs in a batch of its own, in arrival order, and its soft tokens count toward the batch.  A request that fits in one batch never spans two.  A larger request is split, and after each of its batches the requests that arrived meanwhile go first, so a short request waits for at most one batch of a long one.  A device failure that a probe confirms answers 503 `device_lost` and shuts the server down for its supervisor to restart, as the text server does.  Attention is bidirectional, so there is no cache to reuse between requests.  Gufo checks for cancellation before each batch that would take a request's inputs, so a cancelled request does not use the device again.  `--served-model-name` sets the public model ID.  Gufo supports only BF16 safetensors, not GGUF or quantized variants.
 
 See [server limits](../../SERVER.md) and [quality gaps](QUALITY.md).

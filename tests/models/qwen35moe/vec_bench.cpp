@@ -8,8 +8,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <vector>
 
@@ -91,9 +91,8 @@ double Seconds(std::uint32_t iters, const std::function<void()>& body) {
     body();
   }
   Check(hipDeviceSynchronize(), "run");
-  return std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                       start)
-                 .count() /
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+             .count() /
          iters;
 }
 
@@ -113,15 +112,14 @@ void Run(const char* name, std::size_t rows, std::uint32_t iters,
   Check(hipMemcpy(d_q8, q8.data(), q8.size(), hipMemcpyHostToDevice),
         "q8 upload");
   std::vector<float> x(kHidden);
-  for (auto& v : x) v = 0.01F;
+  for (auto& v : x)
+    v = 0.01F;
   Check(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "x");
-  const double t_q8 =
-      Seconds(iters, [&] {
-        qfn_mmq_quantize_q8_1(d_x, d_xq, 1, kHidden, nullptr);
-        qfn_mmq_q8_0_dense_vec_preq(d_q8, nullptr, d_xq, d_out,
-                                    static_cast<int>(rows), 1, kHidden,
-                                    nullptr);
-      });
+  const double t_q8 = Seconds(iters, [&] {
+    qfn_mmq_quantize_q8_1(d_x, d_xq, 1, kHidden, nullptr);
+    qfn_mmq_q8_0_dense_vec_preq(d_q8, nullptr, d_xq, d_out,
+                                static_cast<int>(rows), 1, kHidden, nullptr);
+  });
 
   // Native Q4_K route: moe_vec with one expert.
   auto q4 = MakeQ4K(rows, 0x2222);
@@ -135,28 +133,25 @@ void Run(const char* name, std::size_t rows, std::uint32_t iters,
   std::vector<std::int32_t> ids(64, 0);
   Check(hipMemcpy(d_ids, ids.data(), ids.size() * 4, hipMemcpyHostToDevice),
         "ids");
-  const double t_q4 =
-      Seconds(iters, [&] {
-        qfn_mmq_moe_vec(12 /* GGML type q4_K */, d_q4, d_x, d_ids, d_out,
-                        static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
-      });
+  const double t_q4 = Seconds(iters, [&] {
+    qfn_mmq_moe_vec(12 /* GGML type q4_K */, d_q4, d_x, d_ids, d_out,
+                    static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
+  });
   // Also the Q8_0 weights through moe_vec (kernel choice comparison at
   // equal bytes, relevant for the LM head).
-  const double t_q8m =
-      Seconds(iters, [&] {
-        qfn_mmq_moe_vec(8 /* q8_0 */, d_q8, d_x, d_ids, d_out,
-                        static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
-      });
+  const double t_q8m = Seconds(iters, [&] {
+    qfn_mmq_moe_vec(8 /* q8_0 */, d_q8, d_x, d_ids, d_out,
+                    static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
+  });
   // Q6_K moe_vec: the LM head and routed down format of the Q4_K_M artifact.
   auto q6 = MakeQ6K(rows, 0x3333);
   Check(hipMalloc(&d_q6, q6.size()), "q6 malloc");
   Check(hipMemcpy(d_q6, q6.data(), q6.size(), hipMemcpyHostToDevice),
         "q6 upload");
-  const double t_q6 =
-      Seconds(iters, [&] {
-        qfn_mmq_moe_vec(14 /* q6_K */, d_q6, d_x, d_ids, d_out,
-                        static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
-      });
+  const double t_q6 = Seconds(iters, [&] {
+    qfn_mmq_moe_vec(14 /* q6_K */, d_q6, d_x, d_ids, d_out,
+                    static_cast<int>(rows), kHidden, 1, 1, 1, nullptr);
+  });
 
   std::printf(
       "%-26s rows=%6zu  q8_0: %7.3f ms (%5.0f GB/s)  q4_K moe_vec: %7.3f ms "
@@ -348,10 +343,9 @@ void ValidateBatched(const char* name, const char* path, std::size_t rows,
       if (std::abs(static_cast<double>(ref[t * check + r])) <= 0.05 * peak) {
         continue;
       }
-      worst = std::max(worst,
-                       std::abs(static_cast<double>(ref[t * check + r]) -
-                                static_cast<double>(got[t * rows + r])) /
-                           peak);
+      worst = std::max(worst, std::abs(static_cast<double>(ref[t * check + r]) -
+                                       static_cast<double>(got[t * rows + r])) /
+                                  peak);
     }
   }
   std::printf("  %-22s tokens=%u worst error vs row peak: %g\n", name, tokens,
@@ -384,11 +378,11 @@ int main() {
       12288 * kb * 144 / 256, 12288 * kb * 210 / 256);
   Run("ssm_out", 2048, iters, 2048 * kb * 34 / 32, 2048 * kb * 144 / 256,
       2048 * kb * 210 / 256);
-  Run("attn q|g|k|v", 9216, iters, 9216 * kb * 34 / 32,
-      9216 * kb * 144 / 256, 9216 * kb * 210 / 256);
+  Run("attn q|g|k|v", 9216, iters, 9216 * kb * 34 / 32, 9216 * kb * 144 / 256,
+      9216 * kb * 210 / 256);
   Run("shexp pair", 512, iters, 512 * kb * 34 / 32, 512 * kb * 144 / 256,
       512 * kb * 210 / 256);
-  Run("LM head", 248320, 100, 248320 * kb * 34 / 32,
-      248320 * kb * 144 / 256, 248320 * kb * 210 / 256);
+  Run("LM head", 248320, 100, 248320 * kb * 34 / 32, 248320 * kb * 144 / 256,
+      248320 * kb * 210 / 256);
   return 0;
 }

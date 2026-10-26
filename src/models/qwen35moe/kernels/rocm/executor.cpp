@@ -350,8 +350,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.ctx = f32(T * c.AttentionQDim());
   s.q8 = e->options_.kv_dtypes.key == KvCacheDtype::kQ8_0
              ? Alloc<unsigned char>(a,
-                                    static_cast<std::size_t>(T) *
-                                        c.num_heads *
+                                    static_cast<std::size_t>(T) * c.num_heads *
                                         (c.head_dim + c.head_dim / 32 * 2),
                                     error_msg)
              : nullptr;
@@ -496,14 +495,16 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache = Alloc<std::byte>(
-          a, static_cast<std::size_t>(max_context) *
-                 KvRowBytes(kv_row, options_.kv_dtypes.key),
-          error_msg, &s->allocated_bytes_);
-      at.v_cache = Alloc<std::byte>(
-          a, static_cast<std::size_t>(max_context) *
-                 KvRowBytes(kv_row, options_.kv_dtypes.value),
-          error_msg, &s->allocated_bytes_);
+      at.k_cache =
+          Alloc<std::byte>(a,
+                           static_cast<std::size_t>(max_context) *
+                               KvRowBytes(kv_row, options_.kv_dtypes.key),
+                           error_msg, &s->allocated_bytes_);
+      at.v_cache =
+          Alloc<std::byte>(a,
+                           static_cast<std::size_t>(max_context) *
+                               KvRowBytes(kv_row, options_.kv_dtypes.value),
+                           error_msg, &s->allocated_bytes_);
     }
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
@@ -511,14 +512,16 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.hidden_size,
         error_msg, &s->allocated_bytes_);
-    s->mtp_.k_cache = Alloc<std::byte>(
-        a, static_cast<std::size_t>(max_context) *
-               KvRowBytes(kv_row, options_.kv_dtypes.key),
-        error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache = Alloc<std::byte>(
-        a, static_cast<std::size_t>(max_context) *
-               KvRowBytes(kv_row, options_.kv_dtypes.value),
-        error_msg, &s->allocated_bytes_);
+    s->mtp_.k_cache =
+        Alloc<std::byte>(a,
+                         static_cast<std::size_t>(max_context) *
+                             KvRowBytes(kv_row, options_.kv_dtypes.key),
+                         error_msg, &s->allocated_bytes_);
+    s->mtp_.v_cache =
+        Alloc<std::byte>(a,
+                         static_cast<std::size_t>(max_context) *
+                             KvRowBytes(kv_row, options_.kv_dtypes.value),
+                         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.hidden_size, error_msg, &s->allocated_bytes_);
   }
   if (enable_dflash) {
@@ -1170,10 +1173,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          c.rope_theta, stream_, s.rope);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope);
-    StoreKv(s_.k, reinterpret_cast<__half*>(s.k_cache), n_tokens, kv_row,
-            pos, stream_);
-    StoreKv(s_.v, reinterpret_cast<__half*>(s.v_cache), n_tokens, kv_row,
-            pos, stream_);
+    StoreKv(s_.k, reinterpret_cast<__half*>(s.k_cache), n_tokens, kv_row, pos,
+            stream_);
+    StoreKv(s_.v, reinterpret_cast<__half*>(s.v_cache), n_tokens, kv_row, pos,
+            stream_);
   }
   if (last_only && !Check(hipMemsetAsync(s_.ctx, 0,
                                          static_cast<std::size_t>(n_tokens) *
@@ -1197,8 +1200,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   const bool split = !MatrixRows(n_tokens);
   const unsigned char* q8 = nullptr;
   if (options_.kv_dtypes.key == KvCacheDtype::kQ8_0) {
-    QuantizeAttentionQ(s_.q, s_.q8, n_tokens, c.num_heads, c.head_dim,
-                       stream_);
+    QuantizeAttentionQ(s_.q, s_.q8, n_tokens, c.num_heads, c.head_dim, stream_);
     q8 = s_.q8;
   }
   rocm::Attention(s_.q, q8, s.k_cache, s.v_cache, nullptr, 0, s_.ctx,
@@ -1898,8 +1900,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
-  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_enabled_,
-                                        session, options_.kv_dtypes);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_enabled_, session,
+                                        options_.kv_dtypes);
   h.mtp_position = session.mtp_.position;
   h.hidden_rows = hidden_rows;
   return WalkSnapshot(
@@ -1924,9 +1926,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session,
-                         options_.kv_dtypes);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_enabled_, session,
+                                        options_.kv_dtypes);
   h.mtp_position = session.mtp_.position;
   h.hidden_rows = hidden_rows;
   h.payload_bytes = SnapshotBytes(session, hidden_rows);
@@ -1970,9 +1971,8 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   SnapshotHeader h{};
   std::memcpy(&h, payload.data(), sizeof(h));
-  const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session,
-                         options_.kv_dtypes);
+  const SnapshotHeader mine = MakeSnapshotHeader(config(), session.mtp_enabled_,
+                                                 session, options_.kv_dtypes);
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;

@@ -9,7 +9,6 @@
 #include <cstdint>
 
 #include "src/models/qwen/vision/rope.hpp"
-
 #include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -299,14 +298,14 @@ void Attention(const float* q, const unsigned char* q8, const void* k_cache,
 /// is not 16 or 24 query heads of 256 over two KV heads. `last_only` computes
 /// only the final dense query tile, retaining its key sweep and leaving
 /// earlier output rows untouched.
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const void* k_cache, const void* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false, KvDtypes kv_dtypes = {});
+bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
+                         const void* v_cache, const std::uint32_t* mask,
+                         std::uint32_t mask_words, float* out,
+                         std::uint32_t n_tokens, std::uint32_t start_pos,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t d, std::uint32_t ratio,
+                         hipStream_t stream, bool last_only = false,
+                         KvDtypes kv_dtypes = {});
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

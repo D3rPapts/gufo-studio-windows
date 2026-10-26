@@ -145,8 +145,8 @@ int main() {
   // ending at the allocation boundary. Every untouched destination byte is
   // independently checked, as are odd/unaligned fallback ranges.
 #if defined(_WIN32)
-  auto* mapping = VirtualAlloc(nullptr, bytes,
-                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  auto* mapping =
+      VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   assert(mapping != nullptr);
 #else
   auto* mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,

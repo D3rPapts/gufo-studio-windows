@@ -64,8 +64,7 @@ int main(int argc, char** argv) {
   try {
     std::string error;
     std::printf("loading model...\n");
-    gufo::models::qwen38_flash_next::ModelOptions options{
-        .max_context = 8192};
+    gufo::models::qwen38_flash_next::ModelOptions options{.max_context = 8192};
     if (!mtp_path.empty()) {
       options.mtp_model_path = std::string(mtp_path);
       options.max_draft_tokens = 7;
@@ -99,8 +98,8 @@ int main(int argc, char** argv) {
     // Phase S: session A alone.
     StepRecord serial_a;
     {
-      auto session = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
-                                          6145, &error);
+      auto session = model->CreateSession(
+          gufo::core::SessionMode::kAutoregressive, 6145, &error);
       if (session == nullptr || !session->Sync(prompt_a, &error)) {
         std::fprintf(stderr, "serial setup failed: %s\n", error.c_str());
         return 1;
@@ -120,15 +119,16 @@ int main(int argc, char** argv) {
         serial_a.tokens.push_back(result.tokens.front());
       }
       std::printf("serial A tokens:");
-      for (auto t : serial_a.tokens) std::printf(" %d", t);
+      for (auto t : serial_a.tokens)
+        std::printf(" %d", t);
       std::printf("\n");
     }
 
     // Phase S2: session A alone again (fresh session, same sampler inputs)
     // — the determinism baseline.
     {
-      auto session = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
-                                          6145, &error);
+      auto session = model->CreateSession(
+          gufo::core::SessionMode::kAutoregressive, 6145, &error);
       if (session == nullptr || !session->Sync(prompt_a, &error)) {
         std::fprintf(stderr, "baseline setup failed: %s\n", error.c_str());
         return 1;
@@ -138,17 +138,18 @@ int main(int argc, char** argv) {
       for (int step = 0; step < steps; ++step) {
         Session::DecodeResult result;
         if (!session->DecodeStep(1, sampler, &result, &error) ||
-            result.tokens.empty() || result.tokens.front() != serial_a.tokens[step]) {
+            result.tokens.empty() ||
+            result.tokens.front() != serial_a.tokens[step]) {
           std::fprintf(stderr, "baseline decode differs at %d\n", step);
           return 1;
         }
         const auto again = Snapshot(*session);
         const auto size = again.size();
         for (std::size_t i = 0; i < size; ++i) {
-          worst = std::max(worst,
-                           std::abs(static_cast<double>(again[i]) -
-                                    static_cast<double>(
-                                        serial_a.logits[step * size + i])));
+          worst = std::max(
+              worst,
+              std::abs(static_cast<double>(again[i]) -
+                       static_cast<double>(serial_a.logits[step * size + i])));
         }
       }
       std::printf("baseline rerun: max|d|=%.6g (0 = deterministic)\n", worst);
@@ -178,8 +179,8 @@ int main(int argc, char** argv) {
           return 1;
         }
         const auto frontier = Snapshot(*a2);
-        interleaved_a.logits.insert(interleaved_a.logits.end(), frontier.begin(),
-                                    frontier.end());
+        interleaved_a.logits.insert(interleaved_a.logits.end(),
+                                    frontier.begin(), frontier.end());
         interleaved_a.tokens.push_back(ra.tokens.front());
         if (!b2->DecodeStep(1, sampler_b, &rb, &error) || rb.tokens.empty()) {
           std::fprintf(stderr, "interleaved B decode failed at %d: %s\n", step,
@@ -189,7 +190,8 @@ int main(int argc, char** argv) {
         tokens_b.push_back(rb.tokens.front());
       }
       std::printf("interleaved B tokens:");
-      for (auto t : tokens_b) std::printf(" %d", t);
+      for (auto t : tokens_b)
+        std::printf(" %d", t);
       std::printf("\n");
     }
 
@@ -204,15 +206,18 @@ int main(int argc, char** argv) {
         const double d =
             std::abs(static_cast<double>(serial_a.logits[base + i]) -
                      static_cast<double>(interleaved_a.logits[base + i]));
-        if (d != 0.0) ++differing;
+        if (d != 0.0)
+          ++differing;
         worst = std::max(worst, d);
       }
       const bool tokens_match =
           serial_a.tokens[step] == interleaved_a.tokens[step];
       std::printf("step %d: max|d|=%.6g differing=%zu tokens %d vs %d%s\n",
                   step, worst, differing, serial_a.tokens[step],
-                  interleaved_a.tokens[step], tokens_match ? "" : " TOKEN-FLIP");
-      if (worst != 0.0 && first_bad < 0) first_bad = step;
+                  interleaved_a.tokens[step],
+                  tokens_match ? "" : " TOKEN-FLIP");
+      if (worst != 0.0 && first_bad < 0)
+        first_bad = step;
     }
     std::printf("%s (first differing step: %d)\n",
                 first_bad < 0 ? "ENGINE CLEAN" : "ENGINE REPRO", first_bad);
@@ -258,7 +263,8 @@ int main(int argc, char** argv) {
         tokens_b.push_back(token_b);
       }
       std::printf("batched-advance B tokens:");
-      for (auto t : tokens_b) std::printf(" %d", static_cast<int>(t));
+      for (auto t : tokens_b)
+        std::printf(" %d", static_cast<int>(t));
       std::printf("\n");
       first_bad = -1;
       for (int step = 0; step < steps; ++step) {
@@ -269,7 +275,8 @@ int main(int argc, char** argv) {
           const double d =
               std::abs(static_cast<double>(serial_a.logits[base + i]) -
                        static_cast<double>(batched_a.logits[base + i]));
-          if (d != 0.0) ++differing;
+          if (d != 0.0)
+            ++differing;
           worst = std::max(worst, d);
         }
         const bool tokens_match =
@@ -278,7 +285,8 @@ int main(int argc, char** argv) {
             "batch step %d: max|d|=%.6g differing=%zu tokens %d vs %d%s\n",
             step, worst, differing, serial_a.tokens[step],
             batched_a.tokens[step], tokens_match ? "" : " TOKEN-FLIP");
-        if (worst != 0.0 && first_bad < 0) first_bad = step;
+        if (worst != 0.0 && first_bad < 0)
+          first_bad = step;
       }
       std::printf("%s\n", first_bad < 0 ? "BATCHED-ADVANCE CLEAN"
                                         : "BATCHED-ADVANCE REPRO");
@@ -306,13 +314,12 @@ int main(int argc, char** argv) {
       std::uint64_t serial_accepted = 0;
       for (int cycle = 0; cycle < steps && serial_stream.size() < 8; ++cycle) {
         const auto before = sa->Statistics();
-        const auto budget =
-            std::min<std::size_t>(8 - serial_stream.size(), 8);
+        const auto budget = std::min<std::size_t>(8 - serial_stream.size(), 8);
         Session::DecodeResult result;
         if (!sa->DecodeStep(budget, sa_sampler, &result, &error) ||
             result.tokens.empty()) {
-          std::fprintf(stderr, "mtp serial decode failed at %d: %s\n",
-                       cycle, error.c_str());
+          std::fprintf(stderr, "mtp serial decode failed at %d: %s\n", cycle,
+                       error.c_str());
           return 1;
         }
         const auto after = sa->Statistics();
@@ -320,12 +327,14 @@ int main(int argc, char** argv) {
         serial_accepted += after.accepted - before.accepted;
         serial_stream.insert(serial_stream.end(), result.tokens.begin(),
                              result.tokens.end());
-        if (result.stop) break;
+        if (result.stop)
+          break;
       }
       std::printf("mtp serial A: drafted=%llu accepted=%llu tokens:",
                   static_cast<unsigned long long>(serial_drafted),
                   static_cast<unsigned long long>(serial_accepted));
-      for (auto t : serial_stream) std::printf(" %d", static_cast<int>(t));
+      for (auto t : serial_stream)
+        std::printf(" %d", static_cast<int>(t));
       std::printf("\n");
       // Batched: both sessions per cycle through Session::DecodeBatch.
       auto ba = mk(gufo::core::SessionMode::kSpeculative);
@@ -341,8 +350,8 @@ int main(int argc, char** argv) {
       std::vector<gufo::sampling::TokenId> batched_stream_b;
       std::uint64_t batched_drafted = 0;
       std::uint64_t batched_accepted = 0;
-      for (int cycle = 0;
-           cycle < steps && batched_stream_a.size() < 8; ++cycle) {
+      for (int cycle = 0; cycle < steps && batched_stream_a.size() < 8;
+           ++cycle) {
         const auto before = ba->Statistics();
         const auto budget =
             std::min<std::size_t>(8 - batched_stream_a.size(), 8);
@@ -351,14 +360,13 @@ int main(int argc, char** argv) {
         Session::BatchOutcome oa;
         Session::BatchOutcome ob;
         const Session::DecodeRequest lane_a{ba.get(), budget, &ba_sampler,
-                                            &ra, true, &oa};
+                                            &ra,      true,   &oa};
         const Session::DecodeRequest lane_b{bb.get(), budget, &bb_sampler,
-                                            &rb, true, &ob};
+                                            &rb,      true,   &ob};
         const std::array<Session::DecodeRequest, 2> requests{{lane_a, lane_b}};
         if (!Session::DecodeBatch(requests, &error) || !oa.completed ||
             !ob.completed) {
-          std::fprintf(stderr,
-                       "mtp batched decode failed at %d: %s / %s\n",
+          std::fprintf(stderr, "mtp batched decode failed at %d: %s / %s\n",
                        cycle, oa.error.c_str(), ob.error.c_str());
           return 1;
         }
@@ -369,19 +377,21 @@ int main(int argc, char** argv) {
                                 ra.tokens.end());
         batched_stream_b.insert(batched_stream_b.end(), rb.tokens.begin(),
                                 rb.tokens.end());
-        if (ra.stop) break;
+        if (ra.stop)
+          break;
       }
       std::printf("mtp batched A: drafted=%llu accepted=%llu tokens:",
                   static_cast<unsigned long long>(batched_drafted),
                   static_cast<unsigned long long>(batched_accepted));
-      for (auto t : batched_stream_a) std::printf(" %d", static_cast<int>(t));
+      for (auto t : batched_stream_a)
+        std::printf(" %d", static_cast<int>(t));
       std::printf("\n");
       const bool same = serial_stream == batched_stream_a &&
                         serial_drafted == batched_drafted &&
                         serial_accepted == batched_accepted;
-      std::printf("%s\n",
-                  same ? "MTP BATCH CLEAN" : "MTP BATCH REPRO");
-    }    return 0;
+      std::printf("%s\n", same ? "MTP BATCH CLEAN" : "MTP BATCH REPRO");
+    }
+    return 0;
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "exception: %s\n", ex.what());
     return 1;

@@ -305,8 +305,8 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     HipBuffer<float> d_split(q_count);
     HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
                                 kSplits * (kDim + 2));
-    q::Attention(d_q.get(), nullptr, d_k.get(), d_v.get(), mask_ptr,
-                 mask_words, d_split.get(), d_partials.get(), kSplits, n_tokens,
+    q::Attention(d_q.get(), nullptr, d_k.get(), d_v.get(), mask_ptr, mask_words,
+                 d_split.get(), d_partials.get(), kSplits, n_tokens,
                  d_pos.get(), kHeads, kKvHeads, kDim, kRatio, nullptr);
     q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
     CheckHip(hipDeviceSynchronize(), "split attention");
@@ -455,8 +455,7 @@ void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
   std::vector<unsigned char> v_bytes(static_cast<std::size_t>(n_kv) *
                                      k_row_bytes);
   std::vector<float> kd(n_kv * kKvWidth), vd(n_kv * kKvWidth);
-  auto quant_row = [](const float* src, std::size_t elems,
-                      unsigned char* dst) {
+  auto quant_row = [](const float* src, std::size_t elems, unsigned char* dst) {
     for (std::size_t blk = 0; blk < elems; blk += 32) {
       float amax = 0.0F;
       for (std::uint32_t j = 0; j < 32; ++j) {
@@ -493,8 +492,8 @@ void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
   }
 
   HipBuffer<float> d_q(q_count);
-  HipBuffer<unsigned char> d_q8(static_cast<std::size_t>(n_tokens) *
-                                kHeads * q_row_bytes);
+  HipBuffer<unsigned char> d_q8(static_cast<std::size_t>(n_tokens) * kHeads *
+                                q_row_bytes);
   HipBuffer<unsigned char> d_k(k_bytes.size());
   HipBuffer<unsigned char> d_v(v_bytes.size());
   HipBuffer<float> d_gate(q_count);
@@ -506,16 +505,14 @@ void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
   Upload(&d_v, v_bytes);
   Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
 
-  q::QuantizeAttentionQ(d_q.get(), d_q8.get(), n_tokens, kHeads, kDim,
-                        nullptr);
+  q::QuantizeAttentionQ(d_q.get(), d_q8.get(), n_tokens, kHeads, kDim, nullptr);
   CheckHip(hipDeviceSynchronize(), "quantize q ready");
   q::Attention(d_q.get(), d_q8.get(), d_k.get(), d_v.get(), nullptr, 0,
                d_out.get(), nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads,
                kDim, kRatio, nullptr,
                {gufo::models::qwen35moe::KvDtypes{
                    .key = gufo::models::qwen35moe::KvCacheDtype::kQ8_0,
-                   .value =
-                       gufo::models::qwen35moe::KvCacheDtype::kQ8_0}});
+                   .value = gufo::models::qwen35moe::KvCacheDtype::kQ8_0}});
   q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
   CheckHip(hipDeviceSynchronize(), "q8 attention ready");
   const auto out = Download(&d_out, static_cast<std::uint32_t>(q_count));
@@ -557,9 +554,9 @@ void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
           double dot = 0.0;
           for (std::size_t e = 0; e < kDim; ++e) {
             dot += static_cast<double>(qd[q_row + e]) *
-                   static_cast<double>(kd[static_cast<std::size_t>(key) *
-                                              kKvWidth +
-                                          kvh * kDim + e]);
+                   static_cast<double>(
+                       kd[static_cast<std::size_t>(key) * kKvWidth +
+                          kvh * kDim + e]);
           }
           scores[key] = dot * attention_scale;
           m = std::fmax(m, scores[key]);
@@ -573,15 +570,15 @@ void CheckQ8Scores(std::uint32_t n_tokens, std::uint32_t start_pos,
         for (std::size_t e = 0; e < kDim; ++e) {
           double acc = 0.0;
           for (std::uint32_t key = 0; key <= start_pos + t; ++key) {
-            acc += weights[key] *
-                   static_cast<double>(
-                       vd[static_cast<std::size_t>(key) * kKvWidth +
-                          kvh * kDim + e]);
+            acc +=
+                weights[key] * static_cast<double>(
+                                   vd[static_cast<std::size_t>(key) * kKvWidth +
+                                      kvh * kDim + e]);
           }
           const float gate_value =
               gate[(static_cast<std::size_t>(t) * kHeads + h) * kDim + e];
-          const float want = static_cast<float>(acc / sum) /
-                             (1.0F + std::exp(-gate_value));
+          const float want =
+              static_cast<float>(acc / sum) / (1.0F + std::exp(-gate_value));
           const float got =
               out[(static_cast<std::size_t>(t) * kHeads + h) * kDim + e];
           worst = std::fmax(worst, std::fabs(static_cast<double>(got) -

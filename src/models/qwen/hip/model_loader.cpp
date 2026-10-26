@@ -30,11 +30,14 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
 }
 
 [[nodiscard]] hipError_t MapRegisteredRegion(
-    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
+    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination,
+    bool& source_was_read) {
+  source_was_read = false;
   void* host_copy =
       platform::CloneMappedWeightsToAnonymousPages(source.data, source.size);
   if (host_copy == nullptr)
     return hipErrorOutOfMemory;
+  source_was_read = true;
   const auto unmap = [&](void* pointer) {
     platform::ReleaseCommittedPages(pointer, source.size);
   };
@@ -60,33 +63,84 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
 }
 
 /// Device-resident placement: one hipMalloc copy in (on this APU target)
-/// carve-out memory, streamed from the shard's file handle through the
-/// shared pinned-staging pipeline. The mapped payload is never prefaulted,
-/// so a host with less RAM than the weights can still load them.
-/// `uploader` streams every fallback region and is created on first use.
-[[nodiscard]] bool StreamWeightRegion(
-    std::span<const core::GgufMappedRegion> regions, std::uint32_t shard,
-    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination,
-    std::unique_ptr<WeightUpload>& uploader, std::string* error_msg) {
-  if (uploader == nullptr &&
-      (uploader = WeightUpload::Create(regions, error_msg)) == nullptr) {
-    return false;
-  }
+/// carve-out memory, filled from the cached mapping or by FillDeviceRegions.
+[[nodiscard]] hipError_t AllocateDeviceRegion(
+    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
   void* device_data = nullptr;
-  hipError_t status = hipMalloc(&device_data, source.size);
-  if (status != hipSuccess) {
-    return false;
-  }
-  if (!uploader->Copy(shard, 0, source.size, device_data, error_msg)) {
-    (void)hipFree(device_data);
-    return false;
-  }
-
+  const auto status = hipMalloc(&device_data, source.size);
+  if (status != hipSuccess)
+    return status;
   destination = {.host_data = source.data,
                  .device_data = device_data,
                  .host_copy = nullptr,
                  .size = source.size,
                  .owns_device_allocation = true};
+  return hipSuccess;
+}
+
+/// Streams one region from the read-only mapping through a pinned staging
+/// buffer. Fallback for sources WeightUpload cannot read, such as in-memory
+/// images without a file.
+[[nodiscard]] hipError_t CopyMappedRegion(const core::GgufMappedRegion& source,
+                                          void* device_data) {
+  platform::PrefaultMappedRange(source.data, source.size);
+
+  constexpr std::size_t kChunkBytes = 16ULL << 20;
+  void* staging = nullptr;
+  hipError_t status = hipHostMalloc(&staging, kChunkBytes);
+  if (status != hipSuccess)
+    return status;
+  const auto free_staging = [&](void* pointer) { (void)hipHostFree(pointer); };
+  std::unique_ptr<void, decltype(free_staging)> owned_staging(staging,
+                                                              free_staging);
+
+  const auto chunks =
+      source.size / kChunkBytes + (source.size % kChunkBytes != 0);
+  for (std::size_t index = 0; index < chunks; ++index) {
+    const auto offset = index * kChunkBytes;
+    const auto bytes = std::min(kChunkBytes, source.size - offset);
+    std::memcpy(staging, static_cast<const std::uint8_t*>(source.data) + offset,
+                bytes);
+    status = hipMemcpy(static_cast<std::uint8_t*>(device_data) + offset,
+                       staging, bytes, hipMemcpyHostToDevice);
+    if (status != hipSuccess)
+      return status;
+  }
+  return hipSuccess;
+}
+
+/// Fills device-resident regions from their shard files without touching the
+/// mappings. Copying through a mapping faults the whole shard into host memory
+/// first; on Windows those pages also stay in the process working set, so a
+/// 16 GiB target needs as much free RAM beside the GPU carve-out. WeightUpload
+/// keeps host residency at its staging buffers.
+[[nodiscard]] bool FillDeviceRegions(
+    std::span<const core::GgufMappedRegion> sources,
+    std::span<QwenGpuWeightRegion> destinations,
+    std::span<const std::size_t> indices, std::string* error_msg) {
+  std::string upload_error;
+  if (auto uploader = WeightUpload::Create(sources, &upload_error)) {
+    for (const auto index : indices) {
+      if (!uploader->Copy(static_cast<std::uint32_t>(index), 0,
+                          sources[index].size, destinations[index].device_data,
+                          error_msg))
+        break;
+    }
+    // Finish waits for every queued copy, also after a failed Copy, so the
+    // destinations stay valid until the uploader is gone.
+    return uploader->Finish(error_msg);
+  }
+  for (const auto index : indices) {
+    const auto status =
+        CopyMappedRegion(sources[index], destinations[index].device_data);
+    if (status != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = "Failed to upload GGUF shard " + std::to_string(index) +
+                     ": " + hipGetErrorString(status);
+      }
+      return false;
+    }
+  }
   return true;
 }
 
@@ -102,47 +156,51 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   }
 
   weight_regions.resize(source_regions.size());
-  // In-flight copies of earlier shards must drain before any of their
-  // destinations can be freed.
-  const auto fail = [&](std::unique_ptr<WeightUpload>& uploader) {
-    if (uploader != nullptr) {
-      std::string drain;
-      (void)uploader->Finish(&drain);
-    }
-    ReleaseWeightRegions(weight_regions);
-    return false;
-  };
-  std::unique_ptr<WeightUpload> uploader;
+  std::vector<std::size_t> device_regions;
   for (std::size_t i = 0; i < source_regions.size(); ++i) {
     const auto& source = source_regions[i];
     auto& destination = weight_regions[i];
     hipError_t map_error;
     try {
-      map_error = MapRegisteredRegion(source, destination);
+      bool source_was_read = false;
+      map_error = MapRegisteredRegion(source, destination, source_was_read);
       if (map_error != hipSuccess) {
         // Mapped registration is the Linux fast path; the streaming upload
         // preserves device residency wherever it is refused.
         destination = {};
-        if (!StreamWeightRegion(source_regions, static_cast<std::uint32_t>(i),
-                                source, destination, uploader, error_msg)) {
-          return fail(uploader);
+        map_error = AllocateDeviceRegion(source, destination);
+        if (map_error == hipSuccess) {
+          if (source_was_read) {
+            // A successful clone has already read the mapping. Reuse those
+            // cached bytes if registration fails instead of rereading the
+            // shard with direct I/O. When cloning is unavailable (Windows),
+            // keep the bounded file pipeline without touching the mapping.
+            map_error = CopyMappedRegion(source, destination.device_data);
+          } else {
+            device_regions.push_back(i);
+          }
         }
       }
     } catch (const std::exception& e) {
       if (error_msg)
         *error_msg = e.what();
-      return fail(uploader);
+      ReleaseWeightRegions(weight_regions);
+      return false;
     }
-    if (destination.device_data == nullptr) {
+    if (map_error != hipSuccess || destination.device_data == nullptr) {
+      ReleaseWeightRegions(weight_regions);
       if (error_msg != nullptr) {
         *error_msg = "Failed to make GGUF shard " + std::to_string(i) +
                      " GPU-visible: " + hipGetErrorString(map_error);
       }
-      return fail(uploader);
+      return false;
     }
   }
-  if (uploader != nullptr && !uploader->Finish(error_msg)) {
-    return fail(uploader);
+  if (!device_regions.empty() &&
+      !FillDeviceRegions(source_regions, weight_regions, device_regions,
+                         error_msg)) {
+    ReleaseWeightRegions(weight_regions);
+    return false;
   }
   return true;
 }

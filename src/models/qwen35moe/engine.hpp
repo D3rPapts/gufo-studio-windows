@@ -11,7 +11,6 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/qwen35moe/kv_cache_mode.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
@@ -19,6 +18,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen35moe/config.hpp"
+#include "src/models/qwen35moe/kv_cache_mode.hpp"
 #include "src/models/qwen35moe/mtp_policy.hpp"
 
 namespace gufo::core {

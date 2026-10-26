@@ -554,9 +554,9 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
   // exact p/q verification, so any candidate request keeps the dense path.
   // A round with small-head requests scores those through their tables and
   // never touches the Q4_0 shortlist machinery.
-  const bool shortlist_ok =
-      subset_rows == 0 && s_.mtp_short_row_bytes != 0 &&
-      !draft_output.empty() && n <= options_.max_logit_rows;
+  const bool shortlist_ok = subset_rows == 0 && s_.mtp_short_row_bytes != 0 &&
+                            !draft_output.empty() &&
+                            n <= options_.max_logit_rows;
   bool all_greedy = true;
   for (const auto& item : items)
     all_greedy = all_greedy && item.output.candidates == nullptr;
@@ -1213,15 +1213,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (rows <= 8) {
       for (std::uint32_t row = 0; row < rows; ++row) {
         if (!HcMix(model_->hc_head(),
-                   base.res + static_cast<std::size_t>(row) * c.HcDim(),
-                   false,
+                   base.res + static_cast<std::size_t>(row) * c.HcDim(), false,
                    s_.mixed + static_cast<std::size_t>(row) * c.hidden_size,
                    nullptr, 1, error)) {
           return false;
         }
       }
-      return DenseBatch(model_->output(), s_.mixed, batch_logits_, rows,
-                        error);
+      return DenseBatch(model_->output(), s_.mixed, batch_logits_, rows, error);
     }
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&

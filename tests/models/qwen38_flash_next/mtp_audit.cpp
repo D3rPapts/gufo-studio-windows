@@ -673,23 +673,22 @@ void AuditChainCosts(q::rocm::Executor& exec,
   std::vector<std::int32_t> prefix(prefix_size);
   for (std::size_t i = 0; i < prefix.size(); ++i)
     prefix[i] = pattern[i % pattern.size()];
-  auto base =
-      exec.CreateSession(gufo::core::SessionMode::kSpeculative, capacity,
-                         &error);
+  auto base = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                 capacity, &error);
   Require(base != nullptr, error);
   for (std::size_t offset = 0; offset < prefix.size();) {
     const auto n =
         std::min<std::size_t>(exec.max_batch(), prefix.size() - offset);
-    Require(exec.Forward(*base, std::span(prefix).subspan(offset, n), 0,
-                         nullptr, q::rocm::Executor::ForwardMode::kPrefill,
-                         &error),
-            error);
+    Require(
+        exec.Forward(*base, std::span(prefix).subspan(offset, n), 0, nullptr,
+                     q::rocm::Executor::ForwardMode::kPrefill, &error),
+        error);
     const auto next = prefix[(offset + n) % prefix.size()];
-    Require(exec.MtpForward(*base, std::span(&next, 1),
-                            std::min<std::size_t>(n, exec.max_speculative()) -
-                                1,
-                            {}, &error),
-            error);
+    Require(
+        exec.MtpForward(*base, std::span(&next, 1),
+                        std::min<std::size_t>(n, exec.max_speculative()) - 1,
+                        {}, &error),
+        error);
     offset += n;
   }
   std::vector<std::uint8_t> snapshot(exec.SnapshotBytes(*base, 0));
@@ -700,13 +699,11 @@ void AuditChainCosts(q::rocm::Executor& exec,
   constexpr unsigned kCycles = 40;
   constexpr unsigned kWarm = 8;
   for (const unsigned width : {2U, 4U, 6U, 8U}) {
-    auto session =
-        exec.CreateSession(gufo::core::SessionMode::kSpeculative, capacity,
-                           &error);
+    auto session = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                      capacity, &error);
     Require(session != nullptr, error);
     q::rocm::Executor::SnapshotInfo info;
-    Require(exec.RestoreSnapshot(*session, snapshot, &info, &error,
-                                 width - 1),
+    Require(exec.RestoreSnapshot(*session, snapshot, &info, &error, width - 1),
             error);
     // The draft trails by one position: rewind it so the first cycle's
     // catch-up consumes `width` rows, matching the steady production shape.
@@ -717,17 +714,17 @@ void AuditChainCosts(q::rocm::Executor& exec,
     for (unsigned cycle = 0; cycle < kCycles + kWarm; ++cycle) {
       const auto start = Clock::now();
       const std::uint32_t frontier = session->position();
-      const auto hidden_row = static_cast<std::int32_t>(
-          exec.max_speculative() - width);
-      Require(exec.MtpDraftChain(*session, replay, hidden_row, width - 1,
-                                 &error),
-              error);
+      const auto hidden_row =
+          static_cast<std::int32_t>(exec.max_speculative() - width);
+      Require(
+          exec.MtpDraftChain(*session, replay, hidden_row, width - 1, &error),
+          error);
       const auto chain = exec.ChainTokens(width - 1);
       const std::vector<std::int32_t> verify(chain.begin(), chain.end());
-      Require(exec.Forward(*session, verify, width, nullptr,
-                           q::rocm::Executor::ForwardMode::kVerifyGreedy,
-                           &error),
-              error);
+      Require(
+          exec.Forward(*session, verify, width, nullptr,
+                       q::rocm::Executor::ForwardMode::kVerifyGreedy, &error),
+          error);
       Require(exec.ReadGreedyPredictions(predictions, &error), error);
       Require(exec.Rollback(*session, width, &error, nullptr, false), error);
       exec.MtpRewind(*session, frontier);

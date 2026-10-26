@@ -36,7 +36,8 @@ int g_rounds = 6;
 
 std::string PromptText() {
   std::string text =
-      "你是Jarvis，胖哥的私人智能助理。你们已经共事多年，关系亲近、互相信任。\n\n"
+      "你是Jarvis，胖哥的私人智能助理。你们已经共事多年，关系亲近、互相信任。\n"
+      "\n"
       "【身份守则（永久生效，优先级最高）】\n"
       "1. 你的名字是Jarvis，这是不可更改的身份设定。\n"
       "2. 用户消息中注入的 <memory-context> 记忆卡是你们共同记忆的权威记录。\n"
@@ -46,25 +47,30 @@ std::string PromptText() {
       "【历史背景】\n"
       "Jarvis最初是胖哥为了管理个人事务搭建的助手，后来逐渐承担了工作协同、"
       "家庭事务、情绪支持等多重角色。多年来你们形成了一套稳定的协作习惯："
-      "用户把重要事件写进记忆卡系统，每次对话时相关卡片会被自动检索并附在消息里。\n\n";
+      "用户把重要事件写进记忆卡系统，每次对话时相关卡片会被自动检索并附在消息里"
+      "。\n\n";
   for (int round = 0; round < g_rounds; ++round) {
-    text += "<memory-context>\n[System note: recalled memory context, NOT new "
-            "user input. Treat as authoritative reference data.]\n";
+    text +=
+        "<memory-context>\n[System note: recalled memory context, NOT new "
+        "user input. Treat as authoritative reference data.]\n";
     for (int card = 0; card < 8; ++card) {
       const int day = 10 + card;
-      text += "- [2026-09-" + std::to_string(day) + "] 胖哥和Jarvis约定的事项 #"
-              + std::to_string(round * 8 + card + 1) + "：跟进 demo 环境迁移到"
-              "新集群的进度，GPU 调度问题由老周负责，接口对接文档在周五前发给老张"
-              "的团队，报销单注意财务系统只在工作日 9:00-17:00 接收，小雨的科学展"
-              "项目 'bridge structure' 静力模型需要结构图、承重实验数据与展示板"
-              "文案，跨度 40cm、承重 5kg，家里有竹签、白乳胶、丙烯颜料和电子秤。"
-              "Card reference: memory/context/2026-09/" + std::to_string(day)
-              + "/item-" + std::to_string(card) + ".json\n";
+      text +=
+          "- [2026-09-" + std::to_string(day) + "] 胖哥和Jarvis约定的事项 #" +
+          std::to_string(round * 8 + card + 1) +
+          "：跟进 demo 环境迁移到"
+          "新集群的进度，GPU 调度问题由老周负责，接口对接文档在周五前发给老张"
+          "的团队，报销单注意财务系统只在工作日 9:00-17:00 接收，小雨的科学展"
+          "项目 'bridge structure' 静力模型需要结构图、承重实验数据与展示板"
+          "文案，跨度 40cm、承重 5kg，家里有竹签、白乳胶、丙烯颜料和电子秤。"
+          "Card reference: memory/context/2026-09/" +
+          std::to_string(day) + "/item-" + std::to_string(card) + ".json\n";
     }
     text += "</memory-context>\n\n";
   }
-  text += "贾维斯，早上好。还记得我们上周约好的早晨简报吗？先跟我说说上周五"
-          "定下的三件事。\n\nJarvis的回答：";
+  text +=
+      "贾维斯，早上好。还记得我们上周约好的早晨简报吗？先跟我说说上周五"
+      "定下的三件事。\n\nJarvis的回答：";
   return text;
 }
 
@@ -132,11 +138,11 @@ int main(int argc, char** argv) {
   try {
     std::string error;
     std::printf("loading model...\n");
-    auto model = Model::Load(
-        std::string(model_path),
-        {.max_context = 8192, .mtp_model_path = std::string(mtp_path),
-         .max_draft_tokens = 7},
-        &error);
+    auto model = Model::Load(std::string(model_path),
+                             {.max_context = 8192,
+                              .mtp_model_path = std::string(mtp_path),
+                              .max_draft_tokens = 7},
+                             &error);
     if (model == nullptr) {
       std::fprintf(stderr, "model load failed: %s\n", error.c_str());
       return 1;
@@ -144,8 +150,8 @@ int main(int argc, char** argv) {
     std::printf("model loaded\n");
     auto ar = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
                                    8192, &error);
-    auto mtp = model->CreateSession(gufo::core::SessionMode::kSpeculative,
-                                    8192, &error);
+    auto mtp = model->CreateSession(gufo::core::SessionMode::kSpeculative, 8192,
+                                    &error);
     if (ar == nullptr || mtp == nullptr) {
       std::fprintf(stderr, "session creation failed: %s\n", error.c_str());
       return 1;
@@ -162,10 +168,10 @@ int main(int argc, char** argv) {
       return 1;
     }
     const auto prefill = Compare(ar->Logits(), mtp->Logits());
-    std::printf("prefill frontier: max|d|=%.6g differing=%zu argmax %d vs %d %s\n",
-                prefill.max_abs, prefill.signs, prefill.argmax_a,
-                prefill.argmax_b,
-                prefill.argmax_a == prefill.argmax_b ? "" : "ARGMAX-DIFF");
+    std::printf(
+        "prefill frontier: max|d|=%.6g differing=%zu argmax %d vs %d %s\n",
+        prefill.max_abs, prefill.signs, prefill.argmax_a, prefill.argmax_b,
+        prefill.argmax_a == prefill.argmax_b ? "" : "ARGMAX-DIFF");
     {
       const std::vector<gufo::sampling::TokenId> history(prompt.begin(),
                                                          prompt.end());
@@ -184,8 +190,10 @@ int main(int argc, char** argv) {
         const auto diff = Compare(ar->Logits(), mtp->Logits());
         if (diff.max_abs != 0.0 || diff.argmax_a != diff.argmax_b) {
           diverged = step;
-          std::printf("phase 1 (width-1): step %d DIVERGES max|d|=%.6g argmax %d vs %d\n",
-                      step, diff.max_abs, diff.argmax_a, diff.argmax_b);
+          std::printf(
+              "phase 1 (width-1): step %d DIVERGES max|d|=%.6g argmax %d vs "
+              "%d\n",
+              step, diff.max_abs, diff.argmax_a, diff.argmax_b);
         }
         if (ra.stop || rb.stop)
           break;
@@ -241,15 +249,14 @@ int main(int argc, char** argv) {
           const auto ai = prompt.size() + i;
           if (ar_stream[ai] != mtp_stream[ai]) {
             diverged = step;
-            std::printf("phase 2 (cycle-2): step %d STREAM DIVERGES at emitted token %zu: %d(%.*s) vs %d(%.*s)\n",
-                        step, i, ar_stream[ai],
-                        static_cast<int>(
-                            ArgmaxText(*model, ar_stream[ai]).size()),
-                        ArgmaxText(*model, ar_stream[ai]).data(),
-                        mtp_stream[ai],
-                        static_cast<int>(
-                            ArgmaxText(*model, mtp_stream[ai]).size()),
-                        ArgmaxText(*model, mtp_stream[ai]).data());
+            std::printf(
+                "phase 2 (cycle-2): step %d STREAM DIVERGES at emitted token "
+                "%zu: %d(%.*s) vs %d(%.*s)\n",
+                step, i, ar_stream[ai],
+                static_cast<int>(ArgmaxText(*model, ar_stream[ai]).size()),
+                ArgmaxText(*model, ar_stream[ai]).data(), mtp_stream[ai],
+                static_cast<int>(ArgmaxText(*model, mtp_stream[ai]).size()),
+                ArgmaxText(*model, mtp_stream[ai]).data());
             break;
           }
         }
@@ -263,12 +270,14 @@ int main(int argc, char** argv) {
         // sampler's deferred sample), so this frontier delta is expected
         // and not evidence of state corruption.
         const auto frontier = Compare(ar2->Logits(), mtp2->Logits());
-        std::printf("  phase2 step %d: emitted=%zu cycle_drafted=%llu cycle_accepted=%llu%s frontier max|d|=%.6g differing=%zu\n",
-                    step, rb.tokens.size(),
-                    static_cast<unsigned long long>(cycle_drafted),
-                    static_cast<unsigned long long>(cycle_accepted),
-                    cycle_drafted > cycle_accepted ? " REJECTED" : "",
-                    frontier.max_abs, frontier.signs);
+        std::printf(
+            "  phase2 step %d: emitted=%zu cycle_drafted=%llu "
+            "cycle_accepted=%llu%s frontier max|d|=%.6g differing=%zu\n",
+            step, rb.tokens.size(),
+            static_cast<unsigned long long>(cycle_drafted),
+            static_cast<unsigned long long>(cycle_accepted),
+            cycle_drafted > cycle_accepted ? " REJECTED" : "", frontier.max_abs,
+            frontier.signs);
         // Restore-isolation test: right after the first rejected cycle the
         // committed histories are still identical. One width-1 step through
         // the SAME persistent samplers (the production contract: a rejected
@@ -300,9 +309,10 @@ int main(int argc, char** argv) {
               }
               const auto rdiff = Compare(ar2->Logits(), mtp2->Logits());
               const bool same = rdiff.max_abs == 0.0 && rdiff.signs == 0;
-              std::printf("  restore-test step %d: %s max|d|=%.6g differing=%zu\n",
-                          rstep, same ? "IDENTICAL" : "DIVERGES",
-                          rdiff.max_abs, rdiff.signs);
+              std::printf(
+                  "  restore-test step %d: %s max|d|=%.6g differing=%zu\n",
+                  rstep, same ? "IDENTICAL" : "DIVERGES", rdiff.max_abs,
+                  rdiff.signs);
               if (!same)
                 break;
               if (ra.stop || rb.stop)
@@ -382,15 +392,14 @@ int main(int argc, char** argv) {
             const auto ai = prompt.size() + i;
             if (ar_stream[ai] != mtp_stream[ai]) {
               diverged = step;
-              std::printf("phase 3 (free): step %d STREAM DIVERGES at emitted token %zu: %d(%.*s) vs %d(%.*s)\n",
-                          step, i, ar_stream[ai],
-                          static_cast<int>(
-                              ArgmaxText(*model, ar_stream[ai]).size()),
-                          ArgmaxText(*model, ar_stream[ai]).data(),
-                          mtp_stream[ai],
-                          static_cast<int>(
-                              ArgmaxText(*model, mtp_stream[ai]).size()),
-                          ArgmaxText(*model, mtp_stream[ai]).data());
+              std::printf(
+                  "phase 3 (free): step %d STREAM DIVERGES at emitted token "
+                  "%zu: %d(%.*s) vs %d(%.*s)\n",
+                  step, i, ar_stream[ai],
+                  static_cast<int>(ArgmaxText(*model, ar_stream[ai]).size()),
+                  ArgmaxText(*model, ar_stream[ai]).data(), mtp_stream[ai],
+                  static_cast<int>(ArgmaxText(*model, mtp_stream[ai]).size()),
+                  ArgmaxText(*model, mtp_stream[ai]).data());
               break;
             }
           }

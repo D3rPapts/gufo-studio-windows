@@ -271,7 +271,6 @@ struct Result {
   double ref_sq = 0.0;
 };
 
-
 /// Random Q6_K blocks: 128 low-nibble bytes, 64 high-bit bytes, 16 int8
 
 /// scales and one scale, matching ggml's dequantize_row_q6_K layout.
@@ -514,13 +513,12 @@ Experts MakeIQ3S(std::size_t e, std::size_t m, std::size_t k,
 }
 
 const char* TypeName(q::WeightType type) {
-  return type == q::WeightType::kQ4_K   ? "Q4_K"
-         : type == q::WeightType::kQ5_K ? "Q5_K"
-         : type == q::WeightType::kQ5_1 ? "Q5_1"
-         : type == q::WeightType::kIQ3_S ? "IQ3_S"
+  return type == q::WeightType::kQ4_K     ? "Q4_K"
+         : type == q::WeightType::kQ5_K   ? "Q5_K"
+         : type == q::WeightType::kQ5_1   ? "Q5_1"
+         : type == q::WeightType::kIQ3_S  ? "IQ3_S"
          : type == q::WeightType::kIQ4_NL ? "IQ4_NL"
                                           : "Q8_0";
-
 }
 
 /// Runs the MMQ tier and the F16 route over the same routing and reports

@@ -14,8 +14,7 @@ namespace qfn::testing {
 extern std::atomic<std::size_t> reported_device_free_limit;
 
 inline std::size_t ClampReportedFree(std::size_t free_bytes) {
-  const auto limit =
-      reported_device_free_limit.load(std::memory_order_relaxed);
+  const auto limit = reported_device_free_limit.load(std::memory_order_relaxed);
   return free_bytes < limit ? free_bytes : limit;
 }
 

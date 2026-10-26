@@ -486,8 +486,8 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
     // whole batch with the decode path's arithmetic.
     if (qfn_mmq_moe_vec(static_cast<int>(w.native_type), w.native_data, x,
                         s_.zero_ids, out, static_cast<int>(w.rows),
-                        static_cast<int>(w.cols), static_cast<int>(rows), 1,
-                        1, stream_) != 0) {
+                        static_cast<int>(w.cols), static_cast<int>(rows), 1, 1,
+                        stream_) != 0) {
       return Fail(error, "batched native vector projection failed");
     }
     return true;
@@ -527,10 +527,10 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   // The single-session path reads native bytes below the tiled threshold;
   // chunked batches keep that arithmetic so wide verification reproduces it
   // per row instead of reading the requantized wide-batch view.
-  const bool native =
-      up.native_data != nullptr && gate.native_data != nullptr &&
-      up.native_type == gate.native_type && up.rows == gate.rows &&
-      up.cols == gate.cols;
+  const bool native = up.native_data != nullptr &&
+                      gate.native_data != nullptr &&
+                      up.native_type == gate.native_type &&
+                      up.rows == gate.rows && up.cols == gate.cols;
   const bool q8 = !native && up.type == core::GgmlType::kQ8_0 &&
                   gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
                   up.cols == gate.cols;

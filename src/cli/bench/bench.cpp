@@ -1532,8 +1532,7 @@ int RunOrnithBenchmark(const BenchOptions& options,
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .dflash_model_path =
               dflash ? options.dflash_model_path : std::string{},
-          .kv_cache_mode =
-              static_cast<q35::KvCacheMode>(options.kv_cache_mode),
+          .kv_cache_mode = static_cast<q35::KvCacheMode>(options.kv_cache_mode),
       },
       &error);
   if (model == nullptr) {

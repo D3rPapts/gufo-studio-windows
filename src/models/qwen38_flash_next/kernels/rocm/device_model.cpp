@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <cassert>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -681,9 +681,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
-    Uploader measure{*stager, nullptr,       conversions, allocations,
-                     bytes,   max_half_cols, max_q8_cols, shards,
-                     error_msg};
+    Uploader measure{*stager,     nullptr, conversions,
+                     allocations, bytes,   max_half_cols,
+                     max_q8_cols, shards,  error_msg};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -692,9 +692,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   const hip::WeightAllocator weights(measured);
   std::vector<Conversion> conversions;
-  Uploader up{*stager,   &weights,          conversions,     m->allocations_,
-              m->bytes_, m->max_half_cols_, m->max_q8_cols_, shards,
-              error_msg};
+  Uploader up{*stager,         &weights,  conversions,
+              m->allocations_, m->bytes_, m->max_half_cols_,
+              m->max_q8_cols_, shards,    error_msg};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

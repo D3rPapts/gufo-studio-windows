@@ -28,7 +28,7 @@ from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
 from discovery import check_discovery
-from image_inputs import check_image_count, check_image_inputs
+from image_inputs import check_image_count, check_image_detail, check_image_inputs
 from tool_images import check_tool_images
 from tool_choice import check_tool_choice_cache
 from tool_parameter_order import check_tool_parameter_order
@@ -39,6 +39,7 @@ from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_hist
 from cache_edits import check_cache_edits
 from cache_concurrency import check_cache_concurrency
 from cache_shared_prefix import check_cache_shared_prefix
+from cache_instructions import check_cache_instructions
 from cache_bridge import check_cache_bridge
 from cache_compaction import check_cache_compaction
 from cache_workloads import check_cache_transforms, check_cache_pressure
@@ -2754,10 +2755,10 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
     assert proposed > 0 if speculative != "off" else proposed == 0, final
 
 
-SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
+SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
               "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
               "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
-              "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
+              "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-instructions",
               "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection")
 
 
@@ -2797,8 +2798,8 @@ def main():
     args = parser.parse_args()
     if args.suite in ("discovery", "messages-image-counts", "all") and args.expected_input_modalities is None:
         parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
-    if args.suite in ("image-inputs", "image-count", "tool-images") and not args.vision:
-        parser.error("image-inputs, image-count and tool-images require --vision and a loaded projector")
+    if args.suite in ("image-inputs", "image-count", "tool-images", "image-detail") and not args.vision:
+        parser.error("image-inputs, image-count, tool-images, and image-detail require --vision and a loaded projector")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
         parser.error("--sampling-preset is required for all/sampling-defaults")
     if not isinstance(args.sampling_overrides, dict):
@@ -2860,6 +2861,7 @@ def main():
             "tool-images": lambda: check_tool_images(
                 client, args.model, checks, image_content, chat_result, response_result,
                 args.server_log),
+            "image-detail": lambda: check_image_detail(client, args.model, checks, chat_result),
             "structured": lambda: check_structured_outputs(client, args.model, checks, args.vision),
             "structured-limits": lambda: check_structured_limits(client, args.model, checks, args.vision),
             "native-tools": lambda: check_native_tools(client, args.model, checks, args.vision),
@@ -2930,6 +2932,8 @@ def main():
                 client, args.model, checks, chat_result, args.concurrency),
             "cache-shared-prefix": lambda: check_cache_shared_prefix(
                 client, args.model, checks, chat_result),
+            "cache-instructions": lambda: check_cache_instructions(
+                client, args.model, checks, chat_result),
             "cache-bridge": lambda: check_cache_bridge(
                 client, args.model, checks, chat_result, args.snapshot_capacity_bytes),
             "cache-compaction": lambda: check_cache_compaction(
@@ -2945,7 +2949,7 @@ def main():
                 client, args.model, checks, chat_result),
         }
         selected = ([name for name in suites if name not in ("tool-native-types", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "prefill-scheduling")
-                     and (name not in ("image-inputs", "image-count", "tool-images") or args.vision)]
+                     and (name not in ("image-inputs", "image-count", "tool-images", "image-detail") or args.vision)]
                     if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])
         for name in selected:

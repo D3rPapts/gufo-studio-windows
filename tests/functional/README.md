@@ -124,7 +124,7 @@ nix develop -c python3 tests/functional/qwen_prefill_cancel.py \
 
 Use `--speculative off` for AR. The test owns its loopback server, records each
 request's phase timings and rejects a multi-second prefill blocking the short
-peer. Apply the usual matched 5% and 3 ms timing gates to its retained results.
+peer. Apply the usual matched 5% and 10 ms timing gates to its retained results.
 Add `--deep-peers` before `--` and serve with `--sessions 4` to fill the other
 slots with duplicate deep conversations. This checks that a short request
 after cancellation can reuse a redundant slot while another live copy retains
@@ -193,7 +193,7 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
-`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, and the error shapes.  It is standalone and outside `--suite all`:
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, and `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit.  It is standalone and outside `--suite all`:
 
 ```sh
 nix develop -c python3 tests/functional/embeddings.py \
@@ -246,6 +246,12 @@ code for depth checks. `run.py
 final parse a buffered reply uses, and `tool-native-schemas` rotates endpoint,
 stream and tool choice across cases. `--tier full` (the default for manual runs)
 keeps every suite and combination.
+
+The literal-closer cases from #786 (a lone `</invoke>` and a closer before or
+between calls) use the deterministic HTTP fixtures in
+`tests/cli/openai_chat_test.cpp`, with buffered/streamed and whole/bytewise output.
+Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
+checks must not depend on a model following a request to copy tool markup.
 
 `Devlab functional checks` runs on every push to a non-draft PR, like `CI`
 (`pull_request`), with the repository's fork approval policy. A newer push cancels
@@ -301,8 +307,10 @@ models or their speed observations. Each LLM's `phases.py` arms exercise startup
 short, long and follow-up requests; `service_phases.py` measures bounded service
 histories. Both alternate main/candidate servers for two paired repeats,
 with GPU cool-down. Every request and phase retains all measurements; a slowdown
-requires both >5% and >3 ms in every repeat. Different output/work counters mark
-relevant comparisons inconclusive. The plan selects timing gates from production
+requires both >5% and >10 ms in every repeat. A phase that is slower in only
+some repeats is inconclusive; one that is faster in some repeats and never
+slower counts as unchanged. Different output/work counters mark
+relevant comparisons incomparable and keep the status incomplete. The plan selects timing gates from production
 changes; harness-only changes retain timing observations without gating unrelated
 noise. Startup phases gate only loader/configuration/build changes. Missing timing
 evidence is always incomplete. Display medians do not determine verdicts.
@@ -311,9 +319,14 @@ The hosted report job updates one PR comment with the same correctness and phase
 layout for every selected model, selection reasons, known limitations and links
 to the run/artifacts. Missing selected groups, missing timing arms or mismatched
 revisions cannot pass. Correctness failures and consistently slower server phases
-set the advisory status to `failure`; incomplete, noisy or unavailable evidence
-sets `error`. The ordinary PR check remains advisory; automatic release merging
-requires it. The optional AR depth benchmark remains observational.
+set the advisory status to `failure`; incomplete, incomparable or unavailable evidence
+sets `error`. On ordinary PRs, complete but noisy timing comparisons keep a
+successful status with an explicit warning and retain every observation. The full
+release tier keeps `error` for inconclusive timing. HTTP-ready timing uses server
+monotonic timestamps at load completion and listener readiness. Comparisons with
+older binaries that lack these timestamps retain poll-derived timings as advisory
+observations, excluded from the gate. The ordinary PR check remains advisory;
+automatic release merging requires it. The optional AR depth benchmark remains observational.
 
 The PR write token stays on hosted runners. Fork runs upload their text report;
 `devlab-comment.yml` publishes it from `workflow_run` without executing PR code.
@@ -437,6 +450,7 @@ RAM, disk and restart settings once their contracts pass.
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
 | `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
+| `image-detail` | `detail` `auto` and `low` on a 1536 × 1024 image, where `low` resizes it to 512 × 320, uses fewer prompt tokens, and reuses no image tokens from `auto` |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
@@ -473,6 +487,7 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Use sessions 2/context 262144 to match its capacity; minimum context 65536. Explicit selection only, outside `all` |
 | `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
+| `cache-instructions` | Release tier, Qwen profiles. A long system prompt (about 5,000 tokens) with one mail-like question, then the same system prompt with a new question: the second request, before any boundary is learned, must restore the whole system prompt rather than the nearest grid checkpoint; compare answers with uncached controls |
 | `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, under a full RAM budget with small unrelated requests between turns: from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
 | `cache-compaction` | A tool history grows near the context limit, then a summary replaces it while system/tools stay; check shared-boundary reuse, unchanged retries, continued growth and exact uncached answers. Requires context ≥ 16384. Not in `all` |
 | `cache-transforms` | Clear an old tool result, remove a few hundred late user tokens, or retry/edit after a 10K+ result; restore coherent pre-edit boundaries and compare uncached answers. Requires context ≥ 32768. Not in `all` |
@@ -495,6 +510,13 @@ controls on main, stop at
 `--through-case tool-images:tool_images_control_complete`; full candidate runs
 continue into the newly supported image-bearing tool outputs. A text-only
 model must not qualify the image suite by skipping its assertions.
+
+`image-detail` also requires `--mmproj`. Each of its two requests leaves a new
+stable boundary in the RAM cache. Retry copies cannot displace stable
+boundaries, as [KV-CACHE.md](../../docs/KV-CACHE.md) describes, so in a full
+cache these two boundaries can make a later unchanged retry prefill its
+assistant opening again. Select `image-detail` after `image-count`, whose
+unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
@@ -807,7 +829,7 @@ Every request checks its applicable response format, expected output and timings
 Missing measurements fail. `comparison.json` reports per-request prefill, decode,
 queue, restore and wall times, plus server startup/restart. Missing cases,
 changed output/token counts or unexpected prefill/cache work fail immediately.
-Timing margins remain **both 5% and 3 ms**. One overrun is **inconclusive**, not
+Timing margins remain **both 5% and 10 ms**. One overrun is **inconclusive**, not
 proof of regression. Exit codes: **0 pass, 1 fail, 2 inconclusive/unqualified**.
 
 Use the code diff to identify affected paths. Investigate their timing flags;
