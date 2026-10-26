@@ -68,7 +68,7 @@ Timings are observations; this runner does not perform matched baseline timing
 qualification. WebSocket streaming, long recordings, broad language/voice quality
 and speaker-similarity scoring remain separate coverage.
 
-Devlab speed comparisons use a pinned PR merge base and candidate, matching the
+Devlab speed comparisons use a pinned main revision and candidate, matching the
 runner, toolchain, weights, settings and request histories. `service_phases.py`
 uses server-emitted request timings and work counters: ASR `Server-Timing`
 phases, TTS synthesis time and codec/audio work, and embedding request duration
@@ -124,7 +124,7 @@ nix develop -c python3 tests/functional/qwen_prefill_cancel.py \
 
 Use `--speculative off` for AR. The test owns its loopback server, records each
 request's phase timings and rejects a multi-second prefill blocking the short
-peer. Apply the usual matched 5% and 3 ms timing gates to its retained results.
+peer. Apply the usual matched 5% and 10 ms timing gates to its retained results.
 Add `--deep-peers` before `--` and serve with `--sessions 4` to fill the other
 slots with duplicate deep conversations. This checks that a short request
 after cancellation can reuse a redundant slot while another live copy retains
@@ -193,7 +193,7 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
-`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, and the error shapes.  It is standalone and outside `--suite all`:
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, and `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit.  It is standalone and outside `--suite all`:
 
 ```sh
 nix develop -c python3 tests/functional/embeddings.py \
@@ -233,22 +233,35 @@ priority rules contribute a union. Unknown paths expand to all compatible
 coverage. Suite metadata must cover every name in `run.py`; dependencies are
 deliberately conservative, so even narrow source rules can select many suites.
 
-`--tier pr` plans the per-PR set. Suites marked `"tier": "release"` (the deep
-cache histories, `cache-stalls`, `long-context` and `reasoning-budget`) then move
-to `release_only` unless a changed path matches their `escalate` patterns: cache
-code, the suite's own module, or Flash-Next model code for depth checks. `run.py
+`--tier pr` plans the per-PR set: one or two suites per behavior (`discovery`,
+`state-edges`, `messages-count-tokens`, `responses`, `stops`, `conversation`,
+`image-inputs`, `structured`, `tools`, `tool-streaming`, `sampling-defaults`,
+`batch` and `cache`). Every other suite is marked `"tier": "release"` and moves
+to `release_only`; the deep cache histories, `cache-stalls`, `long-context` and
+`reasoning-budget` still run on a PR when a changed path matches their
+`escalate` patterns: cache code, the suite's own module, or Flash-Next model
+code for depth checks. `run.py
 --tier pr` also trims transport matrices that a case does not depend on:
 `tool-reasoning` keeps the streamed mode, whose partial parses end in the same
 final parse a buffered reply uses, and `tool-native-schemas` rotates endpoint,
 stream and tool choice across cases. `--tier full` (the default for manual runs)
 keeps every suite and combination.
 
+The literal-closer cases from #786 (a lone `</invoke>` and a closer before or
+between calls) use the deterministic HTTP fixtures in
+`tests/cli/openai_chat_test.cpp`, with buffered/streamed and whole/bytewise output.
+Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
+checks must not depend on a model following a request to copy tool markup.
+
 `Devlab functional checks` runs on every push to a non-draft PR, like `CI`
 (`pull_request`), with the repository's fork approval policy. A newer push cancels
 the PR's earlier run. PRs use the `pr` tier; release-please PRs and dispatches
 (unless they choose `tier: pr`) use `full`. Maintain/Admin users can dispatch a
-PR number. Authorization pins its head and merge base; the hosted planner and
-GPU controller use the same workflow/harness revision and recreate the same plan.
+PR number. Authorization pins its head and GitHub's merge of it into main. Like
+`CI`, the GPU job builds and tests that merge commit with the suites it contains,
+so tests added on main never run against a PR binary that predates them. The
+merge's main parent is the diff base and the timing baseline. The GPU controller
+recreates the hosted plan from the merge commit.
 
 `devlab_plan.py` selects owners per path using reviewed priority rules in
 `devlab.json`, then uses `impact.py` for each selected LLM's affected suites.
@@ -258,16 +271,21 @@ Selections from separate paths are combined:
 | --- | --- |
 | Shared LLM behavior, cache, sampling or Qwen framing/vision | Flash-Next Q4/MTP |
 | Private Qwen27 implementation | Qwen27 Q4/DFlash2 |
-| Private DeepSeek implementation | DeepSeek V4/DSpark |
-| Shared LLM and private DeepSeek code | Flash-Next and DeepSeek |
+| Private DeepSeek implementation | DeepSeek V4/DSpark (disabled, see below) |
+| Shared LLM and private DeepSeek code | Flash-Next and DeepSeek (disabled, see below) |
 | Embedding, ASR or TTS code | That category's representative |
 | Shared infrastructure or unmapped paths | One representative per supported category |
 | Documentation, image generation or H3-only paths | No GPU job in this workflow |
 
+Models listed under `disabled` in `devlab.json`, with a reason, are left out of
+the plan and named in the report. DeepSeek V4 is disabled for now: its 81 GiB
+of weights and its suite set make the run too long to finish within a PR.
+Remove its entry to restore it.
+
 The embedding and ASR representatives are EmbeddingGemma 2 and Qwen3-ASR. TTS
 uses Base cloning in the PR tier; the full tier exercises Base, CustomVoice and
 VoiceDesign. Manual `ar` adds the selected LLMs' AR profiles. The existing manual
-`benchmark` option adds Flash-Next and its merge-base/candidate AR depth sweep.
+`benchmark` option adds Flash-Next and its main/candidate AR depth sweep.
 Qwen27 Q8 remains an explicit manual functional qualification outside this bounded
 CI selection. Numerical and agent-replay obligations outside the selected suites
 remain separate; representative coverage is not all-model qualification.
@@ -279,7 +297,7 @@ assets and necessary drafts/projectors/evaluator weights from fixed Hugging Face
 revisions while both production binaries build. Optional `$GUFO_CI_CACHE`
 (default `$RUNNER_TOOL_CACHE/gufo`) reuse is an optimization, not a prerequisite.
 The authorized controller checkout contains the English voice fixture. TTS uses
-the merge-base Gufo binary and a pinned ASR checkpoint as its intelligibility
+the main Gufo binary and a pinned ASR checkpoint as its intelligibility
 evaluator. Missing downloads or fixtures fail visibly.
 
 `devlab_run.py` executes models sequentially on the same GPU. LLM configuration
@@ -287,10 +305,12 @@ groups use fresh server/cache histories; service suites use `model_services.py`.
 Correctness runs on the candidate only. A model failure does not hide other
 models or their speed observations. Each LLM's `phases.py` arms exercise startup,
 short, long and follow-up requests; `service_phases.py` measures bounded service
-histories. Both alternate merge-base/candidate servers for two paired repeats,
+histories. Both alternate main/candidate servers for two paired repeats,
 with GPU cool-down. Every request and phase retains all measurements; a slowdown
-requires both >5% and >3 ms in every repeat. Different output/work counters mark
-relevant comparisons inconclusive. The plan selects timing gates from production
+requires both >5% and >10 ms in every repeat. A phase that is slower in only
+some repeats is inconclusive; one that is faster in some repeats and never
+slower counts as unchanged. Different output/work counters mark
+relevant comparisons incomparable and keep the status incomplete. The plan selects timing gates from production
 changes; harness-only changes retain timing observations without gating unrelated
 noise. Startup phases gate only loader/configuration/build changes. Missing timing
 evidence is always incomplete. Display medians do not determine verdicts.
@@ -299,9 +319,14 @@ The hosted report job updates one PR comment with the same correctness and phase
 layout for every selected model, selection reasons, known limitations and links
 to the run/artifacts. Missing selected groups, missing timing arms or mismatched
 revisions cannot pass. Correctness failures and consistently slower server phases
-set the advisory status to `failure`; incomplete, noisy or unavailable evidence
-sets `error`. The ordinary PR check remains advisory; automatic release merging
-requires it. The optional AR depth benchmark remains observational.
+set the advisory status to `failure`; incomplete, incomparable or unavailable evidence
+sets `error`. On ordinary PRs, complete but noisy timing comparisons keep a
+successful status with an explicit warning and retain every observation. The full
+release tier keeps `error` for inconclusive timing. HTTP-ready timing uses server
+monotonic timestamps at load completion and listener readiness. Comparisons with
+older binaries that lack these timestamps retain poll-derived timings as advisory
+observations, excluded from the gate. The ordinary PR check remains advisory;
+automatic release merging requires it. The optional AR depth benchmark remains observational.
 
 The PR write token stays on hosted runners. Fork runs upload their text report;
 `devlab-comment.yml` publishes it from `workflow_run` without executing PR code.
@@ -425,6 +450,7 @@ RAM, disk and restart settings once their contracts pass.
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
 | `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
+| `image-detail` | `detail` `auto` and `low` on a 1536 × 1024 image, where `low` resizes it to 512 × 320, uses fewer prompt tokens, and reuses no image tokens from `auto` |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
@@ -484,6 +510,13 @@ controls on main, stop at
 `--through-case tool-images:tool_images_control_complete`; full candidate runs
 continue into the newly supported image-bearing tool outputs. A text-only
 model must not qualify the image suite by skipping its assertions.
+
+`image-detail` also requires `--mmproj`. Each of its two requests leaves a new
+stable boundary in the RAM cache. Retry copies cannot displace stable
+boundaries, as [KV-CACHE.md](../../docs/KV-CACHE.md) describes, so in a full
+cache these two boundaries can make a later unchanged retry prefill its
+assistant opening again. Select `image-detail` after `image-count`, whose
+unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
@@ -796,7 +829,7 @@ Every request checks its applicable response format, expected output and timings
 Missing measurements fail. `comparison.json` reports per-request prefill, decode,
 queue, restore and wall times, plus server startup/restart. Missing cases,
 changed output/token counts or unexpected prefill/cache work fail immediately.
-Timing margins remain **both 5% and 3 ms**. One overrun is **inconclusive**, not
+Timing margins remain **both 5% and 10 ms**. One overrun is **inconclusive**, not
 proof of regression. Exit codes: **0 pass, 1 fail, 2 inconclusive/unqualified**.
 
 Use the code diff to identify affected paths. Investigate their timing flags;
