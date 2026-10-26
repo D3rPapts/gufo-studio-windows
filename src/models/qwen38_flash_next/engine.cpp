@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -178,6 +179,22 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       error_msg, expert_slots);
   if (!m->device_) {
     return nullptr;
+  }
+  // The routing profile of earlier runs survives restarts: its most routed
+  // experts are loaded before the first request instead of on demand.
+  if (auto* stream = m->device_->expert_stream()) {
+    const char* profile = std::getenv("GUFO_FLASH_NEXT_EXPERT_PROFILE");
+    if (profile != nullptr && *profile != '\0') {
+      stream->SetProfilePath(profile);
+      std::uint64_t warmed = 0;
+      if (stream->LoadProfile(profile) &&
+          !stream->Warm(nullptr, &warmed, error_msg))
+        return nullptr;
+      std::fprintf(
+          stderr,
+          "[INFO] [experts] event=profile path=%s warmed_experts=%llu\n",
+          profile, static_cast<unsigned long long>(warmed));
+    }
   }
   if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
     std::vector<std::int32_t> specials;
