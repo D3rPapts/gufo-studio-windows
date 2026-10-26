@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <initializer_list>
 #include <utility>
 
@@ -525,10 +526,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
     // A verification batch routes at most kMaxStreamRows rows per layer.
     constexpr std::uint32_t kMaxStreamRows = 8;
+    // Concurrent shard readers; NVMe drives keep more requests in flight.
+    std::uint32_t readers = 8;
+    if (const char* env = std::getenv("GUFO_FLASH_NEXT_EXPERT_READERS"))
+      readers = std::clamp<std::uint32_t>(
+          static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10)), 1, 64);
     m->expert_stream_ = ExpertStream::Create(
         std::move(layers), w.config.num_experts, expert_slots,
-        std::min(expert_slots, kMaxStreamRows * w.config.num_experts_used), 8,
-        error_msg);
+        std::min(expert_slots, kMaxStreamRows * w.config.num_experts_used),
+        readers, error_msg);
     if (!m->expert_stream_)
       return nullptr;
   }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <system_error>
@@ -27,6 +28,13 @@ std::unique_ptr<ExpertStream> ExpertStream::Create(
   }
   std::unique_ptr<ExpertStream> s(new ExpertStream());
   s->num_experts_ = num_experts;
+  // Tuning knobs for measurements: recency ticks per counted use (in
+  // tokens) and the Map() calls between halvings of the counts.
+  if (const char* env = std::getenv("GUFO_FLASH_NEXT_LFU_TOKENS"))
+    s->use_ticks_ = std::strtoull(env, nullptr, 10);
+  if (const char* env = std::getenv("GUFO_FLASH_NEXT_AGE_MAPS"))
+    s->age_maps_ = std::max<std::uint32_t>(
+        1, static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10)));
   s->slots_ = slots;
   s->max_misses_ = max_misses;
   std::uint64_t set_bytes = 0;
@@ -46,6 +54,10 @@ std::unique_ptr<ExpertStream> ExpertStream::Create(
   if (hipHostMalloc(reinterpret_cast<void**>(&s->staging_), s->staging_bytes_,
                     hipHostMallocDefault) != hipSuccess ||
       hipEventCreateWithFlags(&s->staging_done_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipHostMalloc(reinterpret_cast<void**>(&s->prefetch_staging_),
+                    s->staging_bytes_, hipHostMallocDefault) != hipSuccess ||
+      hipEventCreateWithFlags(&s->prefetch_done_, hipEventDisableTiming) !=
           hipSuccess) {
     (void)hipGetLastError();
     SetError(error_msg, "cannot allocate expert staging");
@@ -80,6 +92,12 @@ ExpertStream::~ExpertStream() {
   }
   if (staging_ != nullptr)
     (void)hipHostFree(staging_);
+  if (prefetch_done_ != nullptr) {
+    (void)hipEventSynchronize(prefetch_done_);
+    (void)hipEventDestroy(prefetch_done_);
+  }
+  if (prefetch_staging_ != nullptr)
+    (void)hipHostFree(prefetch_staging_);
 }
 
 void ExpertStream::Worker() {
@@ -110,9 +128,14 @@ void ExpertStream::Worker() {
     }
     {
       std::lock_guard lock(mutex_);
-      failed_ = failed_ || !ok;
-      if (--pending_ == 0)
-        done_.notify_all();
+      if (job.prefetch) {
+        prefetch_failed_ = prefetch_failed_ || !ok;
+        --prefetch_pending_;
+      } else {
+        failed_ = failed_ || !ok;
+        --pending_;
+      }
+      done_.notify_all();
     }
   }
 }
@@ -122,8 +145,9 @@ bool ExpertStream::ReadAll(std::vector<Job>& jobs, std::string* error_msg) {
     std::lock_guard lock(mutex_);
     failed_ = false;
     pending_ = jobs.size();
-    for (const auto& job : jobs)
-      queue_.push_back(job);
+    // Reads Map() waits for go ahead of background prefetch reads.
+    for (auto job = jobs.rbegin(); job != jobs.rend(); ++job)
+      queue_.push_front(*job);
   }
   work_.notify_all();
   std::unique_lock lock(mutex_);
@@ -135,11 +159,149 @@ bool ExpertStream::ReadAll(std::vector<Job>& jobs, std::string* error_msg) {
   return true;
 }
 
+bool ExpertStream::Prefetch(std::uint32_t layer,
+                            std::span<const std::int32_t> ids) {
+  // One prediction in flight: it covers the next layer only.
+  if (prefetch_.active || layer >= layers_.size()) {
+    return false;
+  }
+  // Earlier prefetch uploads read this staging; they must have left it.
+  if (hipEventSynchronize(prefetch_done_) != hipSuccess) {
+    return false;
+  }
+  auto& state = state_[layer];
+  const auto& tensors = layers_[layer].tensors;
+  const std::uint64_t now = ++tick_;
+  std::vector<std::int32_t> missing;
+  for (const std::int32_t expert : ids) {
+    if (expert < 0 || static_cast<std::uint32_t>(expert) >= num_experts_) {
+      return false;
+    }
+    if (state.slot_of[expert] < 0 &&
+        std::find(missing.begin(), missing.end(), expert) == missing.end()) {
+      missing.push_back(expert);
+    }
+  }
+  if (missing.empty()) {
+    return true;
+  }
+  if (missing.size() > max_misses_) {
+    missing.resize(max_misses_);
+  }
+  const std::uint64_t per_use = use_ticks_ * layers_.size();
+  const auto score = [&](std::int32_t slot) {
+    const std::int32_t held = state.expert_in[slot];
+    return state.used[slot] + (held < 0 ? 0 : per_use * state.uses[held]);
+  };
+  std::vector<Job> jobs;
+  std::uint8_t* cursor = prefetch_staging_;
+  prefetch_.experts.clear();
+  prefetch_.slots.clear();
+  for (const std::int32_t expert : missing) {
+    std::int32_t victim = -1;
+    for (std::int32_t slot = 0; slot < static_cast<std::int32_t>(slots_);
+         ++slot) {
+      if (state.used[slot] != now &&
+          (victim < 0 || score(slot) < score(victim))) {
+        victim = slot;
+      }
+    }
+    if (victim < 0) {
+      break;
+    }
+    if (state.expert_in[victim] >= 0) {
+      state.slot_of[state.expert_in[victim]] = -1;
+    }
+    // Reserved now so Map() sees the expert as resident once the read
+    // lands; the upload happens there, before any kernel reads the slot.
+    state.expert_in[victim] = expert;
+    state.slot_of[expert] = victim;
+    state.used[victim] = now;
+    prefetch_.experts.push_back(expert);
+    prefetch_.slots.push_back(victim);
+    for (const auto& tensor : tensors) {
+      jobs.push_back({tensor.file,
+                      tensor.file_offset + static_cast<std::uint64_t>(expert) *
+                                               tensor.expert_bytes,
+                      tensor.expert_bytes, cursor, true});
+      cursor += tensor.expert_bytes;
+    }
+  }
+  if (jobs.empty()) {
+    return false;
+  }
+  prefetch_.layer = layer;
+  prefetch_.active = true;
+  stats_.prefetched += prefetch_.experts.size();
+  {
+    std::lock_guard lock(mutex_);
+    prefetch_failed_ = false;
+    prefetch_pending_ = jobs.size();
+    for (const auto& job : jobs) {
+      queue_.push_back(job);
+    }
+  }
+  work_.notify_all();
+  return true;
+}
+
+bool ExpertStream::FinishPrefetch(hipStream_t stream, std::string* error_msg) {
+  if (!prefetch_.active) {
+    return true;
+  }
+  prefetch_.active = false;
+  bool failed = false;
+  {
+    std::unique_lock lock(mutex_);
+    done_.wait(lock, [this] { return prefetch_pending_ == 0; });
+    failed = prefetch_failed_;
+  }
+  auto& state = state_[prefetch_.layer];
+  const auto& tensors = layers_[prefetch_.layer].tensors;
+  if (failed) {
+    // Release the reservations; Map() loads what it needs itself.
+    for (std::size_t i = 0; i < prefetch_.experts.size(); ++i) {
+      state.slot_of[prefetch_.experts[i]] = -1;
+      state.expert_in[prefetch_.slots[i]] = -1;
+      state.used[prefetch_.slots[i]] = 0;
+    }
+    return true;
+  }
+  const std::uint8_t* source = prefetch_staging_;
+  for (const std::int32_t slot : prefetch_.slots) {
+    for (const auto& tensor : tensors) {
+      auto* destination =
+          static_cast<std::uint8_t*>(tensor.pool) +
+          static_cast<std::uint64_t>(slot) * tensor.expert_bytes;
+      if (hipMemcpyAsync(destination, source, tensor.expert_bytes,
+                         hipMemcpyHostToDevice, stream) != hipSuccess) {
+        SetError(error_msg, "expert prefetch upload failed");
+        return false;
+      }
+      stats_.bytes_read += tensor.expert_bytes;
+      source += tensor.expert_bytes;
+    }
+  }
+  if (hipEventRecord(prefetch_done_, stream) != hipSuccess) {
+    SetError(error_msg, "expert prefetch record failed");
+    return false;
+  }
+  return true;
+}
+
 bool ExpertStream::Map(std::uint32_t layer, std::span<std::int32_t> ids,
                        hipStream_t stream, std::string* error_msg) {
   if (layer >= layers_.size()) {
     SetError(error_msg, "expert stream layer out of range");
     return false;
+  }
+  if (prefetch_.active && prefetch_.layer == layer) {
+    const std::vector<std::int32_t> predicted = prefetch_.experts;
+    if (!FinishPrefetch(stream, error_msg))
+      return false;
+    for (const std::int32_t expert : predicted)
+      if (std::find(ids.begin(), ids.end(), expert) != ids.end())
+        ++stats_.prefetch_hits;
   }
   auto& state = state_[layer];
   const auto& tensors = layers_[layer].tensors;
@@ -148,8 +310,7 @@ bool ExpertStream::Map(std::uint32_t layer, std::span<std::int32_t> ids,
 
   // Routing counts feed the eviction score; halving them every kAgeMaps calls
   // lets the hot set follow the text.
-  constexpr std::uint32_t kAgeMaps = 256;
-  if (++state.maps >= kAgeMaps) {
+  if (++state.maps >= age_maps_) {
     state.maps = 0;
     for (auto& count : state.uses)
       count /= 2;
@@ -192,7 +353,7 @@ bool ExpertStream::Map(std::uint32_t layer, std::span<std::int32_t> ids,
       // expert outlives a burst of one-off experts (LRU blended with LFU).
       // Map() runs once per layer and token, so 2 * layers ticks are about
       // two tokens of recency per counted use.
-      const std::uint64_t per_use = 2ULL * layers_.size();
+      const std::uint64_t per_use = use_ticks_ * layers_.size();
       const auto score = [&](std::int32_t slot) {
         const std::int32_t held = state.expert_in[slot];
         return state.used[slot] + (held < 0 ? 0 : per_use * state.uses[held]);
@@ -278,13 +439,16 @@ void ExpertStream::Report() {
       stderr,
       "[INFO] [experts] event=stream_stats window_s=%.0f routed=%llu "
       "misses=%llu hit_rate=%.1f%% read_gb=%.2f read_s=%.1f "
-      "read_gbps=%.2f total_misses=%llu total_read_gb=%.1f\n",
+      "read_gbps=%.2f total_misses=%llu total_read_gb=%.1f prefetched=%llu "
+      "prefetch_hits=%llu\n",
       seconds, static_cast<unsigned long long>(routed),
       static_cast<unsigned long long>(misses),
       routed == 0 ? 0.0 : 100.0 * (1.0 - double(misses) / double(routed)), gb,
       read_s, read_s > 0 ? gb / read_s : 0.0,
       static_cast<unsigned long long>(stats_.misses),
-      static_cast<double>(stats_.bytes_read) / 1e9);
+      static_cast<double>(stats_.bytes_read) / 1e9,
+      static_cast<unsigned long long>(stats_.prefetched),
+      static_cast<unsigned long long>(stats_.prefetch_hits));
   std::fflush(stderr);
   reported_ = stats_;
   report_at_ = now;

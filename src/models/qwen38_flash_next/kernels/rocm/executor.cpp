@@ -906,6 +906,12 @@ Executor::~Executor() {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
+  (void)hipFree(predict_router_);
+  if (ids_ready_ != nullptr) {
+    (void)hipEventDestroy(ids_ready_);
+  }
+  (void)hipFree(predict_ids_);
+  (void)hipFree(predict_weights_);
   (void)hipFree(verification_penalties_);
   for (void* p : allocations_) {
     (void)hipFree(p);
@@ -2671,23 +2677,93 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  bool shared_done = false;
   if (streamed) {
     // The host maps routed experts to slots and loads the missing ones; the
     // expert kernels then read slot ids from the same buffer.
     const std::size_t count = static_cast<std::size_t>(n_tokens) * used;
-    std::vector<std::int32_t> ids(count);
+    const auto layer = static_cast<std::uint32_t>(&l - trunk.data());
+    // The residual stream changes little between layers, so the next trunk
+    // layer's router applied to this layer's input predicts most of its
+    // experts. Their reads start now and overlap this layer's expert GEMMs
+    // and the next layer's attention; Map() uploads them when that layer
+    // routes, and loads whatever the prediction missed.
+    static const bool prefetch_on = [] {
+      const char* env = std::getenv("GUFO_FLASH_NEXT_PREFETCH");
+      // Off by default: on .198 the reads it adds cost more SSD bandwidth
+      // than the overlap saves (13.6 vs 13.0-13.2 tok/s).
+      return env != nullptr && env[0] == '1';
+    }();
+    const bool predict =
+        prefetch_on && layer + 1 < trunk.size() && n_tokens <= kStreamRows;
+    if (predict) {
+      if (predict_router_ == nullptr &&
+          (!Check(hipMalloc(reinterpret_cast<void**>(&predict_router_),
+                            sizeof(float) * kStreamRows * (c.num_experts + 1)),
+                  "prediction router allocation", error_msg) ||
+           !Check(hipMalloc(reinterpret_cast<void**>(&predict_ids_),
+                            sizeof(std::int32_t) * kStreamRows * used),
+                  "prediction ids allocation", error_msg) ||
+           !Check(hipMalloc(reinterpret_cast<void**>(&predict_weights_),
+                            sizeof(float) * kStreamRows * used),
+                  "prediction weights allocation", error_msg)))
+        return false;
+      if (!Dense(trunk[layer + 1].router, x, predict_router_, n_tokens,
+                 error_msg))
+        return false;
+      RouterTopK(predict_router_, c.num_experts + 1, predict_ids_,
+                 predict_weights_, n_tokens, c.num_experts, used, stream_);
+    }
+    // Host copies outlive this call: the slot ids are uploaded without a
+    // wait, and the next MoE step reuses them only after its own download.
+    auto& ids = stream_ids_;
+    auto& predicted = stream_predicted_;
+    ids.resize(count);
+    predicted.resize(predict ? count : 0);
+    if (ids_ready_ == nullptr &&
+        !Check(hipEventCreateWithFlags(&ids_ready_, hipEventDisableTiming),
+               "routed ids event", error_msg))
+      return false;
     if (!Check(hipMemcpyAsync(ids.data(), s_.ids, count * sizeof(std::int32_t),
                               hipMemcpyDeviceToHost, stream_),
                "routed ids download", error_msg) ||
-        !Check(hipStreamSynchronize(stream_), "routed ids wait", error_msg))
+        (predict && !Check(hipMemcpyAsync(predicted.data(), predict_ids_,
+                                          count * sizeof(std::int32_t),
+                                          hipMemcpyDeviceToHost, stream_),
+                           "predicted ids download", error_msg)) ||
+        !Check(hipEventRecord(ids_ready_, stream_), "routed ids event",
+               error_msg))
       return false;
-    const auto layer = static_cast<std::uint32_t>(&l - trunk.data());
+    // The shared expert does not depend on routing: the GPU runs it while
+    // the host waits for the ids and reads the missing experts.
+    if (!SharedExpert(l, x, n_tokens, error_msg))
+      return false;
+    shared_done = true;
+    if (!Check(hipEventSynchronize(ids_ready_), "routed ids wait", error_msg))
+      return false;
+    if (predict) {
+      // RouterTopK emits each row's experts by falling weight: prefetching
+      // only the first ranks skips the guesses that miss most often.
+      static const std::uint32_t top = [&] {
+        const char* env = std::getenv("GUFO_FLASH_NEXT_PREFETCH_TOP");
+        return env == nullptr
+                   ? used
+                   : static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+      }();
+      if (top < used) {
+        std::size_t kept = 0;
+        for (std::size_t k = 0; k < predicted.size(); ++k)
+          if (k % used < top)
+            predicted[kept++] = predicted[k];
+        predicted.resize(kept);
+      }
+      (void)expert_stream->Prefetch(layer + 1, predicted);
+    }
     if (!expert_stream->Map(layer, ids, stream_, error_msg))
       return false;
     if (!Check(hipMemcpyAsync(s_.ids, ids.data(), count * sizeof(std::int32_t),
                               hipMemcpyHostToDevice, stream_),
-               "slot ids upload", error_msg) ||
-        !Check(hipStreamSynchronize(stream_), "slot ids wait", error_msg))
+               "slot ids upload", error_msg))
       return false;
   }
   if (ExpertMatrixRows(n_tokens)) {
@@ -2705,20 +2781,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
-  shexp_half_ready_ = false;
-  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                  &l.shexp_down, error_msg)) {
-    return false;
-  }
-  if (shexp_half_ready_) {
-    shexp_half_ready_ = false;
-    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
-                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
-      AssignError(error_msg, "shared expert F16 GEMM failed");
-      return false;
-    }
-  } else if (!Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens,
-                    error_msg)) {
+  if (!shared_done && !SharedExpert(l, x, n_tokens, error_msg)) {
     return false;
   }
   if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
@@ -2871,6 +2934,26 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+bool Executor::SharedExpert(const DeviceLayer& l, const float* x,
+                            std::uint32_t n_tokens,
+                            std::string* error_msg) const {
+  shexp_half_ready_ = false;
+  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                  &l.shexp_down, error_msg)) {
+    return false;
+  }
+  if (shexp_half_ready_) {
+    shexp_half_ready_ = false;
+    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
+                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
+      AssignError(error_msg, "shared expert F16 GEMM failed");
+      return false;
+    }
+    return true;
+  }
+  return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
+}
+
 bool Executor::StreamedLayer(const DeviceLayer& l) const {
   const auto& trunk = model_->layers();
   return model_->expert_stream() != nullptr && !trunk.empty() &&
@@ -2929,6 +3012,7 @@ bool Executor::StreamedMoe(const DeviceLayer& l, const float* x, float* out,
     }
     ++rows[expert];
   }
+  stream->AddUses(layer, rows);
   std::vector<std::int32_t> order;
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     if (rows[e] != 0) {
