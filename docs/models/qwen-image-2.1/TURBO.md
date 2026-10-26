@@ -1,8 +1,9 @@
-# Qwen-Image-2.1-Turbo generation
+# Qwen-Image-2.1-Turbo generation and editing
 
-This fork adds native BF16 Turbo **generation** on gfx1151. Reference-image
-editing remains available with the base checkpoint; Turbo editing is deferred
-and returns HTTP 400. This work tracks upstream [issue #689](https://github.com/gufo-org/gufo/issues/689).
+This fork adds native BF16 Turbo **generation and editing** on gfx1151.
+Turbo uses the existing ordered-reference, vision-conditioning and RGBA VAE
+paths with its trained eight-step schedule. It accepts up to ten references,
+including colored guidance or an original-plus-mask pair. This work tracks upstream [issue #689](https://github.com/gufo-org/gufo/issues/689).
 
 ## Pinned model contract
 
@@ -75,6 +76,24 @@ curl --fail-with-body http://127.0.0.1:28182/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen-Image-2.1-Turbo","prompt":"A red ceramic teapot on a wooden table", "size":"1024x1024","seed":42}'
 ```
+
+Editing uses the same multipart endpoint and controls as the base model:
+
+```sh
+~/.local/bin/gufo-image-turbo --reference original.png \
+  --prompt 'Change the cup to cobalt blue, preserving its shape and lighting.' \
+  --size 1024x1024 --seed 42 --output edited.png
+
+~/.local/bin/gufo-image-turbo --reference original.png --reference mask.png \
+  --prompt 'Use image 1 as the original and image 2 as a separate black-and-white mask. Add a green pear in the white editable area. Remove mask and guidance marks.' \
+  --size 1024x1024 --seed 42 --output masked-edit.png
+```
+
+Use repeated multipart `image[]` fields with `/v1/images/edits` for ordered
+references. Seeds, `n`, size, transparent/opaque backgrounds, and PNG responses
+use the existing image API. Masks are guidance supplied as another reference;
+the server returns the complete generated image without compositing original
+pixels outside the mask.
 
 Omit `steps` or pass `8`. Other step counts return HTTP 400 rather than silently
 using an unqualified schedule. The base model retains its default 40 steps and
@@ -172,3 +191,42 @@ no GPU reset, hang or page fault during qualification and measurements.
 ![Photography and portrait comparison: native Gufo left, official reference right](artifacts/turbo-comparison-1.jpg)
 ![Typography and diagram comparison](artifacts/turbo-comparison-2.jpg)
 ![Composition and transparency comparison](artifacts/turbo-comparison-3.jpg)
+
+## Editing qualification (2026-10-26)
+
+The editing-qualified engine is `c5bad09cef01a5eb3a515cf7f4afc4a498910834`,
+with immutable image ID
+`b0ae766e2ee81a5e081de6b951d8d8fd44e3138809443510ef4f8cf2eb90150e`.
+The existing GPU pipeline handles references; this change removes the two
+Turbo-specific rejections at the HTTP and native-model boundaries. Sampling,
+precision, reference preprocessing, seed binding and cache isolation retain
+their existing formulas.
+
+- All **346 matched-input checks** passed the existing **1% relative-L2**
+  limit; the largest measured value was **0.004788**. All nine FP32 schedule
+  values match the pinned official Diffusers pipeline exactly.
+- A single-reference 256² full trajectory measured final-latent cosine
+  **0.999965** and decoded PNG PSNR **53.44 dB** against the independent
+  reference using the same initial noise. An original-plus-mask trajectory
+  measured **0.999829** and **40.62 dB**.
+- Real API requests passed for colored annotation editing, an original plus
+  mask, two-reference composition, transparent extraction, a two-prompt batch,
+  and 1920×1080 editing with retained native 1920×1088 pixels.
+- Annotation and mask fixed-seed replays match decoded pixels exactly; mask
+  replay also passed after service restart. The pre-upgrade generation sample
+  and retained base-model mask control both replay pixel-for-pixel.
+- Model/API contracts cover omitted and explicit eight steps, ordered RGBA
+  references, two outputs, transparency, ten references, and rejection of an
+  empty reference list, eleven references and invalid Turbo step counts.
+  The shared C++ formatting check passed on 665 files. The consuming app's
+  188 tests, type checks and production build passed.
+
+These editing checks are recorded separately from the earlier generation
+performance measurements above. The numerical comparisons use Torch 2.12.0,
+Transformers 5.17.0 and the pinned Diffusers revision. They verify the native
+implementation against the Turbo reference, rather than equating it with the
+base checkpoint's image quality.
+
+[Machine-readable editing qualification](artifacts/turbo-editing-qualification.json)
+
+![Native Gufo and pinned Diffusers editing comparisons](artifacts/turbo-editing-comparison.png)
