@@ -7,6 +7,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -599,6 +600,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::uint64_t expert_cache_bytes = 0;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -623,6 +625,10 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
+    parser.AddOption("", "--expert-cache-bytes", "N",
+                     "Flash-Next: device bytes for routed experts streamed "
+                     "from the GGUF (default: 0 = all experts resident)",
+                     "Model", &expert_cache_bytes);
 
     // Sampling Defaults
     parser.AddOption(
@@ -1227,6 +1233,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::uint64_t expert_cache_bytes = 0;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1262,6 +1269,11 @@ int RunServe(std::span<const char* const> args) {
                        "Flash-Next: static YaRN, required for --context above "
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
+    llm_parser.AddOption("", "--expert-cache-bytes", "N",
+                         "Flash-Next: device bytes for routed experts "
+                         "streamed from the GGUF (default: 0 = all experts "
+                         "resident)",
+                         "Model", &expert_cache_bytes);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1521,6 +1533,16 @@ int RunServe(std::span<const char* const> args) {
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
     // so supervisors see a loading server rather than a refused connection.
     server::LoadingResponder loading(host, port);
+    if (expert_cache_bytes > 0) {
+      // The Flash-Next loader reads the budget from its environment variable
+      // when its options carry none.
+      const auto value = std::to_string(expert_cache_bytes);
+#if defined(_WIN32)
+      _putenv_s("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str());
+#else
+      setenv("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str(), 1);
+#endif
+    }
     const bool load_ok = backend->load(
         model, &err, max_context, session_count,
         server::TextPrefillPolicy{

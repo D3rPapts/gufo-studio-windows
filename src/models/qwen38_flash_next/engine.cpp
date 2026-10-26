@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -145,9 +146,36 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
-                                         m->mtp_weights_.get(),
-                                         m->mtp_reader_.get(), error_msg);
+  std::uint64_t cache_bytes = options.expert_cache_bytes;
+  if (cache_bytes == 0) {
+    if (const char* env = std::getenv("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES"))
+      cache_bytes = std::strtoull(env, nullptr, 10);
+  }
+  std::uint32_t expert_slots = 0;
+  if (cache_bytes > 0) {
+    // One slot holds an expert's gate, up and down matrices in every layer.
+    std::uint64_t slot_bytes = 0;
+    for (const auto& l : m->weights_->layers)
+      for (const TensorRef* t :
+           {&l.ffn_gate_exps, &l.ffn_up_exps, &l.ffn_down_exps})
+        slot_bytes += t->SizeBytes() / t->experts;
+    const std::uint64_t slots = slot_bytes == 0 ? 0 : cache_bytes / slot_bytes;
+    // A row slice routes up to 8 tokens of num_experts_used experts.
+    const std::uint64_t minimum = 8ULL * c.num_experts_used;
+    if (slots < minimum) {
+      AssignError(error_msg, "expert cache below " +
+                                 std::to_string(minimum * slot_bytes) +
+                                 " bytes");
+      return nullptr;
+    }
+    expert_slots = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(slots, c.num_experts));
+    if (expert_slots == c.num_experts)
+      expert_slots = 0;  // everything fits: keep the resident layout
+  }
+  m->device_ = rocm::DeviceModel::Upload(
+      *m->weights_, *m->reader_, m->mtp_weights_.get(), m->mtp_reader_.get(),
+      error_msg, expert_slots);
   if (!m->device_) {
     return nullptr;
   }

@@ -62,6 +62,11 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
+  /// Device bytes for routed experts streamed from the GGUF; 0 keeps every
+  /// expert resident. For hosts whose memory cannot hold the experts:
+  /// missing experts are read from disk per layer. When 0, the environment
+  /// variable GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES may set it.
+  std::uint64_t expert_cache_bytes = 0;
 };
 
 class Session;
