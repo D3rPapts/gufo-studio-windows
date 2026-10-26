@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen35moe/kernels/rocm/executor.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
 #include "src/models/qwen35moe/mtp_sampling.hpp"
@@ -105,10 +106,11 @@ void Executor::UseScratch(const Scratch& scratch) const {
 
 bool Executor::AllocateBatch(std::string* error) const {
   return batch_logits_ != nullptr ||
-         Check(hipMalloc(&batch_logits_,
-                         static_cast<std::size_t>(kBatchSessions) *
-                             std::min(kDecodeRows, options_.max_logit_rows) *
-                             config().vocab_size * sizeof(float)),
+         Check(hip::AllocateDevice(
+                   &batch_logits_,
+                   static_cast<std::size_t>(kBatchSessions) *
+                       std::min(kDecodeRows, options_.max_logit_rows) *
+                       config().vocab_size * sizeof(float)),
                error);
 }
 

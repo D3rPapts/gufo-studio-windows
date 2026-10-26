@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
 
@@ -41,9 +42,10 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
          std::string* error_msg, std::size_t* allocated_bytes = nullptr) {
   void* p = nullptr;
   const std::size_t bytes = std::max<std::size_t>(1, count) * sizeof(T);
-  if (hipMalloc(&p, bytes) != hipSuccess) {
-    AssignError(error_msg,
-                "hipMalloc of " + std::to_string(bytes) + " bytes failed");
+  const hipError_t status = hip::AllocateDevice(&p, bytes);
+  if (status != hipSuccess) {
+    AssignError(error_msg, "device allocation of " + std::to_string(bytes) +
+                               " bytes failed: " + hipGetErrorString(status));
     allocations.push_back(nullptr);
     return nullptr;
   }
@@ -570,7 +572,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
                                             c.ssm_num_v_heads, c.ssm_head_dim);
     const auto bytes = linear * (conv + state) * sizeof(float);
     float* allocation = nullptr;
-    if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
+    if (!Check(hip::AllocateDevice(&allocation, bytes), "rollback allocation",
+               error_msg))
       return false;
     session.rollback_allocations_.push_back(allocation);
     session.rollback_bytes_ += bytes;

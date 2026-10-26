@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <thread>
@@ -690,7 +691,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
     measured = measure.requested;
   }
-  const hip::WeightAllocator weights(measured);
+  // Test seam: force the managed placement where the device heap would keep
+  // dedicated memory, so the fallback stays exercised on machines where both
+  // fit (mirrors GUFO_TEST_UNPINNED_STAGING in weight_upload.cpp).
+  const bool force_managed =
+      std::getenv("GUFO_TEST_MANAGED_WEIGHTS") != nullptr;
+  const hip::WeightAllocator weights(force_managed ? std::uint64_t{1} << 42
+                                                   : measured);
   std::vector<Conversion> conversions;
   Uploader up{*stager,         &weights,  conversions,
               m->allocations_, m->bytes_, m->max_half_cols_,

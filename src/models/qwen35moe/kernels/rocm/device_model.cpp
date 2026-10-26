@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <numeric>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
@@ -131,6 +134,7 @@ void DequantizeRow(GgmlType type, const void* src, float* dst,
 
 struct Uploader {
   hip::WeightUpload& stager;
+  const hip::WeightAllocator* weights;
   std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
   std::size_t& bytes;
@@ -139,6 +143,9 @@ struct Uploader {
   const std::vector<core::GgufMappedRegion>& shards;
   std::string* error;
   bool ok{true};
+  std::uint64_t requested{0};
+
+  [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
   void Fail(const std::string& message) {
     if (ok && error != nullptr) {
@@ -148,9 +155,15 @@ struct Uploader {
   }
 
   void* Allocate(std::size_t size) {
+    requested += size + kTailMargin;
+    if (Measuring()) {
+      return nullptr;
+    }
     void* ptr = nullptr;
-    if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
-      Fail("hipMalloc failed (" + std::to_string(size) + " bytes)");
+    const hipError_t status = weights->Allocate(&ptr, size + kTailMargin);
+    if (status != hipSuccess) {
+      Fail("weight allocation of " + std::to_string(size) +
+           " bytes failed: " + hipGetErrorString(status));
       return nullptr;
     }
     allocations.push_back(ptr);
@@ -165,7 +178,7 @@ struct Uploader {
       return d;
     }
     void* ptr = Allocate(t.SizeBytes());
-    if (ptr == nullptr) {
+    if (!ok || Measuring()) {
       return d;
     }
     if (!stager.Copy(t.shard, t.file_offset, t.SizeBytes(), ptr, error)) {
@@ -209,7 +222,7 @@ struct Uploader {
       rows += t->rows;
     }
     void* ptr = Allocate(size);
-    if (ptr == nullptr) {
+    if (!ok || Measuring()) {
       return DeviceTensor{};
     }
     std::size_t offset = 0;
@@ -272,7 +285,7 @@ struct Uploader {
         static_cast<std::size_t>(cols) / 32 * sizeof(quant::block_q8_0);
     const std::size_t dst_bytes = rows * row_dst_bytes;
     void* ptr = Allocate(dst_bytes);
-    if (ptr == nullptr) {
+    if (!ok || Measuring()) {
       return d;
     }
     // Q8_0 parts are already in the destination layout: their bytes stream
@@ -406,7 +419,7 @@ struct Uploader {
       size += t->SizeBytes();
     }
     void* ptr = Allocate(size);
-    if (ptr == nullptr) {
+    if (!ok || Measuring()) {
       return d;
     }
     std::size_t offset = 0;
@@ -419,14 +432,10 @@ struct Uploader {
       offset += t->SizeBytes();
     }
     const std::size_t count = size / sizeof(float);
-    void* half = nullptr;
-    if (hipMalloc(&half, count * sizeof(std::uint16_t) + kTailMargin) !=
-        hipSuccess) {
-      Fail("hipMalloc failed for stacked tensor");
+    void* half = Allocate(count * sizeof(std::uint16_t));
+    if (!ok || Measuring()) {
       return d;
     }
-    allocations.push_back(half);
-    bytes += count * sizeof(std::uint16_t) + kTailMargin;
     conversions.push_back({ptr, half, count});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
                          kTailMargin, nullptr);
@@ -460,6 +469,11 @@ struct Uploader {
       return d;
     }
     const std::size_t rows = alpha.rows + beta.rows;
+    const std::size_t src_bytes = rows * cols * sizeof(float);
+    void* ptr = Allocate(src_bytes);
+    if (!ok || Measuring()) {
+      return d;
+    }
     std::vector<float> staged(rows * cols);
     const auto fill = [&](const TensorRef& t, std::size_t row_base) {
       const auto* src = static_cast<const std::uint8_t*>(shards[t.shard].data) +
@@ -474,25 +488,16 @@ struct Uploader {
     };
     fill(alpha, 0);
     fill(beta, alpha.rows);
-    const std::size_t src_bytes = staged.size() * sizeof(float);
-    void* ptr = Allocate(src_bytes);
-    if (ptr == nullptr) {
-      return d;
-    }
     if (hipMemcpy(ptr, staged.data(), src_bytes, hipMemcpyHostToDevice) !=
         hipSuccess) {
       Fail("alpha/beta upload failed");
       return d;
     }
-    const std::size_t count = staged.size();
-    void* half = nullptr;
-    if (hipMalloc(&half, count * sizeof(std::uint16_t) + kTailMargin) !=
-        hipSuccess) {
-      Fail("alpha/beta staging allocation failed");
+    const std::size_t count = rows * cols;
+    void* half = Allocate(count * sizeof(std::uint16_t));
+    if (!ok) {
       return d;
     }
-    allocations.push_back(half);
-    bytes += count * sizeof(std::uint16_t) + kTailMargin;
     conversions.push_back({ptr, half, count});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
                          kTailMargin, nullptr);
@@ -544,14 +549,17 @@ struct Uploader {
   }
 
   /// GGUF packs [fc_embedding | fc_hidden] across each row. Split on a
-  /// quantization-block boundary without changing any weight.
-  void SplitMtpProjection(const DeviceTensor& t, DeviceTensor& embedding,
-                          DeviceTensor& hidden) {
-    if (t.empty() || !ok)
+  /// quantization-block boundary without changing any weight. The sizes come
+  /// from the file's TensorRef so the measuring walk counts the split
+  /// allocations before any device bytes exist.
+  void SplitMtpProjection(const TensorRef& t, const DeviceTensor& combined,
+                          DeviceTensor& embedding, DeviceTensor& hidden) {
+    if (t.empty() || !ok) {
       return;
+    }
     // Each half covers half of every raw row; a whole-row decode view of
     // the combined tensor must never leak into the split outputs.
-    if (t.native_data != nullptr) {
+    if (combined.native_data != nullptr) {
       Fail("MTP projection split requires the dequantized tensor");
       return;
     }
@@ -560,16 +568,17 @@ struct Uploader {
     const std::size_t part_bytes = row_bytes * t.rows;
     for (std::uint32_t part = 0; part < 2; ++part) {
       auto& dst = part == 0 ? embedding : hidden;
-      dst = t;
+      dst = combined;
       dst.cols /= 2;
-      if (hipMalloc(&dst.data, part_bytes + kTailMargin) != hipSuccess) {
-        Fail("MTP split projection allocation failed");
+      dst.data = Allocate(part_bytes);
+      if (!ok) {
         return;
       }
-      allocations.push_back(dst.data);
-      bytes += part_bytes + kTailMargin;
+      if (Measuring()) {
+        continue;
+      }
       const auto* src =
-          static_cast<const std::uint8_t*>(t.data) + part * row_bytes;
+          static_cast<const std::uint8_t*>(combined.data) + part * row_bytes;
       if (hipMemcpy2D(dst.data, row_bytes, src, 2 * row_bytes, row_bytes,
                       t.rows, hipMemcpyDeviceToDevice) != hipSuccess ||
           hipMemset(static_cast<std::uint8_t*>(dst.data) + part_bytes, 0,
@@ -578,8 +587,11 @@ struct Uploader {
         return;
       }
     }
-    std::erase(allocations, t.data);
-    (void)hipFree(t.data);
+    if (Measuring()) {
+      return;
+    }
+    std::erase(allocations, combined.data);
+    (void)hipFree(combined.data);
     bytes -= total_row_bytes * t.rows + kTailMargin;
   }
 
@@ -644,20 +656,58 @@ struct Uploader {
       // columns; a raw decode view of the full tensor is meaningless after
       // the column split, so this projection keeps only the Q8_0 halves.
       const auto combined = CopyDequantQ8_0({&l.nextn_eh_proj});
+      if (!ok) {
+        return d;
+      }
       // The split frees the combined buffer, so the streamed upload must be
       // complete first. This is the final layer upload; the drain costs no
       // overlap with later work.
-      if (!stager.Finish(error)) {
+      if (!Measuring() && !stager.Finish(error)) {
         Fail("eh_proj upload failed" + (error != nullptr && !error->empty()
                                             ? ": " + *error
                                             : std::string()));
         return d;
       }
-      SplitMtpProjection(combined, d.nextn_fc_embedding, d.nextn_fc_hidden);
+      SplitMtpProjection(l.nextn_eh_proj, combined, d.nextn_fc_embedding,
+                         d.nextn_fc_hidden);
     }
     return d;
   }
 };
+
+/// The heads and every layer (including the optional MTP block) as one
+/// traversal's output.
+struct Uploaded {
+  DeviceTensor token_embd;
+  DeviceTensor output;
+  DeviceTensor output_norm;
+  std::vector<DeviceLayer> layers;
+  DeviceLayer mtp;
+};
+
+Uploaded WalkModel(Uploader& up, const ModelWeights& w, const MtpWeights* mtp) {
+  Uploaded out;
+  out.token_embd = w.token_embd.type == GgmlType::kQ8_0
+                       ? up.Copy(w.token_embd)
+                       : up.CopyDequantOne(w.token_embd);
+  out.output =
+      w.output.data == w.token_embd.data
+          ? out.token_embd
+          : (w.output.type == GgmlType::kQ8_0 ? up.Copy(w.output)
+                                              : up.CopyDequantOne(w.output));
+  out.output_norm = up.Copy(w.output_norm);
+  out.layers.reserve(w.layers.size());
+  for (const auto& l : w.layers) {
+    out.layers.push_back(up.Layer(l));
+    if (!up.ok) {
+      return out;
+    }
+  }
+  if (mtp != nullptr) {
+    out.mtp = up.Layer(mtp->block);
+  }
+  return out;
+}
 
 }  // namespace
 
@@ -731,35 +781,54 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   for (auto& notice : stager->TakeNotices()) {
     server::Logger::Warn("loader", notice);
   }
-  std::vector<Conversion> conversions;
-  Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
-              m->max_half_cols_, m->max_q8_cols_, shards,          error_msg};
-  if (!up.ok) {
-    return nullptr;
-  }
-  m->token_embd_ = w.token_embd.type == GgmlType::kQ8_0
-                       ? up.Copy(w.token_embd)
-                       : up.CopyDequantOne(w.token_embd);
-  m->output_ =
-      w.output.data == w.token_embd.data
-          ? m->token_embd_
-          : (w.output.type == GgmlType::kQ8_0 ? up.Copy(w.output)
-                                              : up.CopyDequantOne(w.output));
-  m->output_norm_ = up.Copy(w.output_norm);
-  m->layers_.reserve(w.layers.size());
-  for (const auto& l : w.layers) {
-    m->layers_.push_back(up.Layer(l));
-    if (!up.ok) {
+  // Measure first: the weight placement is decided once, from the bytes this
+  // walk will request of the device heap.
+  std::uint64_t measured = 0;
+  {
+    std::vector<Conversion> conversions;
+    std::vector<void*> allocations;
+    std::size_t bytes = 0;
+    std::size_t max_half_cols = 1;
+    std::size_t max_q8_cols = 32;
+    Uploader measure{*stager,      nullptr,       conversions, allocations,
+                     bytes,        max_half_cols, max_q8_cols, shards,
+                     error_msg};
+    (void)WalkModel(measure, w, mtp);
+    if (!measure.ok) {
       return nullptr;
     }
+    measured = measure.requested;
   }
-  if (mtp != nullptr) {
-    m->mtp_ = up.Layer(mtp->block);
-    m->has_mtp_ = true;
+  // Test seam: force the managed placement where the device heap would keep
+  // dedicated memory, so the fallback stays exercised on machines where both
+  // fit (mirrors GUFO_TEST_UNPINNED_STAGING in weight_upload.cpp).
+  const bool force_managed =
+      std::getenv("GUFO_TEST_MANAGED_WEIGHTS") != nullptr;
+  const hip::WeightAllocator weights(force_managed ? std::uint64_t{1} << 42
+                                                   : measured);
+  if (weights.placement() == hip::Placement::kManaged) {
+    server::Logger::Warn(
+        "loader",
+        "event=weights_managed bytes=" + std::to_string(measured) +
+            " the weights do not fit the device heap above its " +
+            std::to_string(hip::kDispatchReserve >> 30) +
+            " GiB dispatch reserve; placing them in managed memory");
   }
+  std::vector<Conversion> conversions;
+  Uploader up{*stager,      &weights,          conversions,     m->allocations_,
+              m->bytes_,    m->max_half_cols_, m->max_q8_cols_, shards,
+              error_msg};
+  auto uploaded = WalkModel(up, w, mtp);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
   }
+  assert(up.requested == measured);
+  m->token_embd_ = uploaded.token_embd;
+  m->output_ = uploaded.output;
+  m->output_norm_ = uploaded.output_norm;
+  m->layers_ = std::move(uploaded.layers);
+  m->mtp_ = uploaded.mtp;
+  m->has_mtp_ = mtp != nullptr;
   for (const auto& c : conversions) {
     NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
                       c.count, nullptr);
