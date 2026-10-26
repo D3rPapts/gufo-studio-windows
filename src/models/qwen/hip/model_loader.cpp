@@ -10,6 +10,7 @@
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/platform/pages.hpp"
+#include "src/core/platform/prefault.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -165,8 +166,8 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
       bool source_was_read = false;
       map_error = MapRegisteredRegion(source, destination, source_was_read);
       if (map_error != hipSuccess) {
-        // Mapped registration is the Linux fast path; the streaming upload
-        // preserves device residency wherever it is refused.
+        // Mapped registration is the Linux fast path; the device-resident
+        // upload preserves single-copy residency wherever it is refused.
         destination = {};
         map_error = AllocateDeviceRegion(source, destination);
         if (map_error == hipSuccess) {
