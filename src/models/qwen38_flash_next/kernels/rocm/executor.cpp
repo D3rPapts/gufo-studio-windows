@@ -2639,12 +2639,49 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  // Streamed experts: a trunk layer's routed experts must fit the layer's
+  // device slots, so larger batches run as row slices of kStreamRows.
+  ExpertStream* const expert_stream = model_->expert_stream();
+  const auto& trunk = model_->layers();
+  const bool streamed = expert_stream != nullptr && !trunk.empty() &&
+                        &l >= trunk.data() && &l < trunk.data() + trunk.size();
+  constexpr std::uint32_t kStreamRows = 8;
+  if (streamed && n_tokens > kStreamRows) {
+    for (std::uint32_t start = 0; start < n_tokens; start += kStreamRows) {
+      const std::uint32_t rows = std::min(kStreamRows, n_tokens - start);
+      const std::size_t offset =
+          static_cast<std::size_t>(start) * c.hidden_size;
+      if ((!last_only || start + rows == n_tokens) &&
+          !Moe(l, x + offset, out + offset, rows, error_msg, false))
+        return false;
+    }
+    return true;
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  if (streamed) {
+    // The host maps routed experts to slots and loads the missing ones; the
+    // expert kernels then read slot ids from the same buffer.
+    const std::size_t count = static_cast<std::size_t>(n_tokens) * used;
+    std::vector<std::int32_t> ids(count);
+    if (!Check(hipMemcpyAsync(ids.data(), s_.ids, count * sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "routed ids download", error_msg) ||
+        !Check(hipStreamSynchronize(stream_), "routed ids wait", error_msg))
+      return false;
+    const auto layer = static_cast<std::uint32_t>(&l - trunk.data());
+    if (!expert_stream->Map(layer, ids, stream_, error_msg))
+      return false;
+    if (!Check(hipMemcpyAsync(s_.ids, ids.data(), count * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "slot ids upload", error_msg) ||
+        !Check(hipStreamSynchronize(stream_), "slot ids wait", error_msg))
+      return false;
+  }
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
@@ -2701,6 +2738,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
+  // Streamed trunk layers run their experts in row slices of at most eight
+  // rows, which never take the tiled route; the caller must then keep the F32
+  // mix and the immediate residual.
+  const auto& trunk = model_->layers();
+  if (model_->expert_stream() != nullptr && !trunk.empty() &&
+      &l >= trunk.data() && &l < trunk.data() + trunk.size())
+    return false;
   return ExpertMatrixRows(n_tokens) &&
          (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
@@ -2882,6 +2926,10 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Streamed experts wait on the host inside every MoE layer; that cannot
+  // be captured.
+  if (model_->expert_stream() != nullptr)
+    graph = false;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
