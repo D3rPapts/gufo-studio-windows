@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -76,6 +77,60 @@ HttpResponse Err(int status, std::string_view reason, std::string_view message,
   body["error"] = std::move(detail);
   return HttpResponse{
       .status = status, .reason = std::string(reason), .body = body.dump()};
+}
+
+/// Static file under --pages-dir: GET /<page>/ serves <dir>/<page>/index.html,
+/// GET /<page>/<file> the file itself, and /<page> redirects to /<page>/.
+/// Same-origin pages need no CORS or private-network preflight from browsers.
+std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
+                                      const HttpRequest& req) {
+  if (dir.empty() || req.method != "GET" || req.path.size() < 2 ||
+      req.path.starts_with("/v1/"))
+    return std::nullopt;
+  std::string_view rel = std::string_view(req.path).substr(1);
+  if (const auto query = rel.find('?'); query != std::string_view::npos)
+    rel = rel.substr(0, query);
+  for (const char c : rel)
+    if (c == '\\' || c == ':' || c == '\0')
+      return std::nullopt;
+  std::filesystem::path file = dir;
+  std::size_t segments = 0;
+  for (std::size_t start = 0; start <= rel.size();) {
+    const auto end = std::min(rel.find('/', start), rel.size());
+    const auto part = rel.substr(start, end - start);
+    if (part == "." || part == "..")
+      return std::nullopt;
+    if (!part.empty()) {
+      file /= std::string(part);
+      ++segments;
+    }
+    start = end + 1;
+  }
+  std::error_code ec;
+  if (segments == 1 && !rel.ends_with('/') &&
+      std::filesystem::is_directory(file, ec))
+    return HttpResponse{.status = 301,
+                        .reason = "Moved Permanently",
+                        .headers = {{"Location", req.path + "/"}}};
+  if (std::filesystem::is_directory(file, ec))
+    file /= "index.html";
+  if (!std::filesystem::is_regular_file(file, ec))
+    return std::nullopt;
+  std::ifstream in(file, std::ios::binary);
+  std::string body((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  const auto ext = file.extension().string();
+  const std::string type = ext == ".html"  ? "text/html; charset=utf-8"
+                           : ext == ".js"  ? "text/javascript; charset=utf-8"
+                           : ext == ".css" ? "text/css; charset=utf-8"
+                           : ext == ".png" ? "image/png"
+                           : ext == ".svg" ? "image/svg+xml"
+                                           : "application/octet-stream";
+  return HttpResponse{.status = 200,
+                      .reason = "OK",
+                      .body = std::move(body),
+                      .headers = {{"Content-Type", type},
+                                  {"Cache-Control", "no-cache"}}};
 }
 
 /// Router-managed paths answered by the front itself. Returns nullopt when
@@ -434,6 +489,7 @@ public:
   std::mutex mutex;
   std::map<std::string, std::shared_ptr<router::Worker>> workers;
   std::filesystem::path exe_path;
+  std::filesystem::path pages_dir;
   std::atomic<bool> stop_requested{false};
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
@@ -478,6 +534,8 @@ public:
   HttpResponse Dispatch(const HttpRequest& req) {
     // Every registry touch, including RouteFront's Listing, is serialized on
     // the same mutex the supervision tick holds.
+    if (auto page = ServePage(pages_dir, req))
+      return std::move(*page);
     std::unique_lock<std::mutex> lock(mutex);
     if (const auto front = RouteFront(registry, req)) {
       return *front;
@@ -989,6 +1047,7 @@ int RunRouter(std::span<const char* const> args) {
 
   std::filesystem::path preset_path;
   std::filesystem::path models_dir;
+  std::filesystem::path pages_dir;
   std::size_t models_max = 2;
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
@@ -1007,6 +1066,10 @@ int RunRouter(std::span<const char* const> args) {
   parser.AddOption("", "--models-dir", "DIR",
                    "Base directory that resolves relative model paths",
                    "Router", &models_dir);
+  parser.AddOption("", "--pages-dir", "DIR",
+                   "Serve static pages: GET /<name>/ returns "
+                   "DIR/<name>/index.html",
+                   "Router", &pages_dir);
   parser.AddOption("", "--models-max", "N",
                    "Maximum concurrently loaded workers (default: 2; "
                    "0 = unlimited)",
@@ -1069,6 +1132,7 @@ int RunRouter(std::span<const char* const> args) {
   registry_options.load_timeout = std::chrono::seconds(load_timeout_seconds);
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
+  state->pages_dir = pages_dir;
 
   // --autoload preloads in section order up to --models-max, waiting for each
   // worker's health endpoint within --load-timeout-seconds.
