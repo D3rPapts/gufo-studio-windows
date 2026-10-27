@@ -665,8 +665,8 @@ float Iq3xxsValue(const block_iq3_xxs& block, std::size_t index) noexcept {
   const std::size_t j = within % 8;
   std::uint32_t aux = 0;
   std::memcpy(&aux, block.qs + 64 + (4 * ib32), sizeof(aux));
-  const float db = Fp16ToFloat(block.d) *
-                   (0.5F + static_cast<float>(aux >> 28U)) * 0.5F;
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(aux >> 28U)) * 0.5F;
   auto signs = static_cast<std::uint32_t>((aux >> (7U * l)) & 127U);
   signs |= static_cast<std::uint32_t>(std::popcount(signs) & 1) << 7U;
   const auto* grid = reinterpret_cast<const std::uint8_t*>(

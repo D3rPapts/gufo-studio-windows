@@ -64,7 +64,7 @@ std::vector<std::uint8_t> MakeWeights(const Format& f, std::size_t rows,
   return w;
 }
 
-template <typename T>
+template<typename T>
 T* Upload(const std::vector<T>& host) {
   T* device = nullptr;
   CheckHip(hipMalloc(&device, host.size() * sizeof(T)), "allocation");
@@ -86,8 +86,7 @@ std::vector<float> Download(const float* device, std::size_t count) {
 /// |weight * activation| of the same output (the scale the int8 activations
 /// are rounded against).
 double Compare(const std::vector<float>& actual,
-               const std::vector<float>& weights,
-               const std::vector<float>& x,
+               const std::vector<float>& weights, const std::vector<float>& x,
                const std::vector<std::int32_t>& ids, int rows, int cols,
                int tokens, int used) {
   double worst = 0.0;
@@ -150,32 +149,32 @@ bool Check(const Format& f, int tokens, bool pair, std::uint32_t seed) {
                             tokens, kExperts, kUsed, nullptr);
     qfn_mmq_set_routed_max_expert_rows(0);
   } else {
-    rc = qfn_mmq_moe_vec(f.ggml_type, d_wa, d_x, d_ids, d_a, rows, cols,
-                         tokens, kExperts, kUsed, nullptr,
-                         pair ? d_wb : nullptr, pair ? d_b : nullptr);
+    rc = qfn_mmq_moe_vec(f.ggml_type, d_wa, d_x, d_ids, d_a, rows, cols, tokens,
+                         kExperts, kUsed, nullptr, pair ? d_wb : nullptr,
+                         pair ? d_b : nullptr);
   }
   CheckHip(hipDeviceSynchronize(), "expert projection");
   double worst = 0.0;
   if (rc == 0) {
-    worst = Compare(Download(d_a, outputs), da, x, ids, rows, cols, tokens,
-                    kUsed);
+    worst =
+        Compare(Download(d_a, outputs), da, x, ids, rows, cols, tokens, kUsed);
     if (pair) {
       worst = std::max(worst, Compare(Download(d_b, outputs), db, x, ids, rows,
                                       cols, tokens, kUsed));
     }
   }
-  for (void* p : {d_wa, d_wb, static_cast<void*>(d_x),
-                  static_cast<void*>(d_ids), static_cast<void*>(d_a),
-                  static_cast<void*>(d_b)}) {
+  for (void* p :
+       {d_wa, d_wb, static_cast<void*>(d_x), static_cast<void*>(d_ids),
+        static_cast<void*>(d_a), static_cast<void*>(d_b)}) {
     CheckHip(hipFree(p), "free");
   }
   const char* route = tiled ? "tiled" : pair ? "vector pair" : "vector";
   // The kernels round activations to int8 per 32 values; that costs well
   // under 1 % of the summed magnitude, a wrong layout costs all of it.
   const bool ok = rc == 0 && worst < 1e-2;
-  std::cout << f.name << ' ' << route << " tokens=" << tokens
-            << ": rc=" << rc << " worst relative error " << worst
-            << (ok ? "" : "  FAILED") << '\n';
+  std::cout << f.name << ' ' << route << " tokens=" << tokens << ": rc=" << rc
+            << " worst relative error " << worst << (ok ? "" : "  FAILED")
+            << '\n';
   return ok;
 }
 

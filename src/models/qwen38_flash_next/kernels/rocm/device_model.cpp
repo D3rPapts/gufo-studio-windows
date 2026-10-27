@@ -12,8 +12,8 @@
 #include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -373,10 +373,9 @@ struct Uploader {
                  std::uint32_t trunk_shards) {
     Uploaded u;
     u.token_embd = Copy(w.token_embd);
-    u.output = w.output.data == w.token_embd.data ? u.token_embd
-               : w.output.type == core::GgmlType::kQ6_K
-                   ? CopyQ6KAsQ8(w.output)
-                   : Copy(w.output);
+    u.output = w.output.data == w.token_embd.data       ? u.token_embd
+               : w.output.type == core::GgmlType::kQ6_K ? CopyQ6KAsQ8(w.output)
+                                                        : Copy(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     for (const auto& l : w.layers) {
@@ -495,11 +494,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ =
-      uploaded.output.type == w.output.type
-          ? w.output.SizeBytes()
-          : std::size_t{uploaded.output.rows} * (uploaded.output.cols / 32) *
-                sizeof(quant::block_q8_0);
+  m->output_bytes_ = uploaded.output.type == w.output.type
+                         ? w.output.SizeBytes()
+                         : std::size_t{uploaded.output.rows} *
+                               (uploaded.output.cols / 32) *
+                               sizeof(quant::block_q8_0);
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
