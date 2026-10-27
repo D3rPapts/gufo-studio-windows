@@ -2663,7 +2663,17 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   ExpertStream* const expert_stream = model_->expert_stream();
   const auto& trunk = model_->layers();
   const bool streamed = StreamedLayer(l);
-  if (streamed && WmmaExperts(l, n_tokens)) {
+  // IQ experts (UD-Q3_K_XL) have no WMMA route, but their MMQ route drops
+  // ids at or past the slot count just like RouteHints, so prefill runs in
+  // the same expert waves instead of row slices that reload experts.
+  const auto iq = [](GgmlType t) {
+    return t == GgmlType::kIQ3_XXS || t == GgmlType::kIQ4_XS ||
+           t == GgmlType::kIQ4_NL;
+  };
+  const bool iq_waves = streamed && iq(l.ffn_gate_exps.type) &&
+                        ExpertMatrixRows(n_tokens) &&
+                        (prefill_phase || n_tokens > kStreamRows);
+  if (streamed && (WmmaExperts(l, n_tokens) || iq_waves)) {
     return StreamedMoe(l, x, out, n_tokens, error_msg);
   }
   if (streamed && n_tokens > kStreamRows) {
