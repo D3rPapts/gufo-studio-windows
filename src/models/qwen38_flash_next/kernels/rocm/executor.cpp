@@ -2808,10 +2808,12 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 }
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
-  // Streamed trunk layers take the tiled route only for prefill batches,
-  // which run as expert waves (StreamedMoe); their narrower batches map
-  // experts per call and need the F32 mix and the immediate residual.
-  if (StreamedLayer(l) && n_tokens <= kStreamRows) {
+  // Streamed trunk layers take the tiled route for every prefill batch, which
+  // runs as expert waves (StreamedMoe), so a prompt suffix after a cache hit
+  // keeps the arithmetic of a full prefill. Narrow decode and verification
+  // batches map experts per call and need the F32 mix and the immediate
+  // residual.
+  if (StreamedLayer(l) && n_tokens <= kStreamRows && !prefill_phase) {
     return false;
   }
   const Config& c = config();
