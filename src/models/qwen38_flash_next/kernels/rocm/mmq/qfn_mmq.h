@@ -90,4 +90,10 @@ int qfn_mmq_q5_K_moe_raw(
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     hipStream_t stream);
 
+// IQ3_XXS, IQ4_XS or IQ4_NL experts (ggml type id in weight_type).
+int qfn_mmq_iq_moe_raw(
+    int weight_type, const void * W, const float * X_f32, const int32_t * ids,
+    float * out, int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    hipStream_t stream);
+
 }

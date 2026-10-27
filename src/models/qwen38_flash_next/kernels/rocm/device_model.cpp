@@ -1,15 +1,20 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -114,6 +119,71 @@ struct Uploader {
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
+    return d;
+  }
+
+  /// A Q6_K output head (unsloth UD-Q3_K_XL) has no device kernel here: the
+  /// upload requantizes it to Q8_0 once on the host, a chunk of rows at a
+  /// time (Q8_0 is finer than Q6_K, so the head loses no precision).
+  DeviceTensor CopyQ6KAsQ8(const TensorRef& t) {
+    DeviceTensor d;
+    if (t.empty() || !ok) {
+      return d;
+    }
+    const std::size_t row_blocks = t.cols / 32;
+    const std::size_t row_bytes = row_blocks * sizeof(quant::block_q8_0);
+    const std::size_t size = row_bytes * t.rows;
+    void* ptr = nullptr;
+    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name) + " (" +
+           std::to_string(size) + " bytes)");
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += size + kTailMargin;
+    const auto* src = static_cast<const std::uint8_t*>(t.data);
+    const std::size_t src_row = t.SizeBytes() / t.rows;
+    constexpr std::size_t kChunkRows = 4096;
+    std::vector<float> values(t.cols);
+    std::vector<quant::block_q8_0> host(kChunkRows * row_blocks);
+    for (std::size_t r0 = 0; r0 < t.rows; r0 += kChunkRows) {
+      const std::size_t n = std::min<std::size_t>(kChunkRows, t.rows - r0);
+      for (std::size_t r = 0; r < n; ++r) {
+        quant::DequantizeQ6_K(src + (r0 + r) * src_row, values.data(), t.cols);
+        for (std::size_t b = 0; b < row_blocks; ++b) {
+          const float* x = values.data() + b * 32;
+          float amax = 0.0f;
+          for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(x[i]));
+          }
+          const float scale = amax / 127.0f;
+          const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+          auto& block = host[r * row_blocks + b];
+          const __half half = __float2half(scale);
+          std::memcpy(&block.d, &half, sizeof(block.d));
+          for (int i = 0; i < 32; ++i) {
+            block.qs[i] = static_cast<std::int8_t>(std::lround(x[i] * inverse));
+          }
+        }
+      }
+      if (hipMemcpy(static_cast<std::uint8_t*>(ptr) + r0 * row_bytes,
+                    host.data(), n * row_bytes,
+                    hipMemcpyHostToDevice) != hipSuccess) {
+        Fail("upload failed for " + std::string(t.name));
+        return d;
+      }
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
+                         nullptr);
+    d.data = ptr;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = 1;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     return d;
   }
 
@@ -353,8 +423,10 @@ struct Uploader {
                  std::uint32_t trunk_shards) {
     Uploaded u;
     u.token_embd = Copy(w.token_embd);
-    u.output =
-        w.output.data == w.token_embd.data ? u.token_embd : Copy(w.output);
+    u.output = w.output.data == w.token_embd.data ? u.token_embd
+               : w.output.type == core::GgmlType::kQ6_K
+                   ? CopyQ6KAsQ8(w.output)
+                   : Copy(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     stream_layer = true;
@@ -425,7 +497,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
            supported(l.ffn_down_exps);
   };
-  if (!supported(w.token_embd) || !supported(w.output) ||
+  // A Q6_K output head is requantized on upload (CopyQ6KAsQ8).
+  if (!supported(w.token_embd) ||
+      (w.output.data == w.token_embd.data && !supported(w.output)) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;
@@ -478,7 +552,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  m->output_bytes_ =
+      uploaded.output.type == w.output.type
+          ? w.output.SizeBytes()
+          : std::size_t{uploaded.output.rows} * (uploaded.output.cols / 32) *
+                sizeof(quant::block_q8_0);
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
