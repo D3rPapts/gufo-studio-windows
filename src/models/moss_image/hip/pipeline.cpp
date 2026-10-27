@@ -4,11 +4,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stdexcept>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/minimax_h3/attention.hip.hpp"
 #include "src/models/moss_image/hip/ops.hpp"
 #include "src/models/moss_image/model.hpp"
 #include "src/models/qwen/control_tokens.hpp"
@@ -125,6 +127,31 @@ std::vector<float> RopeTable(int height, int width, int text_length) {
   return table;
 }
 
+// Dense noncausal attention over the joint image+text sequence on the
+// MiniMax-H3 WMMA kernel (head dimension 128, head-major inputs).
+Matrix DenseAttention(Runtime& rt, const Matrix& q, const Matrix& k,
+                      const Matrix& v) {
+  const int rows = q.rows;
+  auto qh = rt.New(rows, kDim), kh = rt.New(rows, kDim), vh = rt.New(rows, kDim);
+  qwen_image_21::hip::ReorderHeads(q.data, qh.data, rows, kHeads, kHeads,
+                                   kHeadDim, false, rt.stream());
+  qwen_image_21::hip::ReorderHeads(k.data, kh.data, rows, kHeads, kHeads,
+                                   kHeadDim, false, rt.stream());
+  qwen_image_21::hip::ReorderHeads(v.data, vh.data, rows, kHeads, kHeads,
+                                   kHeadDim, false, rt.stream());
+  // Rows beyond 4096 stage the values in a packed copy.
+  const int padded = (rows + 31) / 32 * 32;
+  Matrix packed;
+  if (rows > 4096)
+    packed = rt.New(padded * kHeads, kHeadDim);
+  auto out = rt.New(rows, kDim);
+  ::gufo::minimax_h3::dit_ops::LaunchWmmaAttention(
+      qh.data, kh.data, vh.data, out.data, packed.data,
+      static_cast<std::uint32_t>(rows), kHeads, rt.stream());
+  qwen_image_21::hip::Check(hipGetLastError());
+  return out;
+}
+
 Matrix Attention(Runtime& rt, const Matrix& q, const Matrix& k,
                  const Matrix& v, const std::string& p, const Matrix& rope) {
   auto qn = rt.Normalize(q.Reshape(q.rows * kHeads, kHeadDim), Norm::kRms,
@@ -174,6 +201,21 @@ Conditioning PrepareText(Runtime& rt, const Matrix& encoded, int height,
   return c;
 }
 
+// PROFILE-HACK (local only): per-category GPU time of the DiT forward.
+std::map<std::string, double> g_profile;
+template<typename F>
+auto Timed(Runtime& rt, const char* name, F&& f) {
+  static const bool on = std::getenv("MOSS_IMAGE_PROFILE") != nullptr;
+  if (!on)
+    return f();
+  rt.Synchronize();
+  const auto t0 = Clock::now();
+  auto r = f();
+  rt.Synchronize();
+  g_profile[name] += Milliseconds(t0);
+  return r;
+}
+
 // One transformer forward: [height*width, 128] latents to velocity.
 std::vector<float> Transform(Runtime& rt, const Matrix& latent,
                              const Conditioning& c, const Matrix& mod,
@@ -187,21 +229,27 @@ std::vector<float> Transform(Runtime& rt, const Matrix& latent,
       continue;
     Cancel(cancelled);
     const auto p = "transformer.layers." + std::to_string(layer);
-    const auto y = hip::ShiftScale(
-        rt, rt.Normalize(x, Norm::kRms, p + ".norm1"), mod, 0, 1);
-    const auto attention =
-        Attention(rt, rt.Linear(y, p + ".proj.q"), rt.Linear(y, p + ".proj.k"),
-                  rt.Linear(y, p + ".proj.v"), p, c.rope);
-    x = hip::GatedResidual(rt, x, rt.Linear(attention, p + ".proj.o"), mod, 2);
-    const auto y2 = hip::ShiftScale(
-        rt, rt.Normalize(x, Norm::kRms, p + ".norm2"), mod, 3, 4);
-    const auto up_gate = rt.Linear(y2, p + ".proj.ffn_up_gate");
+    const auto y = Timed(rt, "norm+mod", [&] { return hip::ShiftScale(
+        rt, rt.Normalize(x, Norm::kRms, p + ".norm1"), mod, 0, 1); });
+    const auto q = Timed(rt, "gemm.qkv", [&] { return rt.Linear(y, p + ".proj.q"); });
+    const auto k = Timed(rt, "gemm.qkv", [&] { return rt.Linear(y, p + ".proj.k"); });
+    const auto v = Timed(rt, "gemm.qkv", [&] { return rt.Linear(y, p + ".proj.v"); });
+    auto qn = Timed(rt, "qk-norm+rope", [&] {
+      auto a = rt.Normalize(q.Reshape(q.rows * kHeads, kHeadDim), Norm::kRms, p + ".q_norm").Reshape(q.rows, kDim);
+      return rt.Rope(a, kHeads, kHeadDim, c.rope, 2); });
+    auto kn = Timed(rt, "qk-norm+rope", [&] {
+      auto a = rt.Normalize(k.Reshape(k.rows * kHeads, kHeadDim), Norm::kRms, p + ".k_norm").Reshape(k.rows, kDim);
+      return rt.Rope(a, kHeads, kHeadDim, c.rope, 2); });
+    const auto attention = Timed(rt, "attention", [&] { return DenseAttention(rt, qn, kn, v); });
+    const auto o = Timed(rt, "gemm.o", [&] { return rt.Linear(attention, p + ".proj.o"); });
+    x = Timed(rt, "residual", [&] { return hip::GatedResidual(rt, x, o, mod, 2); });
+    const auto y2 = Timed(rt, "norm+mod", [&] { return hip::ShiftScale(
+        rt, rt.Normalize(x, Norm::kRms, p + ".norm2"), mod, 3, 4); });
+    const auto up_gate = Timed(rt, "gemm.up_gate", [&] { return rt.Linear(y2, p + ".proj.ffn_up_gate"); });
     const int ffn = up_gate.cols / 2;
-    x = hip::GatedResidual(
-        rt, x,
-        rt.Linear(hip::Situ(rt, up_gate, 0, up_gate, ffn, ffn),
-                  p + ".proj.ffn_down"),
-        mod, 5);
+    const auto act = Timed(rt, "situ", [&] { return hip::Situ(rt, up_gate, 0, up_gate, ffn, ffn); });
+    const auto down = Timed(rt, "gemm.down", [&] { return rt.Linear(act, p + ".proj.ffn_down"); });
+    x = Timed(rt, "residual", [&] { return hip::GatedResidual(rt, x, down, mod, 5); });
     rt.Observe(observer, tag + ".block." + std::to_string(layer), x);
   }
   auto out = hip::ShiftScale(
@@ -458,6 +506,8 @@ Result Model::Generate(const Request& request,
     }
     rt.Synchronize();
     result.metrics.denoise_ms = Milliseconds(denoise_start);
+    for (const auto& [name, ms] : g_profile)
+      std::fprintf(stderr, "profile %-14s %9.1f ms\n", name.c_str(), ms);
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
