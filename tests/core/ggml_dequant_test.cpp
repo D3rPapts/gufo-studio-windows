@@ -284,7 +284,13 @@ void TestQ5_K() {
       gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kQ8_0, 32) != 34 ||
       gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kF32, 8) != 32 ||
       gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kBF16, 8) != 16 ||
-      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kQ8_K, 256) != 292) {
+      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kQ8_K, 256) != 292 ||
+      // Routed-expert formats of the unsloth UD-Q3_K_XL Flash-Next GGUF.
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ3_XXS, 512) !=
+          196 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ4_XS, 256) !=
+          136 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ4_NL, 64) != 36) {
     std::cerr << "Assertion failed: QuantizedRowBytes contract\n";
     std::exit(1);
   }
