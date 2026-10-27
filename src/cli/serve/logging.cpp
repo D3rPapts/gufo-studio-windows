@@ -163,10 +163,21 @@ void Logger::LogFormatted(LogLevel level, std::string_view component,
 }
 
 std::string Logger::MemoryStatus() {
+  // Linux refines both fields from /proc (MemAvailable counts reclaimable
+  // cache; sysconf-based queries do not). Windows has no /proc, so the reads
+  // return nothing and the platform leaf answers instead.
+  const std::size_t rss_kib = ReadMemoryKiB("/proc/self/status", "VmRSS:");
+  const std::size_t available_kib =
+      ReadMemoryKiB("/proc/meminfo", "MemAvailable:");
+  const auto memory = platform::QueryHostMemory();
+  const std::uint64_t rss =
+      rss_kib != 0 ? rss_kib : platform::ProcessResidentBytes() / 1024;
+  const std::uint64_t available =
+      available_kib != 0 ? available_kib
+                         : (memory ? memory->available_bytes / 1024 : 0);
   std::ostringstream output;
-  output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
-         << " host_available_mib="
-         << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+  output << "rss_mib=" << rss / 1024
+         << " host_available_mib=" << available / 1024;
   return output.str();
 }
 

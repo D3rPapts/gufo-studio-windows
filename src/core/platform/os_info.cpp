@@ -18,6 +18,9 @@
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+
+#include <fstream>
+#include <sstream>
 #endif
 
 namespace gufo::platform {
@@ -166,6 +169,27 @@ std::optional<HostMemory> QueryHostMemory() {
     return std::nullopt;
   return HostMemory{static_cast<std::uint64_t>(pages) * page_size,
                     AvailableMemoryBytes()};
+#endif
+}
+
+std::uint64_t ProcessResidentBytes() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  counters.cb = sizeof(counters);
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+    return 0;
+  return counters.WorkingSetSize;
+#else
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (!line.starts_with("VmRSS:"))
+      continue;
+    std::istringstream fields(line.substr(sizeof("VmRSS:") - 1));
+    std::uint64_t kib = 0;
+    if (fields >> kib)
+      return kib * 1024;
+  }
+  return 0;
 #endif
 }
 

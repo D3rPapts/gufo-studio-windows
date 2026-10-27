@@ -64,6 +64,10 @@ struct HostMemory {
 /// Returns nullopt when the OS cannot report its memory.
 std::optional<HostMemory> QueryHostMemory();
 
+/// Resident bytes of this process. Windows reports the working set; Linux
+/// reports VmRSS. Returns 0 when the OS cannot answer.
+std::uint64_t ProcessResidentBytes();
+
 /// Fills `out` with the process's local calendar time for `seconds`.
 /// Returns false when the platform cannot convert the time.
 bool LocalTime(std::time_t seconds, std::tm* out) noexcept;

@@ -133,7 +133,7 @@ void DequantizeRow(GgmlType type, const void* src, float* dst,
 }
 
 struct Uploader {
-  hip::WeightUpload& stager;
+  hip::WeightUpload* stager;
   const hip::WeightAllocator* weights;
   std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
@@ -144,6 +144,9 @@ struct Uploader {
   std::string* error;
   bool ok{true};
   std::uint64_t requested{0};
+  /// The measured bytes the whole walk will request; the carveout hint in
+  /// allocation failures reports the total, not the bytes requested so far.
+  std::uint64_t planned{0};
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -162,8 +165,22 @@ struct Uploader {
     void* ptr = nullptr;
     const hipError_t status = weights->Allocate(&ptr, size + kTailMargin);
     if (status != hipSuccess) {
-      Fail("weight allocation of " + std::to_string(size) +
-           " bytes failed: " + hipGetErrorString(status));
+      std::string message = "weight allocation of " + std::to_string(size) +
+                            " bytes failed: " + hipGetErrorString(status);
+      if (weights->placement() == hip::Placement::kManaged) {
+        // Managed placement draws on the driver's shared (system) memory
+        // path, which some driver configurations reject under pressure. A
+        // BIOS carveout that fits the weights keeps them in dedicated
+        // memory instead, where this failure mode does not exist.
+        message +=
+            " (weights are in managed memory; a BIOS UMA memory "
+            "carveout of at least " +
+            std::to_string((std::max(planned, requested) +
+                            hip::kDispatchReserve + (1ull << 30)) >>
+                           30) +
+            " GiB would place them in dedicated memory)";
+      }
+      Fail(std::move(message));
       return nullptr;
     }
     allocations.push_back(ptr);
@@ -181,13 +198,12 @@ struct Uploader {
     if (!ok || Measuring()) {
       return d;
     }
-    if (!stager.Copy(t.shard, t.file_offset, t.SizeBytes(), ptr, error)) {
+    if (!stager->Copy(t.shard, t.file_offset, t.SizeBytes(), ptr, error)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + t.SizeBytes(), 0,
-                         kTailMargin, nullptr);
+    stager->ZeroTail(ptr, t.SizeBytes(), kTailMargin);
     d.data = ptr;
     d.type = t.type;
     d.cols = static_cast<std::uint32_t>(t.cols);
@@ -227,15 +243,14 @@ struct Uploader {
     }
     std::size_t offset = 0;
     for (const TensorRef* t : parts) {
-      if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
-                       static_cast<std::uint8_t*>(ptr) + offset, error)) {
+      if (!stager->Copy(t->shard, t->file_offset, t->SizeBytes(),
+                        static_cast<std::uint8_t*>(ptr) + offset, error)) {
         Fail("native stack upload failed for " + std::string(t->name));
         return DeviceTensor{};
       }
       offset += t->SizeBytes();
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
-                         nullptr);
+    stager->ZeroTail(ptr, size, kTailMargin);
     d.native_data = ptr;
     d.native_type = type;
     d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -300,7 +315,7 @@ struct Uploader {
           any_host = true;
           continue;
         }
-        if (!stager.Copy(
+        if (!stager->Copy(
                 t->shard, t->file_offset, t->SizeBytes(),
                 static_cast<std::uint8_t*>(ptr) + source.first * row_dst_bytes,
                 error)) {
@@ -360,18 +375,16 @@ struct Uploader {
         if (source.type == GgmlType::kQ8_0) {
           continue;
         }
-        if (hipMemcpy(
-                static_cast<std::uint8_t*>(ptr) + source.first * row_dst_bytes,
+        if (!stager->WriteHost(
                 staged.data() + source.first * row_dst_bytes,
-                source.rows * row_dst_bytes,
-                hipMemcpyHostToDevice) != hipSuccess) {
+                static_cast<std::uint8_t*>(ptr) + source.first * row_dst_bytes,
+                source.rows * row_dst_bytes)) {
           Fail("Q8_0 upload failed");
           return d;
         }
       }
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + dst_bytes, 0,
-                         kTailMargin, nullptr);
+    stager->ZeroTail(ptr, dst_bytes, kTailMargin);
     d.data = ptr;
     d.type = GgmlType::kQ8_0;
     d.cols = static_cast<std::uint32_t>(cols);
@@ -424,8 +437,8 @@ struct Uploader {
     }
     std::size_t offset = 0;
     for (const TensorRef* t : parts) {
-      if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
-                       static_cast<std::uint8_t*>(ptr) + offset, error)) {
+      if (!stager->Copy(t->shard, t->file_offset, t->SizeBytes(),
+                        static_cast<std::uint8_t*>(ptr) + offset, error)) {
         Fail("upload failed for " + std::string(t->name));
         return d;
       }
@@ -437,8 +450,7 @@ struct Uploader {
       return d;
     }
     conversions.push_back({ptr, half, count});
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
-                         kTailMargin, nullptr);
+    stager->ZeroTail(half, count * 2, kTailMargin);
     d.data = half;
     d.type = GgmlType::kF16;
     d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -488,8 +500,7 @@ struct Uploader {
     };
     fill(alpha, 0);
     fill(beta, alpha.rows);
-    if (hipMemcpy(ptr, staged.data(), src_bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
+    if (!stager->WriteHost(staged.data(), ptr, src_bytes)) {
       Fail("alpha/beta upload failed");
       return d;
     }
@@ -499,8 +510,7 @@ struct Uploader {
       return d;
     }
     conversions.push_back({ptr, half, count});
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
-                         kTailMargin, nullptr);
+    stager->ZeroTail(half, count * 2, kTailMargin);
     d.data = half;
     d.type = GgmlType::kF16;
     d.cols = static_cast<std::uint32_t>(cols);
@@ -530,16 +540,14 @@ struct Uploader {
     std::size_t offset = 0;
     for (const DeviceTensor* t : parts) {
       const std::size_t part = std::size_t{t->rows} * t->cols / 32 * 34;
-      if (hipMemcpyAsync(static_cast<std::uint8_t*>(ptr) + offset, t->data,
-                         part, hipMemcpyDeviceToDevice,
-                         nullptr) != hipSuccess) {
+      if (!stager->CopyBytes(static_cast<std::uint8_t*>(ptr) + offset, t->data,
+                             part)) {
         Fail("stacked copy failed");
         return d;
       }
       offset += part;
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
-                         nullptr);
+    stager->ZeroTail(ptr, size, kTailMargin);
     d.data = ptr;
     d.type = GgmlType::kQ8_0;
     d.cols = (*parts.begin())->cols;
@@ -579,13 +587,12 @@ struct Uploader {
       }
       const auto* src =
           static_cast<const std::uint8_t*>(combined.data) + part * row_bytes;
-      if (hipMemcpy2D(dst.data, row_bytes, src, 2 * row_bytes, row_bytes,
-                      t.rows, hipMemcpyDeviceToDevice) != hipSuccess ||
-          hipMemset(static_cast<std::uint8_t*>(dst.data) + part_bytes, 0,
-                    kTailMargin) != hipSuccess) {
+      if (!stager->CopyRegion(dst.data, row_bytes, src, 2 * row_bytes,
+                              row_bytes, t.rows)) {
         Fail("MTP split projection copy failed");
         return;
       }
+      stager->ZeroTail(dst.data, part_bytes, kTailMargin);
     }
     if (Measuring()) {
       return;
@@ -662,7 +669,7 @@ struct Uploader {
       // The split frees the combined buffer, so the streamed upload must be
       // complete first. This is the final layer upload; the drain costs no
       // overlap with later work.
-      if (!Measuring() && !stager.Finish(error)) {
+      if (!Measuring() && !stager->Finish(error)) {
         Fail("eh_proj upload failed" + (error != nullptr && !error->empty()
                                             ? ": " + *error
                                             : std::string()));
@@ -774,15 +781,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   const auto regions = reader.GetMappedRegions();
   const std::vector<core::GgufMappedRegion> shards(regions.begin(),
                                                    regions.end());
-  auto stager = hip::WeightUpload::Create(shards, error_msg);
-  if (!stager) {
-    return nullptr;
-  }
-  for (auto& notice : stager->TakeNotices()) {
-    server::Logger::Warn("loader", notice);
-  }
-  // Measure first: the weight placement is decided once, from the bytes this
-  // walk will request of the device heap.
+  // Measure first with no staging: the weight placement decides how the
+  // uploader writes its destinations, so nothing touches HIP before the
+  // placement is known. Measuring walk never calls the stager.
   std::uint64_t measured = 0;
   {
     std::vector<Conversion> conversions;
@@ -790,9 +791,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
-    Uploader measure{*stager,      nullptr,       conversions, allocations,
-                     bytes,        max_half_cols, max_q8_cols, shards,
-                     error_msg};
+    Uploader measure{nullptr,     nullptr, conversions,
+                     allocations, bytes,   max_half_cols,
+                     max_q8_cols, shards,  error_msg};
     (void)WalkModel(measure, w, mtp);
     if (!measure.ok) {
       return nullptr;
@@ -812,12 +813,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
         "event=weights_managed bytes=" + std::to_string(measured) +
             " the weights do not fit the device heap above its " +
             std::to_string(hip::kDispatchReserve >> 30) +
-            " GiB dispatch reserve; placing them in managed memory");
+            " GiB dispatch reserve; placing them in managed memory with host"
+            " writes");
+  }
+  const auto mode = weights.placement() == hip::Placement::kManaged
+                        ? hip::WeightUploadMode::kHostWrite
+                        : hip::WeightUploadMode::kHipCopy;
+  auto stager = hip::WeightUpload::Create(shards, error_msg, mode);
+  if (!stager) {
+    return nullptr;
+  }
+  for (auto& notice : stager->TakeNotices()) {
+    server::Logger::Warn("loader", notice);
   }
   std::vector<Conversion> conversions;
-  Uploader up{*stager,      &weights,          conversions,     m->allocations_,
-              m->bytes_,    m->max_half_cols_, m->max_q8_cols_, shards,
-              error_msg};
+  Uploader up{stager.get(),    &weights,  conversions,
+              m->allocations_, m->bytes_, m->max_half_cols_,
+              m->max_q8_cols_, shards,    error_msg};
+  up.planned = measured;
   auto uploaded = WalkModel(up, w, mtp);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

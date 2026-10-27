@@ -175,10 +175,64 @@ int main() {
                     hipMemcpyDeviceToHost) == hipSuccess,
           "download degraded-staging bytes");
   Require(actual == expected, "degraded staging moves every byte");
+  gufo::platform::UnsetEnv("GUFO_TEST_UNPINNED_STAGING");
+  gufo::platform::UnsetEnv("GUFO_TEST_SYNC_TRANSFERS");
+  upload.reset();
+
+  // Host-write staging: managed placements upload with plain host writes, so
+  // no HIP call ever touches a destination. The destination here is an
+  // ordinary host buffer, which is what host-coherent managed memory looks
+  // like to the CPU.
+  upload = WeightUpload::Create(regions, &error,
+                                gufo::hip::WeightUploadMode::kHostWrite);
+  Require(upload != nullptr, error);
+  Require(upload->HostWrite(), "host-write staging reports its mode");
+  Require(upload->TakeNotices().empty(),
+          "host-write staging records no degradation");
+  slices.clear();
+  expected.assign(guard, 0xa5);
+  slice(0, 4093, (17U << 20) + 123);
+  slice(1, 7, source[1].size() - 7);
+  std::vector<std::uint8_t> host(expected.size(), 0xa5);
+  for (const auto& s : slices) {
+    Require(upload->Copy(s.shard, s.offset, s.size, host.data() + s.destination,
+                         &error),
+            error);
+  }
+  Require(upload->Finish(&error), error);
+  Require(host == expected, "host writes move every byte");
+  // The direct write helpers share the same write path.
+  std::vector<std::uint8_t> pattern(4096);
+  for (std::size_t i = 0; i < pattern.size(); ++i)
+    pattern[i] = static_cast<std::uint8_t>(i * 31 + 7);
+  Require(upload->WriteHost(pattern.data(), host.data(), pattern.size()),
+          "WriteHost into the destination");
+  Require(std::equal(pattern.begin(), pattern.end(), host.begin()),
+          "WriteHost bytes land");
+  Require(upload->CopyBytes(host.data() + 2 * pattern.size(), host.data(),
+                            pattern.size()),
+          "CopyBytes between destinations");
+  Require(std::equal(pattern.begin(), pattern.end(),
+                     host.begin() + 2 * pattern.size()),
+          "CopyBytes bytes land");
+  // Strided rows: source rows of 16 bytes every 8 bytes (overlapping reads),
+  // written to non-overlapping destinations.
+  Require(upload->CopyRegion(host.data() + 3 * pattern.size(), 32,
+                             pattern.data(), 8, 16, 3),
+          "CopyRegion strided rows");
+  for (std::size_t row = 0; row < 3; ++row) {
+    Require(
+        std::equal(pattern.begin() + row * 8, pattern.begin() + row * 8 + 16,
+                   host.begin() + 3 * pattern.size() + row * 32),
+        "CopyRegion row content");
+  }
+  upload->ZeroTail(host.data(), 4 * pattern.size(), 256);
+  for (std::size_t i = 0; i < 256; ++i)
+    Require(host[4 * pattern.size() + i] == 0, "ZeroTail clears the margin");
 
   std::puts(
-      "PASS: byte-exact upload, EOF, guards, bounds, failed-read drain and "
-      "degraded staging");
+      "PASS: byte-exact upload, EOF, guards, bounds, failed-read drain, "
+      "degraded and host-write staging");
   for (const auto& region : regions)
     gufo::platform::CloseFile(region.file_descriptor);
 }

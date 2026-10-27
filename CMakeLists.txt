@@ -1258,6 +1258,13 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151"
       ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=0")
 
+    add_executable(hip_managed_host_write_test
+      tests/core/hip_managed_host_write_test.hip)
+    target_link_libraries(hip_managed_host_write_test PRIVATE gufo_core hip::host)
+    add_test(NAME hip_managed_host_write_test COMMAND hip_managed_host_write_test)
+    set_tests_properties(hip_managed_host_write_test PROPERTIES
+      LABELS "gpu;hip;gfx1151")
+
     add_executable(hip_weight_upload_test tests/core/hip_weight_upload_test.cpp)
     target_link_libraries(hip_weight_upload_test PRIVATE gufo_core)
     add_test(NAME hip_weight_upload_test COMMAND hip_weight_upload_test)

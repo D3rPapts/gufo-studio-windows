@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -95,6 +96,9 @@ struct WeightUpload::State {
     void* destination;
   };
 
+  explicit State(WeightUploadMode upload_mode) : mode(upload_mode) {}
+
+  WeightUploadMode mode;
   std::vector<Shard> shards;
   HostAllocations host_allocations;
   std::array<Slot, kReaders> slots{};
@@ -193,6 +197,13 @@ struct WeightUpload::State {
       platform::Advise(shard.fd, platform::AdviseHint::kDontNeed, task.offset,
                        task.size);
     }
+    if (mode == WeightUploadMode::kHostWrite) {
+      // The destination is host-coherent managed memory: a plain host copy
+      // keeps HIP's copy engine away from writing into managed allocations,
+      // which some Windows drivers reject with a context-wedging fault.
+      std::memcpy(task.destination, payload, task.size);
+      return {};
+    }
     // Without a stream (stream creation was rejected) the copy runs on the
     // blocking default stream; hipMemcpy is its synchronous spelling.
     auto status = slot.stream != nullptr
@@ -235,12 +246,14 @@ struct WeightUpload::State {
   }
 };
 
-WeightUpload::WeightUpload() : state_(std::make_unique<State>()) {}
+WeightUpload::WeightUpload(WeightUploadMode mode)
+    : state_(std::make_unique<State>(mode)) {}
 WeightUpload::~WeightUpload() = default;
 
 std::unique_ptr<WeightUpload> WeightUpload::Create(
-    std::span<const core::GgufMappedRegion> regions, std::string* error) {
-  std::unique_ptr<WeightUpload> uploader(new WeightUpload());
+    std::span<const core::GgufMappedRegion> regions, std::string* error,
+    WeightUploadMode mode) {
+  std::unique_ptr<WeightUpload> uploader(new WeightUpload(mode));
   auto& s = *uploader->state_;
   for (const auto& region : regions) {
     auto& shard = s.shards.emplace_back();
@@ -258,19 +271,29 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
   }
   // Machines can reject pinned allocations or extra streams outright (driver
   // lockable-memory policy, hardware queue caps); degrade per slot instead of
-  // failing the whole load, and record a notice the caller can log.
+  // failing the whole load, and record a notice the caller can log. A
+  // rejected call can leave the error sticky, so it is cleared before the
+  // next HIP call, and after the first rejection no further attempt is made:
+  // the policy that rejected one 16 MiB buffer or stream rejects them all.
+  const bool host_write = mode == WeightUploadMode::kHostWrite;
   std::size_t unpinned_slots = 0;
   std::size_t sync_slots = 0;
   std::string pinned_error;
   std::string stream_error;
+  bool pinned_ok = !host_write && !ForceUnpinnedStaging();
+  bool streams_ok = !host_write && !ForceSyncTransfers();
   for (std::size_t index = 0; index < s.slots.size(); ++index) {
     auto& slot = s.slots[index];
-    const auto pinned = ForceUnpinnedStaging()
-                            ? hipErrorOutOfMemory
-                            : s.host_allocations.Allocate(
-                                  &slot.buffer, kChunkBytes + kAlignment);
+    const auto pinned = pinned_ok ? s.host_allocations.Allocate(
+                                        &slot.buffer, kChunkBytes + kAlignment)
+                                  : hipErrorOutOfMemory;
     if (pinned == hipSuccess) {
       continue;
+    }
+    if (pinned_ok) {
+      pinned_ok = false;
+      // Drop the sticky error so later HIP calls see their own status.
+      (void)hipGetLastError();
     }
     // Aligned reads touch up to kChunkBytes + kAlignment bytes from the
     // aligned base, so the raw allocation carries a second kAlignment for the
@@ -286,6 +309,11 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
       return nullptr;
     }
     slot.buffer = AlignUp(slot.unpinned.get());
+    if (host_write) {
+      // Unpinned is the intended design of host-write staging, not a
+      // degradation of pinned memory.
+      continue;
+    }
     if (pinned_error.empty()) {
       pinned_error = hipGetErrorString(pinned);
     }
@@ -295,12 +323,19 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     if (slot.buffer == nullptr) {
       continue;
     }
-    const auto stream =
-        ForceSyncTransfers()
-            ? hipErrorOutOfMemory
-            : hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking);
+    const auto stream = streams_ok ? hipStreamCreateWithFlags(
+                                         &slot.stream, hipStreamNonBlocking)
+                                   : hipErrorOutOfMemory;
     if (stream != hipSuccess) {
       slot.stream = nullptr;
+      if (streams_ok) {
+        streams_ok = false;
+        (void)hipGetLastError();
+      }
+      if (host_write) {
+        // No stream is the intended design of host-write staging.
+        continue;
+      }
       if (stream_error.empty()) {
         stream_error = hipGetErrorString(stream);
       }
@@ -367,6 +402,56 @@ std::vector<std::string> WeightUpload::TakeNotices() {
   auto& s = *state_;
   std::lock_guard lock(s.mutex);
   return std::exchange(s.notices, {});
+}
+
+bool WeightUpload::HostWrite() const {
+  return state_->mode == WeightUploadMode::kHostWrite;
+}
+
+bool WeightUpload::WriteHost(const void* source, void* destination,
+                             std::size_t bytes) {
+  if (state_->mode == WeightUploadMode::kHostWrite) {
+    std::memcpy(destination, source, bytes);
+    return true;
+  }
+  return hipMemcpy(destination, source, bytes, hipMemcpyHostToDevice) ==
+         hipSuccess;
+}
+
+bool WeightUpload::CopyBytes(void* destination, const void* source,
+                             std::size_t bytes) {
+  if (state_->mode == WeightUploadMode::kHostWrite) {
+    std::memcpy(destination, source, bytes);
+    return true;
+  }
+  return hipMemcpy(destination, source, bytes, hipMemcpyDeviceToDevice) ==
+         hipSuccess;
+}
+
+bool WeightUpload::CopyRegion(void* destination, std::size_t destination_stride,
+                              const void* source, std::size_t source_stride,
+                              std::size_t width, std::size_t rows) {
+  if (state_->mode == WeightUploadMode::kHostWrite) {
+    auto* out = static_cast<std::uint8_t*>(destination);
+    const auto* in = static_cast<const std::uint8_t*>(source);
+    for (std::size_t row = 0; row < rows; ++row) {
+      std::memcpy(out + row * destination_stride, in + row * source_stride,
+                  width);
+    }
+    return true;
+  }
+  return hipMemcpy2D(destination, destination_stride, source, source_stride,
+                     width, rows, hipMemcpyDeviceToDevice) == hipSuccess;
+}
+
+void WeightUpload::ZeroTail(void* destination, std::size_t offset,
+                            std::size_t bytes) {
+  auto* out = static_cast<std::uint8_t*>(destination) + offset;
+  if (state_->mode == WeightUploadMode::kHostWrite) {
+    std::memset(out, 0, bytes);
+    return;
+  }
+  (void)hipMemsetAsync(out, 0, bytes, nullptr);
 }
 
 }  // namespace gufo::hip
