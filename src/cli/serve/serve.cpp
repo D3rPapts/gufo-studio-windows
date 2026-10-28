@@ -564,6 +564,63 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
       });
 }
 
+struct ImageOptions {
+  std::filesystem::path model;
+  std::filesystem::path text_encoder;
+  // Empty: chosen from the model directory (Qwen-Image-2.1 or MOSS-Image).
+  std::string served_model_name;
+  server::ImageLoraOptions loras;
+};
+
+void AddImageOptions(ArgParser& parser, ImageOptions* options) {
+  parser.AddOption("-m", "--model", "DIR",
+                   "Qwen-Image-2.1 or MOSS-Image Diffusers directory", "Model",
+                   &options->model);
+  parser.AddOption("", "--text-encoder", "GGUF",
+                   "MOSS-Image text encoder as GGUF (default: "
+                   "DIR/text_encoder.gguf)",
+                   "Model", &options->text_encoder);
+  parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
+                   "Model", &options->served_model_name);
+  parser.AddCustomOption(
+      "", "--lora", "NAME=PATH",
+      "Register a LoRA adapter for the Qwen-Image-2.1 transformer; requests "
+      "select it by name (repeatable)",
+      "Model",
+      [options](std::string_view, std::string_view value, std::string* err) {
+        std::string name;
+        std::string path;
+        if (!SplitNameValue(value, "--lora", &name, &path, err)) {
+          return false;
+        }
+        options->loras.files.emplace_back(std::move(name), std::move(path));
+        return true;
+      });
+  parser.AddCustomOption(
+      "", "--lora-default", "NAME:SCALE",
+      "Apply a registered --lora to requests that omit 'loras' (repeatable)",
+      "Model",
+      [options](std::string_view, std::string_view value, std::string* err) {
+        const std::size_t separator = value.rfind(':');
+        float scale = 0;
+        if (separator == std::string_view::npos || separator == 0) {
+          *err = "--lora-default expects NAME:SCALE";
+          return false;
+        }
+        const auto text = value.substr(separator + 1);
+        const auto [end, ec] =
+            std::from_chars(text.data(), text.data() + text.size(), scale);
+        if (text.empty() || ec != std::errc{} ||
+            end != text.data() + text.size()) {
+          *err = "--lora-default expects NAME:SCALE";
+          return false;
+        }
+        options->loras.defaults.push_back(
+            {std::string(value.substr(0, separator)), scale});
+        return true;
+      });
+}
+
 void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
                          std::string* served_model_name,
                          std::string* default_prompt_name) {
@@ -633,14 +690,10 @@ static bool ParseVideoLora(
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
   if (subcommand == "image") {
-    std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    ImageOptions options;
     ArgParser parser(std::string(program_name) + " serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+                     "Serve Qwen-Image-2.1 or MOSS-Image generation.");
+    AddImageOptions(parser, &options);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
@@ -1232,20 +1285,10 @@ int RunServe(std::span<const char* const> args) {
         "model=" + embeddings->model_id() + " context_tokens=" +
         std::to_string(server::EmbeddingService::kMaxInputTokens));
   } else if (subcommand == "image") {
-    std::filesystem::path model;
-    std::filesystem::path text_encoder;
-    std::string name;
+    ImageOptions options;
     ArgParser parser("gufo serve image",
                      "Serve Qwen-Image-2.1 or MOSS-Image generation.");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 or MOSS-Image Diffusers directory",
-                     "Model", &model);
-    parser.AddOption("", "--text-encoder", "GGUF",
-                     "MOSS-Image text encoder as GGUF (default: "
-                     "DIR/text_encoder.gguf)",
-                     "Model", &text_encoder);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+    AddImageOptions(parser, &options);
     // Edits accept up to 20 MiB of reference images (FilmStudio sends up to
     // 9); the 8 MiB default rejected an 8-reference keyframe with 413.
     max_request_body_bytes = 32ULL << 20;
@@ -1260,13 +1303,20 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!prepare_server_options())
       return 2;
-    if (model.empty()) {
+    if (options.model.empty()) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
+    const auto& model = options.model;
+    auto& name = options.served_model_name;
     const bool moss = models::moss_image::IsMossImageDirectory(model);
     if (name.empty())
       name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
+    if (moss && !options.loras.files.empty()) {
+      std::cerr << "Error: --lora is only supported for Qwen-Image-2.1
+";
+      return 2;
+    }
     if (validate_only)
       return 0;
     ModelLoadLog load_log(moss ? "moss_image" : "qwen_image_21", model);
@@ -1274,9 +1324,9 @@ int RunServe(std::span<const char* const> args) {
       if (moss) {
         auto moss_model = std::make_shared<models::moss_image::Model>(
             model, models::moss_image::Options{
-                       .text_encoder = text_encoder.empty()
+                       .text_encoder = options.text_encoder.empty()
                                            ? model / "text_encoder.gguf"
-                                           : text_encoder});
+                                           : options.text_encoder});
         images = std::make_shared<server::ImageService>(
             model, name,
             [moss_model](
@@ -1286,13 +1336,18 @@ int RunServe(std::span<const char* const> args) {
             });
         images->set_preview_format(server::LatentFormat::kFlux2Patched);
       } else {
-        images = std::make_shared<server::ImageService>(model, name);
+        images = std::make_shared<server::ImageService>(
+            model, name, server::ImageService::Runner{}, options.loras);
       }
     } catch (const std::exception& error) {
       std::cerr << "Error loading " << name << ": " << error.what() << '\n';
       return 1;
     }
-    load_log.Complete("model=" + name + " weights=mapped upload=on_demand");
+    std::string loaded = "model=" + options.served_model_name +
+                         " weights=mapped upload=on_demand";
+    if (!options.loras.files.empty())
+      loaded += " loras=" + std::to_string(options.loras.files.size());
+    load_log.Complete(loaded);
   } else if (subcommand == "video") {
     std::filesystem::path video_model;
     std::filesystem::path video_root = "video-jobs";
