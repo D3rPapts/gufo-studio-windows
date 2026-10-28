@@ -125,7 +125,10 @@ and the repeat runs: [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md).
 
 TheRock is AMD's ROCm build for Windows; its clang compiles Gufo, Visual
 Studio only supplies the C++ standard library and the Windows SDK. Gufo was
-built and tested with TheRock 10.0.0 only.
+built and tested with TheRock 10.0.0 only. **Do not use TheRock 10.1 or newer
+on Windows yet:** Gufo built with it runs about 50 times slower on gfx1151
+(27B decode 0.2 instead of 11.4 tok/s), and the long-running kernels make
+Windows reset the graphics driver (TDR).
 
 ## Step by step
 
