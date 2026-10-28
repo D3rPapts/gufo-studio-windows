@@ -4,6 +4,11 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
+> **Download [gufo_windows 1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0)**
+> (0.16 GB zip): text, images, speech and video from one OpenAI-compatible
+> port on Windows 11. Unpack it, edit `examples\router.ini`, run
+> `start-router.cmd`. The release notes list the 13 models tested.
+
 This is a fork of [Gufo](https://github.com/gufo-org/gufo), the local
 inference engine for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S,
 `gfx1151`). It carries the [pixmaate Windows port](https://github.com/pixmaate/gufo)
