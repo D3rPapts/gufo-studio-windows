@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "ds4_mmq.h"
+#include "src/core/platform/pages.hpp"
 #include "src/models/qwen3_omni/hip/device_buffer.hpp"
 #include "src/models/qwen3_omni/hip/thinker_kernels.hpp"
 
@@ -146,6 +147,9 @@ struct Thinker::Impl {
       layer.up_exps = Upload(source.up_exps);
       layer.down_exps = Upload(source.down_exps);
       layers.push_back(std::move(layer));
+      // The uploads above are synchronous. Drop the layer's mapped pages:
+      // Windows keeps them resident and the 21 GB GGUF fills the host.
+      gufo::platform::TrimResidentPages();
     }
     const std::size_t kv = capacity * config.KvDim();
     keys.resize(config.layers);
