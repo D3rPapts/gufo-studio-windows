@@ -43,6 +43,7 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/models/moss_image/model.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::cli {
@@ -1001,11 +1002,17 @@ int RunServe(std::span<const char* const> args) {
         std::to_string(server::EmbeddingService::kMaxInputTokens));
   } else if (subcommand == "image") {
     std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    std::filesystem::path text_encoder;
+    std::string name;
     ArgParser parser("gufo serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve Qwen-Image-2.1 or MOSS-Image generation.");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Qwen-Image-2.1 or MOSS-Image Diffusers directory",
+                     "Model", &model);
+    parser.AddOption("", "--text-encoder", "GGUF",
+                     "MOSS-Image text encoder as GGUF (default: "
+                     "DIR/text_encoder.gguf)",
+                     "Model", &text_encoder);
     parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
                      "Model", &name);
     add_server_options(parser, false);
@@ -1023,11 +1030,29 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
-    ModelLoadLog load_log("qwen_image_21", model);
+    const bool moss = models::moss_image::IsMossImageDirectory(model);
+    if (name.empty())
+      name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
+    ModelLoadLog load_log(moss ? "moss_image" : "qwen_image_21", model);
     try {
-      images = std::make_shared<server::ImageService>(model, name);
+      if (moss) {
+        auto moss_model = std::make_shared<models::moss_image::Model>(
+            model, models::moss_image::Options{
+                       .text_encoder = text_encoder.empty()
+                                           ? model / "text_encoder.gguf"
+                                           : text_encoder});
+        images = std::make_shared<server::ImageService>(
+            model, name,
+            [moss_model](
+                const server::ImageService::Request& request,
+                const server::ImageService::CancellationCheck& cancelled) {
+              return moss_model->Generate(request, cancelled);
+            });
+      } else {
+        images = std::make_shared<server::ImageService>(model, name);
+      }
     } catch (const std::exception& error) {
-      std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
+      std::cerr << "Error loading " << name << ": " << error.what() << '\n';
       return 1;
     }
     load_log.Complete("model=" + name + " weights=mapped upload=on_demand");
