@@ -94,4 +94,9 @@ void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept {
   mapping = {};
 }
 
+void TrimResidentPages() noexcept {
+  (void)SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1));
+}
+
 }  // namespace gufo::platform
