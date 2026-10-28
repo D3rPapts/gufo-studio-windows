@@ -1276,6 +1276,13 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
 
+    add_executable(minimax_h3_video_vae_bench
+      tests/models/minimax_h3_video_vae_bench.cpp)
+    target_compile_definitions(minimax_h3_video_vae_bench PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_video_vae_bench PRIVATE
+      gufo_core hip::host)
+
     add_executable(minimax_h3_keyframe_hip_test
       tests/models/minimax_h3_keyframe_hip_test.cpp)
     target_compile_definitions(minimax_h3_keyframe_hip_test PRIVATE

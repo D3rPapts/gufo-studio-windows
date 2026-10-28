@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_
 #define GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -556,6 +557,294 @@ inline void LaunchUnpackRgb(const float* projected, const std::int32_t* frames,
                      dim3(kThreads), 0, stream, projected, frames, rgb,
                      frame_count, tile_height, tile_width, output_frames);
 }
+
+// Reduced-precision block path. The residual stream, norms, biases and every
+// reduction stay F32; GEMM operands and outputs use 16-bit storage so rocBLAS
+// can take its tuned gfx1151 WMMA kernels (BF16 or FP16 in and out with F32
+// accumulation) instead of the untuned F32 fallback.
+inline constexpr int kHalfBf16 = 1;
+inline constexpr int kHalfF16 = 2;
+
+template<int kMode>
+__device__ __forceinline__ float LoadHalf(const std::uint16_t* base,
+                                          std::size_t index) {
+  const std::uint16_t bits = base[index];
+  if constexpr (kMode == kHalfBf16) {
+    return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U);
+  } else {
+    return __half2float(__ushort_as_half(bits));
+  }
+}
+
+template<int kMode>
+__device__ __forceinline__ std::uint16_t StoreHalf(float value) {
+  if constexpr (kMode == kHalfBf16) {
+    std::uint32_t bits = __float_as_uint(value);
+    bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>(bits >> 16U);
+  } else {
+    return __half_as_ushort(__float2half(value));
+  }
+}
+
+#define GUFO_H3_VAE_HALF_DISPATCH(mode, kernel, grid, block, stream, ...) \
+  do {                                                                    \
+    if ((mode) == kHalfBf16) {                                            \
+      hipLaunchKernelGGL(kernel<kHalfBf16>, grid, block, 0, stream,       \
+                         __VA_ARGS__);                                    \
+    } else {                                                              \
+      hipLaunchKernelGGL(kernel<kHalfF16>, grid, block, 0, stream,        \
+                         __VA_ARGS__);                                    \
+    }                                                                     \
+  } while (false)
+
+template<int kMode>
+__global__ void ConvertToHalfKernel(const float* input, std::uint16_t* output,
+                                    std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    output[index] = StoreHalf<kMode>(input[index]);
+  }
+}
+
+inline void LaunchConvertToHalf(const float* input, std::uint16_t* output,
+                                std::size_t elements, int mode,
+                                hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  GUFO_H3_VAE_HALF_DISPATCH(mode, ConvertToHalfKernel,
+                            dim3((elements + kThreads - 1U) / kThreads),
+                            dim3(kThreads), stream, input, output, elements);
+}
+
+template<int kMode>
+__global__ void RmsNormHalfKernel(const float* input, const float* weight,
+                                  std::uint16_t* output, std::uint32_t rows,
+                                  std::uint32_t width, float epsilon) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t row = blockIdx.x * kRowsPerBlock + wave;
+  if (row >= rows) {
+    return;
+  }
+  const std::size_t base = static_cast<std::size_t>(row) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += 32U) {
+    local = fmaf(input[base + column], input[base + column], local);
+  }
+#pragma unroll
+  for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U) {
+    local += __shfl_down(local, stride, 32);
+  }
+  const float inverse =
+      rsqrtf(__shfl(local, 0, 32) / static_cast<float>(width) + epsilon);
+  for (std::uint32_t column = lane; column < width; column += 32U) {
+    output[base + column] =
+        StoreHalf<kMode>(input[base + column] * inverse * weight[column]);
+  }
+}
+
+inline void LaunchRmsNormHalf(const float* input, const float* weight,
+                              std::uint16_t* output, std::uint32_t rows,
+                              std::uint32_t width, float epsilon, int mode,
+                              hipStream_t stream) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  GUFO_H3_VAE_HALF_DISPATCH(mode, RmsNormHalfKernel,
+                            dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock),
+                            dim3(kRowsPerBlock * 32U), stream, input, weight,
+                            output, rows, width, epsilon);
+}
+
+template<int kMode>
+__global__ void VideoQkvRopeHalfKernel(const std::uint16_t* qkv,
+                                       const float* bias, const float* cosine,
+                                       const float* sine, std::uint16_t* query,
+                                       std::uint16_t* key, std::uint16_t* value,
+                                       std::uint32_t rows, std::uint32_t heads,
+                                       std::uint32_t head_dimension,
+                                       std::uint32_t rope_half, float epsilon) {
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || head >= heads || lane >= head_dimension) {
+    return;
+  }
+  const std::size_t base =
+      (static_cast<std::size_t>(row) * heads + head) * head_dimension * 3U;
+  const std::size_t bias_base =
+      static_cast<std::size_t>(head) * head_dimension * 3U;
+  const float query_value =
+      LoadHalf<kMode>(qkv, base + lane) + bias[bias_base + lane];
+  const float key_value = LoadHalf<kMode>(qkv, base + head_dimension + lane) +
+                          bias[bias_base + head_dimension + lane];
+  __shared__ float query_squares[64];
+  __shared__ float key_squares[64];
+  __shared__ float query_values[64];
+  __shared__ float key_values[64];
+  query_squares[lane] = query_value * query_value;
+  key_squares[lane] = key_value * key_value;
+  query_values[lane] = query_value;
+  key_values[lane] = key_value;
+  __syncthreads();
+  for (std::uint32_t stride = head_dimension / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      query_squares[lane] += query_squares[lane + stride];
+      key_squares[lane] += key_squares[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float query_inverse =
+      rsqrtf(query_squares[0] / static_cast<float>(head_dimension) + epsilon);
+  const float key_inverse =
+      rsqrtf(key_squares[0] / static_cast<float>(head_dimension) + epsilon);
+  float transformed_query = query_value * query_inverse;
+  float transformed_key = key_value * key_inverse;
+  if (lane < rope_half) {
+    const std::uint32_t pair = lane + rope_half;
+    const float pair_query = query_values[pair] * query_inverse;
+    const float pair_key = key_values[pair] * key_inverse;
+    const float c = cosine[static_cast<std::size_t>(row) * rope_half + lane];
+    const float s = sine[static_cast<std::size_t>(row) * rope_half + lane];
+    transformed_query = transformed_query * c - pair_query * s;
+    transformed_key = transformed_key * c - pair_key * s;
+  } else if (lane < rope_half * 2U) {
+    const std::uint32_t pair = lane - rope_half;
+    const float pair_query = query_values[pair] * query_inverse;
+    const float pair_key = key_values[pair] * key_inverse;
+    const float c = cosine[static_cast<std::size_t>(row) * rope_half + pair];
+    const float s = sine[static_cast<std::size_t>(row) * rope_half + pair];
+    transformed_query = transformed_query * c + pair_query * s;
+    transformed_key = transformed_key * c + pair_key * s;
+  }
+  const std::size_t output =
+      (static_cast<std::size_t>(row) * heads + head) * head_dimension + lane;
+  query[output] = StoreHalf<kMode>(transformed_query);
+  key[output] = StoreHalf<kMode>(transformed_key);
+  value[output] =
+      StoreHalf<kMode>(LoadHalf<kMode>(qkv, base + head_dimension * 2U + lane) +
+                       bias[bias_base + head_dimension * 2U + lane]);
+}
+
+inline void LaunchVideoQkvRopeHalf(const std::uint16_t* qkv, const float* bias,
+                                   const float* cosine, const float* sine,
+                                   std::uint16_t* query, std::uint16_t* key,
+                                   std::uint16_t* value, std::uint32_t rows,
+                                   std::uint32_t heads,
+                                   std::uint32_t head_dimension,
+                                   std::uint32_t rope_half, float epsilon,
+                                   int mode, hipStream_t stream) {
+  GUFO_H3_VAE_HALF_DISPATCH(mode, VideoQkvRopeHalfKernel, dim3(heads, rows),
+                            dim3(head_dimension), stream, qkv, bias, cosine,
+                            sine, query, key, value, rows, heads,
+                            head_dimension, rope_half, epsilon);
+}
+
+// One wave per score row. The row (at most 32 * kCached keys) stays in
+// registers, so the scores are read once and the probabilities written once.
+template<int kMode>
+__global__ void SoftmaxHalfInPlaceKernel(std::uint16_t* scores,
+                                         std::uint32_t rows,
+                                         std::uint32_t heads) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  constexpr std::uint32_t kCached = 64;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t query_row = blockIdx.x * kRowsPerBlock + wave;
+  const std::uint32_t head = blockIdx.y;
+  if (query_row >= rows || head >= heads) {
+    return;
+  }
+  const std::size_t base =
+      (static_cast<std::size_t>(head) * rows + query_row) * rows;
+  float cached[kCached];
+  float local_maximum = -INFINITY;
+#pragma unroll
+  for (std::uint32_t item = 0; item < kCached; ++item) {
+    const std::uint32_t key_row = lane + item * 32U;
+    cached[item] =
+        key_row < rows ? LoadHalf<kMode>(scores, base + key_row) : -INFINITY;
+    local_maximum = fmaxf(local_maximum, cached[item]);
+  }
+  const float maximum = SoftmaxWaveMaximum(local_maximum);
+  float local_sum = 0.0F;
+#pragma unroll
+  for (std::uint32_t item = 0; item < kCached; ++item) {
+    cached[item] = expf(cached[item] - maximum);
+    local_sum += cached[item];
+  }
+  const float inverse_sum = 1.0F / SoftmaxWaveSum(local_sum);
+#pragma unroll
+  for (std::uint32_t item = 0; item < kCached; ++item) {
+    const std::uint32_t key_row = lane + item * 32U;
+    if (key_row < rows) {
+      scores[base + key_row] = StoreHalf<kMode>(cached[item] * inverse_sum);
+    }
+  }
+}
+
+inline constexpr std::uint32_t kSoftmaxHalfMaximumRows = 64U * 32U;
+
+inline void LaunchSoftmaxHalfInPlace(std::uint16_t* scores, std::uint32_t rows,
+                                     std::uint32_t heads, int mode,
+                                     hipStream_t stream) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  GUFO_H3_VAE_HALF_DISPATCH(
+      mode, SoftmaxHalfInPlaceKernel,
+      dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock, heads), dim3(256),
+      stream, scores, rows, heads);
+}
+
+template<int kMode>
+__global__ void SwiGluHalfKernel(const std::uint16_t* fused, const float* bias,
+                                 std::uint16_t* output, std::uint32_t rows,
+                                 std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    const std::size_t base = static_cast<std::size_t>(row) * width * 2U;
+    const float gate = LoadHalf<kMode>(fused, base + column) + bias[column];
+    const float up =
+        LoadHalf<kMode>(fused, base + width + column) + bias[width + column];
+    output[static_cast<std::size_t>(row) * width + column] =
+        StoreHalf<kMode>((gate / (1.0F + expf(-gate))) * up);
+  }
+}
+
+inline void LaunchSwiGluHalf(const std::uint16_t* fused, const float* bias,
+                             std::uint16_t* output, std::uint32_t rows,
+                             std::uint32_t width, int mode,
+                             hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  GUFO_H3_VAE_HALF_DISPATCH(
+      mode, SwiGluHalfKernel, dim3((width + kThreads - 1U) / kThreads, rows),
+      dim3(kThreads), stream, fused, bias, output, rows, width);
+}
+
+template<int kMode>
+__global__ void ScaleAddHalfKernel(float* residual, const std::uint16_t* branch,
+                                   const float* bias, const float* scale,
+                                   std::uint32_t rows, std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    const std::size_t index = static_cast<std::size_t>(row) * width + column;
+    const float biased = LoadHalf<kMode>(branch, index) + bias[column];
+    residual[index] = fmaf(biased, scale[column], residual[index]);
+  }
+}
+
+inline void LaunchScaleAddHalf(float* residual, const std::uint16_t* branch,
+                               const float* bias, const float* scale,
+                               std::uint32_t rows, std::uint32_t width,
+                               int mode, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  GUFO_H3_VAE_HALF_DISPATCH(
+      mode, ScaleAddHalfKernel, dim3((width + kThreads - 1U) / kThreads, rows),
+      dim3(kThreads), stream, residual, branch, bias, scale, rows, width);
+}
+
+#undef GUFO_H3_VAE_HALF_DISPATCH
 
 }  // namespace gufo::minimax_h3::video_vae_ops
 
