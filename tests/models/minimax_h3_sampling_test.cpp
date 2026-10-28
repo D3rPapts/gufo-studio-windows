@@ -1,3 +1,4 @@
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -271,6 +272,51 @@ void TestLayouts() {
     CHECK(!BuildModulationRowMap(*time_rows, -1, *layout, {}, &error)
                .has_value());
     CHECK(!BuildModulationRowMap(*time_rows, 20, *layout, {}, &error)
+               .has_value());
+  }
+
+  {
+    // FL2VA: [text | first | last | audio | video]. The last anchor sits at
+    // text + sum(all rotary spans) - 5/3, as in the reference.
+    std::string error;
+    const GenerationGeometry geometry = Geometry(256, 256, 124);
+    const std::array anchors = {gufo::minimax_h3::KeyframeAnchor::kFirst,
+                                gufo::minimax_h3::KeyframeAnchor::kLast};
+    auto layout =
+        gufo::minimax_h3::BuildKeyframeLayout(6, geometry, anchors, &error);
+    CHECK(layout.has_value());
+    if (layout.has_value()) {
+      CHECK(layout->segments.size() == 4);
+      CHECK(layout->condition_rows == 128);
+      CHECK(layout->segments[1].kind ==
+            gufo::minimax_h3::SegmentKind::kVideoCondition);
+      CHECK(layout->positions[6].temporal == 6.0);
+      CHECK(std::abs(layout->positions[6 + 64].temporal - 211.0) < 1.0e-9);
+      CHECK(layout->positions[6 + 64].height == layout->positions[6].height);
+      CHECK(layout->segments[2].begin == 6 + 128);
+      // Audio and video clocks still start after the text rows only.
+      CHECK(layout->positions[6 + 128].temporal == 6.0);
+      auto schedule = BuildServingSchedule(8, &error);
+      CHECK(schedule.has_value());
+      auto time_rows = BuildTimeRowSchedule(*schedule, &error);
+      CHECK(time_rows.has_value());
+      CHECK(!BuildModulationRowMap(*time_rows, 0, *layout, {}, &error)
+                 .has_value());
+      gufo::minimax_h3::AppendConditionTimeRow(&*time_rows);
+      CHECK(time_rows->condition_row + 1 == time_rows->time_rows);
+      auto row_map = BuildModulationRowMap(*time_rows, 3, *layout, {}, &error);
+      CHECK(row_map.has_value());
+      if (row_map.has_value()) {
+        CHECK((*row_map)[6] == time_rows->condition_row * 3);
+        CHECK((*row_map)[6 + 127] == time_rows->condition_row * 3);
+        CHECK((*row_map)[6 + 128] == time_rows->audio_rows[3] * 3 + 2);
+        CHECK(row_map->back() == time_rows->video_rows[3] * 3);
+      }
+    }
+    const std::array three = {gufo::minimax_h3::KeyframeAnchor::kFirst,
+                              gufo::minimax_h3::KeyframeAnchor::kLast,
+                              gufo::minimax_h3::KeyframeAnchor::kLast};
+    CHECK(!gufo::minimax_h3::BuildKeyframeLayout(6, geometry, three, &error)
                .has_value());
   }
 

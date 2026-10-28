@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -938,9 +939,35 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
   }
   if (options.vision_inputs || options.deepstack_inputs) {
     SetError(error,
-             "MiniMax H3 initial prompt encoder is text-only; vision and "
-             "deepstack inputs are rejected");
+             "MiniMax H3 prompt encoder takes images as vision_blocks; the "
+             "raw vision and deepstack flags are rejected");
     return false;
+  }
+  std::vector<std::array<std::uint32_t, 3>> rope_positions;
+  if (!options.vision_blocks.empty()) {
+    if (!BuildPromptRopePositions(token_ids.size(), options.vision_blocks,
+                                  &rope_positions, error)) {
+      return false;
+    }
+    for (const PromptVisionBlock& block : options.vision_blocks) {
+      const std::size_t elements = static_cast<std::size_t>(block.grid_height) *
+                                   block.grid_width * kPromptEncoderHiddenSize;
+      if (block.embedding.size() != elements ||
+          block.deepstack.size() > kVisionDeepstackLayers ||
+          std::ranges::any_of(block.deepstack,
+                              [elements](const auto& features) {
+                                return features.size() != elements;
+                              }) ||
+          std::any_of(
+              token_ids.begin() + static_cast<std::ptrdiff_t>(block.begin),
+              token_ids.begin() +
+                  static_cast<std::ptrdiff_t>(
+                      block.begin + elements / kPromptEncoderHiddenSize),
+              [](std::uint32_t token) { return token != kImagePadToken; })) {
+        SetError(error, "MiniMax H3 image block does not match its prompt");
+        return false;
+      }
+    }
   }
   for (const std::uint32_t token : token_ids) {
     if (token >= kPromptEncoderVocabularySize) {
@@ -989,10 +1016,48 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     destroy_stream();
     return false;
   }
-  ops::LaunchPrepareRope(
-      activations.rope_cosine.As<float>(), activations.rope_sine.As<float>(),
-      static_cast<std::uint32_t>(token_ids.size()), kPromptEncoderHeadDimension,
-      kRopeTheta, compute_stream);
+  if (rope_positions.empty()) {
+    ops::LaunchPrepareRope(
+        activations.rope_cosine.As<float>(), activations.rope_sine.As<float>(),
+        static_cast<std::uint32_t>(token_ids.size()),
+        kPromptEncoderHeadDimension, kRopeTheta, compute_stream);
+  } else {
+    // Qwen3-VL interleaved MRoPE (mrope_section 24/20/20): frequency j
+    // follows the height axis when j % 3 == 1 and j < 60, the width axis
+    // when j % 3 == 2 and j < 60, and the temporal axis otherwise.
+    constexpr std::size_t kHalf = kPromptEncoderHeadDimension / 2U;
+    std::vector<float> cosine(token_ids.size() * kHalf);
+    std::vector<float> sine(token_ids.size() * kHalf);
+    for (std::size_t row = 0; row < token_ids.size(); ++row) {
+      for (std::size_t j = 0; j < kHalf; ++j) {
+        const std::size_t axis = j < 60 ? j % 3U : 0U;
+        const float inverse_frequency =
+            expf(-logf(kRopeTheta) *
+                 (2.0F * static_cast<float>(j) /
+                  static_cast<float>(kPromptEncoderHeadDimension)));
+        const float angle =
+            static_cast<float>(rope_positions[row][axis]) * inverse_frequency;
+        cosine[row * kHalf + j] = std::cos(angle);
+        sine[row * kHalf + j] = std::sin(angle);
+      }
+    }
+    status = hipMemcpyAsync(activations.rope_cosine.data(), cosine.data(),
+                            cosine.size() * sizeof(float),
+                            hipMemcpyHostToDevice, compute_stream);
+    if (status == hipSuccess) {
+      status = hipMemcpyAsync(activations.rope_sine.data(), sine.data(),
+                              sine.size() * sizeof(float),
+                              hipMemcpyHostToDevice, compute_stream);
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(compute_stream);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("upload H3 multimodal rope", status));
+      destroy_stream();
+      return false;
+    }
+  }
 
   const TensorDescriptor* embedding_descriptor = RequireTensor(
       inventory, "model.language_model.embed_tokens.weight",
@@ -1032,6 +1097,55 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     return false;
   }
   embedding = {};
+  // Image-pad rows take the vision tower's embeddings instead.
+  for (const PromptVisionBlock& block : options.vision_blocks) {
+    status = hipMemcpy(activations.hidden.As<std::uint16_t>() +
+                           block.begin * kPromptEncoderHiddenSize,
+                       block.embedding.data(),
+                       block.embedding.size() * sizeof(std::uint16_t),
+                       hipMemcpyHostToDevice);
+    if (status != hipSuccess) {
+      SetError(error, HipError("H3 image embedding upload", status));
+      destroy_stream();
+      return false;
+    }
+  }
+  // Qwen3-VL deepstack: after decoder layer k (k < 3) the image rows add the
+  // k-th deepstack feature, rounded back to BF16.
+  const auto add_deepstack = [&](std::size_t layer) {
+    std::vector<std::uint16_t> rows;
+    for (const PromptVisionBlock& block : options.vision_blocks) {
+      if (layer >= block.deepstack.size()) {
+        continue;
+      }
+      const std::vector<std::uint16_t>& features = block.deepstack[layer];
+      rows.resize(features.size());
+      std::uint16_t* device = activations.hidden.As<std::uint16_t>() +
+                              block.begin * kPromptEncoderHiddenSize;
+      hipError_t copy =
+          hipMemcpy(rows.data(), device, rows.size() * sizeof(std::uint16_t),
+                    hipMemcpyDeviceToHost);
+      if (copy != hipSuccess) {
+        return copy;
+      }
+      for (std::size_t index = 0; index < rows.size(); ++index) {
+        const float sum =
+            std::bit_cast<float>(static_cast<std::uint32_t>(rows[index])
+                                 << 16U) +
+            std::bit_cast<float>(static_cast<std::uint32_t>(features[index])
+                                 << 16U);
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(sum);
+        rows[index] = static_cast<std::uint16_t>(
+            (bits + 0x7FFFU + ((bits >> 16U) & 1U)) >> 16U);
+      }
+      copy = hipMemcpy(device, rows.data(), rows.size() * sizeof(std::uint16_t),
+                       hipMemcpyHostToDevice);
+      if (copy != hipSuccess) {
+        return copy;
+      }
+    }
+    return hipSuccess;
+  };
 
   Bf16Gemm gemm;
   telemetry->peak_device_bytes = std::max<std::uint64_t>(
@@ -1102,6 +1216,20 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     }
     telemetry->total_dispatches += layer_telemetry.dispatches;
     telemetry->layers.push_back(layer_telemetry);
+    if (layer < kVisionDeepstackLayers && !options.vision_blocks.empty()) {
+      status = hipStreamSynchronize(compute_stream);
+      if (status == hipSuccess) {
+        status = add_deepstack(layer);
+      }
+      if (status != hipSuccess) {
+        if (future_valid) {
+          (void)next_future.get();
+        }
+        SetError(error, HipError("H3 deepstack injection", status));
+        destroy_stream();
+        return false;
+      }
+    }
 
     if (layer + 1 >= options.layer_count) {
       break;

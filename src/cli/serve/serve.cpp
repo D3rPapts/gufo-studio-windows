@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -531,6 +532,56 @@ void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
 
 }  // namespace
 
+// --lora NAME=PATH[,steps=N][,strength=S]: registers a transformer LoRA that
+// video requests select by name with "gufo": {"lora": NAME}.
+static bool ParseVideoLora(
+    std::string_view value,
+    std::map<std::string, server::VideoLora, std::less<>>* loras,
+    std::string* error) {
+  const std::size_t equals = value.find('=');
+  if (equals == 0 || equals == std::string_view::npos) {
+    *error = "--lora expects NAME=PATH[,steps=N][,strength=S]";
+    return false;
+  }
+  const std::string name(value.substr(0, equals));
+  std::string_view rest = value.substr(equals + 1);
+  server::VideoLora lora;
+  std::size_t comma = rest.find(',');
+  lora.path = std::filesystem::path(std::string(rest.substr(0, comma)));
+  while (comma != std::string_view::npos) {
+    rest.remove_prefix(comma + 1);
+    comma = rest.find(',');
+    const std::string_view item = rest.substr(0, comma);
+    try {
+      if (item.starts_with("steps=")) {
+        lora.steps = std::stoi(std::string(item.substr(6)));
+      } else if (item.starts_with("strength=")) {
+        lora.strength = std::stof(std::string(item.substr(9)));
+      } else {
+        throw std::invalid_argument("unknown key");
+      }
+    } catch (const std::exception&) {
+      *error = "--lora option '" + std::string(item) +
+               "' is not steps=N or strength=S";
+      return false;
+    }
+  }
+  if (lora.path.empty() || lora.steps < 0 || lora.steps > 1000 ||
+      loras->contains(name)) {
+    *error = "--lora '" + name +
+             "' needs a path, steps in 0..1000 and a "
+             "unique name";
+    return false;
+  }
+  std::error_code filesystem_error;
+  if (!std::filesystem::is_regular_file(lora.path, filesystem_error)) {
+    *error = "--lora file not found: " + lora.path.string();
+    return false;
+  }
+  loras->emplace(name, std::move(lora));
+  return true;
+}
+
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
   if (subcommand == "image") {
@@ -581,6 +632,20 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--ttl", "SEC",
                      "Completed-artifact TTL in seconds (default: 3600)",
                      "Storage", &video_ttl_seconds);
+    std::filesystem::path video_vision_projector;
+    parser.AddOption("", "--vision-projector", "GGUF",
+                     "Qwen3-VL vision tower for keyframe prompt blocks",
+                     "Model", &video_vision_projector);
+    std::map<std::string, server::VideoLora, std::less<>> video_loras;
+    parser.AddCustomOption(
+        "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
+        "Register a transformer LoRA for requests (\"gufo\":{\"lora\":NAME}); "
+        "repeatable",
+        "Model",
+        [&video_loras](std::string_view, std::string_view value,
+                       std::string* error) {
+          return ParseVideoLora(value, &video_loras, error);
+        });
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -1135,6 +1200,18 @@ int RunServe(std::span<const char* const> args) {
     video_parser.AddOption("", "--ttl", "SEC",
                            "Completed-artifact TTL in seconds", "Storage",
                            &video_ttl_seconds);
+    std::filesystem::path video_vision_projector;
+    video_parser.AddOption("", "--vision-projector", "GGUF",
+                           "Qwen3-VL vision tower for keyframe prompt blocks",
+                           "Model", &video_vision_projector);
+    std::map<std::string, server::VideoLora, std::less<>> video_loras;
+    video_parser.AddCustomOption(
+        "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
+        "Register a transformer LoRA for requests; repeatable", "Model",
+        [&video_loras](std::string_view, std::string_view value,
+                       std::string* error) {
+          return ParseVideoLora(value, &video_loras, error);
+        });
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -1176,6 +1253,8 @@ int RunServe(std::span<const char* const> args) {
             .id_factory = {},
             .now = {},
             .runner = {},
+            .loras = std::move(video_loras),
+            .vision_projector = video_vision_projector,
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling MiniMax H3 video service: "
@@ -1183,7 +1262,9 @@ int RunServe(std::span<const char* const> args) {
       return 1;
     }
     load_log.Complete(
-        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
+        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy loras=" +
+            std::to_string(video_loras.size()),
+        false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
     SpeechOptions options{.context = is_tts ? 4096U : 1024U};

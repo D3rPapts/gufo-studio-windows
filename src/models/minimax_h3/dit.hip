@@ -23,6 +23,7 @@
 #include "src/models/minimax_h3/dense.hip.hpp"
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
+#include "src/models/minimax_h3/lora.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -838,6 +839,25 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   }
   (void)hipHostFree(impl->staging);
   impl->staging = nullptr;
+  if (options.lora != nullptr) {
+    const std::array<
+        std::tuple<const char*, LoadedWeight*, std::uint64_t, std::uint64_t>, 4>
+        projections = {{
+            {"attn.qkv_proj", &impl->qkv_weight, kDitAttentionWidth * 3U,
+             kDitHiddenSize},
+            {"attn.out_proj", &impl->output_weight, kDitHiddenSize,
+             kDitAttentionWidth},
+            {"mlp.fc1", &impl->fc1_weight, kDitFeedForwardSize * 2U,
+             kDitHiddenSize},
+            {"mlp.fc2", &impl->fc2_weight, kDitHiddenSize, kDitFeedForwardSize},
+        }};
+    for (const auto& [name, weight, rows, columns] : projections) {
+      if (!MergeLoraModule(options.lora, prefix + name, weight->storage.data(),
+                           rows, columns, impl->stream, error)) {
+        return nullptr;
+      }
+    }
+  }
   if (impl->native_projections) {
     for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
                                  &impl->fc1_weight, &impl->fc2_weight}) {

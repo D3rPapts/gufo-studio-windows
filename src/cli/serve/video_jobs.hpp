@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,6 +44,20 @@ struct VideoJobRequest {
   std::string output_format{"mp4"};
   minimax_h3::GenerationParameters parameters;
   std::uint64_t seed{42};
+  // FL2VA keyframes (decoded RGB8), at most one first and one last.
+  std::vector<minimax_h3::GenerationKeyframe> keyframes;
+  // Name of a LoRA registered with the service; empty for none.
+  std::string lora;
+  std::optional<double> lora_strength;
+  // False lets a registered LoRA choose its own step count.
+  bool steps_explicit{false};
+};
+
+/// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).
+struct VideoLora {
+  std::filesystem::path path;
+  int steps{0};  // 0 keeps the preset's evaluations
+  float strength{1.0F};
 };
 
 struct VideoJobSnapshot {
@@ -80,6 +95,9 @@ struct VideoJobServiceOptions {
                      minimax_h3::GenerationProgress, void*,
                      minimax_h3::GenerationTelemetry*, std::string*)>
       runner;
+  std::map<std::string, VideoLora, std::less<>> loras;
+  // Qwen3-VL vision tower for keyframe prompt blocks; empty disables them.
+  std::filesystem::path vision_projector;
 };
 
 struct VideoJobCreateResult {

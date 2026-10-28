@@ -146,6 +146,10 @@ VideoJobServiceOptions Options(const std::filesystem::path& root,
             return runner->Run(request, cancellation, progress, progress_opaque,
                                telemetry, error);
           },
+      .loras = {{"turbo",
+                 {.path = "/private/loras/turbo.safetensors",
+                  .steps = 8,
+                  .strength = 1.0F}}},
   };
 }
 
@@ -285,9 +289,48 @@ void TestValidation(const std::filesystem::path& root) {
       service, "POST", "/v1/videos",
       R"({"model":"minimax-h3","prompt":"x","seconds":"1","input_reference":"secret.png"})");
   Check(reference.status == 400 &&
-            reference.body.find("unsupported_input_reference") !=
+            reference.body.find("invalid_input_reference") != std::string::npos,
+        "keyframes that are not images fail closed");
+
+  const HttpResponse references = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"1","references":[]})");
+  Check(references.status == 400 &&
+            references.body.find("unsupported_input_reference") !=
                 std::string::npos,
-        "future conditioning inputs fail closed");
+        "ordered Ref2VA references stay unsupported");
+
+  const HttpResponse keyframed = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"5","first_frame":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","last_frame":{"image_url":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="},"gufo":{"lora":"turbo"}})");
+  Check(keyframed.status == 202, "first and last frame request accepted");
+  runner.WaitForCalls(2);
+  const h3::GenerationRequest keyframed_generation = runner.latest();
+  Check(keyframed_generation.keyframes.size() == 2 &&
+            keyframed_generation.keyframes[0].anchor ==
+                h3::KeyframeAnchor::kFirst &&
+            keyframed_generation.keyframes[1].anchor ==
+                h3::KeyframeAnchor::kLast &&
+            keyframed_generation.keyframes[0].width == 2 &&
+            keyframed_generation.keyframes[0].rgb.size() == 12 &&
+            keyframed_generation.keyframes[0].rgb[0] == 200,
+        "API decodes first and last keyframes");
+  Check(keyframed_generation.lora_path ==
+                std::filesystem::path("/private/loras/turbo.safetensors") &&
+            keyframed_generation.parameters.evaluations == 8,
+        "registered LoRA selects its file and default steps");
+  WaitCompleted(service, CreatedId(keyframed));
+
+  const HttpResponse unknown_lora = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"lora":"/etc/passwd"}})");
+  Check(unknown_lora.status == 400, "only registered LoRA names are accepted");
+
+  const HttpResponse duplicate_first = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"5","input_reference":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="})");
+  Check(duplicate_first.status == 400,
+        "input_reference and first_frame cannot both anchor the start");
 
   const HttpResponse bad_output = Send(
       service, "POST", "/v1/videos",
@@ -363,7 +406,7 @@ void TestValidation(const std::filesystem::path& root) {
            {}, "multipart/form-data; boundary=\"gufo-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
-  runner.WaitForCalls(2);
+  runner.WaitForCalls(3);
   Check(runner.latest().parameters.preset == "fast-384",
         "multipart request preserves the selected H3 mode");
 
@@ -401,9 +444,9 @@ void TestValidation(const std::filesystem::path& root) {
       Send(service, "POST", "/v1/videos", reference_body, {},
            "multipart/form-data; boundary=gufo-openai-video-boundary");
   Check(multipart_reference.status == 400 &&
-            multipart_reference.body.find("unsupported_input_reference") !=
+            multipart_reference.body.find("invalid_input_reference") !=
                 std::string::npos,
-        "multipart first-frame conditioning remains explicit future work");
+        "multipart keyframe files must decode as images");
 
   const HttpResponse unsupported_media =
       Send(service, "POST", "/v1/videos", "model=minimax-h3", {},

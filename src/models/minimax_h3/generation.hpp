@@ -15,6 +15,7 @@
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
+#include "src/models/minimax_h3/video_vae_encoder.hpp"
 
 namespace gufo::minimax_h3 {
 
@@ -61,6 +62,15 @@ struct GenerationParameters {
     std::span<const float> video, std::span<const float> audio,
     const CancellationToken* cancellation, std::string* error = nullptr);
 
+/// An FL2VA keyframe as decoded RGB8 at its own size; generation fits it to
+/// the canvas (cover and centre crop).
+struct GenerationKeyframe {
+  KeyframeAnchor anchor{KeyframeAnchor::kFirst};
+  int width{0};
+  int height{0};
+  std::vector<std::uint8_t> rgb;
+};
+
 struct GenerationRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -70,12 +80,23 @@ struct GenerationRequest {
   std::string prompt;
   std::uint64_t seed{0};
   GenerationParameters parameters;
+  // At most one first and one last keyframe (FL2VA). Empty: text-to-video.
+  std::vector<GenerationKeyframe> keyframes;
+  // Optional transformer LoRA (original/ComfyUI layout), merged at load.
+  std::filesystem::path lora_path;
+  float lora_strength{1.0F};
+  // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
+  // blocks in the prompt. Empty: keyframes condition the latents only.
+  std::filesystem::path vision_projector;
 };
 
 struct GenerationTelemetry {
   double inventory_ms{0.0};
   double tokenizer_ms{0.0};
   double prompt_ms{0.0};
+  double keyframe_ms{0.0};
+  double vision_ms{0.0};
+  std::size_t vision_tokens{0};
   double denoiser_ms{0.0};
   double video_vae_ms{0.0};
   double first_preview_ms{0.0};
@@ -85,6 +106,9 @@ struct GenerationTelemetry {
   std::size_t prompt_tokens{0};
   InspectionTelemetry inventory;
   PromptEncoderTelemetry prompt_encoder;
+  VideoVaeEncoderTelemetry keyframe_encoder;
+  std::size_t keyframes{0};
+  std::size_t lora_modules{0};
   DenoiserTelemetry denoiser;
   VideoVaeTelemetry video_vae;
   AudioVaeTelemetry audio_vae;

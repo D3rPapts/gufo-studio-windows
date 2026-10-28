@@ -315,11 +315,14 @@ add_library(gufo_core STATIC
   "$<$<PLATFORM_ID:Windows>:src/models/minimax_h3/media_windows.cpp>"
   "$<$<NOT:$<PLATFORM_ID:Windows>>:src/models/minimax_h3/media_posix.cpp>"
   src/models/minimax_h3/prompt_encoder.cpp
+  src/models/minimax_h3/prompt_vision.cpp
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sampling.cpp
   src/models/minimax_h3/sha256.cpp
   src/models/minimax_h3/tokenizer.cpp
   src/models/minimax_h3/video_vae.cpp
+  src/models/minimax_h3/video_vae_encoder.cpp
+  src/models/minimax_h3/lora.cpp
   src/testing/compare/logit_comparator.cpp
   src/eval/dataset.cpp
   src/eval/extract.cpp
@@ -363,6 +366,8 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/prompt_encoder.hip
     src/models/minimax_h3/sampling.hip
     src/models/minimax_h3/video_vae.hip
+    src/models/minimax_h3/video_vae_encoder.hip
+    src/models/minimax_h3/lora.hip
     src/models/minimax_h3/attention.hip
     src/core/hip/snapshot_copy.hip
     src/core/hip/weight_upload.cpp
@@ -1270,6 +1275,13 @@ if (BUILD_TESTING)
     set_tests_properties(minimax_h3_video_vae_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_keyframe_hip_test
+      tests/models/minimax_h3_keyframe_hip_test.cpp)
+    target_compile_definitions(minimax_h3_keyframe_hip_test PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_keyframe_hip_test PRIVATE
+      gufo_core hip::host)
 
     add_executable(minimax_h3_audio_vae_hip_test
       tests/models/minimax_h3_audio_vae_hip_test.hip)

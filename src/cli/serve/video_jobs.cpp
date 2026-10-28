@@ -235,8 +235,14 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "inventory") {
     return scaled(1, 3);
   }
+  if (phase == "vision") {
+    return 3;
+  }
   if (phase == "prompt") {
-    return scaled(3, 10);
+    return scaled(3, 9);
+  }
+  if (phase == "keyframes") {
+    return scaled(9, 10);
   }
   if (phase == "denoiser") {
     return scaled(10, 80);
@@ -580,7 +586,9 @@ struct VideoJobService::Impl {
               job->request.parameters.preset + " size=" + job->request.size +
               " frames=" + std::to_string(job->request.parameters.frames) +
               " steps=" + std::to_string(job->request.parameters.evaluations) +
-              " seed=" + std::to_string(job->request.seed) + " " +
+              " seed=" + std::to_string(job->request.seed) + " keyframes=" +
+              std::to_string(job->request.keyframes.size()) + " lora=" +
+              (job->request.lora.empty() ? "none" : job->request.lora) + " " +
               Logger::MemoryStatus());
       minimax_h3::GenerationRequest generation{
           .model_root = options.model_root,
@@ -593,7 +601,19 @@ struct VideoJobService::Impl {
           .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
+          .keyframes = std::move(job->request.keyframes),
+          .lora_path = {},
+          .lora_strength = 1.0F,
+          .vision_projector = options.vision_projector,
       };
+      if (!job->request.lora.empty()) {
+        const VideoLora& lora = options.loras.at(job->request.lora);
+        generation.lora_path = lora.path;
+        generation.lora_strength =
+            job->request.lora_strength.has_value()
+                ? static_cast<float>(*job->request.lora_strength)
+                : lora.strength;
+      }
       {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
@@ -792,6 +812,18 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
 
   auto job = std::make_shared<Impl::Job>();
   job->request = request;
+  if (!request.lora.empty()) {
+    const auto lora = impl_->options.loras.find(request.lora);
+    if (lora == impl_->options.loras.end()) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "unknown LoRA '" + request.lora +
+                       "'; the server registers LoRAs with --lora NAME=PATH"};
+    }
+    if (!request.steps_explicit && lora->second.steps != 0) {
+      job->request.parameters.evaluations = lora->second.steps;
+    }
+  }
   job->snapshot.id = impl_->options.id_factory();
   job->snapshot.status = VideoJobStatus::kQueued;
   job->snapshot.created_at = impl_->options.now();

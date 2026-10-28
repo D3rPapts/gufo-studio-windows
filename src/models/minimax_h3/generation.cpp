@@ -7,11 +7,14 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <system_error>
 #include <utility>
 
 #include "src/core/platform/os_info.hpp"
+#include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
@@ -633,14 +636,98 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.inventory = inventory->telemetry();
   Report(progress, progress_opaque, "inventory", 1, 1);
 
+  const auto geometry = ResolveGenerationGeometry(
+      request.parameters.internal_width, request.parameters.internal_height,
+      request.parameters.frames, error);
+  if (!geometry.has_value()) {
+    return false;
+  }
+
+  // FL2VA keyframes, fitted to the canvas, in packed order (first, last).
+  std::vector<KeyframeAnchor> keyframe_anchors;
+  std::vector<std::vector<std::uint8_t>> canvases;
+  std::vector<KeyframeImage> keyframe_images;
+  {
+    std::vector<const GenerationKeyframe*> ordered;
+    for (const KeyframeAnchor anchor :
+         {KeyframeAnchor::kFirst, KeyframeAnchor::kLast}) {
+      for (const GenerationKeyframe& keyframe : request.keyframes) {
+        if (keyframe.anchor == anchor) {
+          ordered.push_back(&keyframe);
+        }
+      }
+    }
+    if (ordered.size() != request.keyframes.size() || ordered.size() > 2 ||
+        (ordered.size() == 2 && ordered[0]->anchor == ordered[1]->anchor)) {
+      SetError(error,
+               "MiniMax H3 accepts at most one first and one last "
+               "keyframe");
+      return false;
+    }
+    for (const GenerationKeyframe* keyframe : ordered) {
+      canvases.push_back(FitKeyframeToCanvas(keyframe->rgb, keyframe->width,
+                                             keyframe->height, geometry->width,
+                                             geometry->height));
+      if (canvases.back().empty()) {
+        SetError(error, "MiniMax H3 keyframe is not a valid RGB8 image");
+        return false;
+      }
+      keyframe_anchors.push_back(keyframe->anchor);
+    }
+    for (const auto& canvas : canvases) {
+      keyframe_images.push_back({.width = geometry->width,
+                                 .height = geometry->height,
+                                 .rgb = canvas});
+    }
+  }
+
+  // The FL2VA presentation: per keyframe a "<Picture i>: " label and a
+  // vision block (tagged as video for the DiT), then the prompt verbatim.
+  std::vector<PromptVisionBlock> vision_blocks;
+  if (!keyframe_images.empty() && !request.vision_projector.empty()) {
+    Report(progress, progress_opaque, "vision", 0, 1);
+    begin = Clock::now();
+    if (!EncodeKeyframeVision(request.vision_projector, keyframe_images,
+                              cancellation, &vision_blocks, error)) {
+      return false;
+    }
+    local.vision_ms = Milliseconds(begin, Clock::now());
+    Report(progress, progress_opaque, "vision", 1, 1);
+  }
   begin = Clock::now();
   Tokenizer tokenizer;
   std::vector<std::uint32_t> tokens;
+  std::vector<std::uint8_t> tags;
   if (!Tokenizer::Load(request.model_root / "FL2VA/tokenizer/tokenizer.json",
-                       &tokenizer, error) ||
-      !tokenizer.EncodePrompt(request.prompt, &tokens, error) ||
-      tokens.empty()) {
+                       &tokenizer, error)) {
     return false;
+  }
+  for (std::size_t index = 0; index < vision_blocks.size(); ++index) {
+    std::vector<std::uint32_t> label;
+    if (!tokenizer.Encode("<Picture " + std::to_string(index + 1) + ">: ",
+                          false, &label, error)) {
+      return false;
+    }
+    tokens.insert(tokens.end(), label.begin(), label.end());
+    tags.insert(tags.end(), label.size(), 1);
+    tokens.push_back(kVisionStartToken);
+    vision_blocks[index].begin = tokens.size();
+    const std::size_t rows =
+        static_cast<std::size_t>(vision_blocks[index].grid_height) *
+        vision_blocks[index].grid_width;
+    tokens.insert(tokens.end(), rows, kImagePadToken);
+    tokens.push_back(kVisionEndToken);
+    tags.insert(tags.end(), rows + 2U, 0);
+    local.vision_tokens += rows;
+  }
+  {
+    std::vector<std::uint32_t> prompt;
+    if (!tokenizer.EncodePrompt(request.prompt, &prompt, error) ||
+        prompt.empty()) {
+      return false;
+    }
+    tokens.insert(tokens.end(), prompt.begin(), prompt.end());
+    tags.insert(tags.end(), prompt.size(), 1);
   }
   local.tokenizer_ms = Milliseconds(begin, Clock::now());
   local.prompt_tokens = tokens.size();
@@ -648,19 +735,15 @@ bool GenerateTextVideo(const GenerationRequest& request,
   Report(progress, progress_opaque, "prompt", 0, 1);
   begin = Clock::now();
   PromptEmbedding embedding;
-  if (!EncodePromptLayer50(*inventory, tokens, {}, cancellation, &embedding,
-                           &local.prompt_encoder, error)) {
+  PromptEncoderOptions prompt_options;
+  prompt_options.vision_blocks = vision_blocks;
+  if (!EncodePromptLayer50(*inventory, tokens, prompt_options, cancellation,
+                           &embedding, &local.prompt_encoder, error)) {
     return false;
   }
+  vision_blocks.clear();
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
-
-  const auto geometry = ResolveGenerationGeometry(
-      request.parameters.internal_width, request.parameters.internal_height,
-      request.parameters.frames, error);
-  if (!geometry.has_value()) {
-    return false;
-  }
   const std::size_t video_elements =
       kH3VideoLatentChannels *
       static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
@@ -672,7 +755,43 @@ bool GenerateTextVideo(const GenerationRequest& request,
   if (!noise.has_value()) {
     return false;
   }
-  std::vector<std::uint8_t> tags(embedding.tokens, 1);
+  std::vector<std::vector<float>> keyframe_latents;
+  if (!keyframe_images.empty()) {
+    Report(progress, progress_opaque, "keyframes", 0, 1);
+    begin = Clock::now();
+    std::vector<KeyframeMoments> moments;
+    if (!EncodeKeyframeMoments(*inventory, keyframe_images, cancellation,
+                               &moments, &local.keyframe_encoder, error)) {
+      return false;
+    }
+    for (std::size_t index = 0; index < moments.size(); ++index) {
+      std::vector<float> latent;
+      // The posterior sample is seeded independently of the request, as in
+      // the reference; the anchor noise follows the request seed.
+      if (!BuildKeyframeConditioning(
+              *inventory, moments[index], kH3KeyframeEncodeSeed,
+              request.seed ^ (0x9E3779B97F4A7C15ULL * (index + 1U)), &latent,
+              error)) {
+        return false;
+      }
+      keyframe_latents.push_back(std::move(latent));
+    }
+    local.keyframes = keyframe_latents.size();
+    local.keyframe_ms = Milliseconds(begin, Clock::now());
+    Report(progress, progress_opaque, "keyframes", 1, 1);
+  }
+  std::shared_ptr<const LoraAdapter> lora;
+  if (!request.lora_path.empty()) {
+    lora = LoraAdapter::Open(request.lora_path, request.lora_strength, error);
+    if (lora == nullptr) {
+      return false;
+    }
+    local.lora_modules = lora->modules();
+  }
+  if (tags.size() != embedding.tokens) {
+    SetError(error, "MiniMax H3 prompt tags differ from the prompt rows");
+    return false;
+  }
   auto denoiser = DenoiserSession::Create(
       *inventory,
       {.geometry = *geometry,
@@ -680,9 +799,13 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .text_rows = embedding.tokens,
        .active_blocks = request.parameters.active_blocks,
        .reuse_interval = request.parameters.reuse_interval,
-       .row_parallel_attention = request.parameters.row_parallel_attention},
-      {.layer50 = embedding.values, .tags = tags}, cancellation,
-      &local.denoiser, error);
+       .row_parallel_attention = request.parameters.row_parallel_attention,
+       .lora = lora.get()},
+      {.layer50 = embedding.values,
+       .tags = tags,
+       .keyframe_latents = keyframe_latents,
+       .keyframe_anchors = keyframe_anchors},
+      cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;
   }
@@ -817,6 +940,15 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << telemetry.inventory.payload_bytes_read << ",\n"
          << "  \"tokenizer_ms\": " << telemetry.tokenizer_ms << ",\n"
          << "  \"prompt_ms\": " << telemetry.prompt_ms << ",\n"
+         << "  \"keyframes\": " << telemetry.keyframes << ",\n"
+         << "  \"keyframe_ms\": " << telemetry.keyframe_ms << ",\n"
+         << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
+         << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"
+         << "  \"keyframe_encoder_load_ms\": "
+         << telemetry.keyframe_encoder.load_ms << ",\n"
+         << "  \"keyframe_encoder_tiles\": " << telemetry.keyframe_encoder.tiles
+         << ",\n"
+         << "  \"lora_modules\": " << telemetry.lora_modules << ",\n"
          << "  \"prompt_weight_bytes\": " << prompt_weight_bytes << ",\n"
          << "  \"prompt_load_ms\": " << prompt_load_ms << ",\n"
          << "  \"prompt_prefetch_wait_ms\": " << prompt_prefetch_wait_ms

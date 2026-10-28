@@ -256,6 +256,13 @@ std::optional<TimeRowSchedule> BuildTimeRowSchedule(
   return rows;
 }
 
+void AppendConditionTimeRow(TimeRowSchedule* rows) noexcept {
+  if (rows != nullptr &&
+      rows->condition_row == TimeRowSchedule::kNoConditionRow) {
+    rows->condition_row = rows->time_rows++;
+  }
+}
+
 std::string_view ToString(SegmentKind kind) noexcept {
   switch (kind) {
     case SegmentKind::kText:
@@ -264,6 +271,8 @@ std::string_view ToString(SegmentKind kind) noexcept {
       return "audio";
     case SegmentKind::kVideoTarget:
       return "video";
+    case SegmentKind::kVideoCondition:
+      return "keyframe";
   }
   return "unknown";
 }
@@ -271,6 +280,12 @@ std::string_view ToString(SegmentKind kind) noexcept {
 std::optional<PackedLayout> BuildTextOnlyLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::string* error) {
+  return BuildKeyframeLayout(text_rows, geometry, {}, error);
+}
+
+std::optional<PackedLayout> BuildKeyframeLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const KeyframeAnchor> anchors, std::string* error) {
   if (text_rows == 0 || text_rows > std::numeric_limits<std::uint32_t>::max() ||
       geometry.width < kH3CanvasMultiple ||
       geometry.height < kH3CanvasMultiple ||
@@ -305,6 +320,15 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
   }
   std::size_t video_rows = 0;
   std::size_t audio_rows = 0;
+  std::size_t condition_rows = 0;
+  if (anchors.size() > 2 ||
+      !CheckedMultiply(frame_rows, anchors.size(), &condition_rows) ||
+      text_rows > std::numeric_limits<std::size_t>::max() - condition_rows) {
+    SetError(error, "MiniMax H3 accepts at most a first and a last keyframe");
+    return std::nullopt;
+  }
+  // The overflow checks below run on text plus conditioning rows.
+  text_rows += condition_rows;
   if (!CheckedMultiply(
           frame_rows,
           static_cast<std::size_t>(geometry.temporal.video_latent_frames),
@@ -320,9 +344,11 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
     SetError(error, "MiniMax H3 packed row count overflows");
     return std::nullopt;
   }
+  text_rows -= condition_rows;
 
   PackedLayout layout;
   layout.text_rows = text_rows;
+  layout.condition_rows = condition_rows;
   layout.audio_target_rows = audio_rows;
   layout.video_target_rows = video_rows;
   layout.video_latent_frames = geometry.temporal.video_latent_frames;
@@ -330,8 +356,9 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
   layout.latent_width = geometry.latent_width;
   layout.audio_latent_frames = geometry.temporal.audio_latent_frames;
   try {
-    layout.positions.reserve(text_rows + audio_rows + video_rows);
-    layout.segments.reserve(3);
+    layout.positions.reserve(text_rows + condition_rows + audio_rows +
+                             video_rows);
+    layout.segments.reserve(4);
     for (std::size_t row = 0; row < text_rows; ++row) {
       layout.positions.push_back({static_cast<double>(row), 0.0, 0.0});
     }
@@ -339,6 +366,28 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
 
     const std::vector<Position3D> frame =
         FrameGrid(geometry.latent_height, geometry.latent_width);
+    if (!anchors.empty()) {
+      // The reference anchors "last" at text + sum(all spans) - 5/3, which
+      // is not the rotary time of the last generated frame itself.
+      double spans = 0.0;
+      for (int index = 0; index < geometry.temporal.video_latent_frames;
+           ++index) {
+        spans +=
+            kFrameRescale * kFramesPerToken[static_cast<std::size_t>(index) %
+                                            kFramesPerToken.size()];
+      }
+      for (const KeyframeAnchor anchor : anchors) {
+        const double time =
+            anchor == KeyframeAnchor::kFirst
+                ? static_cast<double>(text_rows)
+                : static_cast<double>(text_rows) + spans - kFrameRescale;
+        for (const Position3D& position : frame) {
+          layout.positions.push_back({time, position.height, position.width});
+        }
+      }
+      layout.segments.push_back({text_rows, text_rows + condition_rows,
+                                 SegmentKind::kVideoCondition});
+    }
     const double low_width = frame.front().width;
     const double high_width =
         frame[static_cast<std::size_t>(geometry.latent_width / 2) - 1].width;
@@ -351,8 +400,9 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
          ++index) {
       layout.positions.push_back({cursor + index, 0.0, high_width});
     }
+    const std::size_t audio_begin = text_rows + condition_rows;
     layout.segments.push_back(
-        {text_rows, text_rows + audio_rows, SegmentKind::kAudioTarget});
+        {audio_begin, audio_begin + audio_rows, SegmentKind::kAudioTarget});
 
     double time = cursor;
     for (int index = 0; index < geometry.temporal.video_latent_frames;
@@ -363,7 +413,8 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
       time += kFrameRescale * kFramesPerToken[static_cast<std::size_t>(index) %
                                               kFramesPerToken.size()];
     }
-    layout.segments.push_back({text_rows + audio_rows, layout.positions.size(),
+    layout.segments.push_back({audio_begin + audio_rows,
+                               layout.positions.size(),
                                SegmentKind::kVideoTarget});
   } catch (const std::exception&) {
     SetError(error,
@@ -379,7 +430,8 @@ std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
   if (step < 0 ||
       static_cast<std::size_t>(step) >= time_rows.video_rows.size() ||
       time_rows.video_rows.size() != time_rows.audio_rows.size() ||
-      layout.positions.empty() || layout.segments.size() != 3 ||
+      layout.positions.empty() ||
+      layout.segments.size() != (layout.condition_rows == 0 ? 3U : 4U) ||
       (!text_tags.empty() && text_tags.size() != layout.text_rows)) {
     SetError(error, "invalid MiniMax H3 modulation row-map arguments");
     return std::nullopt;
@@ -419,6 +471,14 @@ std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
         break;
       case SegmentKind::kVideoTarget:
         time_row = time_rows.video_rows[static_cast<std::size_t>(step)];
+        modality = 0;
+        break;
+      case SegmentKind::kVideoCondition:
+        if (time_rows.condition_row == TimeRowSchedule::kNoConditionRow) {
+          SetError(error, "MiniMax H3 keyframe rows need a condition time row");
+          return std::nullopt;
+        }
+        time_row = time_rows.condition_row;
         modality = 0;
         break;
     }

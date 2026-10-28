@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_HPP_
 #define GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -19,12 +20,41 @@ inline constexpr std::size_t kPromptEncoderKeyValueHeads = 8;
 inline constexpr std::size_t kPromptEncoderHeadDimension = 128;
 inline constexpr std::size_t kPromptEncoderVocabularySize = 151936;
 
+inline constexpr std::uint32_t kVisionStartToken = 151652;
+inline constexpr std::uint32_t kVisionEndToken = 151653;
+inline constexpr std::uint32_t kImagePadToken = 151655;
+inline constexpr std::size_t kVisionDeepstackLayers = 3;
+
+/// One Qwen3-VL image block of the prompt: `rows` consecutive image-pad
+/// tokens starting at `begin`, laid out row-major over the merged
+/// grid_height x grid_width patch grid. Embeddings are BF16 rows of width
+/// kPromptEncoderHiddenSize; deepstack features are added to the same rows
+/// after decoder layers 0, 1 and 2.
+struct PromptVisionBlock {
+  std::size_t begin{0};
+  std::uint32_t grid_height{0};
+  std::uint32_t grid_width{0};
+  std::vector<std::uint16_t> embedding;
+  std::vector<std::vector<std::uint16_t>> deepstack;
+};
+
 struct PromptEncoderOptions {
   std::size_t layer_count{kPromptEncoderLayers};
   bool prefetch_layers{true};
   bool vision_inputs{false};
   bool deepstack_inputs{false};
+  // Image blocks in prompt order. Non-empty switches the rotary positions
+  // to Qwen3-VL's interleaved three-axis layout.
+  std::span<const PromptVisionBlock> vision_blocks;
 };
+
+/// Qwen3-VL rope positions (temporal, height, width) of every token: text
+/// advances all three axes together, an image block spans its grid from the
+/// current offset and the text after it resumes at max(grid) + 1.
+[[nodiscard]] bool BuildPromptRopePositions(
+    std::size_t tokens, std::span<const PromptVisionBlock> blocks,
+    std::vector<std::array<std::uint32_t, 3>>* positions,
+    std::string* error = nullptr);
 
 struct PromptEncoderLayerTelemetry {
   std::size_t layer{0};

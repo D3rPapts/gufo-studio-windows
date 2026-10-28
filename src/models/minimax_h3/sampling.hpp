@@ -18,6 +18,8 @@ inline constexpr int kH3AudioLatentFramesPerSecond = 40;
 inline constexpr int kH3VaeSpatialRatio = 16;
 inline constexpr int kH3MaximumFrames = 345;
 inline constexpr int kH3MaximumEvaluations = 1000;
+// Keyframe anchors are held just short of clean for every step.
+inline constexpr float kH3ConditionTime = 0.999F;
 
 struct TemporalShape {
   int frames{0};
@@ -55,10 +57,16 @@ struct TimeRowSchedule {
   std::vector<std::uint32_t> video_rows;
   std::vector<std::uint32_t> audio_rows;
   std::uint32_t time_rows{0};
+  // Time row of the keyframe conditioning rows (t = kH3ConditionTime), or
+  // kNoConditionRow when the request has no keyframes.
+  static constexpr std::uint32_t kNoConditionRow = 0xFFFFFFFFU;
+  std::uint32_t condition_row{kNoConditionRow};
 };
 
 [[nodiscard]] std::optional<TimeRowSchedule> BuildTimeRowSchedule(
     const SigmaSchedule& schedule, std::string* error = nullptr);
+/// Appends the constant keyframe time row after the schedule's rows.
+void AppendConditionTimeRow(TimeRowSchedule* rows) noexcept;
 
 struct Position3D {
   double temporal{0.0};
@@ -70,6 +78,13 @@ enum class SegmentKind : std::uint8_t {
   kText,
   kAudioTarget,
   kVideoTarget,
+  kVideoCondition,
+};
+
+/// Which end of the generated video an FL2VA keyframe is anchored to.
+enum class KeyframeAnchor : std::uint8_t {
+  kFirst,
+  kLast,
 };
 
 [[nodiscard]] std::string_view ToString(SegmentKind kind) noexcept;
@@ -84,6 +99,7 @@ struct PackedLayout {
   std::vector<Position3D> positions;
   std::vector<LayoutSegment> segments;
   std::size_t text_rows{0};
+  std::size_t condition_rows{0};
   std::size_t audio_target_rows{0};
   std::size_t video_target_rows{0};
   int video_latent_frames{0};
@@ -97,6 +113,12 @@ struct PackedLayout {
 [[nodiscard]] std::optional<PackedLayout> BuildTextOnlyLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::string* error = nullptr);
+/// `[text | keyframe conditions | target audio | target video]`: one latent
+/// frame of rows per anchor, in the given order, placed on the rotary time
+/// of the first or the last generated frame as in the reference.
+[[nodiscard]] std::optional<PackedLayout> BuildKeyframeLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const KeyframeAnchor> anchors, std::string* error = nullptr);
 [[nodiscard]] std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
     const TimeRowSchedule& time_rows, int step, const PackedLayout& layout,
     std::span<const std::uint8_t> text_tags = {}, std::string* error = nullptr);

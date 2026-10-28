@@ -8,6 +8,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/image.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -230,8 +232,16 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
   return boundary;
 }
 
-std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
-                                              std::string* error) {
+bool IsKeyframeField(std::string_view name) {
+  return name == "input_reference" || name == "first_frame" ||
+         name == "last_frame";
+}
+
+// Uploaded keyframe files are returned in `files`; every other part becomes a
+// string member (or the parsed `gufo` object) of the result.
+std::optional<json::Value> ParseMultipartBody(
+    const HttpRequest& request, std::map<std::string, std::string>* files,
+    std::string* error) {
   const auto boundary = MultipartBoundary(request.header("content-type"));
   if (!boundary.has_value()) {
     *error = "multipart video request has an invalid boundary";
@@ -321,7 +331,8 @@ std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
       *error = "multipart video request is missing a closing boundary";
       return std::nullopt;
     }
-    if (++fields > kMaximumMultipartFields || result.contains(field_name)) {
+    if (++fields > kMaximumMultipartFields || result.contains(field_name) ||
+        files->contains(field_name)) {
       *error = fields > kMaximumMultipartFields
                    ? "multipart video request contains too many fields"
                    : "multipart video request repeats a field";
@@ -341,6 +352,8 @@ std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
         *error = "multipart 'gufo' field must contain valid JSON";
         return std::nullopt;
       }
+    } else if (filename_present && IsKeyframeField(field_name)) {
+      (*files)[field_name] = std::string(content);
     } else {
       result[field_name] =
           filename_present ? std::string() : std::string(content);
@@ -371,19 +384,65 @@ std::optional<int> JsonFrame(const json::Value* value) {
 }
 
 bool IsUnsupportedConditioning(const json::Value& body) {
-  static constexpr std::string_view kUnsupported[] = {
-      "input_reference", "first_frame", "last_frame", "references"};
+  static constexpr std::string_view kUnsupported[] = {"references"};
   return std::ranges::any_of(kUnsupported, [&](std::string_view key) {
     return body.contains(std::string(key));
   });
 }
 
+// A keyframe is an uploaded file, a base64 data URL, raw base64, a public
+// HTTPS URL, or an object {"image_url": <string or {"url": string}>}.
+std::optional<minimax_h3::GenerationKeyframe> ReadKeyframe(
+    const json::Value* value, const std::string* file,
+    minimax_h3::KeyframeAnchor anchor, core::ImageReadBudget& budget,
+    std::string* error) {
+  try {
+    std::vector<std::uint8_t> bytes;
+    if (file != nullptr) {
+      if (file->size() > budget.remaining_bytes) {
+        throw std::invalid_argument("keyframe images exceed the size limit");
+      }
+      budget.remaining_bytes -= file->size();
+      bytes.assign(file->begin(), file->end());
+    } else {
+      const json::Value* source = value;
+      if (source != nullptr && source->is_object()) {
+        source = source->find("image_url");
+        if (source != nullptr && source->is_object()) {
+          source = source->find("url");
+        }
+      }
+      if (source == nullptr || !source->is_string() || source->str().empty()) {
+        throw std::invalid_argument(
+            "must be an image file, a data URL, base64, an HTTPS URL or "
+            "{\"image_url\": ...}");
+      }
+      const std::string& text = source->str();
+      bytes = text.starts_with("data:") || text.starts_with("https://") ||
+                      text.starts_with("http://")
+                  ? core::ReadImageUrl(text, budget)
+                  : core::ReadImageUrl("data:image/png;base64," + text, budget);
+    }
+    core::Image image = core::DecodeImage(bytes);
+    return minimax_h3::GenerationKeyframe{
+        .anchor = anchor,
+        .width = static_cast<int>(image.width),
+        .height = static_cast<int>(image.height),
+        .rgb = std::move(image.pixels),
+    };
+  } catch (const std::exception& exception) {
+    *error = exception.what();
+    return std::nullopt;
+  }
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
+  std::map<std::string, std::string> files;
   const std::string content_type = request.header("content-type");
   if (IsMultipartFormData(content_type)) {
     std::string multipart_error;
-    auto parsed = ParseMultipartBody(request, &multipart_error);
+    auto parsed = ParseMultipartBody(request, &files, &multipart_error);
     if (!parsed.has_value()) {
       return Error(400, "Bad Request", std::move(multipart_error),
                    "invalid_multipart_form");
@@ -415,7 +474,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "image and ordered-reference conditioning are not supported",
                  "unsupported_input_reference");
   }
-  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo"})) {
+  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo",
+                             "input_reference", "first_frame", "last_frame"})) {
     return Error(400, "Bad Request",
                  "request contains an unsupported video field",
                  "unsupported_field");
@@ -475,11 +535,15 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::uint64_t seed = 42;
   std::optional<int> frames;
   std::optional<int> selected_frame;
+  std::optional<int> steps;
+  std::string lora;
+  std::optional<double> lora_strength;
   bool preset_explicit = false;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
-        !HasOnlyMembers(*extension, {"preset", "seed", "frames",
-                                     "output_format", "selected_frame"})) {
+        !HasOnlyMembers(*extension,
+                        {"preset", "seed", "frames", "output_format",
+                         "selected_frame", "steps", "lora", "lora_strength"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -515,6 +579,34 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                      "invalid_frames");
       }
     }
+    if (extension->contains("steps")) {
+      steps = JsonFrame(extension->find("steps"));
+      if (!steps.has_value() || *steps < 2 ||
+          *steps > minimax_h3::kH3MaximumEvaluations) {
+        return Error(400, "Bad Request",
+                     "'gufo.steps' must be an integer in 2..1000",
+                     "invalid_steps");
+      }
+    }
+    if (extension->contains("lora")) {
+      const json::Value* value = extension->find("lora");
+      if (!value->is_string() || value->str().empty()) {
+        return Error(400, "Bad Request",
+                     "'gufo.lora' must name a LoRA the server registered",
+                     "invalid_lora");
+      }
+      lora = value->str();
+    }
+    if (extension->contains("lora_strength")) {
+      const json::Value* value = extension->find("lora_strength");
+      if (!value->is_number() || !std::isfinite(value->as_double(0.0)) ||
+          std::fabs(value->as_double(0.0)) > 4.0) {
+        return Error(400, "Bad Request",
+                     "'gufo.lora_strength' must be a number in -4..4",
+                     "invalid_lora");
+      }
+      lora_strength = value->as_double(1.0);
+    }
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
       if (!selected_frame.has_value()) {
@@ -536,6 +628,44 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request", preset_error, "invalid_preset");
   }
   parameters->frames = frames.value_or(*duration_frames);
+  if (steps.has_value()) {
+    parameters->evaluations = *steps;
+  }
+
+  // FL2VA keyframes: `input_reference` (OpenAI) and `first_frame` are the
+  // same first-frame anchor; `last_frame` anchors the end.
+  std::vector<minimax_h3::GenerationKeyframe> keyframes;
+  {
+    core::ImageReadBudget budget;
+    const auto field = [&](const char* name) -> bool {
+      return body.contains(name) || files.contains(name);
+    };
+    if (field("input_reference") && field("first_frame")) {
+      return Error(400, "Bad Request",
+                   "'input_reference' and 'first_frame' both set the first "
+                   "frame",
+                   "invalid_input_reference");
+    }
+    for (const auto& [name, anchor] :
+         {std::pair{"input_reference", minimax_h3::KeyframeAnchor::kFirst},
+          std::pair{"first_frame", minimax_h3::KeyframeAnchor::kFirst},
+          std::pair{"last_frame", minimax_h3::KeyframeAnchor::kLast}}) {
+      if (!field(name)) {
+        continue;
+      }
+      const auto file = files.find(name);
+      std::string image_error;
+      auto keyframe = ReadKeyframe(
+          body.find(name), file == files.end() ? nullptr : &file->second,
+          anchor, budget, &image_error);
+      if (!keyframe.has_value()) {
+        return Error(400, "Bad Request",
+                     "'" + std::string(name) + "' " + image_error,
+                     "invalid_input_reference");
+      }
+      keyframes.push_back(std::move(*keyframe));
+    }
+  }
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256") {
       return Error(400, "Bad Request",
@@ -575,6 +705,10 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .output_format = output_format,
       .parameters = std::move(*parameters),
       .seed = seed,
+      .keyframes = std::move(keyframes),
+      .lora = lora,
+      .lora_strength = lora_strength,
+      .steps_explicit = steps.has_value(),
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

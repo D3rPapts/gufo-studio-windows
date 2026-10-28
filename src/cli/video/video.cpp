@@ -9,12 +9,15 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/core/image.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
@@ -62,6 +65,9 @@ struct VideoOverrides {
   std::optional<int> frames, steps, blocks, reuse;
   bool no_audio = false;
   bool no_mux = false;
+  std::filesystem::path first_frame;
+  std::filesystem::path last_frame;
+  std::string lora_strength = "1";
 };
 
 void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
@@ -77,6 +83,22 @@ void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
       "Model & Output", &overrides.preset);
   parser.AddOption("", "--seed", "N", "Noise RNG seed (default: 42)",
                    "Denoising", &request.seed);
+  parser.AddOption("", "--first-frame", "IMAGE",
+                   "FL2VA: PNG/JPEG/WebP the video starts on", "Keyframes",
+                   &overrides.first_frame);
+  parser.AddOption("", "--last-frame", "IMAGE",
+                   "FL2VA: PNG/JPEG/WebP the video ends on", "Keyframes",
+                   &overrides.last_frame);
+  parser.AddOption("", "--lora", "SAFETENSORS",
+                   "Transformer LoRA merged at load (e.g. the Turbo LoRA)",
+                   "LoRA", &request.lora_path);
+  parser.AddOption("", "--vision-projector", "GGUF",
+                   "Qwen3-VL vision tower (mmproj with deepstack) for the "
+                   "keyframes' <Picture i> prompt blocks",
+                   "Keyframes", &request.vision_projector);
+  parser.AddOption("", "--lora-strength", "F",
+                   "LoRA strength multiplier (default: 1)", "LoRA",
+                   &overrides.lora_strength);
   const auto integer_override = [&](std::string_view name,
                                     std::string_view description,
                                     std::optional<int>* target) {
@@ -293,6 +315,35 @@ std::optional<VideoCliOptions> ParseVideoOptions(
     p.selected_frames = std::move(*frames);
   }
   options.request.parameters = std::move(p);
+  for (const auto& [path, anchor] :
+       {std::pair{overrides.first_frame, minimax_h3::KeyframeAnchor::kFirst},
+        std::pair{overrides.last_frame, minimax_h3::KeyframeAnchor::kLast}}) {
+    if (path.empty()) {
+      continue;
+    }
+    try {
+      core::Image image = core::DecodeImage(core::ReadImageFile(path));
+      options.request.keyframes.push_back(
+          {.anchor = anchor,
+           .width = static_cast<int>(image.width),
+           .height = static_cast<int>(image.height),
+           .rgb = std::move(image.pixels)});
+    } catch (const std::exception& exception) {
+      SetError(error, "cannot read keyframe " + path.string() + ": " +
+                          exception.what());
+      return std::nullopt;
+    }
+  }
+  try {
+    std::size_t used = 0;
+    options.request.lora_strength = std::stof(overrides.lora_strength, &used);
+    if (used != overrides.lora_strength.size()) {
+      throw std::invalid_argument("trailing characters");
+    }
+  } catch (const std::exception&) {
+    SetError(error, "--lora-strength must be a number");
+    return std::nullopt;
+  }
   if (options.request.model_root.empty() || options.request.prompt.empty()) {
     SetError(error, "MiniMax H3 video requires --model and a prompt");
     return std::nullopt;
