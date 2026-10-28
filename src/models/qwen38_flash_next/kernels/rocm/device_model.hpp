@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/platform/mapped_file.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/expert_stream.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -73,7 +75,7 @@ public:
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
       const ModelWeights& weights, const core::GgufReader& reader,
       const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, std::uint32_t expert_slots = 0);
 
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
@@ -103,6 +105,11 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// Streams the trunk's routed experts when Upload() was given expert
+  /// slots; null when every expert is resident.
+  [[nodiscard]] ExpertStream* expert_stream() const noexcept {
+    return expert_stream_.get();
+  }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
@@ -126,6 +133,8 @@ private:
   DeviceLayer mtp_;
   bool has_mtp_{false};
   std::vector<void*> allocations_;
+  std::vector<platform::PlatformFile> stream_files_;
+  std::unique_ptr<ExpertStream> expert_stream_;
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};

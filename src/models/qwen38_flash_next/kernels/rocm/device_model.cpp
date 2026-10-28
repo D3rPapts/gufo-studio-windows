@@ -1,13 +1,20 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -52,6 +59,13 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  /// Routed experts streamed from disk: each trunk layer keeps this many
+  /// expert slots on the device instead of every expert (0 keeps all).
+  std::uint32_t expert_slots{0};
+  /// Trunk layers whose experts are streamed (false for the MTP block).
+  bool stream_layer{false};
+  /// Per streamed layer: gate, up, down sources and their device pools.
+  std::vector<std::array<std::pair<TensorRef, void*>, 3>> streamed;
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -105,6 +119,99 @@ struct Uploader {
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
+    return d;
+  }
+
+  /// A Q6_K output head (unsloth UD-Q3_K_XL) has no device kernel here: the
+  /// upload requantizes it to Q8_0 once on the host, a chunk of rows at a
+  /// time (Q8_0 is finer than Q6_K, so the head loses no precision).
+  DeviceTensor CopyQ6KAsQ8(const TensorRef& t) {
+    DeviceTensor d;
+    if (t.empty() || !ok) {
+      return d;
+    }
+    const std::size_t row_blocks = t.cols / 32;
+    const std::size_t row_bytes = row_blocks * sizeof(quant::block_q8_0);
+    const std::size_t size = row_bytes * t.rows;
+    void* ptr = nullptr;
+    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name) + " (" +
+           std::to_string(size) + " bytes)");
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += size + kTailMargin;
+    const auto* src = static_cast<const std::uint8_t*>(t.data);
+    const std::size_t src_row = t.SizeBytes() / t.rows;
+    constexpr std::size_t kChunkRows = 4096;
+    std::vector<float> values(t.cols);
+    std::vector<quant::block_q8_0> host(kChunkRows * row_blocks);
+    for (std::size_t r0 = 0; r0 < t.rows; r0 += kChunkRows) {
+      const std::size_t n = std::min<std::size_t>(kChunkRows, t.rows - r0);
+      for (std::size_t r = 0; r < n; ++r) {
+        quant::DequantizeQ6_K(src + (r0 + r) * src_row, values.data(), t.cols);
+        for (std::size_t b = 0; b < row_blocks; ++b) {
+          const float* x = values.data() + b * 32;
+          float amax = 0.0f;
+          for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(x[i]));
+          }
+          const float scale = amax / 127.0f;
+          const float inverse = scale != 0.0f ? 1.0f / scale : 0.0f;
+          auto& block = host[r * row_blocks + b];
+          const __half half = __float2half(scale);
+          std::memcpy(&block.d, &half, sizeof(block.d));
+          for (int i = 0; i < 32; ++i) {
+            block.qs[i] = static_cast<std::int8_t>(std::lround(x[i] * inverse));
+          }
+        }
+      }
+      if (hipMemcpy(static_cast<std::uint8_t*>(ptr) + r0 * row_bytes,
+                    host.data(), n * row_bytes,
+                    hipMemcpyHostToDevice) != hipSuccess) {
+        Fail("upload failed for " + std::string(t.name));
+        return d;
+      }
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
+                         nullptr);
+    d.data = ptr;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = 1;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
+    return d;
+  }
+
+  /// Device pool for `expert_slots` experts of a stacked expert tensor,
+  /// laid out like the tensor itself; the stream fills it on demand.
+  DeviceTensor Pool(const TensorRef& t, void** pool) {
+    DeviceTensor d;
+    *pool = nullptr;
+    if (t.empty() || !ok)
+      return d;
+    const std::size_t size = t.SizeBytes() / t.experts * expert_slots;
+    void* ptr = nullptr;
+    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for the expert pool of " +
+           std::string(t.name));
+      return d;
+    }
+    if (Measuring())
+      return d;
+    allocations.push_back(ptr);
+    bytes += size + kTailMargin;
+    (void)hipMemsetAsync(ptr, 0, size + kTailMargin, nullptr);
+    d.data = ptr;
+    d.type = t.type;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = expert_slots;
+    *pool = ptr;
     return d;
   }
 
@@ -285,9 +392,22 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
+    if (stream_layer && expert_slots > 0) {
+      std::array<std::pair<TensorRef, void*>, 3> sources{
+          std::pair{l.ffn_gate_exps, nullptr},
+          {l.ffn_up_exps, nullptr},
+          {l.ffn_down_exps, nullptr}};
+      d.ffn_gate_exps = Pool(l.ffn_gate_exps, &sources[0].second);
+      d.ffn_up_exps = Pool(l.ffn_up_exps, &sources[1].second);
+      d.ffn_down_exps = Pool(l.ffn_down_exps, &sources[2].second);
+      for (auto& source : sources)
+        source.first.shard += shard_base;
+      streamed.push_back(sources);
+    } else {
+      d.ffn_gate_exps = Copy(l.ffn_gate_exps);
+      d.ffn_up_exps = Copy(l.ffn_up_exps);
+      d.ffn_down_exps = Copy(l.ffn_down_exps);
+    }
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -303,16 +423,20 @@ struct Uploader {
                  std::uint32_t trunk_shards) {
     Uploaded u;
     u.token_embd = Copy(w.token_embd);
-    u.output =
-        w.output.data == w.token_embd.data ? u.token_embd : Copy(w.output);
+    u.output = w.output.data == w.token_embd.data ? u.token_embd
+               : w.output.type == core::GgmlType::kQ6_K
+                   ? CopyQ6KAsQ8(w.output)
+                   : Copy(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
+    stream_layer = true;
     for (const auto& l : w.layers) {
       u.layers.push_back(Layer(l));
       if (!ok) {
         return u;
       }
     }
+    stream_layer = false;
     if (mtp != nullptr) {
       shard_base = trunk_shards;
       u.mtp = Layer(mtp->block);
@@ -324,6 +448,9 @@ struct Uploader {
 }  // namespace
 
 DeviceModel::~DeviceModel() {
+  expert_stream_.reset();
+  for (auto file : stream_files_)
+    platform::CloseFile(file);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -356,7 +483,7 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-    std::string* error_msg) {
+    std::string* error_msg, std::uint32_t expert_slots) {
   // The CPU reference also reads Q6_K, but the production embedding, dense
   // and routed kernels do not. Reject it before allocating device weights.
   const auto supported = [&](const TensorRef& t) {
@@ -370,7 +497,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
            supported(l.ffn_down_exps);
   };
-  if (!supported(w.token_embd) || !supported(w.output) ||
+  // A Q6_K output head is requantized on upload (CopyQ6KAsQ8).
+  if (!supported(w.token_embd) ||
+      (w.output.data == w.token_embd.data && !supported(w.output)) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;
@@ -404,6 +533,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager, nullptr,       conversions, allocations,
                      bytes,   max_half_cols, max_q8_cols, error_msg};
+    measure.expert_slots = expert_slots;
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -414,6 +544,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   std::vector<Conversion> conversions;
   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
               m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
+  up.expert_slots = expert_slots;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
@@ -421,7 +552,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  m->output_bytes_ =
+      uploaded.output.type == w.output.type
+          ? w.output.SizeBytes()
+          : std::size_t{uploaded.output.rows} * (uploaded.output.cols / 32) *
+                sizeof(quant::block_q8_0);
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
@@ -437,6 +572,49 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           "weight conversion failed: " + std::string(hipGetErrorString(status));
     }
     return nullptr;
+  }
+  if (expert_slots > 0) {
+    // One reopened handle per shard serves the concurrent expert reads.
+    for (const auto& shard : shards) {
+      bool direct = false;
+      auto file = platform::ReopenRandomReadFile(shard.file_descriptor, direct);
+      if (platform::FileValid(file) && direct) {
+        // Aligned direct reads are not implemented for expert slices.
+        platform::CloseFile(file);
+        file = platform::kInvalidFile;
+      }
+      if (!platform::FileValid(file))
+        file = platform::DuplicateFile(shard.file_descriptor);
+      if (!platform::FileValid(file)) {
+        if (error_msg != nullptr)
+          *error_msg = "cannot open a model shard for expert streaming";
+        return nullptr;
+      }
+      m->stream_files_.push_back(file);
+    }
+    std::vector<ExpertStream::Layer> layers;
+    for (const auto& sources : up.streamed) {
+      ExpertStream::Layer layer;
+      for (std::size_t i = 0; i < 3; ++i) {
+        const auto& [tensor, pool] = sources[i];
+        layer.tensors[i] = {m->stream_files_[tensor.shard], tensor.file_offset,
+                            tensor.SizeBytes() / tensor.experts, pool};
+      }
+      layers.push_back(layer);
+    }
+    // A verification batch routes at most kMaxStreamRows rows per layer.
+    constexpr std::uint32_t kMaxStreamRows = 8;
+    // Concurrent shard readers; NVMe drives keep more requests in flight.
+    std::uint32_t readers = 8;
+    if (const char* env = std::getenv("GUFO_FLASH_NEXT_EXPERT_READERS"))
+      readers = std::clamp<std::uint32_t>(
+          static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10)), 1, 64);
+    m->expert_stream_ = ExpertStream::Create(
+        std::move(layers), w.config.num_experts, expert_slots,
+        std::min(expert_slots, kMaxStreamRows * w.config.num_experts_used),
+        readers, error_msg);
+    if (!m->expert_stream_)
+      return nullptr;
   }
   for (const auto& c : conversions) {
     std::erase(m->allocations_, c.source);

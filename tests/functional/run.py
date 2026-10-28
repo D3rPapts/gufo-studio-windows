@@ -255,6 +255,27 @@ def image_fixture(path):
         + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
+def host_meminfo():
+    """/proc/meminfo, or its MemAvailable line from GlobalMemoryStatusEx on Windows."""
+    path = Path("/proc/meminfo")
+    if path.is_file() or os.name != "nt":
+        return path.read_text()
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                    ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
+                    ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
+                    ("avail_extended", ctypes.c_ulonglong)]
+
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return f"MemAvailable: {status.avail_phys // 1024} kB\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
@@ -428,7 +449,7 @@ def main():
     try:
         if "cache-rotation" in selected:
             from cache_rotation import check_snapshot_budget, host_available_bytes
-            available_before_load = host_available_bytes(Path("/proc/meminfo").read_text())
+            available_before_load = host_available_bytes(host_meminfo())
         startup_started = time.monotonic()
         with server(command, output / "server.log", args.startup_timeout):
             report["startup_ms"] = (time.monotonic() - startup_started) * 1000

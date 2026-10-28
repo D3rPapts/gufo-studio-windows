@@ -750,7 +750,8 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
 
 bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                         std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  // Streamed experts route through Moe(), which loads them per row slice.
+  if (rows <= kDecodeRows || model_->expert_stream() != nullptr)
     return Moe(l, x, out, rows, error);
   const auto& c = config();
   const Scratch base = s_;

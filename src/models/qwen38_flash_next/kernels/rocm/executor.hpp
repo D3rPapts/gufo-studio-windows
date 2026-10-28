@@ -551,7 +551,16 @@ private:
   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                  std::uint32_t n_tokens, std::string* error_msg) const;
+                  std::uint32_t n_tokens, std::string* error_msg,
+                  bool epilogue = true) const;
+  /// Shared-expert GEMMs of `l` into s_.shexp_out.
+  bool SharedExpert(const DeviceLayer& l, const float* x,
+                    std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Trunk layer whose routed experts are streamed from disk.
+  bool StreamedLayer(const DeviceLayer& l) const;
+  /// Prefill MoE over streamed experts in waves that fit the slots.
+  bool StreamedMoe(const DeviceLayer& l, const float* x, float* out,
+                   std::uint32_t n_tokens, std::string* error_msg) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Whether a draft of `session` requesting the small head gets it.
@@ -774,6 +783,14 @@ private:
   std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
   mutable std::uint32_t routed_n_tiles_{0};   ///< routed_tile_rows_ tiles
+  /// Expert waves: RouteHints tiles only ids below this (0 = all).
+  mutable std::uint32_t routed_expert_limit_{0};
+  /// Streamed experts: the next layer's router on this layer's input.
+  mutable float* predict_router_{nullptr};
+  mutable std::int32_t* predict_ids_{nullptr};
+  mutable std::vector<std::int32_t> stream_ids_, stream_predicted_;
+  mutable hipEvent_t ids_ready_{nullptr};
+  mutable float* predict_weights_{nullptr};
   mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
