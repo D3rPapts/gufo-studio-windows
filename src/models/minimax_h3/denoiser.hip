@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -53,6 +55,15 @@ void SetError(std::string* error, std::string message) {
 
 bool IsCancelled(const CancellationToken* cancellation) {
   return cancellation != nullptr && cancellation->IsCancelled();
+}
+
+// GUFO_H3_TRACE=1 prints denoiser setup stages to stderr.
+void Trace(const char* stage) {
+  static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
+  if (enabled) {
+    std::fprintf(stderr, "h3 trace: %s\n", stage);
+    std::fflush(stderr);
+  }
 }
 
 double Milliseconds(Clock::time_point begin, Clock::time_point end) {
@@ -1097,9 +1108,11 @@ struct DenoiserSession::Impl {
 
   bool BuildBlocks(const CancellationToken* cancellation, std::string* error) {
     DeviceBuffer time_embedding;
+    Trace("time embedding");
     if (!BuildTimeEmbedding(&time_embedding, cancellation, error)) {
       return false;
     }
+    Trace("rope");
     std::vector<std::uint16_t> rope_cos;
     std::vector<std::uint16_t> rope_sin;
     if (!BuildRope(&rope_cos, &rope_sin, error)) {
@@ -1280,6 +1293,7 @@ struct DenoiserSession::Impl {
         base_telemetry.adaln_precompute_ms +=
             Milliseconds(modulation_begin, Clock::now());
       }
+      Trace("block modulations computed");
       block0_modulation_host = ranked_modulations[0];
       const auto final_begin = Clock::now();
       if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
@@ -1290,7 +1304,9 @@ struct DenoiserSession::Impl {
       base_telemetry.adaln_precompute_ms +=
           Milliseconds(final_begin, Clock::now());
 
+      Trace("final modulation computed; waiting for core load");
       CoreLoadResult loaded = core_future.get();
+      Trace(loaded.error.empty() ? "core loaded" : loaded.error.c_str());
       const bool missing_block = std::ranges::any_of(
           loaded.sessions,
           [](const auto& session) { return session == nullptr; });
@@ -1312,6 +1328,7 @@ struct DenoiserSession::Impl {
         if (!blocks[index]->PrepareConstants(ranked_modulations[index],
                                              rope_cos, rope_sin, cancellation,
                                              error)) {
+          Trace("prepare constants failed");
           return false;
         }
         base_telemetry.core_load_ms +=
@@ -1834,9 +1851,32 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     SetError(error, HipError("create MiniMax H3 denoiser resources", status));
     return nullptr;
   }
-  if (!impl->RefineText(conditioning.layer50, cancellation, error) ||
-      !impl->BuildBlocks(cancellation, error) ||
-      !impl->LoadHeads(cancellation, error) || !impl->AllocateIo(error)) {
+  Trace("refine text");
+  if (!impl->RefineText(conditioning.layer50, cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  if (std::getenv("GUFO_H3_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "h3 trace: rows=%zu text=%zu keyframe=%zu audio=%zu "
+                 "video=%zu time_rows=%u\n",
+                 impl->layout.rows(), impl->layout.text_rows,
+                 impl->layout.condition_rows, impl->layout.audio_target_rows,
+                 impl->layout.video_target_rows, impl->time_rows.time_rows);
+  }
+  Trace("build blocks");
+  if (!impl->BuildBlocks(cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  Trace("load heads");
+  if (!impl->LoadHeads(cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  Trace("allocate io");
+  if (!impl->AllocateIo(error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
     return nullptr;
   }
   // Text refinement and modulation precomputation are complete. Inference

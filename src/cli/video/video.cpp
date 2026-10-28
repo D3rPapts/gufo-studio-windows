@@ -6,6 +6,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -417,9 +419,28 @@ int RunVideo(std::span<const char* const> args) {
   });
   CliProgress progress{&cancellation, options->profile};
   minimax_h3::GenerationTelemetry telemetry;
-  const bool generated = minimax_h3::GenerateTextVideo(
-      options->request, &cancellation, PrintProgress, &progress, &telemetry,
-      &error);
+  // Name an escaping exception instead of a bare abort.
+  std::set_terminate([] {
+    if (const std::exception_ptr current = std::current_exception()) {
+      try {
+        std::rethrow_exception(current);
+      } catch (const std::exception& exception) {
+        std::cerr << "Error: uncaught exception: " << exception.what()
+                  << std::endl;
+      } catch (...) {
+        std::cerr << "Error: uncaught non-standard exception" << std::endl;
+      }
+    }
+    std::abort();
+  });
+  bool generated = false;
+  try {
+    generated = minimax_h3::GenerateTextVideo(options->request, &cancellation,
+                                              PrintProgress, &progress,
+                                              &telemetry, &error);
+  } catch (const std::exception& exception) {
+    error = std::string("unexpected exception: ") + exception.what();
+  }
   interrupt_watcher.request_stop();
   interrupt_watcher.join();
   interrupt_guard.reset();
