@@ -11,13 +11,71 @@ onto current upstream Gufo, so Gufo builds and runs natively on Windows 11:
 no WSL, no Linux. It serves an OpenAI-compatible API, so clients written for
 llama.cpp's server or the OpenAI API work against it.
 
-**Only Qwen3.8-27B was tested here.** Everything on this page was run on one
-machine (below). Other models are compiled in but were not run; Linux users
-should use [upstream Gufo](https://github.com/gufo-org/gufo).
+The step-by-step guide below covers Qwen3.8-27B. Since then many more models
+run here on the same machine, each from its own branch. They are listed in
+[What runs here now](#what-runs-here-now-october-2026). Everything on this
+page was run on one machine (below); Linux users should use
+[upstream Gufo](https://github.com/gufo-org/gufo).
 
 The port, the fixes and the measurements were done by Claude (Anthropic,
 Claude Opus 5.5) in Claude Code, at the request of the repository owner. MIT
 licensed, like upstream.
+
+## What runs here now (October 2026)
+
+All of this runs on the 64 GB EVO-X2 below, under Windows 11, behind one
+OpenAI-compatible router on one port (one model loaded at a time). Speeds are
+single requests on this machine.
+
+| Model | What it does | Speed here | Branch |
+| --- | --- | --- | --- |
+| Qwen3.8-27B (UD-Q4_K_XL, DFlash2) | text, images in | 28-31 tok/s, prefill ~515 tok/s (table below) | `win-merge-2026-10-24`, `verify-gemm-27b` |
+| **Qwen3.8-Flash-Next on 64 GB** (UD-Q4_K_XL, 104 GB) | text, images in | 14-15 tok/s, prefill ~285 tok/s | `moe-ssd-stream` |
+| **Qwen3.8-Flash-Next UD-Q3_K_XL** (90 GB) | text | ~16 tok/s, prefill ~290 tok/s | `moe-ssd-stream` |
+| Qwen3.6-35B-A3B (Q4_K_M) | text | 70 / 62 / 53 tok/s at 0 / 8K / 32K context | `win-35b-decode-mmvq` |
+| Hemmingway-1.5 (Qwen3.8-27B fine-tune for fiction) | creative writing | ~25 tok/s | runs on the 27B build |
+| Qwen3-Omni-30B-A3B-Captioner | describes audio (speech, voices, sounds) | 47-59 tok/s | `win-main` |
+| Qwen-Image-2.1 | text to image | 1024² / 40 steps ~150 s | `fix/qwen-image-weights-from-file` |
+| MOSS-Image | text to image | 1024² / 50 steps ~200-260 s | `moss-image` |
+| **MiniMax H3** | text to video with stereo sound | 1 s ~1.5 min, 5 s ~5 min (512²) | `feat/h3-windows-media` |
+| Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, Base) | speech, designed voices, voice cloning | ~2x realtime | upstream + `feat/h3-windows-media` build |
+| Router with web pages | one port for all of the above; chat, image, voice and video pages | – | `win-router` |
+
+What made the bigger models fit on 64 GB:
+- **SSD expert streaming for Flash-Next** (`--expert-cache-bytes`): routed
+  experts live in a GPU slot cache and are read from the GGUF on a miss.
+  Without it, neither Flash-Next quant loads on a 64 GB machine.
+- **Reading weights from the file instead of a memory mapping** (Qwen-Image,
+  27B, H3 prompt encoder): Windows keeps mapped pages resident, so a 30-40 GB
+  model filled the 32 GB left to Windows.
+- **H3 on Windows:** MP4/audio muxing through FFmpeg named pipes, and rocBLAS
+  fallbacks where TheRock 10.0 lacks the pinned ROCm 10.1 solutions.
+
+Not working here: Fish Audio Drama-3 TTS (its weights alone take 39.6 GB of
+GPU memory; not yet tried on the 128 GB machine), DeepSeek V4 Flash (too
+large).
+
+### Want something from this?
+
+**Open an [issue](https://github.com/D3rPapts/gufo_windows/issues) in this
+repository** and say what you'd like to use: a model, a fix, a feature from
+one of the branches. We'll help. That can mean rebasing it onto your fork or
+branch, building it for you, or testing on our hardware (a 64 GB and a 128 GB
+Strix Halo, both under Windows 11).
+
+Already offered elsewhere:
+- Upstream: [#773](https://github.com/gufo-org/gufo/pull/773),
+  [#794](https://github.com/gufo-org/gufo/pull/794),
+  [#795](https://github.com/gufo-org/gufo/pull/795),
+  [#796](https://github.com/gufo-org/gufo/pull/796) merged;
+  [#810](https://github.com/gufo-org/gufo/pull/810) (model-bench on Windows),
+  [#822](https://github.com/gufo-org/gufo/pull/822) (27B verify GEMMs),
+  [#830](https://github.com/gufo-org/gufo/pull/830) (Qwen-Image loading),
+  [#856](https://github.com/gufo-org/gufo/pull/856) (H3 on Windows) open.
+- [endyjasmi/gufo#35](https://github.com/endyjasmi/gufo/pull/35): SSD
+  expert streaming and UD-Q3_K_XL for the Windows port.
+- [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1): faster
+  Qwen3.6-35B-A3B decode.
 
 ## What was tested
 
@@ -218,8 +276,9 @@ for the numbers.
 
 ## Not tested here
 
-- Qwen3.8-Flash-Next, DeepSeek V4 Flash, Qwen3.6-35B-A3B, audio, image and
-  video models (compiled into `gufo.exe`, never run on this machine).
+- On this `main` branch: anything but Qwen3.8-27B. The other models in
+  [What runs here now](#what-runs-here-now-october-2026) were tested on their
+  branches. DeepSeek V4 Flash and Qwen3-ASR were never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
 - Concurrent requests; the EVO-X2's high-performance mode and Windows power mode "Best performance".
