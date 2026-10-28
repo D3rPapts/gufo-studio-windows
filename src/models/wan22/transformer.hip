@@ -25,6 +25,9 @@ constexpr int kHeads = 24;
 constexpr int kHeadDim = 128;
 constexpr int kWidth = Transformer::kModelWidth;
 constexpr int kFeedForward = 14336;
+// Tokens per feed-forward pass: bounds the [tokens, 14336] hidden buffer
+// (GEMM launches are split into 4096-row chunks anyway).
+constexpr int kFeedForwardChunk = 8192;
 constexpr int kChannels = Transformer::kChannels;
 constexpr int kPatchValues = kChannels * 4;  // patch 1 x 2 x 2
 constexpr int kFrequencies = 256;
@@ -454,6 +457,20 @@ struct Transformer::Impl {
   bool Reserve(int tokens, int text_rows, int unique, std::string* error);
   bool Download(const void* device, bool bf16, std::size_t count,
                 std::vector<float>* out, std::string* error);
+  // Uploads `text` [rows, 4096] as BF16 into text_in and runs the text
+  // embedding into text_states.
+  bool EmbedText(std::span<const float> text, int rows, std::string* error);
+  // Cross-attention keys (normalized, head-major) and packed values of one
+  // block for the rows in text_states.
+  bool CrossKeysValues(const Block& b, int rows, std::uint16_t* key,
+                       std::uint16_t* packed_values, std::string* error);
+
+  struct TextCache {
+    int rows{0};
+    DeviceBuffer key;     // [layers][heads][rows][128]
+    DeviceBuffer packed;  // [layers] x packed values (PaddedRows(rows))
+  };
+  TextCache text_cache[kTextSlots];
 
   std::vector<platform::PlatformFile> shards;
   std::map<std::string, TensorLocation, std::less<>> tensors;
@@ -470,12 +487,13 @@ struct Transformer::Impl {
   int reserved_text{0};
   int reserved_unique{0};
   DeviceBuffer latent, patches;
-  DeviceBuffer hidden;  // FP32 residual stream [T, W]
-  DeviceBuffer normed;  // BF16 [T, W]
-  DeviceBuffer acc;     // BF16 linear outputs [T, max(3W, F)]
+  DeviceBuffer hidden;                     // FP32 residual stream [T, W]
+  DeviceBuffer normed;                     // BF16 [T, W]
+  DeviceBuffer acc;                        // BF16 linear outputs [T, 3W]
   DeviceBuffer query, key, value, packed;  // head-major BF16
   DeviceBuffer attention;                  // BF16 [T, W]
-  DeviceBuffer gelu;                       // BF16 [T, F]
+  DeviceBuffer ffn;  // BF16 [min(T, kFeedForwardChunk), F] hidden of the FFN
+  int rope_frames{0}, rope_height{0}, rope_width{0};  // geometry of `rope`
   DeviceBuffer text_in, text_hidden, text_states, text_acc;
   DeviceBuffer text_key, text_value, text_packed;
   DeviceBuffer rope;         // float2 [T, 64]
@@ -691,13 +709,14 @@ bool Transformer::Impl::Reserve(int tokens, int text_rows, int unique,
     activation_bytes += bytes;
     return buffer.Allocate(bytes, error);
   };
+  rope_frames = rope_height = rope_width = 0;
   if (!allocate(latent, T * kPatchValues * 4) ||
       !allocate(patches, T * kPatchValues * 2) ||
       !allocate(hidden, T * W * 4) || !allocate(normed, T * W * 2) ||
-      !allocate(acc, T * std::max<std::size_t>(3 * W, F) * 2) ||
-      !allocate(query, T * W * 2) || !allocate(key, T * W * 2) ||
-      !allocate(value, T * W * 2) || !allocate(packed, TP * W * 2) ||
-      !allocate(attention, T * W * 2) || !allocate(gelu, T * F * 2) ||
+      !allocate(acc, T * 3 * W * 2) || !allocate(query, T * W * 2) ||
+      !allocate(key, T * W * 2) || !allocate(value, T * W * 2) ||
+      !allocate(packed, TP * W * 2) || !allocate(attention, T * W * 2) ||
+      !allocate(ffn, std::min<std::size_t>(T, kFeedForwardChunk) * F * 2) ||
       !allocate(text_in, L * kTextWidth * 2) ||
       !allocate(text_hidden, L * W * 2) || !allocate(text_states, L * W * 2) ||
       !allocate(text_acc, L * 2 * W * 2) || !allocate(text_key, L * W * 2) ||
@@ -736,6 +755,84 @@ bool Transformer::Impl::Download(const void* device, bool bf16,
     const std::uint32_t bits = static_cast<std::uint32_t>(half[i]) << 16U;
     std::memcpy(&(*out)[i], &bits, sizeof(float));
   }
+  return true;
+}
+
+bool Transformer::Impl::EmbedText(std::span<const float> text, int rows,
+                                  std::string* error) {
+  std::vector<std::uint16_t> half(text.size());
+  for (std::size_t i = 0; i < half.size(); ++i) {
+    // Round to nearest even like the BF16 cast of the pipeline.
+    std::uint32_t bits;
+    std::memcpy(&bits, &text[i], 4);
+    bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    half[i] = static_cast<std::uint16_t>(bits >> 16U);
+  }
+  if (!Check(hipMemcpyAsync(text_in.get(), half.data(), half.size() * 2,
+                            hipMemcpyHostToDevice, stream),
+             "text upload", error))
+    return false;
+  // Text embedding: linear, GELU (tanh), linear.
+  const std::size_t count = static_cast<std::size_t>(rows) * kWidth;
+  if (!Gemm(text1, text1_bias, text_in.get(), text_acc.get(), rows, kWidth,
+            kTextWidth, error))
+    return false;
+  GeluKernel<<<Blocks(count), 256, 0, stream>>>(text_acc.get(), count,
+                                                text_hidden.get());
+  if (!Gemm(text2, text2_bias, text_hidden.get(), text_states.get(), rows,
+            kWidth, kWidth, error))
+    return false;
+  // The host buffer must stay alive until the copy is done.
+  return Check(hipStreamSynchronize(stream), "text embedding", error);
+}
+
+bool Transformer::Impl::CrossKeysValues(const Block& b, int rows,
+                                        std::uint16_t* key_out,
+                                        std::uint16_t* packed_values,
+                                        std::string* error) {
+  if (!Gemm(b.cross_kv, b.cross_kv_bias, text_states.get(), text_acc.get(),
+            rows, 2 * kWidth, kWidth, error))
+    return false;
+  HeadsKernel<<<rows, kRowThreads, 0, stream>>>(
+      text_acc.get(), 2 * kWidth, rows, b.cross_norm_k.get(), nullptr, key_out);
+  HeadsKernel<<<rows, kRowThreads, 0, stream>>>(text_acc.get() + kWidth,
+                                                2 * kWidth, rows, nullptr,
+                                                nullptr, text_value.get());
+  LaunchPackValues(text_value.get(), packed_values, rows, kHeads, stream);
+  return true;
+}
+
+bool Transformer::PrepareText(int slot, std::span<const float> text,
+                              int text_rows, std::string* error) {
+  Impl& m = *impl_;
+  if (slot < 0 || slot >= kTextSlots || text_rows <= 0 || text_rows > 4096 ||
+      text.size() != static_cast<std::size_t>(text_rows) * kTextWidth) {
+    SetError(error, "Wan transformer: invalid text slot or text states");
+    return false;
+  }
+  if (!m.Reserve(std::max(m.reserved_tokens, 1), text_rows,
+                 std::max(m.reserved_unique, 1), error) ||
+      !m.EmbedText(text, text_rows, error))
+    return false;
+  Impl::TextCache& cache = m.text_cache[slot];
+  const std::size_t key_count = static_cast<std::size_t>(text_rows) * kWidth;
+  const std::size_t packed_count =
+      static_cast<std::size_t>(PaddedRows(text_rows)) * kWidth;
+  if (cache.rows != text_rows) {
+    cache.rows = 0;
+    if (!cache.key.Allocate(kLayers * key_count * 2, error) ||
+        !cache.packed.Allocate(kLayers * packed_count * 2, error))
+      return false;
+  }
+  for (int layer = 0; layer < kLayers; ++layer)
+    if (!m.CrossKeysValues(m.blocks[layer], text_rows,
+                           cache.key.get() + layer * key_count,
+                           cache.packed.get() + layer * packed_count, error))
+      return false;
+  if (!Check(hipGetLastError(), "text keys", error) ||
+      !Check(hipStreamSynchronize(m.stream), "text keys", error))
+    return false;
+  cache.rows = text_rows;
   return true;
 }
 
@@ -922,9 +1019,19 @@ bool Transformer::Forward(const TransformerInput& input,
     SetError(error, "Wan transformer: need one timestep or one per token");
     return false;
   }
-  const int text_rows = input.text_rows;
-  if (text_rows <= 0 || text_rows > 4096 ||
-      input.text.size() != static_cast<std::size_t>(text_rows) * kTextWidth) {
+  // Cached text states (PrepareText) unless probing, which needs the
+  // embedding of this call.
+  const bool cached = input.text_slot >= 0 && probes == nullptr;
+  if (input.text_slot >= kTextSlots ||
+      (input.text_slot >= 0 && m.text_cache[input.text_slot].rows == 0)) {
+    SetError(error, "Wan transformer: text slot was not prepared");
+    return false;
+  }
+  const int text_rows =
+      cached ? m.text_cache[input.text_slot].rows : input.text_rows;
+  if (!cached &&
+      (text_rows <= 0 || text_rows > 4096 ||
+       input.text.size() != static_cast<std::size_t>(text_rows) * kTextWidth)) {
     SetError(error, "Wan transformer: invalid text states");
     return false;
   }
@@ -947,9 +1054,16 @@ bool Transformer::Forward(const TransformerInput& input,
   const int U = static_cast<int>(unique.size());
   if (!m.Reserve(tokens, text_rows, U, error))
     return false;
-  // 3D RoPE: 22 frequency pairs over frames, 21 over rows, 21 over columns.
-  std::vector<float> rope(static_cast<std::size_t>(tokens) * kRopePairs * 2);
-  for (int t = 0; t < tokens; ++t) {
+  hipStream_t s = m.stream;
+  // 3D RoPE: 22 frequency pairs over frames, 21 over rows, 21 over columns
+  // (computed once per latent geometry).
+  std::vector<float> rope;
+  const bool new_rope = m.rope_frames != input.frames ||
+                        m.rope_height != input.height ||
+                        m.rope_width != input.width;
+  if (new_rope)
+    rope.resize(static_cast<std::size_t>(tokens) * kRopePairs * 2);
+  for (int t = 0; new_rope && t < tokens; ++t) {
     const int position[3] = {t / (ph * pw), (t / pw) % ph, t % pw};
     for (int j = 0; j < kRopePairs; ++j) {
       const int axis = j < kRopeTimePairs
@@ -967,33 +1081,29 @@ bool Transformer::Forward(const TransformerInput& input,
           static_cast<float>(std::sin(angle));
     }
   }
-  std::vector<std::uint16_t> text(input.text.size());
-  for (std::size_t i = 0; i < text.size(); ++i) {
-    // Round to nearest even like the BF16 cast of the pipeline.
-    std::uint32_t bits;
-    std::memcpy(&bits, &input.text[i], 4);
-    bits += 0x7FFFU + ((bits >> 16U) & 1U);
-    text[i] = static_cast<std::uint16_t>(bits >> 16U);
-  }
-  hipStream_t s = m.stream;
   if (!Check(hipMemcpyAsync(m.latent.f32(), input.latent.data(),
                             latent_count * 4, hipMemcpyHostToDevice, s),
              "input upload", error) ||
-      !Check(hipMemcpyAsync(m.rope.f32(), rope.data(), rope.size() * 4,
-                            hipMemcpyHostToDevice, s),
-             "input upload", error) ||
+      (new_rope &&
+       !Check(hipMemcpyAsync(m.rope.f32(), rope.data(), rope.size() * 4,
+                             hipMemcpyHostToDevice, s),
+              "input upload", error)) ||
       !Check(hipMemcpyAsync(m.mod_index.i32(), index.data(), index.size() * 4,
                             hipMemcpyHostToDevice, s),
              "input upload", error) ||
       !Check(hipMemcpyAsync(m.timesteps.f32(), unique.data(), U * 4,
                             hipMemcpyHostToDevice, s),
-             "input upload", error) ||
-      !Check(hipMemcpyAsync(m.text_in.get(), text.data(), text.size() * 2,
-                            hipMemcpyHostToDevice, s),
              "input upload", error))
     return false;
   // Host buffers must stay alive until the copies are done.
   if (!Check(hipStreamSynchronize(s), "input upload", error))
+    return false;
+  if (new_rope) {
+    m.rope_frames = input.frames;
+    m.rope_height = input.height;
+    m.rope_width = input.width;
+  }
+  if (!cached && !m.EmbedText(input.text, text_rows, error))
     return false;
 
   const std::size_t T = tokens;
@@ -1025,16 +1135,7 @@ bool Transformer::Forward(const TransformerInput& input,
           m.time_proj.get(), m.time_proj_bias.get(), m.temb.f32(), W,
           kModulation, m.proj.f32());
 
-  // Text embedding: linear, GELU (tanh), linear.
   const std::size_t text_count = static_cast<std::size_t>(text_rows) * W;
-  if (!m.Gemm(m.text1, m.text1_bias, m.text_in.get(), m.text_acc.get(),
-              text_rows, W, kTextWidth, error))
-    return false;
-  GeluKernel<<<Blocks(text_count), 256, 0, s>>>(m.text_acc.get(), text_count,
-                                                m.text_hidden.get());
-  if (!m.Gemm(m.text2, m.text2_bias, m.text_hidden.get(), m.text_states.get(),
-              text_rows, W, W, error))
-    return false;
   if (!Check(hipGetLastError(), "embedding launch", error))
     return false;
 
@@ -1060,7 +1161,9 @@ bool Transformer::Forward(const TransformerInput& input,
                       mod_index};
   };
   std::uint16_t* linear = m.acc.get();
-  std::uint16_t* text_linear = m.text_acc.get();
+  const std::size_t text_key_count = static_cast<std::size_t>(text_rows) * W;
+  const std::size_t text_packed_count =
+      static_cast<std::size_t>(PaddedRows(text_rows)) * W;
   if (!Check(hipEventRecord(m.timing[2 * kLayers], s), "timing", error))
     return false;
   for (int layer = 0; layer < kLayers; ++layer) {
@@ -1098,22 +1201,22 @@ bool Transformer::Forward(const TransformerInput& input,
         m.hidden.f32(), Modulation{}, b.norm2_weight.f32(), b.norm2_bias.f32(),
         m.normed.get());
     if (!m.Gemm(b.cross_q, b.cross_q_bias, m.normed.get(), linear, tokens, W, W,
-                error) ||
-        !m.Gemm(b.cross_kv, b.cross_kv_bias, m.text_states.get(), text_linear,
-                text_rows, 2 * W, W, error))
+                error))
       return false;
     HeadsKernel<<<row_blocks, kRowThreads, 0, s>>>(
         linear, W, tokens, b.cross_norm_q.get(), nullptr, m.query.get());
-    HeadsKernel<<<text_rows, kRowThreads, 0, s>>>(text_linear, 2 * W, text_rows,
-                                                  b.cross_norm_k.get(), nullptr,
-                                                  m.text_key.get());
-    HeadsKernel<<<text_rows, kRowThreads, 0, s>>>(text_linear + W, 2 * W,
-                                                  text_rows, nullptr, nullptr,
-                                                  m.text_value.get());
-    LaunchPackValues(m.text_value.get(), m.text_packed.get(), text_rows, kHeads,
-                     s);
-    LaunchAttention(m.query.get(), m.text_key.get(), m.text_packed.get(),
-                    m.attention.get(), tokens, text_rows, kHeads, s);
+    const std::uint16_t* text_key = m.text_key.get();
+    const std::uint16_t* text_packed = m.text_packed.get();
+    if (cached) {
+      const Impl::TextCache& cache = m.text_cache[input.text_slot];
+      text_key = cache.key.get() + layer * text_key_count;
+      text_packed = cache.packed.get() + layer * text_packed_count;
+    } else if (!m.CrossKeysValues(b, text_rows, m.text_key.get(),
+                                  m.text_packed.get(), error)) {
+      return false;
+    }
+    LaunchAttention(m.query.get(), text_key, text_packed, m.attention.get(),
+                    tokens, text_rows, kHeads, s);
     if (!m.Gemm(b.cross_out, b.cross_out_bias, m.attention.get(), linear,
                 tokens, W, W, error))
       return false;
@@ -1126,14 +1229,19 @@ bool Transformer::Forward(const TransformerInput& input,
     // 3. Feed-forward (GELU tanh).
     LayerNormKernel<<<row_blocks, kRowThreads, 0, s>>>(
         m.hidden.f32(), modulation(b, 3, 4), nullptr, nullptr, m.normed.get());
-    if (!m.Gemm(b.up, b.up_bias, m.normed.get(), linear, tokens, kFeedForward,
-                W, error))
-      return false;
-    const std::size_t up_count = T * kFeedForward;
-    GeluKernel<<<Blocks(up_count), 256, 0, s>>>(linear, up_count, m.gelu.get());
-    if (!m.Gemm(b.down, b.down_bias, m.gelu.get(), linear, tokens, W,
-                kFeedForward, error))
-      return false;
+    for (int first = 0; first < tokens; first += kFeedForwardChunk) {
+      const int rows = std::min(kFeedForwardChunk, tokens - first);
+      const std::size_t up_count =
+          static_cast<std::size_t>(rows) * kFeedForward;
+      if (!m.Gemm(b.up, b.up_bias, m.normed.get() + first * W, m.ffn.get(),
+                  rows, kFeedForward, W, error))
+        return false;
+      GeluKernel<<<Blocks(up_count), 256, 0, s>>>(m.ffn.get(), up_count,
+                                                  m.ffn.get());
+      if (!m.Gemm(b.down, b.down_bias, m.ffn.get(), linear + first * W, rows, W,
+                  kFeedForward, error))
+        return false;
+    }
     if (probing && !m.Download(linear, true, count, &probes->block0_ffn, error))
       return false;
     ResidualKernel<<<Blocks(count), 256, 0, s>>>(

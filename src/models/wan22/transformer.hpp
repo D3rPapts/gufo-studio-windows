@@ -22,6 +22,9 @@ struct TransformerInput {
   std::span<const float> timesteps;
   std::span<const float> text;
   int text_rows{0};
+  /// >= 0: use the text states cached by PrepareText(text_slot) instead of
+  /// `text` / `text_rows` (which may then be empty).
+  int text_slot{-1};
 };
 
 /// Optional intermediates for oracle comparison, all FP32 row-major. The
@@ -61,6 +64,15 @@ public:
   /// FP32). `probes` may be null.
   bool Forward(const TransformerInput& input, std::vector<float>* noise,
                TransformerProbes* probes, std::string* error);
+
+  /// Number of text slots PrepareText can fill (prompt and negative prompt).
+  static constexpr int kTextSlots = 2;
+  /// Runs the text-dependent part of the model once for `text` [text_rows,
+  /// 4096] (the text embedding and every block's cross-attention keys and
+  /// values, which do not change over the denoising steps) and keeps it in
+  /// `slot` for Forward calls with TransformerInput::text_slot = slot.
+  bool PrepareText(int slot, std::span<const float> text, int text_rows,
+                   std::string* error);
 
   /// Device bytes held for weights.
   [[nodiscard]] std::size_t weight_bytes() const;

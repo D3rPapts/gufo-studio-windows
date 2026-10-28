@@ -65,21 +65,25 @@ struct LinearGemm::Impl {
   void* workspace{nullptr};
   hipEvent_t events[2]{};
   std::map<std::tuple<int, int, int, bool>, std::unique_ptr<Plan>> plans;
+  hipblasStatus_t last_status{HIPBLAS_STATUS_SUCCESS};
 };
 
 bool LinearGemm::Impl::Launch(Plan& plan, const hipblasLtMatmulAlgo_t& algo,
                               const std::uint16_t* weight,
                               const std::uint16_t* bias,
                               const std::uint16_t* input, std::uint16_t* out) {
-  if (bias != nullptr && hipblasLtMatmulDescSetAttribute(
-                             plan.op, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias,
-                             sizeof(bias)) != HIPBLAS_STATUS_SUCCESS)
-    return false;
+  if (bias != nullptr) {
+    last_status = hipblasLtMatmulDescSetAttribute(
+        plan.op, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
+    if (last_status != HIPBLAS_STATUS_SUCCESS)
+      return false;
+  }
   const float alpha = 1, beta = 0;
-  return hipblasLtMatmul(handle, plan.op, &alpha, weight, plan.weight, input,
-                         plan.input, &beta, out, plan.output, out, plan.output,
-                         &algo, workspace, kWorkspaceBytes,
-                         stream) == HIPBLAS_STATUS_SUCCESS;
+  last_status =
+      hipblasLtMatmul(handle, plan.op, &alpha, weight, plan.weight, input,
+                      plan.input, &beta, out, plan.output, out, plan.output,
+                      &algo, workspace, kWorkspaceBytes, stream);
+  return last_status == HIPBLAS_STATUS_SUCCESS;
 }
 
 Plan* LinearGemm::Impl::Resolve(const std::uint16_t* weight,
@@ -142,13 +146,21 @@ Plan* LinearGemm::Impl::Resolve(const std::uint16_t* weight,
     Fail(error, "heuristic", status);
     return nullptr;
   }
-  // Time every candidate on the caller's buffers; keep the fastest.
+  // Time every candidate on the caller's buffers; keep the fastest. A pass
+  // in which no candidate launches is retried once after draining the stream
+  // (seen intermittently on gfx1151 / Windows).
   float best = -1;
-  for (int c = 0; c < count; ++c) {
-    const auto& candidate = candidates[c];
+  int skipped = 0;
+  for (int c = 0; c < count || (best < 0 && c < 2 * count); ++c) {
+    if (c == count)
+      (void)hipStreamSynchronize(stream);
+    const auto& candidate = candidates[c % count];
     if (candidate.state != HIPBLAS_STATUS_SUCCESS ||
-        candidate.workspaceSize > kWorkspaceBytes ||
-        !Launch(*plan, candidate.algo, weight, bias, input, out))
+        candidate.workspaceSize > kWorkspaceBytes) {
+      ++skipped;
+      continue;
+    }
+    if (!Launch(*plan, candidate.algo, weight, bias, input, out))
       continue;
     (void)hipEventRecord(events[0], stream);
     bool ok = true;
@@ -166,7 +178,13 @@ Plan* LinearGemm::Impl::Resolve(const std::uint16_t* weight,
     }
   }
   if (best < 0) {
-    Fail(error, "tuning (no usable algorithm)", count);
+    const std::string operation =
+        "tuning (no usable algorithm of " + std::to_string(count) + ", " +
+        std::to_string(skipped) + " skipped) for " + std::to_string(tokens) +
+        "x" + std::to_string(rows) + "x" + std::to_string(columns) +
+        ", last device error " + hipGetErrorString(hipGetLastError()) +
+        ", last status";
+    Fail(error, operation.c_str(), static_cast<int>(last_status));
     return nullptr;
   }
   Plan* result = plan.get();
