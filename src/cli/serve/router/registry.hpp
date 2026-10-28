@@ -100,6 +100,11 @@ private:
 
   std::vector<Entry> entries_;
   std::map<std::string, std::string> job_owners_;
+  // Finished jobs keep their owner so /content and status reads still route
+  // there (the worker reloads and answers from its persisted job state);
+  // oldest first, bounded.
+  std::map<std::string, std::string> finished_owners_;
+  std::vector<std::string> finished_order_;
   RegistryOptions options_;
   std::function<Clock::time_point()> now_;
 };

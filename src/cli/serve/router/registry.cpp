@@ -262,6 +262,14 @@ void Registry::CompleteVideoJob(std::string_view job_id) {
     return;
   }
   Entry* entry = Lookup(it->second);
+  if (finished_owners_.emplace(it->first, it->second).second) {
+    finished_order_.push_back(it->first);
+    constexpr std::size_t kFinishedJobs = 1024;
+    if (finished_order_.size() > kFinishedJobs) {
+      finished_owners_.erase(finished_order_.front());
+      finished_order_.erase(finished_order_.begin());
+    }
+  }
   job_owners_.erase(it);
   if (entry == nullptr) {
     return;
@@ -273,8 +281,12 @@ void Registry::CompleteVideoJob(std::string_view job_id) {
 }
 
 std::string Registry::JobOwner(std::string_view job_id) const {
-  const auto it = job_owners_.find(std::string(job_id));
-  return it == job_owners_.end() ? std::string() : it->second;
+  const std::string key(job_id);
+  if (const auto it = job_owners_.find(key); it != job_owners_.end()) {
+    return it->second;
+  }
+  const auto it = finished_owners_.find(key);
+  return it == finished_owners_.end() ? std::string() : it->second;
 }
 
 bool Registry::Busy(std::string_view model_id) const {
