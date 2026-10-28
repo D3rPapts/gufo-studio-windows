@@ -813,7 +813,7 @@ void PrintServeHelp(std::string_view program_name,
       << "  asr       Serve Qwen3-ASR transcription "
          "(/v1/audio/transcriptions)\n"
       << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
-         "(/v1/embeddings)\n\n"
+         "(/v1/embeddings)\n"
       << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
          "(/v1/chat/completions with input_audio)\n\n"
       << "Server:\n"
