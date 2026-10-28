@@ -105,10 +105,9 @@ class HipMemory:
         """Resolve libamdhip64 the way the Gufo binary links it."""
         executable = gufo_binary.resolve()
         if sys.platform == "win32":
-            # The Windows package ships amdhip64_<major>.dll beside gufo.exe,
-            # which is the one its loader resolves first.
-            for candidate in sorted(executable.parent.glob("amdhip64*.dll")):
-                return cls(candidate)
+            # Under WDDM, hipMemGetInfo counts only the calling process's
+            # allocations: beside a server holding 35 GB it reports 0.15 GiB
+            # used. An outside sampler cannot measure the server there.
             return None
         # Nix's makeWrapper keeps the production ELF beside its launch script.
         # ldd cannot inspect the script that selects Gufo's patched runtime.
