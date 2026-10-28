@@ -215,8 +215,8 @@ int main(int argc, char** argv) {
       row_error = std::max(row_error, std::abs(a - b));
     }
     const double cosine = dot / std::sqrt(a2 * b2);
-    std::cout << "row " << t << " cosine " << cosine << " max_abs "
-              << row_error << "\n";
+    std::cout << "row " << t << " cosine " << cosine << " max_abs " << row_error
+              << "\n";
     min_cosine = std::min(min_cosine, cosine);
     max_error = std::max(max_error, row_error);
   }

@@ -97,8 +97,8 @@ bool CheckPipeline(const json::Value& root, std::string* error) {
   bool normalizer_ok = IsReplaceSpaces(normalizer);
   if (!normalizer_ok && normalizer.member_str("type") == "Sequence") {
     const json::Value& list = Member(normalizer, "normalizers");
-    normalizer_ok = list.is_array() && list.size() == 1 &&
-                    IsReplaceSpaces(list.items()[0]);
+    normalizer_ok =
+        list.is_array() && list.size() == 1 && IsReplaceSpaces(list.items()[0]);
   }
   if (!normalizer_ok) {
     *error = "unsupported umT5 normalizer";
@@ -117,8 +117,7 @@ bool CheckPipeline(const json::Value& root, std::string* error) {
   if (post.member_str("type") != "TemplateProcessing" || !single.is_array() ||
       single.size() != 2 ||
       Member(Member(single.items()[0], "Sequence"), "id").str() != "A" ||
-      Member(Member(single.items()[1], "SpecialToken"), "id").str() !=
-          "</s>") {
+      Member(Member(single.items()[1], "SpecialToken"), "id").str() != "</s>") {
     *error = "unsupported umT5 post-processor";
     return false;
   }
