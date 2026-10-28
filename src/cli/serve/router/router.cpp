@@ -125,7 +125,12 @@ std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                            : ext == ".css" ? "text/css; charset=utf-8"
                            : ext == ".png" ? "image/png"
                            : ext == ".svg" ? "image/svg+xml"
-                                           : "application/octet-stream";
+                           : ext == ".jpg" ? "image/jpeg"
+                           : ext == ".mp4" ? "video/mp4"
+                           : ext == ".wav" ? "audio/wav"
+                           : ext == ".txt" ? "text/plain; charset=utf-8"
+                           : ext == ".json" ? "application/json"
+                                            : "application/octet-stream";
   return HttpResponse{.status = 200,
                       .reason = "OK",
                       .body = std::move(body),
