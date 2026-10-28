@@ -378,6 +378,123 @@ bool IsUnsupportedConditioning(const json::Value& body) {
   });
 }
 
+// Wan 2.2 TI2V-5B: {"model", "prompt", "size" (default "1280x704"),
+// "seconds" (0.2..5 at 24 fps), "gufo": {"seed", "steps" (default 50),
+// "frames" (4k + 1, must match seconds)}}. MP4 only.
+HttpResponse CreateWan22Video(const json::Value& body,
+                              VideoJobService& service) {
+  const json::Value* model_value = body.find("model");
+  const json::Value* prompt_value = body.find("prompt");
+  const json::Value* size_value = body.find("size");
+  if (model_value == nullptr || !model_value->is_string() ||
+      prompt_value == nullptr || !prompt_value->is_string() ||
+      (size_value != nullptr && !size_value->is_string())) {
+    return Error(400, "Bad Request",
+                 "'model', 'prompt', and optional 'size' must be strings",
+                 "invalid_parameter_type");
+  }
+  const std::string model = model_value->str();
+  const std::string prompt = prompt_value->str();
+  const std::string size = body.member_str("size", "1280x704");
+  const json::Value* seconds_value = body.find("seconds");
+  std::string seconds = "5";
+  if (seconds_value != nullptr && seconds_value->is_string()) {
+    seconds = seconds_value->str();
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
+  }
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  if (prompt.empty()) {
+    return Error(400, "Bad Request", "'prompt' is required",
+                 "missing_required_parameter");
+  }
+  std::string duration_error;
+  const auto duration_frames =
+      ResolveWan22DurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  minimax_h3::GenerationParameters parameters;
+  parameters.preset = std::string(kWan22Preset);
+  parameters.frames = *duration_frames;
+  parameters.evaluations = 50;
+  parameters.mux = true;
+  parameters.decode_audio = false;
+  if (!ParseVideoSize(size, &parameters.output_width,
+                      &parameters.output_height)) {
+    return Error(400, "Bad Request", "'size' must be WIDTHxHEIGHT",
+                 "invalid_size");
+  }
+  parameters.internal_width = parameters.output_width;
+  parameters.internal_height = parameters.output_height;
+  std::uint64_t seed = 42;
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension, {"seed", "steps", "frames"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' may contain only 'seed', 'steps' and 'frames'",
+                   "invalid_strix_options");
+    }
+    if (extension->contains("seed")) {
+      const auto parsed = JsonUnsigned(extension->find("seed"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.seed' must be a non-negative exact integer",
+                     "invalid_seed");
+      }
+      seed = *parsed;
+    }
+    if (extension->contains("steps")) {
+      const auto parsed = JsonFrame(extension->find("steps"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.steps' must be 1..100",
+                     "invalid_steps");
+      }
+      parameters.evaluations = *parsed;
+    }
+    if (extension->contains("frames")) {
+      const auto parsed = JsonFrame(extension->find("frames"));
+      if (!parsed.has_value() || *parsed != *duration_frames) {
+        return Error(400, "Bad Request",
+                     "'gufo.frames' must match the 'seconds' duration",
+                     "invalid_frames");
+      }
+    }
+  }
+  std::string parameter_error;
+  if (!ValidateWan22Parameters(parameters, &parameter_error)) {
+    return Error(400, "Bad Request", parameter_error, "invalid_parameters");
+  }
+  const VideoJobCreateResult created = service.Create({
+      .model = model,
+      .prompt = prompt,
+      .size = size,
+      .seconds = seconds,
+      .output_format = "mp4",
+      .parameters = std::move(parameters),
+      .seed = seed,
+  });
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   const std::string content_type = request.header("content-type");
@@ -419,6 +536,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request",
                  "request contains an unsupported video field",
                  "unsupported_field");
+  }
+  if (service.family() == VideoModelFamily::kWan22) {
+    return CreateWan22Video(body, service);
   }
 
   const json::Value* model_value = body.find("model");

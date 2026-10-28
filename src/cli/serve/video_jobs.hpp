@@ -35,6 +35,33 @@ enum class VideoJobResult : std::uint8_t {
   kIoError,
 };
 
+// Which model family a video service runs. MiniMax H3 is validated against
+// its pinned source manifest; Wan 2.2 TI2V-5B is a Diffusers directory
+// (model_index.json names WanPipeline) and reuses GenerationParameters with
+// preset "wan22": output size, frames and evaluations (= sampling steps).
+enum class VideoModelFamily : std::uint8_t {
+  kMinimaxH3,
+  kWan22,
+};
+
+inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
+inline constexpr std::string_view kWan22Preset = "wan22";
+
+// True when `root/model_index.json` describes a Wan 2.2 TI2V-5B pipeline.
+[[nodiscard]] bool IsWan22ModelDirectory(const std::filesystem::path& root);
+
+// Wan 2.2 request shape: multiples of 32, 256..1280 per side and at most
+// 1280 * 704 pixels; 4k + 1 frames up to 121; 1..100 steps.
+[[nodiscard]] bool ValidateWan22Parameters(
+    const minimax_h3::GenerationParameters& parameters,
+    std::string* error = nullptr);
+// Frames at 24 fps for an HTTP duration of 1..5 seconds, snapped to 4k + 1.
+[[nodiscard]] std::optional<int> ResolveWan22DurationFrames(
+    std::string_view seconds, std::string* error = nullptr);
+// Parses "WxH".
+[[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
+                                  int* height);
+
 struct VideoJobRequest {
   std::string model{"minimax-h3"};
   std::string prompt;
@@ -67,6 +94,9 @@ struct VideoJobContent {
 };
 
 struct VideoJobServiceOptions {
+  VideoModelFamily family{VideoModelFamily::kMinimaxH3};
+  // Public model id of a Wan 2.2 service (empty: kWan22ModelId).
+  std::string model_id;
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
   std::filesystem::path storage_root;
@@ -111,6 +141,9 @@ public:
   VideoJobService& operator=(VideoJobService&&) = delete;
 
   [[nodiscard]] bool ready() const noexcept;
+  [[nodiscard]] VideoModelFamily family() const noexcept;
+  // Public model id: "minimax-h3" or the Wan 2.2 id.
+  [[nodiscard]] std::string model_id() const;
   [[nodiscard]] std::string initialization_error() const;
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);

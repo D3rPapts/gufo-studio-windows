@@ -570,8 +570,8 @@ void PrintServeHelp(std::string_view program_name,
         std::string(program_name) + " serve video",
         "Start the MiniMax H3 text-to-video HTTP generation server.");
     parser.AddOption("-m", "--model", "DIR",
-                     "Operator-supplied MiniMax H3 directory", "Model",
-                     &video_model);
+                     "MiniMax H3 or Wan 2.2 TI2V-5B (Diffusers) directory",
+                     "Model", &video_model);
     parser.AddOption(
         "", "--root", "DIR",
         "Storage root for persistent video jobs (default: video-jobs)",
@@ -1123,9 +1123,10 @@ int RunServe(std::span<const char* const> args) {
 
     gufo::cli::ArgParser video_parser(
         "gufo serve video", "Start the MiniMax H3 video generation server.");
-    video_parser.AddOption("-m", "--model", "DIR",
-                           "Operator-supplied MiniMax H3 directory", "Model",
-                           &video_model);
+    video_parser.AddOption(
+        "-m", "--model", "DIR",
+        "MiniMax H3 or Wan 2.2 TI2V-5B (Diffusers) directory", "Model",
+        &video_model);
     video_parser.AddOption("", "--root", "DIR",
                            "Storage root for persistent video jobs", "Storage",
                            &video_root);
@@ -1163,9 +1164,15 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 
+    // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B; anything
+    // else is validated as MiniMax H3.
+    const bool wan22 = server::IsWan22ModelDirectory(video_model);
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
+            .family = wan22 ? server::VideoModelFamily::kWan22
+                            : server::VideoModelFamily::kMinimaxH3,
+            .model_id = {},
             .model_root = video_model,
             .source_manifest = video_manifest,
             .storage_root = video_root,
@@ -1178,12 +1185,14 @@ int RunServe(std::span<const char* const> args) {
             .runner = {},
         });
     if (!video_jobs->ready()) {
-      std::cerr << "Error enabling MiniMax H3 video service: "
-                << video_jobs->initialization_error() << '\n';
+      std::cerr << "Error enabling " << (wan22 ? "Wan 2.2" : "MiniMax H3")
+                << " video service: " << video_jobs->initialization_error()
+                << '\n';
       return 1;
     }
-    load_log.Complete(
-        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
+    load_log.Complete("model=" + video_jobs->model_id() +
+                          " sessions=1 queue_capacity=1 weights=lazy",
+                      false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
     SpeechOptions options{.context = is_tts ? 4096U : 1024U};
