@@ -37,6 +37,11 @@ void* CloneMappedWeightsToAnonymousPages(const void* source_data,
 void PopulateWritablePages(void* data, std::size_t bytes,
                            std::size_t worker_limit = 4) noexcept;
 
+/// Asks the OS to drop this process's resident pages it can reload later
+/// (file-backed mapping pages after their upload, for instance). Windows keeps
+/// such pages in the working set until memory runs out; elsewhere a no-op.
+void TrimResidentPages() noexcept;
+
 /// Returns a human-readable summary of resident pages in `[data, data +
 /// bytes)`.
 std::string DescribeResidentPages(void* data, std::size_t bytes);
