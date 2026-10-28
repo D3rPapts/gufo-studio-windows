@@ -1,26 +1,23 @@
-# Wan 2.2 TI2V-5B: umT5-XXL tokenizer, text encoder and transformer (DiT).
-add_library(gufo_wan22 STATIC EXCLUDE_FROM_ALL tokenizer.cpp)
+# Wan 2.2 TI2V-5B: umT5-XXL tokenizer, text encoder, transformer (DiT), UniPC
+# scheduler, VAE decoder and the text-to-video pipeline.
+add_library(gufo_wan22 STATIC EXCLUDE_FROM_ALL tokenizer.cpp scheduler.cpp)
 target_include_directories(gufo_wan22 PUBLIC ${PROJECT_SOURCE_DIR})
 
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_wan22 PRIVATE text_encoder.hip transformer.hip
-    attention.hip gemm.cpp)
+    attention.hip gemm.cpp vae.hip pipeline.cpp)
   target_compile_options(gufo_wan22 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_link_libraries(gufo_wan22 PUBLIC gufo_platform hip::host
     roc::rocblas roc::hipblaslt)
 
-  add_executable(gufo-wan-t5 EXCLUDE_FROM_ALL t5_main.cpp)
-  set_target_properties(gufo-wan-t5 PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  target_link_libraries(gufo-wan-t5 PRIVATE gufo_wan22)
-  gufo_stage_hip_runtime(gufo-wan-t5)
-
-  add_executable(gufo-wan-dit EXCLUDE_FROM_ALL dit_main.cpp)
-  set_target_properties(gufo-wan-dit PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-  target_link_libraries(gufo-wan-dit PRIVATE gufo_wan22)
-  gufo_stage_hip_runtime(gufo-wan-dit)
+  foreach(tool t5 dit video)
+    add_executable(gufo-wan-${tool} EXCLUDE_FROM_ALL ${tool}_main.cpp)
+    set_target_properties(gufo-wan-${tool} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    target_link_libraries(gufo-wan-${tool} PRIVATE gufo_wan22)
+    gufo_stage_hip_runtime(gufo-wan-${tool})
+  endforeach()
 endif()
 
 if (BUILD_TESTING)
