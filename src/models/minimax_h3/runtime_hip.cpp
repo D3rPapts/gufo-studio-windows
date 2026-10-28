@@ -1,5 +1,7 @@
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -130,6 +132,22 @@ public:
 };
 
 }  // namespace
+
+void TraceStage(const char* stage) {
+  static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
+  if (!enabled) {
+    return;
+  }
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    (void)hipGetLastError();
+  }
+  std::fprintf(stderr, "h3 trace: %s (device free %.2f of %.2f GiB)\n", stage,
+               static_cast<double>(free_bytes) / (1U << 30U),
+               static_cast<double>(total_bytes) / (1U << 30U));
+  std::fflush(stderr);
+}
 
 std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
     std::string* error) {

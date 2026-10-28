@@ -584,6 +584,8 @@ std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
   SetError(error, "MiniMax H3 HIP residency requires ENGINE_ENABLE_HIP");
   return nullptr;
 }
+
+void TraceStage(const char*) {}
 #endif
 
 PhaseSession::~PhaseSession() {

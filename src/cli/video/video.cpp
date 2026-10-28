@@ -21,6 +21,7 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/core/image.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 #ifndef GUFO_H3_SOURCE_MANIFEST
@@ -381,6 +382,10 @@ std::optional<VideoCliOptions> ParseVideoOptions(
 }
 
 int RunVideo(std::span<const char* const> args) {
+  // Internal: H3 vision + text encoding in a short-lived child process.
+  if (args.size() == 3 && std::string_view(args[0]) == "--h3-prompt-child") {
+    return minimax_h3::RunPromptChild(args[1], args[2]);
+  }
   std::string error;
   auto options = ParseVideoOptions(args, &error);
   if (!options.has_value()) {

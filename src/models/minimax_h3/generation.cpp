@@ -683,8 +683,26 @@ bool GenerateTextVideo(const GenerationRequest& request,
 
   // The FL2VA presentation: per keyframe a "<Picture i>: " label and a
   // vision block (tagged as video for the DiT), then the prompt verbatim.
+  // On Windows the vision tower and the text encoder run in a child process
+  // (EncodePromptIsolated); the image block grids follow from the canvas.
   std::vector<PromptVisionBlock> vision_blocks;
-  if (!keyframe_images.empty() && !request.vision_projector.empty()) {
+  const bool use_vision =
+      !keyframe_images.empty() && !request.vision_projector.empty();
+  const bool isolate_prompt = PromptIsolationEnabled();
+  TraceStage("prompt phase start");
+  if (use_vision && isolate_prompt) {
+    for (const KeyframeImage& image : keyframe_images) {
+      if (image.width % 32 != 0 || image.height % 32 != 0) {
+        SetError(error,
+                 "MiniMax H3 keyframe vision needs 32-pixel canvas sides");
+        return false;
+      }
+      PromptVisionBlock block;
+      block.grid_height = static_cast<std::uint32_t>(image.height / 32);
+      block.grid_width = static_cast<std::uint32_t>(image.width / 32);
+      vision_blocks.push_back(std::move(block));
+    }
+  } else if (use_vision) {
     Report(progress, progress_opaque, "vision", 0, 1);
     begin = Clock::now();
     if (!EncodeKeyframeVision(request.vision_projector, keyframe_images,
@@ -692,6 +710,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
       return false;
     }
     local.vision_ms = Milliseconds(begin, Clock::now());
+    TraceStage("vision encoded");
     Report(progress, progress_opaque, "vision", 1, 1);
   }
   begin = Clock::now();
@@ -735,13 +754,30 @@ bool GenerateTextVideo(const GenerationRequest& request,
   Report(progress, progress_opaque, "prompt", 0, 1);
   begin = Clock::now();
   PromptEmbedding embedding;
-  PromptEncoderOptions prompt_options;
-  prompt_options.vision_blocks = vision_blocks;
-  if (!EncodePromptLayer50(*inventory, tokens, prompt_options, cancellation,
-                           &embedding, &local.prompt_encoder, error)) {
-    return false;
+  if (isolate_prompt) {
+    const PromptIsolationInput isolated{
+        .model_root = request.model_root,
+        .manifest = request.source_manifest,
+        .projector =
+            use_vision ? request.vision_projector : std::filesystem::path(),
+        .images = use_vision ? std::span<const KeyframeImage>(keyframe_images)
+                             : std::span<const KeyframeImage>(),
+        .tokens = tokens,
+        .blocks = vision_blocks};
+    if (!EncodePromptIsolated(isolated, cancellation, &embedding,
+                              &local.prompt_encoder, &local.vision_ms, error)) {
+      return false;
+    }
+  } else {
+    PromptEncoderOptions prompt_options;
+    prompt_options.vision_blocks = vision_blocks;
+    if (!EncodePromptLayer50(*inventory, tokens, prompt_options, cancellation,
+                             &embedding, &local.prompt_encoder, error)) {
+      return false;
+    }
   }
   vision_blocks.clear();
+  TraceStage("prompt encoded");
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
   const std::size_t video_elements =
@@ -778,6 +814,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
     }
     local.keyframes = keyframe_latents.size();
     local.keyframe_ms = Milliseconds(begin, Clock::now());
+    TraceStage("keyframes encoded");
     Report(progress, progress_opaque, "keyframes", 1, 1);
   }
   std::shared_ptr<const LoraAdapter> lora;
@@ -818,6 +855,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   }
   local.denoiser_ms = Milliseconds(begin, Clock::now());
   denoiser.reset();
+  TraceStage("denoiser released");
   if (!request.latents_directory.empty()) {
     Report(progress, progress_opaque, "latents", 0, 1);
     const std::span<const unsigned char> prompt_bytes(
@@ -863,6 +901,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.video_vae_ms = Milliseconds(begin, Clock::now());
   local.first_preview_ms = Milliseconds(total_begin, Clock::now());
   video_decoder.reset();
+  TraceStage("video decoder released");
 
   if (!request.frames_directory.empty() &&
       !WriteDiagnosticFrames(request.frames_directory, frames, cancellation,

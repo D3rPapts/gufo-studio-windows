@@ -59,11 +59,7 @@ bool IsCancelled(const CancellationToken* cancellation) {
 
 // GUFO_H3_TRACE=1 prints denoiser setup stages to stderr.
 void Trace(const char* stage) {
-  static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
-  if (enabled) {
-    std::fprintf(stderr, "h3 trace: %s\n", stage);
-    std::fflush(stderr);
-  }
+  TraceStage(stage);
 }
 
 double Milliseconds(Clock::time_point begin, Clock::time_point end) {
