@@ -19,4 +19,10 @@ void Model::SetLog(std::function<void(const std::string&)>) {}
 bool Model::DeviceLost() const {
   return false;
 }
+LoraInfo Model::AddLora(const std::string&, const std::filesystem::path&) {
+  throw std::runtime_error("Qwen-Image requires HIP");
+}
+std::vector<Lora> Model::ActiveLoras() const {
+  return {};
+}
 }  // namespace gufo::models::qwen_image_21

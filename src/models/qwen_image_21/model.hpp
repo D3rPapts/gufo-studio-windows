@@ -35,6 +35,13 @@ std::uint64_t InitialNoiseSeed(std::uint64_t seed,
 /// ComfyUI KSampler treats denoise above this as a full schedule.
 inline constexpr double kFullStrength = 0.9999;
 
+/// A registered adapter selected by name; strength multiplies its alpha/rank.
+struct Lora {
+  std::string name;
+  float scale{1};
+  bool operator==(const Lora&) const = default;
+};
+
 struct Request {
   std::string prompt;
   std::vector<Image> images;
@@ -58,13 +65,15 @@ struct Request {
   double strength{1};
   /// Live preview of the denoised estimate; never changes the image.
   models::PreviewHook preview;
+  // Applied in order; scale 0 entries are ignored.
+  std::vector<Lora> loras{};
 };
 
 struct Metrics {
   double prompt_ms{0};
   double denoise_ms{0};
   double vae_ms{0};
-  double total_ms{0};
+  double total_ms{0};  // includes lora_ms
   std::size_t resident_weight_bytes{0};
   /// DiT condition rows (text + reference tokens) of the positive prompt and
   /// the negative prompt's own rows (references are shared).
@@ -72,11 +81,19 @@ struct Metrics {
   int negative_condition_rows{0};
   /// The text encoder left GPU memory for this request's caches.
   bool released_text_encoder{false};
+  double lora_ms{0};  // adapter switch, before prompt encoding
 };
 
 struct Result {
   Image image;
   Metrics metrics;
+};
+
+struct LoraInfo {
+  std::string format;
+  std::size_t targets{0};  // base weights the adapter patches
+  int min_rank{0};
+  int max_rank{0};
 };
 
 using CancellationCheck = std::function<bool()>;
@@ -121,6 +138,12 @@ public:
   bool DeviceLost() const;
   /// Diagnostic lines (memory per phase, memory checks).
   void SetLog(std::function<void(const std::string&)> log);
+  /// Validate and register an adapter before serving; requests select it by
+  /// name.
+  LoraInfo AddLora(const std::string& name, const std::filesystem::path& path);
+  /// Adapters merged into the transformer weights now (does not wait for
+  /// Generate); empty while a switch is in progress or after one failed.
+  std::vector<Lora> ActiveLoras() const;
 
 private:
   struct Impl;
