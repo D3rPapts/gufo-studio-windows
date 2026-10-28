@@ -1,6 +1,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -188,6 +189,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
       break;
     case core::GgmlType::kIQ2_XXS:
       block_bytes = 66;
+      break;
+    case core::GgmlType::kIQ3_XXS:
+      block_bytes = sizeof(block_iq3_xxs);
       break;
     case core::GgmlType::kQ3_K:
       block_bytes = sizeof(block_q3_K);
@@ -541,6 +545,62 @@ constexpr std::uint32_t kIq3sGrid[512] = {
 
 constexpr std::uint8_t kSignMaskIq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
+// 256-entry IQ3_XXS grid, verbatim from ggml-common.h (iq3xxs_grid).
+constexpr std::uint32_t kIq3xxsGrid[256] = {
+    0x04040404U, 0x04040414U, 0x04040424U, 0x04040c0cU, 0x04040c1cU,
+    0x04040c3eU, 0x04041404U, 0x04041414U, 0x04041c0cU, 0x04042414U,
+    0x04043e1cU, 0x04043e2cU, 0x040c040cU, 0x040c041cU, 0x040c0c04U,
+    0x040c0c14U, 0x040c140cU, 0x040c142cU, 0x040c1c04U, 0x040c1c14U,
+    0x040c240cU, 0x040c2c24U, 0x040c3e04U, 0x04140404U, 0x04140414U,
+    0x04140424U, 0x04140c0cU, 0x04141404U, 0x04141414U, 0x04141c0cU,
+    0x04141c1cU, 0x04141c3eU, 0x04142c0cU, 0x04142c3eU, 0x04143e2cU,
+    0x041c040cU, 0x041c043eU, 0x041c0c04U, 0x041c0c14U, 0x041c142cU,
+    0x041c3e04U, 0x04240c1cU, 0x04241c3eU, 0x04242424U, 0x04242c3eU,
+    0x04243e1cU, 0x04243e2cU, 0x042c040cU, 0x042c043eU, 0x042c1c14U,
+    0x042c2c14U, 0x04341c2cU, 0x04343424U, 0x043e0c04U, 0x043e0c24U,
+    0x043e0c34U, 0x043e241cU, 0x043e340cU, 0x0c04040cU, 0x0c04041cU,
+    0x0c040c04U, 0x0c040c14U, 0x0c04140cU, 0x0c04141cU, 0x0c041c04U,
+    0x0c041c14U, 0x0c041c24U, 0x0c04243eU, 0x0c042c04U, 0x0c0c0404U,
+    0x0c0c0414U, 0x0c0c0c0cU, 0x0c0c1404U, 0x0c0c1414U, 0x0c14040cU,
+    0x0c14041cU, 0x0c140c04U, 0x0c140c14U, 0x0c14140cU, 0x0c141c04U,
+    0x0c143e14U, 0x0c1c0404U, 0x0c1c0414U, 0x0c1c1404U, 0x0c1c1c0cU,
+    0x0c1c2434U, 0x0c1c3434U, 0x0c24040cU, 0x0c24042cU, 0x0c242c04U,
+    0x0c2c1404U, 0x0c2c1424U, 0x0c2c2434U, 0x0c2c3e0cU, 0x0c34042cU,
+    0x0c3e1414U, 0x0c3e2404U, 0x14040404U, 0x14040414U, 0x14040c0cU,
+    0x14040c1cU, 0x14041404U, 0x14041414U, 0x14041434U, 0x14041c0cU,
+    0x14042414U, 0x140c040cU, 0x140c041cU, 0x140c042cU, 0x140c0c04U,
+    0x140c0c14U, 0x140c140cU, 0x140c1c04U, 0x140c341cU, 0x140c343eU,
+    0x140c3e04U, 0x14140404U, 0x14140414U, 0x14140c0cU, 0x14140c3eU,
+    0x14141404U, 0x14141414U, 0x14141c3eU, 0x14142404U, 0x14142c2cU,
+    0x141c040cU, 0x141c0c04U, 0x141c0c24U, 0x141c3e04U, 0x141c3e24U,
+    0x14241c2cU, 0x14242c1cU, 0x142c041cU, 0x142c143eU, 0x142c240cU,
+    0x142c3e24U, 0x143e040cU, 0x143e041cU, 0x143e0c34U, 0x143e242cU,
+    0x1c04040cU, 0x1c040c04U, 0x1c040c14U, 0x1c04140cU, 0x1c04141cU,
+    0x1c042c04U, 0x1c04342cU, 0x1c043e14U, 0x1c0c0404U, 0x1c0c0414U,
+    0x1c0c1404U, 0x1c0c1c0cU, 0x1c0c2424U, 0x1c0c2434U, 0x1c14040cU,
+    0x1c14041cU, 0x1c140c04U, 0x1c14142cU, 0x1c142c14U, 0x1c143e14U,
+    0x1c1c0c0cU, 0x1c1c1c1cU, 0x1c241c04U, 0x1c24243eU, 0x1c243e14U,
+    0x1c2c0404U, 0x1c2c0434U, 0x1c2c1414U, 0x1c2c2c2cU, 0x1c340c24U,
+    0x1c341c34U, 0x1c34341cU, 0x1c3e1c1cU, 0x1c3e3404U, 0x24040424U,
+    0x24040c3eU, 0x24041c2cU, 0x24041c3eU, 0x24042c1cU, 0x24042c3eU,
+    0x240c3e24U, 0x24141404U, 0x24141c3eU, 0x24142404U, 0x24143404U,
+    0x24143434U, 0x241c043eU, 0x241c242cU, 0x24240424U, 0x24242c0cU,
+    0x24243424U, 0x242c142cU, 0x242c241cU, 0x242c3e04U, 0x243e042cU,
+    0x243e0c04U, 0x243e0c14U, 0x243e1c04U, 0x2c040c14U, 0x2c04240cU,
+    0x2c043e04U, 0x2c0c0404U, 0x2c0c0434U, 0x2c0c1434U, 0x2c0c2c2cU,
+    0x2c140c24U, 0x2c141c14U, 0x2c143e14U, 0x2c1c0414U, 0x2c1c2c1cU,
+    0x2c240c04U, 0x2c24141cU, 0x2c24143eU, 0x2c243e14U, 0x2c2c0414U,
+    0x2c2c1c0cU, 0x2c342c04U, 0x2c3e1424U, 0x2c3e2414U, 0x34041424U,
+    0x34042424U, 0x34042434U, 0x34043424U, 0x340c140cU, 0x340c340cU,
+    0x34140c3eU, 0x34143424U, 0x341c1c04U, 0x341c1c34U, 0x34242424U,
+    0x342c042cU, 0x342c2c14U, 0x34341c1cU, 0x343e041cU, 0x343e140cU,
+    0x3e04041cU, 0x3e04042cU, 0x3e04043eU, 0x3e040c04U, 0x3e041c14U,
+    0x3e042c14U, 0x3e0c1434U, 0x3e0c2404U, 0x3e140c14U, 0x3e14242cU,
+    0x3e142c14U, 0x3e1c0404U, 0x3e1c0c2cU, 0x3e1c1c1cU, 0x3e1c3404U,
+    0x3e24140cU, 0x3e24240cU, 0x3e2c0404U, 0x3e2c0414U, 0x3e2c1424U,
+    0x3e341c04U,
+};
+
 float Iq4NlValue(const block_iq4_nl& block, std::size_t index) noexcept {
   const std::size_t lane = index % 16;
   const bool high_nibble = index >= 16;
@@ -595,6 +655,26 @@ float Iq3sValue(const block_iq3_s& block, std::size_t index) noexcept {
   return negate ? -db * magnitude : db * magnitude;
 }
 
+// Mirrors dequantize_row_iq3_xxs: per 32 elements, eight grid indices in qs
+// and one uint32 after them (7-bit sign codes for four groups of eight, scale
+// in the top four bits). The eighth sign bit makes each group's parity even.
+float Iq3xxsValue(const block_iq3_xxs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;
+  const std::size_t within = index % 32;
+  const std::size_t l = within / 8;
+  const std::size_t j = within % 8;
+  std::uint32_t aux = 0;
+  std::memcpy(&aux, block.qs + 64 + (4 * ib32), sizeof(aux));
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(aux >> 28U)) * 0.5F;
+  auto signs = static_cast<std::uint32_t>((aux >> (7U * l)) & 127U);
+  signs |= static_cast<std::uint32_t>(std::popcount(signs) & 1) << 7U;
+  const auto* grid = reinterpret_cast<const std::uint8_t*>(
+      &kIq3xxsGrid[block.qs[(8 * ib32) + (2 * l) + (j / 4)]]);
+  const float magnitude = static_cast<float>(grid[j % 4]);
+  return (signs & kSignMaskIq2xs[j]) != 0 ? -db * magnitude : db * magnitude;
+}
+
 }  // namespace
 
 const std::uint32_t* Iq3sGrid() noexcept {
@@ -617,6 +697,16 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k) {
   for (std::size_t b = 0; b < nb; ++b) {
     for (std::size_t i = 0; i < 256; ++i) {
       dst[(b * 256) + i] = Iq4XsValue(blocks[b], i);
+    }
+  }
+}
+
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_iq3_xxs*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Iq3xxsValue(blocks[b], i);
     }
   }
 }
