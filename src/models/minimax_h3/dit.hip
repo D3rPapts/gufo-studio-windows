@@ -31,6 +31,9 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
+constexpr std::size_t kSector = 4096;
+// Sector slack before and after a staged chunk (see LoadWeight).
+constexpr std::size_t kWeightStagingSlack = 2U * kSector;
 constexpr std::size_t kMaximumAttentionRows = 131'072;
 constexpr std::size_t kMaximumScalarAttentionRows = 16'384;
 constexpr std::size_t kShortAttentionRows = 4'096;
@@ -286,28 +289,28 @@ bool LoadWeight(const ModelInventory& inventory,
       success = false;
       break;
     }
+    // The staging buffer has kWeightStagingSlack spare bytes: each chunk is
+    // read as its sector-aligned superset so ReadFileParallel can use
+    // unbuffered handles; the copy starts at the chunk's first byte.
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
-    std::size_t read_bytes = 0;
-    while (read_bytes < chunk) {
-      const std::size_t result = platform::ReadFileAt(
-          file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
-      if (result == 0) {
-        SetError(error,
-                 "short read loading MiniMax H3 DiT tensor " + descriptor.name);
-        success = false;
-        break;
-      }
-      read_bytes += result;
-    }
-    if (!success) {
+    const std::uint64_t position = descriptor.file_offset + copied;
+    const std::uint64_t aligned = position / kSector * kSector;
+    const auto lead = static_cast<std::size_t>(position - aligned);
+    const std::size_t span = (lead + chunk + kSector - 1U) / kSector * kSector;
+    const std::size_t read_bytes =
+        platform::ReadFileParallel(file, staging, span, aligned);
+    if (read_bytes < lead + chunk) {
+      SetError(error,
+               "short read loading MiniMax H3 DiT tensor " + descriptor.name);
+      success = false;
       break;
     }
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess) {
       status = hipMemcpyAsync(
-          static_cast<std::byte*>(output->storage.data()) + copied, staging,
-          chunk, hipMemcpyHostToDevice, stream);
+          static_cast<std::byte*>(output->storage.data()) + copied,
+          static_cast<const std::byte*>(staging) + lead, chunk,
+          hipMemcpyHostToDevice, stream);
     }
     if (status == hipSuccess) {
       status = hipStreamSynchronize(stream);
@@ -780,8 +783,9 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     status = hipEventCreate(&impl->stop_event);
   }
   if (status == hipSuccess) {
-    status = hipHostMalloc(&impl->staging, kWeightStagingBytes,
-                           hipHostMallocDefault);
+    status =
+        hipHostMalloc(&impl->staging, kWeightStagingBytes + kWeightStagingSlack,
+                      hipHostMallocDefault);
   }
   if (status != hipSuccess) {
     SetError(error, HipError("create MiniMax H3 DiT resources", status));

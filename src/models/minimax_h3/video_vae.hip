@@ -30,6 +30,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
+constexpr std::size_t kSector = 4096;
+constexpr std::size_t kSectorSlack = 2U * kSector;
 constexpr std::uint32_t kHidden = 2048;
 constexpr std::uint32_t kBlocks = 36;
 constexpr std::uint32_t kHeads = 32;
@@ -246,28 +248,26 @@ bool LoadTensor(const ModelInventory& inventory,
       break;
     }
     const std::size_t chunk = std::min(staging_bytes, source_bytes - copied);
-    std::size_t read_bytes = 0;
-    while (read_bytes < chunk) {
-      const std::size_t result = platform::ReadFileAt(
-          file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
-      if (result == 0) {
-        SetError(error, "short read loading MiniMax H3 VisualVAE tensor " +
-                            descriptor.name);
-        success = false;
-        break;
-      }
-      read_bytes += static_cast<std::size_t>(result);
-    }
-    if (!success) {
+    // Sector-aligned superset read (the staging buffer has kSectorSlack
+    // spare bytes) so ReadFileParallel can use unbuffered handles.
+    const std::uint64_t position = descriptor.file_offset + copied;
+    const std::uint64_t aligned = position / kSector * kSector;
+    const auto lead = static_cast<std::size_t>(position - aligned);
+    const std::size_t span = (lead + chunk + kSector - 1U) / kSector * kSector;
+    if (platform::ReadFileParallel(file, staging, span, aligned) <
+        lead + chunk) {
+      SetError(error, "short read loading MiniMax H3 VisualVAE tensor " +
+                          descriptor.name);
+      success = false;
       break;
     }
+    const void* source = static_cast<const std::byte*>(staging) + lead;
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess && !convert) {
       status = hipMemcpyAsync(static_cast<std::byte*>(output->data()) + copied,
-                              staging, chunk, hipMemcpyHostToDevice, stream);
+                              source, chunk, hipMemcpyHostToDevice, stream);
     } else if (status == hipSuccess) {
-      status = hipMemcpyAsync(device_staging, staging, chunk,
+      status = hipMemcpyAsync(device_staging, source, chunk,
                               hipMemcpyHostToDevice, stream);
       if (status == hipSuccess) {
         video_vae_ops::LaunchConvertToHalf(
@@ -1198,7 +1198,7 @@ std::unique_ptr<VideoVaeDecoder> VideoVaeDecoder::Create(
   hipError_t status =
       hipStreamCreateWithFlags(&impl->stream, hipStreamNonBlocking);
   if (status == hipSuccess) {
-    status = hipHostMalloc(&impl->staging, kWeightStagingBytes,
+    status = hipHostMalloc(&impl->staging, kWeightStagingBytes + kSectorSlack,
                            hipHostMallocDefault);
   }
   if (status != hipSuccess) {

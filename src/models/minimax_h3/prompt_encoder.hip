@@ -19,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -180,6 +181,57 @@ struct LoadedTensor {
 
 struct HostMapping;
 
+// Pinned host buffers of the Windows read path. Every decoder layer has the
+// same interval sizes, so the buffers of a finished layer serve the next
+// prefetch instead of pinning and unpinning ~1 GB per layer. Drained when
+// the encoder returns.
+class PinnedPool {
+public:
+  // Buffers are released only after the stream that read them synchronized
+  // (RunLayer waits for its stop event), so reuse never races the GPU.
+  hipError_t Acquire(std::size_t bytes, void** host) {
+    std::vector<std::pair<void*, std::size_t>> unused;
+    {
+      const std::lock_guard lock(mutex_);
+      for (auto it = free_.begin(); it != free_.end(); ++it) {
+        if (it->second == bytes) {
+          *host = it->first;
+          free_.erase(it);
+          return hipSuccess;
+        }
+      }
+      // Other sizes (the embedding table) would only hold host memory.
+      unused.swap(free_);
+    }
+    for (const auto& buffer : unused) {
+      (void)hipHostFree(buffer.first);
+    }
+    return hipHostMalloc(host, bytes, hipHostMallocMapped);
+  }
+
+  void Release(void* host, std::size_t bytes) {
+    const std::lock_guard lock(mutex_);
+    free_.emplace_back(host, bytes);
+  }
+
+  void Drain() {
+    std::vector<std::pair<void*, std::size_t>> buffers;
+    {
+      const std::lock_guard lock(mutex_);
+      buffers.swap(free_);
+    }
+    for (const auto& buffer : buffers) {
+      (void)hipHostFree(buffer.first);
+    }
+  }
+
+private:
+  std::mutex mutex_;
+  std::vector<std::pair<void*, std::size_t>> free_;
+};
+
+PinnedPool g_pinned_pool;
+
 struct LoadedBatch {
   std::vector<LoadedTensor> tensors;
   std::vector<HostMapping> mappings;
@@ -244,7 +296,7 @@ struct HostMapping {
 
   void Release() noexcept {
     if (pinned && host != nullptr) {
-      (void)hipHostFree(host);
+      g_pinned_pool.Release(host, bytes);
       g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
       pinned = false;
     }
@@ -325,8 +377,7 @@ struct BatchLoadResult {
 bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
                         std::size_t length, HostMapping* mapping,
                         std::string* error) {
-  hipError_t status =
-      hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
+  hipError_t status = g_pinned_pool.Acquire(length, &mapping->host);
   if (status != hipSuccess) {
     mapping->host = nullptr;
     *error = HipError("hipHostMalloc(H3 text weight)", status);
@@ -340,18 +391,12 @@ bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
     *error = "cannot open H3 text shard " + path.string() + ": " + open_error;
     return false;
   }
-  std::size_t read_bytes = 0;
-  while (read_bytes < length) {
-    const std::size_t result = platform::ReadFileAt(
-        file, static_cast<std::byte*>(mapping->host) + read_bytes,
-        length - read_bytes, offset + read_bytes);
-    if (result == 0) {
-      break;
-    }
-    read_bytes += result;
-  }
+  // A single buffered ReadFile reached ~1.7 GB/s on the 990 PRO; parallel
+  // unbuffered pieces keep several NVMe requests in flight.
+  const bool complete =
+      platform::ReadFileParallel(file, mapping->host, length, offset) == length;
   platform::CloseFile(file);
-  if (read_bytes != length) {
+  if (!complete) {
     *error = "short read loading H3 text shard " + path.string();
     return false;
   }
@@ -922,6 +967,10 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
                          PromptEmbedding* output,
                          PromptEncoderTelemetry* telemetry,
                          std::string* error) {
+  // Declared first: unpins the pooled buffers after every batch is gone.
+  struct PoolDrain {
+    ~PoolDrain() { g_pinned_pool.Drain(); }
+  } pool_drain;
   if (output != nullptr) {
     *output = {};
   }
