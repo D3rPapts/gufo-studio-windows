@@ -142,6 +142,16 @@ public:
   std::optional<std::size_t> chat_token_count;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
+  std::optional<std::string> render_chat_prompt(
+      const gufo::server::ChatRequest& request) const override {
+    rendered_chat = request;
+    if (render_error)
+      throw std::invalid_argument(*render_error);
+    return rendered_prompt;
+  }
+  std::optional<std::string> rendered_prompt;
+  std::optional<std::string> render_error;
+  mutable gufo::server::ChatRequest rendered_chat;
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
                   const CancellationCheck& cancel, const TokenCallback& token,
@@ -204,9 +214,18 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs) {
+      gufo::server::DecodedLogprobs probabilities;
+      probabilities.entries.push_back({3, result.text, -3.0});
+      if (*sampling.logprobs > 0)
+        probabilities.entries.push_back({1, "alternative", -0.5});
+      result.logprobs.push_back(std::move(probabilities));
+    }
     if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
-      (void)token(result.text);
+      (void)token(gufo::server::TokenPiece(
+          result.text,
+          result.logprobs.empty() ? nullptr : &result.logprobs.front()));
     }
     if (failure == 6)
       throw std::runtime_error("context exceeded");

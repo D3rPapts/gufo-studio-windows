@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/cli/serve/component_cache_metrics.hpp"
+#include "src/cli/serve/logprobs.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -129,11 +130,11 @@ struct ChatRequest {
 ///
 /// Implementations retain ownership of tokenization, templates, complete
 /// continuation state, and execution resources. The transport observes only
-/// generated text pieces and aggregate request metrics.
+/// generated text pieces, optional token probabilities and aggregate metrics.
 class TextGenerationBackend {
 public:
   using CancellationCheck = std::function<bool()>;
-  using TokenCallback = std::function<bool(std::string_view)>;
+  using TokenCallback = std::function<bool(const TokenPiece&)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -190,6 +191,7 @@ public:
   struct Result {
     std::optional<ComponentCacheMetrics> component_cache;
     std::string text;
+    std::vector<DecodedLogprobs> logprobs;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
@@ -393,6 +395,13 @@ public:
   /// Prompt tokens a chat request would use after template rendering, without
   /// generating. Empty when the backend cannot tell.
   [[nodiscard]] virtual std::optional<std::size_t> count_chat_tokens(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
+
+  /// The prompt text a chat request renders to through the model's chat
+  /// template, before tokenization. Empty when the backend cannot tell.
+  [[nodiscard]] virtual std::optional<std::string> render_chat_prompt(
       const ChatRequest&) const {
     return std::nullopt;
   }

@@ -572,6 +572,64 @@ void TestLlamaProps() {
   assert(named.member_str("build_info") == "0.2.0 (abc1234)");
 }
 
+void TestApplyTemplate() {
+  RunningServer server;
+  const std::string chat = R"({"messages":[{"role":"system","content":"sys"},
+      {"role":"user","content":"ping"}],
+      "tools":[{"type":"function","function":{"name":"t","parameters":
+        {"type":"object","properties":{"a":{"type":"string"}}}}}]})";
+  const int calls = server.backend->calls;
+
+  // A backend that cannot render its template as text says so.
+  ExpectStatus(server.Post("/apply-template", chat), 501);
+
+  // The prompt is the backend's render of the parsed Chat request; no model
+  // field is needed, as outside llama-server router mode.
+  server.backend->rendered_prompt = "<rendered>";
+  server.backend->reasoning.enabled = true;
+  server.backend->reasoning.effort = gufo::ReasoningEffort::kMedium;
+  const auto response = server.Post("/apply-template", chat);
+  ExpectStatus(response, 200);
+  const auto body =
+      gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  assert(body.member_str("prompt") == "<rendered>");
+  assert(body.find("model") == nullptr);
+  const auto rendered = server.backend->rendered_chat;
+  assert(rendered.messages.size() == 2 && rendered.tools.size() == 1);
+  // A request that sets no reasoning renders at the server's defaults, which
+  // is what makes them observable; a request's own effort wins.
+  assert(rendered.reasoning.enabled == true &&
+         rendered.reasoning.effort == gufo::ReasoningEffort::kMedium);
+  ExpectStatus(server.Post("/apply-template",
+                           R"({"reasoning_effort":"low",
+                               "messages":[{"role":"user","content":"hi"}]})"),
+               200);
+  assert(server.backend->rendered_chat.reasoning.effort ==
+         gufo::ReasoningEffort::kLow);
+
+  ExpectStatus(server.Post("/apply-template", R"({"messages":[]})"), 400);
+  // A forwarded streaming Chat body renders like any other.
+  ExpectStatus(
+      server.Post(
+          "/apply-template",
+          R"({"stream":true,"messages":[{"role":"user","content":"hi"}]})"),
+      200);
+  ExpectStatus(server.Post("/apply-template",
+                           R"({"model":"other",
+                               "messages":[{"role":"user","content":"hi"}]})"),
+               404);
+  // A template error is the request's, as in Chat.
+  server.backend->render_error = "No user query found in messages.";
+  const auto invalid = server.Post("/apply-template", chat);
+  ExpectStatus(invalid, 400);
+  assert(invalid.find("No user query found") != std::string::npos);
+  server.backend->render_error.reset();
+  // Rendering never generates.
+  assert(server.backend->calls == calls);
+  server.backend->rendered_prompt.reset();
+  server.backend->reasoning = {};
+}
+
 void TestLlamaSlotsAndMetrics() {
   RunningServer server;
   const auto get = [&](const std::string& path) {
@@ -1788,9 +1846,12 @@ void TestServedModelNames() {
       {"/v1/messages", R"("messages":[{"role":"user","content":"hi"}])"},
       {"/v1/messages/count_tokens",
        R"("messages":[{"role":"user","content":"hi"}])", false},
+      {"/apply-template", R"("messages":[{"role":"user","content":"hi"}])",
+       false},
       {"/completion", R"("prompt":"hi")", false},
   };
   server.backend->chat_token_count = 1;
+  server.backend->rendered_prompt = "p";
   const auto post = [&](const Endpoint& endpoint, const std::string& model) {
     return server.Post(endpoint.path, R"({"model":")" + model + R"(",)" +
                                           endpoint.fields + "}");
@@ -1831,6 +1892,7 @@ void TestServedModelNames() {
              .member_str("model") == "test");
   server.backend->names = {"test"};
   server.backend->chat_token_count.reset();
+  server.backend->rendered_prompt.reset();
 }
 
 void TestRawCompletionStreaming() {
@@ -2259,6 +2321,22 @@ void TestLoadingResponder() {
   ExpectLoading(SendParts(
       "127.0.0.1", port,
       {"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"}));
+  // A body the responder leaves unread, whole or arriving after the head,
+  // must not reset the connection before the client reads the answer.
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 65536\r\n\r\n" +
+       std::string(65536, 'x')}));
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 4096\r\n\r\n",
+       std::string(4096, 'x')}));
+  // A body larger than the socket buffers is still being sent when the
+  // answer is written; closing then breaks the client's send.
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 8388608\r\n\r\n" +
+       std::string(8388608, 'x')}));
   // A request head split across segments is answered after it completes.
   ExpectLoading(
       SendParts("127.0.0.1", port, {"GET /hea", "lth HTTP/1.1\r\n", "\r\n"}));
@@ -2827,6 +2905,76 @@ void TestRawCompletionCachePrompt() {
   }
 }
 
+void TestResponsesLogprobsOptions() {
+  RunningServer server;
+  for (const bool stream : {false, true}) {
+    for (const auto* count : {"null", "0", "3", "20"}) {
+      const auto response = server.Post(
+          "/v1/responses",
+          std::string(
+              R"({"input":"hello","include":["message.output_text.logprobs"],"top_logprobs":)") +
+              count + R"(,"stream":)" + (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      const auto requested =
+          std::string_view(count) == "null" ? 0 : std::stoi(count);
+      assert(server.backend->LastCall().sampling.logprobs == requested);
+      assert(response.find(R"("token":"ok")") != std::string::npos);
+      assert(response.find(R"("logprob":-3)") != std::string::npos);
+      assert(response.find(R"("bytes":[111,107])") != std::string::npos);
+    }
+  }
+  for (const auto* options :
+       {R"("top_logprobs":-1)", R"("top_logprobs":21)", R"("top_logprobs":1.5)",
+        R"("top_logprobs":true)", R"("top_logprobs":"3")", R"("include":[1])",
+        R"("include":"message.output_text.logprobs")", R"("logprobs":true)"}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        400);
+    assert(server.backend->calls == before);
+  }
+  for (const auto* options :
+       {R"("include":null)", R"("include":[])", R"("top_logprobs":3)",
+        R"("include":["reasoning.encrypted_content"] )"}) {
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        200);
+    assert(!server.backend->LastCall().sampling.logprobs);
+  }
+}
+
+void TestRawCompletionLogprobs() {
+  RunningServer server;
+  for (const bool stream : {false, true}) {
+    for (const int count : {0, 1, 20}) {
+      const auto response = server.Post(
+          "/v1/completions", std::string(R"({"prompt":"hello","logprobs":)") +
+                                 std::to_string(count) + R"(,"stream":)" +
+                                 (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      assert(response.find(R"("tokens":["ok"])") != std::string::npos);
+      assert(response.find(R"("token_logprobs":[-3])") != std::string::npos);
+      assert(response.find(R"("text_offset":[0])") != std::string::npos);
+      assert(response.find(
+                 count ? R"("top_logprobs":[{"ok":-3,"alternative":-0.5}])"
+                       : R"("top_logprobs":[{"ok":-3}])") != std::string::npos);
+    }
+  }
+  for (const auto* value : {"true", "false", "-1", "21", "1.5", "\"1\""}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(server.Post("/v1/completions",
+                             std::string(R"({"prompt":"hello","logprobs":)") +
+                                 value + "}"),
+                 400);
+    assert(server.backend->calls == before);
+  }
+  ExpectStatus(
+      server.Post("/v1/completions", R"({"prompt":"hello","logprobs":null})"),
+      200);
+}
+
 void TestRawCompletionPromptProgress() {
   RunningServer server;
   server.backend->progress = {
@@ -2871,6 +3019,8 @@ std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
           .model_root = "/nonexistent/embeddinggemma",
           .validate_model = !ready,  // Validation fails without a checkpoint.
           .model_id = "embedding-test",
+          .prompts = {},
+          .default_prompt_name = {},
           .runner =
               [](const std::vector<gufo::server::EmbeddingInput>& texts,
                  const gufo::server::EmbeddingRequestOptions&,
@@ -3006,6 +3156,8 @@ void TestEmbeddingService() {
             .model_root = "/nonexistent/embeddinggemma",
             .validate_model = false,
             .model_id = "embedding-test",
+            .prompts = {},
+            .default_prompt_name = {},
             .runner =
                 [](const std::vector<gufo::server::EmbeddingInput>&,
                    const gufo::server::EmbeddingRequestOptions&,
@@ -3068,6 +3220,7 @@ int main() {
   TestExpectContinue();
   TestFallbackBackendMetrics();
   TestLlamaProps();
+  TestApplyTemplate();
   TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
@@ -3078,6 +3231,8 @@ int main() {
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
+  TestRawCompletionLogprobs();
+  TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
   TestCompatibilityStopSequences();
