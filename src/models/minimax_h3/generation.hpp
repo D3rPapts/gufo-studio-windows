@@ -96,6 +96,10 @@ struct GenerationRequest {
   std::vector<std::uint8_t> first_frame;
   std::string negative_prompt;
   float guidance{5.0F};
+  // Wan 2.1 camera runner only: "gufo.camera" JSON and an uploaded guide
+  // video file.
+  std::string camera_json;
+  std::filesystem::path guide_video_path;
 };
 
 struct GenerationTelemetry {

@@ -107,6 +107,13 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
     if (callbacks.progress)
       callbacks.progress(phase, done, total);
   };
+  const auto cancelled = [&] {
+    if (callbacks.keep_going && !callbacks.keep_going()) {
+      SetError(error, "cancelled");
+      return true;
+    }
+    return false;
+  };
   const int lf = 1 + (n - 1) / 4, lh = h / 8, lw = w / 8;
   const std::size_t plane = static_cast<std::size_t>(lf) * lh * lw;
 
@@ -132,6 +139,8 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
     progress("prompt", 1, 1);
   }
   dump("text", text, {TextEncoder::kMaxTokens, TextEncoder::kModelWidth});
+  if (cancelled())
+    return false;
 
   // 2. CLIP image states.
   std::vector<float> clip_states;
@@ -235,6 +244,8 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
     sigmas.push_back(0.0);
     std::vector<float> velocity;
     for (int step = 0; step < request.steps; ++step) {
+      if (cancelled())
+        return false;
       const auto step_start = Clock::now();
       std::copy(latents.begin(), latents.end(), input.begin());
       Transformer21Input in;
@@ -279,6 +290,8 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
     *final_latents = latents;
 
   // 5. VAE decode.
+  if (cancelled())
+    return false;
   if (video != nullptr) {
     const auto start = Clock::now();
     auto decoder = VaeDecoder::Load(request.wan21_root / "vae", error);

@@ -26,8 +26,6 @@
 #include <utility>
 
 #include "src/cli/serve/asr_service.hpp"
-#include "src/cli/serve/omni_api.hpp"
-#include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
@@ -35,6 +33,8 @@
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/omni_api.hpp"
+#include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
@@ -785,7 +785,7 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready() &&
-      video_jobs->family() == VideoModelFamily::kWan22) {
+      video_jobs->family() != VideoModelFamily::kMinimaxH3) {
     json::Value model = json::Value::object();
     model["id"] = video_jobs->model_id();
     model["object"] = "model";

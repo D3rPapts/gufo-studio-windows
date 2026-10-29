@@ -444,8 +444,8 @@ void AddOmniOptions(ArgParser& parser, OmniOptions* options) {
                    "8192)",
                    "Model", &options->context);
   parser.AddOption("-n", "--max-tokens", "N",
-                   "Caption length limit and default (default: 1024)",
-                   "Model", &options->max_tokens);
+                   "Caption length limit and default (default: 1024)", "Model",
+                   &options->max_tokens);
   parser.AddOption("", "--served-model-name", "NAME",
                    "Public API model ID (default: qwen3-omni-captioner)",
                    "Model", &options->served_model_name);
@@ -979,8 +979,7 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image" || arg == "embedding" ||
-        arg == "omni") {
+        arg == "image" || arg == "embedding" || arg == "omni") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1037,11 +1036,11 @@ int RunServe(std::span<const char* const> args) {
     // and the `queue_budget` line is emitted now so an absolute threshold
     // (`--log-level=error`) suppresses this INFO startup diagnostic with the
     // rest of the boot sequence instead of leaking it before SetLevel ran.
-    const auto profile = subcommand == "llm" ? diagnostics::QueueProfile::kText
-                         : (subcommand == "tts" || subcommand == "asr" ||
-                            subcommand == "omni")
-                             ? diagnostics::QueueProfile::kAudio
-                             : diagnostics::QueueProfile::kUnmeasured;
+    const auto profile =
+        subcommand == "llm" ? diagnostics::QueueProfile::kText
+        : (subcommand == "tts" || subcommand == "asr" || subcommand == "omni")
+            ? diagnostics::QueueProfile::kAudio
+            : diagnostics::QueueProfile::kUnmeasured;
     const auto plan =
         diagnostics::PlanQueues(profile, diagnostics::QueryQueueCensus(),
                                 std::getenv("GPU_MAX_HW_QUEUES"));
@@ -1271,14 +1270,17 @@ int RunServe(std::span<const char* const> args) {
           };
     }
 
-    // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B; anything
-    // else is validated as MiniMax H3.
-    const bool wan22 = server::IsWan22ModelDirectory(video_model);
+    // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B, a camera
+    // bundle (gufo-camera.json) Wan 2.1 I2V + Uni3C; anything else is
+    // validated as MiniMax H3.
+    const bool wan21 = server::IsWan21CameraDirectory(video_model);
+    const bool wan22 = !wan21 && server::IsWan22ModelDirectory(video_model);
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
-            .family = wan22 ? server::VideoModelFamily::kWan22
-                            : server::VideoModelFamily::kMinimaxH3,
+            .family = wan21   ? server::VideoModelFamily::kWan21Uni3C
+                      : wan22 ? server::VideoModelFamily::kWan22
+                              : server::VideoModelFamily::kMinimaxH3,
             .model_id = {},
             .model_root = video_model,
             .source_manifest = video_manifest,
@@ -1295,7 +1297,10 @@ int RunServe(std::span<const char* const> args) {
             .interpolator = std::move(video_interpolator),
         });
     if (!video_jobs->ready()) {
-      std::cerr << "Error enabling " << (wan22 ? "Wan 2.2" : "MiniMax H3")
+      std::cerr << "Error enabling "
+                << (wan21   ? "Wan 2.1 camera"
+                    : wan22 ? "Wan 2.2"
+                            : "MiniMax H3")
                 << " video service: " << video_jobs->initialization_error()
                 << '\n';
       return 1;
@@ -1416,13 +1421,12 @@ int RunServe(std::span<const char* const> args) {
     ModelLoadLog load_log(subcommand, options.model);
     std::string error;
     std::shared_ptr<models::qwen3_omni::Captioner> captioner =
-        models::qwen3_omni::Captioner::Create(
-            {.model = options.model,
-             .mmproj = options.mmproj,
-             .backend = "gpu",
-             .context = options.context,
-             .threads = 0},
-            &error);
+        models::qwen3_omni::Captioner::Create({.model = options.model,
+                                               .mmproj = options.mmproj,
+                                               .backend = "gpu",
+                                               .context = options.context,
+                                               .threads = 0},
+                                              &error);
     if (captioner == nullptr) {
       std::cerr << "Error loading Qwen3-Omni captioner: " << error << '\n';
       return 1;
@@ -1439,9 +1443,9 @@ int RunServe(std::span<const char* const> args) {
               return captioner->Caption(request, cancelled, result, failure);
             },
     });
-    load_log.Complete("model=" + omni->model_id() +
-                      " sessions=1 context_tokens=" +
-                      std::to_string(options.context));
+    load_log.Complete(
+        "model=" + omni->model_id() +
+        " sessions=1 context_tokens=" + std::to_string(options.context));
 #else
     std::cerr << "Error: this gufo build has no Qwen3-Omni support (needs "
                  "HIP)\n";

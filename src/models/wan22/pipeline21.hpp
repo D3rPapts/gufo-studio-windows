@@ -66,6 +66,8 @@ struct I2V21Callbacks {
                      const std::vector<std::size_t>& shape)>
       dump;
   std::function<void(const std::string& phase, int done, int total)> progress;
+  /// Returning false cancels between stages and steps.
+  std::function<bool()> keep_going;
   /// The rendered guide video, RGB8 [frames, height, width, 3].
   std::function<void(const std::vector<std::uint8_t>& frames, int count)>
       rendered_guide;

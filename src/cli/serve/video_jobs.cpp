@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/video_wan21.hpp"
 #include "src/cli/serve/video_wan22.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -52,6 +53,58 @@ bool IsWan22ModelDirectory(const std::filesystem::path& root) {
   } catch (...) {
     return false;
   }
+}
+
+bool IsWan21CameraDirectory(const std::filesystem::path& root) {
+  std::ifstream input(root / "gufo-camera.json", std::ios::binary);
+  if (!input)
+    return false;
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  try {
+    return json::parse(text).member_str("_class_name") ==
+           "GufoWan21Uni3CCamera";
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ValidateWan21Parameters(const minimax_h3::GenerationParameters& p,
+                             std::string* error) {
+  const auto fail = [error](const char* message) {
+    if (error != nullptr)
+      *error = message;
+    return false;
+  };
+  if (p.preset != kWan21Preset)
+    return fail("Wan 2.1 camera jobs use the 'wan21' preset");
+  const int w = p.output_width, h = p.output_height;
+  if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
+      h % 16 != 0 || w * h > 832 * 480)
+    return fail(
+        "size must be WxH with multiples of 16, 256..1024 per side and at "
+        "most 832x480 pixels");
+  if (p.frames < 5 || p.frames > 81 || (p.frames - 1) % 4 != 0)
+    return fail("frames must be 4k + 1 between 5 and 81");
+  if (p.evaluations < 1 || p.evaluations > 20)
+    return fail("steps must be 1..20");
+  return true;
+}
+
+std::optional<int> ResolveWan21DurationFrames(std::string_view seconds,
+                                              std::string* error) {
+  double value = 0;
+  const auto parsed =
+      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
+  if (parsed.ec != std::errc() ||
+      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
+      value < 0.25 || value > 5.05) {
+    if (error != nullptr)
+      *error = "'seconds' must be a number between 0.25 and 5";
+    return std::nullopt;
+  }
+  const int groups = std::max(1, static_cast<int>(std::lround(value * 4.0)));
+  return std::min(4 * groups + 1, 81);
 }
 
 bool ParseVideoSize(std::string_view size, int* width, int* height) {
@@ -380,15 +433,18 @@ struct VideoJobService::Impl {
     if (!options.now) {
       options.now = UnixNow;
     }
-    const bool wan = options.family == VideoModelFamily::kWan22;
+    const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C;
+    const bool wan = options.family == VideoModelFamily::kWan22 || wan21;
     if (wan && options.model_id.empty()) {
-      options.model_id = std::string(kWan22ModelId);
+      options.model_id = std::string(wan21 ? kWan21ModelId : kWan22ModelId);
     }
     if (!wan) {
       options.model_id = "minimax-h3";
     }
     if (!options.runner) {
-      if (wan) {
+      if (wan21) {
+        options.runner = RunWan21Job;
+      } else if (wan) {
         options.runner = RunWan22Job;
       } else {
         options.runner = minimax_h3::GenerateTextVideo;
@@ -408,7 +464,14 @@ struct VideoJobService::Impl {
         return;
       }
 #endif
-      if (options.validate_model_inventory &&
+      if (options.validate_model_inventory && wan21 &&
+          !IsWan21CameraDirectory(options.model_root)) {
+        initialization_error =
+            "not a Wan 2.1 camera bundle (gufo-camera.json): " +
+            options.model_root.string();
+        return;
+      }
+      if (options.validate_model_inventory && !wan21 &&
           !IsWan22ModelDirectory(options.model_root)) {
         initialization_error = "not a Wan 2.2 TI2V-5B Diffusers directory: " +
                                options.model_root.string();
@@ -546,14 +609,17 @@ struct VideoJobService::Impl {
         const double completed_at = value.member_double("completed_at", -1);
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
-        const bool wan = options.family == VideoModelFamily::kWan22;
+        const bool wan = options.family != VideoModelFamily::kMinimaxH3;
+        const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C;
         int recovered_width = 0, recovered_height = 0;
         const bool valid_output =
             wan ? job->snapshot.output_format == "mp4" &&
                       job->snapshot.model == options.model_id &&
                       ParseVideoSize(job->snapshot.size, &recovered_width,
                                      &recovered_height) &&
-                      ResolveWan22DurationFrames(job->snapshot.seconds)
+                      (wan21
+                           ? ResolveWan21DurationFrames(job->snapshot.seconds)
+                           : ResolveWan22DurationFrames(job->snapshot.seconds))
                 : ((job->snapshot.output_format == "mp4" &&
                     (job->snapshot.size == "512x512" ||
                      job->snapshot.size == "1344x768")) ||
@@ -736,7 +802,18 @@ struct VideoJobService::Impl {
           .first_frame = std::move(job->request.first_frame),
           .negative_prompt = job->request.negative_prompt,
           .guidance = static_cast<float>(job->request.guidance),
+          .camera_json = job->request.camera_json,
+          .guide_video_path = {},
       };
+      if (!job->request.guide_video.empty()) {
+        // The uploaded guide is decoded by FFmpeg from the job directory.
+        generation.guide_video_path = job->directory / "guide.mp4";
+        std::ofstream guide(generation.guide_video_path, std::ios::binary);
+        guide.write(
+            reinterpret_cast<const char*>(job->request.guide_video.data()),
+            static_cast<std::streamsize>(job->request.guide_video.size()));
+        std::vector<std::uint8_t>().swap(job->request.guide_video);
+      }
       if (!job->request.lora.empty()) {
         const VideoLora& lora = options.loras.at(job->request.lora);
         generation.lora_path = lora.path;
@@ -971,7 +1048,30 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .job = std::nullopt,
             .error = initialization_error()};
   }
-  if (impl_->options.family == VideoModelFamily::kWan22) {
+  if (impl_->options.family == VideoModelFamily::kWan21Uni3C) {
+    int width = 0, height = 0;
+    const auto frames = ResolveWan21DurationFrames(request.seconds);
+    if (request.model != impl_->options.model_id ||
+        request.prompt.find('\0') != std::string::npos ||
+        request.output_format != "mp4" ||
+        !ParseVideoSize(request.size, &width, &height) ||
+        width != request.parameters.output_width ||
+        height != request.parameters.output_height || !frames ||
+        *frames != request.parameters.frames ||
+        !ValidateWan21Parameters(request.parameters, nullptr) ||
+        !request.keyframes.empty() || !request.lora.empty() ||
+        request.first_frame.empty() ||
+        request.first_frame.size() !=
+            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
+                static_cast<std::size_t>(
+                    std::max(request.first_frame_height, 0)) *
+                3U ||
+        (!request.camera_json.empty() && !request.guide_video.empty())) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "invalid Wan 2.1 camera video job request"};
+    }
+  } else if (impl_->options.family == VideoModelFamily::kWan22) {
     int width = 0, height = 0;
     const auto frames = ResolveWan22DurationFrames(request.seconds);
     if (request.model != impl_->options.model_id || request.prompt.empty() ||

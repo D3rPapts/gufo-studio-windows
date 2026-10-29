@@ -421,6 +421,7 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/video_wan21.cpp
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
   src/cli/serve/http_server.cpp
@@ -839,11 +840,12 @@ if (BUILD_TESTING)
   add_executable(video_jobs_test
     tests/cli/video_jobs_test.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan21.cpp
     src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core gufo_cache)
   if (ENGINE_ENABLE_HIP)
-    target_link_libraries(video_jobs_test PRIVATE gufo_wan22)
+    target_link_libraries(video_jobs_test PRIVATE gufo_wan22 gufo_rife)
   endif()
   add_test(NAME video_jobs_test COMMAND video_jobs_test)
   set_tests_properties(video_jobs_test PROPERTIES
@@ -853,11 +855,12 @@ if (BUILD_TESTING)
     tests/cli/video_api_test.cpp
     src/cli/serve/video_api.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan21.cpp
     src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core gufo_cache)
   if (ENGINE_ENABLE_HIP)
-    target_link_libraries(video_api_test PRIVATE gufo_wan22)
+    target_link_libraries(video_api_test PRIVATE gufo_wan22 gufo_rife)
   endif()
   add_test(NAME video_api_test COMMAND video_api_test)
   set_tests_properties(video_api_test PROPERTIES
