@@ -123,8 +123,13 @@ void TestQwenTextToImage() {
   assert(task.outputs[0].kind == comfy::OutputKind::kImage);
   assert(task.outputs[0].prefix ==
          "life3_zukunftsszenarien/v100_lauf_kurz/stil/demo_personen_r1");
-  // The negative prompt has no gufo field: the plan says so.
-  assert(!plan.warnings.empty());
+  // Negative prompt and cfg pass through as gufo fields.
+  assert(image.guidance && *image.guidance == 2.5);
+  assert(!image.strength);
+  const json::Value extension = comfy::ImageExtension(image);
+  assert(extension.member_str("negative_prompt") == "chibi, childlike");
+  assert(extension.find("guidance")->as_double() == 2.5);
+  assert(extension.find("strength") == nullptr);
 }
 
 void TestQwenReferencesAndCanvas() {
@@ -219,13 +224,14 @@ void TestWan() {
 void TestUnsupportedNodes() {
   const comfy::PlanError error = ErrorOf(R"({
     "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
-    "2": {"class_type": "RIFE VFI", "inputs": {"frames": ["1", 0], "multiplier": 4}},
+    "2": {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 30, "batch_size": 1}},
     "3": {"class_type": "FancyUpscaler", "inputs": {"image": ["2", 0]}},
     "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": "x"}}
   })");
   assert(error.type == "invalid_prompt");
   assert(error.message.find("FancyUpscaler (node 3)") != std::string::npos);
-  assert(error.message.find("RIFE VFI (node 2)") != std::string::npos);
+  assert(error.message.find("EmptyAceStep1.5LatentAudio (node 2)") !=
+         std::string::npos);
   assert(error.message.find("port pending") != std::string::npos);
   assert(error.node_errors.find("2") != nullptr);
   assert(error.node_errors.find("3") != nullptr);
@@ -239,6 +245,126 @@ void TestUnsupportedNodes() {
     "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0], "filename_prefix": "x"}}
   })")
              .type == "prompt_outputs_failed_validation");
+}
+
+std::string Replace(std::string text, const std::string& from,
+                    const std::string& to) {
+  const auto at = text.find(from);
+  assert(at != std::string::npos);
+  return text.replace(at, from.size(), to);
+}
+
+void TestImageToImage() {
+  const std::string text =
+      Replace(kQwenCanvas, "\"denoise\": 1.0", "\"denoise\": 0.6");
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.strength && *image.strength == 0.6);
+  assert((image.init_image == comfy::FileRef{"leinwand.png", "input"}));
+  assert(comfy::ImageExtension(image).find("strength")->as_double() == 0.6);
+  // Without an encoded image there is nothing to denoise from.
+  const comfy::PlanError error =
+      ErrorOf(Replace(kQwenText, "\"denoise\": 1.0", "\"denoise\": 0.5"));
+  assert(error.message.find("VAEEncode") != std::string::npos);
+}
+
+void TestRife() {
+  // VAEDecode -> RIFE VFI x4 -> SaveImage; the audio output stays plain.
+  std::string text =
+      Replace(kH3,
+              "\"40\": {\"class_type\": \"SaveImage\", \"inputs\": "
+              "{\"images\": [\"32\", 0]",
+              "\"39\": {\"class_type\": \"RIFE VFI\", \"inputs\": "
+              "{\"ckpt_name\": \"rife49.pth\", "
+              "\"frames\": [\"32\", 0], \"clear_cache_after_n_frames\": 10, "
+              "\"multiplier\": 4, "
+              "\"fast_mode\": true, \"ensemble\": true, \"scale_factor\": 1.0, "
+              "\"dtype\": "
+              "\"float32\", \"torch_compile\": false, \"batch_size\": 1}},\n"
+              " \"40\": {\"class_type\": \"SaveImage\", \"inputs\": "
+              "{\"images\": [\"39\", 0]");
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.interpolate == 4 && video.fps == 96);
+  assert(comfy::VideoRequestBody(video)
+             .find("gufo")
+             ->find("interpolate")
+             ->as_double() == 4);
+  bool warned = false;
+  for (const auto& warning : plan.warnings)
+    warned = warned || warning.find("rife49") != std::string::npos;
+  assert(warned);
+  // A second, plain image output of the same video conflicts.
+  text = Replace(text, " \"41\": {",
+                 " \"42\": {\"class_type\": \"PreviewImage\", \"inputs\": "
+                 "{\"images\": [\"32\", 0]}},\n \"41\": {");
+  assert(ErrorOf(text).message.find("same RIFE") != std::string::npos);
+  // RIFE on a still image has no gufo endpoint.
+  const comfy::PlanError still = ErrorOf(
+      Replace(kQwenText, "\"images\": [\"7\", 0]",
+              "\"images\": [\"9\", 0]}}, \"9\": {\"class_type\": \"RIFE VFI\", "
+              "\"inputs\": {\"frames\": [\"7\", 0], \"multiplier\": 2"));
+  assert(still.message.find("H3 or Wan") != std::string::npos);
+}
+
+constexpr const char* kDialogue = R"({
+ "1": {"class_type": "LoadAudio", "inputs": {"audio": "anna.wav"}},
+ "2": {"class_type": "LoadAudio", "inputs": {"audio": "ben.flac"}},
+ "3": {"class_type": "FB_Qwen3TTSVoiceClonePrompt", "inputs": {"ref_audio": ["1", 0], "ref_text": "Hallo, ich bin Anna.", "model_choice": "1.7B", "device": "auto", "precision": "bf16", "attention": "auto"}},
+ "4": {"class_type": "FB_Qwen3TTSVoiceClonePrompt", "inputs": {"ref_audio": ["2", 0], "ref_text": "", "model_choice": "1.7B", "device": "auto", "precision": "bf16", "attention": "auto", "x_vector_only": true}},
+ "5": {"class_type": "FB_Qwen3TTSRoleBank", "inputs": {"role_name_1": "Anna", "prompt_1": ["3", 0], "role_name_2": "Ben", "prompt_2": ["4", 0]}},
+ "6": {"class_type": "FB_Qwen3TTSDialogueInference", "inputs": {"script": "Anna: Guten Morgen.\n\nben: Morgen!\r\nAnna： Wie geht es dir?", "role_bank": ["5", 0], "model_choice": "1.7B", "device": "auto", "precision": "bf16", "language": "Auto", "pause_linebreak": 0.25, "period_pause": 0.4, "comma_pause": 0.2, "question_pause": 0.6, "hyphen_pause": 0.3, "merge_outputs": true, "batch_size": 4, "seed": 9}},
+ "7": {"class_type": "SaveAudio", "inputs": {"audio": ["6", 0], "filename_prefix": "dialog/szene1"}},
+ "8": {"class_type": "FB_Qwen3TTSVoiceClone", "inputs": {"target_text": "Allein.", "voice_clone_prompt": ["3", 0], "model_choice": "1.7B", "device": "auto", "precision": "bf16", "language": "German"}},
+ "9": {"class_type": "SaveAudio", "inputs": {"audio": ["8", 0], "filename_prefix": "dialog/anna"}}
+})";
+
+void TestDialogue() {
+  const comfy::Plan plan = PlanOf(kDialogue);
+  assert(plan.tasks.size() == 2);
+  const comfy::Task* dialogue_task = nullptr;
+  const comfy::Task* clone_task = nullptr;
+  for (const auto& task : plan.tasks)
+    (task.node_id == "6" ? dialogue_task : clone_task) = &task;
+  const auto& dialogue = std::get<comfy::DialogueTask>(dialogue_task->spec);
+  assert(dialogue.lines.size() == 3 && dialogue.merge);
+  assert(dialogue.pause_seconds == 0.25);
+  assert(dialogue.lines[0].text == "Guten Morgen.");
+  assert((dialogue.lines[0].reference_audio ==
+          comfy::FileRef{"anna.wav", "input"}));
+  assert(dialogue.lines[0].reference_text == "Hallo, ich bin Anna.");
+  assert(!dialogue.lines[0].embedding_only);
+  assert(dialogue.lines[1].text == "Morgen!");
+  assert((dialogue.lines[1].reference_audio ==
+          comfy::FileRef{"ben.flac", "input"}));
+  assert(dialogue.lines[1].embedding_only);
+  assert(dialogue.lines[2].text == "Wie geht es dir?");
+  assert(dialogue.lines[2].model == "qwen3-tts-clone");
+  assert(dialogue.lines[2].seed && *dialogue.lines[2].seed == 9);
+  const auto& clone = std::get<comfy::SpeechTask>(clone_task->spec);
+  assert((clone.reference_audio == comfy::FileRef{"anna.wav", "input"}));
+  assert(clone.reference_text == "Hallo, ich bin Anna.");
+  assert(clone.language == "german");
+  // An unknown role is a validation error.
+  const comfy::PlanError error =
+      ErrorOf(Replace(kDialogue, "ben: Morgen!", "Carl: Morgen!"));
+  assert(error.message.find("Carl") != std::string::npos);
+}
+
+void TestWavJoin() {
+  comfy::Wav a{24000, 1, std::string(4, '\x01')};
+  comfy::Wav b{24000, 1, std::string(2, '\x02')};
+  const auto joined =
+      comfy::JoinWavs({comfy::BuildWav(a), comfy::BuildWav(b)}, 0.001);
+  assert(joined);
+  const auto parsed = comfy::ParseWav(*joined);
+  assert(parsed && parsed->sample_rate == 24000 && parsed->channels == 1);
+  // 4 bytes + 24 silent samples (48 bytes) + 2 bytes.
+  assert(parsed->pcm.size() == 4 + 48 + 2);
+  assert(parsed->pcm.substr(4, 48) == std::string(48, '\0'));
+  comfy::Wav other{16000, 1, "xx"};
+  assert(!comfy::JoinWavs({comfy::BuildWav(a), comfy::BuildWav(other)}, 0));
+  assert(!comfy::ParseWav("RIFF....WAVE"));
 }
 
 void TestHelpers() {
@@ -304,6 +430,10 @@ int main() {
   TestH3Unsupported();
   TestWan();
   TestUnsupportedNodes();
+  TestImageToImage();
+  TestRife();
+  TestDialogue();
+  TestWavJoin();
   TestHelpers();
   std::cout << "router_comfy_graph_test: all passed\n";
   return 0;

@@ -96,6 +96,11 @@ private:
                        const ImageTask& spec);
   json::Value RunSpeech(const std::shared_ptr<Job>& job, const Task& task,
                         const SpeechTask& spec);
+  json::Value RunDialogue(const std::shared_ptr<Job>& job, const Task& task,
+                          const DialogueTask& spec);
+  std::string Speak(const std::shared_ptr<Job>& job, const SpeechTask& spec);
+  json::Value SaveSpeech(const Task& task,
+                         const std::vector<std::string>& wavs);
   json::Value RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                        const VideoTask& spec);
 

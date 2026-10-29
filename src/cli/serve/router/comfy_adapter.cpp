@@ -54,6 +54,8 @@ struct Adapter::Job {
   std::vector<std::string> outputs;
   Plan plan;
   std::atomic<bool> cancel{false};
+  /// Warnings found while running (worker thread only).
+  std::vector<std::string> warnings;
 };
 
 namespace {
@@ -338,9 +340,15 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
                     image->references.end());
       if (image->size_source == SizeSource::kCanvas)
         files->push_back(image->canvas);
+      if (image->strength)
+        files->push_back(image->init_image);
     } else if (const auto* speech = std::get_if<SpeechTask>(&task.spec)) {
       if (speech->reference_audio)
         files->push_back(*speech->reference_audio);
+    } else if (const auto* dialogue = std::get_if<DialogueTask>(&task.spec)) {
+      for (const SpeechTask& line : dialogue->lines)
+        if (line.reference_audio)
+          files->push_back(*line.reference_audio);
     } else if (const auto* video = std::get_if<VideoTask>(&task.spec)) {
       if (video->first_frame)
         files->push_back(*video->first_frame);
@@ -979,6 +987,14 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
       if (job->cancel.load())
         throw Interrupted();
       const json::Value ui = RunTask(job, task);
+      for (const std::string& warning : job->warnings) {
+        json::Value data = json::Value::object();
+        data["message"] = warning;
+        message("gufo_warning", std::move(data));
+        Logger::Warn("comfy",
+                     "event=warning prompt_id=" + job->id + " " + warning);
+      }
+      job->warnings.clear();
       for (const auto& [node, value] : ui.members()) {
         outputs[node] = value;
         json::Value node_meta = json::Value::object();
@@ -1072,6 +1088,8 @@ json::Value Adapter::RunTask(const std::shared_ptr<Job>& job,
     return RunImage(job, task, *image);
   if (const auto* speech = std::get_if<SpeechTask>(&task.spec))
     return RunSpeech(job, task, *speech);
+  if (const auto* dialogue = std::get_if<DialogueTask>(&task.spec))
+    return RunDialogue(job, task, *dialogue);
   return RunVideo(job, task, std::get<VideoTask>(task.spec));
 }
 
@@ -1124,19 +1142,25 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     }
   }
   const std::string size = std::to_string(width) + "x" + std::to_string(height);
-  FetchResult result;
-  if (references.empty()) {
-    json::Value body = json::Value::object();
-    body["model"] = spec.model;
-    body["prompt"] = spec.prompt;
-    body["size"] = size;
-    body["steps"] = spec.steps;
-    body["seed"] = spec.seed;
-    body["n"] = spec.batch;
-    body["response_format"] = "b64_json";
-    result = Call(job, "POST", "/v1/images/generations", body.dump(),
+  std::string init_image;
+  if (spec.strength)
+    init_image = ReadFileRef(spec.init_image);
+  const json::Value extension = ImageExtension(spec);
+  const auto send = [&](bool with_extension) {
+    if (references.empty() && init_image.empty()) {
+      json::Value body = json::Value::object();
+      body["model"] = spec.model;
+      body["prompt"] = spec.prompt;
+      body["size"] = size;
+      body["steps"] = spec.steps;
+      body["seed"] = spec.seed;
+      body["n"] = spec.batch;
+      body["response_format"] = "b64_json";
+      if (with_extension && !extension.empty())
+        body["gufo"] = extension;
+      return Call(job, "POST", "/v1/images/generations", body.dump(),
                   "application/json");
-  } else {
+    }
     std::vector<MultipartPart> parts = {
         {"model", "", "", spec.model},
         {"prompt", "", "", spec.prompt},
@@ -1145,17 +1169,37 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
         {"seed", "", "", std::to_string(spec.seed)},
         {"n", "", "", std::to_string(spec.batch)},
         {"response_format", "", "", "b64_json"}};
+    if (with_extension && !extension.empty())
+      parts.push_back({"gufo", "", "application/json", extension.dump()});
+    if (!init_image.empty()) {
+      const std::string type = SniffImageType(init_image);
+      parts.push_back(
+          {"image",
+           std::string("init") + (type == "image/jpeg" ? ".jpg" : ".png"), type,
+           init_image});
+    }
     for (std::size_t i = 0; i < references.size(); ++i) {
       const std::string type = SniffImageType(references[i]);
       parts.push_back({"image[]",
                        "reference-" + std::to_string(i + 1) +
                            (type == "image/jpeg" ? ".jpg" : ".png"),
-                       type, std::move(references[i])});
+                       type, references[i]});
     }
     const std::string boundary = "gufocomfy" + NewUuid();
-    result =
-        Call(job, "POST", "/v1/images/edits", BuildMultipart(parts, boundary),
-             "multipart/form-data; boundary=" + boundary);
+    return Call(job, "POST", "/v1/images/edits",
+                BuildMultipart(parts, boundary),
+                "multipart/form-data; boundary=" + boundary);
+  };
+  FetchResult result = send(true);
+  if (result.status == 400 && !extension.empty() && !spec.strength &&
+      ErrorMessage(result).find("gufo") != std::string::npos) {
+    // An image worker without the gufo fields (negative prompt, guidance):
+    // render without them and say so, as before.
+    job->warnings.push_back("node " + task.node_id +
+                            ": the image worker rejected " + extension.dump() +
+                            " (" + ErrorMessage(result) +
+                            "); rendered without negative prompt / guidance");
+    result = send(false);
   }
   Logger::Info("comfy",
                "event=image prompt_id=" + job->id + " size=" + size +
@@ -1191,8 +1235,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   return ui;
 }
 
-json::Value Adapter::RunSpeech(const std::shared_ptr<Job>& job,
-                               const Task& task, const SpeechTask& spec) {
+std::string Adapter::Speak(const std::shared_ptr<Job>& job,
+                           const SpeechTask& spec) {
   json::Value body = json::Value::object();
   body["model"] = spec.model;
   body["input"] = spec.text;
@@ -1239,18 +1283,59 @@ json::Value Adapter::RunSpeech(const std::shared_ptr<Job>& job,
     throw std::runtime_error("gufo speech request failed (HTTP " +
                              std::to_string(result.status) +
                              "): " + ErrorMessage(result));
+  return result.body;
+}
+
+json::Value Adapter::SaveSpeech(const Task& task,
+                                const std::vector<std::string>& wavs) {
   json::Value ui = json::Value::object();
   for (const OutputTarget& target : task.outputs) {
-    if (options_.ffmpeg.empty()) {
-      ui[target.node_id] = SaveBytes(target, "wav", result.body);
-      continue;
+    json::Value list = json::Value::array();
+    for (const std::string& wav : wavs) {
+      json::Value saved;
+      if (options_.ffmpeg.empty()) {
+        saved = SaveBytes(target, "wav", wav);
+      } else {
+        const fs::path file = WorkFile("wav");
+        WriteAll(file, wav);
+        saved = SaveAudioTrack(target, file);
+        fs::remove(file);
+      }
+      list.push_back(saved["audio"].items().front());
     }
-    const fs::path wav = WorkFile("wav");
-    WriteAll(wav, result.body);
-    ui[target.node_id] = SaveAudioTrack(target, wav);
-    fs::remove(wav);
+    json::Value node = json::Value::object();
+    node["audio"] = std::move(list);
+    ui[target.node_id] = std::move(node);
   }
   return ui;
+}
+
+json::Value Adapter::RunSpeech(const std::shared_ptr<Job>& job,
+                               const Task& task, const SpeechTask& spec) {
+  return SaveSpeech(task, {Speak(job, spec)});
+}
+
+json::Value Adapter::RunDialogue(const std::shared_ptr<Job>& job,
+                                 const Task& task, const DialogueTask& spec) {
+  std::vector<std::string> lines;
+  for (std::size_t i = 0; i < spec.lines.size(); ++i) {
+    if (job->cancel.load())
+      throw Interrupted();
+    lines.push_back(Speak(job, spec.lines[i]));
+    json::Value data = json::Value::object();
+    data["value"] = static_cast<int>(i + 1);
+    data["max"] = static_cast<int>(spec.lines.size());
+    data["prompt_id"] = job->id;
+    data["node"] = task.node_id;
+    Emit(job->client_id, "progress", std::move(data));
+  }
+  if (!spec.merge)
+    return SaveSpeech(task, lines);
+  auto joined = JoinWavs(lines, spec.pause_seconds);
+  if (!joined)
+    throw std::runtime_error(
+        "cannot join the dialogue lines (different WAV formats)");
+  return SaveSpeech(task, {*joined});
 }
 
 json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,

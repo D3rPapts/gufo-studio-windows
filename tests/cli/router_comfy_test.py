@@ -109,6 +109,9 @@ def serve_fake_worker(argv):
         def image_reply(self, fields, size, count):
             if "FAIL" in fields.get("prompt", ""):
                 return self.send(500, {"error": {"message": "fake failure"}})
+            if "OLDGUFO" in fields.get("prompt", "") and "gufo" in fields:
+                return self.send(400, {"error": {
+                    "message": "unsupported image parameter: gufo"}})
             width, height = (int(v) for v in size.split("x"))
             data = [{"b64_json": base64.b64encode(make_png(width, height, i)).decode()}
                     for i in range(count)]
@@ -125,15 +128,19 @@ def serve_fake_worker(argv):
                 message = BytesParser(policy=HTTP).parsebytes(
                     b"Content-Type: " + self.headers["Content-Type"].encode() +
                     b"\r\n\r\n" + raw)
-                fields, images = {}, []
+                fields, images, init = {}, [], None
                 for part in message.iter_parts():
                     name = part.get_param("name", header="content-disposition")
                     data = part.get_payload(decode=True)
                     if name == "image[]":
                         images.append(hashlib.sha256(data).hexdigest())
+                    elif name == "image":
+                        init = hashlib.sha256(data).hexdigest()
                     else:
                         fields[name] = data.decode()
-                log({"path": path, "fields": fields, "images": images})
+                if "gufo" in fields:
+                    fields["gufo"] = json.loads(fields["gufo"])
+                log({"path": path, "fields": fields, "images": images, "init": init})
                 return self.image_reply(fields, fields["size"], int(fields.get("n", 1)))
             if path == "/v1/audio/speech":
                 fields = json.loads(raw)
@@ -308,8 +315,8 @@ def clone_graph(reference):
     }
 
 
-def h3_graph(first, last, width=512, height=512):
-    return {
+def h3_graph(first, last, width=512, height=512, rife=0):
+    graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "strength_model": 1.0}},
         "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax_h3", "device": "default"}},
@@ -322,6 +329,22 @@ def h3_graph(first, last, width=512, height=512):
         "32": {"class_type": "VAEDecode", "inputs": {"samples": ["30", 0], "vae": ["4", 0]}},
         "57": {"class_type": "CreateVideo", "inputs": {"images": ["32", 0], "fps": 24}},
         "58": {"class_type": "SaveVideo", "inputs": {"video": ["57", 0], "filename_prefix": "film/clips/shot01", "format": "mp4", "codec": "h264"}},
+    }
+    if rife:
+        graph["40"] = {"class_type": "RIFE VFI", "inputs": {"ckpt_name": "rife47.pth", "frames": ["32", 0], "clear_cache_after_n_frames": 10, "multiplier": rife, "fast_mode": True, "ensemble": True, "scale_factor": 1.0, "dtype": "float32", "torch_compile": False, "batch_size": 1}}
+        graph["57"]["inputs"] = {"images": ["40", 0], "fps": 24 * rife}
+    return graph
+
+
+def dialogue_graph():
+    return {
+        "1": {"class_type": "LoadAudio", "inputs": {"audio": "anna.wav"}},
+        "2": {"class_type": "LoadAudio", "inputs": {"audio": "ben.wav"}},
+        "3": {"class_type": "FB_Qwen3TTSVoiceClonePrompt", "inputs": {"ref_audio": ["1", 0], "ref_text": "Ich bin Anna.", "model_choice": "1.7B", "device": "auto", "precision": "bf16", "attention": "auto"}},
+        "4": {"class_type": "FB_Qwen3TTSVoiceClonePrompt", "inputs": {"ref_audio": ["2", 0], "ref_text": "", "model_choice": "1.7B", "device": "auto", "precision": "bf16", "attention": "auto", "x_vector_only": True}},
+        "5": {"class_type": "FB_Qwen3TTSRoleBank", "inputs": {"role_name_1": "Anna", "prompt_1": ["3", 0], "role_name_2": "Ben", "prompt_2": ["4", 0]}},
+        "6": {"class_type": "FB_Qwen3TTSDialogueInference", "inputs": {"script": "Anna: Guten Morgen.\nBen: Morgen!\nAnna: Wie geht es?", "role_bank": ["5", 0], "model_choice": "1.7B", "device": "auto", "precision": "bf16", "language": "Auto", "pause_linebreak": 0.25, "period_pause": 0, "comma_pause": 0, "question_pause": 0, "hyphen_pause": 0, "merge_outputs": True, "batch_size": 4, "seed": 3}},
+        "7": {"class_type": "SaveAudio", "inputs": {"audio": ["6", 0], "filename_prefix": "film/dialog/szene1"}},
     }
 
 
@@ -410,10 +433,11 @@ def check_qwen(router):
     assert call["path"] == "/v1/images/generations", call
     assert call["fields"] == {"model": "qwen-image-2.1", "prompt": "an office",
                               "size": "1024x1024", "steps": 25, "seed": 1769224114,
-                              "n": 1, "response_format": "b64_json"}, call
+                              "n": 1, "response_format": "b64_json",
+                              "gufo": {"negative_prompt": "chibi", "guidance": 2.5}}, call
     messages = [m[0] for m in entry["status"]["messages"]]
     assert messages[0] == "execution_start" and messages[-1] == "execution_success"
-    assert "gufo_warning" in messages  # the negative prompt has no gufo field
+    assert "gufo_warning" not in messages, messages
     # The counter continues after existing files.
     again = router.run(qwen_graph())
     assert again["outputs"]["8"]["images"][0]["filename"] == "demo_00002_.png"
@@ -427,6 +451,22 @@ def check_qwen_references(router):
     assert call["fields"]["size"] == "1344x832", call
     assert call["fields"]["steps"] == "25" and call["fields"]["seed"] == "1769224114"
     assert len(call["images"]) == 2 and call["images"][0] != call["images"][1]
+    assert call["fields"]["gufo"] == {"negative_prompt": "chibi", "guidance": 2.5}
+    assert call["init"] is None
+    # denoise < 1: image to image from the canvas with gufo.strength.
+    graph = qwen_graph(canvas="leinwand.png", prefix="film/keyframes/i2i")
+    graph["6"]["inputs"]["denoise"] = 0.55
+    router.run(graph)
+    call = router.fake_entries()[-1]
+    assert call["path"] == "/v1/images/edits" and call["images"] == [], call
+    assert call["init"] == hashlib.sha256(make_png(1344, 832)).hexdigest()
+    assert call["fields"]["gufo"]["strength"] == 0.55, call
+    # An image worker without the gufo fields: rendered without them + warning.
+    entry = router.run(qwen_graph(prompt="OLDGUFO office", prefix="film/stil/old"))
+    calls = router.fake_entries()[-2:]
+    assert "gufo" in calls[0]["fields"] and "gufo" not in calls[1]["fields"], calls
+    warnings = [m[1]["message"] for m in entry["status"]["messages"] if m[0] == "gufo_warning"]
+    assert warnings and "rejected" in warnings[0], entry["status"]
     # Without a canvas the latent follows the first reference (64x48 -> ~1024^2).
     router.run(qwen_graph(refs=["ref.png"], prefix="film/keyframes/kf1"))
     assert router.fake_entries()[-1]["fields"]["size"] == "1184x896"
@@ -453,6 +493,25 @@ def check_speech(router, audio_ext):
     assert call["fields"]["voice"] == "voice-clone"
     assert call["fields"]["reference_audio"] == hashlib.sha256(make_wav()).hexdigest()
     assert call["fields"]["reference_text"] == "Hallo und willkommen."
+    anna, ben = make_wav(0.5), make_wav(0.3)
+    router.upload("anna.wav", anna)
+    router.upload("ben.wav", ben)
+    before = len(router.fake_entries())
+    entry = router.run(dialogue_graph())
+    calls = router.fake_entries()[before:]
+    assert [c["fields"]["input"] for c in calls] == ["Guten Morgen.", "Morgen!", "Wie geht es?"]
+    assert calls[0]["fields"]["reference_audio"] == hashlib.sha256(anna).hexdigest()
+    assert calls[0]["fields"]["reference_text"] == "Ich bin Anna."
+    assert calls[1]["fields"]["reference_audio"] == hashlib.sha256(ben).hexdigest()
+    assert calls[1]["fields"]["voice_clone_mode"] == "speaker_embedding_only"
+    assert all(c["fields"]["seed"] == 3 and c["model"] == "qwen3-tts-clone" for c in calls)
+    files = entry["outputs"]["7"]["audio"]
+    assert len(files) == 1 and files[0]["filename"] == "szene1_00001." + audio_ext, files
+    status, data = router.request("GET", "/view?" + urllib.parse.urlencode(files[0]))
+    assert status == 200
+    if audio_ext == "wav":
+        # Three 0.25 s fake lines and two 0.25 s pauses at 24 kHz, 16 bit.
+        assert len(data) == 44 + 5 * 6000 * 2, len(data)
 
 
 def check_video(router):
@@ -471,12 +530,16 @@ def check_video(router):
     assert fields["first_frame"] == "data:image/png;base64," + png_hash
     assert fields["last_frame"].startswith("data:image/png;base64,")
     assert fields["last_frame"] != fields["first_frame"]
+    entry = router.run(h3_graph("ref.png", "ref (1).png", rife=4))
+    fields = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]["fields"]
+    assert fields["gufo"]["interpolate"] == 4, fields
+    assert entry["outputs"]["58"]["images"][0]["filename"] == "shot01_00002_.mp4"
 
 
 def check_errors(router):
     graph = qwen_graph()
     graph["9"] = {"class_type": "FancyUpscaler", "inputs": {"image": ["7", 0]}}
-    graph["10"] = {"class_type": "RIFE VFI", "inputs": {"frames": ["7", 0], "multiplier": 4}}
+    graph["10"] = {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 30, "batch_size": 1}}
     status, body = router.json("POST", "/prompt", {"prompt": graph})
     assert status == 400, body
     assert "FancyUpscaler (node 9)" in body["error"]["message"], body

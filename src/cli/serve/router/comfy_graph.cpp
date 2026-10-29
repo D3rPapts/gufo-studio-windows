@@ -54,6 +54,9 @@ constexpr std::string_view kPlumbing[] = {
     "PrimitiveBoolean",
     "TextEncodeQwenImage21",
     "MiniMaxH3AddGuide",
+    "RIFE VFI",
+    "FB_Qwen3TTSVoiceClonePrompt",
+    "FB_Qwen3TTSRoleBank",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -64,6 +67,7 @@ constexpr std::string_view kGenerators[] = {
     "FB_Qwen3TTSVoiceDesign",
     "FB_Qwen3TTSVoiceClone",
     "FB_Qwen3TTSCustomVoice",
+    "FB_Qwen3TTSDialogueInference",
 };
 
 constexpr std::string_view kOutputs[] = {
@@ -71,7 +75,7 @@ constexpr std::string_view kOutputs[] = {
 
 // Node families other gufo ports are bringing; named so the error says so.
 constexpr std::string_view kPending[] = {
-    "RIFE VFI", "TextEncodeAceStepAudio1.5", "EmptyAceStep1.5LatentAudio",
+    "TextEncodeAceStepAudio1.5", "EmptyAceStep1.5LatentAudio",
     "TextEncodeAceStepAudio", "EmptyAceStepLatentAudio"};
 
 template<std::size_t N>
@@ -80,7 +84,10 @@ bool Contains(const std::string_view (&set)[N], std::string_view value) {
 }
 
 bool IsTts(std::string_view class_type) {
-  return class_type.starts_with("FB_Qwen3TTS");
+  return class_type == "FB_Qwen3TTSVoiceDesign" ||
+         class_type == "FB_Qwen3TTSVoiceClone" ||
+         class_type == "FB_Qwen3TTSCustomVoice" ||
+         class_type == "FB_Qwen3TTSDialogueInference";
 }
 
 bool IsSampler(std::string_view class_type) {
@@ -374,10 +381,15 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
   task.model = models.image;
   task.steps = static_cast<int>(graph.Num(sampler, "steps"));
   task.seed = Seed(graph.Num(sampler, SeedKey(cls), 0));
-  if (cls == "KSampler" && graph.Num(sampler, "denoise", 1.0) < 0.999)
-    throw NodeFailure(sampler, "unsupported_value",
-                      "denoise below 1 (image to image) is not supported by "
-                      "gufo Qwen-Image");
+  if (const double denoise = graph.Num(sampler, "denoise", 1.0);
+      cls == "KSampler" && denoise < 0.999) {
+    if (denoise <= 0.0)
+      throw NodeFailure(sampler, "unsupported_value", "denoise must be > 0");
+    task.strength = denoise;
+  }
+  if (const json::Value* cfg = graph.Literal(sampler, "cfg");
+      cfg != nullptr && cfg->is_number())
+    task.guidance = cfg->as_double();
   const ModelChain chain = FollowModel(graph, sampler);
   if (!chain.loras.empty())
     throw NodeFailure(sampler, "unsupported_value",
@@ -432,7 +444,7 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
   if (task.references.size() > 10)
     throw NodeFailure(positive.encoder, "unsupported_value",
                       "gufo Qwen-Image takes at most 10 reference images");
-  // Negative prompt: kept for the record; gufo Qwen-Image has no field.
+  // Negative prompt: sent as gufo.negative_prompt (with true CFG).
   const Conditioning negative = FollowConditioning(graph, sampler, "negative");
   if (!negative.encoder.empty() && !negative.zeroed) {
     if (graph.Class(negative.encoder) == "TextEncodeQwenImage21")
@@ -440,13 +452,6 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
     else
       task.negative_prompt = ClipText(graph, negative);
   }
-  if (!task.negative_prompt.empty())
-    warnings->push_back("node " + sampler +
-                        ": negative prompt ignored (gufo Qwen-Image has none)");
-  if (const double cfg = graph.Num(sampler, "cfg", 1.0);
-      cfg != 1.0 && cfg != 2.5)
-    warnings->push_back("node " + sampler + ": cfg " + std::to_string(cfg) +
-                        " ignored (gufo uses its own guidance)");
   const std::string latent_class = graph.Class(latent.node);
   if (latent_class == "TextEncodeQwenImage21") {
     task.size_source = task.references.empty() ? SizeSource::kSquare
@@ -457,6 +462,8 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
     task.size_source = SizeSource::kCanvas;
     task.canvas = ImageFile(graph, latent.node, "pixels",
                             graph.RequireLink(latent.node, "pixels"));
+    if (task.strength)
+      task.init_image = task.canvas;
   } else if (latent_class == "EmptyLatentImage" ||
              latent_class == "EmptySD3LatentImage") {
     task.size_source = SizeSource::kExplicit;
@@ -472,6 +479,10 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
                       "VAEEncode or an empty latent, not " +
                           latent_class);
   }
+  if (task.strength && task.init_image.name.empty())
+    throw NodeFailure(sampler, "unsupported_value",
+                      "denoise below 1 needs latent_image from VAEEncode of a "
+                      "LoadImage (image to image)");
   return task;
 }
 
@@ -575,6 +586,138 @@ VideoTask BuildWan(const Graph& graph, const std::string& sampler,
   return task;
 }
 
+/// ref_audio / ref_text / x_vector_only of a clone node (VoiceClone or
+/// VoiceClonePrompt) into `task`.
+void ApplyCloneReference(const Graph& graph, const std::string& id,
+                         SpeechTask* task) {
+  task->reference_audio =
+      AudioFile(graph, id, "ref_audio", graph.RequireLink(id, "ref_audio"));
+  task->reference_text = graph.Str(id, "ref_text", "");
+  task->embedding_only =
+      graph.Bool(id, "x_vector_only", false) || task->reference_text.empty();
+}
+
+void ApplyClonePrompt(const Graph& graph, const std::string& id,
+                      const Link& link, SpeechTask* task) {
+  if (graph.Class(link.node) != "FB_Qwen3TTSVoiceClonePrompt")
+    throw NodeFailure(id, "unsupported_link",
+                      "voice_clone_prompt must come from "
+                      "FB_Qwen3TTSVoiceClonePrompt, not " +
+                          graph.Class(link.node));
+  ApplyCloneReference(graph, link.node, task);
+}
+
+/// Language, seed and sampling fields shared by every TTS node.
+void ApplySpeechCommon(const Graph& graph, const std::string& id,
+                       SpeechTask* task, std::vector<std::string>* warnings) {
+  const std::string language = graph.Str(id, "language", "Auto");
+  task->language = language == "Auto" ? "" : Lower(language);
+  if (const json::Value* seed = graph.Literal(id, "seed");
+      seed != nullptr && seed->is_number())
+    task->seed = Seed(seed->as_double());
+  if (graph.Str(id, "model_choice", "1.7B") != "1.7B")
+    warnings->push_back("node " + id + ": gufo serves the 1.7B Qwen3-TTS");
+  for (const char* key : {"temperature", "top_p", "top_k", "repetition_penalty",
+                          "max_new_tokens"}) {
+    if (const json::Value* value = graph.Literal(id, key);
+        value != nullptr && value->is_number())
+      task->sampling[key] = value->as_double();
+  }
+}
+
+std::string Trim(std::string text) {
+  while (!text.empty() &&
+         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r'))
+    text.pop_back();
+  std::size_t first = 0;
+  while (first < text.size() && (text[first] == ' ' || text[first] == '\t'))
+    ++first;
+  return text.substr(first);
+}
+
+/// FB_Qwen3TTSDialogueInference: each "Role: text" script line becomes one
+/// clone request with the role's FB_Qwen3TTSVoiceClonePrompt.
+DialogueTask BuildDialogue(const Graph& graph, const std::string& id,
+                           const ModelIds& models,
+                           std::vector<std::string>* warnings) {
+  const Link bank = graph.RequireLink(id, "role_bank");
+  if (graph.Class(bank.node) != "FB_Qwen3TTSRoleBank")
+    throw NodeFailure(id, "unsupported_link",
+                      "role_bank must come from FB_Qwen3TTSRoleBank");
+  std::map<std::string, SpeechTask> roles;
+  for (int i = 1; i <= 8; ++i) {
+    const std::string index = std::to_string(i);
+    auto prompt = graph.LinkOf(bank.node, "prompt_" + index);
+    if (!prompt)
+      continue;
+    SpeechTask role;
+    role.model = models.tts_clone;
+    role.voice = "voice-clone";
+    ApplyClonePrompt(graph, bank.node, *prompt, &role);
+    const std::string name =
+        Trim(graph.Str(bank.node, "role_name_" + index, "Role" + index));
+    roles[Lower(name)] = std::move(role);
+  }
+  if (roles.empty())
+    throw NodeFailure(bank.node, "required_input_missing",
+                      "the role bank has no voice prompts");
+  SpeechTask common;
+  ApplySpeechCommon(graph, id, &common, warnings);
+  if (const json::Value* tokens = graph.Literal(id, "max_new_tokens_per_line");
+      tokens != nullptr && tokens->is_number())
+    common.sampling["max_new_tokens"] = tokens->as_double();
+  DialogueTask task;
+  task.pause_seconds = graph.Num(id, "pause_linebreak", 0.5);
+  task.merge = graph.Bool(id, "merge_outputs", true);
+  const std::string script = graph.Str(id, "script");
+  std::size_t start = 0;
+  while (start <= script.size()) {
+    std::size_t end = script.find('\n', start);
+    if (end == std::string::npos)
+      end = script.size();
+    const std::string line = Trim(script.substr(start, end - start));
+    start = end + 1;
+    if (line.empty())
+      continue;
+    // "Role: text"; the full-width colon counts too.
+    std::size_t colon = line.find(':');
+    std::size_t skip = 1;
+    if (const std::size_t wide = line.find("\xEF\xBC\x9A");
+        wide != std::string::npos &&
+        (colon == std::string::npos || wide < colon)) {
+      colon = wide;
+      skip = 3;
+    }
+    if (colon == std::string::npos)
+      throw NodeFailure(id, "invalid_input",
+                        "script line without 'Role:' prefix: " + line);
+    const std::string role = Trim(line.substr(0, colon));
+    const std::string text = Trim(line.substr(colon + skip));
+    const auto found = roles.find(Lower(role));
+    if (found == roles.end())
+      throw NodeFailure(id, "invalid_input",
+                        "script role '" + role + "' is not in the role bank");
+    if (text.empty())
+      continue;
+    SpeechTask spoken = found->second;
+    spoken.text = text;
+    spoken.language = common.language;
+    spoken.seed = common.seed;
+    spoken.sampling = common.sampling;
+    task.lines.push_back(std::move(spoken));
+  }
+  if (task.lines.empty())
+    throw NodeFailure(id, "required_input_missing", "the script has no lines");
+  for (const char* key :
+       {"period_pause", "comma_pause", "question_pause", "hyphen_pause"}) {
+    if (const json::Value* value = graph.Literal(id, key);
+        value != nullptr && value->is_number() && value->as_double() > 0)
+      warnings->push_back("node " + id + ": " + key +
+                          " is not applied (gufo pauses only between lines)");
+  }
+  return task;
+}
+
 SpeechTask BuildSpeech(const Graph& graph, const std::string& id,
                        const ModelIds& models,
                        std::vector<std::string>* warnings) {
@@ -589,15 +732,13 @@ SpeechTask BuildSpeech(const Graph& graph, const std::string& id,
     task.model = models.tts_clone;
     task.voice = "voice-clone";
     task.text = graph.Str(id, "target_text");
-    if (graph.LinkOf(id, "voice_clone_prompt"))
-      throw NodeFailure(id, "unsupported_value",
-                        "voice_clone_prompt is not supported; connect "
-                        "ref_audio from LoadAudio");
-    task.reference_audio =
-        AudioFile(graph, id, "ref_audio", graph.RequireLink(id, "ref_audio"));
-    task.reference_text = graph.Str(id, "ref_text", "");
-    task.embedding_only =
-        graph.Bool(id, "x_vector_only", false) || task.reference_text.empty();
+    // A FB_Qwen3TTSVoiceClonePrompt carries the reference instead of
+    // ref_audio/ref_text on the node itself.
+    if (auto prompt = graph.LinkOf(id, "voice_clone_prompt"))
+      ApplyClonePrompt(graph, id, *prompt, &task);
+    else
+      ApplyCloneReference(graph, id, &task);
+    task.instructions = graph.Str(id, "instruct", "");
   } else if (cls == "FB_Qwen3TTSCustomVoice") {
     task.model = models.tts_custom;
     task.text = graph.Str(id, "text");
@@ -611,19 +752,7 @@ SpeechTask BuildSpeech(const Graph& graph, const std::string& id,
   }
   if (task.text.empty())
     throw NodeFailure(id, "required_input_missing", "text is empty");
-  const std::string language = graph.Str(id, "language", "Auto");
-  task.language = language == "Auto" ? "" : Lower(language);
-  if (const json::Value* seed = graph.Literal(id, "seed");
-      seed != nullptr && seed->is_number())
-    task.seed = Seed(seed->as_double());
-  if (graph.Str(id, "model_choice", "1.7B") != "1.7B")
-    warnings->push_back("node " + id + ": gufo serves the 1.7B Qwen3-TTS");
-  for (const char* key : {"temperature", "top_p", "top_k", "repetition_penalty",
-                          "max_new_tokens"}) {
-    if (const json::Value* value = graph.Literal(id, key);
-        value != nullptr && value->is_number())
-      task.sampling[key] = value->as_double();
-  }
+  ApplySpeechCommon(graph, id, &task, warnings);
   return task;
 }
 
@@ -696,6 +825,8 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["lora"] = task.lora;
     if (task.lora_strength)
       gufo["lora_strength"] = *task.lora_strength;
+    if (task.interpolate > 1)
+      gufo["interpolate"] = task.interpolate;
   } else {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
@@ -704,9 +835,124 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["guidance"] = *task.guidance;
     if (!task.negative_prompt.empty())
       gufo["negative_prompt"] = task.negative_prompt;
+    if (task.interpolate > 1)
+      gufo["interpolate"] = task.interpolate;
   }
   body["gufo"] = std::move(gufo);
   return body;
+}
+
+json::Value ImageExtension(const ImageTask& task) {
+  json::Value gufo = json::Value::object();
+  if (!task.negative_prompt.empty())
+    gufo["negative_prompt"] = task.negative_prompt;
+  if (task.guidance)
+    gufo["guidance"] = *task.guidance;
+  if (task.strength)
+    gufo["strength"] = *task.strength;
+  return gufo;
+}
+
+namespace {
+
+std::uint32_t Le32(std::string_view bytes, std::size_t at) {
+  return static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at])) |
+         static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 1]))
+             << 8 |
+         static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 2]))
+             << 16 |
+         static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 3]))
+             << 24;
+}
+
+void PutLe(std::string* out, std::uint32_t value, int bytes) {
+  for (int i = 0; i < bytes; ++i)
+    out->push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+}
+
+}  // namespace
+
+std::optional<Wav> ParseWav(std::string_view bytes) {
+  if (bytes.size() < 12 || bytes.substr(0, 4) != "RIFF" ||
+      bytes.substr(8, 4) != "WAVE")
+    return std::nullopt;
+  Wav wav;
+  bool format = false;
+  std::size_t at = 12;
+  while (at + 8 <= bytes.size()) {
+    const std::string_view id = bytes.substr(at, 4);
+    std::size_t size = Le32(bytes, at + 4);
+    const std::size_t body = at + 8;
+    if (id == "data" && size > bytes.size() - body)
+      size = bytes.size() - body;  // streamed WAVs may carry a 0/-1 size
+    if (size > bytes.size() - body)
+      return std::nullopt;
+    if (id == "fmt ") {
+      if (size < 16)
+        return std::nullopt;
+      const unsigned audio_format = static_cast<unsigned char>(bytes[body]) |
+                                    static_cast<unsigned char>(bytes[body + 1])
+                                        << 8;
+      wav.channels = static_cast<unsigned char>(bytes[body + 2]) |
+                     static_cast<unsigned char>(bytes[body + 3]) << 8;
+      wav.sample_rate = static_cast<int>(Le32(bytes, body + 4));
+      const unsigned bits = static_cast<unsigned char>(bytes[body + 14]) |
+                            static_cast<unsigned char>(bytes[body + 15]) << 8;
+      if (audio_format != 1 || bits != 16 || wav.channels < 1)
+        return std::nullopt;
+      format = true;
+    } else if (id == "data") {
+      if (!format)
+        return std::nullopt;
+      wav.pcm = std::string(bytes.substr(body, size));
+      return wav;
+    }
+    at = body + size + (size & 1);
+  }
+  return std::nullopt;
+}
+
+std::string BuildWav(const Wav& wav) {
+  std::string out = "RIFF";
+  PutLe(&out, static_cast<std::uint32_t>(36 + wav.pcm.size()), 4);
+  out += "WAVEfmt ";
+  PutLe(&out, 16, 4);
+  PutLe(&out, 1, 2);
+  PutLe(&out, static_cast<std::uint32_t>(wav.channels), 2);
+  PutLe(&out, static_cast<std::uint32_t>(wav.sample_rate), 4);
+  PutLe(&out, static_cast<std::uint32_t>(wav.sample_rate * wav.channels * 2),
+        4);
+  PutLe(&out, static_cast<std::uint32_t>(wav.channels * 2), 2);
+  PutLe(&out, 16, 2);
+  out += "data";
+  PutLe(&out, static_cast<std::uint32_t>(wav.pcm.size()), 4);
+  out += wav.pcm;
+  return out;
+}
+
+std::optional<std::string> JoinWavs(const std::vector<std::string>& parts,
+                                    double pause_seconds) {
+  if (parts.empty())
+    return std::nullopt;
+  Wav joined;
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    auto wav = ParseWav(parts[i]);
+    if (!wav)
+      return std::nullopt;
+    if (i == 0) {
+      joined.sample_rate = wav->sample_rate;
+      joined.channels = wav->channels;
+    } else {
+      if (wav->sample_rate != joined.sample_rate ||
+          wav->channels != joined.channels)
+        return std::nullopt;
+      const auto frames = static_cast<std::size_t>(
+          std::lround(std::max(0.0, pause_seconds) * joined.sample_rate));
+      joined.pcm.append(frames * 2 * joined.channels, '\0');
+    }
+    joined.pcm += wav->pcm;
+  }
+  return BuildWav(joined);
 }
 
 bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
@@ -761,6 +1007,7 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
   }
   // 2. Each output node is fed by exactly one generator.
   std::map<std::string, std::size_t> task_of;
+  std::map<std::size_t, std::optional<int>> rife_of;
   bool any_output = false;
   try {
     for (const auto& [id, node] : prompt.members()) {
@@ -799,7 +1046,9 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
         Task task;
         task.node_id = generator;
         task.class_type = graph.Class(generator);
-        if (tts) {
+        if (tts && task.class_type == "FB_Qwen3TTSDialogueInference") {
+          task.spec = BuildDialogue(graph, generator, models, &plan->warnings);
+        } else if (tts) {
           task.spec = BuildSpeech(graph, generator, models, &plan->warnings);
         } else {
           const Link latent = graph.RequireLink(generator, "latent_image");
@@ -816,13 +1065,66 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
         plan->tasks.push_back(std::move(task));
       }
       Task& task = plan->tasks[found->second];
-      const bool speech = std::holds_alternative<SpeechTask>(task.spec);
+      const bool speech = std::holds_alternative<SpeechTask>(task.spec) ||
+                          std::holds_alternative<DialogueTask>(task.spec);
       const bool image = std::holds_alternative<ImageTask>(task.spec);
       if ((speech && target.kind != OutputKind::kAudio) ||
           (image && target.kind != OutputKind::kImage))
         throw NodeFailure(
             id, "unsupported_link",
             cls + " cannot store the output of " + task.class_type);
+      // RIFE VFI between the video decode and this output: gufo
+      // interpolates the whole video job (gufo.interpolate).
+      std::vector<std::string> rife;
+      for (const std::string& node_id : upstream)
+        if (graph.Class(node_id) == "RIFE VFI")
+          rife.push_back(node_id);
+      int multiplier = 1;
+      if (!rife.empty()) {
+        if (!std::holds_alternative<VideoTask>(task.spec))
+          throw NodeFailure(rife.front(), "unsupported_link",
+                            "RIFE VFI is served only after an H3 or Wan video "
+                            "in the same workflow");
+        if (rife.size() > 1)
+          throw NodeFailure(rife.back(), "unsupported_link",
+                            "chained RIFE VFI nodes are not supported");
+        multiplier = static_cast<int>(graph.Num(rife.front(), "multiplier", 2));
+        if (multiplier < 1 || multiplier > 8)
+          throw NodeFailure(rife.front(), "unsupported_value",
+                            "gufo interpolates with a multiplier of 1..8");
+        const std::string ckpt = graph.Str(rife.front(), "ckpt_name", "");
+        if (!ckpt.empty() && ckpt != "rife47.pth")
+          plan->warnings.push_back("node " + rife.front() +
+                                   ": gufo runs RIFE "
+                                   "4.7 instead of " +
+                                   ckpt);
+        if (graph.Num(rife.front(), "scale_factor", 1.0) != 1.0)
+          plan->warnings.push_back("node " + rife.front() +
+                                   ": scale_factor is ignored");
+      }
+      // The audio track is not interpolated, so audio outputs do not count.
+      auto* video = std::get_if<VideoTask>(&task.spec);
+      if (video != nullptr && target.kind != OutputKind::kAudio) {
+        auto& seen = rife_of[found->second];
+        if (seen && *seen != multiplier)
+          throw NodeFailure(id, "unsupported_link",
+                            "outputs of one video need the same RIFE "
+                            "interpolation (gufo interpolates the whole job)");
+        seen = multiplier;
+        video->interpolate = multiplier;
+        video->fps = 24 * multiplier;
+        if (target.kind == OutputKind::kVideo) {
+          // CreateVideo's fps sets the playback speed; gufo keeps real time.
+          for (const std::string& node_id : upstream)
+            if (graph.Class(node_id) == "CreateVideo" &&
+                graph.Num(node_id, "fps", video->fps) != video->fps)
+              plan->warnings.push_back(
+                  "node " + node_id + ": fps " +
+                  std::to_string(graph.Num(node_id, "fps", 0)) +
+                  " ignored; gufo writes " + std::to_string(video->fps) +
+                  " fps at the original speed");
+        }
+      }
       task.outputs.push_back(std::move(target));
     }
   } catch (const NodeFailure& failure) {

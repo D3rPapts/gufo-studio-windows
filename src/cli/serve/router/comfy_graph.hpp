@@ -67,9 +67,13 @@ enum class SizeSource {
 struct ImageTask {
   std::string model;
   std::string prompt;
-  std::string negative_prompt;  // not sent: gufo Qwen-Image has none
+  std::string negative_prompt;  // gufo.negative_prompt
   std::uint64_t seed{0};
   int steps{0};
+  std::optional<double> guidance;  // KSampler cfg -> gufo.guidance
+  /// denoise < 1: image to image from `init_image` with gufo.strength.
+  std::optional<double> strength;
+  FileRef init_image;
   SizeSource size_source{SizeSource::kSquare};
   int width{0};
   int height{0};
@@ -92,6 +96,14 @@ struct SpeechTask {
   json::Value sampling = json::Value::object();  // extra sampling fields
 };
 
+/// FB_Qwen3TTSDialogueInference: "Role: text" lines, each spoken with the
+/// role's clone reference (FB_Qwen3TTSRoleBank) and joined with silence.
+struct DialogueTask {
+  std::vector<SpeechTask> lines;  // one clone request per script line
+  double pause_seconds{0.5};      // silence between lines
+  bool merge{true};               // false: one output file per line
+};
+
 enum class VideoFamily { kH3, kWan };
 
 struct VideoTask {
@@ -110,6 +122,7 @@ struct VideoTask {
   std::string lora;
   std::optional<double> lora_strength;
   int fps{24};
+  int interpolate{1};  // RIFE multiplier from a "RIFE VFI" node (gufo 1..8)
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds
@@ -119,7 +132,7 @@ json::Value VideoRequestBody(const VideoTask& task);
 struct Task {
   std::string node_id;  // the sampler / TTS node producing the media
   std::string class_type;
-  std::variant<ImageTask, SpeechTask, VideoTask> spec;
+  std::variant<ImageTask, SpeechTask, VideoTask, DialogueTask> spec;
   std::vector<OutputTarget> outputs;
 };
 
@@ -174,6 +187,22 @@ bool ParseMultipart(std::string_view content_type, std::string_view body,
                     std::vector<MultipartPart>* parts, std::string* error);
 std::string BuildMultipart(const std::vector<MultipartPart>& parts,
                            std::string_view boundary);
+
+/// The "gufo" extension object for an image request (negative prompt,
+/// guidance, strength); empty when there is nothing to send.
+json::Value ImageExtension(const ImageTask& task);
+
+/// 16-bit PCM WAV pieces for joining dialogue lines.
+struct Wav {
+  int sample_rate{0};
+  int channels{0};
+  std::string pcm;  // interleaved little-endian int16
+};
+std::optional<Wav> ParseWav(std::string_view bytes);
+std::string BuildWav(const Wav& wav);
+/// Joins `parts` (same format) with `pause_seconds` of silence between them.
+std::optional<std::string> JoinWavs(const std::vector<std::string>& parts,
+                                    double pause_seconds);
 
 /// ComfyUI output naming: prefix "a/b/c" -> subfolder "a/b", base "c".
 struct SaveName {
