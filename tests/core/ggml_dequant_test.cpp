@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <numeric>
@@ -284,7 +285,13 @@ void TestQ5_K() {
       gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kQ8_0, 32) != 34 ||
       gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kF32, 8) != 32 ||
       gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kBF16, 8) != 16 ||
-      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kQ8_K, 256) != 292) {
+      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kQ8_K, 256) != 292 ||
+      // Routed-expert formats of the unsloth UD-Q3_K_XL Flash-Next GGUF.
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ3_XXS, 512) !=
+          196 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ4_XS, 256) !=
+          136 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kIQ4_NL, 64) != 36) {
     std::cerr << "Assertion failed: QuantizedRowBytes contract\n";
     std::exit(1);
   }
@@ -447,6 +454,28 @@ void TestModelRows(const std::filesystem::path& model_path) {
                5120, kQ6Samples, 0.5780322588980198);
 }
 
+// IQ3_XXS (unsloth UD-Q3_K_XL Flash-Next gate/up experts), hand-decoded from
+// dequantize_row_iq3_xxs: grid entry 0 is four 4s and entry 1 packs
+// {20, 4, 4, 4}; the first sub-block's word carries scale 2 (db = 1.25) and
+// sign code 1, which with its even-parity bit negates elements 0 and 7.
+void TestIQ3_XXS() {
+  gufo::quant::block_iq3_xxs block{};
+  block.d = 0x3C00;  // fp16 1.0
+  block.qs[1] = 1;
+  const std::uint32_t word = (2U << 28U) | 1U;
+  std::memcpy(block.qs + 64, &word, sizeof(word));
+  std::array<float, 256> actual{};
+  gufo::quant::DequantizeIQ3_XXS(&block, actual.data(), actual.size());
+  const float first[8] = {-5.0F, 5.0F, 5.0F, 5.0F, 25.0F, 5.0F, 5.0F, -5.0F};
+  for (std::size_t i = 0; i < 8; ++i) {
+    ExpectNear(actual[i], first[i], "IQ3_XXS signed grid value");
+  }
+  ExpectNear(actual[8], 5.0F, "IQ3_XXS sub-block scale");
+  // Later sub-blocks: scale 0 gives db = 0.25 over grid entry 0.
+  ExpectNear(actual[32], 1.0F, "IQ3_XXS zero scale word");
+  ExpectNear(actual[255], 1.0F, "IQ3_XXS last element");
+}
+
 }  // namespace
 
 int main() {
@@ -456,6 +485,7 @@ int main() {
   TestQ8();
   TestQ8_0();
   TestQ5_K();
+  TestIQ3_XXS();
   if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     TestModelRows(model);
