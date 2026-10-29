@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
-#include <thread>
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
@@ -13,6 +12,7 @@ namespace {
 
 constexpr std::size_t kEventsKept = 20;
 constexpr std::chrono::seconds kSaveInterval{30};
+constexpr std::chrono::seconds kReleaseWait{30};
 
 double Round1(std::int64_t bytes) {
   return std::round(ToGb(bytes) * 10.0) / 10.0;
@@ -135,56 +135,63 @@ AdmissionPlan Residency::PlanFor(
     const WorkerPids& pids) {
   const std::lock_guard<std::mutex> lock(mutex_);
   SampleLocked(pids);
+  // A stopped worker returns its GPU memory with a delay (seconds after a
+  // kill mid-load): plan only on settled numbers, or a second eviction would
+  // follow the first for nothing.
+  if (const std::string waiting = PendingReleaseLocked(); !waiting.empty()) {
+    AdmissionPlan plan;
+    plan.action = AdmissionPlan::Action::kWait;
+    plan.reason = "waiting until " + waiting + " has returned its memory";
+    return plan;
+  }
   bool exclusive = false;
   const MemoryNeed need = book_.Need(id, options_.policy.factor, &exclusive);
   return PlanAdmission(system_, ViewsLocked(residents), id, need, exclusive,
                        options_.policy);
 }
 
-Residency::ReleaseTicket Residency::BeginRelease(
-    const std::vector<std::string>& ids) {
+void Residency::NoteStopping(std::string_view id) {
   const std::lock_guard<std::mutex> lock(mutex_);
-  ReleaseTicket ticket;
-  ticket.gpu_free_before = system_.DedicatedFree() + system_.SharedFree();
-  ticket.host_free_before = system_.host_available;
-  for (const auto& id : ids) {
-    if (const auto it = current_.find(id); it != current_.end()) {
-      ticket.gpu_expected += it->second.Gpu();
-      ticket.host_expected +=
-          it->second.host_working_set + it->second.gpu_shared;
-    }
+  const auto it = current_.find(id);
+  if (it == current_.end() || !it->second.valid) {
+    return;
   }
-  return ticket;
+  Release release;
+  release.id = std::string(id);
+  release.gpu_free_before = system_.DedicatedFree() + system_.SharedFree();
+  release.host_free_before = system_.host_available;
+  release.gpu_expected = it->second.Gpu();
+  release.host_expected = it->second.host_working_set + it->second.gpu_shared;
+  release.until = Clock::now() + kReleaseWait;
+  releases_.push_back(std::move(release));
 }
 
-void Residency::AwaitRelease(const ReleaseTicket& ticket,
-                             std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  for (;;) {
-    SystemMemory now;
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      system_ = probe_->System();
-      now = system_;
-    }
-    const bool gpu_back =
-        !now.gpu_valid ||
-        now.DedicatedFree() + now.SharedFree() >=
-            ticket.gpu_free_before + ticket.gpu_expected * 7 / 10;
+std::string Residency::PendingReleaseLocked() {
+  const auto now = Clock::now();
+  std::string waiting;
+  for (auto it = releases_.begin(); it != releases_.end();) {
+    // Most of the stopped worker's memory is free again, or we gave up.
+    const bool gpu_back = !system_.gpu_valid ||
+                          system_.DedicatedFree() + system_.SharedFree() >=
+                              it->gpu_free_before + it->gpu_expected * 7 / 10;
     const bool host_back =
-        !now.host_valid || now.host_available >= ticket.host_free_before +
-                                                     ticket.host_expected / 2;
-    if ((gpu_back && host_back) || Clock::now() >= deadline) {
+        !system_.host_valid ||
+        system_.host_available >= it->host_free_before + it->host_expected / 2;
+    if ((gpu_back && host_back) || now >= it->until) {
       server::Logger::Info(
           "router",
-          std::string("event=memory_released complete=") +
+          "event=memory_released model=" + it->id + " complete=" +
               (gpu_back && host_back ? "yes" : "timeout") + " gpu_free_gb=" +
-              std::to_string(ToGb(now.DedicatedFree() + now.SharedFree())) +
-              " host_free_gb=" + std::to_string(ToGb(now.host_available)));
-      return;
+              std::to_string(
+                  ToGb(system_.DedicatedFree() + system_.SharedFree())) +
+              " host_free_gb=" + std::to_string(ToGb(system_.host_available)));
+      it = releases_.erase(it);
+    } else {
+      waiting += (waiting.empty() ? "" : ", ") + it->id;
+      ++it;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
+  return waiting;
 }
 
 void Residency::Sample(const WorkerPids& pids) {

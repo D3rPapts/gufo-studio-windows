@@ -77,6 +77,20 @@ bool Fits(const Room& room, const MemoryNeed& need,
   return room.host - policy.reserve_host - spill >= need.host;
 }
 
+/// True when even an empty machine could not give `need` (estimate larger
+/// than the hardware): waiting would never end, so such a model may start
+/// alone and the watchdog guards it.
+bool NeverFits(const SystemMemory& system, const MemoryNeed& need,
+               const MemoryPolicy& policy) {
+  if (system.gpu_valid && system.gpu_dedicated_total + system.gpu_shared_total -
+                                  policy.reserve_gpu <
+                              need.gpu) {
+    return true;
+  }
+  return system.host_valid &&
+         system.host_total - policy.reserve_host < need.host;
+}
+
 std::string Gb(std::int64_t bytes) {
   std::ostringstream out;
   out.setf(std::ios::fixed);
@@ -160,9 +174,21 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
       return plan;
     }
     const Room room = Project(system, {}, {});
+    const bool fits = Fits(room, need, policy);
+    if (!fits && !NeverFits(system, need, policy)) {
+      plan.action = AdmissionPlan::Action::kWait;
+      plan.reason =
+          "exclusive, not enough free memory yet (held outside "
+          "the router or still being released); " +
+          RoomText(room);
+      return plan;
+    }
     plan.action = AdmissionPlan::Action::kSpawn;
-    plan.alone = !Fits(room, need, policy);
-    plan.reason = "exclusive, alone; " + RoomText(room);
+    plan.alone = !fits;
+    plan.reason = std::string(fits ? "exclusive, fits; "
+                                   : "exclusive, alone (estimate exceeds the "
+                                     "machine); ") +
+                  RoomText(room);
     return plan;
   }
 
@@ -215,11 +241,25 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
                   " GB host; after eviction " + RoomText(room);
     return plan;
   }
+  if (!fits && !NeverFits(system, need, policy)) {
+    // Nothing of ours is left to evict: the memory is held by other
+    // processes or a stopped worker has not returned it yet. Wait (the
+    // request's load timeout bounds this) instead of over-committing.
+    plan.action = AdmissionPlan::Action::kWait;
+    plan.reason =
+        "not enough free memory yet (held outside the router or "
+        "still being released); need " +
+        Gb(need.gpu) + " GB gpu + " + Gb(need.host) + " GB host; " +
+        RoomText(room);
+    return plan;
+  }
   plan.action = AdmissionPlan::Action::kSpawn;
   plan.alone = !fits;
-  plan.reason = std::string(fits ? "fits" : "alone") + "; need " +
-                Gb(need.gpu) + " GB gpu + " + Gb(need.host) + " GB host; " +
-                RoomText(room);
+  plan.reason = std::string(fits ? "fits"
+                                 : "alone (estimate exceeds the "
+                                   "machine)") +
+                "; need " + Gb(need.gpu) + " GB gpu + " + Gb(need.host) +
+                " GB host; " + RoomText(room);
   return plan;
 }
 

@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <cwctype>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -61,6 +62,14 @@ std::vector<std::pair<std::wstring, std::int64_t>> ReadArray(
     values.emplace_back(items[i].szName, items[i].FmtValue.largeValue);
   }
   return values;
+}
+
+std::string Narrow(const std::wstring& text) {
+  std::string out;
+  for (const wchar_t c : text) {
+    out.push_back(c < 128 ? static_cast<char>(c) : '?');
+  }
+  return out;
 }
 
 class WindowsMemoryProbe final : public MemoryProbe {
@@ -107,12 +116,40 @@ public:
       memory.host_total = static_cast<std::int64_t>(status.ullTotalPhys);
       memory.host_available = static_cast<std::int64_t>(status.ullAvailPhys);
     }
-    if (query_ == nullptr || dedicated_total_ <= 0 ||
-        PdhCollectQueryData(query_) != ERROR_SUCCESS) {
+    if (query_ == nullptr || dedicated_total_ <= 0) {
+      diag_ = query_ == nullptr ? "pdh query unavailable" : "no dxgi adapter";
       return memory;
     }
+    const PDH_STATUS collected = PdhCollectQueryData(query_);
+    if (collected != ERROR_SUCCESS) {
+      diag_ = "PdhCollectQueryData failed " + std::to_string(collected);
+      return memory;
+    }
+    const auto dedicated = ReadArray(adapter_dedicated_);
     bool found = false;
-    for (const auto& [name, value] : ReadArray(adapter_dedicated_)) {
+    for (const auto& [name, value] : dedicated) {
+      found = found || MatchesAdapter(name);
+    }
+    if (!found && !dedicated.empty()) {
+      // The DXGI LUID did not match any counter instance: fall back to the
+      // adapter with the most dedicated memory in use (the real GPU).
+      const auto* best = &dedicated.front();
+      for (const auto& item : dedicated) {
+        if (item.second > best->second) {
+          best = &item;
+        }
+      }
+      const auto phys = best->first.find(L"phys");
+      diag_ = "dxgi luid " + Narrow(luid_) + " not among " +
+              std::to_string(dedicated.size()) + " instances; using " +
+              Narrow(best->first);
+      luid_ = best->first.substr(0, phys);
+    }
+    if (dedicated.empty()) {
+      diag_ = "no GPU Adapter Memory instances";
+    }
+    found = false;
+    for (const auto& [name, value] : dedicated) {
       if (MatchesAdapter(name)) {
         memory.gpu_dedicated_used += value;
         found = true;
@@ -127,6 +164,13 @@ public:
     memory.gpu_dedicated_total = dedicated_total_;
     memory.gpu_shared_total = shared_total_;
     return memory;
+  }
+
+  std::string Describe() override {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return "adapter " + Narrow(luid_) + " dedicated " +
+           std::to_string(dedicated_total_) + " shared " +
+           std::to_string(shared_total_) + (diag_.empty() ? "" : "; " + diag_);
   }
 
   std::map<std::uint32_t, ProcessMemory> Processes(
@@ -208,8 +252,23 @@ private:
     factory->Release();
   }
 
+  /// PDH spells the LUID hex digits in upper case inside a process (Get-Counter
+  /// shows lower case), so compare case-insensitively.
   [[nodiscard]] bool MatchesAdapter(const std::wstring& instance) const {
-    return !luid_.empty() && instance.find(luid_) != std::wstring::npos;
+    if (luid_.empty() || instance.size() < luid_.size()) {
+      return false;
+    }
+    for (std::size_t start = 0; start + luid_.size() <= instance.size();
+         ++start) {
+      bool same = true;
+      for (std::size_t i = 0; same && i < luid_.size(); ++i) {
+        same = std::towlower(instance[start + i]) == std::towlower(luid_[i]);
+      }
+      if (same) {
+        return true;
+      }
+    }
+    return false;
   }
 
   std::mutex mutex_;
@@ -221,6 +280,7 @@ private:
   std::int64_t dedicated_total_{0};
   std::int64_t shared_total_{0};
   std::wstring luid_;
+  std::string diag_;
 };
 
 }  // namespace

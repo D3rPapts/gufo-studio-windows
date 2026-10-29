@@ -56,6 +56,8 @@ public:
   /// Usage per pid; pids that cannot be read are missing from the map.
   virtual std::map<std::uint32_t, ProcessMemory> Processes(
       const std::vector<std::uint32_t>& pids) = 0;
+  /// Adapter and counter diagnostics for --memory-report.
+  virtual std::string Describe() { return {}; }
 };
 
 /// DXGI + PDH + psapi on Windows; host-only (/proc/meminfo) elsewhere.
@@ -105,7 +107,11 @@ struct AdmissionPlan {
 ///  - otherwise idle, fully loaded residents are evicted least recently used
 ///    first until it fits; busy or loading residents are never evicted (wait);
 ///  - an exclusive candidate evicts every idle resident and waits for the
-///    rest; an exclusive resident blocks every other model the same way.
+///    rest; an exclusive resident blocks every other model the same way;
+///  - when nothing of ours is left to evict and it still does not fit
+///    (memory held by other processes, or not yet returned by a stopped
+///    worker), wait; only a need larger than the whole machine starts
+///    alone.
 AdmissionPlan PlanAdmission(const SystemMemory& system,
                             const std::vector<ResidentView>& residents,
                             std::string_view id, const MemoryNeed& need,

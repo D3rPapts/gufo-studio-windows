@@ -860,7 +860,6 @@ private:
                        ")");
       return Gate::kSpawn;
     }
-    const auto ticket = residency->BeginRelease(plan.evict);
     for (const auto& victim : plan.evict) {
       // The plan was made under the lock, but each stop releases it: a
       // victim that became busy or reloads meanwhile stays; the next plan
@@ -879,14 +878,6 @@ private:
                        plan.reason + ")");
       StopLocked(victim);
     }
-    mutex.unlock();
-    try {
-      residency->AwaitRelease(ticket, std::chrono::seconds(5));
-    } catch (...) {
-      mutex.lock();
-      throw;
-    }
-    mutex.lock();
     return Gate::kEvicted;
   }
 
@@ -967,6 +958,9 @@ private:
       return;
     }
     stopping.insert(id);
+    if (residency != nullptr) {
+      residency->NoteStopping(id);
+    }
     mutex.unlock();
     try {
       worker->Stop();
@@ -1373,6 +1367,7 @@ int RunRouter(std::span<const char* const> args) {
     report["gpu_shared_used_gb"] = router::ToGb(memory.gpu_shared_used);
     report["host_total_gb"] = router::ToGb(memory.host_total);
     report["host_available_gb"] = router::ToGb(memory.host_available);
+    report["probe"] = probe->Describe();
     std::cout << report.dump() << "\n";
     return 0;
   }

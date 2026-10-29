@@ -52,19 +52,9 @@ public:
                         const std::vector<Registry::ResidentEntry>& residents,
                         const WorkerPids& pids);
 
-  /// Free GPU+host before an eviction and what the evicted workers held.
-  struct ReleaseTicket {
-    std::int64_t gpu_free_before{0};
-    std::int64_t host_free_before{0};
-    std::int64_t gpu_expected{0};
-    std::int64_t host_expected{0};
-  };
-  [[nodiscard]] ReleaseTicket BeginRelease(const std::vector<std::string>& ids);
-  /// Polls until most of the evicted memory shows up as free again (the
-  /// driver returns it shortly after process exit) or `timeout` passes.
-  /// Call without the router mutex.
-  void AwaitRelease(const ReleaseTicket& ticket,
-                    std::chrono::milliseconds timeout);
+  /// Call before stopping a worker: admissions wait until most of its
+  /// measured memory shows up as free again (at most 30 s).
+  void NoteStopping(std::string_view id);
 
   /// Samples system + worker memory and updates learned peaks (saved to the
   /// memory file at most every 30 s while growing). Call without the router
@@ -96,6 +86,18 @@ private:
       const std::vector<Registry::ResidentEntry>& residents) const;
   void SampleLocked(const WorkerPids& pids);
   void SaveLocked(bool force);
+  /// Drops settled releases; ids still being released, comma separated.
+  std::string PendingReleaseLocked();
+
+  struct Release {
+    std::string id;
+    std::int64_t gpu_free_before{0};
+    std::int64_t host_free_before{0};
+    std::int64_t gpu_expected{0};
+    std::int64_t host_expected{0};
+    Clock::time_point until{};
+  };
+  std::vector<Release> releases_;
 
   ResidencyOptions options_;
   std::unique_ptr<MemoryProbe> probe_;

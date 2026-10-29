@@ -187,11 +187,19 @@ void TestExclusiveResident() {
   CHECK(plan.action == Action::kWait);
 }
 
-void TestAloneWhenNothingToEvict() {
-  // The desktop holds a lot: nothing of ours is resident, so start anyway
-  // (the watchdog still guards), flagged alone.
-  const auto plan = PlanAdmission(Machine(20, 10, 10), {}, "image", Need(30),
-                                  false, MemoryPolicy{});
+void TestWaitWhenMemoryHeldOutside() {
+  // Another process (or a stopped worker that has not returned its memory
+  // yet) holds a lot and nothing of ours is resident: wait, do not
+  // over-commit.
+  auto plan = PlanAdmission(Machine(20, 10, 10), {}, "image", Need(30), false,
+                            MemoryPolicy{});
+  CHECK(plan.action == Action::kWait);
+  plan = PlanAdmission(Machine(20, 10, 10), {}, "h3", Need(30), true,
+                       MemoryPolicy{});
+  CHECK(plan.action == Action::kWait);
+  // A need larger than the whole machine would wait forever: start alone.
+  plan = PlanAdmission(Machine(20, 10, 10), {}, "huge", Need(50), false,
+                       MemoryPolicy{});
   CHECK(plan.action == Action::kSpawn);
   CHECK(plan.alone);
 }
@@ -211,8 +219,7 @@ void TestSpillCountsAgainstHost() {
   // of host RAM, which then is too small.
   const auto plan = PlanAdmission(Machine(29, 0, 12), {}, "big", Need(10, 1),
                                   false, MemoryPolicy{});
-  CHECK(plan.action == Action::kSpawn);
-  CHECK(plan.alone);
+  CHECK(plan.action == Action::kWait);
   const auto fits = PlanAdmission(Machine(29, 0, 20), {}, "big", Need(10, 1),
                                   false, MemoryPolicy{});
   CHECK(fits.action == Action::kSpawn);
@@ -346,7 +353,7 @@ int main() {
   TestUnmeasuredResidentCountsFullNeed();
   TestExclusiveCandidate();
   TestExclusiveResident();
-  TestAloneWhenNothingToEvict();
+  TestWaitWhenMemoryHeldOutside();
   TestHostLimit();
   TestSpillCountsAgainstHost();
   TestWatchdog();
