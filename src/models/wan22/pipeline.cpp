@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -14,6 +15,7 @@
 #include "src/models/wan22/text_encoder.hpp"
 #include "src/models/wan22/tokenizer.hpp"
 #include "src/models/wan22/transformer.hpp"
+#include "src/models/wan22/vae.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -76,7 +78,103 @@ bool EncodeText(const Tokenizer& tokenizer, TextEncoder& encoder,
   return true;
 }
 
+double Lanczos3(double x) {
+  x = std::abs(x);
+  if (x < 1e-9)
+    return 1.0;
+  if (x >= 3.0)
+    return 0.0;
+  const double pi = 3.141592653589793;
+  return 3.0 * std::sin(pi * x) * std::sin(pi * x / 3.0) / (pi * pi * x * x);
+}
+
+// Resampling weights of `out` samples covering the source window
+// [offset, offset + extent) of `size` samples (PIL-style support scaling).
+struct Taps {
+  std::vector<int> first, count;
+  std::vector<double> weights;  // [out, stride]
+  int stride{0};
+};
+
+Taps BuildTaps(int size, int out, double offset, double extent) {
+  const double scale = extent / out;
+  const double support = 3.0 * std::max(scale, 1.0);
+  Taps taps;
+  taps.stride = static_cast<int>(std::ceil(support)) * 2 + 1;
+  taps.first.resize(out);
+  taps.count.resize(out);
+  taps.weights.assign(static_cast<std::size_t>(out) * taps.stride, 0.0);
+  for (int i = 0; i < out; ++i) {
+    const double center = offset + (i + 0.5) * scale;
+    const int lower = std::max(0, static_cast<int>(center - support));
+    const int upper = std::min(size, static_cast<int>(center + support) + 1);
+    double sum = 0;
+    int n = 0;
+    for (int j = lower; j < upper && n < taps.stride; ++j, ++n) {
+      const double w = Lanczos3((j + 0.5 - center) / std::max(scale, 1.0));
+      taps.weights[static_cast<std::size_t>(i) * taps.stride + n] = w;
+      sum += w;
+    }
+    for (int k = 0; k < n && sum != 0; ++k)
+      taps.weights[static_cast<std::size_t>(i) * taps.stride + k] /= sum;
+    taps.first[i] = lower;
+    taps.count[i] = n;
+  }
+  return taps;
+}
+
 }  // namespace
+
+std::vector<std::uint8_t> FitImage(std::span<const std::uint8_t> rgb,
+                                   int source_width, int source_height,
+                                   int width, int height) {
+  if (source_width <= 0 || source_height <= 0 || width <= 0 || height <= 0 ||
+      rgb.size() != static_cast<std::size_t>(source_width) * source_height * 3)
+    return {};
+  if (source_width == width && source_height == height)
+    return {rgb.begin(), rgb.end()};
+  // Cover the canvas; the centred crop is a source window of the image.
+  const double scale = std::max(static_cast<double>(width) / source_width,
+                                static_cast<double>(height) / source_height);
+  const double window_width = width / scale, window_height = height / scale;
+  const Taps columns = BuildTaps(
+      source_width, width, (source_width - window_width) / 2, window_width);
+  const Taps rows =
+      BuildTaps(source_height, height, (source_height - window_height) / 2,
+                window_height);
+  std::vector<double> horizontal(static_cast<std::size_t>(source_height) *
+                                 width * 3);
+  for (int y = 0; y < source_height; ++y)
+    for (int x = 0; x < width; ++x)
+      for (int c = 0; c < 3; ++c) {
+        double sum = 0;
+        for (int k = 0; k < columns.count[x]; ++k)
+          sum +=
+              columns
+                  .weights[static_cast<std::size_t>(x) * columns.stride + k] *
+              rgb[(static_cast<std::size_t>(y) * source_width +
+                   columns.first[x] + k) *
+                      3 +
+                  c];
+        horizontal[(static_cast<std::size_t>(y) * width + x) * 3 + c] = sum;
+      }
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(width) * height * 3);
+  for (int y = 0; y < height; ++y)
+    for (int x = 0; x < width; ++x)
+      for (int c = 0; c < 3; ++c) {
+        double sum = 0;
+        for (int k = 0; k < rows.count[y]; ++k)
+          sum +=
+              rows.weights[static_cast<std::size_t>(y) * rows.stride + k] *
+              horizontal[(static_cast<std::size_t>(rows.first[y] + k) * width +
+                          x) *
+                             3 +
+                         c];
+        out[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+            static_cast<std::uint8_t>(std::clamp(std::lround(sum), 0L, 255L));
+      }
+  return out;
+}
 
 bool ValidateVideoShape(int width, int height, int frames, std::string* error) {
   if (width < 32 || height < 32 || width % 32 != 0 || height % 32 != 0 ||
@@ -177,7 +275,44 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
     return false;
   }
 
-  // 2. Denoising loop.
+  // 2. Image-to-video: the first frame as a normalized latent frame.
+  const std::size_t plane =
+      static_cast<std::size_t>(latent_height) * latent_width;
+  std::vector<float> condition;
+  if (!request.first_frame.empty()) {
+    const auto clock = Clock::now();
+    if (request.first_frame.size() !=
+        static_cast<std::size_t>(request.width) * request.height * 3) {
+      SetError(error, "first frame does not match the video size");
+      return false;
+    }
+    progress("image", 0, 1);
+    auto encoder = VaeEncoder::Load(request.model_root / "vae", error);
+    if (!encoder)
+      return false;
+    std::vector<float> rgb(request.first_frame.size());
+    for (std::size_t i = 0; i < rgb.size(); ++i)
+      rgb[i] =
+          static_cast<float>(request.first_frame[i]) / 255.0F * 2.0F - 1.0F;
+    if (!encoder->Encode(rgb, request.height, request.width, true, &condition,
+                         error))
+      return false;
+    TrackDevice(&t.peak_device_bytes);
+    progress("image", 1, 1);
+    t.image_ms = Milliseconds(clock);
+  }
+  // latents[c, 0] = condition[c] (the (1 - mask) * condition + mask *
+  // latents blend of the pipeline, mask 0 on the first latent frame).
+  const auto blend_first_frame = [&](std::vector<float>& values) {
+    if (condition.empty())
+      return;
+    for (int c = 0; c < VaeDecoder::kLatentChannels; ++c)
+      std::copy_n(
+          condition.begin() + c * plane, plane,
+          values.begin() + static_cast<std::size_t>(c) * latent_frames * plane);
+  };
+
+  // 3. Denoising loop.
   std::vector<float> latents =
       request.noise.empty()
           ? GaussianNoise(latent_count, request.seed)
@@ -191,6 +326,18 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
     t.transformer_load_ms = Milliseconds(clock);
     UniPcScheduler scheduler(*scheduler_config, request.steps);
     const bool guided = request.guidance > 1.0F;
+    // The text-dependent part of the transformer is the same in every step.
+    const int text_rows = static_cast<int>(TextEncoder::kMaxTokens);
+    if (!transformer->PrepareText(0, text, text_rows, error) ||
+        (guided && !transformer->PrepareText(1, negative, text_rows, error)))
+      return false;
+    std::vector<float>().swap(text);
+    std::vector<float>().swap(negative);
+    // Per-token timesteps: the conditioned first frame stays at t = 0.
+    const std::size_t tokens = static_cast<std::size_t>(latent_frames) *
+                               (latent_height / 2) * (latent_width / 2);
+    const std::size_t frame_tokens = tokens / latent_frames;
+    std::vector<float> timesteps(condition.empty() ? 1 : tokens, 0.0F);
     std::vector<float> cond, uncond, input(latent_count);
     clock = Clock::now();
     progress("denoiser", 0, request.steps);
@@ -200,25 +347,41 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
         return false;
       }
       const auto step_clock = Clock::now();
+      if (callbacks.before_step)
+        callbacks.before_step(step, latents);
       // The transformer runs in BF16: latents.to(bfloat16).
       for (std::size_t i = 0; i < latent_count; ++i)
         input[i] = Bf16(latents[i]);
+      blend_first_frame(input);
+      if (!condition.empty())
+        for (int c = 0; c < VaeDecoder::kLatentChannels; ++c)
+          for (std::size_t i = 0; i < plane; ++i) {
+            float& value =
+                input[static_cast<std::size_t>(c) * latent_frames * plane + i];
+            value = Bf16(value);
+          }
       const float timestep = static_cast<float>(
           scheduler.timesteps()[static_cast<std::size_t>(step)]);
+      std::fill(timesteps.begin() + static_cast<std::ptrdiff_t>(
+                                        condition.empty() ? 0 : frame_tokens),
+                timesteps.end(), timestep);
       TransformerInput in;
       in.latent = input;
       in.frames = latent_frames;
       in.height = latent_height;
       in.width = latent_width;
-      in.timesteps = std::span<const float>(&timestep, 1);
-      in.text = text;
-      in.text_rows = static_cast<int>(TextEncoder::kMaxTokens);
+      in.timesteps = timesteps;
+      in.text_slot = 0;
+      auto forward_clock = Clock::now();
       if (!transformer->Forward(in, &cond, nullptr, error))
         return false;
+      t.forward_ms.push_back(Milliseconds(forward_clock));
       if (guided) {
-        in.text = negative;
+        in.text_slot = 1;
+        forward_clock = Clock::now();
         if (!transformer->Forward(in, &uncond, nullptr, error))
           return false;
+        t.forward_ms.push_back(Milliseconds(forward_clock));
         // noise_uncond + g * (noise_pred - noise_uncond), each op in BF16.
         for (std::size_t i = 0; i < latent_count; ++i)
           cond[i] = Bf16(uncond[i] +
@@ -226,6 +389,8 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
       }
       if (step == 0)
         TrackDevice(&t.peak_device_bytes);
+      if (callbacks.on_noise)
+        callbacks.on_noise(step, cond);
       scheduler.Step(cond, latents);
       t.step_ms.push_back(Milliseconds(step_clock));
       if (callbacks.on_step)
@@ -234,10 +399,11 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
     }
     t.denoise_ms = Milliseconds(clock);
   }
+  blend_first_frame(latents);
   if (final_latents != nullptr)
     *final_latents = latents;
 
-  // 3. VAE decode.
+  // 4. VAE decode.
   if (video != nullptr) {
     auto clock = Clock::now();
     auto vae = VaeDecoder::Load(request.model_root / "vae", error);

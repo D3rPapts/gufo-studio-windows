@@ -18,6 +18,8 @@ if (ENGINE_ENABLE_HIP)
     target_link_libraries(gufo-wan-${tool} PRIVATE gufo_wan22)
     gufo_stage_hip_runtime(gufo-wan-${tool})
   endforeach()
+  # --image reads PNG/JPEG/WebP through the core image decoder.
+  target_link_libraries(gufo-wan-video PRIVATE gufo_core)
 endif()
 
 if (BUILD_TESTING)

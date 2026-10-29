@@ -3,8 +3,9 @@
 //   gufo-wan-video --model ROOT --prompt TEXT [--negative TEXT]
 //                  [--width W] [--height H] [--frames N] [--steps S]
 //                  [--guidance G] [--seed N] [--fps N] [--out FILE.mp4]
-//                  [--oracle DIR]
+//                  [--image FILE] [--oracle DIR [--replay]]
 //   gufo-wan-video --model ROOT --vae-oracle DIR
+//   gufo-wan-video --model ROOT --encoder-oracle DIR
 //   gufo-wan-video --scheduler-oracle DIR [--model ROOT]
 //   gufo-wan-video --model ROOT --vae-bench FRAMES HEIGHT WIDTH
 //
@@ -13,6 +14,12 @@
 // tools-local/wan_pipe_oracle.py. `--scheduler-oracle` replays the reference
 // noise predictions through the UniPC scheduler (no GPU). `--vae-oracle`
 // decodes DIR/vae_in.npy and compares with the untiled DIR/vae_out.npy.
+// `--image` makes it image-to-video from FILE (PNG/JPEG/WebP, fitted to the
+// video size); with `--oracle` (tools-local/wan_i2v_oracle.py) the final
+// blended latents are compared too; `--replay` starts every step from the
+// reference sample and compares each step's guided noise prediction.
+// `--encoder-oracle` encodes DIR/enc*_in.npy and compares the posterior means
+// with DIR/enc*_mu.npy.
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/image.hpp"
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/scheduler.hpp"
 #include "src/models/wan22/vae.hpp"
@@ -238,6 +246,66 @@ int VaeOracle(const std::filesystem::path& model,
   return pass ? 0 : 1;
 }
 
+int EncoderOracle(const std::filesystem::path& model,
+                  const std::filesystem::path& dir) {
+  std::string error;
+  auto start = Clock::now();
+  auto encoder = wan22::VaeEncoder::Load(model / "vae", &error);
+  if (!encoder) {
+    std::cerr << "encoder load: " << error << "\n";
+    return 1;
+  }
+  std::cout << "encoder load " << Seconds(start) << " s, weights "
+            << encoder->weight_bytes() / 1048576.0 << " MiB\n";
+  bool pass = true;
+  for (const char* name : {"enc", "enc2"}) {
+    std::vector<float> image, reference;
+    std::vector<std::size_t> shape, reference_shape;
+    if (!ReadNpy(dir / (std::string(name) + "_in.npy"), &image, &shape) ||
+        shape.size() != 3 || shape[0] != 3 ||
+        !ReadNpy(dir / (std::string(name) + "_mu.npy"), &reference,
+                 &reference_shape)) {
+      std::cerr << "cannot read " << name << " oracle in " << dir << "\n";
+      return 1;
+    }
+    const int height = static_cast<int>(shape[1]);
+    const int width = static_cast<int>(shape[2]);
+    const std::size_t plane = static_cast<std::size_t>(height) * width;
+    std::vector<float> rgb(plane * 3);
+    for (int c = 0; c < 3; ++c)
+      for (std::size_t i = 0; i < plane; ++i)
+        rgb[i * 3 + c] = image[c * plane + i];
+    std::vector<float> latent;
+    for (int run = 0; run < 2; ++run) {
+      start = Clock::now();
+      if (!encoder->Encode(rgb, height, width, false, &latent, &error)) {
+        std::cerr << "encode: " << error << "\n";
+        return 1;
+      }
+      std::cout << name << " " << width << "x" << height << " encode run "
+                << run << ": " << Seconds(start) * 1000 << " ms, activations "
+                << encoder->activation_bytes() / 1048576.0 << " MiB\n";
+    }
+    if (latent.size() != reference.size()) {
+      std::cerr << "size mismatch " << latent.size() << " vs "
+                << reference.size() << "\n";
+      return 1;
+    }
+    const Comparison c =
+        Compare(latent.data(), reference.data(), latent.size());
+    Print(std::string(name) + "_mu", c);
+    pass = pass && c.cosine >= 0.999;
+    if (std::string(name) == "enc" &&
+        ReadNpy(dir / "condition.npy", &reference, &reference_shape) &&
+        encoder->Encode(rgb, height, width, true, &latent, &error) &&
+        latent.size() == reference.size())
+      Print("condition",
+            Compare(latent.data(), reference.data(), latent.size()));
+  }
+  std::cout << (pass ? "PASS" : "FAIL") << "\n";
+  return pass ? 0 : 1;
+}
+
 int VaeBench(const std::filesystem::path& model, int frames, int height,
              int width) {
   std::string error;
@@ -272,8 +340,10 @@ int Usage() {
   std::cerr
       << "usage: gufo-wan-video --model ROOT --prompt TEXT [--negative TEXT] "
          "[--width W] [--height H] [--frames N] [--steps S] [--guidance G] "
-         "[--seed N] [--fps N] [--out FILE.mp4] [--oracle DIR]\n"
+         "[--seed N] [--fps N] [--out FILE.mp4] [--image FILE] "
+         "[--oracle DIR [--replay]]\n"
          "       gufo-wan-video --model ROOT --vae-oracle DIR\n"
+         "       gufo-wan-video --model ROOT --encoder-oracle DIR\n"
          "       gufo-wan-video --scheduler-oracle DIR [--model ROOT]\n"
          "       gufo-wan-video --model ROOT --vae-bench FRAMES HEIGHT WIDTH\n";
   return 2;
@@ -284,6 +354,8 @@ int Usage() {
 int main(int argc, char** argv) {
   wan22::VideoRequest request;
   std::string out = "wan-video.mp4", oracle, vae_oracle, scheduler_oracle;
+  std::string image_path, encoder_oracle;
+  bool replay = false;
   int fps = 24;
   int bench[3]{};
   bool have_prompt = false;
@@ -313,10 +385,16 @@ int main(int argc, char** argv) {
       fps = std::atoi(argv[++i]);
     else if (name == "--out" && more)
       out = argv[++i];
+    else if (name == "--replay")
+      replay = true;
     else if (name == "--oracle" && more)
       oracle = argv[++i];
     else if (name == "--vae-oracle" && more)
       vae_oracle = argv[++i];
+    else if (name == "--encoder-oracle" && more)
+      encoder_oracle = argv[++i];
+    else if (name == "--image" && more)
+      image_path = argv[++i];
     else if (name == "--scheduler-oracle" && more)
       scheduler_oracle = argv[++i];
     else if (name == "--vae-bench" && i + 3 < argc)
@@ -331,6 +409,8 @@ int main(int argc, char** argv) {
     return Usage();
   if (!vae_oracle.empty())
     return VaeOracle(request.model_root, vae_oracle);
+  if (!encoder_oracle.empty())
+    return EncoderOracle(request.model_root, encoder_oracle);
   if (bench[0] > 0)
     return VaeBench(request.model_root, bench[0], bench[1], bench[2]);
   if (!have_prompt)
@@ -345,6 +425,22 @@ int main(int argc, char** argv) {
       return 1;
     }
     request.noise = noise;
+  }
+  std::vector<std::uint8_t> first_frame;
+  if (!image_path.empty()) {
+    try {
+      const auto image =
+          gufo::core::DecodeImage(gufo::core::ReadImageFile(image_path));
+      first_frame = wan22::FitImage(image.pixels, static_cast<int>(image.width),
+                                    static_cast<int>(image.height),
+                                    request.width, request.height);
+      std::cout << "first frame " << image_path << " (" << image.width << "x"
+                << image.height << ")\n";
+    } catch (const std::exception& e) {
+      std::cerr << "cannot read " << image_path << ": " << e.what() << "\n";
+      return 1;
+    }
+    request.first_frame = first_frame;
   }
   std::cout << "prompt \"" << request.prompt << "\", " << request.width << "x"
             << request.height << ", " << request.frames << " frames, "
@@ -364,7 +460,8 @@ int main(int argc, char** argv) {
     std::snprintf(name, sizeof(name), "step%02d_sample.npy", step + 1);
     std::vector<float> expected;
     std::vector<std::size_t> expected_shape;
-    const auto path = std::filesystem::exists(dir / name)
+    // Image-to-video: latents_final.npy is blended, compared further down.
+    const auto path = std::filesystem::exists(dir / name) || !image_path.empty()
                           ? dir / name
                           : dir / "latents_final.npy";
     if (!ReadNpy(path, &expected, &expected_shape) ||
@@ -375,10 +472,58 @@ int main(int argc, char** argv) {
     Print("latents after step " + std::to_string(step), c);
     min_step_cosine = std::min(min_step_cosine, c.cosine);
   };
+  // --replay: every step starts from the reference sample (teacher forcing),
+  // so the guided noise prediction of each step is compared on its own.
+  double min_noise_cosine = 1;
+  if (replay && !oracle.empty()) {
+    callbacks.before_step = [&](int step, std::vector<float>& latents) {
+      char name[32];
+      std::snprintf(name, sizeof(name), "step%02d_sample.npy", step);
+      std::vector<float> sample;
+      std::vector<std::size_t> sample_shape;
+      if (ReadNpy(dir / name, &sample, &sample_shape) &&
+          sample.size() == latents.size())
+        latents = sample;
+    };
+    callbacks.on_noise = [&](int step, std::span<const float> noise) {
+      char name[32];
+      std::snprintf(name, sizeof(name), "step%02d_noise.npy", step);
+      std::vector<float> expected;
+      std::vector<std::size_t> expected_shape;
+      if (!ReadNpy(dir / name, &expected, &expected_shape) ||
+          expected.size() != noise.size())
+        return;
+      const Comparison c = Compare(noise.data(), expected.data(), noise.size());
+      Print("replayed noise of step " + std::to_string(step), c);
+      if (image_path.empty()) {
+        min_noise_cosine = std::min(min_noise_cosine, c.cosine);
+        return;
+      }
+      // Image-to-video replaces latent frame 0, so its prediction is unused:
+      // compare frames 1.. on their own.
+      const int frames = (request.frames - 1) / 4 + 1;
+      const std::size_t plane =
+          static_cast<std::size_t>(request.height / 16) * (request.width / 16);
+      std::vector<float> a, b;
+      for (int ch = 0; ch < wan22::VaeDecoder::kLatentChannels; ++ch) {
+        const std::size_t offset =
+            (static_cast<std::size_t>(ch) * frames + 1) * plane;
+        const std::size_t count = static_cast<std::size_t>(frames - 1) * plane;
+        a.insert(a.end(), noise.begin() + offset,
+                 noise.begin() + offset + count);
+        b.insert(b.end(), expected.begin() + offset,
+                 expected.begin() + offset + count);
+      }
+      const Comparison used = Compare(a.data(), b.data(), a.size());
+      Print("  frames 1.. of step " + std::to_string(step), used);
+      min_noise_cosine = std::min(min_noise_cosine, used.cosine);
+    };
+  }
   wan22::DecodedVideo video;
   wan22::VideoTelemetry telemetry;
   std::string error;
-  if (!wan22::GenerateVideo(request, callbacks, nullptr, &video,
+  std::vector<float> final_latents;
+  if (!wan22::GenerateVideo(request, callbacks, &final_latents, &video,
                             !oracle.empty(), &telemetry, &error)) {
     std::cerr << "generate: " << error << "\n";
     return 1;
@@ -389,13 +534,21 @@ int main(int argc, char** argv) {
     return 1;
   }
   const double mp4_s = Seconds(encode_start);
-  double step_sum = 0;
+  double step_sum = 0, forward_sum = 0;
   for (double ms : telemetry.step_ms)
     step_sum += ms;
+  for (double ms : telemetry.forward_ms)
+    forward_sum += ms;
+  const double steps_done =
+      static_cast<double>(std::max<std::size_t>(telemetry.step_ms.size(), 1));
   std::cout << std::fixed << std::setprecision(2) << "tokens "
             << telemetry.prompt_tokens << " / negative "
-            << telemetry.negative_tokens << "\ntext "
-            << telemetry.text_ms / 1000 << " s, transformer load "
+            << telemetry.negative_tokens << "\nper step: transformer "
+            << forward_sum / 1000 / steps_done << " s ("
+            << telemetry.forward_ms.size() << " calls), rest "
+            << (step_sum - forward_sum) / 1000 / steps_done << " s\ntext "
+            << telemetry.text_ms / 1000 << " s, image "
+            << telemetry.image_ms / 1000 << " s, transformer load "
             << telemetry.transformer_load_ms / 1000 << " s, denoise "
             << telemetry.denoise_ms / 1000 << " s ("
             << step_sum / 1000 /
@@ -410,6 +563,10 @@ int main(int argc, char** argv) {
   if (oracle.empty())
     return 0;
   std::vector<float> reference;
+  if (ReadNpy(dir / "latents_final.npy", &reference, &shape) &&
+      reference.size() == final_latents.size())
+    Print("final latents",
+          Compare(final_latents.data(), reference.data(), reference.size()));
   if (!ReadNpy(dir / "video.npy", &reference, &shape))
     return 1;
   const auto ours = ChannelFirst(video);
@@ -422,6 +579,9 @@ int main(int argc, char** argv) {
   const double min_frame =
       FrameCosines(ours, reference, video.frames,
                    static_cast<std::size_t>(video.height) * video.width, false);
+  if (replay)
+    std::cout << std::defaultfloat << "min replayed noise cosine "
+              << min_noise_cosine << "\n";
   std::cout << std::defaultfloat << "min latent cosine over steps "
             << min_step_cosine << ", min frame cosine " << min_frame << "\n";
   return 0;

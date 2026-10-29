@@ -60,6 +60,37 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+/// Encoder of the same VAE for one image (the image-to-video first frame),
+/// as Diffusers' untiled `_encode` of a single frame: every causal 3x3x3
+/// convolution sees two zero frames before the image, so only its last
+/// temporal tap is loaded, and the temporal downsampling convolutions are
+/// skipped (Diffusers only caches on the first chunk). BF16 weights and
+/// activations, FP32 accumulation, attention and norms in FP32.
+class VaeEncoder {
+public:
+  /// Loads the encoder half of `<diffusers root>/vae`.
+  [[nodiscard]] static std::unique_ptr<VaeEncoder> Load(
+      const std::filesystem::path& vae_dir, std::string* error);
+  ~VaeEncoder();
+  VaeEncoder(const VaeEncoder&) = delete;
+  VaeEncoder& operator=(const VaeEncoder&) = delete;
+
+  /// `rgb` is [height, width, 3] in [-1, 1] (height, width multiples of 16).
+  /// Writes the posterior mean [48, height / 16, width / 16] (the "argmax"
+  /// latent), with `normalize` as (mean - latents_mean) / latents_std, the
+  /// model-space condition of the image-to-video pipeline.
+  bool Encode(std::span<const float> rgb, int height, int width, bool normalize,
+              std::vector<float>* latent, std::string* error);
+
+  [[nodiscard]] std::size_t weight_bytes() const;
+  [[nodiscard]] std::size_t activation_bytes() const;
+
+private:
+  struct Impl;
+  explicit VaeEncoder(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_VAE_HPP_
