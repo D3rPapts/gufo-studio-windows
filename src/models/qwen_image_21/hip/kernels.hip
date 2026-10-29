@@ -823,11 +823,11 @@ Matrix Runtime::Weight(std::string_view name) {
     if (name.starts_with(prefix) &&
         std::ranges::find(prefetched_groups_, prefix) ==
             prefetched_groups_.end()) {
-      prefetched_groups_.push_back(prefix);
       // Without a readable file, fault the component in parallel instead of
       // serial faults during each HIP upload.
       if (!UploadGroup(prefix))
         weights_.Prefetch(prefix);
+      prefetched_groups_.push_back(prefix);
       break;
     }
   }
@@ -856,31 +856,46 @@ Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
 // the process working set first; on Windows those pages stay resident, so a
 // 31 GB model exhausts a 32 GB host beside the GPU carve-out.
 bool Runtime::UploadGroup(std::string_view prefix) {
+  // Bound temporary device storage as well as pinned host storage. Keeping
+  // an entire F32 component staged needs three times its final BF16 size.
+  constexpr std::size_t kBatchBytes = 256ULL << 20;
+  std::vector<
+      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>>
+      staged;
   std::string error;
+  // Destroy the uploader before staged on every exit, including allocation
+  // failures, so no worker can write to a destination returned to the pool.
   auto uploader = gufo::hip::WeightUpload::Create(weights_.Files(), &error);
   if (!uploader)
     return false;
   // Pool blocks handed out below may still be read by queued kernels, and the
   // uploader copies on its own streams.
   Synchronize();
-  std::vector<
-      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>>
-      staged;
+  std::size_t staged_bytes = 0;
+  const auto flush = [&] {
+    if (!uploader->Finish(&error))
+      throw std::runtime_error("Qwen-Image weight upload failed: " + error);
+    for (auto& [name, w, target] : staged)
+      Store(name, *w, std::move(target));
+    staged.clear();
+    staged_bytes = 0;
+  };
   for (const auto& [name, w] : weights_.Group(prefix)) {
     if (device_weights_.contains(name))
       continue;
+    const auto bytes = w->bf16 ? w->bytes : w->bytes + w->bytes / 2;
+    // A tensor larger than the budget is uploaded alone.
+    if (!staged.empty() &&
+        bytes > kBatchBytes - std::min(staged_bytes, kBatchBytes))
+      flush();
     auto target = Stage(*w);
     void* destination = target.raw.data ? target.raw.data : target.m.data;
     staged.emplace_back(name, w, std::move(target));
+    staged_bytes += bytes;
     if (!uploader->Copy(w->file, w->offset, w->bytes, destination, &error))
       break;
   }
-  // Finish waits for every queued copy, also after a failed Copy, so the
-  // destinations stay valid until the uploader is gone.
-  if (!uploader->Finish(&error))
-    throw std::runtime_error("Qwen-Image weight upload failed: " + error);
-  for (auto& [name, w, target] : staged)
-    Store(name, *w, std::move(target));
+  flush();
   return true;
 }
 
