@@ -25,6 +25,7 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
@@ -183,6 +184,27 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
     return HttpResponse{.status = 200, .reason = "OK", .body = resp.dump()};
   }
   return std::nullopt;
+}
+
+/// Drains a (possibly streamed) response into one buffer for the ComfyUI
+/// adapter.
+router::comfy::FetchResult CollectResponse(HttpResponse response) {
+  router::comfy::FetchResult result;
+  result.status = response.status;
+  for (const auto& [name, value] : response.headers) {
+    if (name.size() == 12 && (name[0] == 'C' || name[0] == 'c') &&
+        (name == "Content-Type" || name == "content-type"))
+      result.content_type = value;
+  }
+  if (response.streaming_body) {
+    response.streaming_body([&result](std::string_view chunk) {
+      result.body.append(chunk);
+      return true;
+    });
+  } else {
+    result.body = std::move(response.body);
+  }
+  return result;
 }
 
 std::optional<int> ParseEnvPort(const char* value) {
@@ -500,6 +522,8 @@ public:
   std::filesystem::path exe_path;
   std::filesystem::path pages_dir;
   std::atomic<bool> stop_requested{false};
+  /// ComfyUI-compatible front (--comfy-dir); null when disabled.
+  std::unique_ptr<router::comfy::Adapter> comfy;
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -543,6 +567,10 @@ public:
   HttpResponse Dispatch(const HttpRequest& req) {
     // Every registry touch, including RouteFront's Listing, is serialized on
     // the same mutex the supervision tick holds.
+    if (comfy != nullptr) {
+      if (auto answer = comfy->Handle(req))
+        return std::move(*answer);
+    }
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
     std::unique_lock<std::mutex> lock(mutex);
@@ -696,6 +724,21 @@ public:
     }
     busy->Release();
     return response;
+  }
+
+  /// Stops every loaded worker that serves no request (ComfyUI /free).
+  void UnloadIdle() {
+    std::unique_lock<std::mutex> lock(mutex);
+    std::vector<std::string> idle;
+    for (const auto& [id, worker] : workers) {
+      (void)worker;
+      if (!registry.Busy(id))
+        idle.push_back(id);
+    }
+    for (const auto& id : idle) {
+      Logger::Info("router", "event=free_unload model=" + id);
+      StopLocked(id);
+    }
   }
 
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
@@ -1057,6 +1100,8 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path preset_path;
   std::filesystem::path models_dir;
   std::filesystem::path pages_dir;
+  std::filesystem::path comfy_dir;
+  std::filesystem::path comfy_ffmpeg;
   std::size_t models_max = 2;
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
@@ -1079,6 +1124,15 @@ int RunRouter(std::span<const char* const> args) {
                    "Serve static pages: GET /<name>/ returns "
                    "DIR/<name>/index.html",
                    "Router", &pages_dir);
+  parser.AddOption("", "--comfy-dir", "DIR",
+                   "Serve a ComfyUI-compatible API (/prompt, /history, "
+                   "/view, /upload/image, /ws); DIR holds input/, output/, "
+                   "temp/ and history.json",
+                   "Router", &comfy_dir);
+  parser.AddOption("", "--comfy-ffmpeg", "FILE",
+                   "ffmpeg for the ComfyUI API: FLAC audio, PNG frames from "
+                   "videos, non-WAV voice references",
+                   "Router", &comfy_ffmpeg);
   parser.AddOption("", "--models-max", "N",
                    "Maximum concurrently loaded workers (default: 2; "
                    "0 = unlimited)",
@@ -1142,6 +1196,39 @@ int RunRouter(std::span<const char* const> args) {
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
   state->pages_dir = pages_dir;
+  if (!comfy_dir.empty()) {
+    router::comfy::AdapterOptions comfy_options;
+    comfy_options.root = comfy_dir;
+    comfy_options.ffmpeg = comfy_ffmpeg;
+    RouterState* const raw = state.get();
+    if (api_key.empty()) {
+      // Jobs go through the front like any client, so they show up in the
+      // request log and count as busy for idle checks.
+      const std::string self_host =
+          host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+              ? "127.0.0.1"
+              : host;
+      comfy_options.fetch = [self_host, port](const HttpRequest& request) {
+        router::UpstreamTarget target;
+        target.host = self_host;
+        target.port = port;
+        return CollectResponse(router::ProxyToWorker(target, request));
+      };
+    } else {
+      // The loopback relay drops Authorization; dispatch in process instead.
+      comfy_options.fetch = [raw](const HttpRequest& request) {
+        return CollectResponse(raw->Dispatch(request));
+      };
+    }
+    comfy_options.unload = [raw] { raw->UnloadIdle(); };
+    try {
+      state->comfy =
+          std::make_unique<router::comfy::Adapter>(std::move(comfy_options));
+    } catch (const std::exception& error) {
+      std::cerr << "Error: --comfy-dir: " << error.what() << '\n';
+      return 2;
+    }
+  }
 
   // --autoload preloads in section order up to --models-max, waiting for each
   // worker's health endpoint within --load-timeout-seconds.
@@ -1212,6 +1299,13 @@ int RunRouter(std::span<const char* const> args) {
     return 2;
   }
   state->StartSpawner();
+  if (state->comfy != nullptr) {
+    state->comfy->Start();
+    Logger::Info("router", "event=comfy_api dir=" + comfy_dir.string() +
+                               " ffmpeg=" +
+                               (comfy_ffmpeg.empty() ? std::string("none")
+                                                     : comfy_ffmpeg.string()));
+  }
   std::thread supervision([&state] {
     while (!state->stop_requested.load()) {
       state->SuperviseOnce();
@@ -1223,6 +1317,8 @@ int RunRouter(std::span<const char* const> args) {
   // Graceful shutdown: stop accepting, refuse new loads, drain in-flight
   // work for up to 10 s, then terminate every worker.
   state->stop_requested.store(true);
+  if (state->comfy != nullptr)
+    state->comfy->Stop();
   const auto drain_deadline = std::chrono::steady_clock::now() + kShutdownDrain;
   while (std::chrono::steady_clock::now() < drain_deadline) {
     bool any_busy = false;
