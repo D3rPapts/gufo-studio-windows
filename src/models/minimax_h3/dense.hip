@@ -8,13 +8,13 @@
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 namespace gufo::minimax_h3::dit_ops {
 namespace {
-__device__ hip_bfloat16 Bf16(float x) {
+__device__ __forceinline__ hip_bfloat16 Bf16(float x) {
   return hip_bfloat16(x);
 }
 using Fragment = __attribute__((ext_vector_type(16))) unsigned short;
 using Accumulator = __attribute__((ext_vector_type(8))) float;
 
-__device__ Fragment Load(const std::uint16_t* x) {
+__device__ __forceinline__ Fragment Load(const std::uint16_t* x) {
   union {
     Fragment b;
     uint4 u[2];

@@ -49,6 +49,12 @@ public:
                              const MtpTrace* stage_inputs = nullptr);
 
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+
+  /// When set, every trunk MoE block appends its selected expert ids (in
+  /// selection order) to `trace`; a token adds num_layers * num_experts_used.
+  void SetExpertTrace(std::vector<std::uint32_t>* trace) noexcept {
+    expert_trace_ = trace;
+  }
   void Reset();
 
 private:
@@ -89,6 +95,7 @@ private:
   NgramTable* ngram_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};
+  std::vector<std::uint32_t>* expert_trace_{nullptr};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   AttentionState mtp_attention_;

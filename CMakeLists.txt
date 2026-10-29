@@ -318,6 +318,7 @@ add_library(gufo_core STATIC
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
   src/core/sampling.cpp
+  src/models/minimax_h3/audio_input.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
   src/models/minimax_h3/dit.cpp
@@ -326,11 +327,14 @@ add_library(gufo_core STATIC
   "$<$<PLATFORM_ID:Windows>:src/models/minimax_h3/media_windows.cpp>"
   "$<$<NOT:$<PLATFORM_ID:Windows>>:src/models/minimax_h3/media_posix.cpp>"
   src/models/minimax_h3/prompt_encoder.cpp
+  src/models/minimax_h3/prompt_vision.cpp
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sampling.cpp
   src/models/minimax_h3/sha256.cpp
   src/models/minimax_h3/tokenizer.cpp
   src/models/minimax_h3/video_vae.cpp
+  src/models/minimax_h3/video_vae_encoder.cpp
+  src/models/minimax_h3/lora.cpp
   src/testing/compare/logit_comparator.cpp
   src/eval/dataset.cpp
   src/eval/extract.cpp
@@ -345,10 +349,12 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
   Threads::Threads PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl
-  OpenSSL::Crypto)
+  OpenSSL::Crypto PkgConfig::SNDFILE PkgConfig::SOXR)
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
+add_subdirectory(src/models/fish_drama3)
+add_subdirectory(src/models/moss_image)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
@@ -372,6 +378,8 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/prompt_encoder.hip
     src/models/minimax_h3/sampling.hip
     src/models/minimax_h3/video_vae.hip
+    src/models/minimax_h3/video_vae_encoder.hip
+    src/models/minimax_h3/lora.hip
     src/models/minimax_h3/attention.hip
     src/core/hip/snapshot_copy.hip
     src/core/hip/weight_upload.cpp
@@ -410,10 +418,13 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_service.cpp
   src/cli/serve/embeddings_api.cpp
   src/cli/serve/embedding_service.cpp
+  src/cli/serve/omni_api.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/video_wan22.cpp
+  src/cli/serve/video_rife.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -423,7 +434,13 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
+if (ENGINE_ENABLE_HIP)
+  # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
+  target_link_libraries(gufo_http PUBLIC gufo_wan22)
+  # RIFE frame interpolation of finished videos ("gufo":{"interpolate":N}).
+  target_link_libraries(gufo_http PUBLIC gufo_rife)
+endif()
 
 add_executable(gufo
   src/cli/main.cpp
@@ -431,6 +448,7 @@ add_executable(gufo
   src/cli/eval/eval.cpp
   src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
+  src/cli/video/video_interpolate.cpp
   src/cli/serve/serve.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/continuation_disk_store.cpp
@@ -440,7 +458,7 @@ add_executable(gufo
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
-target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
+target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http gufo_rife CURL::libcurl)
 gufo_stage_hip_runtime(gufo)
 target_compile_definitions(gufo PRIVATE
   GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
@@ -453,7 +471,7 @@ target_compile_definitions(gufo PRIVATE
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
 endif()
-target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
+target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_embedding_gemma2)
 
 if (NOT WIN32)
   add_custom_target(gufo-server ALL
@@ -828,8 +846,12 @@ if (BUILD_TESTING)
   add_executable(video_jobs_test
     tests/cli/video_jobs_test.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core gufo_cache)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(video_jobs_test PRIVATE gufo_wan22)
+  endif()
   add_test(NAME video_jobs_test COMMAND video_jobs_test)
   set_tests_properties(video_jobs_test PROPERTIES
     LABELS "cpu;server;video;minimax-h3;queue;cancellation;quality")
@@ -838,8 +860,12 @@ if (BUILD_TESTING)
     tests/cli/video_api_test.cpp
     src/cli/serve/video_api.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core gufo_cache)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(video_api_test PRIVATE gufo_wan22)
+  endif()
   add_test(NAME video_api_test COMMAND video_api_test)
   set_tests_properties(video_api_test PROPERTIES
     LABELS "cpu;server;api;video;minimax-h3;quality")
@@ -973,7 +999,7 @@ if (BUILD_TESTING)
     tests/models/qwen3_tts/audio_api_test.cpp
     src/cli/serve/audio_tts_api.cpp
     src/cli/serve/tts_service.cpp)
-  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts)
+  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts gufo_fish_drama3)
   add_test(NAME qwen3_tts_audio_api_test COMMAND qwen3_tts_audio_api_test)
   set_tests_properties(qwen3_tts_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;server;api;audio;quality")
@@ -984,6 +1010,22 @@ if (BUILD_TESTING)
   add_test(NAME qwen3_tts_audio_test COMMAND qwen3_tts_audio_test)
   set_tests_properties(qwen3_tts_audio_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;audio;quality;resampling")
+
+  add_executable(fish_drama3_config_test
+    tests/models/fish_drama3/config_test.cpp)
+  target_link_libraries(fish_drama3_config_test PRIVATE gufo_fish_drama3)
+  add_test(NAME fish_drama3_config_test COMMAND fish_drama3_config_test)
+  set_tests_properties(fish_drama3_config_test PROPERTIES
+    LABELS "cpu;models;fish-drama3;config;quality")
+
+  add_executable(fish_drama3_test
+    tests/models/fish_drama3/fish_drama3_test.cpp)
+  target_link_libraries(fish_drama3_test PRIVATE gufo_fish_drama3 gufo_qwen3_tts)
+  add_test(NAME fish_drama3_test COMMAND fish_drama3_test)
+  set_tests_properties(fish_drama3_test PROPERTIES
+    LABELS "gpu;models;fish-drama3;quality;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE)
 
   add_executable(qwen3_tts_config_test
     tests/models/qwen3_tts/config_test.cpp)
@@ -1287,6 +1329,34 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
 
+    add_executable(minimax_h3_video_vae_bench
+      tests/models/minimax_h3_video_vae_bench.cpp)
+    target_compile_definitions(minimax_h3_video_vae_bench PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_video_vae_bench PRIVATE
+      gufo_core hip::host)
+
+    add_executable(minimax_h3_audio_guide_probe
+      tests/models/minimax_h3_audio_guide_probe.cpp)
+    target_compile_definitions(minimax_h3_audio_guide_probe PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_audio_guide_probe PRIVATE
+      gufo_core hip::host)
+
+    add_executable(minimax_h3_gemm_sweep
+      tests/models/minimax_h3_gemm_sweep.hip)
+    target_link_libraries(minimax_h3_gemm_sweep PRIVATE gufo_core hip::host)
+    add_executable(minimax_h3_attention_bench
+      tests/models/minimax_h3_attention_bench.hip)
+    target_link_libraries(minimax_h3_attention_bench PRIVATE gufo_core hip::host)
+
+    add_executable(minimax_h3_keyframe_hip_test
+      tests/models/minimax_h3_keyframe_hip_test.cpp)
+    target_compile_definitions(minimax_h3_keyframe_hip_test PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_keyframe_hip_test PRIVATE
+      gufo_core hip::host)
+
     add_executable(minimax_h3_audio_vae_hip_test
       tests/models/minimax_h3_audio_vae_hip_test.hip)
     target_compile_definitions(minimax_h3_audio_vae_hip_test PRIVATE
@@ -1364,3 +1434,11 @@ endif()
 if (BUILD_TESTING)
   include(cmake/Checks.cmake)
 endif()
+
+# Qwen3-Omni-30B-A3B-Captioner (GGUF arch qwen3vlmoe + qwen3a audio
+# projector): its runtime library and the gufo-omni driver.
+add_subdirectory(src/models/qwen3_omni)
+
+# Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
+add_subdirectory(src/models/wan22)
+add_subdirectory(src/models/rife)

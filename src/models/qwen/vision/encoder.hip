@@ -368,6 +368,8 @@ struct Encoder::Impl {
   hipblasHandle_t blas{nullptr};
   std::unique_ptr<gufo::hip::HipblasLtGemm> lt;
   bool uploaded{false};
+  // Qwen3-VL ViT layers whose output feeds a deepstack merger.
+  std::vector<unsigned> deepstack_layers;
 
   Impl(const std::filesystem::path& path, std::uint32_t width)
       : output_width(width) {
@@ -413,11 +415,20 @@ struct Encoder::Impl {
         deepstack_value
             ? std::get_if<std::vector<std::uint64_t>>(&deepstack_value->value)
             : nullptr;
-    if (!deepstack || deepstack->size() != 27 ||
-        std::any_of(deepstack->begin(), deepstack->end(),
-                    [](auto enabled) { return enabled != 0; })) {
+    if (!deepstack || deepstack->size() != 27) {
       throw std::invalid_argument(
-          "Qwen3.8 vision requires a final-layer-only merger");
+          "Qwen vision projector lacks its deepstack layer list");
+    }
+    for (unsigned layer = 0; layer < 27; ++layer) {
+      if ((*deepstack)[layer] != 0)
+        deepstack_layers.push_back(layer);
+    }
+    // Qwen3.8 merges the final layer only. Qwen3-VL (the MiniMax H3 text
+    // encoder) also merges ViT layers 8, 16 and 24 into deepstack features.
+    if (!deepstack_layers.empty() &&
+        deepstack_layers != std::vector<unsigned>{8, 16, 24}) {
+      throw std::invalid_argument(
+          "Qwen vision deepstack layers must be 8, 16 and 24");
     }
     if (reader->GetMetadataString("clip.projector_type") != "qwen3vl_merger") {
       throw std::invalid_argument("unsupported Qwen vision projector");
@@ -470,7 +481,18 @@ struct Encoder::Impl {
     require("mm.0.bias", {kMergeHidden}, core::GgmlType::kF32);
     require("mm.2.weight", {kMergeHidden, width}, core::GgmlType::kBF16);
     require("mm.2.bias", {width}, core::GgmlType::kF32);
-    if (reader->GetTensorCount() != 334) {
+    for (const unsigned layer : deepstack_layers) {
+      const auto prefix = "v.deepstack." + std::to_string(layer) + ".";
+      require(prefix + "norm.weight", {kMergeHidden}, core::GgmlType::kF32);
+      require(prefix + "norm.bias", {kMergeHidden}, core::GgmlType::kF32);
+      require(prefix + "fc1.weight", {kMergeHidden, kMergeHidden},
+              core::GgmlType::kBF16);
+      require(prefix + "fc1.bias", {kMergeHidden}, core::GgmlType::kF32);
+      require(prefix + "fc2.weight", {kMergeHidden, width},
+              core::GgmlType::kBF16);
+      require(prefix + "fc2.bias", {width}, core::GgmlType::kF32);
+    }
+    if (reader->GetTensorCount() != 334 + 6 * deepstack_layers.size()) {
       throw std::invalid_argument(
           "unexpected tensors in Qwen vision projector");
     }
@@ -606,6 +628,10 @@ void Encoder::Upload() {
 Encoder::Embedding::~Embedding() {
   if (data_ != nullptr)
     (void)hipFree(data_);
+  for (float* features : deepstack_) {
+    if (features != nullptr)
+      (void)hipFree(features);
+  }
 }
 
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
@@ -668,6 +694,37 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     observer(stage, copy);
   };
   observe("patch", hidden.As<float>(), std::size_t{count} * kHidden);
+  auto embedding = std::shared_ptr<Embedding>(new Embedding);
+  embedding->rows_ = merged;
+  embedding->width_ = impl_->output_width;
+  // Postshuffle merger: LayerNorm over the 2x2-merged 4608-wide rows, then
+  // fc1, exact GELU and fc2, like the final merger's projection.
+  const auto merge = [&](const std::string& prefix, const std::string& norm,
+                         const std::string& fc1, const std::string& fc2,
+                         bool postshuffle, float* output) {
+    if (postshuffle) {
+      LayerNorm<<<merged, kThreads, 0, stream>>>(
+          hidden.As<float>(), normalized.As<Bf16>(),
+          impl_->FloatWeight(prefix + norm + ".weight"),
+          impl_->FloatWeight(prefix + norm + ".bias"), kMergeHidden);
+    } else {
+      LayerNorm<<<count, kThreads, 0, stream>>>(
+          hidden.As<float>(), normalized.As<Bf16>(),
+          impl_->FloatWeight(prefix + norm + ".weight"),
+          impl_->FloatWeight(prefix + norm + ".bias"), kHidden);
+    }
+    impl_->Gemm(prefix + fc1 + ".weight", normalized.As<Bf16>(),
+                work.As<float>(), merged, kMergeHidden, kMergeHidden);
+    Activate<<<(merged * kMergeHidden + kThreads - 1) / kThreads, kThreads, 0,
+               stream>>>(
+        work.As<float>(), impl_->FloatWeight(prefix + fc1 + ".bias"),
+        normalized.As<Bf16>(), merged * kMergeHidden, kMergeHidden, false);
+    impl_->Gemm(prefix + fc2 + ".weight", normalized.As<Bf16>(), output, merged,
+                embedding->width_, kMergeHidden);
+    Finish<<<(merged * embedding->width_ + kThreads - 1) / kThreads, kThreads,
+             0, stream>>>(output, impl_->FloatWeight(prefix + fc2 + ".bias"),
+                          merged * embedding->width_, embedding->width_);
+  };
   for (unsigned layer = 0; layer < 27; ++layer) {
     check_cancelled();
     const auto prefix = "v.blk." + std::to_string(layer) + ".";
@@ -742,27 +799,20 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                              count * kHidden, kHidden);
     observe("layer" + std::to_string(layer), hidden.As<float>(),
             std::size_t{count} * kHidden);
+    if (std::find(impl_->deepstack_layers.begin(),
+                  impl_->deepstack_layers.end(),
+                  layer) != impl_->deepstack_layers.end()) {
+      float* features = nullptr;
+      Check(hipMalloc(&features,
+                      std::size_t{merged} * embedding->width_ * sizeof(float)));
+      embedding->deepstack_.push_back(features);
+      merge("v.deepstack." + std::to_string(layer) + ".", "norm", "fc1", "fc2",
+            true, features);
+    }
   }
-  LayerNorm<<<count, kThreads, 0, stream>>>(
-      hidden.As<float>(), normalized.As<Bf16>(),
-      impl_->FloatWeight("v.post_ln.weight"),
-      impl_->FloatWeight("v.post_ln.bias"), kHidden);
-  impl_->Gemm("mm.0.weight", normalized.As<Bf16>(), work.As<float>(), merged,
-              kMergeHidden, kMergeHidden);
-  Activate<<<(merged * kMergeHidden + kThreads - 1) / kThreads, kThreads, 0,
-             stream>>>(work.As<float>(), impl_->FloatWeight("mm.0.bias"),
-                       normalized.As<Bf16>(), merged * kMergeHidden,
-                       kMergeHidden, false);
-  auto embedding = std::shared_ptr<Embedding>(new Embedding);
-  embedding->rows_ = merged;
-  embedding->width_ = impl_->output_width;
   Check(hipMalloc(&embedding->data_,
                   std::size_t{merged} * embedding->width_ * sizeof(float)));
-  impl_->Gemm("mm.2.weight", normalized.As<Bf16>(), embedding->data_, merged,
-              embedding->width_, kMergeHidden);
-  Finish<<<(merged * embedding->width_ + kThreads - 1) / kThreads, kThreads, 0,
-           stream>>>(embedding->data_, impl_->FloatWeight("mm.2.bias"),
-                     merged * embedding->width_, embedding->width_);
+  merge("", "v.post_ln", "mm.0", "mm.2", false, embedding->data_);
   Check(hipGetLastError());
   Check(hipStreamSynchronize(stream));
   check_cancelled();

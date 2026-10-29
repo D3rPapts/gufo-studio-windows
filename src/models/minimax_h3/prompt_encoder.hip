@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -179,6 +181,57 @@ struct LoadedTensor {
 
 struct HostMapping;
 
+// Pinned host buffers of the Windows read path. Every decoder layer has the
+// same interval sizes, so the buffers of a finished layer serve the next
+// prefetch instead of pinning and unpinning ~1 GB per layer. Drained when
+// the encoder returns.
+class PinnedPool {
+public:
+  // Buffers are released only after the stream that read them synchronized
+  // (RunLayer waits for its stop event), so reuse never races the GPU.
+  hipError_t Acquire(std::size_t bytes, void** host) {
+    std::vector<std::pair<void*, std::size_t>> unused;
+    {
+      const std::lock_guard lock(mutex_);
+      for (auto it = free_.begin(); it != free_.end(); ++it) {
+        if (it->second == bytes) {
+          *host = it->first;
+          free_.erase(it);
+          return hipSuccess;
+        }
+      }
+      // Other sizes (the embedding table) would only hold host memory.
+      unused.swap(free_);
+    }
+    for (const auto& buffer : unused) {
+      (void)hipHostFree(buffer.first);
+    }
+    return hipHostMalloc(host, bytes, hipHostMallocMapped);
+  }
+
+  void Release(void* host, std::size_t bytes) {
+    const std::lock_guard lock(mutex_);
+    free_.emplace_back(host, bytes);
+  }
+
+  void Drain() {
+    std::vector<std::pair<void*, std::size_t>> buffers;
+    {
+      const std::lock_guard lock(mutex_);
+      buffers.swap(free_);
+    }
+    for (const auto& buffer : buffers) {
+      (void)hipHostFree(buffer.first);
+    }
+  }
+
+private:
+  std::mutex mutex_;
+  std::vector<std::pair<void*, std::size_t>> free_;
+};
+
+PinnedPool g_pinned_pool;
+
 struct LoadedBatch {
   std::vector<LoadedTensor> tensors;
   std::vector<HostMapping> mappings;
@@ -243,7 +296,7 @@ struct HostMapping {
 
   void Release() noexcept {
     if (pinned && host != nullptr) {
-      (void)hipHostFree(host);
+      g_pinned_pool.Release(host, bytes);
       g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
       pinned = false;
     }
@@ -324,8 +377,7 @@ struct BatchLoadResult {
 bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
                         std::size_t length, HostMapping* mapping,
                         std::string* error) {
-  hipError_t status =
-      hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
+  hipError_t status = g_pinned_pool.Acquire(length, &mapping->host);
   if (status != hipSuccess) {
     mapping->host = nullptr;
     *error = HipError("hipHostMalloc(H3 text weight)", status);
@@ -339,18 +391,12 @@ bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
     *error = "cannot open H3 text shard " + path.string() + ": " + open_error;
     return false;
   }
-  std::size_t read_bytes = 0;
-  while (read_bytes < length) {
-    const std::size_t result = platform::ReadFileAt(
-        file, static_cast<std::byte*>(mapping->host) + read_bytes,
-        length - read_bytes, offset + read_bytes);
-    if (result == 0) {
-      break;
-    }
-    read_bytes += result;
-  }
+  // A single buffered ReadFile reached ~1.7 GB/s on the 990 PRO; parallel
+  // unbuffered pieces keep several NVMe requests in flight.
+  const bool complete =
+      platform::ReadFileParallel(file, mapping->host, length, offset) == length;
   platform::CloseFile(file);
-  if (read_bytes != length) {
+  if (!complete) {
     *error = "short read loading H3 text shard " + path.string();
     return false;
   }
@@ -921,6 +967,10 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
                          PromptEmbedding* output,
                          PromptEncoderTelemetry* telemetry,
                          std::string* error) {
+  // Declared first: unpins the pooled buffers after every batch is gone.
+  struct PoolDrain {
+    ~PoolDrain() { g_pinned_pool.Drain(); }
+  } pool_drain;
   if (output != nullptr) {
     *output = {};
   }
@@ -938,9 +988,35 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
   }
   if (options.vision_inputs || options.deepstack_inputs) {
     SetError(error,
-             "MiniMax H3 initial prompt encoder is text-only; vision and "
-             "deepstack inputs are rejected");
+             "MiniMax H3 prompt encoder takes images as vision_blocks; the "
+             "raw vision and deepstack flags are rejected");
     return false;
+  }
+  std::vector<std::array<std::uint32_t, 3>> rope_positions;
+  if (!options.vision_blocks.empty()) {
+    if (!BuildPromptRopePositions(token_ids.size(), options.vision_blocks,
+                                  &rope_positions, error)) {
+      return false;
+    }
+    for (const PromptVisionBlock& block : options.vision_blocks) {
+      const std::size_t elements = static_cast<std::size_t>(block.grid_height) *
+                                   block.grid_width * kPromptEncoderHiddenSize;
+      if (block.embedding.size() != elements ||
+          block.deepstack.size() > kVisionDeepstackLayers ||
+          std::ranges::any_of(block.deepstack,
+                              [elements](const auto& features) {
+                                return features.size() != elements;
+                              }) ||
+          std::any_of(
+              token_ids.begin() + static_cast<std::ptrdiff_t>(block.begin),
+              token_ids.begin() +
+                  static_cast<std::ptrdiff_t>(
+                      block.begin + elements / kPromptEncoderHiddenSize),
+              [](std::uint32_t token) { return token != kImagePadToken; })) {
+        SetError(error, "MiniMax H3 image block does not match its prompt");
+        return false;
+      }
+    }
   }
   for (const std::uint32_t token : token_ids) {
     if (token >= kPromptEncoderVocabularySize) {
@@ -989,10 +1065,48 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     destroy_stream();
     return false;
   }
-  ops::LaunchPrepareRope(
-      activations.rope_cosine.As<float>(), activations.rope_sine.As<float>(),
-      static_cast<std::uint32_t>(token_ids.size()), kPromptEncoderHeadDimension,
-      kRopeTheta, compute_stream);
+  if (rope_positions.empty()) {
+    ops::LaunchPrepareRope(
+        activations.rope_cosine.As<float>(), activations.rope_sine.As<float>(),
+        static_cast<std::uint32_t>(token_ids.size()),
+        kPromptEncoderHeadDimension, kRopeTheta, compute_stream);
+  } else {
+    // Qwen3-VL interleaved MRoPE (mrope_section 24/20/20): frequency j
+    // follows the height axis when j % 3 == 1 and j < 60, the width axis
+    // when j % 3 == 2 and j < 60, and the temporal axis otherwise.
+    constexpr std::size_t kHalf = kPromptEncoderHeadDimension / 2U;
+    std::vector<float> cosine(token_ids.size() * kHalf);
+    std::vector<float> sine(token_ids.size() * kHalf);
+    for (std::size_t row = 0; row < token_ids.size(); ++row) {
+      for (std::size_t j = 0; j < kHalf; ++j) {
+        const std::size_t axis = j < 60 ? j % 3U : 0U;
+        const float inverse_frequency =
+            expf(-logf(kRopeTheta) *
+                 (2.0F * static_cast<float>(j) /
+                  static_cast<float>(kPromptEncoderHeadDimension)));
+        const float angle =
+            static_cast<float>(rope_positions[row][axis]) * inverse_frequency;
+        cosine[row * kHalf + j] = std::cos(angle);
+        sine[row * kHalf + j] = std::sin(angle);
+      }
+    }
+    status = hipMemcpyAsync(activations.rope_cosine.data(), cosine.data(),
+                            cosine.size() * sizeof(float),
+                            hipMemcpyHostToDevice, compute_stream);
+    if (status == hipSuccess) {
+      status = hipMemcpyAsync(activations.rope_sine.data(), sine.data(),
+                              sine.size() * sizeof(float),
+                              hipMemcpyHostToDevice, compute_stream);
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(compute_stream);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("upload H3 multimodal rope", status));
+      destroy_stream();
+      return false;
+    }
+  }
 
   const TensorDescriptor* embedding_descriptor = RequireTensor(
       inventory, "model.language_model.embed_tokens.weight",
@@ -1032,6 +1146,55 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     return false;
   }
   embedding = {};
+  // Image-pad rows take the vision tower's embeddings instead.
+  for (const PromptVisionBlock& block : options.vision_blocks) {
+    status = hipMemcpy(activations.hidden.As<std::uint16_t>() +
+                           block.begin * kPromptEncoderHiddenSize,
+                       block.embedding.data(),
+                       block.embedding.size() * sizeof(std::uint16_t),
+                       hipMemcpyHostToDevice);
+    if (status != hipSuccess) {
+      SetError(error, HipError("H3 image embedding upload", status));
+      destroy_stream();
+      return false;
+    }
+  }
+  // Qwen3-VL deepstack: after decoder layer k (k < 3) the image rows add the
+  // k-th deepstack feature, rounded back to BF16.
+  const auto add_deepstack = [&](std::size_t layer) {
+    std::vector<std::uint16_t> rows;
+    for (const PromptVisionBlock& block : options.vision_blocks) {
+      if (layer >= block.deepstack.size()) {
+        continue;
+      }
+      const std::vector<std::uint16_t>& features = block.deepstack[layer];
+      rows.resize(features.size());
+      std::uint16_t* device = activations.hidden.As<std::uint16_t>() +
+                              block.begin * kPromptEncoderHiddenSize;
+      hipError_t copy =
+          hipMemcpy(rows.data(), device, rows.size() * sizeof(std::uint16_t),
+                    hipMemcpyDeviceToHost);
+      if (copy != hipSuccess) {
+        return copy;
+      }
+      for (std::size_t index = 0; index < rows.size(); ++index) {
+        const float sum =
+            std::bit_cast<float>(static_cast<std::uint32_t>(rows[index])
+                                 << 16U) +
+            std::bit_cast<float>(static_cast<std::uint32_t>(features[index])
+                                 << 16U);
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(sum);
+        rows[index] = static_cast<std::uint16_t>(
+            (bits + 0x7FFFU + ((bits >> 16U) & 1U)) >> 16U);
+      }
+      copy = hipMemcpy(device, rows.data(), rows.size() * sizeof(std::uint16_t),
+                       hipMemcpyHostToDevice);
+      if (copy != hipSuccess) {
+        return copy;
+      }
+    }
+    return hipSuccess;
+  };
 
   Bf16Gemm gemm;
   telemetry->peak_device_bytes = std::max<std::uint64_t>(
@@ -1102,6 +1265,20 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     }
     telemetry->total_dispatches += layer_telemetry.dispatches;
     telemetry->layers.push_back(layer_telemetry);
+    if (layer < kVisionDeepstackLayers && !options.vision_blocks.empty()) {
+      status = hipStreamSynchronize(compute_stream);
+      if (status == hipSuccess) {
+        status = add_deepstack(layer);
+      }
+      if (status != hipSuccess) {
+        if (future_valid) {
+          (void)next_future.get();
+        }
+        SetError(error, HipError("H3 deepstack injection", status));
+        destroy_stream();
+        return false;
+      }
+    }
 
     if (layer + 1 >= options.layer_count) {
       break;

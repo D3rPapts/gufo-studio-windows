@@ -20,25 +20,49 @@ __device__ Fragment Load(const std::uint16_t* x) {
   return value.b;
 }
 
+// Key/value row `row` of `head` in up to three head-major segments.
+__device__ const std::uint16_t* SegmentRow(const KeySegments& s, bool value,
+                                           int head, int row) {
+  const int segment = row < s.end[0] ? 0 : (row < s.end[1] ? 1 : 2);
+  const int first = segment == 0 ? 0 : (segment == 1 ? s.end[0] : s.end[1]);
+  const std::uint16_t* base =
+      segment == 0 ? (value ? s.values[0] : s.keys[0])
+                   : (segment == 1 ? (value ? s.values[1] : s.keys[1])
+                                   : (value ? s.values[2] : s.keys[2]));
+  const int stride =
+      segment == 0 ? s.stride[0] : (segment == 1 ? s.stride[1] : s.stride[2]);
+  return base + (static_cast<std::size_t>(head) * stride + (row - first)) * 128;
+}
+
 // Online softmax with BF16 QK matrix instructions and an FP32 value product.
 // No probability narrowing and no global score/probability allocation.
 // Each block owns 128 queries by all 128 output channels, consuming 32 keys at
 // a time. Split value staging into two halves to bound LDS usage.
-template<bool Masked>
+// Segmented reads keys and values from `segments` (cached condition rows
+// and the new rows) instead of one contiguous head-major copy.
+template<bool Masked, bool Segmented = false>
 __global__ void FusedAttention(const std::uint16_t* queries,
                                const std::uint16_t* keys,
                                const std::uint16_t* values,
                                hip_bfloat16* output, int heads, int rows,
                                int count, int query_start, int query_count,
-                               const int* limits) {
+                               const int* limits, KeySegments segments = {}) {
   __shared__ float p[32][129], v[16][129], stats[128][3];
   __shared__ int last_key;
   const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
   const int col = blockIdx.x * 128, head = blockIdx.y;
   const int query_end = query_start + query_count;
   queries += static_cast<std::size_t>(head) * rows * 128;
-  keys += static_cast<std::size_t>(head) * count * 128;
-  values += static_cast<std::size_t>(head) * count * 128;
+  if constexpr (!Segmented) {
+    keys += static_cast<std::size_t>(head) * count * 128;
+    values += static_cast<std::size_t>(head) * count * 128;
+  }
+  const auto value_at = [&](int row, int channel) {
+    if constexpr (Segmented)
+      return SegmentRow(segments, true, head, row)[channel];
+    else
+      return values[static_cast<std::size_t>(row) * 128 + channel];
+  };
   if (tid < 128) {
     stats[tid][0] = -INFINITY;
     stats[tid][1] = 0;
@@ -67,10 +91,7 @@ __global__ void FusedAttention(const std::uint16_t* queries,
 #pragma unroll
   for (int z = 0; z < 16; ++z) {
     const int i = tid + z * 256;
-    prefetch_v[z] =
-        i / 128 < count
-            ? values[static_cast<std::size_t>(i / 128) * 128 + i % 128]
-            : 0;
+    prefetch_v[z] = i / 128 < count ? value_at(i / 128, i % 128) : 0;
   }
   for (int base = 0; base < visible; base += 32) {
     for (int qoff = 0; qoff < 128; qoff += 64) {
@@ -84,8 +105,12 @@ __global__ void FusedAttention(const std::uint16_t* queries,
         if (qr < query_end)
           q = Load(queries + static_cast<std::size_t>(qr) * 128 + d);
         Fragment k{};
-        if (kr < count)
-          k = Load(keys + static_cast<std::size_t>(kr) * 128 + d);
+        if (kr < count) {
+          if constexpr (Segmented)
+            k = Load(SegmentRow(segments, false, head, kr) + d);
+          else
+            k = Load(keys + static_cast<std::size_t>(kr) * 128 + d);
+        }
         dot = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q, k, dot);
       }
 #pragma unroll
@@ -135,10 +160,9 @@ __global__ void FusedAttention(const std::uint16_t* queries,
 #pragma unroll
     for (int z = 0; z < 16; ++z) {
       const int i = tid + z * 256;
-      prefetch_v[z] =
-          base + 32 + i / 128 < count
-              ? values[std::size_t(base + 32 + i / 128) * 128 + i % 128]
-              : 0;
+      prefetch_v[z] = base + 32 + i / 128 < count
+                          ? value_at(base + 32 + i / 128, i % 128)
+                          : 0;
     }
     __syncthreads();
 #pragma unroll
@@ -197,6 +221,23 @@ void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
     FusedAttention<false><<<grid, 256, 0, stream>>>(
         queries, keys, values, reinterpret_cast<hip_bfloat16*>(output), heads,
         rows, count, query_start, query_count, nullptr);
+}
+
+void FusedAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits) {
+  const dim3 grid((query_count + 127) / 128, heads);
+  const int count = segments.end[2];
+  if (limits)
+    FusedAttention<true, true><<<grid, 256, 0, stream>>>(
+        queries, nullptr, nullptr, reinterpret_cast<hip_bfloat16*>(output),
+        heads, rows, count, query_start, query_count, limits, segments);
+  else
+    FusedAttention<false, true><<<grid, 256, 0, stream>>>(
+        queries, nullptr, nullptr, reinterpret_cast<hip_bfloat16*>(output),
+        heads, rows, count, query_start, query_count, nullptr, segments);
 }
 
 }  // namespace gufo::models::qwen_image_21::hip

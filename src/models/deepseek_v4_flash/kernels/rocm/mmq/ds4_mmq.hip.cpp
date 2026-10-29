@@ -709,6 +709,12 @@ extern "C" int ds4_mmq_q4_K_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
 }
 
+extern "C" int ds4_mmq_q6_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_dense", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, hipStream_t stream) {
@@ -1649,6 +1655,14 @@ extern "C" int ds4_mmq_q4_K_moe(
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
@@ -3400,6 +3414,15 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_q6_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q6_K>(
+        "ds4_mmq_q6_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
 extern "C" int ds4_mmq_mxfp4_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -4249,6 +4272,98 @@ extern "C" int ds4_mmq_q8_0_dense_vec(
         "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
 }
 
+extern "C" int ds4_mmq_q4_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q6_K>(
+        "ds4_mmq_q6_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+// ---------------------------------------------------------------------------
+// Pre-quantized MMVQ entries (Qwen3-Omni decode). The caller quantizes an
+// activation once with ds4_mmq_quantize_q8_1 and reuses it for every matrix
+// that reads it. No output memset or sanitize pass: MMVQ writes every output
+// element it owns, and the routes passed in are always valid expert ids.
+// ---------------------------------------------------------------------------
+
+extern "C" size_t ds4_mmq_q8_1_bytes(int K, int rows) {
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    return (size_t)rows * (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+}
+
+extern "C" int ds4_mmq_quantize_q8_1(
+        const float * X, void * q8, int K, int rows, hipStream_t stream) {
+    if (!X || !q8 || K <= 0 || rows <= 0 || K % 256 != 0) return -1;
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    ds4_quantize_row_q8_1_hip(
+        X, /*ids=*/nullptr, q8, GGML_TYPE_Q8_0, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * rows,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/rows, /*ne3=*/1, stream);
+    return hipGetLastError() == hipSuccess ? 0 : -2;
+}
+
+extern "C" int ds4_mmq_vec_preq(
+        int type_x, const void * W, const void * W_gate, const void * q8,
+        const int32_t * ids, float * out, int M, int K, int n_cols,
+        int n_experts, int n_expert_used, hipStream_t stream) {
+    const ggml_type type = (ggml_type)type_x;
+    if (!W || !q8 || !out || M <= 0 || K <= 0 || n_cols <= 0 || K % 256 != 0) {
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const int64_t s01_row = (int64_t)K / ggml_blck_size(type);
+    const int64_t s11_y   = ne10_padded / QK8_1;
+    ds4_ggml_hip_mm_fusion_args_device fusion = {};
+    if (W_gate) {
+        if (!ids || n_cols != 1) return -1;
+        fusion.gate   = W_gate;
+        fusion.glu_op = GGML_GLU_OP_SWIGLU;
+    }
+    if (!ids) {
+        if (n_cols > MMVQ_MAX_BATCH_SIZE) return -1;
+        mul_mat_vec_q_switch_type(
+            W, type, q8, /*ids=*/nullptr, fusion, out,
+            K, M, n_cols, (int)s01_row, (int)s11_y, M,
+            /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
+            /*stride_channel_x=*/0, /*stride_channel_y=*/(int)(n_cols * s11_y),
+            /*stride_channel_dst=*/0,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+            /*ids_stride=*/0, stream);
+        return hipGetLastError() == hipSuccess ? 0 : -3;
+    }
+    // MoE: column = token, channel = slot; out[(token * used + slot) * M + row].
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc = ds4_ggml_hip_info().devices[dev].cc;
+    const int col_cap =
+        W_gate ? 1 : get_mmvq_mmid_max_batch(type, ds4_ggml_hip_highest_compiled_arch(cc));
+    const int64_t s2_dst = (int64_t)n_expert_used * M;
+    for (int c0 = 0; c0 < n_cols; c0 += col_cap) {
+        const int ncols = (n_cols - c0 < col_cap) ? (n_cols - c0) : col_cap;
+        mul_mat_vec_q_switch_type(
+            W, type,
+            (const void *)((const char *)q8 + (size_t)c0 * s11_y * sizeof(block_q8_1)),
+            ids + (size_t)c0 * n_expert_used, fusion, out + (int64_t)c0 * s2_dst,
+            K, M, ncols, (int)s01_row, (int)s11_y, (int)s2_dst,
+            /*nchannels_x=*/n_experts, /*nchannels_y=*/1,
+            /*nchannels_dst=*/n_expert_used,
+            /*stride_channel_x=*/(int)(M * s01_row), /*stride_channel_y=*/(int)s11_y,
+            /*stride_channel_dst=*/M,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+            /*ids_stride=*/n_expert_used, stream);
+        if (hipGetLastError() != hipSuccess) return -3;
+    }
+    return 0;
+}
+
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
 // device functions from mmq.hip.hpp, so the .o objects below contain everything
@@ -4260,6 +4375,8 @@ template void mul_mat_q_case<GGML_TYPE_Q2_K>(
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);

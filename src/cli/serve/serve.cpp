@@ -7,6 +7,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -32,9 +34,14 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
+
+#if defined(GUFO_HAVE_QWEN3_OMNI)
+#include "src/models/qwen3_omni/captioner.hpp"
+#endif
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -42,7 +49,9 @@
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
+#include "src/cli/serve/video_rife.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/models/moss_image/model.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::cli {
@@ -156,6 +165,31 @@ void ShutdownAfterDeviceLoss() {
                     std::to_string(kDeviceLostExitStatus) +
                     " timeout_s=" + std::to_string(kShutdownTimeout.count()));
   (void)std::raise(SIGTERM);
+}
+
+// MiniMax H3 worker recycling (VideoJobServiceOptions::recycle): about
+// 512x512 at 5 s (37 latent frames x 256 rows) and larger.
+constexpr std::size_t kDefaultH3RecycleRows = 8000;
+
+// Leaves through the SIGTERM shutdown path a few seconds after a large H3 job
+// so pollers can still read its status; the router restarts the worker on
+// the next request and the new process serves the persisted result. A
+// watchdog bounds the teardown.
+void RecycleVideoWorker(const std::string& job_id) {
+  try {
+    std::thread([job_id] {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      server::Logger::Info("server", "event=video_worker_recycle job=" +
+                                         job_id + " exit_status=0");
+      std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        ::_exit(0);
+      }).detach();
+      (void)std::raise(SIGTERM);
+    }).detach();
+  } catch (...) {
+    ::_exit(0);
+  }
 }
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
@@ -434,6 +468,33 @@ struct SpeechOptions {
   std::map<std::string, std::string> voice_lang_specs;
 };
 
+struct OmniOptions {
+  std::string model;
+  std::string mmproj;
+  std::size_t context{8192};
+  std::size_t max_tokens{1024};
+  std::string served_model_name{"qwen3-omni-captioner"};
+};
+
+void AddOmniOptions(ArgParser& parser, OmniOptions* options) {
+  parser.AddOption("-m", "--model", "PATH",
+                   "Qwen3-Omni-30B-A3B-Captioner text GGUF", "Model",
+                   &options->model);
+  parser.AddOption("", "--mmproj", "PATH",
+                   "Matching projector GGUF (audio tower)", "Model",
+                   &options->mmproj);
+  parser.AddOption("-c", "--context", "N",
+                   "Context capacity: audio tokens plus caption (default: "
+                   "8192)",
+                   "Model", &options->context);
+  parser.AddOption("-n", "--max-tokens", "N",
+                   "Caption length limit and default (default: 1024)",
+                   "Model", &options->max_tokens);
+  parser.AddOption("", "--served-model-name", "NAME",
+                   "Public API model ID (default: qwen3-omni-captioner)",
+                   "Model", &options->served_model_name);
+}
+
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
   parser.AddOption("-m", "--model", "DIR",
                    tts ? "Qwen3-TTS 12Hz 1.7B model directory"
@@ -516,6 +577,56 @@ void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
 
 }  // namespace
 
+// --lora NAME=PATH[,steps=N][,strength=S]: registers a transformer LoRA that
+// video requests select by name with "gufo": {"lora": NAME}.
+static bool ParseVideoLora(
+    std::string_view value,
+    std::map<std::string, server::VideoLora, std::less<>>* loras,
+    std::string* error) {
+  const std::size_t equals = value.find('=');
+  if (equals == 0 || equals == std::string_view::npos) {
+    *error = "--lora expects NAME=PATH[,steps=N][,strength=S]";
+    return false;
+  }
+  const std::string name(value.substr(0, equals));
+  std::string_view rest = value.substr(equals + 1);
+  server::VideoLora lora;
+  std::size_t comma = rest.find(',');
+  lora.path = std::filesystem::path(std::string(rest.substr(0, comma)));
+  while (comma != std::string_view::npos) {
+    rest.remove_prefix(comma + 1);
+    comma = rest.find(',');
+    const std::string_view item = rest.substr(0, comma);
+    try {
+      if (item.starts_with("steps=")) {
+        lora.steps = std::stoi(std::string(item.substr(6)));
+      } else if (item.starts_with("strength=")) {
+        lora.strength = std::stof(std::string(item.substr(9)));
+      } else {
+        throw std::invalid_argument("unknown key");
+      }
+    } catch (const std::exception&) {
+      *error = "--lora option '" + std::string(item) +
+               "' is not steps=N or strength=S";
+      return false;
+    }
+  }
+  if (lora.path.empty() || lora.steps < 0 || lora.steps > 1000 ||
+      loras->contains(name)) {
+    *error = "--lora '" + name +
+             "' needs a path, steps in 0..1000 and a "
+             "unique name";
+    return false;
+  }
+  std::error_code filesystem_error;
+  if (!std::filesystem::is_regular_file(lora.path, filesystem_error)) {
+    *error = "--lora file not found: " + lora.path.string();
+    return false;
+  }
+  loras->emplace(name, std::move(lora));
+  return true;
+}
+
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
   if (subcommand == "image") {
@@ -555,8 +666,8 @@ void PrintServeHelp(std::string_view program_name,
         std::string(program_name) + " serve video",
         "Start the MiniMax H3 text-to-video HTTP generation server.");
     parser.AddOption("-m", "--model", "DIR",
-                     "Operator-supplied MiniMax H3 directory", "Model",
-                     &video_model);
+                     "MiniMax H3 or Wan 2.2 TI2V-5B (Diffusers) directory",
+                     "Model", &video_model);
     parser.AddOption(
         "", "--root", "DIR",
         "Storage root for persistent video jobs (default: video-jobs)",
@@ -566,8 +677,43 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--ttl", "SEC",
                      "Completed-artifact TTL in seconds (default: 3600)",
                      "Storage", &video_ttl_seconds);
+    std::filesystem::path video_vision_projector;
+    parser.AddOption("", "--vision-projector", "GGUF",
+                     "Qwen3-VL vision tower for keyframe prompt blocks",
+                     "Model", &video_vision_projector);
+    std::filesystem::path video_rife_model;
+    parser.AddOption("", "--rife-model", "SAFETENSORS",
+                     "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}",
+                     "Model", &video_rife_model);
+    std::size_t video_recycle_rows = kDefaultH3RecycleRows;
+    parser.AddOption("", "--recycle-rows", "N",
+                     "MiniMax H3: exit the worker after a completed job with "
+                     "at least N denoiser video rows so a supervisor restarts "
+                     "it with all GPU memory (default 8000; 0 = never)",
+                     "Storage", &video_recycle_rows);
+    std::map<std::string, server::VideoLora, std::less<>> video_loras;
+    parser.AddCustomOption(
+        "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
+        "Register a transformer LoRA for requests (\"gufo\":{\"lora\":NAME}); "
+        "repeatable",
+        "Model",
+        [&video_loras](std::string_view, std::string_view value,
+                       std::string* error) {
+          return ParseVideoLora(value, &video_loras, error);
+        });
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
+    parser.PrintHelp();
+    return;
+  }
+
+  if (subcommand == "omni") {
+    OmniOptions options;
+    ArgParser parser(std::string(program_name) + " serve omni",
+                     "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.");
+    AddOmniOptions(parser, &options);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
     return;
   }
@@ -622,6 +768,8 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::uint64_t expert_cache_bytes = 0;
+    std::string expert_profile;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -646,6 +794,14 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
+    parser.AddOption("", "--expert-cache-bytes", "N",
+                     "Flash-Next: device bytes for routed experts streamed "
+                     "from the GGUF (default: 0 = all experts resident)",
+                     "Model", &expert_cache_bytes);
+    parser.AddOption("", "--expert-profile", "FILE",
+                     "Flash-Next: routing profile kept across restarts; its "
+                     "most routed experts are loaded at startup",
+                     "Model", &expert_profile);
 
     // Sampling Defaults
     parser.AddOption(
@@ -772,7 +928,9 @@ void PrintServeHelp(std::string_view program_name,
       << "  asr       Serve Qwen3-ASR transcription "
          "(/v1/audio/transcriptions)\n"
       << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
-         "(/v1/embeddings)\n\n"
+         "(/v1/embeddings)\n"
+      << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
+         "(/v1/chat/completions with input_audio)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -866,7 +1024,8 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image" || arg == "embedding") {
+        arg == "image" || arg == "embedding" ||
+        arg == "omni") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -874,7 +1033,7 @@ int RunServe(std::span<const char* const> args) {
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
-          topic != "embedding") {
+          topic != "embedding" && topic != "omni") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -924,7 +1083,8 @@ int RunServe(std::span<const char* const> args) {
     // (`--log-level=error`) suppresses this INFO startup diagnostic with the
     // rest of the boot sequence instead of leaking it before SetLevel ran.
     const auto profile = subcommand == "llm" ? diagnostics::QueueProfile::kText
-                         : (subcommand == "tts" || subcommand == "asr")
+                         : (subcommand == "tts" || subcommand == "asr" ||
+                            subcommand == "omni")
                              ? diagnostics::QueueProfile::kAudio
                              : diagnostics::QueueProfile::kUnmeasured;
     const auto plan =
@@ -959,6 +1119,7 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::AsrService> asr;
   std::shared_ptr<server::ImageService> images;
   std::shared_ptr<server::EmbeddingService> embeddings;
+  std::shared_ptr<server::OmniService> omni;
 
   if (subcommand == "embedding") {
     std::filesystem::path model;
@@ -1015,13 +1176,22 @@ int RunServe(std::span<const char* const> args) {
         std::to_string(server::EmbeddingService::kMaxInputTokens));
   } else if (subcommand == "image") {
     std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    std::filesystem::path text_encoder;
+    std::string name;
     ArgParser parser("gufo serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve Qwen-Image-2.1 or MOSS-Image generation.");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Qwen-Image-2.1 or MOSS-Image Diffusers directory",
+                     "Model", &model);
+    parser.AddOption("", "--text-encoder", "GGUF",
+                     "MOSS-Image text encoder as GGUF (default: "
+                     "DIR/text_encoder.gguf)",
+                     "Model", &text_encoder);
     parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
                      "Model", &name);
+    // Edits accept up to 20 MiB of reference images (FilmStudio sends up to
+    // 9); the 8 MiB default rejected an 8-reference keyframe with 413.
+    max_request_body_bytes = 32ULL << 20;
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
@@ -1037,11 +1207,29 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
-    ModelLoadLog load_log("qwen_image_21", model);
+    const bool moss = models::moss_image::IsMossImageDirectory(model);
+    if (name.empty())
+      name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
+    ModelLoadLog load_log(moss ? "moss_image" : "qwen_image_21", model);
     try {
-      images = std::make_shared<server::ImageService>(model, name);
+      if (moss) {
+        auto moss_model = std::make_shared<models::moss_image::Model>(
+            model, models::moss_image::Options{
+                       .text_encoder = text_encoder.empty()
+                                           ? model / "text_encoder.gguf"
+                                           : text_encoder});
+        images = std::make_shared<server::ImageService>(
+            model, name,
+            [moss_model](
+                const server::ImageService::Request& request,
+                const server::ImageService::CancellationCheck& cancelled) {
+              return moss_model->Generate(request, cancelled);
+            });
+      } else {
+        images = std::make_shared<server::ImageService>(model, name);
+      }
     } catch (const std::exception& error) {
-      std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
+      std::cerr << "Error loading " << name << ": " << error.what() << '\n';
       return 1;
     }
     load_log.Complete("model=" + name + " weights=mapped upload=on_demand");
@@ -1053,9 +1241,10 @@ int RunServe(std::span<const char* const> args) {
 
     gufo::cli::ArgParser video_parser(
         "gufo serve video", "Start the MiniMax H3 video generation server.");
-    video_parser.AddOption("-m", "--model", "DIR",
-                           "Operator-supplied MiniMax H3 directory", "Model",
-                           &video_model);
+    video_parser.AddOption(
+        "-m", "--model", "DIR",
+        "MiniMax H3 or Wan 2.2 TI2V-5B (Diffusers) directory", "Model",
+        &video_model);
     video_parser.AddOption("", "--root", "DIR",
                            "Storage root for persistent video jobs", "Storage",
                            &video_root);
@@ -1065,6 +1254,30 @@ int RunServe(std::span<const char* const> args) {
     video_parser.AddOption("", "--ttl", "SEC",
                            "Completed-artifact TTL in seconds", "Storage",
                            &video_ttl_seconds);
+    std::filesystem::path video_vision_projector;
+    video_parser.AddOption("", "--vision-projector", "GGUF",
+                           "Qwen3-VL vision tower for keyframe prompt blocks",
+                           "Model", &video_vision_projector);
+    std::filesystem::path video_rife_model;
+    video_parser.AddOption(
+        "", "--rife-model", "SAFETENSORS",
+        "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}", "Model",
+        &video_rife_model);
+    std::size_t video_recycle_rows = kDefaultH3RecycleRows;
+    video_parser.AddOption(
+        "", "--recycle-rows", "N",
+        "MiniMax H3: exit the worker after a completed job with at least N "
+        "denoiser video rows so a supervisor restarts it with all GPU memory "
+        "(default 8000, about 512x512 at 5 s; 0 = never)",
+        "Storage", &video_recycle_rows);
+    std::map<std::string, server::VideoLora, std::less<>> video_loras;
+    video_parser.AddCustomOption(
+        "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
+        "Register a transformer LoRA for requests; repeatable", "Model",
+        [&video_loras](std::string_view, std::string_view value,
+                       std::string* error) {
+          return ParseVideoLora(value, &video_loras, error);
+        });
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -1092,10 +1305,36 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "video");
       return 2;
     }
+    if (!video_rife_model.empty() &&
+        !std::filesystem::is_regular_file(video_rife_model)) {
+      std::cerr << "Error: --rife-model file not found: "
+                << video_rife_model.string() << "\n";
+      return 2;
+    }
+    decltype(server::VideoJobServiceOptions::interpolator) video_interpolator;
+    if (!video_rife_model.empty()) {
+      video_interpolator =
+          [video_rife_model](const std::filesystem::path& input,
+                             const std::filesystem::path& output,
+                             int multiplier,
+                             const minimax_h3::CancellationToken* cancellation,
+                             minimax_h3::GenerationProgress progress,
+                             void* opaque, std::string* error) {
+            return server::RunRifeInterpolation(video_rife_model, input, output,
+                                                multiplier, cancellation,
+                                                progress, opaque, error);
+          };
+    }
 
+    // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B; anything
+    // else is validated as MiniMax H3.
+    const bool wan22 = server::IsWan22ModelDirectory(video_model);
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
+            .family = wan22 ? server::VideoModelFamily::kWan22
+                            : server::VideoModelFamily::kMinimaxH3,
+            .model_id = {},
             .model_root = video_model,
             .source_manifest = video_manifest,
             .storage_root = video_root,
@@ -1106,14 +1345,23 @@ int RunServe(std::span<const char* const> args) {
             .id_factory = {},
             .now = {},
             .runner = {},
+            .loras = std::move(video_loras),
+            .vision_projector = video_vision_projector,
+            .interpolator = std::move(video_interpolator),
+            .recycle_rows = wan22 ? 0 : video_recycle_rows,
+            .recycle = RecycleVideoWorker,
         });
     if (!video_jobs->ready()) {
-      std::cerr << "Error enabling MiniMax H3 video service: "
-                << video_jobs->initialization_error() << '\n';
+      std::cerr << "Error enabling " << (wan22 ? "Wan 2.2" : "MiniMax H3")
+                << " video service: " << video_jobs->initialization_error()
+                << '\n';
       return 1;
     }
-    load_log.Complete(
-        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
+    load_log.Complete("model=" + video_jobs->model_id() +
+                          " sessions=1 queue_capacity=1 weights=lazy loras=" +
+                          std::to_string(video_loras.size()) +
+                          " rife=" + (video_rife_model.empty() ? "off" : "on"),
+                      false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
     SpeechOptions options{.context = is_tts ? 4096U : 1024U};
@@ -1195,6 +1443,67 @@ int RunServe(std::span<const char* const> args) {
           "model=" + asr->model_id() +
           " sessions=1 context_tokens=" + std::to_string(options.context));
     }
+  } else if (subcommand == "omni") {
+    OmniOptions options;
+    ArgParser parser("gufo serve omni",
+                     "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.");
+    AddOmniOptions(parser, &options);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", subcommand);
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (options.model.empty() || options.mmproj.empty()) {
+      std::cerr << "Error: --model <PATH> and --mmproj <PATH> are required "
+                   "for omni server\n";
+      return 2;
+    }
+    if (options.context < 64U || options.max_tokens == 0U) {
+      std::cerr << "Error: --context must be at least 64 and --max-tokens "
+                   "positive\n";
+      return 2;
+    }
+#if defined(GUFO_HAVE_QWEN3_OMNI)
+    ModelLoadLog load_log(subcommand, options.model);
+    std::string error;
+    std::shared_ptr<models::qwen3_omni::Captioner> captioner =
+        models::qwen3_omni::Captioner::Create(
+            {.model = options.model,
+             .mmproj = options.mmproj,
+             .backend = "gpu",
+             .context = options.context,
+             .threads = 0},
+            &error);
+    if (captioner == nullptr) {
+      std::cerr << "Error loading Qwen3-Omni captioner: " << error << '\n';
+      return 1;
+    }
+    omni = std::make_shared<server::OmniService>(server::OmniServiceOptions{
+        .model_id = options.served_model_name,
+        .context_tokens = options.context,
+        .max_tokens = options.max_tokens,
+        .runner =
+            [captioner](const models::qwen3_omni::CaptionRequest& request,
+                        const models::qwen3_omni::CancellationCheck& cancelled,
+                        models::qwen3_omni::CaptionResult* result,
+                        std::string* failure) {
+              return captioner->Caption(request, cancelled, result, failure);
+            },
+    });
+    load_log.Complete("model=" + omni->model_id() +
+                      " sessions=1 context_tokens=" +
+                      std::to_string(options.context));
+#else
+    std::cerr << "Error: this gufo build has no Qwen3-Omni support (needs "
+                 "HIP)\n";
+    return 1;
+#endif
   } else {
     // Default to LLM server
     std::string model;
@@ -1233,6 +1542,8 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::uint64_t expert_cache_bytes = 0;
+    std::string expert_profile;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1268,6 +1579,15 @@ int RunServe(std::span<const char* const> args) {
                        "Flash-Next: static YaRN, required for --context above "
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
+    llm_parser.AddOption("", "--expert-cache-bytes", "N",
+                         "Flash-Next: device bytes for routed experts "
+                         "streamed from the GGUF (default: 0 = all experts "
+                         "resident)",
+                         "Model", &expert_cache_bytes);
+    llm_parser.AddOption("", "--expert-profile", "FILE",
+                         "Flash-Next: routing profile kept across restarts; "
+                         "its most routed experts are loaded at startup",
+                         "Model", &expert_profile);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1501,6 +1821,23 @@ int RunServe(std::span<const char* const> args) {
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
     // so supervisors see a loading server rather than a refused connection.
     server::LoadingResponder loading(host, port);
+    if (expert_cache_bytes > 0) {
+      // The Flash-Next loader reads the budget from its environment variable
+      // when its options carry none.
+      const auto value = std::to_string(expert_cache_bytes);
+#if defined(_WIN32)
+      _putenv_s("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str());
+#else
+      setenv("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str(), 1);
+#endif
+    }
+    if (!expert_profile.empty()) {
+#if defined(_WIN32)
+      _putenv_s("GUFO_FLASH_NEXT_EXPERT_PROFILE", expert_profile.c_str());
+#else
+      setenv("GUFO_FLASH_NEXT_EXPERT_PROFILE", expert_profile.c_str(), 1);
+#endif
+    }
     const bool load_ok = backend->load(
         model, &err, max_context, session_count,
         server::TextPrefillPolicy{
@@ -1607,6 +1944,9 @@ int RunServe(std::span<const char* const> args) {
               },
       },
       images, embeddings);
+  if (omni != nullptr) {
+    server.set_omni(omni);
+  }
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
@@ -18,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
 
@@ -29,6 +31,7 @@ using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
 using gufo::server::VideoJobService;
 using gufo::server::VideoJobServiceOptions;
+using gufo::server::VideoModelFamily;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL video_api_test: " << message << '\n';
@@ -39,6 +42,40 @@ void Check(bool condition, const std::string& message) {
   if (!condition) {
     Fail(message);
   }
+}
+
+// A 0.25 s mono 16 kHz PCM16 WAV (a 440 Hz tone).
+std::string TinyWav() {
+  constexpr std::uint32_t kRate = 16000;
+  constexpr std::uint32_t kSamples = 4000;
+  std::string wav;
+  const auto u32 = [&](std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+      wav.push_back(static_cast<char>((value >> shift) & 255U));
+    }
+  };
+  const auto u16 = [&](std::uint16_t value) {
+    wav.push_back(static_cast<char>(value & 255U));
+    wav.push_back(static_cast<char>(value >> 8U));
+  };
+  wav += "RIFF";
+  u32(36 + kSamples * 2);
+  wav += "WAVEfmt ";
+  u32(16);
+  u16(1);
+  u16(1);
+  u32(kRate);
+  u32(kRate * 2);
+  u16(2);
+  u16(16);
+  wav += "data";
+  u32(kSamples * 2);
+  for (std::uint32_t index = 0; index < kSamples; ++index) {
+    const double phase = 2.0 * 3.14159265358979 * 440.0 * index / kRate;
+    u16(static_cast<std::uint16_t>(
+        static_cast<std::int16_t>(std::sin(phase) * 8000.0)));
+  }
+  return wav;
 }
 
 std::string NextId() {
@@ -146,6 +183,10 @@ VideoJobServiceOptions Options(const std::filesystem::path& root,
             return runner->Run(request, cancellation, progress, progress_opaque,
                                telemetry, error);
           },
+      .loras = {{"turbo",
+                 {.path = "/private/loras/turbo.safetensors",
+                  .steps = 8,
+                  .strength = 1.0F}}},
   };
 }
 
@@ -285,9 +326,109 @@ void TestValidation(const std::filesystem::path& root) {
       service, "POST", "/v1/videos",
       R"({"model":"minimax-h3","prompt":"x","seconds":"1","input_reference":"secret.png"})");
   Check(reference.status == 400 &&
-            reference.body.find("unsupported_input_reference") !=
+            reference.body.find("invalid_input_reference") != std::string::npos,
+        "keyframes that are not images fail closed");
+
+  const HttpResponse references = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"1","references":[]})");
+  Check(references.status == 400 &&
+            references.body.find("unsupported_input_reference") !=
                 std::string::npos,
-        "future conditioning inputs fail closed");
+        "ordered Ref2VA references stay unsupported");
+
+  const HttpResponse keyframed = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"5","first_frame":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","last_frame":{"image_url":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="},"gufo":{"lora":"turbo"}})");
+  Check(keyframed.status == 202, "first and last frame request accepted");
+  runner.WaitForCalls(2);
+  const h3::GenerationRequest keyframed_generation = runner.latest();
+  Check(keyframed_generation.keyframes.size() == 2 &&
+            keyframed_generation.keyframes[0].anchor ==
+                h3::KeyframeAnchor::kFirst &&
+            keyframed_generation.keyframes[1].anchor ==
+                h3::KeyframeAnchor::kLast &&
+            keyframed_generation.keyframes[0].width == 2 &&
+            keyframed_generation.keyframes[0].rgb.size() == 12 &&
+            keyframed_generation.keyframes[0].rgb[0] == 200,
+        "API decodes first and last keyframes");
+  Check(keyframed_generation.lora_path ==
+                std::filesystem::path("/private/loras/turbo.safetensors") &&
+            keyframed_generation.parameters.evaluations == 8,
+        "registered LoRA selects its file and default steps");
+  WaitCompleted(service, CreatedId(keyframed));
+
+  {
+    // A FilmStudio shot: 832x512, first frame, an intermediate and a last
+    // guide frame, and the voice as audio anchor at frame 0.
+    const std::string audio = gufo::server::EncodeAudioBase64(TinyWav());
+    const HttpResponse guided = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","size":"832x512","seconds":"5","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","audio_reference":"data:audio/wav;base64,)" +
+            audio +
+            R"(","gufo":{"lora":"turbo","keyframes":[{"frame":60,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="},{"frame":-1,"image":{"image_url":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}}]}})");
+    Check(guided.status == 202,
+          "832x512 guided request accepted: " + guided.body);
+    runner.WaitForCalls(3);
+    const h3::GenerationRequest guided_generation = runner.latest();
+    Check(guided_generation.parameters.preset == "exact-832x512" &&
+              guided_generation.parameters.internal_width == 832 &&
+              guided_generation.parameters.internal_height == 512 &&
+              guided_generation.parameters.output_width == 832 &&
+              guided_generation.parameters.output_height == 512,
+          "832x512 maps to the exact-832x512 preset");
+    Check(guided_generation.keyframes.size() == 3 &&
+              guided_generation.keyframes[0].vision &&
+              guided_generation.keyframes[1].frame == 60 &&
+              !guided_generation.keyframes[1].vision &&
+              guided_generation.keyframes[2].frame == -1 &&
+              guided_generation.keyframes[1].rgb.size() == 12,
+          "guide frames keep their frame index and skip the vision prompt");
+    Check(guided_generation.audio_guides.size() == 1 &&
+              guided_generation.audio_guides[0].frame == 0 &&
+              guided_generation.audio_guides[0].waveform.sample_rate == 32000 &&
+              guided_generation.audio_guides[0].waveform.channels == 2 &&
+              guided_generation.audio_guides[0].waveform.samples == 8000 &&
+              guided_generation.audio_guides[0].waveform.pcm[100] ==
+                  guided_generation.audio_guides[0].waveform.pcm[8100],
+          "audio_reference decodes to 32 kHz stereo at frame 0");
+    WaitCompleted(service, CreatedId(guided));
+
+    const HttpResponse same_frame = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","gufo":{"keyframes":[{"frame":0,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}]}})");
+    Check(same_frame.status == 400 &&
+              same_frame.body.find("invalid_keyframes") != std::string::npos,
+          "two images cannot anchor the same frame");
+    const HttpResponse outside = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"keyframes":[{"frame":500,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}]}})");
+    Check(outside.status == 400, "guide frames must lie inside the video");
+    const HttpResponse bad_audio = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","audio_reference":"bm90IGF1ZGlv"})");
+    Check(
+        bad_audio.status == 400 &&
+            bad_audio.body.find("invalid_audio_reference") != std::string::npos,
+        "audio_reference must decode as audio");
+    const HttpResponse bad_size = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","size":"800x600","seconds":"5"})");
+    Check(bad_size.status == 400 &&
+              bad_size.body.find("invalid_size") != std::string::npos,
+          "sizes off the 32-pixel grid are rejected");
+  }
+
+  const HttpResponse unknown_lora = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"lora":"/etc/passwd"}})");
+  Check(unknown_lora.status == 400, "only registered LoRA names are accepted");
+
+  const HttpResponse duplicate_first = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"5","input_reference":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="})");
+  Check(duplicate_first.status == 400,
+        "input_reference and first_frame cannot both anchor the start");
 
   const HttpResponse bad_output = Send(
       service, "POST", "/v1/videos",
@@ -363,7 +504,7 @@ void TestValidation(const std::filesystem::path& root) {
            {}, "multipart/form-data; boundary=\"gufo-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
-  runner.WaitForCalls(2);
+  runner.WaitForCalls(4);
   Check(runner.latest().parameters.preset == "fast-384",
         "multipart request preserves the selected H3 mode");
 
@@ -401,9 +542,9 @@ void TestValidation(const std::filesystem::path& root) {
       Send(service, "POST", "/v1/videos", reference_body, {},
            "multipart/form-data; boundary=gufo-openai-video-boundary");
   Check(multipart_reference.status == 400 &&
-            multipart_reference.body.find("unsupported_input_reference") !=
+            multipart_reference.body.find("invalid_input_reference") !=
                 std::string::npos,
-        "multipart first-frame conditioning remains explicit future work");
+        "multipart keyframe files must decode as images");
 
   const HttpResponse unsupported_media =
       Send(service, "POST", "/v1/videos", "model=minimax-h3", {},
@@ -521,6 +662,102 @@ void TestQueueSaturation(const std::filesystem::path& root) {
   runner.Release();
 }
 
+// Wan 2.2: first frame (JSON base64 and multipart upload), negative prompt
+// and guidance reach the runner; last frames and unknown options do not.
+void TestWan22Options(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobServiceOptions options = Options(root, &runner);
+  options.family = VideoModelFamily::kWan22;
+  options.model_root = "/private/models/Wan2.2-TI2V-5B";
+  VideoJobService service(std::move(options));
+  Check(service.ready(), service.initialization_error());
+  // A 1x1 RGBA PNG.
+  const std::string png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+      "hK"
+      "mMIQAAAABJRU5ErkJggg==";
+  const std::string body =
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"input_reference":")" +
+      png +
+      R"(","gufo":{"seed":3,"steps":4,"negative_prompt":"blurry","guidance":3.5}})";
+  const HttpResponse created = Send(service, "POST", "/v1/videos", body);
+  Check(created.status == 202,
+        "Wan image-to-video request is accepted: " + created.body);
+  runner.WaitForCalls(1);
+  WaitCompleted(service, CreatedId(created));
+  h3::GenerationRequest generation = runner.latest();
+  Check(generation.first_frame_width == 1 &&
+            generation.first_frame_height == 1 &&
+            generation.first_frame.size() == 3 &&
+            generation.negative_prompt == "blurry" &&
+            generation.guidance == 3.5F && generation.seed == 3 &&
+            generation.parameters.evaluations == 4 &&
+            generation.parameters.output_width == 480,
+        "Wan first frame, negative prompt and guidance reach the runner");
+
+  const HttpResponse plain = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1})");
+  Check(plain.status == 202, "Wan text-to-video request is accepted");
+  runner.WaitForCalls(2);
+  WaitCompleted(service, CreatedId(plain));
+  generation = runner.latest();
+  Check(generation.first_frame.empty() && generation.negative_prompt.empty() &&
+            generation.guidance == 5.0F,
+        "Wan defaults: text-to-video, empty negative prompt, guidance 5");
+
+  // Decoded PNG bytes as a multipart file upload.
+  std::string file;
+  {
+    static constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : png) {
+      const auto index = kAlphabet.find(c);
+      if (index == std::string_view::npos)
+        continue;
+      buffer = (buffer << 6U) | static_cast<std::uint32_t>(index);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        file += static_cast<char>((buffer >> bits) & 0xFFU);
+      }
+    }
+  }
+  const std::string boundary = "wan-boundary";
+  std::string multipart = Multipart(boundary, {{"model", "wan2.2-ti2v-5b"},
+                                               {"prompt", "fox"},
+                                               {"size", "480x480"},
+                                               {"seconds", "1"}});
+  multipart.erase(multipart.size() - (boundary.size() + 6));
+  multipart += "--" + boundary +
+               "\r\nContent-Disposition: form-data; name=\"first_frame\"; "
+               "filename=\"f.png\"\r\nContent-Type: image/png\r\n\r\n" +
+               file + "\r\n--" + boundary + "--\r\n";
+  const HttpResponse uploaded =
+      Send(service, "POST", "/v1/videos", multipart, {},
+           "multipart/form-data; boundary=" + boundary);
+  Check(uploaded.status == 202,
+        "Wan multipart first frame is accepted: " + uploaded.body);
+  runner.WaitForCalls(3);
+  WaitCompleted(service, CreatedId(uploaded));
+  Check(runner.latest().first_frame.size() == 3,
+        "Wan multipart first frame reaches the runner");
+
+  for (
+      const std::string bad :
+      {R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"last_frame":"x"})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"input_reference":"!!"})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"guidance":"5"}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"guidance":50}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"negative_prompt":1}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"lora":"x"}})"}) {
+    Check(Send(service, "POST", "/v1/videos", bad).status == 400,
+          "invalid Wan request is rejected: " + bad);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -535,6 +772,7 @@ int main() {
   TestDurations(base / "durations");
   TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
+  TestWan22Options(base / "wan22");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";
   return 0;

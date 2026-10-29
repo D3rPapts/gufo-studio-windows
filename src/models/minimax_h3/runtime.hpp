@@ -185,6 +185,9 @@ private:
 
 [[nodiscard]] std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
     std::string* error = nullptr);
+
+// GUFO_H3_TRACE=1: prints the stage and the device's free memory to stderr.
+void TraceStage(const char* stage);
 [[nodiscard]] constexpr ResidencyMode DefaultResidencyMode() noexcept {
   return ResidencyMode::kDeviceCopy;
 }

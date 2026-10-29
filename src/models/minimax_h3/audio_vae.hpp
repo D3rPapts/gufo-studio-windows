@@ -74,6 +74,43 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+struct AudioVaeEncoderTelemetry {
+  double load_ms{0.0};
+  double encode_ms{0.0};
+  std::uint64_t weight_bytes{0};
+  std::uint64_t scratch_bytes{0};
+  std::uint64_t dispatches{0};
+};
+
+/// The AudioVAE's DAC encoder and attention projection (posterior mean, no
+/// sampling) for audio guides: 32 kHz waveforms in [-1, 1] become normalized
+/// latents `[32][2][ceil(samples / 800)]`, as the reference's encode().
+class AudioVaeEncoder {
+public:
+  ~AudioVaeEncoder();
+
+  AudioVaeEncoder(const AudioVaeEncoder&) = delete;
+  AudioVaeEncoder& operator=(const AudioVaeEncoder&) = delete;
+  AudioVaeEncoder(AudioVaeEncoder&&) noexcept;
+  AudioVaeEncoder& operator=(AudioVaeEncoder&&) noexcept;
+
+  [[nodiscard]] static std::unique_ptr<AudioVaeEncoder> Create(
+      const ModelInventory& inventory, const CancellationToken* cancellation,
+      AudioVaeEncoderTelemetry* telemetry, std::string* error = nullptr);
+
+  /// `waveform` must be stereo, channel-major, at 32 kHz.
+  [[nodiscard]] bool Encode(const AudioWaveform& waveform,
+                            const CancellationToken* cancellation,
+                            std::vector<float>* latent, int* latent_frames,
+                            AudioVaeEncoderTelemetry* telemetry,
+                            std::string* error = nullptr);
+
+private:
+  struct Impl;
+  explicit AudioVaeEncoder(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace gufo::minimax_h3
 
 #endif  // GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_HPP_

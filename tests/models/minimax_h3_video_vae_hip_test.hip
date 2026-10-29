@@ -103,8 +103,7 @@ int main() {
   const char* root = std::getenv("GUFO_H3_MODEL_ROOT");
   const char* golden_value = std::getenv("GUFO_H3_VIDEO_VAE_GOLDEN");
   if (root == nullptr || golden_value == nullptr) {
-    std::cout
-        << "SKIP: GUFO_H3_MODEL_ROOT or GUFO_H3_VIDEO_VAE_GOLDEN unset\n";
+    std::cout << "SKIP: GUFO_H3_MODEL_ROOT or GUFO_H3_VIDEO_VAE_GOLDEN unset\n";
     return 77;
   }
   constexpr std::size_t kLatentElements = 24 * 7 * 16 * 16;
@@ -186,7 +185,8 @@ int main() {
   }
   CHECK(decoder->output_frames() == 22);
   CHECK(decoder->tile_pixels() == 256);
-  CHECK(creation.weight_bytes > 9ULL * 1024ULL * 1024ULL * 1024ULL);
+  // 16-bit block matrices (default) halve the 9.7 GiB F32 checkpoint.
+  CHECK(creation.weight_bytes > 4ULL * 1024ULL * 1024ULL * 1024ULL);
   CHECK(creation.peak_live_bytes < 120ULL * 1024ULL * 1024ULL * 1024ULL);
   CHECK(creation.scratch_address != 0);
   CHECK(creation.swap_bytes == 0);

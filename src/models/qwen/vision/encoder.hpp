@@ -25,6 +25,11 @@ public:
     [[nodiscard]] const float* data() const noexcept { return data_; }
     [[nodiscard]] std::uint32_t rows() const noexcept { return rows_; }
     [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
+    /// Qwen3-VL deepstack features (rows x width each, device F32), one per
+    /// deepstack ViT layer in ascending layer order; empty for Qwen3.8.
+    [[nodiscard]] const std::vector<float*>& deepstack() const noexcept {
+      return deepstack_;
+    }
 
   private:
     friend class Encoder;
@@ -32,6 +37,7 @@ public:
     float* data_{nullptr};
     std::uint32_t rows_{0};
     std::uint32_t width_{0};
+    std::vector<float*> deepstack_;
   };
 
   using Observer =

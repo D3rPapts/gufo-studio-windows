@@ -1,3 +1,4 @@
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -271,6 +272,112 @@ void TestLayouts() {
     CHECK(!BuildModulationRowMap(*time_rows, -1, *layout, {}, &error)
                .has_value());
     CHECK(!BuildModulationRowMap(*time_rows, 20, *layout, {}, &error)
+               .has_value());
+  }
+
+  {
+    // FL2VA: [text | first | last | audio | video]. The last anchor sits at
+    // text + sum(all rotary spans) - 5/3, as in the reference.
+    std::string error;
+    const GenerationGeometry geometry = Geometry(256, 256, 124);
+    const std::array anchors = {gufo::minimax_h3::KeyframeAnchor::kFirst,
+                                gufo::minimax_h3::KeyframeAnchor::kLast};
+    auto layout =
+        gufo::minimax_h3::BuildKeyframeLayout(6, geometry, anchors, &error);
+    CHECK(layout.has_value());
+    if (layout.has_value()) {
+      CHECK(layout->segments.size() == 4);
+      CHECK(layout->condition_rows == 128);
+      CHECK(layout->segments[1].kind ==
+            gufo::minimax_h3::SegmentKind::kVideoCondition);
+      CHECK(layout->positions[6].temporal == 6.0);
+      CHECK(std::abs(layout->positions[6 + 64].temporal - 211.0) < 1.0e-9);
+      CHECK(layout->positions[6 + 64].height == layout->positions[6].height);
+      CHECK(layout->segments[2].begin == 6 + 128);
+      // Audio and video clocks still start after the text rows only.
+      CHECK(layout->positions[6 + 128].temporal == 6.0);
+      auto schedule = BuildServingSchedule(8, &error);
+      CHECK(schedule.has_value());
+      auto time_rows = BuildTimeRowSchedule(*schedule, &error);
+      CHECK(time_rows.has_value());
+      CHECK(!BuildModulationRowMap(*time_rows, 0, *layout, {}, &error)
+                 .has_value());
+      gufo::minimax_h3::AppendConditionTimeRow(&*time_rows);
+      CHECK(time_rows->condition_row + 1 == time_rows->time_rows);
+      auto row_map = BuildModulationRowMap(*time_rows, 3, *layout, {}, &error);
+      CHECK(row_map.has_value());
+      if (row_map.has_value()) {
+        CHECK((*row_map)[6] == time_rows->condition_row * 3);
+        CHECK((*row_map)[6 + 127] == time_rows->condition_row * 3);
+        CHECK((*row_map)[6 + 128] == time_rows->audio_rows[3] * 3 + 2);
+        CHECK(row_map->back() == time_rows->video_rows[3] * 3);
+      }
+    }
+    const std::array three = {gufo::minimax_h3::KeyframeAnchor::kFirst,
+                              gufo::minimax_h3::KeyframeAnchor::kLast,
+                              gufo::minimax_h3::KeyframeAnchor::kLast};
+    CHECK(!gufo::minimax_h3::BuildKeyframeLayout(6, geometry, three, &error)
+               .has_value());
+  }
+
+  {
+    // MiniMaxH3AddGuide: [text | image guides | audio guides | audio |
+    // video]; guides sit on text + 5/3 * frame, audio guides advance one
+    // rotary unit per latent frame on both stereo tracks.
+    std::string error;
+    const GenerationGeometry geometry = Geometry(832, 512, 124);
+    const std::array frames = {0, 60, 123};
+    const std::array audio = {
+        gufo::minimax_h3::AudioGuidePlacement{.frame = 0, .latent_frames = 40}};
+    CHECK(gufo::minimax_h3::MaximumAudioGuideFrames(geometry, 0) == 207);
+    CHECK(gufo::minimax_h3::MaximumAudioGuideFrames(geometry, 60) == 107);
+    CHECK(gufo::minimax_h3::MaximumAudioGuideFrames(geometry, 124) == 0);
+    auto layout =
+        gufo::minimax_h3::BuildGuideLayout(6, geometry, frames, audio, &error);
+    CHECK(layout.has_value());
+    if (layout.has_value()) {
+      const std::size_t frame_rows = 26 * 16;
+      CHECK(layout->segments.size() == 5);
+      CHECK(layout->condition_rows == 3 * frame_rows);
+      CHECK(layout->audio_condition_rows == 80);
+      CHECK(layout->segments[2].kind ==
+            gufo::minimax_h3::SegmentKind::kAudioCondition);
+      CHECK(layout->positions[6].temporal == 6.0);
+      CHECK(std::abs(layout->positions[6 + frame_rows].temporal - 106.0) <
+            1.0e-9);
+      CHECK(std::abs(layout->positions[6 + 2 * frame_rows].temporal - 211.0) <
+            1.0e-9);
+      const std::size_t audio_guide = 6 + 3 * frame_rows;
+      CHECK(layout->positions[audio_guide].temporal == 6.0);
+      CHECK(layout->positions[audio_guide + 39].temporal == 45.0);
+      CHECK(layout->positions[audio_guide + 40].temporal == 6.0);
+      CHECK(layout->positions[audio_guide].width ==
+            layout->positions[audio_guide + 80].width);
+      CHECK(layout->positions[audio_guide + 40].width ==
+            layout->positions[audio_guide + 80 + 207].width);
+      CHECK(layout->segments[3].begin == audio_guide + 80);
+      auto schedule = BuildServingSchedule(8, &error);
+      auto time_rows = BuildTimeRowSchedule(*schedule, &error);
+      CHECK(time_rows.has_value());
+      gufo::minimax_h3::AppendConditionTimeRow(&*time_rows);
+      CHECK(!BuildModulationRowMap(*time_rows, 0, *layout, {}, &error)
+                 .has_value());
+      gufo::minimax_h3::AppendAudioConditionTimeRow(&*time_rows);
+      auto row_map = BuildModulationRowMap(*time_rows, 2, *layout, {}, &error);
+      CHECK(row_map.has_value());
+      if (row_map.has_value()) {
+        CHECK((*row_map)[audio_guide - 1] == time_rows->condition_row * 3);
+        CHECK((*row_map)[audio_guide] ==
+              time_rows->audio_condition_row * 3 + 2);
+        CHECK((*row_map)[audio_guide + 80] == time_rows->audio_rows[2] * 3 + 2);
+      }
+    }
+    const std::array late = {gufo::minimax_h3::AudioGuidePlacement{
+        .frame = 60, .latent_frames = 108}};
+    CHECK(!gufo::minimax_h3::BuildGuideLayout(6, geometry, {}, late, &error)
+               .has_value());
+    const std::array outside = {124};
+    CHECK(!gufo::minimax_h3::BuildGuideLayout(6, geometry, outside, {}, &error)
                .has_value());
   }
 

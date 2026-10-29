@@ -289,4 +289,6 @@ void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept {
   mapping = {};
 }
 
+void TrimResidentPages() noexcept {}
+
 }  // namespace gufo::platform

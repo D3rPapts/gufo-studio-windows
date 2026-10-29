@@ -7,11 +7,14 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <system_error>
 #include <utility>
 
 #include "src/core/platform/os_info.hpp"
+#include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
@@ -417,6 +420,41 @@ void Report(GenerationProgress progress, void* opaque, std::string_view phase,
 
 }  // namespace
 
+std::optional<std::pair<int, int>> ParseCanvasSize(std::string_view size) {
+  const std::size_t x = size.find('x');
+  if (x == std::string_view::npos) {
+    return std::nullopt;
+  }
+  int width = 0;
+  int height = 0;
+  const auto parse = [](std::string_view text, int* value) {
+    const auto result =
+        std::from_chars(text.data(), text.data() + text.size(), *value);
+    return !text.empty() && result.ec == std::errc{} &&
+           result.ptr == text.data() + text.size();
+  };
+  if (!parse(size.substr(0, x), &width) ||
+      !parse(size.substr(x + 1), &height) || width < 256 || height < 256 ||
+      width > 1344 || height > 1344 || width % kH3CanvasMultiple != 0 ||
+      height % kH3CanvasMultiple != 0 ||
+      static_cast<std::int64_t>(width) * height > kH3MaximumPixels) {
+    return std::nullopt;
+  }
+  return std::pair{width, height};
+}
+
+namespace {
+
+std::optional<std::pair<int, int>> ParseExactPresetSize(std::string_view name) {
+  constexpr std::string_view kPrefix = "exact-";
+  if (!name.starts_with(kPrefix)) {
+    return std::nullopt;
+  }
+  return ParseCanvasSize(name.substr(kPrefix.size()));
+}
+
+}  // namespace
+
 std::optional<GenerationParameters> ResolveGenerationPreset(
     std::string_view name, std::string* error) {
   GenerationParameters parameters;
@@ -477,10 +515,25 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .decode_audio = false,
                   .mux = false,
                   .selected_frames = {0, 11, 21}};
+  } else if (const auto size = ParseExactPresetSize(name); size.has_value()) {
+    // "exact-WxH": the released exact recipe at any canvas the model accepts
+    // (multiples of 32, 256..1344 per side, at most 768*1344 pixels), e.g.
+    // FilmStudio's 832x512 shots. Frames come from the request duration.
+    parameters = {.preset = "exact-" + std::to_string(size->first) + "x" +
+                            std::to_string(size->second),
+                  .internal_width = size->first,
+                  .internal_height = size->second,
+                  .output_width = size->first,
+                  .output_height = size->second,
+                  .frames = 124,
+                  .evaluations = 49,
+                  .active_blocks = 50,
+                  .reuse_interval = 1,
+                  .selected_frames = {}};
   } else {
     SetError(error,
              "unknown MiniMax H3 preset; expected exact, exact-1344x768, "
-             "fast, aggressive, or dev");
+             "exact-WxH, fast, aggressive, or dev");
     return std::nullopt;
   }
   return parameters;
@@ -633,14 +686,149 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.inventory = inventory->telemetry();
   Report(progress, progress_opaque, "inventory", 1, 1);
 
+  const auto geometry = ResolveGenerationGeometry(
+      request.parameters.internal_width, request.parameters.internal_height,
+      request.parameters.frames, error);
+  if (!geometry.has_value()) {
+    return false;
+  }
+
+  // FL2VA keyframes and guide frames, fitted to the canvas, in frame order
+  // (first, intermediate guides, last). Only the vision keyframes get a
+  // "<Picture i>" block, numbered in that order.
+  std::vector<int> keyframe_frames;
+  // Owns the fitted pixels; KeyframeImage only views them.
+  std::vector<std::vector<std::uint8_t>> canvases;
+  std::vector<KeyframeImage> keyframe_images;
+  std::vector<KeyframeImage> vision_images;
+  {
+    std::vector<std::pair<int, const GenerationKeyframe*>> ordered;
+    for (const GenerationKeyframe& keyframe : request.keyframes) {
+      int frame =
+          keyframe.frame == kKeyframeAtAnchor
+              ? KeyframeAnchorFrame(keyframe.anchor, geometry->temporal.frames)
+              : keyframe.frame;
+      if (frame < 0 && frame != kKeyframeAtAnchor) {
+        frame += geometry->temporal.frames;
+      }
+      if (frame < 0 || frame >= geometry->temporal.frames) {
+        SetError(error,
+                 "MiniMax H3 guide frame " + std::to_string(keyframe.frame) +
+                     " is outside the video's " +
+                     std::to_string(geometry->temporal.frames) + " frames");
+        return false;
+      }
+      ordered.emplace_back(frame, &keyframe);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto& left, const auto& right) {
+                       return left.first < right.first;
+                     });
+    if (ordered.size() > kH3MaximumKeyframes) {
+      SetError(error, "MiniMax H3 accepts at most " +
+                          std::to_string(kH3MaximumKeyframes) +
+                          " keyframes and guide frames");
+      return false;
+    }
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+      if (ordered[index].first == ordered[index - 1].first) {
+        SetError(error, "MiniMax H3 got two images for frame " +
+                            std::to_string(ordered[index].first));
+        return false;
+      }
+    }
+    canvases.reserve(ordered.size());
+    for (const auto& [frame, keyframe] : ordered) {
+      canvases.push_back(FitKeyframeToCanvas(keyframe->rgb, keyframe->width,
+                                             keyframe->height, geometry->width,
+                                             geometry->height));
+      if (canvases.back().empty()) {
+        SetError(error, "MiniMax H3 keyframe is not a valid RGB8 image");
+        return false;
+      }
+      keyframe_frames.push_back(frame);
+      const KeyframeImage image{.width = geometry->width,
+                                .height = geometry->height,
+                                .rgb = canvases.back()};
+      if (keyframe->vision) {
+        vision_images.push_back(image);
+      }
+      keyframe_images.push_back(image);
+    }
+  }
+  if (request.audio_guides.size() > kH3MaximumAudioGuides) {
+    SetError(error, "MiniMax H3 accepts at most " +
+                        std::to_string(kH3MaximumAudioGuides) +
+                        " audio guides");
+    return false;
+  }
+
+  // The FL2VA presentation: per keyframe a "<Picture i>: " label and a
+  // vision block (tagged as video for the DiT), then the prompt verbatim.
+  // On Windows the vision tower and the text encoder run in a child process
+  // (EncodePromptIsolated); the image block grids follow from the canvas.
+  std::vector<PromptVisionBlock> vision_blocks;
+  const bool use_vision =
+      !vision_images.empty() && !request.vision_projector.empty();
+  const bool isolate_prompt = PromptIsolationEnabled();
+  TraceStage("prompt phase start");
+  if (use_vision && isolate_prompt) {
+    for (const KeyframeImage& image : vision_images) {
+      if (image.width % 32 != 0 || image.height % 32 != 0) {
+        SetError(error,
+                 "MiniMax H3 keyframe vision needs 32-pixel canvas sides");
+        return false;
+      }
+      PromptVisionBlock block;
+      block.grid_height = static_cast<std::uint32_t>(image.height / 32);
+      block.grid_width = static_cast<std::uint32_t>(image.width / 32);
+      vision_blocks.push_back(std::move(block));
+    }
+  } else if (use_vision) {
+    Report(progress, progress_opaque, "vision", 0, 1);
+    begin = Clock::now();
+    if (!EncodeKeyframeVision(request.vision_projector, vision_images,
+                              cancellation, &vision_blocks, error)) {
+      return false;
+    }
+    local.vision_ms = Milliseconds(begin, Clock::now());
+    TraceStage("vision encoded");
+    Report(progress, progress_opaque, "vision", 1, 1);
+  }
   begin = Clock::now();
   Tokenizer tokenizer;
   std::vector<std::uint32_t> tokens;
+  std::vector<std::uint8_t> tags;
   if (!Tokenizer::Load(request.model_root / "FL2VA/tokenizer/tokenizer.json",
-                       &tokenizer, error) ||
-      !tokenizer.EncodePrompt(request.prompt, &tokens, error) ||
-      tokens.empty()) {
+                       &tokenizer, error)) {
     return false;
+  }
+  for (std::size_t index = 0; index < vision_blocks.size(); ++index) {
+    std::vector<std::uint32_t> label;
+    if (!tokenizer.Encode("<Picture " + std::to_string(index + 1) + ">: ",
+                          false, &label, error)) {
+      return false;
+    }
+    tokens.insert(tokens.end(), label.begin(), label.end());
+    tags.insert(tags.end(), label.size(), 1);
+    tokens.push_back(kVisionStartToken);
+    vision_blocks[index].begin = tokens.size();
+    const std::size_t rows =
+        static_cast<std::size_t>(vision_blocks[index].grid_height) *
+        vision_blocks[index].grid_width;
+    tokens.insert(tokens.end(), rows, kImagePadToken);
+    tokens.push_back(kVisionEndToken);
+    tags.insert(tags.end(), rows + 2U, 0);
+    local.vision_tokens += rows;
+  }
+  {
+    std::vector<std::uint32_t> prompt;
+    if (!tokenizer.EncodePrompt(request.prompt, &prompt, error) ||
+        prompt.empty()) {
+      return false;
+    }
+    tokens.insert(tokens.end(), prompt.begin(), prompt.end());
+    tags.insert(tags.end(), prompt.size(), 1);
   }
   local.tokenizer_ms = Milliseconds(begin, Clock::now());
   local.prompt_tokens = tokens.size();
@@ -648,19 +836,32 @@ bool GenerateTextVideo(const GenerationRequest& request,
   Report(progress, progress_opaque, "prompt", 0, 1);
   begin = Clock::now();
   PromptEmbedding embedding;
-  if (!EncodePromptLayer50(*inventory, tokens, {}, cancellation, &embedding,
-                           &local.prompt_encoder, error)) {
-    return false;
+  if (isolate_prompt) {
+    const PromptIsolationInput isolated{
+        .model_root = request.model_root,
+        .manifest = request.source_manifest,
+        .projector =
+            use_vision ? request.vision_projector : std::filesystem::path(),
+        .images = use_vision ? std::span<const KeyframeImage>(vision_images)
+                             : std::span<const KeyframeImage>(),
+        .tokens = tokens,
+        .blocks = vision_blocks};
+    if (!EncodePromptIsolated(isolated, cancellation, &embedding,
+                              &local.prompt_encoder, &local.vision_ms, error)) {
+      return false;
+    }
+  } else {
+    PromptEncoderOptions prompt_options;
+    prompt_options.vision_blocks = vision_blocks;
+    if (!EncodePromptLayer50(*inventory, tokens, prompt_options, cancellation,
+                             &embedding, &local.prompt_encoder, error)) {
+      return false;
+    }
   }
+  vision_blocks.clear();
+  TraceStage("prompt encoded");
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
-
-  const auto geometry = ResolveGenerationGeometry(
-      request.parameters.internal_width, request.parameters.internal_height,
-      request.parameters.frames, error);
-  if (!geometry.has_value()) {
-    return false;
-  }
   const std::size_t video_elements =
       kH3VideoLatentChannels *
       static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
@@ -672,7 +873,115 @@ bool GenerateTextVideo(const GenerationRequest& request,
   if (!noise.has_value()) {
     return false;
   }
-  std::vector<std::uint8_t> tags(embedding.tokens, 1);
+  std::vector<std::vector<float>> keyframe_latents;
+  if (!keyframe_images.empty()) {
+    Report(progress, progress_opaque, "keyframes", 0, 1);
+    begin = Clock::now();
+    std::vector<KeyframeMoments> moments;
+    if (!EncodeKeyframeMoments(*inventory, keyframe_images, cancellation,
+                               &moments, &local.keyframe_encoder, error)) {
+      return false;
+    }
+    for (std::size_t index = 0; index < moments.size(); ++index) {
+      std::vector<float> latent;
+      // The posterior sample is seeded independently of the request, as in
+      // the reference; the anchor noise follows the request seed.
+      if (!BuildKeyframeConditioning(
+              *inventory, moments[index], kH3KeyframeEncodeSeed,
+              request.seed ^ (0x9E3779B97F4A7C15ULL * (index + 1U)), &latent,
+              error)) {
+        return false;
+      }
+      keyframe_latents.push_back(std::move(latent));
+    }
+    local.keyframes = keyframe_latents.size();
+    local.keyframe_ms = Milliseconds(begin, Clock::now());
+    TraceStage("keyframes encoded");
+    Report(progress, progress_opaque, "keyframes", 1, 1);
+  }
+  // Audio guides: AudioVAE posterior mean, cropped to the audio track that
+  // remains behind the guide's frame (MiniMaxH3AddGuide audio).
+  std::vector<AudioGuideLatent> audio_guides;
+  if (!request.audio_guides.empty()) {
+    Report(progress, progress_opaque, "audio_guides", 0, 1);
+    begin = Clock::now();
+    AudioVaeEncoderTelemetry encoder_telemetry;
+    auto encoder = AudioVaeEncoder::Create(*inventory, cancellation,
+                                           &encoder_telemetry, error);
+    if (encoder == nullptr) {
+      return false;
+    }
+    for (const GenerationAudioGuide& guide : request.audio_guides) {
+      int frame = guide.frame;
+      if (frame < 0) {
+        frame += geometry->temporal.frames;
+      }
+      const int room = MaximumAudioGuideFrames(*geometry, frame);
+      if (room < 1) {
+        SetError(error, "MiniMax H3 audio guide frame " +
+                            std::to_string(guide.frame) +
+                            " is past the end of the video's audio track");
+        return false;
+      }
+      // The encoder's convolutions reach about 11 latent frames ahead and its
+      // attention is causal, so 16 frames of margin keep the kept frames
+      // exact while long clips are not encoded in full.
+      AudioWaveform clip = guide.waveform;
+      const std::size_t keep_samples =
+          static_cast<std::size_t>(room + 16) * kH3AudioVaeHopLength;
+      if (static_cast<std::size_t>(clip.samples) > keep_samples) {
+        std::vector<float> cropped(keep_samples * 2U);
+        for (int track = 0; track < 2; ++track) {
+          std::copy_n(clip.pcm.begin() +
+                          static_cast<std::ptrdiff_t>(track) * clip.samples,
+                      keep_samples,
+                      cropped.begin() +
+                          static_cast<std::ptrdiff_t>(track * keep_samples));
+        }
+        clip.pcm = std::move(cropped);
+        clip.samples = static_cast<int>(keep_samples);
+      }
+      AudioGuideLatent latent{.frame = frame};
+      if (!encoder->Encode(clip, cancellation, &latent.latent,
+                           &latent.latent_frames, &encoder_telemetry, error)) {
+        return false;
+      }
+      if (latent.latent_frames > room) {
+        // Keep the first `room` frames of every [channel][track] row.
+        std::vector<float> kept(static_cast<std::size_t>(room) *
+                                kH3AudioLatentChannels * kH3AudioTracks);
+        for (std::size_t row = 0; row < kH3AudioLatentChannels * kH3AudioTracks;
+             ++row) {
+          std::copy_n(latent.latent.begin() + static_cast<std::ptrdiff_t>(row) *
+                                                  latent.latent_frames,
+                      room,
+                      kept.begin() + static_cast<std::ptrdiff_t>(row) * room);
+        }
+        latent.latent = std::move(kept);
+        latent.latent_frames = room;
+      }
+      local.audio_guide_frames +=
+          static_cast<std::size_t>(latent.latent_frames);
+      audio_guides.push_back(std::move(latent));
+    }
+    encoder.reset();
+    local.audio_guides = audio_guides.size();
+    local.audio_guide_ms = Milliseconds(begin, Clock::now());
+    TraceStage("audio guides encoded");
+    Report(progress, progress_opaque, "audio_guides", 1, 1);
+  }
+  std::shared_ptr<const LoraAdapter> lora;
+  if (!request.lora_path.empty()) {
+    lora = LoraAdapter::Open(request.lora_path, request.lora_strength, error);
+    if (lora == nullptr) {
+      return false;
+    }
+    local.lora_modules = lora->modules();
+  }
+  if (tags.size() != embedding.tokens) {
+    SetError(error, "MiniMax H3 prompt tags differ from the prompt rows");
+    return false;
+  }
   auto denoiser = DenoiserSession::Create(
       *inventory,
       {.geometry = *geometry,
@@ -680,9 +989,14 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .text_rows = embedding.tokens,
        .active_blocks = request.parameters.active_blocks,
        .reuse_interval = request.parameters.reuse_interval,
-       .row_parallel_attention = request.parameters.row_parallel_attention},
-      {.layer50 = embedding.values, .tags = tags}, cancellation,
-      &local.denoiser, error);
+       .row_parallel_attention = request.parameters.row_parallel_attention,
+       .lora = lora.get()},
+      {.layer50 = embedding.values,
+       .tags = tags,
+       .keyframe_latents = keyframe_latents,
+       .keyframe_frames = keyframe_frames,
+       .audio_guides = audio_guides},
+      cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;
   }
@@ -695,6 +1009,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   }
   local.denoiser_ms = Milliseconds(begin, Clock::now());
   denoiser.reset();
+  TraceStage("denoiser released");
   if (!request.latents_directory.empty()) {
     Report(progress, progress_opaque, "latents", 0, 1);
     const std::span<const unsigned char> prompt_bytes(
@@ -740,6 +1055,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.video_vae_ms = Milliseconds(begin, Clock::now());
   local.first_preview_ms = Milliseconds(total_begin, Clock::now());
   video_decoder.reset();
+  TraceStage("video decoder released");
 
   if (!request.frames_directory.empty() &&
       !WriteDiagnosticFrames(request.frames_directory, frames, cancellation,
@@ -817,6 +1133,19 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << telemetry.inventory.payload_bytes_read << ",\n"
          << "  \"tokenizer_ms\": " << telemetry.tokenizer_ms << ",\n"
          << "  \"prompt_ms\": " << telemetry.prompt_ms << ",\n"
+         << "  \"keyframes\": " << telemetry.keyframes << ",\n"
+         << "  \"keyframe_ms\": " << telemetry.keyframe_ms << ",\n"
+         << "  \"audio_guides\": " << telemetry.audio_guides << ",\n"
+         << "  \"audio_guide_frames\": " << telemetry.audio_guide_frames
+         << ",\n"
+         << "  \"audio_guide_ms\": " << telemetry.audio_guide_ms << ",\n"
+         << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
+         << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"
+         << "  \"keyframe_encoder_load_ms\": "
+         << telemetry.keyframe_encoder.load_ms << ",\n"
+         << "  \"keyframe_encoder_tiles\": " << telemetry.keyframe_encoder.tiles
+         << ",\n"
+         << "  \"lora_modules\": " << telemetry.lora_modules << ",\n"
          << "  \"prompt_weight_bytes\": " << prompt_weight_bytes << ",\n"
          << "  \"prompt_load_ms\": " << prompt_load_ms << ",\n"
          << "  \"prompt_prefetch_wait_ms\": " << prompt_prefetch_wait_ms

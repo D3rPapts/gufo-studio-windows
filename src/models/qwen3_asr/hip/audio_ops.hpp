@@ -27,9 +27,10 @@ void LaunchConvolution3x3(const void* input, const void* weight, void* output,
 void LaunchConvOutputLayout(const void* input_bfloat16, void* output_bfloat16,
                             std::size_t chunks, hipStream_t stream);
 
+/// `hidden` is the tower width: 1024 for Qwen3-ASR-1.7B, 1280 for Qwen3-Omni.
 void LaunchAddPositionAndCompact(const float* projected, float* compact_output,
                                  std::size_t feature_frames, std::size_t chunks,
-                                 hipStream_t stream);
+                                 hipStream_t stream, std::size_t hidden = 1024);
 
 void LaunchLayerNormToBfloat16(const float* input, const void* weight_bfloat16,
                                const void* bias_bfloat16, void* output_bfloat16,
