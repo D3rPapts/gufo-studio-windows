@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -109,6 +112,154 @@ __global__ void Im2colKernel(Im2colArgs a, std::size_t first_row,
     value = reinterpret_cast<const uint4*>(source)[group];
   }
   reinterpret_cast<uint4*>(columns + local * per_row * 8)[q] = value;
+}
+
+// Channel 0 of tap `tap` for output position (f, y, x) of the im2col source
+// above, nullptr where the window reads padding.
+__device__ __forceinline__ const std::uint16_t* ConvSource(const Im2colArgs& a,
+                                                           int f, int y, int x,
+                                                           int tap) {
+  const int dx = tap % a.ks, dy = (tap / a.ks) % a.ks, dt = tap / (a.ks * a.ks);
+  const int ef = f + dt - (a.kt - 1);
+  int sy, sx;
+  if (a.down) {
+    sy = 2 * y + dy;
+    sx = 2 * x + dx;
+    if (sy >= a.source_height || sx >= a.source_width)
+      return nullptr;
+  } else {
+    const int yy = y + dy - a.ks / 2;
+    const int xx = x + dx - a.ks / 2;
+    if (yy < 0 || yy >= a.height || xx < 0 || xx >= a.width)
+      return nullptr;
+    sy = yy >> a.upsample;
+    sx = xx >> a.upsample;
+  }
+  const std::size_t pixel = static_cast<std::size_t>(sy) * a.source_width + sx;
+  const std::size_t plane =
+      static_cast<std::size_t>(a.source_height) * a.source_width;
+  if (ef >= 0) {
+    const int sf = a.split ? ef >> 1 : ef;
+    const int offset = a.split ? (ef & 1) * a.channels : 0;
+    return a.current + (sf * plane + pixel) * a.stride + offset;
+  }
+  return a.history + ((ef + 2) * plane + pixel) * a.stride;
+}
+
+// Implicit-GEMM convolution: out[pixel, row] = bias[row] + sum over taps and
+// channels of weight[row, tap * C + c] * source(pixel, tap)[c], the im2col
+// above without materializing the columns. A block computes 128 rows x 128
+// pixels with eight waves (2 x 4, each 64 rows x 32 pixels) of BF16 WMMA with
+// FP32 accumulation; K advances 64 channels of one tap per stage through LDS,
+// the next stage is fetched into registers meanwhile.
+constexpr int kTileM = 128, kTileN = 128, kTileK = 64, kLdsK = kTileK + 8;
+constexpr int kOutStride = kTileM + 8;
+using Frag = __attribute__((ext_vector_type(16))) unsigned short;
+using Acc = __attribute__((ext_vector_type(8))) float;
+
+__device__ __forceinline__ Frag LoadFrag(const std::uint16_t* p) {
+  union {
+    Frag f;
+    uint4 v[2];
+  } u;
+  u.v[0] = *reinterpret_cast<const uint4*>(p);
+  u.v[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return u.f;
+}
+
+__launch_bounds__(256) __global__
+    void ImplicitConvKernel(Im2colArgs a, const std::uint16_t* weight,
+                            const std::uint16_t* bias, int rows, int pixels,
+                            std::uint16_t* out) {
+  __shared__ __align__(16) std::uint16_t lds[2 * kTileM * kLdsK];
+  std::uint16_t* as = lds;
+  std::uint16_t* bs = lds + kTileM * kLdsK;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int sl = lane & 15, wr = wave >> 2, wt = wave & 3;
+  const int row0 = blockIdx.y * kTileM;
+  const int pixel0 = blockIdx.x * kTileN;
+  const int group = tid & 7, line = tid >> 3;
+  int pf[4], py[4], px[4];
+  bool valid[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int p = pixel0 + line + 32 * i;
+    valid[i] = p < pixels;
+    px[i] = p % a.width;
+    py[i] = (p / a.width) % a.height;
+    pf[i] = p / (a.width * a.height);
+  }
+  const int chunks = a.channels / kTileK;
+  const int stages = a.kt * a.ks * a.ks * chunks;
+  const std::size_t k_total = static_cast<std::size_t>(stages) * kTileK;
+  uint4 av[4], bv[4];
+  const auto fetch = [&](int s) {
+    const int tap = s / chunks;
+    const int c = (s % chunks) * kTileK + group * 8;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const std::uint16_t* source =
+          valid[i] ? ConvSource(a, pf[i], py[i], px[i], tap) : nullptr;
+      bv[i] = source != nullptr ? *reinterpret_cast<const uint4*>(source + c)
+                                : make_uint4(0, 0, 0, 0);
+      av[i] = *reinterpret_cast<const uint4*>(
+          weight + static_cast<std::size_t>(row0 + line + 32 * i) * k_total +
+          static_cast<std::size_t>(s) * kTileK + group * 8);
+    }
+  };
+  Acc acc[4][2]{};
+  fetch(0);
+  for (int s = 0; s < stages; ++s) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      *reinterpret_cast<uint4*>(as + (line + 32 * i) * kLdsK + group * 8) =
+          av[i];
+      *reinterpret_cast<uint4*>(bs + (line + 32 * i) * kLdsK + group * 8) =
+          bv[i];
+    }
+    __syncthreads();
+    if (s + 1 < stages)
+      fetch(s + 1);
+#pragma unroll
+    for (int kk = 0; kk < kTileK; kk += 16) {
+      Frag fa[4], fb[2];
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        fa[i] = LoadFrag(as + ((wr * 4 + i) * 16 + sl) * kLdsK + kk);
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+        fb[j] = LoadFrag(bs + ((wt * 2 + j) * 16 + sl) * kLdsK + kk);
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+              fa[i], fb[j], acc[i][j]);
+    }
+  }
+  __syncthreads();
+  // Stage [pixel, row] through LDS for row-contiguous stores.
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int z = 0; z < 8; ++z) {
+        const int r = (wr * 4 + i) * 16 + 2 * z + lane / 16;
+        const int p = (wt * 2 + j) * 16 + sl;
+        lds[p * kOutStride + r] =
+            ToBf16(acc[i][j][z] + FromBf16(bias[row0 + r]));
+      }
+  __syncthreads();
+  for (int index = tid; index < kTileN * kTileM / 8; index += 256) {
+    const int p = index / (kTileM / 8), g = index % (kTileM / 8);
+    if (pixel0 + p < pixels)
+      *reinterpret_cast<uint4*>(out +
+                                static_cast<std::size_t>(pixel0 + p) * rows +
+                                row0 + g * 8) =
+          *reinterpret_cast<const uint4*>(lds + p * kOutStride + g * 8);
+  }
 }
 
 // out = act(x / max(|x|, 1e-12) * sqrt(C) * gamma) per pixel (F.normalize
@@ -451,6 +602,25 @@ struct WanVaeCore {
   DeviceBuffer columns;
   DeviceBuffer qkv32, scores, attn32;
   std::size_t activation_bytes{0};
+
+  // Spatial/temporal convolutions with at most 256 output rows use the
+  // implicit kernel, wider ones im2col + hipBLASLt (faster there on gfx1151:
+  // at 1280x704x121 up_blocks.3 26.3 + 10.2 -> 20.1 + 8.2 s, the 1024-row
+  // layers ~15% slower). GUFO_WAN_VAE_CONV=gemm or =implicit forces one path.
+  int conv_mode{1};  // 0 gemm, 1 by width, 2 implicit
+  bool UseImplicit(const Conv& conv) const {
+    return conv_mode != 0 && conv.kt * conv.ks * conv.ks > 1 &&
+           conv.rows % kTileM == 0 && conv.cin % kTileK == 0 &&
+           (conv_mode == 2 || conv.rows <= 256);
+  }
+  // GUFO_WAN_VAE_PROFILE=1: synchronized per-convolution timing, printed to
+  // stderr after each decode, keyed by `stage` and shape.
+  bool profile{false};
+  std::string stage;
+  std::map<std::string, std::pair<double, int>> times;
+  bool RunConvTimed(Conv& conv, const Im2colArgs& source, std::uint16_t* out,
+                    std::string* error);
+  void PrintProfile(double total_seconds);
 };
 
 struct VaeDecoder::Impl : WanVaeCore {
@@ -590,6 +760,11 @@ bool WanVaeCore::Open(const std::filesystem::path& dir, std::string* error) {
     SetError(error, "Wan VAE rocBLAS handle");
     return false;
   }
+  const char* conv_env = std::getenv("GUFO_WAN_VAE_CONV");
+  const std::string conv_name = conv_env != nullptr ? conv_env : "";
+  conv_mode = conv_name == "gemm" ? 0 : (conv_name == "implicit" ? 2 : 1);
+  const char* profile_mode = std::getenv("GUFO_WAN_VAE_PROFILE");
+  profile = profile_mode != nullptr && std::string(profile_mode) == "1";
   return true;
 }
 
@@ -730,9 +905,55 @@ bool WanVaeCore::LoadResnet(const std::string& prefix, int cin, int cout,
 
 bool WanVaeCore::RunConv(Conv& conv, const Im2colArgs& source,
                          std::uint16_t* out, std::string* error) {
+  if (!profile)
+    return RunConvTimed(conv, source, out, error);
+  if (!Check(hipStreamSynchronize(stream), "profile", error))
+    return false;
+  const auto start = std::chrono::steady_clock::now();
+  if (!RunConvTimed(conv, source, out, error) ||
+      !Check(hipStreamSynchronize(stream), "profile", error))
+    return false;
+  const bool implicit = UseImplicit(conv);
+  std::ostringstream key;
+  key << stage << " " << conv.kt << "x" << conv.ks << "x" << conv.ks << " "
+      << conv.cin << "->" << conv.rows << " " << source.height << "x"
+      << source.width << (implicit ? " implicit" : " gemm");
+  auto& entry = times[key.str()];
+  entry.first += std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+  ++entry.second;
+  return true;
+}
+
+void WanVaeCore::PrintProfile(double total_seconds) {
+  if (!profile)
+    return;
+  double convs = 0;
+  for (const auto& [key, entry] : times) {
+    std::fprintf(stderr, "vae profile %-48s %4d calls %8.3f s\n", key.c_str(),
+                 entry.second, entry.first);
+    convs += entry.first;
+  }
+  std::fprintf(stderr,
+               "vae profile convolutions %.3f s, other %.3f s, total %.3f s\n",
+               convs, total_seconds - convs, total_seconds);
+  times.clear();
+}
+
+bool WanVaeCore::RunConvTimed(Conv& conv, const Im2colArgs& source,
+                              std::uint16_t* out, std::string* error) {
   const std::size_t rows =
       static_cast<std::size_t>(source.frames) * source.height * source.width;
   const int taps = conv.kt * conv.ks * conv.ks;
+  if (UseImplicit(conv) && source.channels == conv.cin) {
+    const dim3 grid(static_cast<unsigned>((rows + kTileN - 1) / kTileN),
+                    static_cast<unsigned>(conv.rows / kTileM));
+    ImplicitConvKernel<<<grid, 256, 0, stream>>>(source, conv.weight.get(),
+                                                 conv.bias.get(), conv.rows,
+                                                 static_cast<int>(rows), out);
+    return Check(hipGetLastError(), "implicit convolution", error);
+  }
   if (taps == 1 && !source.upsample && !source.split && !source.down &&
       source.stride == conv.cin)
     return gemm.Run(conv.weight.get(), conv.bias.get(), source.current, out,
@@ -958,6 +1179,7 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
   for (int i = 0; i < 5; ++i)
     p[i] = pool[i].get();
   // Latent [h, w, 48] -> post_quant_conv -> conv_in -> mid block.
+  stage = "in";
   Tensor x{p[0], 1, h, w, kZ};
   if (!CausalConv(post_quant,
                   Tensor{const_cast<std::uint16_t*>(latent_frame), 1, h, w, kZ},
@@ -965,6 +1187,7 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
       !CausalConv(conv_in, x, p[1], error))
     return false;
   x = Tensor{p[1], 1, h, w, kTop};
+  stage = "mid";
   if (!RunResnet(mid0, x, p[0], p[2], p[3], error))
     return false;
   x.data = p[0];
@@ -978,6 +1201,7 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
   int in_index = 0;
   for (int b = 0; b < 4; ++b) {
     UpBlock& block = up[b];
+    stage = "up" + std::to_string(b);
     std::array<int, 4> other{};
     for (int i = 0, n = 0; i < 5; ++i)
       if (i != in_index)
@@ -1034,6 +1258,7 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
     in_index = other[1];
   }
   // Head: norm_out + SiLU -> conv_out -> unpatchify, clamp.
+  stage = "head";
   std::array<int, 4> other{};
   for (int i = 0, n = 0; i < 5; ++i)
     if (i != in_index)
@@ -1136,6 +1361,7 @@ bool VaeDecoder::Decode(std::span<const float> latent, int frames, int height,
     video->rgb8.resize(frame_values * total);
   std::vector<float> chunk(frame_values * kTemporalRatio);
   std::vector<std::uint16_t> host(plane * kZ);
+  const auto decode_start = std::chrono::steady_clock::now();
   int written = 0;
   for (int f = 0; f < frames; ++f) {
     if (keep_going && !keep_going()) {
@@ -1172,6 +1398,9 @@ bool VaeDecoder::Decode(std::span<const float> latent, int frames, int height,
     if (progress)
       progress(f + 1, frames);
   }
+  m.PrintProfile(std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - decode_start)
+                     .count());
   return true;
 }
 
