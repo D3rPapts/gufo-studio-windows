@@ -6,7 +6,7 @@ target_include_directories(gufo_wan22 PUBLIC ${PROJECT_SOURCE_DIR})
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_wan22 PRIVATE text_encoder.hip transformer.hip
     attention.hip gemm.cpp vae.hip pipeline.cpp clip_vision.hip
-    transformer21.hip)
+    transformer21.hip uni3c.hip pipeline21.cpp)
   target_compile_options(gufo_wan22 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_link_libraries(gufo_wan22 PUBLIC gufo_platform hip::host
@@ -21,6 +21,7 @@ if (ENGINE_ENABLE_HIP)
   endforeach()
   # --image reads PNG/JPEG/WebP through the core image decoder.
   target_link_libraries(gufo-wan-video PRIVATE gufo_core)
+  target_link_libraries(gufo-wan-check21 PRIVATE gufo_core)
 endif()
 
 if (BUILD_TESTING)

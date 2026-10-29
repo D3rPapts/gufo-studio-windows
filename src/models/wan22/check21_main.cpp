@@ -12,6 +12,25 @@
 // shape instead (21 60 104 = 81 frames of 832x480), the context from DIR.
 // Both refuse to load with less than 14 GiB of free host RAM.
 //
+//   gufo-wan-check21 --i2v OUT.mp4 --model ROOT --t5 ROOT --dit FILE
+//                    [--lora FILE] --image FILE --prompt TEXT [--width W]
+//                    [--height H] [--frames N] [--steps S] [--seed N]
+//                    [--uni3c FILE --guide-raw FILE.rgb [--uni3c-strength S]]
+//                    [--dump DIR]
+//
+//   gufo-wan-check21 --dit FILE --lora FILE --clip DIR --dit-oracle DIR
+//                    --uni3c FILE --uni3c-oracle DIR
+//
+// `--uni3c-oracle` runs the DiT input of the DiT oracle with the Uni3C
+// ControlNet on DIR/guide.npy and compares the residuals of control blocks 0
+// and 19 with tools-local/wan21_uni3c_oracle.py; it also reports how much the
+// control changes the output.
+//
+// `--i2v` runs the whole Wan 2.1 image-to-video pipeline (pipeline21.hpp);
+// --guide-raw is rgb24 frames at the video size (ffmpeg -f rawvideo);
+// --dump writes the pipeline intermediates as .npy for
+// tools-local/wan21_pipe_oracle.py.
+//
 // `--clip-oracle` runs the CLIP vision encoder on DIR/clip_pixels.npy
 // [3, 224, 224] and compares with DIR/clip_states.npy [257, 1280]; it also
 // preprocesses DIR/clip_image.npy (RGB as FP32 0..255, [H, W, 3]) and
@@ -32,8 +51,12 @@
 #include <string>
 #include <vector>
 
+#include "src/core/image.hpp"
 #include "src/models/wan22/clip_vision.hpp"
+#include "src/models/wan22/pipeline.hpp"
+#include "src/models/wan22/pipeline21.hpp"
 #include "src/models/wan22/transformer21.hpp"
+#include "src/models/wan22/uni3c.hpp"
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -372,6 +395,163 @@ int DitBench(const std::filesystem::path& dit,
   return std::isfinite(sum) ? 0 : 1;
 }
 
+int Uni3COracle(const std::filesystem::path& dit,
+                const std::filesystem::path& lora,
+                const std::filesystem::path& dit_dir,
+                const std::filesystem::path& clip_dir,
+                const std::filesystem::path& uni3c_file,
+                const std::filesystem::path& dir) {
+  std::vector<float> x, guide, plain_ref;
+  std::vector<std::size_t> shape, guide_shape, ref_shape;
+  if (!ReadNpy(dit_dir / "x.npy", &x, &shape) || shape.size() != 4 ||
+      !ReadNpy(dir / "guide.npy", &guide, &guide_shape) ||
+      !ReadNpy(dit_dir / "noise.npy", &plain_ref, &ref_shape)) {
+    std::cerr << "cannot read x.npy / guide.npy / noise.npy\n";
+    return 1;
+  }
+  auto model = LoadDit(dit, lora);
+  if (!model || !PrepareContext(*model, dit_dir, clip_dir, nullptr, nullptr))
+    return 1;
+  std::string error;
+  auto uni3c = wan22::Uni3C::Load(uni3c_file, model->stream(), &error);
+  const int frames = static_cast<int>(shape[1]);
+  const int height = static_cast<int>(shape[2]);
+  const int width = static_cast<int>(shape[3]);
+  if (!uni3c || !uni3c->SetGuide(guide, frames, height, width, &error)) {
+    std::cerr << "uni3c: " << error << "\n";
+    return 1;
+  }
+  std::cout << "uni3c weights " << uni3c->weight_bytes() / 1073741824.0
+            << " GiB\n";
+  uni3c->set_probe(true);
+  wan22::Transformer21Input input;
+  input.latent = x;
+  input.frames = frames;
+  input.height = height;
+  input.width = width;
+  input.timestep = 875.0F;
+  std::vector<float> plain, controlled;
+  if (!model->Forward(input, &plain, nullptr, &error)) {
+    std::cerr << "forward: " << error << "\n";
+    return 1;
+  }
+  input.hook = uni3c.get();
+  const auto start = Clock::now();
+  if (!model->Forward(input, &controlled, nullptr, &error)) {
+    std::cerr << "forward with uni3c: " << error << "\n";
+    return 1;
+  }
+  std::cout << "forward with uni3c " << Seconds(start) << " s\n";
+  bool pass = true;
+  const auto compare = [&](const char* name, const std::vector<float>& ours) {
+    std::vector<float> reference;
+    std::vector<std::size_t> reference_shape;
+    if (!ReadNpy(dir / (std::string(name) + ".npy"), &reference,
+                 &reference_shape) ||
+        reference.size() != ours.size()) {
+      std::cerr << "missing or misshaped " << name << "\n";
+      pass = false;
+      return;
+    }
+    const Comparison c = Compare(ours.data(), reference.data(), ours.size());
+    Print(name, c);
+    pass = pass && c.cosine >= 0.999;
+  };
+  compare("residual0", uni3c->residual_first());
+  compare("residual19", uni3c->residual_last());
+  Print("noise without control vs DiT oracle",
+        Compare(plain.data(), plain_ref.data(), plain.size()));
+  Print("noise with vs without control",
+        Compare(controlled.data(), plain.data(), plain.size()));
+  std::cout << (pass ? "PASS" : "FAIL") << "\n";
+  return pass ? 0 : 1;
+}
+
+int RunI2V(const wan22::I2V21Request& base, const std::filesystem::path& out,
+           const std::filesystem::path& image_path,
+           const std::filesystem::path& guide_path,
+           const std::filesystem::path& dump_dir) {
+  wan22::I2V21Request request = base;
+  std::vector<std::uint8_t> first_frame, guide;
+  try {
+    const auto image =
+        gufo::core::DecodeImage(gufo::core::ReadImageFile(image_path));
+    first_frame = wan22::FitImage(image.pixels, static_cast<int>(image.width),
+                                  static_cast<int>(image.height), request.width,
+                                  request.height);
+  } catch (const std::exception& e) {
+    std::cerr << "cannot read " << image_path << ": " << e.what() << "\n";
+    return 1;
+  }
+  request.first_frame = first_frame;
+  if (!guide_path.empty()) {
+    std::ifstream in(guide_path, std::ios::binary | std::ios::ate);
+    const std::size_t frame =
+        static_cast<std::size_t>(request.width) * request.height * 3;
+    const auto size = static_cast<std::size_t>(in.tellg());
+    if (!in || size == 0 || size % frame != 0) {
+      std::cerr << "guide " << guide_path << " is not rgb24 frames of "
+                << request.width << "x" << request.height << "\n";
+      return 1;
+    }
+    guide.resize(size);
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(guide.data()),
+            static_cast<std::streamsize>(size));
+    request.guide = guide;
+    request.guide_frames = static_cast<int>(size / frame);
+    std::cout << "guide " << guide_path << ": " << request.guide_frames
+              << " frames\n";
+  }
+  if (AvailableGiB() < 14.0) {
+    std::cerr << "less than 14 GiB host RAM available (" << AvailableGiB()
+              << "), not running\n";
+    return 1;
+  }
+  wan22::I2V21Callbacks callbacks;
+  if (!dump_dir.empty()) {
+    std::filesystem::create_directories(dump_dir);
+    std::vector<float> frame(first_frame.begin(), first_frame.end());
+    WriteNpy(dump_dir / "first_frame.npy", frame,
+             {static_cast<std::size_t>(request.height),
+              static_cast<std::size_t>(request.width), 3});
+    callbacks.dump = [&](const std::string& name,
+                         const std::vector<float>& values,
+                         const std::vector<std::size_t>& shape) {
+      WriteNpy(dump_dir / (name + ".npy"), values, shape);
+    };
+  }
+  callbacks.progress = [](const std::string& phase, int done, int total) {
+    std::cout << "  " << phase << " " << done << "/" << total << "\n"
+              << std::flush;
+  };
+  wan22::DecodedVideo video;
+  wan22::I2V21Telemetry tel;
+  std::string error;
+  if (!wan22::GenerateI2V21(request, callbacks, nullptr, &video, &tel,
+                            &error)) {
+    std::cerr << "i2v: " << error << "\n";
+    return 1;
+  }
+  std::cout << "text " << tel.text_ms / 1000 << " s, clip "
+            << tel.clip_ms / 1000 << " s, condition " << tel.condition_ms / 1000
+            << " s, guide " << tel.guide_ms / 1000 << " s, dit load "
+            << tel.dit_load_ms / 1000 << " s, context " << tel.context_ms / 1000
+            << " s, decode " << tel.decode_ms / 1000 << " s, total "
+            << tel.total_ms / 1000 << " s\n";
+  for (std::size_t i = 0; i < tel.step_ms.size(); ++i)
+    std::cout << "step " << i << ": " << tel.step_ms[i] / 1000 << " s\n";
+  std::cout << "peak device " << tel.peak_device_bytes / 1073741824.0
+            << " GiB, peak working set " << PeakWorkingSetGiB() << " GiB\n";
+  if (!wan22::WriteMp4(out, video, 16, &error)) {
+    std::cerr << "mp4: " << error << "\n";
+    return 1;
+  }
+  std::cout << "wrote " << out << " (" << video.frames << " frames "
+            << video.width << "x" << video.height << ")\n";
+  return 0;
+}
+
 int Usage() {
   std::cerr << "usage: gufo-wan-check21 --model ROOT --clip-oracle DIR\n"
                "       gufo-wan-check21 --dit FILE [--lora FILE] --clip DIR "
@@ -384,6 +564,8 @@ int Usage() {
 int main(int argc, char** argv) {
   std::filesystem::path model, clip_oracle, dit, lora, dit_oracle, clip_dir;
   int bench[3]{};
+  wan22::I2V21Request i2v;
+  std::filesystem::path i2v_out, image, guide_raw, dump_dir, uni3c_oracle;
   for (int i = 1; i < argc; ++i) {
     const std::string name = argv[i];
     const bool more = i + 1 < argc;
@@ -399,11 +581,48 @@ int main(int argc, char** argv) {
       dit_oracle = argv[++i];
     else if (name == "--clip" && more)
       clip_dir = argv[++i];
+    else if (name == "--i2v" && more)
+      i2v_out = argv[++i];
+    else if (name == "--t5" && more)
+      i2v.t5_root = argv[++i];
+    else if (name == "--image" && more)
+      image = argv[++i];
+    else if (name == "--prompt" && more)
+      i2v.prompt = argv[++i];
+    else if (name == "--width" && more)
+      i2v.width = std::atoi(argv[++i]);
+    else if (name == "--height" && more)
+      i2v.height = std::atoi(argv[++i]);
+    else if (name == "--frames" && more)
+      i2v.frames = std::atoi(argv[++i]);
+    else if (name == "--steps" && more)
+      i2v.steps = std::atoi(argv[++i]);
+    else if (name == "--seed" && more)
+      i2v.seed = std::strtoull(argv[++i], nullptr, 10);
+    else if (name == "--uni3c" && more)
+      i2v.uni3c_file = argv[++i];
+    else if (name == "--guide-raw" && more)
+      guide_raw = argv[++i];
+    else if (name == "--uni3c-strength" && more)
+      i2v.uni3c_strength = static_cast<float>(std::atof(argv[++i]));
+    else if (name == "--uni3c-oracle" && more)
+      uni3c_oracle = argv[++i];
+    else if (name == "--dump" && more)
+      dump_dir = argv[++i];
     else if (name == "--dit-bench" && i + 3 < argc)
       for (int& value : bench)
         value = std::atoi(argv[++i]);
     else
       return Usage();
+  }
+  if (!uni3c_oracle.empty())
+    return Uni3COracle(dit, lora, dit_oracle, clip_dir, i2v.uni3c_file,
+                       uni3c_oracle);
+  if (!i2v_out.empty()) {
+    i2v.wan21_root = model;
+    i2v.dit_file = dit;
+    i2v.lora_file = lora;
+    return RunI2V(i2v, i2v_out, image, guide_raw, dump_dir);
   }
   if (!dit.empty() && !dit_oracle.empty() && bench[0] > 0)
     return DitBench(dit, lora, dit_oracle, clip_dir, bench[0], bench[1],

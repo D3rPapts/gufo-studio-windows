@@ -1,6 +1,8 @@
 #ifndef GUFO_MODELS_WAN22_TRANSFORMER21_HPP_
 #define GUFO_MODELS_WAN22_TRANSFORMER21_HPP_
 
+#include <hip/hip_runtime_api.h>
+
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -9,6 +11,21 @@
 #include <vector>
 
 namespace gufo::models::wan22 {
+
+/// Extra per-block conditioning (the Uni3C ControlNet): Begin sees the model
+/// input and the time embedding once per Forward, AfterBlock may add to the
+/// FP32 residual stream [tokens, 5120] after each block. All device work is
+/// ordered on `stream` (the transformer's).
+class Transformer21Hook {
+public:
+  virtual ~Transformer21Hook() = default;
+  /// `input` FP32 [36, frames, height, width], `temb` FP32 [5120].
+  virtual bool Begin(const float* input, int frames, int height, int width,
+                     const float* temb, hipStream_t stream,
+                     std::string* error) = 0;
+  virtual bool AfterBlock(int layer, float* hidden, hipStream_t stream,
+                          std::string* error) = 0;
+};
 
 /// One call of the Wan 2.1 I2V 14B transformer: the model input
 /// [36, frames, height, width] (16 noisy latent + 4 first-frame mask + 16
@@ -21,6 +38,7 @@ struct Transformer21Input {
   int width{0};
   float timestep{0};
   int context_slot{0};
+  Transformer21Hook* hook{nullptr};
 };
 
 /// Optional intermediates for oracle comparison (FP32 row-major).
@@ -80,6 +98,8 @@ public:
   /// kernels (device events).
   [[nodiscard]] double last_blocks_ms() const;
   [[nodiscard]] double last_attention_ms() const;
+  /// The stream all device work runs on (for hooks sharing it).
+  [[nodiscard]] hipStream_t stream() const;
 
 private:
   struct Impl;

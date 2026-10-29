@@ -967,6 +967,9 @@ double Transformer21::last_attention_ms() const {
 double Transformer21::last_blocks_ms() const {
   return impl_->blocks_ms;
 }
+hipStream_t Transformer21::stream() const {
+  return impl_->stream;
+}
 
 std::unique_ptr<Transformer21> Transformer21::Load(
     const std::filesystem::path& dit_file,
@@ -1330,6 +1333,10 @@ bool Transformer21::Forward(const Transformer21Input& input,
   if (probes != nullptr &&
       !m.Download(m.temb.f32(), false, W, &probes->temb, error))
     return false;
+  if (input.hook != nullptr &&
+      !input.hook->Begin(m.latent.f32(), input.frames, input.height,
+                         input.width, m.temb.f32(), s, error))
+    return false;
 
   const float* proj = m.proj.f32();
   const auto modulated = [&](const Block& b, int shift, int scale) {
@@ -1429,6 +1436,9 @@ bool Transformer21::Forward(const Transformer21Input& input,
         linear, b.modulation.f32() + 5 * W, proj + 5 * W, count,
         m.hidden.f32());
     if (!Check(hipGetLastError(), "block launch", error))
+      return false;
+    if (input.hook != nullptr &&
+        !input.hook->AfterBlock(layer, m.hidden.f32(), s, error))
       return false;
     if (probes != nullptr && layer == 0 &&
         !m.Download(m.hidden.f32(), false, count, &probes->block0, error))
