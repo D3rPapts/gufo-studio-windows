@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/serve/preview.hpp"
 #include "src/models/minimax_h3/generation.hpp"
 
 namespace gufo::server {
@@ -91,6 +92,9 @@ struct VideoJobRequest {
   // RIFE frame multiplier for the finished MP4 (1 = off, 2..8); needs
   // VideoJobServiceOptions::interpolator.
   int interpolate{1};
+  // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
+  // every second step by default ("gufo": {"preview": {...}}).
+  PreviewOptions preview{.always = false, .every = 2, .max_side = 320};
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).

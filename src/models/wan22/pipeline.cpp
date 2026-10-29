@@ -391,6 +391,21 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
         TrackDevice(&t.peak_device_bytes);
       if (callbacks.on_noise)
         callbacks.on_noise(step, cond);
+      if (callbacks.preview.Wants(step + 1, request.steps)) {
+        const float sigma = scheduler.sigmas()[static_cast<std::size_t>(step)];
+        std::vector<float> x0(latent_count);
+        for (std::size_t i = 0; i < latent_count; ++i)
+          x0[i] = latents[i] - sigma * cond[i];
+        blend_first_frame(x0);
+        callbacks.preview.publish({.step = step + 1,
+                                   .steps = request.steps,
+                                   .frames = latent_frames,
+                                   .height = latent_height,
+                                   .width = latent_width,
+                                   .channels = VaeDecoder::kLatentChannels,
+                                   .channel_major = true,
+                                   .data = x0});
+      }
       scheduler.Step(cond, latents);
       t.step_ms.push_back(Milliseconds(step_clock));
       if (callbacks.on_step)

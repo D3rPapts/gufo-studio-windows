@@ -123,6 +123,8 @@ struct GenerationRequest {
   std::vector<std::uint8_t> first_frame;
   std::string negative_prompt;
   float guidance{5.0F};
+  // Live preview of the denoised latents (MiniMax H3 and Wan 2.2).
+  models::PreviewHook preview;
 };
 
 struct GenerationTelemetry {

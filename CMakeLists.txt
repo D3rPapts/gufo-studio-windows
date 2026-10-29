@@ -87,6 +87,8 @@ if (WIN32)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+# Animated WebP loops of live video previews (WebPAnimEncoder).
+pkg_check_modules(WEBPMUX REQUIRED IMPORTED_TARGET libwebpmux)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
 pkg_check_modules(SOXR REQUIRED IMPORTED_TARGET soxr)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -411,6 +413,11 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_deepseek_v4_flash PUBLIC gufo_logging)
 endif()
 
+# Live image/video previews (/v1/previews): latent2rgb, JPEG, animated WebP.
+add_library(gufo_preview STATIC src/cli/serve/preview.cpp)
+target_link_libraries(gufo_preview PUBLIC gufo_core JPEG::JPEG PkgConfig::WEBP
+  PkgConfig::WEBPMUX)
+
 add_library(gufo_http STATIC
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
@@ -433,7 +440,7 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
+target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
   target_link_libraries(gufo_http PUBLIC gufo_wan22)
@@ -837,12 +844,17 @@ if (BUILD_TESTING)
   set_tests_properties(video_cli_test PROPERTIES
     LABELS "cpu;server;cli;minimax-h3;quality")
 
+  add_executable(preview_test tests/cli/preview_test.cpp)
+  target_link_libraries(preview_test PRIVATE gufo_preview)
+  add_test(NAME preview_test COMMAND preview_test)
+  set_tests_properties(preview_test PROPERTIES LABELS "cpu;server;preview")
+
   add_executable(video_jobs_test
     tests/cli/video_jobs_test.cpp
     src/cli/serve/video_jobs.cpp
     src/cli/serve/video_wan22.cpp
   )
-  target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core gufo_cache)
+  target_link_libraries(video_jobs_test PRIVATE gufo_preview gufo_logging gufo_core gufo_cache)
   if (ENGINE_ENABLE_HIP)
     target_link_libraries(video_jobs_test PRIVATE gufo_wan22)
   endif()
@@ -856,7 +868,7 @@ if (BUILD_TESTING)
     src/cli/serve/video_jobs.cpp
     src/cli/serve/video_wan22.cpp
   )
-  target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core gufo_cache)
+  target_link_libraries(video_api_test PRIVATE gufo_preview gufo_logging gufo_core gufo_cache)
   if (ENGINE_ENABLE_HIP)
     target_link_libraries(video_api_test PRIVATE gufo_wan22)
   endif()

@@ -102,6 +102,22 @@ bool HasOnlyMembers(const json::Value& value,
   });
 }
 
+// "gufo.preview": live preview options of the job (its id is the job id).
+std::optional<HttpResponse> ParseVideoPreview(const json::Value& extension,
+                                              PreviewOptions* preview) {
+  const json::Value* value = extension.find("preview");
+  if (value == nullptr)
+    return std::nullopt;
+  try {
+    if (!ParsePreviewRequest(*value, preview).empty())
+      throw std::invalid_argument(
+          "gufo.preview.id is the job id for videos; leave it out");
+  } catch (const std::invalid_argument& error) {
+    return Error(400, "Bad Request", error.what(), "invalid_preview");
+  }
+  return std::nullopt;
+}
+
 std::string_view TrimAscii(std::string_view value) {
   while (!value.empty() &&
          std::isspace(static_cast<unsigned char>(value.front())) != 0) {
@@ -615,15 +631,20 @@ HttpResponse CreateWan22Video(const json::Value& body,
   std::string negative_prompt;
   double guidance = 5.0;
   int interpolate = 1;
+  PreviewOptions preview = VideoJobRequest{}.preview;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension,
                         {"seed", "steps", "frames", "negative_prompt",
-                         "guidance", "interpolate"})) {
+                         "guidance", "interpolate", "preview"})) {
       return Error(400, "Bad Request",
                    "'gufo' may contain only 'seed', 'steps', 'frames', "
-                   "'negative_prompt', 'guidance' and 'interpolate'",
+                   "'negative_prompt', 'guidance', 'interpolate' and "
+                   "'preview'",
                    "invalid_strix_options");
+    }
+    if (const auto failed = ParseVideoPreview(*extension, &preview)) {
+      return *failed;
     }
     if (extension->contains("interpolate")) {
       const auto parsed = JsonInterpolate(extension->find("interpolate"));
@@ -698,6 +719,7 @@ HttpResponse CreateWan22Video(const json::Value& body,
       .negative_prompt = std::move(negative_prompt),
       .guidance = guidance,
       .interpolate = interpolate,
+      .preview = preview,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
@@ -824,6 +846,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::string lora;
   std::optional<double> lora_strength;
   int interpolate = 1;
+  PreviewOptions preview = VideoJobRequest{}.preview;
   bool preset_explicit = false;
   int audio_reference_frame = 0;
   const json::Value* guide_keyframes = nullptr;
@@ -832,10 +855,14 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
                                      "output_format", "selected_frame", "steps",
                                      "lora", "lora_strength", "interpolate",
-                                     "keyframes", "audio_reference_frame"})) {
+                                     "keyframes", "audio_reference_frame",
+                                     "preview"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
+    }
+    if (const auto failed = ParseVideoPreview(*extension, &preview)) {
+      return *failed;
     }
     if (extension->contains("preset")) {
       if (!extension->find("preset")->is_string()) {
@@ -1153,6 +1180,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .lora_strength = lora_strength,
       .steps_explicit = steps.has_value(),
       .interpolate = interpolate,
+      .preview = preview,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

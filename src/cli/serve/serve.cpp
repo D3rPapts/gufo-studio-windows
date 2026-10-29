@@ -1211,6 +1211,7 @@ int RunServe(std::span<const char* const> args) {
                 const server::ImageService::CancellationCheck& cancelled) {
               return moss_model->Generate(request, cancelled);
             });
+        images->set_preview_format(server::LatentFormat::kFlux2Patched);
       } else {
         images = std::make_shared<server::ImageService>(model, name);
       }

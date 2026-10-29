@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "src/models/preview_hook.hpp"
+
 namespace gufo::models::qwen_image_21 {
 
 struct Image {
@@ -54,6 +56,8 @@ struct Request {
   /// strength.
   std::optional<Image> init_image;
   double strength{1};
+  /// Live preview of the denoised estimate; never changes the image.
+  models::PreviewHook preview;
 };
 
 struct Metrics {
