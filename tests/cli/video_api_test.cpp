@@ -29,6 +29,7 @@ using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
 using gufo::server::VideoJobService;
 using gufo::server::VideoJobServiceOptions;
+using gufo::server::VideoModelFamily;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL video_api_test: " << message << '\n';
@@ -521,6 +522,102 @@ void TestQueueSaturation(const std::filesystem::path& root) {
   runner.Release();
 }
 
+// Wan 2.2: first frame (JSON base64 and multipart upload), negative prompt
+// and guidance reach the runner; last frames and unknown options do not.
+void TestWan22Options(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobServiceOptions options = Options(root, &runner);
+  options.family = VideoModelFamily::kWan22;
+  options.model_root = "/private/models/Wan2.2-TI2V-5B";
+  VideoJobService service(std::move(options));
+  Check(service.ready(), service.initialization_error());
+  // A 1x1 RGBA PNG.
+  const std::string png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+      "hK"
+      "mMIQAAAABJRU5ErkJggg==";
+  const std::string body =
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"input_reference":")" +
+      png +
+      R"(","gufo":{"seed":3,"steps":4,"negative_prompt":"blurry","guidance":3.5}})";
+  const HttpResponse created = Send(service, "POST", "/v1/videos", body);
+  Check(created.status == 202,
+        "Wan image-to-video request is accepted: " + created.body);
+  runner.WaitForCalls(1);
+  WaitCompleted(service, CreatedId(created));
+  h3::GenerationRequest generation = runner.latest();
+  Check(generation.first_frame_width == 1 &&
+            generation.first_frame_height == 1 &&
+            generation.first_frame.size() == 3 &&
+            generation.negative_prompt == "blurry" &&
+            generation.guidance == 3.5F && generation.seed == 3 &&
+            generation.parameters.evaluations == 4 &&
+            generation.parameters.output_width == 480,
+        "Wan first frame, negative prompt and guidance reach the runner");
+
+  const HttpResponse plain = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1})");
+  Check(plain.status == 202, "Wan text-to-video request is accepted");
+  runner.WaitForCalls(2);
+  WaitCompleted(service, CreatedId(plain));
+  generation = runner.latest();
+  Check(generation.first_frame.empty() && generation.negative_prompt.empty() &&
+            generation.guidance == 5.0F,
+        "Wan defaults: text-to-video, empty negative prompt, guidance 5");
+
+  // Decoded PNG bytes as a multipart file upload.
+  std::string file;
+  {
+    static constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : png) {
+      const auto index = kAlphabet.find(c);
+      if (index == std::string_view::npos)
+        continue;
+      buffer = (buffer << 6U) | static_cast<std::uint32_t>(index);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        file += static_cast<char>((buffer >> bits) & 0xFFU);
+      }
+    }
+  }
+  const std::string boundary = "wan-boundary";
+  std::string multipart = Multipart(boundary, {{"model", "wan2.2-ti2v-5b"},
+                                               {"prompt", "fox"},
+                                               {"size", "480x480"},
+                                               {"seconds", "1"}});
+  multipart.erase(multipart.size() - (boundary.size() + 6));
+  multipart += "--" + boundary +
+               "\r\nContent-Disposition: form-data; name=\"first_frame\"; "
+               "filename=\"f.png\"\r\nContent-Type: image/png\r\n\r\n" +
+               file + "\r\n--" + boundary + "--\r\n";
+  const HttpResponse uploaded =
+      Send(service, "POST", "/v1/videos", multipart, {},
+           "multipart/form-data; boundary=" + boundary);
+  Check(uploaded.status == 202,
+        "Wan multipart first frame is accepted: " + uploaded.body);
+  runner.WaitForCalls(3);
+  WaitCompleted(service, CreatedId(uploaded));
+  Check(runner.latest().first_frame.size() == 3,
+        "Wan multipart first frame reaches the runner");
+
+  for (
+      const std::string bad :
+      {R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"last_frame":"x"})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"input_reference":"!!"})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"guidance":"5"}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"guidance":50}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"negative_prompt":1}})",
+       R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"lora":"x"}})"}) {
+    Check(Send(service, "POST", "/v1/videos", bad).status == 400,
+          "invalid Wan request is rejected: " + bad);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -535,6 +632,7 @@ int main() {
   TestDurations(base / "durations");
   TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
+  TestWan22Options(base / "wan22");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";
   return 0;

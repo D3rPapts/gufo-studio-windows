@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/models/minimax_h3/generation.hpp"
 
@@ -70,6 +71,13 @@ struct VideoJobRequest {
   std::string output_format{"mp4"};
   minimax_h3::GenerationParameters parameters;
   std::uint64_t seed{42};
+  // Wan 2.2 only: image-to-video first frame (decoded RGB8 at its own size,
+  // empty for text-to-video), negative prompt and guidance scale.
+  int first_frame_width{0};
+  int first_frame_height{0};
+  std::vector<std::uint8_t> first_frame;
+  std::string negative_prompt;
+  double guidance{5.0};
 };
 
 struct VideoJobSnapshot {

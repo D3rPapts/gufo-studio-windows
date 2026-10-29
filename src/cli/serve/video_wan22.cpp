@@ -1,6 +1,8 @@
 #include "src/cli/serve/video_wan22.hpp"
 
 #include <chrono>
+#include <cstdint>
+#include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/wan22/pipeline.hpp"
@@ -24,6 +26,21 @@ bool RunWan22Job(const minimax_h3::GenerationRequest& request,
   video_request.frames = request.parameters.frames;
   video_request.steps = request.parameters.evaluations;
   video_request.seed = request.seed;
+  video_request.negative_prompt = request.negative_prompt;
+  video_request.guidance = request.guidance;
+  std::vector<std::uint8_t> first_frame;
+  if (!request.first_frame.empty()) {
+    // Scale to cover the video size, crop the centre.
+    first_frame = wan22::FitImage(
+        request.first_frame, request.first_frame_width,
+        request.first_frame_height, video_request.width, video_request.height);
+    if (first_frame.empty()) {
+      if (error != nullptr)
+        *error = "invalid first frame";
+      return false;
+    }
+    video_request.first_frame = first_frame;
+  }
   wan22::VideoCallbacks callbacks;
   callbacks.progress = [&](std::string_view phase, int done, int total) {
     if (progress != nullptr)

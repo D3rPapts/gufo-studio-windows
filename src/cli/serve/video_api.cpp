@@ -8,13 +8,16 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
 
+#include "src/core/image.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -230,8 +233,16 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
   return boundary;
 }
 
-std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
-                                              std::string* error) {
+bool IsKeyframeField(std::string_view name) {
+  return name == "input_reference" || name == "first_frame" ||
+         name == "last_frame";
+}
+
+// Uploaded keyframe files are returned in `files`; every other part becomes a
+// string member (or the parsed `gufo` object) of the result.
+std::optional<json::Value> ParseMultipartBody(
+    const HttpRequest& request, std::map<std::string, std::string>* files,
+    std::string* error) {
   const auto boundary = MultipartBoundary(request.header("content-type"));
   if (!boundary.has_value()) {
     *error = "multipart video request has an invalid boundary";
@@ -321,7 +332,8 @@ std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
       *error = "multipart video request is missing a closing boundary";
       return std::nullopt;
     }
-    if (++fields > kMaximumMultipartFields || result.contains(field_name)) {
+    if (++fields > kMaximumMultipartFields || result.contains(field_name) ||
+        files->contains(field_name)) {
       *error = fields > kMaximumMultipartFields
                    ? "multipart video request contains too many fields"
                    : "multipart video request repeats a field";
@@ -341,6 +353,8 @@ std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
         *error = "multipart 'gufo' field must contain valid JSON";
         return std::nullopt;
       }
+    } else if (filename_present && IsKeyframeField(field_name)) {
+      (*files)[field_name] = std::string(content);
     } else {
       result[field_name] =
           filename_present ? std::string() : std::string(content);
@@ -378,11 +392,91 @@ bool IsUnsupportedConditioning(const json::Value& body) {
   });
 }
 
+// A first frame is an uploaded file, a base64 data URL, raw base64, a public
+// HTTPS URL, or an object {"image_url": <string or {"url": string}>}.
+std::optional<core::Image> ReadFirstFrame(const json::Value* value,
+                                          const std::string* file,
+                                          std::string* error) {
+  try {
+    core::ImageReadBudget budget;
+    std::vector<std::uint8_t> bytes;
+    if (file != nullptr) {
+      if (file->size() > budget.remaining_bytes) {
+        throw std::invalid_argument("image exceeds the size limit");
+      }
+      bytes.assign(file->begin(), file->end());
+    } else {
+      const json::Value* source = value;
+      if (source != nullptr && source->is_object()) {
+        source = source->find("image_url");
+        if (source != nullptr && source->is_object()) {
+          source = source->find("url");
+        }
+      }
+      if (source == nullptr || !source->is_string() || source->str().empty()) {
+        throw std::invalid_argument(
+            "must be an image file, a data URL, base64, an HTTPS URL or "
+            "{\"image_url\": ...}");
+      }
+      const std::string& text = source->str();
+      bytes = text.starts_with("data:") || text.starts_with("https://") ||
+                      text.starts_with("http://")
+                  ? core::ReadImageUrl(text, budget)
+                  : core::ReadImageUrl("data:image/png;base64," + text, budget);
+    }
+    return core::DecodeImage(bytes);
+  } catch (const std::exception& exception) {
+    *error = exception.what();
+    return std::nullopt;
+  }
+}
+
 // Wan 2.2 TI2V-5B: {"model", "prompt", "size" (default "1280x704"),
-// "seconds" (0.2..5 at 24 fps), "gufo": {"seed", "steps" (default 50),
-// "frames" (4k + 1, must match seconds)}}. MP4 only.
+// "seconds" (0.2..5 at 24 fps), "input_reference" or "first_frame" (image-
+// to-video; the image is scaled to cover the size and centre-cropped),
+// "gufo": {"seed", "steps" (default 50), "frames" (4k + 1, must match
+// seconds), "negative_prompt" (default ""), "guidance" (default 5; <= 1
+// disables classifier-free guidance)}}. MP4 only.
 HttpResponse CreateWan22Video(const json::Value& body,
+                              const std::map<std::string, std::string>& files,
                               VideoJobService& service) {
+  if (body.contains("last_frame") || files.contains("last_frame") ||
+      body.contains("references")) {
+    return Error(400, "Bad Request",
+                 "Wan 2.2 supports only a first frame ('input_reference' or "
+                 "'first_frame')",
+                 "unsupported_input_reference");
+  }
+  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo",
+                             "input_reference", "first_frame"})) {
+    return Error(400, "Bad Request",
+                 "request contains an unsupported video field",
+                 "unsupported_field");
+  }
+  const auto has_field = [&](const char* name) {
+    return body.contains(name) || files.contains(name);
+  };
+  if (has_field("input_reference") && has_field("first_frame")) {
+    return Error(400, "Bad Request",
+                 "'input_reference' and 'first_frame' both set the first frame",
+                 "invalid_input_reference");
+  }
+  std::optional<core::Image> first_frame;
+  for (const char* name : {"input_reference", "first_frame"}) {
+    if (!has_field(name)) {
+      continue;
+    }
+    const auto file = files.find(name);
+    std::string image_error;
+    first_frame = ReadFirstFrame(body.find(name),
+                                 file == files.end() ? nullptr : &file->second,
+                                 &image_error);
+    if (!first_frame.has_value()) {
+      return Error(400, "Bad Request",
+                   "'" + std::string(name) + "' " + image_error,
+                   "invalid_input_reference");
+    }
+  }
   const json::Value* model_value = body.find("model");
   const json::Value* prompt_value = body.find("prompt");
   const json::Value* size_value = body.find("size");
@@ -431,12 +525,34 @@ HttpResponse CreateWan22Video(const json::Value& body,
   parameters.internal_width = parameters.output_width;
   parameters.internal_height = parameters.output_height;
   std::uint64_t seed = 42;
+  std::string negative_prompt;
+  double guidance = 5.0;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
-        !HasOnlyMembers(*extension, {"seed", "steps", "frames"})) {
+        !HasOnlyMembers(*extension, {"seed", "steps", "frames",
+                                     "negative_prompt", "guidance"})) {
       return Error(400, "Bad Request",
-                   "'gufo' may contain only 'seed', 'steps' and 'frames'",
+                   "'gufo' may contain only 'seed', 'steps', 'frames', "
+                   "'negative_prompt' and 'guidance'",
                    "invalid_strix_options");
+    }
+    if (extension->contains("negative_prompt")) {
+      const json::Value* value = extension->find("negative_prompt");
+      if (!value->is_string() || value->str().find('\0') != std::string::npos) {
+        return Error(400, "Bad Request",
+                     "'gufo.negative_prompt' must be a string",
+                     "invalid_negative_prompt");
+      }
+      negative_prompt = value->str();
+    }
+    if (extension->contains("guidance")) {
+      const json::Value* value = extension->find("guidance");
+      guidance = value->is_number() ? value->as_double(-1.0) : -1.0;
+      if (!std::isfinite(guidance) || guidance < 0.0 || guidance > 20.0) {
+        return Error(400, "Bad Request",
+                     "'gufo.guidance' must be a number in 0..20",
+                     "invalid_guidance");
+      }
     }
     if (extension->contains("seed")) {
       const auto parsed = JsonUnsigned(extension->find("seed"));
@@ -476,6 +592,14 @@ HttpResponse CreateWan22Video(const json::Value& body,
       .output_format = "mp4",
       .parameters = std::move(parameters),
       .seed = seed,
+      .first_frame_width =
+          first_frame ? static_cast<int>(first_frame->width) : 0,
+      .first_frame_height =
+          first_frame ? static_cast<int>(first_frame->height) : 0,
+      .first_frame = first_frame ? std::move(first_frame->pixels)
+                                 : std::vector<std::uint8_t>(),
+      .negative_prompt = std::move(negative_prompt),
+      .guidance = guidance,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
@@ -497,10 +621,11 @@ HttpResponse CreateWan22Video(const json::Value& body,
 
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
+  std::map<std::string, std::string> files;
   const std::string content_type = request.header("content-type");
   if (IsMultipartFormData(content_type)) {
     std::string multipart_error;
-    auto parsed = ParseMultipartBody(request, &multipart_error);
+    auto parsed = ParseMultipartBody(request, &files, &multipart_error);
     if (!parsed.has_value()) {
       return Error(400, "Bad Request", std::move(multipart_error),
                    "invalid_multipart_form");
@@ -527,7 +652,10 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
   }
-  if (IsUnsupportedConditioning(body)) {
+  if (service.family() == VideoModelFamily::kWan22) {
+    return CreateWan22Video(body, files, service);
+  }
+  if (IsUnsupportedConditioning(body) || !files.empty()) {
     return Error(400, "Bad Request",
                  "image and ordered-reference conditioning are not supported",
                  "unsupported_input_reference");
@@ -536,9 +664,6 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request",
                  "request contains an unsupported video field",
                  "unsupported_field");
-  }
-  if (service.family() == VideoModelFamily::kWan22) {
-    return CreateWan22Video(body, service);
   }
 
   const json::Value* model_value = body.find("model");

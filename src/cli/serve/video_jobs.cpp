@@ -698,8 +698,13 @@ struct VideoJobService::Impl {
               job->request.parameters.preset + " size=" + job->request.size +
               " frames=" + std::to_string(job->request.parameters.frames) +
               " steps=" + std::to_string(job->request.parameters.evaluations) +
-              " seed=" + std::to_string(job->request.seed) + " " +
-              Logger::MemoryStatus());
+              " seed=" + std::to_string(job->request.seed) +
+              (job->request.first_frame.empty()
+                   ? std::string()
+                   : " first_frame=" +
+                         std::to_string(job->request.first_frame_width) + "x" +
+                         std::to_string(job->request.first_frame_height)) +
+              " " + Logger::MemoryStatus());
       minimax_h3::GenerationRequest generation{
           .model_root = options.model_root,
           .source_manifest = options.source_manifest,
@@ -711,6 +716,11 @@ struct VideoJobService::Impl {
           .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
+          .first_frame_width = job->request.first_frame_width,
+          .first_frame_height = job->request.first_frame_height,
+          .first_frame = std::move(job->request.first_frame),
+          .negative_prompt = job->request.negative_prompt,
+          .guidance = static_cast<float>(job->request.guidance),
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
@@ -917,7 +927,15 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
         width != request.parameters.output_width ||
         height != request.parameters.output_height || !frames ||
         *frames != request.parameters.frames ||
-        !ValidateWan22Parameters(request.parameters, nullptr)) {
+        !ValidateWan22Parameters(request.parameters, nullptr) ||
+        request.first_frame.size() !=
+            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
+                static_cast<std::size_t>(
+                    std::max(request.first_frame_height, 0)) *
+                3U ||
+        !std::isfinite(request.guidance) || request.guidance < 0.0 ||
+        request.guidance > 20.0 ||
+        request.negative_prompt.find('\0') != std::string::npos) {
       return {.result = VideoJobResult::kInvalid,
               .job = std::nullopt,
               .error = "invalid Wan 2.2 video job request"};

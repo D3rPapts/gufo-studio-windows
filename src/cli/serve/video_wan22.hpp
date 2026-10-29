@@ -8,8 +8,10 @@
 namespace gufo::server {
 
 // Video job runner for Wan 2.2 TI2V-5B: request.parameters carries the size
-// (output_width x output_height), frames and steps (evaluations); writes an
-// H.264 MP4 at 24 fps to request.output_path. Loads every stage per job.
+// (output_width x output_height), frames and steps (evaluations); the
+// request's first frame (fitted to the size), negative prompt and guidance
+// select image-to-video and CFG. Writes an H.264 MP4 at 24 fps to
+// request.output_path. Loads every stage per job.
 [[nodiscard]] bool RunWan22Job(
     const minimax_h3::GenerationRequest& request,
     const minimax_h3::CancellationToken* cancellation,
