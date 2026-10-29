@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "src/cli/serve/audio_stream.hpp"
+#include "src/cli/serve/video_wan21.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/models/minimax_h3/audio_input.hpp"
@@ -239,7 +240,7 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
 bool IsKeyframeField(std::string_view name) {
   return name == "input_reference" || name == "first_frame" ||
          name == "last_frame" || name == "audio_reference" ||
-         name.starts_with("keyframe_");
+         name == "render_video" || name.starts_with("keyframe_");
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -717,6 +718,265 @@ HttpResponse CreateWan22Video(const json::Value& body,
   return response;
 }
 
+// Standard or URL-safe base64 (padding optional); nullopt when invalid.
+std::optional<std::vector<std::uint8_t>> DecodeBase64(std::string_view text) {
+  std::vector<std::uint8_t> out;
+  out.reserve(text.size() * 3 / 4);
+  std::uint32_t buffer = 0;
+  int bits = 0;
+  for (char c : text) {
+    int v;
+    if (c >= 'A' && c <= 'Z')
+      v = c - 'A';
+    else if (c >= 'a' && c <= 'z')
+      v = c - 'a' + 26;
+    else if (c >= '0' && c <= '9')
+      v = c - '0' + 52;
+    else if (c == '+' || c == '-')
+      v = 62;
+    else if (c == '/' || c == '_')
+      v = 63;
+    else if (c == '=')
+      break;
+    else if (c == '\r' || c == '\n' || c == ' ')
+      continue;
+    else
+      return std::nullopt;
+    buffer = (buffer << 6U) | static_cast<std::uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<std::uint8_t>((buffer >> bits) & 0xFFU));
+    }
+  }
+  return out;
+}
+
+// Wan 2.1 I2V 14B + Uni3C ("wan2.1-uni3c"): {"model", "prompt", "size"
+// (default "832x480", multiples of 16, at most 832x480 pixels), "seconds"
+// (0.25..5 at 16 fps, default 5), "first_frame" or "input_reference"
+// (required), "gufo": {"seed", "steps" (default 4), "frames",
+// "interpolate", "camera": {"type", "amount", "speed", "ease"} |
+// {"poses": [...]} | {"render_video": MP4 data URL or base64}}}; a
+// multipart upload may carry the guide as a "render_video" file instead.
+// Without a camera it is plain image-to-video.
+HttpResponse CreateWan21Video(const json::Value& body,
+                              const std::map<std::string, std::string>& files,
+                              VideoJobService& service) {
+  if (body.contains("last_frame") || files.contains("last_frame") ||
+      body.contains("references")) {
+    return Error(400, "Bad Request",
+                 "Wan 2.1 supports only a first frame ('first_frame' or "
+                 "'input_reference')",
+                 "unsupported_input_reference");
+  }
+  if (!HasOnlyMembers(body,
+                      {"model", "prompt", "size", "seconds", "gufo",
+                       "input_reference", "first_frame", "render_video"})) {
+    return Error(400, "Bad Request",
+                 "request contains an unsupported video field",
+                 "unsupported_field");
+  }
+  const auto has_field = [&](const char* name) {
+    return body.contains(name) || files.contains(name);
+  };
+  if (has_field("input_reference") == has_field("first_frame")) {
+    return Error(400, "Bad Request",
+                 "exactly one of 'first_frame' and 'input_reference' is "
+                 "required",
+                 "invalid_input_reference");
+  }
+  std::optional<core::Image> first_frame;
+  for (const char* name : {"input_reference", "first_frame"}) {
+    if (!has_field(name))
+      continue;
+    const auto file = files.find(name);
+    std::string image_error;
+    first_frame = ReadFirstFrame(body.find(name),
+                                 file == files.end() ? nullptr : &file->second,
+                                 &image_error);
+    if (!first_frame.has_value()) {
+      return Error(400, "Bad Request",
+                   "'" + std::string(name) + "' " + image_error,
+                   "invalid_input_reference");
+    }
+  }
+  const json::Value* model_value = body.find("model");
+  const json::Value* prompt_value = body.find("prompt");
+  const json::Value* size_value = body.find("size");
+  if (model_value == nullptr || !model_value->is_string() ||
+      prompt_value == nullptr || !prompt_value->is_string() ||
+      (size_value != nullptr && !size_value->is_string())) {
+    return Error(400, "Bad Request",
+                 "'model', 'prompt', and optional 'size' must be strings",
+                 "invalid_parameter_type");
+  }
+  const std::string model = model_value->str();
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  const std::string prompt = prompt_value->str();
+  if (prompt.find('\0') != std::string::npos) {
+    return Error(400, "Bad Request", "'prompt' must not contain NUL",
+                 "invalid_prompt");
+  }
+  const std::string size = body.member_str("size", "832x480");
+  const json::Value* seconds_value = body.find("seconds");
+  std::string seconds = "5";
+  if (seconds_value != nullptr && seconds_value->is_string()) {
+    seconds = seconds_value->str();
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
+  }
+  std::string duration_error;
+  const auto duration_frames =
+      ResolveWan21DurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  minimax_h3::GenerationParameters parameters;
+  parameters.preset = std::string(kWan21Preset);
+  parameters.frames = *duration_frames;
+  parameters.evaluations = 4;
+  parameters.mux = true;
+  parameters.decode_audio = false;
+  if (!ParseVideoSize(size, &parameters.output_width,
+                      &parameters.output_height)) {
+    return Error(400, "Bad Request", "'size' must be WIDTHxHEIGHT",
+                 "invalid_size");
+  }
+  parameters.internal_width = parameters.output_width;
+  parameters.internal_height = parameters.output_height;
+  std::uint64_t seed = 42;
+  int interpolate = 1;
+  std::string camera_json;
+  std::vector<std::uint8_t> guide_video;
+  if (const auto upload = files.find("render_video"); upload != files.end()) {
+    guide_video.assign(upload->second.begin(), upload->second.end());
+  }
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension,
+                        {"seed", "steps", "frames", "interpolate", "camera"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' may contain only 'seed', 'steps', 'frames', "
+                   "'interpolate' and 'camera'",
+                   "invalid_strix_options");
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
+    }
+    if (extension->contains("seed")) {
+      const auto parsed = JsonUnsigned(extension->find("seed"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.seed' must be a non-negative exact integer",
+                     "invalid_seed");
+      }
+      seed = *parsed;
+    }
+    if (extension->contains("steps")) {
+      const auto parsed = JsonFrame(extension->find("steps"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.steps' must be 1..20",
+                     "invalid_steps");
+      }
+      parameters.evaluations = *parsed;
+    }
+    if (extension->contains("frames")) {
+      const auto parsed = JsonFrame(extension->find("frames"));
+      if (!parsed.has_value() || *parsed != *duration_frames) {
+        return Error(400, "Bad Request",
+                     "'gufo.frames' must match the 'seconds' duration",
+                     "invalid_frames");
+      }
+    }
+    if (const json::Value* camera = extension->find("camera")) {
+      if (!guide_video.empty()) {
+        return Error(400, "Bad Request",
+                     "'gufo.camera' and an uploaded 'render_video' exclude "
+                     "each other",
+                     "invalid_camera");
+      }
+      if (camera->is_object() && camera->contains("render_video")) {
+        const json::Value* video = camera->find("render_video");
+        if (camera->size() != 1 || !video->is_string()) {
+          return Error(400, "Bad Request",
+                       "'gufo.camera.render_video' must be the only camera "
+                       "field and an MP4 data URL or base64 string",
+                       "invalid_camera");
+        }
+        std::string_view text = video->str();
+        if (text.starts_with("data:")) {
+          const auto comma = text.find(',');
+          if (comma == std::string_view::npos ||
+              text.substr(0, comma).find(";base64") == std::string_view::npos) {
+            return Error(400, "Bad Request",
+                         "'gufo.camera.render_video' data URL must be base64",
+                         "invalid_camera");
+          }
+          text.remove_prefix(comma + 1);
+        }
+        auto decoded = DecodeBase64(text);
+        if (!decoded.has_value() || decoded->size() < 64) {
+          return Error(400, "Bad Request",
+                       "'gufo.camera.render_video' is not valid base64 video",
+                       "invalid_camera");
+        }
+        guide_video = std::move(*decoded);
+      } else {
+        models::wan22::CameraSpec spec;
+        std::string camera_error;
+        if (!ParseCameraSpec(*camera, &spec, &camera_error)) {
+          return Error(400, "Bad Request", camera_error, "invalid_camera");
+        }
+        camera_json = camera->dump();
+      }
+    }
+  }
+  std::string parameter_error;
+  if (!ValidateWan21Parameters(parameters, &parameter_error)) {
+    return Error(400, "Bad Request", parameter_error, "invalid_parameters");
+  }
+  const VideoJobCreateResult created = service.Create({
+      .model = model,
+      .prompt = prompt,
+      .size = size,
+      .seconds = seconds,
+      .output_format = "mp4",
+      .parameters = std::move(parameters),
+      .seed = seed,
+      .first_frame_width = static_cast<int>(first_frame->width),
+      .first_frame_height = static_cast<int>(first_frame->height),
+      .first_frame = std::move(first_frame->pixels),
+      .interpolate = interpolate,
+      .camera_json = std::move(camera_json),
+      .guide_video = std::move(guide_video),
+  });
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   std::map<std::string, std::string> files;
@@ -752,6 +1012,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   }
   if (service.family() == VideoModelFamily::kWan22) {
     return CreateWan22Video(body, files, service);
+  }
+  if (service.family() == VideoModelFamily::kWan21Uni3C) {
+    return CreateWan21Video(body, files, service);
   }
   if (IsUnsupportedConditioning(body)) {
     return Error(400, "Bad Request",

@@ -5,13 +5,15 @@ target_include_directories(gufo_wan22 PUBLIC ${PROJECT_SOURCE_DIR})
 
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_wan22 PRIVATE text_encoder.hip transformer.hip
-    attention.hip gemm.cpp vae.hip pipeline.cpp)
+    attention.hip gemm.cpp vae.hip pipeline.cpp clip_vision.hip
+    transformer21.hip uni3c.hip pipeline21.cpp
+    moge.hip camera_path.cpp point_render.hip)
   target_compile_options(gufo_wan22 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_link_libraries(gufo_wan22 PUBLIC gufo_platform hip::host
     roc::rocblas roc::hipblaslt)
 
-  foreach(tool t5 dit video)
+  foreach(tool t5 dit video check21)
     add_executable(gufo-wan-${tool} EXCLUDE_FROM_ALL ${tool}_main.cpp)
     set_target_properties(gufo-wan-${tool} PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -20,6 +22,7 @@ if (ENGINE_ENABLE_HIP)
   endforeach()
   # --image reads PNG/JPEG/WebP through the core image decoder.
   target_link_libraries(gufo-wan-video PRIVATE gufo_core)
+  target_link_libraries(gufo-wan-check21 PRIVATE gufo_core)
 endif()
 
 if (BUILD_TESTING)

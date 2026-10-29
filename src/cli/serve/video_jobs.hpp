@@ -44,10 +44,24 @@ enum class VideoJobResult : std::uint8_t {
 enum class VideoModelFamily : std::uint8_t {
   kMinimaxH3,
   kWan22,
+  kWan21Uni3C,
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
 inline constexpr std::string_view kWan22Preset = "wan22";
+// Wan 2.1 I2V 14B + lightx2v + Uni3C camera control (+ MoGe-2 camera paths).
+inline constexpr std::string_view kWan21ModelId = "wan2.1-uni3c";
+inline constexpr std::string_view kWan21Preset = "wan21";
+
+/// A Wan 2.1 camera bundle: `gufo-camera.json` in the root names its parts
+/// (see video_wan21.hpp).
+[[nodiscard]] bool IsWan21CameraDirectory(const std::filesystem::path& root);
+[[nodiscard]] bool ValidateWan21Parameters(
+    const minimax_h3::GenerationParameters& parameters,
+    std::string* error = nullptr);
+/// 16 fps: 4k + 1 frames for 0.25..5 seconds (at most 81).
+[[nodiscard]] std::optional<int> ResolveWan21DurationFrames(
+    std::string_view seconds, std::string* error = nullptr);
 
 // True when `root/model_index.json` describes a Wan 2.2 TI2V-5B pipeline.
 [[nodiscard]] bool IsWan22ModelDirectory(const std::filesystem::path& root);
@@ -91,6 +105,10 @@ struct VideoJobRequest {
   // RIFE frame multiplier for the finished MP4 (1 = off, 2..8); needs
   // VideoJobServiceOptions::interpolator.
   int interpolate{1};
+  // Wan 2.1 camera: the "gufo.camera" object as JSON (type/amount/speed/ease
+  // or poses), and an uploaded guide video (MP4 bytes) instead.
+  std::string camera_json;
+  std::vector<std::uint8_t> guide_video;
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).
