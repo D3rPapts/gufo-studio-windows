@@ -5,8 +5,10 @@
 #include <cmath>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
+#include <string>
 
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
@@ -35,6 +37,22 @@ double Milliseconds(Clock::time_point start) {
 void Cancel(const CancellationCheck& cancelled) {
   if (cancelled && cancelled())
     throw std::runtime_error("image request cancelled");
+}
+
+/// Observe a second pass (negative prompt, init image) under its own names.
+Observer Prefixed(const Observer& observer, std::string prefix) {
+  if (!observer.write)
+    return {};
+  Observer result;
+  result.write = [observer, prefix](std::string_view name,
+                                    std::span<const float> values, int rows,
+                                    int cols) {
+    observer.write(prefix + std::string(name), values, rows, cols);
+  };
+  result.include = [observer, prefix](std::string_view name) {
+    return observer.Wants(prefix + std::string(name));
+  };
+  return result;
 }
 
 Matrix Concat(Runtime& rt, std::initializer_list<Matrix> values) {
@@ -568,6 +586,30 @@ Result Model::Generate(const Request& request,
     const int height = request.height / 16, width = request.width / 16;
     auto context = PrepareDiffusion(rt, impl_->weights, prompt, height, width,
                                     cancelled, observer);
+    // True CFG: a second prompt with its own condition caches. Its boundaries
+    // are observed under "negative.".
+    const bool guided = request.guidance > 1;
+    const auto negative_observer = Prefixed(observer, "negative.");
+    std::optional<DiffusionContext> negative_context;
+    if (guided) {
+      Request negative;
+      negative.prompt = request.negative_prompt;
+      negative.images = request.images;
+      const auto encoded = EncodePrompt(rt, impl_->tokenizer, negative,
+                                        cancelled, negative_observer);
+      negative_context = PrepareDiffusion(rt, impl_->weights, encoded, height,
+                                          width, cancelled, negative_observer);
+    }
+    const bool img2img =
+        request.init_image && request.strength <= kFullStrength;
+    std::optional<Image> init_image;
+    Matrix init_latent;
+    if (img2img) {
+      init_image =
+          ResizeImage(*request.init_image, request.width, request.height);
+      init_latent = EncodeVae(rt, impl_->weights, *init_image, cancelled,
+                              Prefixed(observer, "init."));
+    }
     rt.Synchronize();
     result.metrics.prompt_ms = Milliseconds(start);
     // Generate independent full-precision normal draws; seed replay never
@@ -576,7 +618,8 @@ Result Model::Generate(const Request& request,
     // edited at the same size and seed. Bind edit noise to its reference
     // pixels, including later edits of an edit, without changing generation or
     // replay.
-    std::mt19937_64 rng(InitialNoiseSeed(request.seed, prompt.images));
+    std::mt19937_64 rng(InitialNoiseSeed(request.seed, prompt.images,
+                                         init_image ? &*init_image : nullptr));
     std::normal_distribution<float> normal(0, 1);
     std::vector<float> noise(static_cast<std::size_t>(height) * width * 64);
     for (float& value : noise)
@@ -584,12 +627,25 @@ Result Model::Generate(const Request& request,
     auto latent = rt.Upload(noise, height * width, 64);
     rt.Observe(observer, "noise", latent);
     const auto denoise_start = Clock::now();
-    const auto sigmas = FlowSigmas(request.steps, height * width);
+    const auto sigmas =
+        DenoiseSigmas(request.steps, request.strength, height * width);
     if (observer.Wants("sigmas"))
       observer.write("sigmas", sigmas, 1, static_cast<int>(sigmas.size()));
+    if (img2img) {
+      latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
+      rt.Observe(observer, "init.latent", latent);
+    }
     for (int step = 0; step < request.steps; ++step) {
-      const auto velocity =
+      auto velocity =
           Denoise(rt, context, latent, sigmas[step], step, cancelled, observer);
+      if (guided) {
+        const auto negative =
+            Denoise(rt, *negative_context, latent, sigmas[step], step,
+                    cancelled, negative_observer);
+        velocity = rt.Guidance(velocity, negative, request.guidance);
+        rt.Observe(observer, "dit." + std::to_string(step) + ".guided",
+                   velocity);
+      }
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
