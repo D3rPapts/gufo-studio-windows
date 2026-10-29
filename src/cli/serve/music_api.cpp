@@ -174,7 +174,10 @@ HttpResponse MusicService::Handle(const HttpRequest& request) {
 HttpResponse MusicService::Submit(const HttpRequest& request) {
   json::Value body;
   try {
-    body = json::parse(request.body);
+    // Tolerate a UTF-8 byte order mark (Windows PowerShell writes one).
+    const std::string_view text = request.body;
+    body = json::parse(std::string(
+        text.substr(0, 3) == "\xEF\xBB\xBF" ? text.substr(3) : text));
   } catch (const std::exception&) {
     return Error(400, "Bad Request", "request body must be valid JSON",
                  "parse_error");
