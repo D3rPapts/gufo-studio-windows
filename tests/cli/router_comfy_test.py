@@ -171,7 +171,9 @@ def serve_fake_worker(argv):
                 if "render_video" in camera:
                     camera["render_video"] = describe(camera["render_video"])
                 log({"path": path, "fields": fields})
-                video_id = "video_%d" % (len(videos) + 1)
+                # Unique across fake workers, like gufo's random job ids: the
+                # router routes status/content reads by job id.
+                video_id = "video_%s_%d" % (model.replace(".", "_"), len(videos) + 1)
                 videos[video_id] = b"FAKEMP4-" + model.encode()
                 return self.send(202, {"id": video_id, "object": "video",
                                        "status": "queued", "progress": 0})
