@@ -10,7 +10,8 @@
 // the embeddings, block 0 and the output with tools-local/wan21_dit_oracle.py.
 // With `--dit-bench` it times Forward on random input of the given latent
 // shape instead (21 60 104 = 81 frames of 832x480), the context from DIR.
-// Both refuse to load with less than 14 GiB of free host RAM.
+// Both refuse to load with less than 8 GiB of free host RAM (the
+// 14B path needs ~1.1 GiB of host memory).
 //
 //   gufo-wan-check21 --i2v OUT.mp4 --model ROOT --t5 ROOT --dit FILE
 //                    [--lora FILE] --image FILE --prompt TEXT [--width W]
@@ -252,8 +253,8 @@ std::unique_ptr<wan22::Transformer21> LoadDit(
   const double available = AvailableGiB();
   std::cout << "host RAM available " << available << " GiB, device used "
             << DeviceUsedGiB() << " GiB\n";
-  if (available < 14.0) {
-    std::cerr << "less than 14 GiB host RAM available, not loading\n";
+  if (available < 8.0) {
+    std::cerr << "less than 8 GiB host RAM available, not loading\n";
     return nullptr;
   }
   std::string error;
@@ -503,8 +504,8 @@ int RunI2V(const wan22::I2V21Request& base, const std::filesystem::path& out,
     std::cout << "guide " << guide_path << ": " << request.guide_frames
               << " frames\n";
   }
-  if (AvailableGiB() < 14.0) {
-    std::cerr << "less than 14 GiB host RAM available (" << AvailableGiB()
+  if (AvailableGiB() < 8.0) {
+    std::cerr << "less than 8 GiB host RAM available (" << AvailableGiB()
               << "), not running\n";
     return 1;
   }
