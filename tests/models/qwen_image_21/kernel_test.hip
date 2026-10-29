@@ -654,11 +654,13 @@ int main() {
   image::Check(hipGetDeviceCount(&devices));
   if (!devices)
     return 77;
+  // Attention first: it does not depend on the other kernels' code objects.
+  Fused(false);
+  Fused(true);
+  std::cout << "fused and segmented attention passed\n" << std::flush;
   Conversion();
   Normalization();
   Layout();
-  Fused(false);
-  Fused(true);
   PackedLayout();
   Dense();
   Convolution();

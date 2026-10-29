@@ -14,11 +14,13 @@ struct DeviceMemory {
   bool segments{false};
   std::uint64_t local_usage{0}, local_budget{0};
   std::uint64_t nonlocal_usage{0}, nonlocal_budget{0};
+  /// Dedicated (carve-out) memory of the adapter.
+  std::uint64_t dedicated{0};
   std::uint64_t host_available{0};
 
   /// Bytes this process can still allocate without exhausting host RAM:
-  /// local headroom plus shared headroom, the latter bounded by available
-  /// host memory minus `host_reserve`.
+  /// the DXGI headroom, bounded by the free dedicated carve-out plus
+  /// available host memory minus `host_reserve`.
   std::uint64_t Available(std::uint64_t host_reserve) const;
   std::string Describe() const;
 };

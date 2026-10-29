@@ -48,6 +48,7 @@ bool QuerySegments(DeviceMemory* memory) {
         memory->local_budget = local.Budget;
         memory->nonlocal_usage = nonlocal.CurrentUsage;
         memory->nonlocal_budget = nonlocal.Budget;
+        memory->dedicated = desc.DedicatedVideoMemory;
         found = true;
       }
       adapter3->Release();
@@ -72,8 +73,13 @@ std::uint64_t DeviceMemory::Available(std::uint64_t host_reserve) const {
       host_available > host_reserve ? host_available - host_reserve : 0;
   if (!segments)
     return hip_free;
-  return Headroom(local_budget, local_usage) +
-         std::min(Headroom(nonlocal_budget, nonlocal_usage), host);
+  const std::uint64_t budget = Headroom(local_budget, local_usage) +
+                               Headroom(nonlocal_budget, nonlocal_usage);
+  // An APU may report its whole budget as local (Strix Halo: 48 GB local,
+  // 0 shared, 32 GB carve-out): beyond the dedicated carve-out every byte
+  // comes from host RAM.
+  const std::uint64_t used = local_usage + nonlocal_usage;
+  return std::min(budget, Headroom(dedicated, used) + host);
 }
 
 std::string DeviceMemory::Describe() const {
@@ -81,7 +87,8 @@ std::string DeviceMemory::Describe() const {
   out << "hip_free_mib=" << hip_free / kMiB
       << " hip_total_mib=" << hip_total / kMiB;
   if (segments)
-    out << " local_usage_mib=" << local_usage / kMiB
+    out << " dedicated_mib=" << dedicated / kMiB
+        << " local_usage_mib=" << local_usage / kMiB
         << " local_budget_mib=" << local_budget / kMiB
         << " shared_usage_mib=" << nonlocal_usage / kMiB
         << " shared_budget_mib=" << nonlocal_budget / kMiB;
