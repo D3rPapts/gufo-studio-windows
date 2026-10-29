@@ -555,7 +555,7 @@ def check_video(router, stretched):
     fields = call["fields"]
     assert fields["model"] == "minimax-h3" and fields["size"] == "512x512", fields
     assert fields["gufo"] == {"seed": 7, "steps": 8, "frames": 124, "lora": "turbo"}, fields
-    assert fields["seconds"] == 6
+    assert fields["seconds"] == 5
     # ComfyUI stretches guide images to the canvas: the adapter does too (ffmpeg).
     size = "512x512" if stretched else "64x48"
     assert fields["first_frame"] == "data:image/png;base64," + size, fields

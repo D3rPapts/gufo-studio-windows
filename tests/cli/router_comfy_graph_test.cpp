@@ -4,6 +4,7 @@
 // built from the node signatures ComfyUI's /object_info reports.
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <variant>
@@ -183,7 +184,20 @@ void TestH3() {
   assert((video.last_frame == comfy::FileRef{"kf1.png", "input"}));
   const json::Value body = comfy::VideoRequestBody(video);
   assert(body.member_str("size") == "1344x768");
-  assert(body.find("seconds")->as_double() == 6);
+  assert(body.find("seconds")->as_double() == 5);
+  // seconds and gufo.frames must agree after gufo's 24-fps alignment.
+  for (const int frames : {124, 141, 243, 345}) {
+    comfy::VideoTask longer = video;
+    longer.frames = frames;
+    const double seconds =
+        comfy::VideoRequestBody(longer).find("seconds")->as_double();
+    const int aligned =
+        comfy::SnapH3Frames(static_cast<int>(std::ceil(seconds * 24)));
+    assert(seconds >= 5 && seconds <= 14.375 && aligned == frames);
+  }
+  std::string medium = kH3;
+  medium.replace(medium.find("\"length\": 120"), 13, "\"length\": 73");
+  assert(ErrorOf(medium).message.find("124..345") != std::string::npos);
   assert(body.find("gufo")->find("frames")->as_double() == 124);
   assert(body.find("gufo")->member_str("lora") == "turbo");
   assert(body.find("gufo")->find("steps")->as_double() == 8);
