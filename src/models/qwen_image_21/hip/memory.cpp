@@ -3,6 +3,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 
 #include "src/core/platform/os_info.hpp"
@@ -71,8 +72,10 @@ constexpr std::uint64_t kMiB = 1ULL << 20;
 std::uint64_t DeviceMemory::Available(std::uint64_t host_reserve) const {
   const std::uint64_t host =
       host_available > host_reserve ? host_available - host_reserve : 0;
+  // Elsewhere hipMemGetInfo is the only source; without any reading the
+  // check is skipped rather than refusing every large request.
   if (!segments)
-    return hip_free;
+    return hip_valid ? hip_free : UINT64_MAX;
   const std::uint64_t budget = Headroom(local_budget, local_usage) +
                                Headroom(nonlocal_budget, nonlocal_usage);
   // An APU may report its whole budget as local (Strix Halo: 48 GB local,
@@ -100,6 +103,7 @@ DeviceMemory QueryDeviceMemory() {
   DeviceMemory memory;
   std::size_t free = 0, total = 0;
   if (hipMemGetInfo(&free, &total) == hipSuccess) {
+    memory.hip_valid = true;
     memory.hip_free = free;
     memory.hip_total = total;
   } else {
