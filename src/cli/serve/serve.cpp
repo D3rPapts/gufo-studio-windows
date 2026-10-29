@@ -1175,6 +1175,9 @@ int RunServe(std::span<const char* const> args) {
                      "Model", &text_encoder);
     parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
                      "Model", &name);
+    // Edits accept up to 20 MiB of reference images (FilmStudio sends up to
+    // 9); the 8 MiB default rejected an 8-reference keyframe with 413.
+    max_request_body_bytes = 32ULL << 20;
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';

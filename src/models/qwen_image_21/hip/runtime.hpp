@@ -128,6 +128,10 @@ public:
   /// Return cached pool blocks to HIP. Freed tensors otherwise stay cached
   /// (up to 8 GB) and push the next phase into shared (host) memory.
   void Trim();
+  /// Upper bound of freed blocks kept for reuse (default 8 GB).
+  void SetCacheLimit(std::size_t bytes);
+  /// Copy `source` into rows [row, row + source.rows) of `destination`.
+  void CopyRows(const Matrix& destination, int row, const Matrix& source);
   std::size_t WeightBytes() const { return weight_bytes_; }
   hipStream_t stream() const { return stream_; }
 
