@@ -69,7 +69,9 @@ if (WIN32)
     http_server_test audio_websocket_test continuation_disk_store_test
     component_text_cache_test eval_http_client_test cache_disk_faults_test
     cache_boundary_test cache_adapter_test cache_slot_test cache_disk_test
-    cache_streaming_test cache_tiered_test cache_disk_publication_test)
+    cache_streaming_test cache_tiered_test cache_disk_publication_test
+    router_proxy_test router_workers_test router_ws_relay_test
+    router_contract_test)
   list(REMOVE_ITEM gufo_pr_targets ${gufo_pr_linux_only})
   list(REMOVE_ITEM gufo_pr_tests ${gufo_pr_linux_only})
 endif()
