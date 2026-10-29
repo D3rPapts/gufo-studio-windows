@@ -57,6 +57,19 @@ constexpr std::string_view kPlumbing[] = {
     "RIFE VFI",
     "FB_Qwen3TTSVoiceClonePrompt",
     "FB_Qwen3TTSRoleBank",
+    "TextEncodeAceStepAudio1.5",
+    "EmptyAceStep1.5LatentAudio",
+    "WanImageToVideo",
+    "WanCameraImageToVideo",
+    "WanCameraEmbedding",
+    "WanUni3CControlnetApply",
+    "ModelPatchLoader",
+    "CLIPVisionLoader",
+    "CLIPVisionEncode",
+    "LoadVideo",
+    "GetVideoComponents",
+    "VHS_LoadVideo",
+    "GufoCameraMove",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -74,9 +87,9 @@ constexpr std::string_view kOutputs[] = {
     "SaveImage", "PreviewImage", "SaveAudio", "PreviewAudio", "SaveVideo"};
 
 // Node families other gufo ports are bringing; named so the error says so.
-constexpr std::string_view kPending[] = {
-    "TextEncodeAceStepAudio1.5", "EmptyAceStep1.5LatentAudio",
-    "TextEncodeAceStepAudio", "EmptyAceStepLatentAudio"};
+// (ACE-Step 1.0; gufo serves ACE-Step 1.5.)
+constexpr std::string_view kPending[] = {"TextEncodeAceStepAudio",
+                                         "EmptyAceStepLatentAudio"};
 
 template<std::size_t N>
 bool Contains(const std::string_view (&set)[N], std::string_view value) {
@@ -293,6 +306,7 @@ FileRef AudioFile(const Graph& graph, const std::string& id,
 struct ModelChain {
   std::string loader;  // unet/ckpt name
   std::vector<std::pair<std::string, double>> loras;
+  std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
 };
 
 ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
@@ -303,6 +317,12 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
     if (cls == "LoraLoaderModelOnly" || cls == "LoraLoader") {
       chain.loras.emplace_back(graph.Str(link.node, "lora_name"),
                                graph.Num(link.node, "strength_model", 1.0));
+    } else if (cls == "WanUni3CControlnetApply") {
+      if (!chain.uni3c.empty())
+        throw NodeFailure(sampler, "unsupported_link",
+                          "the model input passes through two "
+                          "WanUni3CControlnetApply nodes");
+      chain.uni3c = link.node;
     } else if (cls == "UNETLoader") {
       chain.loader = graph.Str(link.node, "unet_name", "");
       return chain;
@@ -346,8 +366,13 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
     } else if (cls == "ConditioningZeroOut") {
       cond.zeroed = true;
       link = graph.RequireLink(link->node, "conditioning");
+    } else if (cls == "WanImageToVideo" || cls == "WanCameraImageToVideo") {
+      // Outputs (positive, negative, latent): follow the matching input.
+      link = graph.RequireLink(link->node,
+                               link->slot == 1 ? "negative" : "positive");
     } else if (cls == "TextEncodeQwenImage21" || cls == "CLIPTextEncode" ||
-               cls == "MiniMaxH3ImageToVideo") {
+               cls == "MiniMaxH3ImageToVideo" ||
+               cls == "TextEncodeAceStepAudio1.5") {
       cond.encoder = link->node;
       cond.slot = link->slot;
       return cond;
@@ -790,6 +815,260 @@ SpeechTask BuildSpeech(const Graph& graph, const std::string& id,
   return task;
 }
 
+/// ACE-Step 1.5 (ComfyUI's template): KSampler <- EmptyAceStep1.5LatentAudio,
+/// positive TextEncodeAceStepAudio1.5, negative its ConditioningZeroOut.
+MusicTask BuildMusic(const Graph& graph, const std::string& sampler,
+                     const ModelIds& models, const Link& latent,
+                     std::vector<std::string>* warnings) {
+  MusicTask task;
+  task.model = models.music;
+  task.duration = graph.Num(latent.node, "seconds", 120.0);
+  if (task.duration < 1.0 || task.duration > 600.0)
+    throw NodeFailure(latent.node, "unsupported_value",
+                      "gufo ACE-Step renders 1..600 seconds");
+  if (graph.Num(latent.node, "batch_size", 1) != 1)
+    throw NodeFailure(latent.node, "unsupported_value",
+                      "gufo ACE-Step renders batch_size 1");
+  task.steps = static_cast<int>(graph.Num(sampler, "steps", 8));
+  if (task.steps < 1 || task.steps > 50)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo ACE-Step takes 1..50 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  if (graph.Num(sampler, "denoise", 1.0) < 0.999)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo ACE-Step has no audio-to-audio (denoise < 1)");
+  const ModelChain chain = FollowModel(graph, sampler);
+  if (!chain.loras.empty() || !chain.uni3c.empty())
+    throw NodeFailure(sampler, "unsupported_value",
+                      "LoRAs are not supported for ACE-Step in gufo");
+  if (!chain.loader.empty() &&
+      Lower(chain.loader).find("acestep_v1.5_xl_turbo") == std::string::npos)
+    warnings->push_back("model " + chain.loader + " is served by " +
+                        task.model);
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "TextEncodeAceStepAudio1.5" ||
+      positive.zeroed)
+    throw NodeFailure(sampler, "unsupported_link",
+                      "positive conditioning must come from "
+                      "TextEncodeAceStepAudio1.5");
+  const std::string& text = positive.encoder;
+  task.tags = graph.Str(text, "tags");
+  if (task.tags.empty())
+    throw NodeFailure(text, "required_input_missing", "tags are empty");
+  task.lyrics = graph.Str(text, "lyrics", "");
+  task.bpm = static_cast<int>(graph.Num(text, "bpm", 0));
+  task.timesignature = graph.Str(text, "timesignature", "");
+  task.language = graph.Str(text, "language", "");
+  if (task.language == "unknown")
+    task.language.clear();
+  task.keyscale = graph.Str(text, "keyscale", "");
+  if (const json::Value* codes = graph.Literal(text, "generate_audio_codes");
+      codes != nullptr && codes->is_bool())
+    task.audio_codes = codes->as_bool();
+  for (const auto& [key, field] :
+       {std::pair<const char*, std::optional<double>*>{"cfg_scale",
+                                                       &task.lm_cfg},
+        {"temperature", &task.lm_temperature},
+        {"top_p", &task.lm_top_p}}) {
+    if (const json::Value* value = graph.Literal(text, key);
+        value != nullptr && value->is_number())
+      *field = value->as_double();
+  }
+  for (const char* key : {"top_k", "min_p"}) {
+    if (const json::Value* value = graph.Literal(text, key);
+        value != nullptr && value->is_number() && value->as_double() != 0)
+      warnings->push_back("node " + text + ": " + key +
+                          " is not applied (gufo ACE-Step has no such field)");
+  }
+  const double duration = graph.Num(text, "duration", task.duration);
+  if (std::abs(duration - task.duration) > 0.05)
+    warnings->push_back("node " + text + ": duration " +
+                        std::to_string(duration) + " differs from the latent; "
+                        "gufo renders the latent's " +
+                        std::to_string(task.duration) + " s");
+  if (const json::Value* seed = graph.Literal(text, "seed");
+      seed != nullptr && seed->is_number() &&
+      Seed(seed->as_double()) != task.seed)
+    warnings->push_back("node " + text +
+                        ": gufo ACE-Step takes one seed (the KSampler's)");
+  return task;
+}
+
+/// gufo.camera types (wan2.1-uni3c, models/wan22/camera_path).
+bool IsCameraType(std::string_view type) {
+  static constexpr std::string_view kTypes[] = {
+      "static",     "pan_left",    "pan_right",  "tilt_up",   "tilt_down",
+      "zoom_in",    "zoom_out",    "dolly_in",   "dolly_out", "truck_left",
+      "truck_right", "crane_up",   "crane_down", "orbit_left", "orbit_right"};
+  return Contains(kTypes, type);
+}
+
+CameraMove GufoCameraMoveOf(const Graph& graph, const std::string& id) {
+  CameraMove move;
+  move.type = Lower(graph.Str(id, "camera", graph.Str(id, "type", "static")));
+  if (!IsCameraType(move.type))
+    throw NodeFailure(id, "unsupported_value",
+                      "unknown camera move '" + move.type + "'");
+  move.speed = graph.Num(id, "speed", 1.0);
+  move.ease = graph.Str(id, "ease", "linear");
+  if (const json::Value* amount = graph.Literal(id, "amount");
+      amount != nullptr && amount->is_number() && amount->as_double() >= 0)
+    move.amount = amount->as_double();
+  return move;
+}
+
+/// ComfyUI's WanCameraEmbedding presets (Wan Fun Camera trajectories: "Pan"
+/// and "Zoom" move the camera, they do not turn it) as gufo moves.
+CameraMove WanCameraEmbeddingOf(const Graph& graph, const std::string& id,
+                                std::vector<std::string>* warnings) {
+  static constexpr std::pair<std::string_view, std::string_view> kMap[] = {
+      {"Static", "static"},        {"Pan Up", "crane_up"},
+      {"Pan Down", "crane_down"},  {"Pan Left", "truck_left"},
+      {"Pan Right", "truck_right"}, {"Zoom In", "dolly_in"},
+      {"Zoom Out", "dolly_out"}};
+  const std::string pose = graph.Str(id, "camera_pose", "Static");
+  CameraMove move;
+  move.type.clear();
+  for (const auto& [comfy_name, gufo_name] : kMap)
+    if (pose == comfy_name)
+      move.type = std::string(gufo_name);
+  if (move.type.empty())
+    throw NodeFailure(id, "unsupported_value",
+                      "camera_pose '" + pose +
+                          "' (roll) has no gufo preset; use GufoCameraMove");
+  move.speed = graph.Num(id, "speed", 1.0);
+  warnings->push_back("node " + id + ": WanCameraEmbedding '" + pose +
+                      "' runs as gufo camera " + move.type +
+                      " on wan2.1-uni3c (Uni3C, not Wan Fun Camera)");
+  return move;
+}
+
+/// Wan 2.1 I2V + Uni3C camera moves (wan2.1-uni3c, 16 fps).
+VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
+                      const ModelIds& models, const Link& latent,
+                      std::vector<std::string>* warnings) {
+  const std::string video = latent.node;
+  const std::string video_class = graph.Class(video);
+  VideoTask task;
+  task.family = VideoFamily::kCamera;
+  task.model = models.camera;
+  task.fps = 16;
+  task.width = static_cast<int>(graph.Num(video, "width", 832));
+  task.height = static_cast<int>(graph.Num(video, "height", 480));
+  if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 16 ||
+      task.height < 16 || task.width * task.height > 832 * 480)
+    throw NodeFailure(video, "unsupported_value",
+                      "gufo wan2.1-uni3c needs width/height in multiples of "
+                      "16 and at most 832x480 pixels, not " +
+                          std::to_string(task.width) + "x" +
+                          std::to_string(task.height));
+  task.frames = static_cast<int>(graph.Num(video, "length", 81));
+  if (task.frames < 5 || task.frames > 81 || (task.frames - 1) % 4 != 0)
+    throw NodeFailure(video, "unsupported_value",
+                      "gufo wan2.1-uni3c length must be 4k+1 frames, 5..81 "
+                      "(16 fps)");
+  if (graph.Num(video, "batch_size", 1) != 1)
+    throw NodeFailure(video, "unsupported_value",
+                      "gufo wan2.1-uni3c renders batch_size 1");
+  auto start = graph.LinkOf(video, "start_image");
+  if (!start)
+    throw NodeFailure(video, "required_input_missing",
+                      "gufo wan2.1-uni3c needs a start_image");
+  task.first_frame = ImageFile(graph, video, "start_image", *start);
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "CLIPTextEncode")
+    throw NodeFailure(sampler, "unsupported_link",
+                      "Wan positive conditioning must come from "
+                      "CLIPTextEncode");
+  task.prompt = graph.Str(positive.encoder, "text");
+  if (!ClipText(graph, FollowConditioning(graph, sampler, "negative")).empty())
+    warnings->push_back("node " + sampler +
+                        ": the negative prompt is not applied "
+                        "(gufo wan2.1-uni3c has no negative prompt)");
+  task.steps = static_cast<int>(graph.Num(sampler, "steps"));
+  if (task.steps < 1 || task.steps > 20)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.1-uni3c takes 1..20 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  if (graph.Num(sampler, "cfg", 1.0) != 1.0)
+    warnings->push_back("node " + sampler +
+                        ": cfg is not applied (gufo wan2.1-uni3c runs the "
+                        "distilled model)");
+  const ModelChain chain = FollowModel(graph, sampler);
+  for (const auto& [name, strength] : chain.loras) {
+    (void)strength;
+    const std::string lower = Lower(name);
+    if (lower.find("lightx2v") == std::string::npos &&
+        lower.find("distill") == std::string::npos)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "gufo wan2.1-uni3c has its step-distill LoRA built "
+                        "in and takes no other LoRA, not " +
+                            name);
+  }
+  // The camera: WanUni3CControlnetApply.render_video, or the Fun Camera
+  // conditions of WanCameraImageToVideo.
+  std::optional<Link> source;
+  std::string source_node;
+  if (!chain.uni3c.empty()) {
+    for (const auto& [key, fallback] :
+         {std::pair<const char*, double>{"strength", 1.0},
+          {"start_percent", 0.0},
+          {"end_percent", 1.0}})
+      if (graph.Num(chain.uni3c, key, fallback) != fallback)
+        warnings->push_back("node " + chain.uni3c + ": " + key +
+                            " is not applied (gufo runs Uni3C at full "
+                            "strength over all steps)");
+    source = graph.RequireLink(chain.uni3c, "render_video");
+    source_node = chain.uni3c;
+  }
+  if (video_class == "WanCameraImageToVideo") {
+    if (auto conditions = graph.LinkOf(video, "camera_conditions")) {
+      if (source)
+        throw NodeFailure(video, "unsupported_link",
+                          "camera_conditions and a Uni3C render_video "
+                          "exclude each other");
+      source = conditions;
+      source_node = video;
+    }
+  }
+  if (source) {
+    const std::string cls = graph.Class(source->node);
+    if (cls == "GufoCameraMove") {
+      task.camera = GufoCameraMoveOf(graph, source->node);
+    } else if (cls == "WanCameraEmbedding") {
+      task.camera = WanCameraEmbeddingOf(graph, source->node, warnings);
+    } else if (cls == "VHS_LoadVideo") {
+      task.render_video =
+          ParseFileRef(graph.Str(source->node, "video"), "input");
+    } else if (cls == "GetVideoComponents") {
+      const Link file = graph.RequireLink(source->node, "video");
+      if (graph.Class(file.node) != "LoadVideo")
+        throw NodeFailure(source->node, "unsupported_link",
+                          "the guide video must come from LoadVideo");
+      task.render_video = ParseFileRef(graph.Str(file.node, "file"), "input");
+    } else {
+      throw NodeFailure(source_node, "unsupported_link",
+                        "the camera must come from GufoCameraMove, "
+                        "WanCameraEmbedding or a loaded guide video, not " +
+                            cls);
+    }
+  }
+  if (task.camera) {
+    if (!(task.camera->speed >= 0.05 && task.camera->speed <= 4.0))
+      throw NodeFailure(source->node, "unsupported_value",
+                        "camera speed must be 0.05..4");
+    if (task.camera->ease != "linear" && task.camera->ease != "ease_in_out")
+      throw NodeFailure(source->node, "unsupported_value",
+                        "camera ease must be linear or ease_in_out");
+    if (task.camera->amount && *task.camera->amount > 360)
+      throw NodeFailure(source->node, "unsupported_value",
+                        "camera amount must be 0..360");
+  }
+  return task;
+}
+
 OutputKind KindOf(std::string_view class_type) {
   if (class_type == "SaveAudio" || class_type == "PreviewAudio")
     return OutputKind::kAudio;
@@ -864,6 +1143,23 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["interpolate"] = task.interpolate;
     if (task.audio_reference)
       gufo["audio_reference_frame"] = task.audio_reference_frame;
+  } else if (task.family == VideoFamily::kCamera) {
+    // 16 fps, 4k+1 frames: gufo maps seconds back to 4 * round(4 s) + 1.
+    body["size"] =
+        std::to_string(task.width) + "x" + std::to_string(task.height);
+    body["seconds"] = (task.frames - 1) / 16.0;
+    gufo["frames"] = task.frames;
+    if (task.interpolate > 1)
+      gufo["interpolate"] = task.interpolate;
+    if (task.camera) {
+      json::Value camera = json::Value::object();
+      camera["type"] = task.camera->type;
+      if (task.camera->amount)
+        camera["amount"] = *task.camera->amount;
+      camera["speed"] = task.camera->speed;
+      camera["ease"] = task.camera->ease;
+      gufo["camera"] = std::move(camera);
+    }
   } else {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
@@ -876,6 +1172,35 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["interpolate"] = task.interpolate;
   }
   body["gufo"] = std::move(gufo);
+  return body;
+}
+
+json::Value MusicRequestBody(const MusicTask& task) {
+  json::Value body = json::Value::object();
+  body["model"] = task.model;
+  body["prompt"] = task.tags;
+  if (!task.lyrics.empty())
+    body["lyrics"] = task.lyrics;
+  body["duration"] = task.duration;
+  body["seed"] = task.seed;
+  body["steps"] = task.steps;
+  if (task.bpm > 0)
+    body["bpm"] = task.bpm;
+  if (!task.timesignature.empty())
+    body["timesignature"] = task.timesignature;
+  if (!task.language.empty())
+    body["language"] = task.language;
+  if (!task.keyscale.empty())
+    body["keyscale"] = task.keyscale;
+  if (task.audio_codes)
+    body["audio_codes"] = *task.audio_codes;
+  if (task.lm_cfg)
+    body["lm_cfg"] = *task.lm_cfg;
+  if (task.lm_temperature)
+    body["lm_temperature"] = *task.lm_temperature;
+  if (task.lm_top_p)
+    body["lm_top_p"] = *task.lm_top_p;
+  body["response_format"] = "wav";
   return body;
 }
 
@@ -1094,6 +1419,13 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
             task.spec = BuildH3(graph, generator, models, latent);
           else if (latent_class == "Wan22ImageToVideoLatent")
             task.spec = BuildWan(graph, generator, models, latent);
+          else if (latent_class == "WanImageToVideo" ||
+                   latent_class == "WanCameraImageToVideo")
+            task.spec = BuildCamera(graph, generator, models, latent,
+                                    &plan->warnings);
+          else if (latent_class == "EmptyAceStep1.5LatentAudio")
+            task.spec = BuildMusic(graph, generator, models, latent,
+                                   &plan->warnings);
           else
             task.spec =
                 BuildImage(graph, generator, models, latent, &plan->warnings);
@@ -1103,7 +1435,8 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
       }
       Task& task = plan->tasks[found->second];
       const bool speech = std::holds_alternative<SpeechTask>(task.spec) ||
-                          std::holds_alternative<DialogueTask>(task.spec);
+                          std::holds_alternative<DialogueTask>(task.spec) ||
+                          std::holds_alternative<MusicTask>(task.spec);
       const bool image = std::holds_alternative<ImageTask>(task.spec);
       if ((speech && target.kind != OutputKind::kAudio) ||
           (image && target.kind != OutputKind::kImage))
@@ -1150,7 +1483,8 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
                             "interpolation (gufo interpolates the whole job)");
         seen = multiplier;
         video->interpolate = multiplier;
-        video->fps = 24 * multiplier;
+        video->fps =
+            (video->family == VideoFamily::kCamera ? 16 : 24) * multiplier;
         if (target.kind == OutputKind::kVideo) {
           // CreateVideo's fps sets the playback speed; gufo keeps real time.
           for (const std::string& node_id : upstream)

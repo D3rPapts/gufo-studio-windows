@@ -361,6 +361,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(ref);
       if (video->audio_reference)
         files->push_back(*video->audio_reference);
+      if (video->render_video)
+        files->push_back(*video->render_video);
     }
   }
 }
@@ -1097,6 +1099,8 @@ json::Value Adapter::RunTask(const std::shared_ptr<Job>& job,
     return RunSpeech(job, task, *speech);
   if (const auto* dialogue = std::get_if<DialogueTask>(&task.spec))
     return RunDialogue(job, task, *dialogue);
+  if (const auto* music = std::get_if<MusicTask>(&task.spec))
+    return RunMusic(job, task, *music);
   return RunVideo(job, task, std::get<VideoTask>(task.spec));
 }
 
@@ -1354,6 +1358,22 @@ json::Value Adapter::RunDialogue(const std::shared_ptr<Job>& job,
   return SaveSpeech(task, {*joined});
 }
 
+json::Value Adapter::RunMusic(const std::shared_ptr<Job>& job,
+                              const Task& task, const MusicTask& spec) {
+  const FetchResult result = Call(job, "POST", "/v1/audio/music",
+                                  MusicRequestBody(spec).dump(),
+                                  "application/json");
+  Logger::Info("comfy", "event=music prompt_id=" + job->id +
+                            " model=" + spec.model +
+                            " status=" + std::to_string(result.status) +
+                            " bytes=" + std::to_string(result.body.size()));
+  if (result.status != 200 || !result.body.starts_with("RIFF"))
+    throw std::runtime_error("gufo music request failed (HTTP " +
+                             std::to_string(result.status) +
+                             "): " + ErrorMessage(result));
+  return SaveSpeech(task, {result.body});
+}
+
 json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                               const VideoTask& spec) {
   json::Value body = VideoRequestBody(spec);
@@ -1400,6 +1420,12 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
       keyframes.push_back(std::move(keyframe));
     }
     body["gufo"]["keyframes"] = std::move(keyframes);
+  }
+  if (spec.render_video) {
+    json::Value camera = json::Value::object();
+    camera["render_video"] = "data:video/mp4;base64," +
+                             Base64Encode(ReadFileRef(*spec.render_video));
+    body["gufo"]["camera"] = std::move(camera);
   }
   if (spec.audio_reference) {
     const std::string audio = ReadFileRef(*spec.audio_reference);
