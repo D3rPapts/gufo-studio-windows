@@ -292,6 +292,8 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_http STATIC
+  src/cli/serve/router/comfy_adapter.cpp
+  src/cli/serve/router/comfy_graph.cpp
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
@@ -547,6 +549,14 @@ if (BUILD_TESTING)
   set_tests_properties(router_workers_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
 
+  add_executable(router_comfy_graph_test tests/cli/router_comfy_graph_test.cpp
+    src/cli/serve/router/comfy_graph.cpp)
+  target_include_directories(router_comfy_graph_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_comfy_graph_test PRIVATE cxx_std_20)
+  add_test(NAME router_comfy_graph_test COMMAND router_comfy_graph_test)
+  set_tests_properties(router_comfy_graph_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
   add_executable(router_ws_relay_test tests/cli/router_ws_relay_test.cpp)
   target_link_libraries(router_ws_relay_test PRIVATE gufo_http)
   add_test(NAME router_ws_relay_test COMMAND router_ws_relay_test)
@@ -652,6 +662,12 @@ if (BUILD_TESTING)
       $<TARGET_FILE:gufo>)
   set_tests_properties(router_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 120)
+
+  add_test(NAME router_comfy_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_comfy_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_comfy_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
 
   # Real-model smoke check: gpu-only labels, so the hosted check-pr name
   # filter skips it and gpu-fast excludes it while gpu-full executes it.
