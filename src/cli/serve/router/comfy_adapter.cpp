@@ -37,6 +37,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/cli/serve/websocket.hpp"
 
 namespace gufo::router::comfy {
@@ -859,6 +860,78 @@ void Adapter::Emit(const std::string& client, std::string_view type,
     events_.pop_front();
 }
 
+bool Adapter::WatchedLocked(const std::string& client) const {
+  if (client.empty())
+    return !sockets_.empty();
+  const auto it = sockets_.find(client);
+  return it != sockets_.end() && it->second > 0;
+}
+
+void Adapter::EmitPreview(const std::string& client,
+                          const std::string& prompt_id,
+                          const std::string& node_id, std::string jpeg) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  previews_[client] =
+      Preview{next_preview_++, prompt_id, node_id, std::move(jpeg)};
+}
+
+void Adapter::RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
+                            const std::string& preview_id,
+                            const std::string& model, bool image_progress,
+                            std::stop_token stop) {
+  double seq = 0;
+  while (!stop.stop_requested()) {
+    // Short sleep slices: the end of the task stops the relay at once.
+    const auto until = std::chrono::steady_clock::now() + options_.preview_poll;
+    while (!stop.stop_requested() && std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (stop.stop_requested())
+      break;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!WatchedLocked(job->client_id))
+        continue;  // nobody looks: the worker renders no previews either
+    }
+    HttpRequest poll;
+    poll.method = "GET";
+    poll.path = "/v1/previews/" + preview_id;
+    poll.query = "format=frame-json";
+    if (!model.empty())
+      poll.query += "&model=" + model;
+    poll.request_id = "comfy-preview-" + job->id;
+    FetchResult result;
+    try {
+      result = options_.fetch(poll);
+    } catch (const std::exception&) {
+      continue;
+    }
+    if (result.status != 200)
+      continue;
+    try {
+      const json::Value parsed = json::parse(result.body);
+      const double next = parsed.member_double("seq", 0);
+      if (next <= seq || !parsed.contains("data"))
+        continue;
+      seq = next;
+      auto jpeg = Base64Decode(parsed.member_str("data"));
+      if (!jpeg || jpeg->empty())
+        continue;
+      EmitPreview(job->client_id, job->id, task.node_id, std::move(*jpeg));
+      if (image_progress) {
+        // Images have no other progress source: the preview's step.
+        json::Value data = json::Value::object();
+        data["value"] = static_cast<int>(parsed.member_double("step", 0));
+        data["max"] = static_cast<int>(parsed.member_double("steps", 0));
+        data["prompt_id"] = job->id;
+        data["node"] = task.node_id;
+        Emit(job->client_id, "progress", std::move(data));
+      }
+    } catch (const std::exception&) {
+      // A malformed preview is skipped; the next poll tries again.
+    }
+  }
+}
+
 void Adapter::EmitStatusLocked() {
   json::Value info = json::Value::object();
   info["queue_remaining"] = QueueRemainingLocked();
@@ -883,10 +956,52 @@ HttpResponse Adapter::Socket(const HttpRequest& request) {
   return server::UpgradeWebSocket(
       request, [this, client](server::WebSocket& socket) {
         std::uint64_t last = 0;
+        std::uint64_t last_preview = 0;
         std::string hello;
+        // Clients announce {"type": "feature_flags", "data":
+        // {"supports_preview_metadata": true}} as their first message.
+        std::atomic<bool> metadata{false};
+        std::thread reader([&socket, &metadata] {
+          std::string text;
+          while (socket.Receive(&text)) {
+            try {
+              const json::Value message = json::parse(text);
+              if (message.member_str("type") != "feature_flags")
+                continue;
+              const json::Value* data = message.find("data");
+              const json::Value* flag =
+                  data != nullptr ? data->find("supports_preview_metadata")
+                                  : nullptr;
+              metadata = flag != nullptr && flag->is_bool() && flag->as_bool();
+              json::Value features = json::Value::object();
+              features["supports_preview_metadata"] = true;
+              json::Value reply = json::Value::object();
+              reply["type"] = "feature_flags";
+              reply["data"] = std::move(features);
+              (void)socket.SendText(reply.dump());
+            } catch (const std::exception&) {
+              // Not JSON or not for us; ComfyUI ignores it as well.
+            }
+          }
+        });
+        struct Session {
+          Adapter& adapter;
+          server::WebSocket& socket;
+          std::thread& reader;
+          const std::string& client;
+          ~Session() {
+            socket.Close();
+            reader.join();
+            const std::lock_guard<std::mutex> lock(adapter.mutex_);
+            if (--adapter.sockets_[client] <= 0)
+              adapter.sockets_.erase(client);
+          }
+        } session{*this, socket, reader, client};
         {
           const std::lock_guard<std::mutex> lock(mutex_);
+          ++sockets_[client];
           last = next_event_ - 1;
+          last_preview = next_preview_ - 1;
           json::Value info = json::Value::object();
           info["queue_remaining"] = QueueRemainingLocked();
           json::Value status = json::Value::object();
@@ -904,6 +1019,7 @@ HttpResponse Adapter::Socket(const HttpRequest& request) {
         auto keepalive = std::chrono::steady_clock::now();
         for (;;) {
           std::vector<std::string> out;
+          std::vector<Preview> previews;
           {
             const std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_)
@@ -915,12 +1031,38 @@ HttpResponse Adapter::Socket(const HttpRequest& request) {
               if (event.client.empty() || event.client == client)
                 out.push_back(event.text);
             }
+            std::uint64_t newest = last_preview;
+            for (const std::string& key : {client, std::string()}) {
+              const auto it = previews_.find(key);
+              if (it != previews_.end() && it->second.seq > last_preview) {
+                previews.push_back(it->second);
+                newest = std::max(newest, it->second.seq);
+              }
+            }
+            last_preview = newest;
           }
           if (socket.cancelled())
             break;
           bool ok = true;
           for (const std::string& text : out)
             ok = ok && socket.SendText(text);
+          for (const Preview& preview : previews) {
+            if (!metadata.load()) {
+              ok = ok && socket.SendBinary(PreviewImageFrame(preview.jpeg));
+              continue;
+            }
+            json::Value meta = json::Value::object();
+            meta["node_id"] = preview.node_id;
+            meta["prompt_id"] = preview.prompt_id;
+            meta["display_node_id"] = preview.node_id;
+            meta["parent_node_id"] = nullptr;
+            meta["real_node_id"] = preview.node_id;
+            meta["image_type"] = "image/jpeg";
+            ok = ok && socket.SendBinary(
+                           PreviewMetadataFrame(preview.jpeg, meta.dump()));
+          }
+          if (!previews.empty())
+            keepalive = std::chrono::steady_clock::now();
           if (!ok)
             break;
           if (out.empty() && std::chrono::steady_clock::now() - keepalive >
@@ -1160,7 +1302,21 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   if (spec.strength)
     init_image = ReadFileRef(spec.init_image);
   const json::Value extension = ImageExtension(spec);
-  const auto send = [&](bool with_extension) {
+  // Live preview under this id; the worker renders it only while the relay
+  // below polls it for a connected /ws client.
+  const std::string preview_id = PreviewId(job->id, task.node_id);
+  const auto gufo_fields = [&](bool with_extension, bool with_preview) {
+    json::Value fields =
+        with_extension ? extension : json::Value(json::Value::object());
+    if (with_preview) {
+      json::Value preview = json::Value::object();
+      preview["id"] = preview_id;
+      fields["preview"] = std::move(preview);
+    }
+    return fields;
+  };
+  const auto send = [&](bool with_extension, bool with_preview) {
+    const json::Value fields = gufo_fields(with_extension, with_preview);
     if (references.empty() && init_image.empty()) {
       json::Value body = json::Value::object();
       body["model"] = spec.model;
@@ -1170,8 +1326,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       body["seed"] = spec.seed;
       body["n"] = spec.batch;
       body["response_format"] = "b64_json";
-      if (with_extension && !extension.empty())
-        body["gufo"] = extension;
+      if (!fields.empty())
+        body["gufo"] = fields;
       return Call(job, "POST", "/v1/images/generations", body.dump(),
                   "application/json");
     }
@@ -1183,8 +1339,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
         {"seed", "", "", std::to_string(spec.seed)},
         {"n", "", "", std::to_string(spec.batch)},
         {"response_format", "", "", "b64_json"}};
-    if (with_extension && !extension.empty())
-      parts.push_back({"gufo", "", "application/json", extension.dump()});
+    if (!fields.empty())
+      parts.push_back({"gufo", "", "application/json", fields.dump()});
     if (!init_image.empty()) {
       const std::string type = SniffImageType(init_image);
       // The start image is the single "image" part, or "init_image" next
@@ -1206,7 +1362,17 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
                 BuildMultipart(parts, boundary),
                 "multipart/form-data; boundary=" + boundary);
   };
-  FetchResult result = send(true);
+  std::jthread relay([&](std::stop_token stop) {
+    RelayPreviews(job, task, preview_id, spec.model, true, stop);
+  });
+  FetchResult result = send(true, true);
+  if (result.status == 400 &&
+      ErrorMessage(result).find("preview") != std::string::npos) {
+    // A worker without live previews renders as before.
+    result = send(true, false);
+  }
+  relay.request_stop();
+  relay.join();
   if (result.status == 400 && !extension.empty() && !spec.strength &&
       ErrorMessage(result).find("gufo") != std::string::npos) {
     // An image worker without the gufo fields (negative prompt, guidance):
@@ -1215,7 +1381,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
                             ": the image worker rejected " + extension.dump() +
                             " (" + ErrorMessage(result) +
                             "); rendered without negative prompt / guidance");
-    result = send(false);
+    result = send(false, false);
   }
   Logger::Info("comfy",
                "event=image prompt_id=" + job->id + " size=" + size +
@@ -1418,6 +1584,10 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     throw std::runtime_error("gufo video response has no id");
   Logger::Info("comfy", "event=video_created prompt_id=" + job->id +
                             " video=" + video_id + " model=" + spec.model);
+  // The middle frame of the worker's preview loop, while a /ws client looks.
+  std::jthread relay([&](std::stop_token stop) {
+    RelayPreviews(job, task, video_id, "", false, stop);
+  });
   int last_progress = -1;
   for (;;) {
     if (job->cancel.load()) {

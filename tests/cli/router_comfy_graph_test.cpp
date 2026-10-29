@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/core/json.hpp"
 
 namespace comfy = gufo::router::comfy;
@@ -475,6 +476,34 @@ void TestHelpers() {
 
 }  // namespace
 
+// ComfyUI /ws preview frames: big-endian u32 type, then format or metadata
+// length, then the bytes (server.py BinaryEventTypes 1 and 4).
+void TestPreviewFrames() {
+  const std::string jpeg("\xFF\xD8\xFF\xE0jpeg", 8);
+  const std::string one = comfy::PreviewImageFrame(jpeg);
+  assert(one.size() == 8 + jpeg.size());
+  assert(one.substr(0, 8) == std::string("\0\0\0\x01\0\0\0\x01", 8));
+  assert(one.substr(8) == jpeg);
+  const std::string png = comfy::PreviewImageFrame("x", comfy::kPreviewPng);
+  assert(png.substr(4, 4) == std::string("\0\0\0\x02", 4));
+  const std::string meta = R"({"node_id":"6","prompt_id":"p"})";
+  const std::string four = comfy::PreviewMetadataFrame(jpeg, meta);
+  assert(four.substr(0, 4) == std::string("\0\0\0\x04", 4));
+  const auto length = (static_cast<unsigned char>(four[4]) << 24) |
+                      (static_cast<unsigned char>(four[5]) << 16) |
+                      (static_cast<unsigned char>(four[6]) << 8) |
+                      static_cast<unsigned char>(four[7]);
+  assert(length == meta.size());
+  assert(four.substr(8, meta.size()) == meta);
+  assert(four.substr(8 + meta.size()) == jpeg);
+  // Lengths above 255 use the higher bytes.
+  const std::string long_meta(300, 'm');
+  const std::string big = comfy::PreviewMetadataFrame("", long_meta);
+  assert(big.substr(4, 4) == std::string("\0\0\x01\x2C", 4));
+  assert(comfy::PreviewId("a1b2-c3", "12:4") == "a1b2-c3_12_4");
+  assert(comfy::PreviewId(std::string(200, 'x'), "1").size() == 128);
+}
+
 int main() {
   TestQwenTextToImage();
   TestQwenReferencesAndCanvas();
@@ -489,6 +518,7 @@ int main() {
   TestDialogue();
   TestWavJoin();
   TestHelpers();
+  TestPreviewFrames();
   std::cout << "router_comfy_graph_test: all passed\n";
   return 0;
 }
