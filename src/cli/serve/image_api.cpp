@@ -492,6 +492,10 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " denoise_ms=" << result.metrics.denoise_ms
               << " vae_ms=" << result.metrics.vae_ms
               << " total_ms=" << result.metrics.total_ms
+              << " condition_rows=" << result.metrics.condition_rows
+              << " negative_rows=" << result.metrics.negative_condition_rows
+              << " released_text_encoder="
+              << (result.metrics.released_text_encoder ? 1 : 0)
               << " resident_weight_mib="
               << result.metrics.resident_weight_bytes / (1024 * 1024);
       Logger::Info("image", details.str());
