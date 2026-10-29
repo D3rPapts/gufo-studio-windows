@@ -40,11 +40,13 @@ single requests on this machine.
 | Qwen3.6-35B-A3B (Q4_K_M) | text | 70 / 62 / 53 tok/s at 0 / 8K / 32K context | `win-35b-decode-mmvq` |
 | Hemmingway-1.5 (Qwen3.8-27B fine-tune for fiction) | creative writing | ~25 tok/s | runs on the 27B build |
 | Qwen3-Omni-30B-A3B-Captioner | describes audio (speech, voices, sounds) | 47-59 tok/s | `win-main` |
-| Qwen-Image-2.1 | text to image | 1024² / 40 steps ~150 s | `fix/qwen-image-weights-from-file` |
-| MOSS-Image | text to image | 1024² / 50 steps ~200-260 s | `moss-image` |
-| **MiniMax H3** | text to video with stereo sound | 1 s ~1.5 min, 5 s ~5 min (512²) | `feat/h3-windows-media` |
+| Qwen-Image-2.1 | text to image, **editing with up to 10 reference images** (`/v1/images/edits`) | 512² / 20 steps 10.5 s; one-reference edit 31 s | `perf/forceinline` |
+| MOSS-Image | text to image, **element placement** (JSON layout prompt with boxes) | 512² / 20 steps 18.8 s | `perf/forceinline` |
+| **MiniMax H3** | text or image to video with stereo sound: first/last frame, turbo LoRA (8 steps), picture understanding | 5 s (512², turbo, first frame) in 131 s | `feat/media-next` |
+| **Wan 2.2 TI2V-5B** | text or image to video (no sound), negative prompt, guidance | 480² / 1 s / 20 steps 46 s; 1280×704 / 5 s / 50 steps ~30 min | `feat/media-next` |
 | Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, Base) | speech, designed voices, voice cloning | ~2x realtime | upstream + `feat/h3-windows-media` build |
-| Router with web pages | one port for all of the above; chat, image, voice and video pages | – | `win-router` |
+| **RIFE 4.7** (rife49) | frame interpolation x2-x8 after H3 or Wan jobs (`"gufo":{"interpolate":4}`), audio kept | x4 of 5 s 512² video in 1.9 s; 1280×704 in 4.8 s | `feat/rife` |
+| Router with web pages | one port for all of the above; chat, image (with reference images and a box editor for placement), voice and video pages | – | `win-router` |
 
 What made the bigger models fit on 64 GB:
 - **SSD expert streaming for Flash-Next** (`--expert-cache-bytes`): routed
@@ -54,7 +56,22 @@ What made the bigger models fit on 64 GB:
   27B, H3 prompt encoder): Windows keeps mapped pages resident, so a 30-40 GB
   model filled the 32 GB left to Windows.
 - **H3 on Windows:** MP4/audio muxing through FFmpeg named pipes, and rocBLAS
-  fallbacks where TheRock 10.0 lacks the pinned ROCm 10.1 solutions.
+  fallbacks where TheRock 10.0 lacks the pinned ROCm 10.1 solutions. Since
+  29 October the video decoder runs in FP16 (132 s → 23 s for 5 s of video)
+  and the picture encoder runs in a short-lived child process, so all 50 DiT
+  blocks and picture understanding fit together.
+
+Found on the way: **the Windows build did not inline GPU helper functions.**
+clang-cl turns the RelWithDebInfo flag `/Ob1` into `-finline-hint-functions`
+for the device compile too, so every `__device__` helper without `inline`
+stayed a real call inside the kernels. Building HIP sources with `/Ob2`
+(`perf/forceinline`) makes Qwen-Image 30 % faster and MOSS-Image 8 % faster,
+with bit-identical output; the 27B and Flash-Next kernels were already
+inlined and are unchanged.
+
+In progress: a ComfyUI-compatible API in the router (next to the
+OpenAI-style one), memory-aware loading of several models at once in the
+router, and ACE-Step 1.5 music.
 
 Not working here: Fish Audio Drama-3 TTS (its weights alone take 39.6 GB of
 GPU memory; not yet tried on the 128 GB machine), DeepSeek V4 Flash (too
@@ -73,12 +90,15 @@ Already offered elsewhere:
   [#794](https://github.com/gufo-org/gufo/pull/794),
   [#795](https://github.com/gufo-org/gufo/pull/795),
   [#796](https://github.com/gufo-org/gufo/pull/796) merged;
-  [#810](https://github.com/gufo-org/gufo/pull/810) (model-bench on Windows),
-  [#822](https://github.com/gufo-org/gufo/pull/822) (27B verify GEMMs),
+  [#810](https://github.com/gufo-org/gufo/pull/810) (model-bench on Windows)
+  merged too; [#822](https://github.com/gufo-org/gufo/pull/822) (27B verify GEMMs),
   [#830](https://github.com/gufo-org/gufo/pull/830) (Qwen-Image loading),
   [#856](https://github.com/gufo-org/gufo/pull/856) (H3 on Windows) open.
 - [endyjasmi/gufo#35](https://github.com/endyjasmi/gufo/pull/35): SSD
-  expert streaming and UD-Q3_K_XL for the Windows port.
+  expert streaming and UD-Q3_K_XL for the Windows port (declined: that port
+  matches upstream's numbers, so these stay here).
+- [slimsami/strycast#7](https://github.com/slimsami/strycast/pull/7): MMQ
+  decode for the 35B experts, merged.
 - [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1): faster
   Qwen3.6-35B-A3B decode.
 
