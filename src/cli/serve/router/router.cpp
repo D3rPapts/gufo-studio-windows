@@ -82,6 +82,23 @@ HttpResponse Err(int status, std::string_view reason, std::string_view message,
       .status = status, .reason = std::string(reason), .body = body.dump()};
 }
 
+/// llama.cpp's error body (format_error_response): a numeric `code` equal to
+/// the HTTP status and llama.cpp's `type` names, for the router-mode
+/// /models/load and /models/unload routes clients written for it parse.
+HttpResponse LlamaErr(int status, std::string_view reason,
+                      std::string_view message, std::string_view type) {
+  json::Value detail = json::Value::object();
+  detail["code"] = status;
+  detail["message"] = std::string(message);
+  detail["type"] = std::string(type);
+  json::Value body = json::Value::object();
+  body["error"] = std::move(detail);
+  return HttpResponse{.status = status,
+                      .reason = std::string(reason),
+                      .body = body.dump(),
+                      .headers = {{"Content-Type", "application/json"}}};
+}
+
 /// Static file under --pages-dir: GET /<page>/ serves <dir>/<page>/index.html,
 /// GET /<page>/<file> the file itself, and /<page> redirects to /<page>/.
 /// Same-origin pages need no CORS or private-network preflight from browsers.
@@ -584,6 +601,10 @@ public:
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
     std::unique_lock<std::mutex> lock(mutex);
+    if (req.method == "POST" &&
+        (req.path == "/models/load" || req.path == "/models/unload")) {
+      return ModelsControlLocked(req);
+    }
     if (const auto front = RouteFront(registry, req)) {
       return *front;
     }
@@ -756,6 +777,80 @@ public:
       // the memory is back.
       StopLocked(id);
     }
+  }
+
+  /// llama.cpp router-mode model control (state mutex held):
+  ///   POST /models/unload {"model": id} stops the worker -> {"success": true}
+  ///   POST /models/load   {"model": id} loads it (synchronously, unlike
+  ///                       llama.cpp, which answers before the load ends)
+  /// Errors use llama.cpp's messages and shape: unknown model -> "model is
+  /// not found" (unload 400 invalid_request_error, load 404 not_found_error),
+  /// unload of an unloaded model -> 400 "model is not running", load of a
+  /// loaded/loading one -> 400 "model is already running". gufo addition:
+  /// unloading a model that serves requests, sockets or video jobs is a 409
+  /// "model is busy" instead of cutting the work off.
+  HttpResponse ModelsControlLocked(const HttpRequest& req) {
+    const bool unload = req.path == "/models/unload";
+    std::string model_id;
+    try {
+      const json::Value body = json::parse(req.body);
+      model_id = body.member_str("model");
+    } catch (const std::exception&) {
+      return LlamaErr(400, "Bad Request", "request body must be JSON",
+                      "invalid_request_error");
+    }
+    const router::PresetModel* preset = registry.Find(model_id);
+    if (preset == nullptr) {
+      return unload ? LlamaErr(400, "Bad Request", "model is not found",
+                               "invalid_request_error")
+                    : LlamaErr(404, "Not Found", "model is not found",
+                               "not_found_error");
+    }
+    bool resident = false;
+    bool busy = false;
+    for (const auto& entry : registry.Residents()) {
+      if (entry.id == model_id) {
+        resident = true;
+        busy = entry.busy;
+      }
+    }
+    json::Value ok = json::Value::object();
+    ok["success"] = true;
+    const HttpResponse success{
+        .status = 200,
+        .reason = "OK",
+        .body = ok.dump(),
+        .headers = {{"Content-Type", "application/json"}}};
+    if (unload) {
+      if (!resident) {
+        return LlamaErr(400, "Bad Request", "model is not running",
+                        "invalid_request_error");
+      }
+      if (busy || registry.Busy(model_id)) {
+        return LlamaErr(409, "Conflict", "model is busy",
+                        "invalid_request_error");
+      }
+      Logger::Info("router", "event=models_unload model=" + model_id);
+      if (residency != nullptr) {
+        residency->Event("unloaded " + model_id + " (/models/unload)");
+      }
+      StopLocked(model_id);
+      return success;
+    }
+    if (resident) {
+      return LlamaErr(400, "Bad Request", "model is already running",
+                      "invalid_request_error");
+    }
+    if (stop_requested.load()) {
+      return Err(502, "Bad Gateway", "router is shutting down", "server_error",
+                 "upstream_unavailable");
+    }
+    Logger::Info("router", "event=models_load model=" + model_id);
+    auto admitted = AdmitLocked(model_id, *preset);
+    if (auto* failed = std::get_if<HttpResponse>(&admitted)) {
+      return std::move(*failed);
+    }
+    return success;
   }
 
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
