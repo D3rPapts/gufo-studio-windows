@@ -422,6 +422,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
   src/cli/serve/video_wan22.cpp
+  src/cli/serve/music_api.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -435,6 +436,8 @@ target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts guf
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
   target_link_libraries(gufo_http PUBLIC gufo_wan22)
+  # ACE-Step 1.5 behind `gufo serve music` (src/models/ace_step).
+  target_link_libraries(gufo_http PUBLIC gufo_ace_step)
 endif()
 
 add_executable(gufo
@@ -1404,3 +1407,6 @@ add_subdirectory(src/models/qwen3_omni)
 
 # Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
 add_subdirectory(src/models/wan22)
+
+# ACE-Step 1.5 XL turbo (music): text encoder, DiT, VAE and gufo-ace-check.
+add_subdirectory(src/models/ace_step)
