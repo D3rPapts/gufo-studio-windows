@@ -255,6 +255,15 @@ __global__ void Elementwise(const B* x, const B* other, B* y, std::size_t n,
   // FP32 dt does not promote the BF16 tensor), then adds to the FP32 sample.
   if (op == 6)
     value = a + Round(scalar * float(other[i]));
+  // True CFG in BF16 tensor arithmetic: negative + scale * (positive -
+  // negative), each operation rounded as in the Diffusers pipeline.
+  if (op == 7) {
+    const float negative = float(other[i]);
+    value = negative + Round(scalar * Round(a - negative));
+  }
+  // Image to image start: sigma * noise + (1 - sigma) * image in FP32.
+  if (op == 8)
+    value = scalar * a + (1.0F - scalar) * float(other[i]);
   y[i] = Bf16(value);
 }
 
@@ -1349,6 +1358,28 @@ Matrix Runtime::Euler(const Matrix& x, const Matrix& velocity, float dt) {
   auto out = New(x.rows, x.cols);
   Elementwise<<<Blocks(out.size()), 256, 0, stream_>>>(
       Ptr(x), Ptr(velocity), Ptr(out), out.size(), 6, dt);
+  Check(hipGetLastError());
+  return out;
+}
+
+Matrix Runtime::Guidance(const Matrix& positive, const Matrix& negative,
+                         float scale) {
+  if (positive.rows != negative.rows || positive.cols != negative.cols)
+    throw std::logic_error("Qwen-Image guidance shape mismatch");
+  auto out = New(positive.rows, positive.cols);
+  Elementwise<<<Blocks(out.size()), 256, 0, stream_>>>(
+      Ptr(positive), Ptr(negative), Ptr(out), out.size(), 7, scale);
+  Check(hipGetLastError());
+  return out;
+}
+
+Matrix Runtime::NoiseMix(const Matrix& noise, const Matrix& image,
+                         float sigma) {
+  if (noise.rows != image.rows || noise.cols != image.cols)
+    throw std::logic_error("Qwen-Image start latent shape mismatch");
+  auto out = New(noise.rows, noise.cols);
+  Elementwise<<<Blocks(out.size()), 256, 0, stream_>>>(
+      Ptr(noise), Ptr(image), Ptr(out), out.size(), 8, sigma);
   Check(hipGetLastError());
   return out;
 }

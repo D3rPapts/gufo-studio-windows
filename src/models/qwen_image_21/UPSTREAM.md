@@ -44,6 +44,20 @@ compare matched block inputs as well as the complete trajectory. Do not change
 weights, remove reference images, reduce precision or skip diffusion steps to
 pass a speed gate.
 
+Guidance and image to image (Gufo extensions, `gufo.*` request fields):
+`guidance` above 1 is the pipeline's `true_cfg_scale`: each step also runs the
+negative prompt (same reference images, separate condition caches) and
+combines `negative + guidance * (positive - negative)` with BF16 rounding after
+every tensor operation. Unlike the pipeline, which ignores the scale without a
+negative prompt, an absent negative prompt encodes like an empty prompt, as a
+ComfyUI KSampler with an empty negative conditioning would. `strength` below 1
+follows ComfyUI KSampler `denoise` (the pinned Diffusers revision has no
+Qwen-Image-2.1 image-to-image pipeline): `steps` steps over the last
+`steps + 1` sigmas of an `int(steps / strength)` schedule, starting from
+`sigma * noise + (1 - sigma) * latent` with the posterior-mean VAE latent of the
+start image resized to the output size. Defaults (1 and 1) keep the unguided
+full-schedule path unchanged.
+
 Gufo's RNG differs from PyTorch's. Compare shared initial noise, not numeric
 seeds alone. Edit RNG seeds also bind the ordered, resized RGBA references:
 reusing a generation seed must not replay the noise that generated the source.
