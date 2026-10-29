@@ -1126,6 +1126,10 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   int height = spec.height;
   switch (spec.size_source) {
     case SizeSource::kExplicit:
+      // ComfyUI empty latents are multiples of 16 (or 8); gufo Qwen-Image
+      // sizes are multiples of 32.
+      width = std::max(32, static_cast<int>(std::lround(width / 32.0)) * 32);
+      height = std::max(32, static_cast<int>(std::lround(height / 32.0)) * 32);
       break;
     case SizeSource::kSquare:
       width = height = spec.resolution;
