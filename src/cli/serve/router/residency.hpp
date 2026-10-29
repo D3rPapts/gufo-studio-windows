@@ -65,8 +65,10 @@ public:
       const std::vector<Registry::ResidentEntry>& residents);
 
   void OnSpawn(std::string_view id);
-  /// Worker gone: saves learned peaks, drops the cached usage.
-  void OnUnloaded(std::string_view id);
+  /// Worker gone: saves learned peaks, drops the cached usage. `complete`:
+  /// it had finished loading and was stopped normally (idle unload,
+  /// eviction), so its measured peak now replaces the estimate.
+  void OnUnloaded(std::string_view id, bool complete);
   /// The watchdog killed this load: remember it so the waiting request fails
   /// instead of respawning, and raise the learned peak.
   void OnAborted(std::string_view id);

@@ -71,7 +71,8 @@ std::vector<ResidentView> Residency::ViewsLocked(
     view.loading = entry.loading;
     view.busy = entry.busy;
     view.last_active = entry.last_active;
-    view.need = book_.Need(entry.id, options_.policy.factor, &view.exclusive);
+    view.need = book_.Need(entry.id, options_.policy.factor,
+                           options_.policy.learned_factor, &view.exclusive);
     if (const auto it = current_.find(entry.id); it != current_.end()) {
       view.current = it->second;
     }
@@ -145,7 +146,8 @@ AdmissionPlan Residency::PlanFor(
     return plan;
   }
   bool exclusive = false;
-  const MemoryNeed need = book_.Need(id, options_.policy.factor, &exclusive);
+  const MemoryNeed need = book_.Need(
+      id, options_.policy.factor, options_.policy.learned_factor, &exclusive);
   return PlanAdmission(system_, ViewsLocked(residents), id, need, exclusive,
                        options_.policy);
 }
@@ -161,7 +163,7 @@ void Residency::NoteStopping(std::string_view id) {
   release.gpu_free_before = system_.DedicatedFree() + system_.SharedFree();
   release.host_free_before = system_.host_available;
   release.gpu_expected = it->second.Gpu();
-  release.host_expected = it->second.host_working_set + it->second.gpu_shared;
+  release.host_expected = it->second.host_working_set;
   release.until = Clock::now() + kReleaseWait;
   releases_.push_back(std::move(release));
 }
@@ -225,8 +227,11 @@ void Residency::OnSpawn(std::string_view id) {
   current_.erase(std::string(id));
 }
 
-void Residency::OnUnloaded(std::string_view id) {
+void Residency::OnUnloaded(std::string_view id, bool complete) {
   const std::lock_guard<std::mutex> lock(mutex_);
+  if (complete) {
+    book_.MarkComplete(id);
+  }
   current_.erase(std::string(id));
   spawned_.erase(std::string(id));
   SaveLocked(true);
@@ -288,6 +293,7 @@ json::Value Residency::Status(
       static_cast<long long>(options_.idle_default.count());
   json::Value policy = json::Value::object();
   policy["factor"] = options_.policy.factor;
+  policy["learned_factor"] = options_.policy.learned_factor;
   policy["reserve_gpu_gb"] = Round1(options_.policy.reserve_gpu);
   policy["reserve_host_gb"] = Round1(options_.policy.reserve_host);
   policy["abort_host_gb"] = Round1(options_.policy.abort_host);
@@ -302,7 +308,8 @@ json::Value Residency::Status(
     model["state"] = std::string(state);
     model["busy"] = busy;
     bool exclusive = false;
-    const MemoryNeed need = book_.Need(id, 1.0, &exclusive);
+    const MemoryNeed need = book_.Need(
+        id, options_.policy.factor, options_.policy.learned_factor, &exclusive);
     const MemoryBook::Record record = book_.Get(id);
     model["exclusive"] = exclusive;
     ProcessMemory usage;
@@ -322,8 +329,7 @@ json::Value Residency::Status(
     model["learned_host_peak_gb"] =
         record.has_learned ? json::Value(Round1(record.learned.host))
                            : json::Value();
-    model["need_gb"] = Round1(static_cast<std::int64_t>(
-        static_cast<double>(need.gpu) * options_.policy.factor));
+    model["need_gb"] = Round1(need.gpu);
     if (entry != nullptr) {
       const long long idle = std::chrono::duration_cast<std::chrono::seconds>(
                                  registry_now - entry->last_active)

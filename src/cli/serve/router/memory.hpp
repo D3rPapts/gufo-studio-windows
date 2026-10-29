@@ -68,10 +68,15 @@ std::unique_ptr<MemoryProbe> MakeSystemMemoryProbe();
 struct MemoryNeed {
   std::int64_t gpu{0};
   std::int64_t host{0};
+  /// Part of `gpu` the model itself keeps in shared memory (pinned host
+  /// buffers such as an in-RAM prompt cache); it is already counted in
+  /// `host`, so it is no spill. 0 for estimates (unknown).
+  std::int64_t shared{0};
 };
 
 struct MemoryPolicy {
-  double factor{1.15};                    // safety factor on estimates/peaks
+  double factor{1.15};          // safety factor on hand-written estimates
+  double learned_factor{1.10};  // on measured peaks (sampled every second)
   std::int64_t reserve_gpu{3 * kGiB};     // kept free on the GPU (desktop, dwm)
   std::int64_t reserve_host{4 * kGiB};    // kept free in host RAM
   std::int64_t abort_host{3 * kGiB / 2};  // watchdog: host below this
@@ -102,8 +107,8 @@ struct AdmissionPlan {
 ///  - memory still owed by residents (need minus current usage) is counted
 ///    as taken, so concurrent loads cannot double-book the same free bytes;
 ///  - fits: dedicated+shared free minus reserve_gpu >= need.gpu, and host
-///    free minus reserve_host minus the part that spills into shared >=
-///    need.host;
+///    free minus reserve_host minus the part that spills past free
+///    dedicated into shared (shared is host RAM) >= need.host;
 ///  - otherwise idle, fully loaded residents are evicted least recently used
 ///    first until it fits; busy or loading residents are never evicted (wait);
 ///  - an exclusive candidate evicts every idle resident and waits for the
@@ -141,6 +146,9 @@ public:
     bool has_learned{false};
     MemoryNeed learned;
     std::string learned_at;
+    /// The peak comes from a worker that finished loading and served until a
+    /// normal stop; from then on it replaces the estimate.
+    bool learned_complete{false};
   };
 
   /// Empty path: nothing is read or written.
@@ -157,10 +165,14 @@ public:
   bool Observe(std::string_view id, const ProcessMemory& usage);
   /// Raises the learned peak to at least `need` (watchdog abort).
   void RaiseLearned(std::string_view id, const MemoryNeed& need);
+  /// A worker of `id` ran through load and use and was stopped normally.
+  void MarkComplete(std::string_view id);
 
-  /// max(estimate, learned) x factor. A model with neither is exclusive.
+  /// Learned peak x learned_factor once a complete run was measured;
+  /// before that max(estimate x factor, learned x learned_factor). A model
+  /// with neither is exclusive.
   [[nodiscard]] MemoryNeed Need(std::string_view id, double factor,
-                                bool* exclusive) const;
+                                double learned_factor, bool* exclusive) const;
   [[nodiscard]] Record Get(std::string_view id) const;
   [[nodiscard]] const std::filesystem::path& file() const { return file_; }
 

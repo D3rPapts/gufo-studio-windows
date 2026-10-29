@@ -41,21 +41,25 @@ Room Project(const SystemMemory& system,
     }
     room.dedicated += view->current.gpu_dedicated;
     room.shared += view->current.gpu_shared;
-    room.host += view->current.gpu_shared + view->current.host_working_set;
+    // A worker's own shared buffers (pinned host memory) are part of its
+    // working set: measured on the 27B, host free dropped by the working set
+    // alone. Count them once.
+    room.host += view->current.host_working_set;
   }
   for (const ResidentView* view : kept) {
-    const std::int64_t gpu_now = view->current.valid ? view->current.Gpu() : 0;
-    const std::int64_t host_now =
-        view->current.valid ? view->current.host_working_set : 0;
-    const std::int64_t owed_gpu =
-        std::max<std::int64_t>(0, view->need.gpu - gpu_now);
-    const std::int64_t owed_host =
-        std::max<std::int64_t>(0, view->need.host - host_now);
+    const bool measured = view->current.valid;
+    const std::int64_t need_dedicated = view->need.gpu - view->need.shared;
+    const std::int64_t owed_dedicated = std::max<std::int64_t>(
+        0, need_dedicated - (measured ? view->current.gpu_dedicated : 0));
+    const std::int64_t owed_shared = std::max<std::int64_t>(
+        0, view->need.shared - (measured ? view->current.gpu_shared : 0));
+    const std::int64_t owed_host = std::max<std::int64_t>(
+        0, view->need.host - (measured ? view->current.host_working_set : 0));
     const std::int64_t from_dedicated =
-        std::min(owed_gpu, std::max<std::int64_t>(0, room.dedicated));
-    const std::int64_t spill = owed_gpu - from_dedicated;
+        std::min(owed_dedicated, std::max<std::int64_t>(0, room.dedicated));
+    const std::int64_t spill = owed_dedicated - from_dedicated;
     room.dedicated -= from_dedicated;
-    room.shared -= spill;
+    room.shared -= spill + owed_shared;
     room.host -= spill + owed_host;
   }
   return room;
@@ -63,17 +67,17 @@ Room Project(const SystemMemory& system,
 
 bool Fits(const Room& room, const MemoryNeed& need,
           const MemoryPolicy& policy) {
-  const std::int64_t usable_dedicated = room.dedicated - policy.reserve_gpu;
-  // A reserve the dedicated segment cannot hold comes out of shared.
-  const std::int64_t usable_shared =
-      room.shared + std::min<std::int64_t>(0, usable_dedicated);
-  const std::int64_t dedicated_part =
-      std::max<std::int64_t>(0, usable_dedicated);
-  if (dedicated_part + std::max<std::int64_t>(0, usable_shared) < need.gpu) {
+  // The GPU reserve guards dedicated + shared together: a full dedicated
+  // segment is no failure (the driver places the rest in shared), but every
+  // byte that spills into shared comes out of host RAM.
+  const std::int64_t dedicated_part = std::max<std::int64_t>(0, room.dedicated);
+  if (dedicated_part + room.shared - policy.reserve_gpu < need.gpu) {
     return false;
   }
+  // Only what the model wants in dedicated but does not find there spills;
+  // its own shared buffers are already in need.host.
   const std::int64_t spill =
-      std::max<std::int64_t>(0, need.gpu - dedicated_part);
+      std::max<std::int64_t>(0, need.gpu - need.shared - dedicated_part);
   return room.host - policy.reserve_host - spill >= need.host;
 }
 
@@ -165,15 +169,8 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
                     (blockers.front()->loading ? " (loading)" : " (busy)");
       return plan;
     }
-    if (!evict.empty()) {
-      plan.action = AdmissionPlan::Action::kEvict;
-      for (const ResidentView* view : evict) {
-        plan.evict.push_back(view->id);
-      }
-      plan.reason = "exclusive";
-      return plan;
-    }
-    const Room room = Project(system, {}, {});
+    // Free memory once every other worker is gone.
+    const Room room = Project(system, {}, evict);
     const bool fits = Fits(room, need, policy);
     if (!fits && !NeverFits(system, need, policy)) {
       plan.action = AdmissionPlan::Action::kWait;
@@ -181,6 +178,14 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
           "exclusive, not enough free memory yet (held outside "
           "the router or still being released); " +
           RoomText(room);
+      return plan;
+    }
+    if (!evict.empty()) {
+      plan.action = AdmissionPlan::Action::kEvict;
+      for (const ResidentView* view : evict) {
+        plan.evict.push_back(view->id);
+      }
+      plan.reason = "exclusive; after eviction " + RoomText(room);
       return plan;
     }
     plan.action = AdmissionPlan::Action::kSpawn;
@@ -232,6 +237,19 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
                   " GB gpu, " + RoomText(room);
     return plan;
   }
+  if (!fits && !NeverFits(system, need, policy)) {
+    // Even with every worker of ours gone it would not fit: the memory is
+    // held by other processes or a stopped worker has not returned it yet.
+    // Evict nothing (that would only cost the residents) and wait; the
+    // request's load timeout bounds this.
+    plan.action = AdmissionPlan::Action::kWait;
+    plan.reason =
+        "not enough free memory yet (held outside the router or "
+        "still being released); need " +
+        Gb(need.gpu) + " GB gpu + " + Gb(need.host) + " GB host; " +
+        RoomText(room);
+    return plan;
+  }
   if (!evict.empty()) {
     plan.action = AdmissionPlan::Action::kEvict;
     for (const ResidentView* view : evict) {
@@ -239,18 +257,6 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     }
     plan.reason = "need " + Gb(need.gpu) + " GB gpu + " + Gb(need.host) +
                   " GB host; after eviction " + RoomText(room);
-    return plan;
-  }
-  if (!fits && !NeverFits(system, need, policy)) {
-    // Nothing of ours is left to evict: the memory is held by other
-    // processes or a stopped worker has not returned it yet. Wait (the
-    // request's load timeout bounds this) instead of over-committing.
-    plan.action = AdmissionPlan::Action::kWait;
-    plan.reason =
-        "not enough free memory yet (held outside the router or "
-        "still being released); need " +
-        Gb(need.gpu) + " GB gpu + " + Gb(need.host) + " GB host; " +
-        RoomText(room);
     return plan;
   }
   plan.action = AdmissionPlan::Action::kSpawn;
@@ -338,7 +344,12 @@ bool MemoryBook::Load(std::string* error) {
       record.has_learned = true;
       record.learned.gpu = FromGb(gpu->as_double());
       record.learned.host = FromGb(entry.member_double("learned_host_gb"));
+      record.learned.shared = FromGb(entry.member_double("learned_shared_gb"));
       record.learned_at = entry.member_str("learned_at");
+      if (const auto* complete = entry.find("learned_complete");
+          complete != nullptr && complete->is_bool()) {
+        record.learned_complete = complete->as_bool();
+      }
     }
   }
   return true;
@@ -368,7 +379,9 @@ bool MemoryBook::Save(std::string* error) {
       if (record.has_learned) {
         entry["learned_gpu_gb"] = round(record.learned.gpu);
         entry["learned_host_gb"] = round(record.learned.host);
+        entry["learned_shared_gb"] = round(record.learned.shared);
         entry["learned_at"] = record.learned_at;
+        entry["learned_complete"] = record.learned_complete;
       }
       models[id] = std::move(entry);
     }
@@ -418,7 +431,7 @@ bool MemoryBook::Observe(std::string_view id, const ProcessMemory& usage) {
   const std::int64_t gpu = usage.Gpu();
   if (!record.has_learned) {
     record.has_learned = true;
-    record.learned = {gpu, host};
+    record.learned = {gpu, host, usage.gpu_shared};
     record.learned_at = NowText();
     dirty_ = true;
     return true;
@@ -428,6 +441,7 @@ bool MemoryBook::Observe(std::string_view id, const ProcessMemory& usage) {
     grew = grew || gpu - record.learned.gpu > kLearnStep;
     record.learned.gpu = gpu;
   }
+  record.learned.shared = std::max(record.learned.shared, usage.gpu_shared);
   if (host > record.learned.host) {
     grew = grew || host - record.learned.host > kLearnStep;
     record.learned.host = host;
@@ -449,8 +463,19 @@ void MemoryBook::RaiseLearned(std::string_view id, const MemoryNeed& need) {
   dirty_ = true;
 }
 
+void MemoryBook::MarkComplete(std::string_view id) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = records_.find(id);
+  if (it == records_.end() || !it->second.has_learned ||
+      it->second.learned_complete) {
+    return;
+  }
+  it->second.learned_complete = true;
+  dirty_ = true;
+}
+
 MemoryNeed MemoryBook::Need(std::string_view id, double factor,
-                            bool* exclusive) const {
+                            double learned_factor, bool* exclusive) const {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = records_.find(id);
   if (it == records_.end() ||
@@ -460,14 +485,20 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
   }
   const Record& record = it->second;
   *exclusive = record.exclusive;
+  const auto scale = [](std::int64_t bytes, double by) {
+    return static_cast<std::int64_t>(static_cast<double>(bytes) * by);
+  };
   MemoryNeed need;
-  need.gpu = std::max(record.has_estimate ? record.estimate.gpu : 0,
-                      record.has_learned ? record.learned.gpu : 0);
-  need.host = std::max(record.has_estimate ? record.estimate.host : 0,
-                       record.has_learned ? record.learned.host : 0);
-  need.gpu = static_cast<std::int64_t>(static_cast<double>(need.gpu) * factor);
-  need.host =
-      static_cast<std::int64_t>(static_cast<double>(need.host) * factor);
+  if (record.has_estimate && !(record.has_learned && record.learned_complete)) {
+    need.gpu = scale(record.estimate.gpu, factor);
+    need.host = scale(record.estimate.host, factor);
+  }
+  if (record.has_learned) {
+    need.shared = std::min(scale(record.learned.shared, learned_factor),
+                           scale(record.learned.gpu, learned_factor));
+    need.gpu = std::max(need.gpu, scale(record.learned.gpu, learned_factor));
+    need.host = std::max(need.host, scale(record.learned.host, learned_factor));
+  }
   return need;
 }
 

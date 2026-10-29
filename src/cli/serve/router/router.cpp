@@ -787,8 +787,8 @@ private:
     return pids;
   }
 
-  /// Samples memory every second (twice a second while a worker loads) and,
-  /// with the guard on, runs the watchdog: memory critical during a load
+  /// Samples memory every second (every tick, 250 ms, while a worker loads)
+  /// and, with the guard on, runs the watchdog: memory critical during a load
   /// kills the newest load; otherwise the least recently used idle worker
   /// goes. Busy workers are never touched.
   void SuperviseMemoryLocked(std::unique_lock<std::mutex>& lock) {
@@ -799,7 +799,7 @@ private:
     const bool loading =
         std::any_of(residents.begin(), residents.end(),
                     [](const auto& entry) { return entry.loading; });
-    if (++sample_ticks_ < (loading ? 2 : 4)) {
+    if (++sample_ticks_ < (loading ? 1 : 4)) {
       return;
     }
     sample_ticks_ = 0;
@@ -843,8 +843,10 @@ private:
     const router::AdmissionPlan plan =
         residency->PlanFor(model_id, residents, PidsLocked());
     if (plan.action == router::AdmissionPlan::Action::kWait) {
-      if (plan.reason != *last_wait) {
-        *last_wait = plan.reason;
+      // One event per kind of wait, not one per changed number.
+      const std::string kind = plan.reason.substr(0, plan.reason.find(';'));
+      if (kind != *last_wait) {
+        *last_wait = kind;
         residency->Event("waiting to load " + model_id + ": " + plan.reason);
       }
       return Gate::kWait;
@@ -952,6 +954,10 @@ private:
   /// shared_ptr keeps the worker object alive until it is reaped.
   void StopLocked(const std::string& id) {
     auto worker = FindWorkerLocked(id);
+    bool was_ready = false;
+    for (const auto& entry : registry.Residents()) {
+      was_ready = was_ready || (entry.id == id && !entry.loading);
+    }
     registry.MarkUnloaded(id);
     workers.erase(id);
     if (worker == nullptr) {
@@ -972,7 +978,7 @@ private:
     mutex.lock();
     stopping.erase(id);
     if (residency != nullptr) {
-      residency->OnUnloaded(id);
+      residency->OnUnloaded(id, was_ready);
     }
   }
 
@@ -1254,6 +1260,7 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path memory_file;
   router::MemoryPolicy memory_policy;
   double memory_factor = memory_policy.factor;
+  double memory_learned_factor = memory_policy.learned_factor;
   double reserve_gpu_gb = router::ToGb(memory_policy.reserve_gpu);
   double reserve_host_gb = router::ToGb(memory_policy.reserve_host);
   double abort_host_gb = router::ToGb(memory_policy.abort_host);
@@ -1311,6 +1318,10 @@ int RunRouter(std::span<const char* const> args) {
                    "Safety factor on estimates and learned peaks (default: "
                    "1.15)",
                    "Memory", &memory_factor);
+  parser.AddOption("", "--memory-learned-factor", "X",
+                   "Safety factor on measured (learned) peaks (default: "
+                   "1.05)",
+                   "Memory", &memory_learned_factor);
   parser.AddOption("", "--memory-reserve-gpu-gb", "GB",
                    "GPU memory always kept free (default: 3)", "Memory",
                    &reserve_gpu_gb);
@@ -1393,6 +1404,7 @@ int RunRouter(std::span<const char* const> args) {
     router::ResidencyOptions residency_options;
     residency_options.enabled = memory_guard;
     residency_options.policy.factor = memory_factor;
+    residency_options.policy.learned_factor = memory_learned_factor;
     residency_options.policy.reserve_gpu = router::FromGb(reserve_gpu_gb);
     residency_options.policy.reserve_host = router::FromGb(reserve_host_gb);
     residency_options.policy.abort_host = router::FromGb(abort_host_gb);

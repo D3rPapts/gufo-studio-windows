@@ -217,13 +217,29 @@ void TestHostLimit() {
 void TestSpillCountsAgainstHost() {
   // Dedicated is nearly full; the 10 GB that spill into shared also come out
   // of host RAM, which then is too small.
-  const auto plan = PlanAdmission(Machine(29, 0, 12), {}, "big", Need(10, 1),
+  const auto plan = PlanAdmission(Machine(29, 0, 11), {}, "big", Need(10, 1),
                                   false, MemoryPolicy{});
   CHECK(plan.action == Action::kWait);
   const auto fits = PlanAdmission(Machine(29, 0, 20), {}, "big", Need(10, 1),
                                   false, MemoryPolicy{});
   CHECK(fits.action == Action::kSpawn);
   CHECK(!fits.alone);
+}
+
+void TestOwnSharedIsNoSpill() {
+  // Measured 27B: 31.6 GB dedicated + 3.5 GB shared (pinned prompt cache,
+  // part of its 6.5 GB working set). Only the dedicated part that does not
+  // find room spills into host RAM.
+  MemoryNeed need = Need(38.6, 7.1);
+  need.shared = Gb(3.85);
+  auto plan = PlanAdmission(Machine(1, 0.5, 18), {}, "27b", need, false,
+                            MemoryPolicy{});
+  CHECK(plan.action == Action::kSpawn && !plan.alone);
+  // Without the split the whole excess would count as spill and not fit.
+  need.shared = 0;
+  plan = PlanAdmission(Machine(1, 0.5, 18), {}, "27b", need, false,
+                       MemoryPolicy{});
+  CHECK(plan.action == Action::kWait);
 }
 
 void TestWatchdog() {
@@ -247,6 +263,28 @@ void TestWatchdog() {
   CHECK(action.reason.empty() && action.abort_load.empty());
 }
 
+void TestFactors() {
+  // Estimates get the large factor, measured peaks the small one.
+  MemoryBook book({});
+  book.SetEstimate("a", {Gb(20), Gb(2)});
+  ProcessMemory usage;
+  usage.valid = true;
+  usage.gpu_dedicated = Gb(30);
+  usage.host_working_set = Gb(1);
+  book.Observe("a", usage);
+  bool exclusive = false;
+  const MemoryNeed need = book.Need("a", 1.15, 1.05, &exclusive);
+  CHECK(need.gpu ==
+        static_cast<std::int64_t>(static_cast<double>(Gb(30)) * 1.05));
+  CHECK(need.host ==
+        static_cast<std::int64_t>(static_cast<double>(Gb(2)) * 1.15));
+  // After a complete run the measured peak replaces the estimate.
+  book.MarkComplete("a");
+  const MemoryNeed learned = book.Need("a", 1.15, 1.05, &exclusive);
+  CHECK(learned.host ==
+        static_cast<std::int64_t>(static_cast<double>(Gb(1)) * 1.05));
+}
+
 void TestMemoryBook() {
   const auto file =
       std::filesystem::temp_directory_path() /
@@ -256,10 +294,10 @@ void TestMemoryBook() {
     std::string error;
     CHECK(book.Load(&error));
     bool exclusive = false;
-    book.Need("unknown", 1.15, &exclusive);
+    book.Need("unknown", 1.15, 1.05, &exclusive);
     CHECK(exclusive);
     book.SetEstimate("a", {Gb(10), Gb(2)});
-    MemoryNeed need = book.Need("a", 1.0, &exclusive);
+    MemoryNeed need = book.Need("a", 1.0, 1.0, &exclusive);
     CHECK(!exclusive && need.gpu == Gb(10));
     ProcessMemory usage;
     usage.valid = true;
@@ -268,7 +306,7 @@ void TestMemoryBook() {
     usage.host_working_set = Gb(1);
     usage.host_peak_working_set = Gb(3);
     CHECK(book.Observe("a", usage));
-    need = book.Need("a", 1.0, &exclusive);
+    need = book.Need("a", 1.0, 1.0, &exclusive);
     CHECK(need.gpu == Gb(13) && need.host == Gb(3));
     usage.gpu_dedicated = Gb(12.1);
     CHECK(!book.Observe("a", usage));  // below the 256 MiB step
@@ -281,9 +319,9 @@ void TestMemoryBook() {
     std::string error;
     CHECK(book.Load(&error));
     bool exclusive = false;
-    const MemoryNeed need = book.Need("a", 1.0, &exclusive);
+    const MemoryNeed need = book.Need("a", 1.0, 1.0, &exclusive);
     CHECK(need.gpu > Gb(13.05) && need.gpu < Gb(13.15));
-    book.Need("h3", 1.0, &exclusive);
+    book.Need("h3", 1.0, 1.0, &exclusive);
     CHECK(exclusive);
   }
   std::error_code ignored;
@@ -356,7 +394,9 @@ int main() {
   TestWaitWhenMemoryHeldOutside();
   TestHostLimit();
   TestSpillCountsAgainstHost();
+  TestOwnSharedIsNoSpill();
   TestWatchdog();
+  TestFactors();
   TestMemoryBook();
   TestPresetHintsAndIdleOverride();
   if (failures != 0) {
