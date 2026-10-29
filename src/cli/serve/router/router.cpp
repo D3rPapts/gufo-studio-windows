@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -28,6 +29,7 @@
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
+#include "src/cli/serve/router/residency.hpp"
 #include "src/cli/serve/router/workers.hpp"
 #include "src/cli/serve/router/ws_relay.hpp"
 #include "src/cli/serve/serve.hpp"
@@ -500,6 +502,11 @@ public:
   std::filesystem::path exe_path;
   std::filesystem::path pages_dir;
   std::atomic<bool> stop_requested{false};
+  /// Memory probes, learned peaks and (with --memory-guard) admission by
+  /// live free memory instead of a model count.
+  std::unique_ptr<router::Residency> residency;
+  /// Workers being stopped right now (status "unloading").
+  std::set<std::string> stopping;
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -543,6 +550,9 @@ public:
   HttpResponse Dispatch(const HttpRequest& req) {
     // Every registry touch, including RouteFront's Listing, is serialized on
     // the same mutex the supervision tick holds.
+    if (req.method == "GET" && (req.path == "/router/status" ||
+                                req.path.starts_with("/router/status?")))
+      return RouterStatus();
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
     std::unique_lock<std::mutex> lock(mutex);
@@ -714,24 +724,174 @@ public:
       }
     }
     for (const auto& id : registry.DueIdleUnloads()) {
+      // An earlier stop in this loop released the lock: a request may have
+      // made this model busy meanwhile.
+      if (registry.Busy(id)) {
+        continue;
+      }
       Logger::Info("router", "event=idle_unload model=" + id);
+      if (residency != nullptr) {
+        residency->Event("idle unload " + id);
+      }
       StopLocked(id);
     }
     if (registry.HasQueued()) {
       const std::string candidate = registry.EvictionCandidate();
       if (!candidate.empty()) {
         Logger::Info("router", "event=evict model=" + candidate);
+        if (residency != nullptr) {
+          residency->Event("evicted " + candidate + " (--models-max)");
+        }
         StopLocked(candidate);
       }
     }
+    SuperviseMemoryLocked(lock);
     for (const auto& id : registry.DueLoadTimeouts()) {
       Logger::Warn("router", "event=load_timeout_expired model=" + id);
       StopLocked(id);
     }
   }
 
+  /// GET /router/status: live memory, resident workers with their usage and
+  /// idle timers, and the last residency decisions.
+  HttpResponse RouterStatus() {
+    std::vector<router::Registry::ResidentEntry> residents;
+    std::set<std::string> unloading;
+    router::Registry::Clock::time_point now;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      residents = registry.Residents();
+      unloading = stopping;
+      now = registry.NowForStatus();
+    }
+    json::Value body = residency != nullptr
+                           ? residency->Status(residents, unloading, now)
+                           : json::Value::object();
+    body["models_max"] = static_cast<long long>(options.max_active);
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = body.dump(),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-cache"}}};
+  }
+
 private:
   using AdmissionResult = std::variant<int, HttpResponse>;
+
+  /// Worker pids for the memory probes (state mutex held).
+  router::Residency::WorkerPids PidsLocked() {
+    router::Residency::WorkerPids pids;
+    for (const auto& [id, worker] : workers) {
+      pids.emplace_back(id, worker->pid());
+    }
+    return pids;
+  }
+
+  /// Samples memory every second (twice a second while a worker loads) and,
+  /// with the guard on, runs the watchdog: memory critical during a load
+  /// kills the newest load; otherwise the least recently used idle worker
+  /// goes. Busy workers are never touched.
+  void SuperviseMemoryLocked(std::unique_lock<std::mutex>& lock) {
+    if (residency == nullptr) {
+      return;
+    }
+    const auto residents = registry.Residents();
+    const bool loading =
+        std::any_of(residents.begin(), residents.end(),
+                    [](const auto& entry) { return entry.loading; });
+    if (++sample_ticks_ < (loading ? 2 : 4)) {
+      return;
+    }
+    sample_ticks_ = 0;
+    const auto pids = PidsLocked();
+    lock.unlock();
+    residency->Sample(pids);
+    lock.lock();
+    if (!residency->enabled()) {
+      return;
+    }
+    const router::WatchdogAction action =
+        residency->Watchdog(registry.Residents());
+    if (!action.abort_load.empty()) {
+      Logger::Warn("router", "event=memory_abort model=" + action.abort_load +
+                                 " reason=\"" + action.reason + "\"");
+      residency->OnAborted(action.abort_load);
+      residency->Event("aborted load of " + action.abort_load + ": " +
+                       action.reason);
+      StopLocked(action.abort_load);
+    } else if (!action.evict.empty()) {
+      Logger::Warn("router", "event=memory_evict model=" + action.evict +
+                                 " reason=\"" + action.reason + "\"");
+      residency->Event("evicted " + action.evict + ": " + action.reason);
+      StopLocked(action.evict);
+    } else if (!action.reason.empty() &&
+               std::chrono::steady_clock::now() - last_critical_log_ >
+                   std::chrono::seconds(10)) {
+      last_critical_log_ = std::chrono::steady_clock::now();
+      Logger::Warn("router", "event=memory_critical reason=\"" + action.reason +
+                                 "\" action=none");
+      residency->Event(action.reason + " (nothing idle to stop)");
+    }
+  }
+
+  enum class Gate { kSpawn, kWait, kEvicted };
+
+  /// Memory admission for a cold start of `model_id` (state mutex held; it
+  /// is released while evicted workers stop and their memory returns).
+  Gate MemoryGateLocked(const std::string& model_id, std::string* last_wait) {
+    const auto residents = registry.Residents();
+    const router::AdmissionPlan plan =
+        residency->PlanFor(model_id, residents, PidsLocked());
+    if (plan.action == router::AdmissionPlan::Action::kWait) {
+      if (plan.reason != *last_wait) {
+        *last_wait = plan.reason;
+        residency->Event("waiting to load " + model_id + ": " + plan.reason);
+      }
+      return Gate::kWait;
+    }
+    if (plan.action == router::AdmissionPlan::Action::kSpawn) {
+      std::string beside;
+      for (const auto& entry : residents) {
+        if (entry.id != model_id) {
+          beside += (beside.empty() ? " beside " : ", ") + entry.id;
+        }
+      }
+      residency->Event("loading " + model_id + beside + " (" + plan.reason +
+                       ")");
+      return Gate::kSpawn;
+    }
+    const auto ticket = residency->BeginRelease(plan.evict);
+    for (const auto& victim : plan.evict) {
+      // The plan was made under the lock, but each stop releases it: a
+      // victim that became busy or reloads meanwhile stays; the next plan
+      // decides again.
+      bool idle_ready = false;
+      for (const auto& entry : registry.Residents()) {
+        idle_ready =
+            idle_ready || (entry.id == victim && !entry.busy && !entry.loading);
+      }
+      if (!idle_ready) {
+        continue;
+      }
+      Logger::Info("router",
+                   "event=memory_evict model=" + victim + " for=" + model_id);
+      residency->Event("evicted " + victim + " to fit " + model_id + " (" +
+                       plan.reason + ")");
+      StopLocked(victim);
+    }
+    mutex.unlock();
+    try {
+      residency->AwaitRelease(ticket, std::chrono::seconds(5));
+    } catch (...) {
+      mutex.lock();
+      throw;
+    }
+    mutex.lock();
+    return Gate::kEvicted;
+  }
+
+  int sample_ticks_{0};
+  std::chrono::steady_clock::time_point last_critical_log_{};
 
   struct SpawnJob {
     router::WorkerSpec spec;
@@ -806,14 +966,20 @@ private:
     if (worker == nullptr) {
       return;
     }
+    stopping.insert(id);
     mutex.unlock();
     try {
       worker->Stop();
     } catch (...) {
       mutex.lock();
+      stopping.erase(id);
       throw;
     }
     mutex.lock();
+    stopping.erase(id);
+    if (residency != nullptr) {
+      residency->OnUnloaded(id);
+    }
   }
 
   /// A 502 relayed before any upstream response byte means the worker failed
@@ -896,6 +1062,9 @@ private:
                                " port=" + std::to_string(worker_port) +
                                " attempt=" + std::to_string(attempt));
     workers[model_id] = std::move(worker);
+    if (residency != nullptr) {
+      residency->OnSpawn(model_id);
+    }
     return std::nullopt;
   }
 
@@ -911,6 +1080,7 @@ private:
     // deadline state mid-flight. MarkUnloaded disarms the registry clock, so
     // the front tracks the outer bound itself.
     const auto began = std::chrono::steady_clock::now();
+    std::string last_wait;
     for (;;) {
       if (options.load_timeout > std::chrono::seconds(0) &&
           std::chrono::steady_clock::now() - began >= options.load_timeout) {
@@ -922,6 +1092,30 @@ private:
         const router::LoadDecision decision = registry.RequestLoad(model_id);
         if (decision == router::LoadDecision::kLoadTimeout) {
           return LoadTimeoutLocked(model_id);
+        }
+        if (decision == router::LoadDecision::kSpawn && residency != nullptr &&
+            residency->enabled()) {
+          if (residency->AbortedSince(model_id, began)) {
+            registry.MarkUnloaded(model_id);
+            return Err(
+                507, "Insufficient Storage",
+                "loading '" + model_id + "' was stopped because memory ran low",
+                "server_error", "insufficient_memory");
+          }
+          if (stop_requested.load()) {
+            return Err(502, "Bad Gateway", "router is shutting down",
+                       "server_error", "upstream_unavailable");
+          }
+          const Gate gate = MemoryGateLocked(model_id, &last_wait);
+          if (gate == Gate::kWait) {
+            mutex.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            mutex.lock();
+            continue;
+          }
+          if (gate == Gate::kEvicted) {
+            continue;
+          }
         }
         if (decision == router::LoadDecision::kSpawn) {
           ++attempt;
@@ -1061,6 +1255,15 @@ int RunRouter(std::span<const char* const> args) {
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
   bool autoload = false;
+  bool memory_guard = false;
+  bool memory_report = false;
+  std::filesystem::path memory_file;
+  router::MemoryPolicy memory_policy;
+  double memory_factor = memory_policy.factor;
+  double reserve_gpu_gb = router::ToGb(memory_policy.reserve_gpu);
+  double reserve_host_gb = router::ToGb(memory_policy.reserve_host);
+  double abort_host_gb = router::ToGb(memory_policy.abort_host);
+  double abort_gpu_gb = router::ToGb(memory_policy.abort_gpu);
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
@@ -1092,8 +1295,42 @@ int RunRouter(std::span<const char* const> args) {
                    "0 = unlimited)",
                    "Router", &load_timeout_seconds);
   parser.AddFlag("", "--autoload",
-                 "Preload preset models at startup in section order", "Router",
-                 &autoload);
+                 "Preload preset models at startup in section order "
+                 "(with --memory-guard only the first one)",
+                 "Router", &autoload);
+  parser.AddFlag("", "--memory-guard",
+                 "Admit cold loads by live free GPU/host memory: keep loaded "
+                 "models beside a new one while it fits, evict idle ones "
+                 "least recently used first, wait for busy ones, and stop a "
+                 "load when memory runs critically low. Combine with "
+                 "--models-max 0. Preset keys router-gpu-gb, router-host-gb, "
+                 "router-exclusive and router-idle-seconds tune single models",
+                 "Memory", &memory_guard);
+  parser.AddFlag("", "--memory-report",
+                 "Print one memory probe sample as JSON and exit", "Memory",
+                 &memory_report);
+  parser.AddOption("", "--memory-file", "FILE",
+                   "Learned per-model memory peaks (JSON; default: the preset "
+                   "path with .memory.json)",
+                   "Memory", &memory_file);
+  parser.AddOption("", "--memory-factor", "X",
+                   "Safety factor on estimates and learned peaks (default: "
+                   "1.15)",
+                   "Memory", &memory_factor);
+  parser.AddOption("", "--memory-reserve-gpu-gb", "GB",
+                   "GPU memory always kept free (default: 3)", "Memory",
+                   &reserve_gpu_gb);
+  parser.AddOption("", "--memory-reserve-host-gb", "GB",
+                   "Host RAM always kept free (default: 4)", "Memory",
+                   &reserve_host_gb);
+  parser.AddOption("", "--memory-abort-host-gb", "GB",
+                   "Watchdog: stop the newest load below this free host RAM "
+                   "(default: 1.5)",
+                   "Memory", &abort_host_gb);
+  parser.AddOption("", "--memory-abort-gpu-gb", "GB",
+                   "Watchdog: stop the newest load below this free GPU memory "
+                   "(dedicated + shared; default: 0.5)",
+                   "Memory", &abort_gpu_gb);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
                    &max_request_body_bytes, &api_key, &log_options);
 
@@ -1124,6 +1361,21 @@ int RunRouter(std::span<const char* const> args) {
     Logger::SetLevel(*log_options.level);
   }
 
+  if (memory_report) {
+    // One probe sample as JSON, for checking the counters on a machine.
+    const auto probe = router::MakeSystemMemoryProbe();
+    const router::SystemMemory memory = probe->System();
+    json::Value report = json::Value::object();
+    report["gpu_valid"] = memory.gpu_valid;
+    report["gpu_dedicated_total_gb"] = router::ToGb(memory.gpu_dedicated_total);
+    report["gpu_dedicated_used_gb"] = router::ToGb(memory.gpu_dedicated_used);
+    report["gpu_shared_total_gb"] = router::ToGb(memory.gpu_shared_total);
+    report["gpu_shared_used_gb"] = router::ToGb(memory.gpu_shared_used);
+    report["host_total_gb"] = router::ToGb(memory.host_total);
+    report["host_available_gb"] = router::ToGb(memory.host_available);
+    std::cout << report.dump() << "\n";
+    return 0;
+  }
   if (preset_path.empty()) {
     std::cerr << "Error: --models-preset <FILE> is required\n";
     return 2;
@@ -1142,13 +1394,43 @@ int RunRouter(std::span<const char* const> args) {
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
   state->pages_dir = pages_dir;
+  {
+    router::ResidencyOptions residency_options;
+    residency_options.enabled = memory_guard;
+    residency_options.policy.factor = memory_factor;
+    residency_options.policy.reserve_gpu = router::FromGb(reserve_gpu_gb);
+    residency_options.policy.reserve_host = router::FromGb(reserve_host_gb);
+    residency_options.policy.abort_host = router::FromGb(abort_host_gb);
+    residency_options.policy.abort_gpu = router::FromGb(abort_gpu_gb);
+    residency_options.idle_default = registry_options.idle_timeout;
+    if (memory_file.empty()) {
+      memory_file = preset_path;
+      memory_file.replace_extension(".memory.json");
+    }
+    residency_options.memory_file = memory_file;
+    state->residency = std::make_unique<router::Residency>(
+        residency_options, router::MakeSystemMemoryProbe(), models);
+    std::string memory_error;
+    if (!state->residency->Init(&memory_error)) {
+      std::cerr << "Error: " << memory_error << "\n";
+      return 2;
+    }
+    if (memory_guard) {
+      Logger::Info("router",
+                   "event=memory_guard file=" + memory_file.string() +
+                       " factor=" + std::to_string(memory_factor) +
+                       " reserve_gpu_gb=" + std::to_string(reserve_gpu_gb) +
+                       " reserve_host_gb=" + std::to_string(reserve_host_gb));
+    }
+  }
 
   // --autoload preloads in section order up to --models-max, waiting for each
   // worker's health endpoint within --load-timeout-seconds.
   if (autoload) {
     for (const auto& model : models) {
-      if (registry_options.max_active > 0 &&
-          state->workers.size() >= registry_options.max_active) {
+      if ((registry_options.max_active > 0 &&
+           state->workers.size() >= registry_options.max_active) ||
+          (memory_guard && !state->workers.empty())) {
         break;
       }
       std::string spawn_error;
@@ -1190,6 +1472,8 @@ int RunRouter(std::span<const char* const> args) {
       state->registry.MarkReady(model.id);
       Logger::Info("router", "event=autoload_ready model=" + model.id);
       state->workers[model.id] = std::move(worker);
+      state->residency->OnSpawn(model.id);
+      state->residency->Event("autoload " + model.id);
     }
   }
 

@@ -1,6 +1,7 @@
 #include "src/cli/serve/router/preset.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <utility>
@@ -78,6 +79,47 @@ std::string ResolvePathValue(std::string_view value,
   return (models_dir / candidate).string();
 }
 
+bool ParseNumber(std::string_view text, double* value) {
+  const std::string copy(TrimSpaces(text));
+  if (copy.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  *value = std::strtod(copy.c_str(), &end);
+  return end == copy.c_str() + copy.size() && *value >= 0.0;
+}
+
+/// Router-only `router-*` keys; they configure residency, not the worker.
+bool ParseHint(const std::string& key, std::string_view value,
+               PresetHints* hints, std::string* error) {
+  double number = 0.0;
+  if (key == "router-gpu-gb" || key == "router-host-gb" ||
+      key == "router-idle-seconds") {
+    if (!ParseNumber(value, &number)) {
+      *error = "'" + key + "' needs a non-negative number";
+      return false;
+    }
+    if (key == "router-gpu-gb") {
+      hints->gpu_gb = number;
+    } else if (key == "router-host-gb") {
+      hints->host_gb = number;
+    } else {
+      hints->idle_seconds = static_cast<long long>(number);
+    }
+    return true;
+  }
+  if (key == "router-exclusive") {
+    if (value != "true" && value != "false") {
+      *error = "'router-exclusive' takes true|false";
+      return false;
+    }
+    hints->exclusive = value == "true" ? 1 : 0;
+    return true;
+  }
+  *error = "unknown router key '" + key + "'";
+  return false;
+}
+
 }  // namespace
 
 bool IsReservedKey(std::string_view key) {
@@ -101,7 +143,15 @@ bool LoadPreset(const std::filesystem::path& file,
     const bool external = section.modality == "external";
     std::vector<std::string> argv;
     std::string command;
+    PresetHints hints;
     for (const auto& [key, value] : section.entries) {
+      if (key.starts_with("router-")) {
+        std::string hint_error;
+        if (!ParseHint(key, value, &hints, &hint_error)) {
+          return SectionError(section, hint_error, error);
+        }
+        continue;
+      }
       if (IsReservedKey(key)) {
         return SectionError(
             section, "reserved key '" + key + "' is managed by the router",
@@ -150,6 +200,7 @@ bool LoadPreset(const std::filesystem::path& file,
       }
       models->push_back(
           {section.modality, section.id, std::move(argv), std::move(command)});
+      models->back().hints = hints;
       return true;
     }
     // Video workers have no `--served-model-name`; the routing id still
@@ -164,6 +215,7 @@ bool LoadPreset(const std::filesystem::path& file,
       return SectionError(section, validation, error);
     }
     models->push_back({section.modality, section.id, std::move(argv), {}});
+    models->back().hints = hints;
     return true;
   };
 

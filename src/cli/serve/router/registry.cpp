@@ -135,17 +135,38 @@ bool Registry::HasQueued() const {
   return false;
 }
 
+std::chrono::seconds Registry::IdleTimeout(const Entry& entry) const {
+  if (entry.preset.hints.idle_seconds >= 0) {
+    return std::chrono::seconds(entry.preset.hints.idle_seconds);
+  }
+  return options_.idle_timeout;
+}
+
+std::vector<Registry::ResidentEntry> Registry::Residents() const {
+  std::vector<ResidentEntry> residents;
+  for (const auto& entry : entries_) {
+    if (entry.state == State::kUnloaded) {
+      continue;
+    }
+    residents.push_back({entry.preset.id, entry.state == State::kLoading,
+                         BusyEntry(entry), entry.last_active,
+                         IdleTimeout(entry)});
+  }
+  return residents;
+}
+
 std::vector<std::string> Registry::DueIdleUnloads() {
   std::vector<std::string> due;
-  if (options_.idle_timeout == std::chrono::seconds(0)) {
-    return due;
-  }
   const Clock::time_point now = Now();
   for (const auto& entry : entries_) {
     if (entry.state != State::kReady || BusyEntry(entry)) {
       continue;
     }
-    if (now - entry.last_active >= options_.idle_timeout) {
+    const std::chrono::seconds timeout = IdleTimeout(entry);
+    if (timeout == std::chrono::seconds(0)) {
+      continue;
+    }
+    if (now - entry.last_active >= timeout) {
       due.push_back(entry.preset.id);
     }
   }

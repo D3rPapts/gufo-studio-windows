@@ -401,6 +401,13 @@ int Worker::port() const {
   return impl_->port;
 }
 
+std::uint32_t Worker::pid() const {
+  std::lock_guard lock(impl_->mutex);
+  return impl_->process == nullptr
+             ? 0
+             : static_cast<std::uint32_t>(GetProcessId(impl_->process));
+}
+
 const std::string& Worker::model_id() const {
   return impl_->model_id;
 }

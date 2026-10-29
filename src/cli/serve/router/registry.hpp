@@ -76,6 +76,18 @@ public:
   /// Number of loading or ready models.
   [[nodiscard]] std::size_t ActiveCount() const;
 
+  /// Loading or ready models, section order (memory residency, status).
+  struct ResidentEntry {
+    std::string id;
+    bool loading{false};
+    bool busy{false};
+    Clock::time_point last_active{};
+    /// Idle unload after this long; 0 = never.
+    std::chrono::seconds idle_timeout{0};
+  };
+  [[nodiscard]] std::vector<ResidentEntry> Residents() const;
+  [[nodiscard]] Clock::time_point NowForStatus() const { return Now(); }
+
 private:
   enum class State { kUnloaded, kLoading, kReady };
 
@@ -97,6 +109,8 @@ private:
   [[nodiscard]] bool DeadlineExpired(const Entry& entry) const;
   [[nodiscard]] static bool BusyEntry(const Entry& entry);
   void Touch(Entry& entry);
+  /// Router default unless the preset sets router-idle-seconds.
+  [[nodiscard]] std::chrono::seconds IdleTimeout(const Entry& entry) const;
 
   std::vector<Entry> entries_;
   std::map<std::string, std::string> job_owners_;

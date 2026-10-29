@@ -2,6 +2,7 @@
 #define GUFO_CLI_SERVE_ROUTER_WORKERS_HPP_
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -38,6 +39,8 @@ public:
                                        std::string* error);
 
   [[nodiscard]] int port() const;
+  /// Operating-system process id (0 once stopped), for memory probes.
+  [[nodiscard]] std::uint32_t pid() const;
   [[nodiscard]] const std::string& model_id() const;
 
   /// GET /health on 127.0.0.1:port() within 300 ms; true only on HTTP 200.

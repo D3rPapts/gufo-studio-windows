@@ -295,6 +295,8 @@ add_library(gufo_http STATIC
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
+  src/cli/serve/router/memory.cpp
+  src/cli/serve/router/residency.cpp
   src/cli/serve/router/router.cpp
   src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
@@ -320,9 +322,12 @@ add_library(gufo_http STATIC
 # Router workers: fork/exec on Linux, CreateProcessW in a kill-on-close job on
 # Windows.
 if (WIN32)
-  target_sources(gufo_http PRIVATE src/cli/serve/router/workers_win32.cpp)
+  target_sources(gufo_http PRIVATE src/cli/serve/router/workers_win32.cpp
+                                   src/cli/serve/router/memory_win32.cpp)
+  target_link_libraries(gufo_http PRIVATE dxgi pdh)
 else()
-  target_sources(gufo_http PRIVATE src/cli/serve/router/workers.cpp)
+  target_sources(gufo_http PRIVATE src/cli/serve/router/workers.cpp
+                                   src/cli/serve/router/memory_posix.cpp)
 endif()
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
 
@@ -522,6 +527,12 @@ if (BUILD_TESTING)
   target_link_libraries(router_registry_test PRIVATE gufo_http)
   add_test(NAME router_registry_test COMMAND router_registry_test)
   set_tests_properties(router_registry_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_memory_test tests/cli/router_memory_test.cpp)
+  target_link_libraries(router_memory_test PRIVATE gufo_http)
+  add_test(NAME router_memory_test COMMAND router_memory_test)
+  set_tests_properties(router_memory_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
 
   add_executable(router_proxy_test tests/cli/router_proxy_test.cpp)

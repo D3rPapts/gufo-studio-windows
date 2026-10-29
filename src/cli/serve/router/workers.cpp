@@ -375,6 +375,10 @@ int Worker::port() const {
   return impl_->port;
 }
 
+std::uint32_t Worker::pid() const {
+  return impl_->pid > 0 ? static_cast<std::uint32_t>(impl_->pid) : 0;
+}
+
 const std::string& Worker::model_id() const {
   return impl_->model_id;
 }
