@@ -6,6 +6,7 @@
 //                  [--image FILE] [--oracle DIR [--replay]]
 //   gufo-wan-video --model ROOT --vae-oracle DIR
 //   gufo-wan-video --model ROOT --encoder-oracle DIR
+//   gufo-wan-video --model ROOT --video-encoder-oracle DIR
 //   gufo-wan-video --scheduler-oracle DIR [--model ROOT]
 //   gufo-wan-video --model ROOT --vae-bench FRAMES HEIGHT WIDTH
 //
@@ -19,7 +20,8 @@
 // blended latents are compared too; `--replay` starts every step from the
 // reference sample and compares each step's guided noise prediction.
 // `--encoder-oracle` encodes DIR/enc*_in.npy and compares the posterior means
-// with DIR/enc*_mu.npy.
+// with DIR/enc*_mu.npy. `--video-encoder-oracle` (Wan 2.1 VAE) encodes the
+// video DIR/venc_in.npy [3, F, H, W] and compares with DIR/venc_mu.npy.
 
 #include <algorithm>
 #include <chrono>
@@ -306,6 +308,79 @@ int EncoderOracle(const std::filesystem::path& model,
   return pass ? 0 : 1;
 }
 
+int VideoEncoderOracle(const std::filesystem::path& model,
+                       const std::filesystem::path& dir) {
+  std::vector<float> video, reference;
+  std::vector<std::size_t> shape, reference_shape;
+  if (!ReadNpy(dir / "venc_in.npy", &video, &shape) || shape.size() != 4 ||
+      shape[0] != 3 ||
+      !ReadNpy(dir / "venc_mu.npy", &reference, &reference_shape) ||
+      reference_shape.size() != 4) {
+    std::cerr << "cannot read video encoder oracle in " << dir << "\n";
+    return 1;
+  }
+  std::string error;
+  auto start = Clock::now();
+  auto encoder = wan22::VaeEncoder::Load(model / "vae", &error);
+  if (!encoder) {
+    std::cerr << "encoder load: " << error << "\n";
+    return 1;
+  }
+  std::cout << "encoder load " << Seconds(start) << " s, weights "
+            << encoder->weight_bytes() / 1048576.0 << " MiB\n";
+  const int frames = static_cast<int>(shape[1]);
+  const int height = static_cast<int>(shape[2]);
+  const int width = static_cast<int>(shape[3]);
+  const std::size_t plane = static_cast<std::size_t>(height) * width;
+  std::vector<float> rgb(video.size());
+  for (int c = 0; c < 3; ++c)
+    for (int f = 0; f < frames; ++f)
+      for (std::size_t i = 0; i < plane; ++i)
+        rgb[(f * plane + i) * 3 + c] =
+            video[(static_cast<std::size_t>(c) * frames + f) * plane + i];
+  std::vector<float> latent;
+  for (int run = 0; run < 2; ++run) {
+    start = Clock::now();
+    if (!encoder->EncodeVideo(rgb, frames, height, width, false, &latent,
+                              &error)) {
+      std::cerr << "encode: " << error << "\n";
+      return 1;
+    }
+    std::cout << frames << "x" << width << "x" << height << " encode run "
+              << run << ": " << Seconds(start) << " s, activations "
+              << encoder->activation_bytes() / 1048576.0 << " MiB\n";
+  }
+  if (latent.size() != reference.size()) {
+    std::cerr << "size mismatch " << latent.size() << " vs " << reference.size()
+              << "\n";
+    return 1;
+  }
+  const Comparison c = Compare(latent.data(), reference.data(), latent.size());
+  Print("venc_mu", c);
+  // Per latent frame over all channels.
+  const int channels = static_cast<int>(reference_shape[0]);
+  const int latent_frames = static_cast<int>(reference_shape[1]);
+  const std::size_t latent_plane = reference_shape[2] * reference_shape[3];
+  double minimum = 1;
+  for (int f = 0; f < latent_frames; ++f) {
+    std::vector<float> a, b;
+    for (int ch = 0; ch < channels; ++ch) {
+      const std::size_t offset =
+          (static_cast<std::size_t>(ch) * latent_frames + f) * latent_plane;
+      a.insert(a.end(), latent.begin() + offset,
+               latent.begin() + offset + latent_plane);
+      b.insert(b.end(), reference.begin() + offset,
+               reference.begin() + offset + latent_plane);
+    }
+    const Comparison fc = Compare(a.data(), b.data(), a.size());
+    Print("  latent frame " + std::to_string(f), fc);
+    minimum = std::min(minimum, fc.cosine);
+  }
+  const bool pass = c.cosine >= 0.999 && minimum >= 0.999;
+  std::cout << (pass ? "PASS" : "FAIL") << "\n";
+  return pass ? 0 : 1;
+}
+
 int VaeBench(const std::filesystem::path& model, int frames, int height,
              int width) {
   std::string error;
@@ -314,8 +389,10 @@ int VaeBench(const std::filesystem::path& model, int frames, int height,
     std::cerr << "vae load: " << error << "\n";
     return 1;
   }
-  const auto latent = wan22::GaussianNoise(
-      static_cast<std::size_t>(48) * frames * height * width, 7);
+  const auto latent =
+      wan22::GaussianNoise(static_cast<std::size_t>(vae->latent_channels()) *
+                               frames * height * width,
+                           7);
   wan22::DecodedVideo video;
   auto start = Clock::now();
   auto last = start;
@@ -344,6 +421,7 @@ int Usage() {
          "[--oracle DIR [--replay]]\n"
          "       gufo-wan-video --model ROOT --vae-oracle DIR\n"
          "       gufo-wan-video --model ROOT --encoder-oracle DIR\n"
+         "       gufo-wan-video --model ROOT --video-encoder-oracle DIR\n"
          "       gufo-wan-video --scheduler-oracle DIR [--model ROOT]\n"
          "       gufo-wan-video --model ROOT --vae-bench FRAMES HEIGHT WIDTH\n";
   return 2;
@@ -354,7 +432,7 @@ int Usage() {
 int main(int argc, char** argv) {
   wan22::VideoRequest request;
   std::string out = "wan-video.mp4", oracle, vae_oracle, scheduler_oracle;
-  std::string image_path, encoder_oracle;
+  std::string image_path, encoder_oracle, video_encoder_oracle;
   bool replay = false;
   int fps = 24;
   int bench[3]{};
@@ -393,6 +471,8 @@ int main(int argc, char** argv) {
       vae_oracle = argv[++i];
     else if (name == "--encoder-oracle" && more)
       encoder_oracle = argv[++i];
+    else if (name == "--video-encoder-oracle" && more)
+      video_encoder_oracle = argv[++i];
     else if (name == "--image" && more)
       image_path = argv[++i];
     else if (name == "--scheduler-oracle" && more)
@@ -411,6 +491,8 @@ int main(int argc, char** argv) {
     return VaeOracle(request.model_root, vae_oracle);
   if (!encoder_oracle.empty())
     return EncoderOracle(request.model_root, encoder_oracle);
+  if (!video_encoder_oracle.empty())
+    return VideoEncoderOracle(request.model_root, video_encoder_oracle);
   if (bench[0] > 0)
     return VaeBench(request.model_root, bench[0], bench[1], bench[2]);
   if (!have_prompt)

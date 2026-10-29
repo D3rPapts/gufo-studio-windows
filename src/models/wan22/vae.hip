@@ -57,8 +57,15 @@ struct Im2colArgs {
   int upsample;  // 1: nearest 2x spatial upsample of the source
   int split;     // 1: frame f = source frame f / 2, channel block f % 2
   int down;      // 1: stride 2 from the top-left, zeros past the right/bottom
+  int tdown;     // 1: temporal stride 2 over "last history frame ++ current"
   int kt, ks;
 };
+
+// Stream frame read by output frame f at temporal tap dt: negative indices
+// address the two-frame history (-1 is its last frame).
+__device__ __forceinline__ int StreamFrame(const Im2colArgs& a, int f, int dt) {
+  return a.tdown ? 2 * f + dt - 1 : f + dt - (a.kt - 1);
+}
 
 // columns[row, ((dt * ks + dy) * ks + dx) * C + c], eight channels a thread.
 __global__ void Im2colKernel(Im2colArgs a, std::size_t first_row,
@@ -80,7 +87,7 @@ __global__ void Im2colKernel(Im2colArgs a, std::size_t first_row,
   const int y = static_cast<int>((row / a.width) % a.height);
   const int f =
       static_cast<int>(row / (static_cast<std::size_t>(a.width) * a.height));
-  const int ef = f + dt - (a.kt - 1);
+  const int ef = StreamFrame(a, f, dt);
   int sy, sx;
   bool inside;
   if (a.down) {
@@ -120,7 +127,7 @@ __device__ __forceinline__ const std::uint16_t* ConvSource(const Im2colArgs& a,
                                                            int f, int y, int x,
                                                            int tap) {
   const int dx = tap % a.ks, dy = (tap / a.ks) % a.ks, dt = tap / (a.ks * a.ks);
-  const int ef = f + dt - (a.kt - 1);
+  const int ef = StreamFrame(a, f, dt);
   int sy, sx;
   if (a.down) {
     sy = 2 * y + dy;
@@ -435,6 +442,16 @@ __global__ void OutputKernel(const std::uint16_t* x, int frames, int height,
   rgb[i] = fminf(fmaxf(FromBf16(x[source]), -1.0F), 1.0F);
 }
 
+// Wan 2.1: conv_out rows [frames, H, W, 16] -> clamped RGB [frames, H, W, 3].
+__global__ void OutputDirectKernel(const std::uint16_t* x, std::size_t count,
+                                   float* rgb) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  rgb[i] = fminf(fmaxf(FromBf16(x[(i / 3) * kOutPadded + i % 3]), -1.0F), 1.0F);
+}
+
 unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
@@ -526,6 +543,8 @@ struct DownBlock {
   bool down{false};
   int ft{1};  // AvgDown3D temporal factor
   Conv resample;
+  bool temporal{false};  // Wan 2.1 downsample3d: stride-2 time convolution
+  Conv time_conv;
   int in_channels{0}, out_channels{0};
 };
 
@@ -590,6 +609,11 @@ struct WanVaeCore {
   };
   std::map<std::string, Location, std::less<>> tensors;
   std::vector<float> mean, std_dev;
+  // Wan 2.1 (z_dim 16, base_dim 96, 8x8 spatial, no patchify, plain
+  // up/down blocks) instead of the Wan 2.2 TI2V-5B VAE.
+  bool v21{false};
+  int z{kZ};
+  int spatial{VaeDecoder::kSpatialRatio};
 
   DeviceBuffer attn_gamma;
   Conv attn_qkv, attn_proj;
@@ -632,6 +656,7 @@ struct VaeDecoder::Impl : WanVaeCore {
   Resnet mid0, mid1;
   std::array<UpBlock, 4> up;
   DeviceBuffer norm_out;
+  int top{kTop};  // channels of conv_in and the mid block
 
   // Geometry-dependent state.
   int prepared_height{0}, prepared_width{0};
@@ -650,6 +675,11 @@ struct VaeEncoder::Impl : WanVaeCore {
 
   int prepared_height{0}, prepared_width{0};
   std::array<DeviceBuffer, 6> pool;
+
+  // Wan 2.1 video encoding (full 3x3x3 kernels with causal caches).
+  bool LoadV21(std::string* error);
+  bool PrepareVideo(int height, int width, std::string* error);
+  int video_height{0}, video_width{0};
 };
 
 bool WanVaeCore::Open(const std::filesystem::path& dir, std::string* error) {
@@ -666,7 +696,35 @@ bool WanVaeCore::Open(const std::filesystem::path& dir, std::string* error) {
   const json::Value* mean_value = config.find("latents_mean");
   const json::Value* std_value = config.find("latents_std");
   const json::Value* mult = config.find("dim_mult");
-  if (config.member_str("_class_name") != "AutoencoderKLWan" ||
+  const json::Value* residual_flag = config.find("is_residual");
+  const json::Value* patch = config.find("patch_size");
+  v21 = config.member_double("z_dim") == 16 &&
+        (residual_flag == nullptr || !residual_flag->as_bool()) &&
+        (patch == nullptr || patch->is_null());
+  if (v21) {
+    z = 16;
+    spatial = 8;
+  }
+  const json::Value* attn_list = config.find("attn_scales");
+  const json::Value* down_list = config.find("temperal_downsample");
+  if (v21 &&
+      (config.member_str("_class_name") != "AutoencoderKLWan" ||
+       config.member_double("base_dim") != 96 ||
+       config.member_double("num_res_blocks") != 2 || mean_value == nullptr ||
+       !mean_value->is_array() || mean_value->size() != 16 ||
+       std_value == nullptr || !std_value->is_array() ||
+       std_value->size() != 16 || mult == nullptr || !mult->is_array() ||
+       mult->size() != 4 || mult->items()[0].as_size() != 1 ||
+       mult->items()[1].as_size() != 2 || mult->items()[2].as_size() != 4 ||
+       mult->items()[3].as_size() != 4 ||
+       (attn_list != nullptr && !(attn_list->is_array() && attn_list->empty())) ||
+       down_list == nullptr || !down_list->is_array() ||
+       down_list->size() != 3 || down_list->items()[0].as_bool() ||
+       !down_list->items()[1].as_bool() || !down_list->items()[2].as_bool())) {
+    SetError(error, "unsupported Wan 2.1 VAE configuration");
+    return false;
+  }
+  if (!v21 && (config.member_str("_class_name") != "AutoencoderKLWan" ||
       config.member_double("z_dim") != kZ ||
       config.member_double("base_dim") != 160 ||
       config.member_double("decoder_base_dim") != 256 ||
@@ -679,22 +737,22 @@ bool WanVaeCore::Open(const std::filesystem::path& dir, std::string* error) {
       std_value->size() != kZ || mult == nullptr || !mult->is_array() ||
       mult->size() != 4 || mult->items()[0].as_size() != 1 ||
       mult->items()[1].as_size() != 2 || mult->items()[2].as_size() != 4 ||
-      mult->items()[3].as_size() != 4) {
+      mult->items()[3].as_size() != 4)) {
     SetError(error, "unsupported VAE configuration (Wan 2.2 TI2V-5B only)");
     return false;
   }
   const json::Value* attn = config.find("attn_scales");
   const json::Value* down = config.find("temperal_downsample");
   const json::Value* residual = config.find("is_residual");
-  if ((attn != nullptr && !(attn->is_array() && attn->empty())) ||
+  if (!v21 && ((attn != nullptr && !(attn->is_array() && attn->empty())) ||
       down == nullptr || !down->is_array() || down->size() != 3 ||
       down->items()[0].as_bool() || !down->items()[1].as_bool() ||
       !down->items()[2].as_bool() || residual == nullptr ||
-      !residual->as_bool()) {
+      !residual->as_bool())) {
     SetError(error, "unsupported VAE configuration (Wan 2.2 TI2V-5B only)");
     return false;
   }
-  for (int c = 0; c < kZ; ++c) {
+  for (int c = 0; c < z; ++c) {
     mean.push_back(static_cast<float>(mean_value->items()[c].as_double()));
     std_dev.push_back(static_cast<float>(std_value->items()[c].as_double()));
   }
@@ -1101,22 +1159,26 @@ bool VaeDecoder::Impl::Prepare(int height, int width, std::string* error) {
     const std::size_t hw = static_cast<std::size_t>(height) * width;
     // Largest activation: 4 frames at 8x the latent size with 512 channels
     // (or the 1024-channel time convolution output at 2x).
+    // Wan 2.1: 4 frames at 8x with 96 channels (block 2's upsampler output).
     const std::size_t largest =
-        std::max<std::size_t>(4 * 64 * 512, 2 * 4 * 2048) * hw;
+        v21 ? std::size_t{4 * 64 * 96} * hw
+            : std::max<std::size_t>(4 * 64 * 512, 2 * 4 * 2048) * hw;
     activation_bytes = 0;
     for (auto& buffer : pool) {
       if (!buffer.Allocate(largest * 2, error))
         return false;
       activation_bytes += largest * 2;
     }
-    const std::size_t widest = static_cast<std::size_t>(27) * kTop * 2;
+    const std::size_t widest = static_cast<std::size_t>(27) * top * 2;
+    const std::size_t pixels_out =
+        static_cast<std::size_t>(spatial) * spatial * hw;
     if (!columns.Allocate(
             std::max(kColumnBytes, LinearGemm::kRowChunk * widest), error) ||
-        !qkv32.Allocate(hw * 3 * kTop * 4, error) ||
+        !qkv32.Allocate(hw * 3 * top * 4, error) ||
         !scores.Allocate(hw * hw * 4, error) ||
-        !attn32.Allocate(hw * kTop * 4, error) ||
-        !rgb_device.Allocate(4 * 256 * hw * 3 * 4, error) ||
-        !latent_device.Allocate(hw * kZ * 2, error))
+        !attn32.Allocate(hw * top * 4, error) ||
+        !rgb_device.Allocate(4 * pixels_out * 3 * 4, error) ||
+        !latent_device.Allocate(hw * z * 2, error))
       return false;
     activation_bytes += columns.bytes() + qkv32.bytes() + scores.bytes() +
                         attn32.bytes() + rgb_device.bytes() +
@@ -1180,13 +1242,13 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
     p[i] = pool[i].get();
   // Latent [h, w, 48] -> post_quant_conv -> conv_in -> mid block.
   stage = "in";
-  Tensor x{p[0], 1, h, w, kZ};
+  Tensor x{p[0], 1, h, w, z};
   if (!CausalConv(post_quant,
-                  Tensor{const_cast<std::uint16_t*>(latent_frame), 1, h, w, kZ},
+                  Tensor{const_cast<std::uint16_t*>(latent_frame), 1, h, w, z},
                   p[0], error) ||
       !CausalConv(conv_in, x, p[1], error))
     return false;
-  x = Tensor{p[1], 1, h, w, kTop};
+  x = Tensor{p[1], 1, h, w, top};
   stage = "mid";
   if (!RunResnet(mid0, x, p[0], p[2], p[3], error))
     return false;
@@ -1246,15 +1308,19 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
     args.ks = 3;
     if (!RunConv(block.resample, args, bb, error))
       return false;
-    Tensor z{bb, args.frames, args.height, args.width, block.out_channels};
-    const int ft = block.mode == 3 ? 2 : 1;
-    const int skip = first ? ft - 1 : 0;
-    DupUpAddKernel<<<Blocks(z.count()), kThreads, 0, stream>>>(
-        bb, block_in.data, z.frames, block_in.height, block_in.width,
-        block.out_channels, block_in.channels, ft, skip);
-    if (!Check(hipGetLastError(), "shortcut", error))
-      return false;
-    x = z;
+    Tensor up_out{bb, args.frames, args.height, args.width,
+                  block.resample.cout};
+    if (!v21) {
+      // Wan 2.2 residual up block: DupUp3D shortcut.
+      const int ft = block.mode == 3 ? 2 : 1;
+      const int skip = first ? ft - 1 : 0;
+      DupUpAddKernel<<<Blocks(up_out.count()), kThreads, 0, stream>>>(
+          bb, block_in.data, up_out.frames, block_in.height, block_in.width,
+          block.out_channels, block_in.channels, ft, skip);
+      if (!Check(hipGetLastError(), "shortcut", error))
+        return false;
+    }
+    x = up_out;
     in_index = other[1];
   }
   // Head: norm_out + SiLU -> conv_out -> unpatchify, clamp.
@@ -1268,10 +1334,14 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
   Norm(x, norm_out, true, a.data);
   if (!CausalConv(conv_out, a, p[other[1]], error))
     return false;
-  const std::size_t count =
-      static_cast<std::size_t>(x.frames) * 4 * x.height * x.width * 3;
-  OutputKernel<<<Blocks(count), kThreads, 0, stream>>>(
-      p[other[1]], x.frames, x.height, x.width, rgb_device.f32());
+  const std::size_t count = static_cast<std::size_t>(x.frames) *
+                            (v21 ? 1 : 4) * x.height * x.width * 3;
+  if (v21)
+    OutputDirectKernel<<<Blocks(count), kThreads, 0, stream>>>(
+        p[other[1]], count, rgb_device.f32());
+  else
+    OutputKernel<<<Blocks(count), kThreads, 0, stream>>>(
+        p[other[1]], x.frames, x.height, x.width, rgb_device.f32());
   *out_frames = x.frames;
   return Check(hipGetLastError(), "output", error) &&
          Check(hipMemcpyAsync(rgb, rgb_device.f32(), count * 4,
@@ -1282,6 +1352,13 @@ bool VaeDecoder::Impl::DecodeFrame(int frame, bool first,
 
 VaeDecoder::VaeDecoder(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 VaeDecoder::~VaeDecoder() = default;
+
+int VaeDecoder::latent_channels() const {
+  return impl_->z;
+}
+int VaeDecoder::spatial_ratio() const {
+  return impl_->spatial;
+}
 
 std::size_t VaeDecoder::weight_bytes() const {
   return impl_->weight_bytes;
@@ -1297,34 +1374,46 @@ std::unique_ptr<VaeDecoder> VaeDecoder::Load(const std::filesystem::path& dir,
   if (!m.Open(dir, error))
     return nullptr;
   const std::string d = "decoder.";
+  m.top = m.v21 ? 384 : kTop;
   if (!m.LoadConv("post_quant_conv", 1, 1, 0, &m.post_quant, error) ||
       !m.LoadConv(d + "conv_in", 3, 3, 0, &m.conv_in, error) ||
-      !m.LoadResnet(d + "mid_block.resnets.0", kTop, kTop, &m.mid0, error) ||
-      !m.LoadResnet(d + "mid_block.resnets.1", kTop, kTop, &m.mid1, error) ||
-      !m.LoadAttention(d + "mid_block.attentions.0", kTop, error) ||
-      !m.LoadGamma(d + "norm_out.gamma", 256, &m.norm_out, error) ||
+      !m.LoadResnet(d + "mid_block.resnets.0", m.top, m.top, &m.mid0, error) ||
+      !m.LoadResnet(d + "mid_block.resnets.1", m.top, m.top, &m.mid1, error) ||
+      !m.LoadAttention(d + "mid_block.attentions.0", m.top, error) ||
+      !m.LoadGamma(d + "norm_out.gamma", m.v21 ? 96 : 256, &m.norm_out,
+                   error) ||
       !m.LoadConv(d + "conv_out", 3, 3, kOutPadded, &m.conv_out, error))
     return nullptr;
-  // dims [1024, 1024, 1024, 512, 256]; temporal upsampling in blocks 0, 1.
-  constexpr int kDims[5] = {1024, 1024, 1024, 512, 256};
+  // Wan 2.2: dims [1024, 1024, 1024, 512, 256]; Wan 2.1: [384, 384, 384,
+  // 192, 96], where every upsampler halves the channels, so blocks 1..3 start
+  // at half their nominal width. Temporal upsampling in blocks 0, 1.
+  constexpr int kDims22[5] = {1024, 1024, 1024, 512, 256};
+  constexpr int kDims21[5] = {384, 384, 384, 192, 96};
+  const int* dims = m.v21 ? kDims21 : kDims22;
   for (int b = 0; b < 4; ++b) {
     UpBlock& block = m.up[b];
-    block.in_channels = kDims[b];
-    block.out_channels = kDims[b + 1];
+    block.in_channels = m.v21 && b > 0 ? dims[b] / 2 : dims[b];
+    block.out_channels = dims[b + 1];
     block.mode = b < 2 ? 3 : (b == 2 ? 2 : 0);
     const std::string prefix = d + "up_blocks." + std::to_string(b);
+    const std::string upsampler =
+        prefix + (m.v21 ? ".upsamplers.0" : ".upsampler");
     block.resnets.resize(3);
     for (int r = 0; r < 3; ++r)
       if (!m.LoadResnet(prefix + ".resnets." + std::to_string(r),
                         r == 0 ? block.in_channels : block.out_channels,
                         block.out_channels, &block.resnets[r], error))
         return nullptr;
-    if (block.mode == 3 && !m.LoadConv(prefix + ".upsampler.time_conv", 3, 1, 0,
+    if (block.mode == 3 && !m.LoadConv(upsampler + ".time_conv", 3, 1, 0,
                                        &block.time_conv, error))
       return nullptr;
-    if (block.mode != 0 && !m.LoadConv(prefix + ".upsampler.resample.1", 1, 3,
-                                       0, &block.resample, error))
+    if (block.mode != 0 && !m.LoadConv(upsampler + ".resample.1", 1, 3, 0,
+                                       &block.resample, error))
       return nullptr;
+  }
+  if (m.conv_in.cin != m.z || m.conv_in.cout != m.top) {
+    SetError(error, "unexpected Wan VAE decoder shapes");
+    return nullptr;
   }
   m.Close();
   return std::unique_ptr<VaeDecoder>(new VaeDecoder(std::move(impl)));
@@ -1339,14 +1428,14 @@ bool VaeDecoder::Decode(std::span<const float> latent, int frames, int height,
   Impl& m = *impl_;
   const std::size_t plane = static_cast<std::size_t>(height) * width;
   if (frames < 1 || height < 1 || width < 1 ||
-      latent.size() != plane * frames * kZ) {
+      latent.size() != plane * frames * m.z) {
     SetError(error, "Wan VAE: latent size does not match its shape");
     return false;
   }
   if (!m.Prepare(height, width, error))
     return false;
-  const int out_height = height * kSpatialRatio;
-  const int out_width = width * kSpatialRatio;
+  const int out_height = height * m.spatial;
+  const int out_width = width * m.spatial;
   const int total = 1 + (frames - 1) * kTemporalRatio;
   const std::size_t frame_values =
       static_cast<std::size_t>(out_height) * out_width * 3;
@@ -1360,7 +1449,7 @@ bool VaeDecoder::Decode(std::span<const float> latent, int frames, int height,
   if (want_rgb8)
     video->rgb8.resize(frame_values * total);
   std::vector<float> chunk(frame_values * kTemporalRatio);
-  std::vector<std::uint16_t> host(plane * kZ);
+  std::vector<std::uint16_t> host(plane * m.z);
   const auto decode_start = std::chrono::steady_clock::now();
   int written = 0;
   for (int f = 0; f < frames; ++f) {
@@ -1369,11 +1458,11 @@ bool VaeDecoder::Decode(std::span<const float> latent, int frames, int height,
       return false;
     }
     // De-normalize (latents * std + mean) into channels-last BF16.
-    for (int c = 0; c < kZ; ++c) {
+    for (int c = 0; c < m.z; ++c) {
       const float* source =
           latent.data() + (static_cast<std::size_t>(c) * frames + f) * plane;
       for (std::size_t i = 0; i < plane; ++i)
-        host[i * kZ + c] = HostBf16(source[i] * m.std_dev[c] + m.mean[c]);
+        host[i * m.z + c] = HostBf16(source[i] * m.std_dev[c] + m.mean[c]);
     }
     if (!Check(hipMemcpyAsync(m.latent_device.get(), host.data(),
                               host.size() * 2, hipMemcpyHostToDevice, m.stream),
@@ -1445,6 +1534,12 @@ std::unique_ptr<VaeEncoder> VaeEncoder::Load(const std::filesystem::path& dir,
   Impl& m = *impl;
   if (!m.Open(dir, error))
     return nullptr;
+  if (m.v21) {
+    if (!m.LoadV21(error))
+      return nullptr;
+    m.Close();
+    return std::unique_ptr<VaeEncoder>(new VaeEncoder(std::move(impl)));
+  }
   // One frame: every causal 3x3x3 kernel sees two zero frames and the image,
   // so only its last temporal tap contributes.
   constexpr int kTap = 2;
@@ -1493,6 +1588,8 @@ bool VaeEncoder::Encode(std::span<const float> rgb, int height, int width,
                         bool normalize, std::vector<float>* latent,
                         std::string* error) {
   Impl& m = *impl_;
+  if (m.v21)
+    return EncodeVideo(rgb, 1, height, width, normalize, latent, error);
   if (height < 16 || width < 16 || height % 16 != 0 || width % 16 != 0 ||
       rgb.size() != static_cast<std::size_t>(height) * width * 3) {
     SetError(error, "Wan VAE encoder: image must be WxHx3 with W, H % 16 == 0");
@@ -1615,6 +1712,288 @@ bool VaeEncoder::Encode(std::span<const float> rgb, int height, int width,
         value = (value - m.mean[c]) * (1.0F / m.std_dev[c]);
       (*latent)[c * plane + i] = value;
     }
+  return true;
+}
+
+int VaeEncoder::latent_channels() const {
+  return impl_->z;
+}
+
+// Wan 2.1 encoder for videos: diffusers' WanEncoder3d with is_residual
+// false, whose down_blocks are one flat list (two resnets, then a resample
+// per level), with full 3x3x3 kernels and causal caches.
+bool VaeEncoder::Impl::LoadV21(std::string* error) {
+  Impl& m = *this;
+  const std::string e = "encoder.";
+  constexpr int kDims[5] = {96, 96, 192, 384, 384};
+  // RGB padded to 8 input channels.
+  if (!m.LoadConv(e + "conv_in", 3, 3, 0, &m.conv_in, error, -1, 8))
+    return false;
+  int index = 0;
+  for (int b = 0; b < 4; ++b) {
+    DownBlock& block = m.blocks[b];
+    block.in_channels = kDims[b];
+    block.out_channels = kDims[b + 1];
+    block.down = b < 3;
+    block.temporal = b == 1 || b == 2;
+    block.resnets.resize(2);
+    for (int r = 0; r < 2; ++r, ++index)
+      if (!m.LoadResnet(e + "down_blocks." + std::to_string(index),
+                        r == 0 ? block.in_channels : block.out_channels,
+                        block.out_channels, &block.resnets[r], error))
+        return false;
+    if (!block.down)
+      continue;
+    const std::string prefix = e + "down_blocks." + std::to_string(index++);
+    if (!m.LoadConv(prefix + ".resample.1", 1, 3, 0, &block.resample, error) ||
+        (block.temporal &&
+         !m.LoadConv(prefix + ".time_conv", 3, 1, 0, &block.time_conv, error)))
+      return false;
+  }
+  if (!m.LoadResnet(e + "mid_block.resnets.0", 384, 384, &m.mid0, error) ||
+      !m.LoadResnet(e + "mid_block.resnets.1", 384, 384, &m.mid1, error) ||
+      !m.LoadAttention(e + "mid_block.attentions.0", 384, error) ||
+      !m.LoadGamma(e + "norm_out.gamma", 384, &m.norm_out, error) ||
+      !m.LoadConv(e + "conv_out", 3, 3, 0, &m.conv_out, error) ||
+      !m.LoadConv("quant_conv", 1, 1, 0, &m.quant, error))
+    return false;
+  if (m.conv_in.cout != 96 || m.conv_out.cout != 2 * m.z ||
+      m.quant.cin != 2 * m.z || m.quant.cout != 2 * m.z) {
+    SetError(error, "unexpected Wan 2.1 VAE encoder shapes");
+    return false;
+  }
+  return true;
+}
+
+// Buffers and causal caches for chunks of up to four frames of
+// height x width pixels.
+bool VaeEncoder::Impl::PrepareVideo(int height, int width,
+                                    std::string* error) {
+  if (height == video_height && width == video_width)
+    return true;
+  video_height = video_width = 0;
+  prepared_height = prepared_width = 0;
+  const std::size_t hw = static_cast<std::size_t>(height) * width;
+  // Largest activation: four frames at full resolution with 96 channels.
+  const std::size_t largest = 4 * hw * 96;
+  activation_bytes = 0;
+  for (auto& buffer : pool) {
+    if (!buffer.Allocate(largest * 2, error))
+      return false;
+    activation_bytes += largest * 2;
+  }
+  const std::size_t widest = static_cast<std::size_t>(27) * 384 * 2;
+  if (!columns.Allocate(std::max(kColumnBytes, LinearGemm::kRowChunk * widest),
+                        error) ||
+      !PrepareAttention(hw / 64, 384, error))
+    return false;
+  activation_bytes += columns.bytes();
+  // A cache of two input frames for every causal convolution at its
+  // resolution (`shift` halvings of the image size).
+  const auto history = [&](Conv& conv, int shift) {
+    if (conv.kt != 3)
+      return true;
+    conv.history_height = height >> shift;
+    conv.history_width = width >> shift;
+    const std::size_t bytes = std::size_t{2} * conv.history_height *
+                              conv.history_width * conv.cin * 2;
+    activation_bytes += bytes;
+    return conv.history.Allocate(bytes, error);
+  };
+  const auto resnet_history = [&](Resnet& resnet, int shift) {
+    return history(resnet.conv1, shift) && history(resnet.conv2, shift);
+  };
+  if (!history(conv_in, 0))
+    return false;
+  for (int b = 0; b < 4; ++b) {
+    for (auto& resnet : blocks[b].resnets)
+      if (!resnet_history(resnet, b))
+        return false;
+    if (blocks[b].temporal && !history(blocks[b].time_conv, b + 1))
+      return false;
+  }
+  if (!resnet_history(mid0, 3) || !resnet_history(mid1, 3) ||
+      !history(conv_out, 3))
+    return false;
+  video_height = height;
+  video_width = width;
+  return true;
+}
+
+bool VaeEncoder::EncodeVideo(std::span<const float> rgb, int frames, int height,
+                             int width, bool normalize,
+                             std::vector<float>* latent, std::string* error) {
+  Impl& m = *impl_;
+  if (!m.v21) {
+    SetError(error, "Wan VAE: video encoding needs the Wan 2.1 VAE");
+    return false;
+  }
+  if (frames < 1 || (frames - 1) % 4 != 0 || height < 16 || width < 16 ||
+      height % 16 != 0 || width % 16 != 0 ||
+      rgb.size() != static_cast<std::size_t>(frames) * height * width * 3) {
+    SetError(error,
+             "Wan VAE encoder: video must be Fx(H)x(W)x3 with F = 4k + 1, "
+             "W, H % 16 == 0");
+    return false;
+  }
+  if (!m.PrepareVideo(height, width, error))
+    return false;
+  // Zero caches: the causal padding of the first chunk.
+  const auto clear = [&](Conv& conv) {
+    return conv.kt != 3 || Check(hipMemsetAsync(conv.history.get(), 0,
+                                                conv.history.bytes(), m.stream),
+                                 "cache reset", error);
+  };
+  bool ok = clear(m.conv_in) && clear(m.mid0.conv1) && clear(m.mid0.conv2) &&
+            clear(m.mid1.conv1) && clear(m.mid1.conv2) && clear(m.conv_out);
+  for (auto& block : m.blocks) {
+    for (auto& resnet : block.resnets)
+      ok = ok && clear(resnet.conv1) && clear(resnet.conv2);
+    if (block.temporal)
+      ok = ok && clear(block.time_conv);
+  }
+  if (!ok)
+    return false;
+  std::array<std::uint16_t*, 6> p{};
+  for (int i = 0; i < 6; ++i)
+    p[i] = m.pool[i].get();
+  const auto others = [&](int skip) {
+    std::array<int, 5> list{};
+    for (int i = 0, n = 0; i < 6; ++i)
+      if (i != skip)
+        list[n++] = i;
+    return list;
+  };
+  const int z = m.z;
+  const int lh = height / 8, lw = width / 8;
+  const int latent_frames = 1 + (frames - 1) / 4;
+  const std::size_t latent_plane = static_cast<std::size_t>(lh) * lw;
+  latent->assign(latent_plane * z * latent_frames, 0.0F);
+  constexpr int kIn = 8;
+  const std::size_t image_plane = static_cast<std::size_t>(height) * width;
+  std::vector<std::uint16_t> host(4 * image_plane * kIn, 0);
+  std::vector<std::uint16_t> moments(latent_plane * 2 * z);
+  for (int chunk = 0; chunk < latent_frames; ++chunk) {
+    const int first = chunk == 0 ? 0 : 1 + 4 * (chunk - 1);
+    const int count = chunk == 0 ? 1 : 4;
+    for (int f = 0; f < count; ++f)
+      for (std::size_t i = 0; i < image_plane; ++i)
+        for (int c = 0; c < 3; ++c)
+          host[(f * image_plane + i) * kIn + c] =
+              HostBf16(rgb[((first + f) * image_plane + i) * 3 + c]);
+    if (!Check(hipMemcpyAsync(p[0], host.data(), count * image_plane * kIn * 2,
+                              hipMemcpyHostToDevice, m.stream),
+               "video upload", error) ||
+        !m.CausalConv(m.conv_in, Tensor{p[0], count, height, width, kIn}, p[1],
+                      error))
+      return false;
+    Tensor x{p[1], count, height, width, 96};
+    int current = 1;
+    for (DownBlock& block : m.blocks) {
+      const auto o = others(current);
+      std::uint16_t *a = p[o[0]], *b = p[o[1]], *s1 = p[o[2]], *s2 = p[o[3]];
+      if (!m.RunResnet(block.resnets[0], x, a, s1, s2, error))
+        return false;
+      Tensor y{a, x.frames, x.height, x.width, block.out_channels};
+      if (!m.RunResnet(block.resnets[1], y, b, s1, s2, error))
+        return false;
+      y.data = b;
+      if (!block.down) {
+        x = y;
+        current = o[1];
+        continue;
+      }
+      // ZeroPad2d((0, 1, 0, 1)) + stride-2 3x3 convolution per frame.
+      Im2colArgs args{};
+      args.current = b;
+      args.frames = y.frames;
+      args.height = y.height / 2;
+      args.width = y.width / 2;
+      args.channels = args.stride = y.channels;
+      args.source_height = y.height;
+      args.source_width = y.width;
+      args.down = 1;
+      args.kt = 1;
+      args.ks = 3;
+      std::uint16_t* c = p[o[4]];
+      if (!m.RunConv(block.resample, args, c, error))
+        return false;
+      Tensor down{c, y.frames, args.height, args.width, block.out_channels};
+      x = down;
+      current = o[4];
+      if (!block.temporal)
+        continue;
+      // downsample3d: the first chunk only caches its frame; later chunks
+      // run the stride-2 time convolution over "cached last frame ++ chunk".
+      const std::size_t plane = static_cast<std::size_t>(down.height) *
+                                down.width * down.channels * 2;
+      auto* history = reinterpret_cast<std::byte*>(block.time_conv.history.get());
+      const auto* last =
+          reinterpret_cast<const std::byte*>(c) + (down.frames - 1) * plane;
+      if (chunk > 0) {
+        Im2colArgs t{};
+        t.current = c;
+        t.history = block.time_conv.history.get();
+        t.frames = down.frames / 2;
+        t.height = t.source_height = down.height;
+        t.width = t.source_width = down.width;
+        t.channels = t.stride = down.channels;
+        t.kt = 3;
+        t.ks = 1;
+        t.tdown = 1;
+        if (!m.RunConv(block.time_conv, t, a, error))
+          return false;
+        x = Tensor{a, t.frames, down.height, down.width, down.channels};
+        current = o[0];
+      }
+      if (!Check(hipMemcpyAsync(history + plane, last, plane,
+                                hipMemcpyDeviceToDevice, m.stream),
+                 "cache update", error))
+        return false;
+    }
+    if (x.frames != 1) {
+      SetError(error, "Wan VAE encoder: unexpected chunk length");
+      return false;
+    }
+    // Mid block, head, quant_conv.
+    const auto o = others(current);
+    std::uint16_t *a = p[o[0]], *b = p[o[1]], *s1 = p[o[2]], *s2 = p[o[3]];
+    if (!m.RunResnet(m.mid0, x, a, s1, s2, error))
+      return false;
+    Tensor y = x;
+    y.data = a;
+    if (!m.RunAttention(y, b, s1, s2, error))
+      return false;
+    y.data = b;
+    if (!m.RunResnet(m.mid1, y, a, s1, s2, error))
+      return false;
+    y.data = a;
+    m.Norm(y, m.norm_out, true, s1);
+    y.data = s1;
+    if (!m.CausalConv(m.conv_out, y, s2, error))
+      return false;
+    y.data = s2;
+    y.channels = 2 * z;
+    if (!m.CausalConv(m.quant, y, b, error) ||
+        !Check(hipMemcpyAsync(moments.data(), b, moments.size() * 2,
+                              hipMemcpyDeviceToHost, m.stream),
+               "latent download", error) ||
+        !Check(hipStreamSynchronize(m.stream), "encode", error))
+      return false;
+    // Posterior mean (the first z channels), channel-first [z, F, h, w].
+    for (int ch = 0; ch < z; ++ch)
+      for (std::size_t i = 0; i < latent_plane; ++i) {
+        const std::uint32_t bits =
+            static_cast<std::uint32_t>(moments[i * 2 * z + ch]) << 16U;
+        float value;
+        std::memcpy(&value, &bits, 4);
+        if (normalize)
+          value = (value - m.mean[ch]) * (1.0F / m.std_dev[ch]);
+        (*latent)[(static_cast<std::size_t>(ch) * latent_frames + chunk) *
+                      latent_plane +
+                  i] = value;
+      }
+  }
   return true;
 }
 

@@ -22,7 +22,9 @@ struct DecodedVideo {
 };
 
 /// Decoder of the Wan 2.2 VAE (Diffusers AutoencoderKLWan, z_dim 48,
-/// decoder_base_dim 256, patch 2: 16x spatial and 4x temporal expansion).
+/// decoder_base_dim 256, patch 2: 16x spatial and 4x temporal expansion), or
+/// of the Wan 2.1 VAE (z_dim 16, base_dim 96, 8x spatial, 4x temporal), chosen
+/// by the config. The constants below are the Wan 2.2 values.
 /// Weights are uploaded as BF16; convolutions are BF16 GEMMs with FP32
 /// accumulation (im2col in bounded row passes), norms and softmax in FP32.
 /// The decode runs one latent frame at a time with causal caches, exactly
@@ -41,7 +43,11 @@ public:
   VaeDecoder(const VaeDecoder&) = delete;
   VaeDecoder& operator=(const VaeDecoder&) = delete;
 
-  /// Decodes model-space latents [48, frames, height, width] (FP32, as the
+  /// Latent channels and spatial expansion of the loaded VAE.
+  [[nodiscard]] int latent_channels() const;
+  [[nodiscard]] int spatial_ratio() const;
+
+  /// Decodes model-space latents [z, frames, height, width] (FP32, as the
   /// transformer produces them; the latents_mean/std de-normalization is
   /// applied here). Fills `video->rgb` and/or `video->rgb8` as requested.
   /// `progress(done, total)` is called after every latent frame; returning
@@ -81,6 +87,18 @@ public:
   /// model-space condition of the image-to-video pipeline.
   bool Encode(std::span<const float> rgb, int height, int width, bool normalize,
               std::vector<float>* latent, std::string* error);
+
+  /// Wan 2.1 only: encodes a video `rgb` [frames, height, width, 3] in
+  /// [-1, 1] (frames = 4k + 1, height, width multiples of 16) like Diffusers'
+  /// untiled `_encode` (first frame, then chunks of four with causal caches).
+  /// Writes the posterior mean [16, 1 + (frames - 1) / 4, height / 8,
+  /// width / 8], normalized as above when `normalize`. With the Wan 2.1 VAE,
+  /// `Encode` is this with one frame.
+  bool EncodeVideo(std::span<const float> rgb, int frames, int height,
+                   int width, bool normalize, std::vector<float>* latent,
+                   std::string* error);
+
+  [[nodiscard]] int latent_channels() const;
 
   [[nodiscard]] std::size_t weight_bytes() const;
   [[nodiscard]] std::size_t activation_bytes() const;
