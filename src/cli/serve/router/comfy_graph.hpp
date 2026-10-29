@@ -123,6 +123,13 @@ struct VideoTask {
   std::optional<double> lora_strength;
   int fps{24};
   int interpolate{1};  // RIFE multiplier from a "RIFE VFI" node (gufo 1..8)
+  /// H3 MiniMaxH3AddGuide images between first and last frame (frame index,
+  /// negative = from the end) -> gufo.keyframes.
+  std::vector<std::pair<int, FileRef>> keyframes;
+  /// H3 MiniMaxH3AddGuide audio -> audio_reference at
+  /// gufo.audio_reference_frame.
+  std::optional<FileRef> audio_reference;
+  int audio_reference_frame{0};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

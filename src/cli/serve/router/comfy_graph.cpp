@@ -499,10 +499,13 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
   task.frames = SnapH3Frames(length);
   task.steps = static_cast<int>(graph.Num(sampler, "steps"));
   task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
-  if (!((task.width == 512 && task.height == 512) ||
-        (task.width == 1344 && task.height == 768)))
+  // gufo H3 sizes: multiples of 32, 256..1344 per side, at most 768x1344.
+  if (task.width % 32 != 0 || task.height % 32 != 0 || task.width < 256 ||
+      task.height < 256 || task.width > 1344 || task.height > 1344 ||
+      task.width * task.height > 768 * 1344)
     throw NodeFailure(video, "unsupported_value",
-                      "gufo MiniMax H3 renders 512x512 or 1344x768, not " +
+                      "gufo MiniMax H3 needs width/height in multiples of 32, "
+                      "256..1344, at most 768x1344 pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));
   if (auto first = graph.LinkOf(video, "first_frame"))
@@ -516,10 +519,15 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
                       "MiniMaxH3ImageToVideo that makes the latent");
   for (const std::string& guide : positive.guides) {
     const int frame = static_cast<int>(graph.Num(guide, "frame_idx", 0));
-    if (graph.LinkOf(guide, "audio"))
-      throw NodeFailure(guide, "unsupported_value",
-                        "audio anchors (MiniMaxH3AddGuide audio) are not "
-                        "supported by gufo H3 yet");
+    if (auto audio = graph.LinkOf(guide, "audio")) {
+      const FileRef file = AudioFile(graph, guide, "audio", *audio);
+      if (task.audio_reference && !(*task.audio_reference == file &&
+                                    task.audio_reference_frame == frame))
+        throw NodeFailure(guide, "unsupported_value",
+                          "gufo H3 takes one audio anchor per video");
+      task.audio_reference = file;
+      task.audio_reference_frame = frame;
+    }
     auto image = graph.LinkOf(guide, "image");
     if (!image)
       continue;
@@ -536,12 +544,31 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
                           "two different last frames");
       task.last_frame = file;
     } else {
-      throw NodeFailure(guide, "unsupported_value",
-                        "intermediate guide frames (frame_idx " +
-                            std::to_string(frame) +
-                            ") are not supported by gufo H3 yet");
+      for (const auto& [at, existing] : task.keyframes)
+        if (at == frame && !(existing == file))
+          throw NodeFailure(
+              guide, "unsupported_value",
+              "two different guide images at frame " + std::to_string(frame));
+      task.keyframes.emplace_back(frame, file);
     }
   }
+  std::sort(task.keyframes.begin(), task.keyframes.end(),
+            [&](const auto& a, const auto& b) {
+              const auto absolute = [&](int f) {
+                return f < 0 ? task.frames + f : f;
+              };
+              return absolute(a.first) < absolute(b.first);
+            });
+  task.keyframes.erase(
+      std::unique(task.keyframes.begin(), task.keyframes.end()),
+      task.keyframes.end());
+  const std::size_t anchors = task.keyframes.size() +
+                              (task.first_frame ? 1 : 0) +
+                              (task.last_frame ? 1 : 0);
+  if (anchors > 8)
+    throw NodeFailure(video, "unsupported_value",
+                      "gufo H3 takes at most 8 guide images including the "
+                      "first and last frame");
   const ModelChain chain = FollowModel(graph, sampler);
   for (const auto& [name, strength] : chain.loras) {
     if (Lower(name).find("turbo") == std::string::npos)
@@ -827,6 +854,8 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["lora_strength"] = *task.lora_strength;
     if (task.interpolate > 1)
       gufo["interpolate"] = task.interpolate;
+    if (task.audio_reference)
+      gufo["audio_reference_frame"] = task.audio_reference_frame;
   } else {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);

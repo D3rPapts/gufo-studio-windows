@@ -151,11 +151,18 @@ def serve_fake_worker(argv):
                 return self.send(200, make_wav(), "audio/wav")
             if path == "/v1/videos":
                 fields = json.loads(raw)
-                for key in ("first_frame", "last_frame"):
+                def describe(url):
+                    # Images by pixel size, audio by hash.
+                    prefix, _, data = url.partition(",")
+                    raw = base64.b64decode(data)
+                    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+                        return prefix + ",%dx%d" % png_size(raw)
+                    return prefix + "," + hashlib.sha256(raw).hexdigest()
+                for key in ("first_frame", "last_frame", "audio_reference"):
                     if key in fields:
-                        prefix, _, data = fields[key].partition(",")
-                        fields[key] = prefix + "," + hashlib.sha256(
-                            base64.b64decode(data)).hexdigest()
+                        fields[key] = describe(fields[key])
+                for keyframe in fields.get("gufo", {}).get("keyframes", []):
+                    keyframe["image"] = describe(keyframe["image"])
                 log({"path": path, "fields": fields})
                 video_id = "video_%d" % (len(videos) + 1)
                 videos[video_id] = b"FAKEMP4-" + model.encode()
@@ -315,7 +322,7 @@ def clone_graph(reference):
     }
 
 
-def h3_graph(first, last, width=512, height=512, rife=0):
+def h3_graph(first, last, width=512, height=512, rife=0, middle=None, audio=None):
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "strength_model": 1.0}},
@@ -330,6 +337,17 @@ def h3_graph(first, last, width=512, height=512, rife=0):
         "57": {"class_type": "CreateVideo", "inputs": {"images": ["32", 0], "fps": 24}},
         "58": {"class_type": "SaveVideo", "inputs": {"video": ["57", 0], "filename_prefix": "film/clips/shot01", "format": "mp4", "codec": "h264"}},
     }
+    if middle or audio:
+        positive = ["21", 0]
+        if middle:
+            graph["12"] = {"class_type": "LoadImage", "inputs": {"image": middle}}
+            graph["23"] = {"class_type": "MiniMaxH3AddGuide", "inputs": {"positive": positive, "latent": ["20", 1], "frame_idx": 60, "vae": ["4", 0], "image": ["12", 0]}}
+            positive = ["23", 0]
+        if audio:
+            graph["13"] = {"class_type": "LoadAudio", "inputs": {"audio": audio}}
+            graph["24"] = {"class_type": "MiniMaxH3AddGuide", "inputs": {"positive": positive, "latent": ["20", 1], "frame_idx": 0, "audio": ["13", 0]}}
+            positive = ["24", 0]
+        graph["30"]["inputs"]["positive"] = positive
     if rife:
         graph["40"] = {"class_type": "RIFE VFI", "inputs": {"ckpt_name": "rife47.pth", "frames": ["32", 0], "clear_cache_after_n_frames": 10, "multiplier": rife, "fast_mode": True, "ensemble": True, "scale_factor": 1.0, "dtype": "float32", "torch_compile": False, "batch_size": 1}}
         graph["57"]["inputs"] = {"images": ["40", 0], "fps": 24 * rife}
@@ -526,7 +544,7 @@ def check_speech(router, audio_ext):
         assert len(data) == 44 + 5 * 6000 * 2, len(data)
 
 
-def check_video(router):
+def check_video(router, stretched):
     entry = router.run(h3_graph("ref.png", "ref (1).png"))
     video = entry["outputs"]["58"]
     assert video["animated"] == [True], video
@@ -538,14 +556,24 @@ def check_video(router):
     assert fields["model"] == "minimax-h3" and fields["size"] == "512x512", fields
     assert fields["gufo"] == {"seed": 7, "steps": 8, "frames": 124, "lora": "turbo"}, fields
     assert fields["seconds"] == 6
-    png_hash = hashlib.sha256(make_png(64, 48)).hexdigest()
-    assert fields["first_frame"] == "data:image/png;base64," + png_hash
-    assert fields["last_frame"].startswith("data:image/png;base64,")
-    assert fields["last_frame"] != fields["first_frame"]
+    # ComfyUI stretches guide images to the canvas: the adapter does too (ffmpeg).
+    size = "512x512" if stretched else "64x48"
+    assert fields["first_frame"] == "data:image/png;base64," + size, fields
+    assert fields["last_frame"] == "data:image/png;base64," + size, fields
     entry = router.run(h3_graph("ref.png", "ref (1).png", rife=4))
     fields = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]["fields"]
     assert fields["gufo"]["interpolate"] == 4, fields
     assert entry["outputs"]["58"]["images"][0]["filename"] == "shot01_00002_.mp4"
+    # 832x512, an intermediate guide image and a voice line as audio anchor.
+    router.run(h3_graph("ref.png", "ref (1).png", 832, 512, middle="ref.png", audio="voice.wav"))
+    fields = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]["fields"]
+    assert fields["size"] == "832x512", fields
+    size = "832x512" if stretched else "64x48"
+    assert fields["gufo"]["keyframes"] == [
+        {"frame": 60, "image": "data:image/png;base64," + size}], fields
+    assert fields["audio_reference"] == ("data:audio/wav;base64," +
+                                         hashlib.sha256(make_wav()).hexdigest()), fields
+    assert fields["gufo"]["audio_reference_frame"] == 0, fields
 
 
 def check_errors(router):
@@ -557,8 +585,8 @@ def check_errors(router):
     assert "FancyUpscaler (node 9)" in body["error"]["message"], body
     assert "port pending" in body["error"]["message"], body
     assert set(body["node_errors"]) == {"9", "10"}, body
-    status, body = router.json("POST", "/prompt", {"prompt": h3_graph("ref.png", "ref.png", 832, 512)})
-    assert status == 400 and "832x512" in body["error"]["message"], body
+    status, body = router.json("POST", "/prompt", {"prompt": h3_graph("ref.png", "ref.png", 840, 512)})
+    assert status == 400 and "840x512" in body["error"]["message"], body
     status, body = router.json("POST", "/prompt", {"prompt": qwen_graph(refs=["missing.png"])})
     assert status == 400 and "missing.png" in body["error"]["message"], body
     status, body = router.json("POST", "/prompt", {"no": "prompt"})
@@ -632,7 +660,7 @@ def main():
         check_qwen(router)
         check_qwen_references(router)
         check_speech(router, "flac" if ffmpeg else "wav")
-        check_video(router)
+        check_video(router, bool(ffmpeg))
         check_errors(router)
         check_websocket(router)
         remaining = check_queue_history_free(router)
