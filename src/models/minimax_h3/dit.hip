@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -30,7 +31,26 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
+// Pinned staging per block loader: 32 MiB keep four 8 MiB unbuffered reads
+// in flight. Tuning hooks: GUFO_H3_LOAD_STAGING_MB, GUFO_H3_LOAD_READERS
+// (parallel readers per chunk, default 4).
+constexpr std::size_t kWeightStagingBytes = 32ULL << 20U;
+
+std::size_t EnvSize(const char* name, std::size_t fallback) {
+  const char* value = std::getenv(name);
+  const long long parsed = value == nullptr ? 0 : std::atoll(value);
+  return parsed > 0 ? static_cast<std::size_t>(parsed) : fallback;
+}
+std::size_t WeightStagingBytes() {
+  static const std::size_t bytes =
+      EnvSize("GUFO_H3_LOAD_STAGING_MB", kWeightStagingBytes >> 20U) << 20U;
+  return bytes;
+}
+unsigned WeightReaders() {
+  static const auto readers =
+      static_cast<unsigned>(EnvSize("GUFO_H3_LOAD_READERS", 4));
+  return readers;
+}
 constexpr std::size_t kSector = 4096;
 // Sector slack before and after a staged chunk (see LoadWeight).
 constexpr std::size_t kWeightStagingSlack = 2U * kSector;
@@ -297,8 +317,8 @@ bool LoadWeight(const ModelInventory& inventory,
     const std::uint64_t aligned = position / kSector * kSector;
     const auto lead = static_cast<std::size_t>(position - aligned);
     const std::size_t span = (lead + chunk + kSector - 1U) / kSector * kSector;
-    const std::size_t read_bytes =
-        platform::ReadFileParallel(file, staging, span, aligned);
+    const std::size_t read_bytes = platform::ReadFileParallel(
+        file, staging, span, aligned, WeightReaders());
     if (read_bytes < lead + chunk) {
       SetError(error,
                "short read loading MiniMax H3 DiT tensor " + descriptor.name);
@@ -783,9 +803,9 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     status = hipEventCreate(&impl->stop_event);
   }
   if (status == hipSuccess) {
-    status =
-        hipHostMalloc(&impl->staging, kWeightStagingBytes + kWeightStagingSlack,
-                      hipHostMallocDefault);
+    status = hipHostMalloc(&impl->staging,
+                           WeightStagingBytes() + kWeightStagingSlack,
+                           hipHostMallocDefault);
   }
   if (status != hipSuccess) {
     SetError(error, HipError("create MiniMax H3 DiT resources", status));
@@ -835,7 +855,7 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       }};
   for (const auto& [descriptor, weight] : weights) {
     if (!LoadWeight(inventory, *descriptor, impl->device, impl->stream,
-                    impl->staging, kWeightStagingBytes, cancellation, weight,
+                    impl->staging, WeightStagingBytes(), cancellation, weight,
                     error)) {
       return nullptr;
     }

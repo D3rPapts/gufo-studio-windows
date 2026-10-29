@@ -34,6 +34,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
+constexpr std::size_t kTensorSector = 4096;
+constexpr std::size_t kTensorStagingSlack = 2U * kTensorSector;
 constexpr std::size_t kTimeInputWidth = 256;
 constexpr std::size_t kTimeHiddenWidth = 5376;
 constexpr std::size_t kTimeOutputWidth = 2688;
@@ -231,6 +233,29 @@ bool LoadTensor(const ModelInventory& inventory,
     }
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
     std::size_t read_bytes = 0;
+    std::size_t lead = 0;
+    // Each chunk is read as its sector-aligned superset with unbuffered
+    // parallel readers (the staging buffer has kTensorStagingSlack spare
+    // bytes). GUFO_H3_PARALLEL_TENSOR_READ=0 keeps one buffered stream.
+    static const bool parallel_read = [] {
+      const char* value = std::getenv("GUFO_H3_PARALLEL_TENSOR_READ");
+      return value == nullptr || std::atoi(value) != 0;
+    }();
+    if (parallel_read) {
+      const std::uint64_t position = descriptor.file_offset + copied;
+      const std::uint64_t aligned = position / kTensorSector * kTensorSector;
+      lead = static_cast<std::size_t>(position - aligned);
+      const std::size_t span =
+          (lead + chunk + kTensorSector - 1U) / kTensorSector * kTensorSector;
+      if (platform::ReadFileParallel(file, staging, span, aligned) <
+          lead + chunk) {
+        SetError(error,
+                 "short read loading MiniMax H3 tensor " + descriptor.name);
+        success = false;
+        break;
+      }
+      read_bytes = chunk;
+    }
     while (read_bytes < chunk) {
       const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
@@ -249,7 +274,8 @@ bool LoadTensor(const ModelInventory& inventory,
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess) {
       status = hipMemcpyAsync(static_cast<std::byte*>(output->data()) + copied,
-                              staging, chunk, hipMemcpyHostToDevice, stream);
+                              static_cast<const std::byte*>(staging) + lead,
+                              chunk, hipMemcpyHostToDevice, stream);
     }
     if (status == hipSuccess) {
       status = hipStreamSynchronize(stream);
@@ -1249,9 +1275,20 @@ struct DenoiserSession::Impl {
           }
           return worker_result;
         };
-        auto second_worker = std::async(std::launch::async, worker);
-        WorkerResult first = worker();
-        WorkerResult second = second_worker.get();
+        // Four block loaders beside the AdaLN precompute keep the disk busy
+        // (GUFO_H3_LOAD_WORKERS overrides, 1..8).
+        const char* workers_value = std::getenv("GUFO_H3_LOAD_WORKERS");
+        const int worker_count = std::clamp(
+            workers_value == nullptr ? 4 : std::atoi(workers_value), 1, 8);
+        std::vector<std::future<WorkerResult>> others;
+        for (int index = 1; index < worker_count; ++index) {
+          others.push_back(std::async(std::launch::async, worker));
+        }
+        std::vector<WorkerResult> workers;
+        workers.push_back(worker());
+        for (auto& other : others) {
+          workers.push_back(other.get());
+        }
         result.sessions.resize(kDitBlocks);
         const auto merge = [&](WorkerResult* worker_result) {
           if (result.error.empty() && !worker_result->error.empty()) {
@@ -1266,8 +1303,9 @@ struct DenoiserSession::Impl {
             result.sessions[block] = std::move(session);
           }
         };
-        merge(&first);
-        merge(&second);
+        for (WorkerResult& worker_result : workers) {
+          merge(&worker_result);
+        }
         result.load_ms = Milliseconds(load_begin, Clock::now());
         return result;
       });
@@ -1840,8 +1878,9 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   hipError_t status =
       hipStreamCreateWithFlags(&impl->stream, hipStreamNonBlocking);
   if (status == hipSuccess) {
-    status = hipHostMalloc(&impl->staging, kWeightStagingBytes,
-                           hipHostMallocDefault);
+    status =
+        hipHostMalloc(&impl->staging, kWeightStagingBytes + kTensorStagingSlack,
+                      hipHostMallocDefault);
   }
   if (status != hipSuccess) {
     SetError(error, HipError("create MiniMax H3 denoiser resources", status));
