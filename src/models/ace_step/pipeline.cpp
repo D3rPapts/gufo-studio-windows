@@ -155,7 +155,7 @@ struct MusicPipeline::Impl {
   std::unique_ptr<TextEncoder> text;
   std::unique_ptr<Dit> dit;
   std::unique_ptr<VaeDecoder> vae;
-  std::unique_ptr<CodeLm> lm;
+  std::filesystem::path lm_path, dit_path;
   std::vector<float> silence;  // [frames, 64]
   int silence_frames{0};
 
@@ -210,11 +210,10 @@ std::unique_ptr<MusicPipeline> MusicPipeline::Load(const ModelPaths& paths,
   impl->vae = VaeDecoder::Load(paths.vae, error);
   if (!impl->vae)
     return nullptr;
-  if (!paths.lm.empty()) {
-    impl->lm = CodeLm::Load(paths.lm, error);
-    if (!impl->lm)
-      return nullptr;
-  }
+  // The 8.4 GB LM is loaded per request and released before the DiT runs,
+  // so only one large model holds device memory at a time.
+  impl->lm_path = paths.lm;
+  impl->dit_path = paths.dit;
   return std::unique_ptr<MusicPipeline>(new MusicPipeline(std::move(impl)));
 }
 
@@ -257,19 +256,20 @@ bool MusicPipeline::Generate(const MusicRequest& request,
   tm.text_seconds = Since(start);
   if (!report(0.05, "conditions"))
     return Fail(error, "cancelled");
-  start = std::chrono::steady_clock::now();
-  const auto timbre = m.Silence(kTimbreFrames);
-  if (!m.dit->EncodeConditions(text, tm.text_tokens, lyric, tm.lyric_tokens,
-                               timbre, kTimbreFrames, &conditions, error))
-    return false;
   const int frames = static_cast<int>(
       std::lround(request.duration * kSampleRate / kSamplesPerFrame));
   tm.frames = frames;
   // Source latents: the 5 Hz LM's planned audio codes through the
   // detokenizer, or silence (plain text-to-music); all-ones chunk mask.
-  std::vector<float> source;
-  if (m.lm != nullptr && request.audio_codes) {
+  // The LM and the DiT never hold device memory at the same time.
+  std::vector<int> codes;
+  const bool plan = !m.lm_path.empty() && request.audio_codes;
+  if (plan) {
     const auto lm_start = std::chrono::steady_clock::now();
+    m.dit.reset();
+    auto lm = CodeLm::Load(m.lm_path, error);
+    if (!lm)
+      return false;
     std::vector<std::uint32_t> cond, uncond;
     try {
       cond = m.tokenizer->Encode(MusicLmPrompt(request));
@@ -283,17 +283,31 @@ bool MusicPipeline::Generate(const MusicRequest& request,
     sampling.top_p = request.lm_top_p;
     sampling.seed = request.seed;
     const int count = static_cast<int>(request.duration * 5);
-    std::vector<int> codes;
-    if (!m.lm->Generate(
+    if (!lm->Generate(
             cond, uncond, count, sampling, &codes,
             [&](int done) {
               return report(0.05 + 0.4 * done / std::max(count, 1), "codes");
             },
-            error) ||
-        !m.dit->CodeHints(codes, frames, &source, error))
+            error))
       return false;
+    lm.reset();
     tm.codes = count;
     tm.lm_seconds = Since(lm_start);
+  }
+  start = std::chrono::steady_clock::now();
+  if (m.dit == nullptr) {
+    m.dit = Dit::Load(m.dit_path, error);
+    if (!m.dit)
+      return false;
+  }
+  const auto timbre = m.Silence(kTimbreFrames);
+  if (!m.dit->EncodeConditions(text, tm.text_tokens, lyric, tm.lyric_tokens,
+                               timbre, kTimbreFrames, &conditions, error))
+    return false;
+  std::vector<float> source;
+  if (plan) {
+    if (!m.dit->CodeHints(codes, frames, &source, error))
+      return false;
   } else {
     source = m.Silence(frames);
   }

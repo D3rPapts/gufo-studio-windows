@@ -5,6 +5,7 @@
 //   gufo-ace-check --oracle DIR --case N --text qwen_0.6b_ace15.safetensors
 //       --dit acestep_v1.5_xl_turbo_bf16.safetensors --tokenizer tokenizer.json
 //       [--stages tokens,text,cond,v0,steps]
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -285,6 +286,19 @@ int main(int argc, char** argv) {
         "lm cfg distribution: KL %.4f, overlap %.4f, |cond-uncond| "
         "%.2f vs |cond error| %.2f\n",
         kl, overlap, std::sqrt(diff), std::sqrt(err));
+    for (const std::vector<float>* values :
+         {static_cast<const std::vector<float>*>(&cfg), &want_cfg}) {
+      std::vector<int> order(values->size());
+      for (std::size_t i = 0; i < order.size(); ++i)
+        order[i] = static_cast<int>(i);
+      std::partial_sort(
+          order.begin(), order.begin() + 5, order.end(),
+          [&](int a, int b) { return (*values)[a] > (*values)[b]; });
+      std::printf("lm cfg top5 %s:", values == &cfg ? "gufo  " : "oracle");
+      for (int i = 0; i < 5; ++i)
+        std::printf(" %d(%.1f)", order[i], (*values)[order[i]]);
+      std::printf("\n");
+    }
     std::printf("lm cfg sampling: %.1f codes/s (2 sequences)\n",
                 lm->last_codes_per_second());
   }

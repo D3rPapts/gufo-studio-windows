@@ -270,9 +270,10 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
         {"X-Gufo-Music-Id", job.id},
         {"X-Gufo-Seed", std::to_string(job.request.seed)},
         {"X-Gufo-Generation-Seconds",
-         std::to_string(
-             job.telemetry.text_seconds + job.telemetry.condition_seconds +
-             job.telemetry.diffusion_seconds + job.telemetry.vae_seconds)}};
+         std::to_string(job.telemetry.lm_seconds + job.telemetry.text_seconds +
+                        job.telemetry.condition_seconds +
+                        job.telemetry.diffusion_seconds +
+                        job.telemetry.vae_seconds)}};
     return response;
   }
   json::Value body = json::Value::object();

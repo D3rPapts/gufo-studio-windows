@@ -67,8 +67,9 @@ struct MusicTelemetry {
 using MusicProgress = std::function<bool(double, std::string_view)>;
 
 /// The text-to-music pipeline: tokenizer, Qwen3-0.6B text encoder, condition
-/// encoder, turbo DiT sampler (Euler, no CFG) and the Oobleck VAE. All parts
-/// stay loaded (about 12 GB of device memory).
+/// encoder, turbo DiT sampler (Euler, no CFG) and the Oobleck VAE stay
+/// loaded (about 12 GB of device memory); the optional 5 Hz LM (8.4 GB) is
+/// loaded for each request that plans audio codes and released again.
 class MusicPipeline {
 public:
   [[nodiscard]] static std::unique_ptr<MusicPipeline> Load(
