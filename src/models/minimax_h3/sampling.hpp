@@ -20,6 +20,13 @@ inline constexpr int kH3MaximumFrames = 345;
 inline constexpr int kH3MaximumEvaluations = 1000;
 // Keyframe anchors are held just short of clean for every step.
 inline constexpr float kH3ConditionTime = 0.999F;
+// Audio guides are held exactly clean (the reference's audio condition
+// timestep is 1.0, without noise augmentation).
+inline constexpr float kH3AudioConditionTime = 1.0F;
+// Image guides (first, last, and intermediate keyframes) per request.
+inline constexpr std::size_t kH3MaximumKeyframes = 8;
+// Audio guides per request.
+inline constexpr std::size_t kH3MaximumAudioGuides = 2;
 
 struct TemporalShape {
   int frames{0};
@@ -61,12 +68,17 @@ struct TimeRowSchedule {
   // kNoConditionRow when the request has no keyframes.
   static constexpr std::uint32_t kNoConditionRow = 0xFFFFFFFFU;
   std::uint32_t condition_row{kNoConditionRow};
+  // Time row of the audio guide rows (t = kH3AudioConditionTime), or
+  // kNoConditionRow when the request has no audio guide.
+  std::uint32_t audio_condition_row{kNoConditionRow};
 };
 
 [[nodiscard]] std::optional<TimeRowSchedule> BuildTimeRowSchedule(
     const SigmaSchedule& schedule, std::string* error = nullptr);
 /// Appends the constant keyframe time row after the schedule's rows.
 void AppendConditionTimeRow(TimeRowSchedule* rows) noexcept;
+/// Appends the constant audio guide time row after the schedule's rows.
+void AppendAudioConditionTimeRow(TimeRowSchedule* rows) noexcept;
 
 struct Position3D {
   double temporal{0.0};
@@ -79,6 +91,7 @@ enum class SegmentKind : std::uint8_t {
   kAudioTarget,
   kVideoTarget,
   kVideoCondition,
+  kAudioCondition,
 };
 
 /// Which end of the generated video an FL2VA keyframe is anchored to.
@@ -99,7 +112,10 @@ struct PackedLayout {
   std::vector<Position3D> positions;
   std::vector<LayoutSegment> segments;
   std::size_t text_rows{0};
+  // Image guide rows (one latent frame per keyframe).
   std::size_t condition_rows{0};
+  // Audio guide rows (two stereo tracks per audio latent frame).
+  std::size_t audio_condition_rows{0};
   std::size_t audio_target_rows{0};
   std::size_t video_target_rows{0};
   int video_latent_frames{0};
@@ -119,6 +135,35 @@ struct PackedLayout {
 [[nodiscard]] std::optional<PackedLayout> BuildKeyframeLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const KeyframeAnchor> anchors, std::string* error = nullptr);
+
+/// Pixel frame index of a first/last anchor in a video of `frames` frames.
+[[nodiscard]] int KeyframeAnchorFrame(KeyframeAnchor anchor,
+                                      int frames) noexcept;
+
+/// An audio guide in the packed sequence: `latent_frames` audio latent
+/// frames that start at pixel frame `frame` of the target video.
+struct AudioGuidePlacement {
+  int frame{0};
+  int latent_frames{0};
+};
+
+/// Largest audio guide (in audio latent frames) that still fits behind pixel
+/// frame `frame`, as in the reference (floor(audio_t - 5/3 * frame)); 0 when
+/// the frame is past the end of the audio track.
+[[nodiscard]] int MaximumAudioGuideFrames(const GenerationGeometry& geometry,
+                                          int frame) noexcept;
+
+/// `[text | image guides | audio guides | target audio | target video]` as in
+/// the reference's MiniMaxH3AddGuide: every image guide is one latent frame
+/// of rows on the rotary time `text + 5/3 * frame`, every audio guide's
+/// stereo rows start on that time and advance one per latent frame. Rows of
+/// a full attention sequence may be packed in any order, so the guides are
+/// grouped by modality rather than interleaved per guide.
+[[nodiscard]] std::optional<PackedLayout> BuildGuideLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const int> keyframe_frames,
+    std::span<const AudioGuidePlacement> audio_guides,
+    std::string* error = nullptr);
 [[nodiscard]] std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
     const TimeRowSchedule& time_rows, int step, const PackedLayout& layout,
     std::span<const std::uint8_t> text_tags = {}, std::string* error = nullptr);

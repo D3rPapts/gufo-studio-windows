@@ -11,14 +11,17 @@
 #include <map>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/audio_stream.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
+#include "src/models/minimax_h3/audio_input.hpp"
 
 namespace gufo::server {
 namespace {
@@ -235,7 +238,8 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
 
 bool IsKeyframeField(std::string_view name) {
   return name == "input_reference" || name == "first_frame" ||
-         name == "last_frame";
+         name == "last_frame" || name == "audio_reference" ||
+         name.starts_with("keyframe_");
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -373,6 +377,57 @@ std::optional<std::uint64_t> JsonUnsigned(const json::Value* value) {
     return std::nullopt;
   }
   return static_cast<std::uint64_t>(number);
+}
+
+// A signed exact integer in int range (guide frames count from the end when
+// negative).
+std::optional<int> JsonSignedFrame(const json::Value* value) {
+  if (value == nullptr || !value->is_number()) {
+    return std::nullopt;
+  }
+  const double number = value->as_double(0.5);
+  if (!std::isfinite(number) || std::floor(number) != number ||
+      number < -100000.0 || number > 100000.0) {
+    return std::nullopt;
+  }
+  return static_cast<int>(number);
+}
+
+// An audio guide: a base64 data URL ("data:audio/flac;base64,...") or raw
+// base64 of a WAV/FLAC/Ogg/MP3 file, or the uploaded file's bytes.
+std::optional<minimax_h3::AudioWaveform> ReadGuideAudio(
+    const json::Value* value, const std::string* file, std::string* error) {
+  std::string bytes;
+  if (file != nullptr) {
+    bytes = *file;
+  } else {
+    if (value == nullptr || !value->is_string() || value->str().empty()) {
+      *error = "must be an audio file or a base64 (data URL) string";
+      return std::nullopt;
+    }
+    std::string_view text = value->str();
+    if (text.starts_with("data:")) {
+      const std::size_t marker = text.find(";base64,");
+      if (marker == std::string_view::npos) {
+        *error = "data URL must be base64 encoded";
+        return std::nullopt;
+      }
+      text.remove_prefix(marker + 8);
+    }
+    if (!DecodeAudioBase64(text, minimax_h3::kH3MaximumGuideAudioBytes,
+                           &bytes)) {
+      *error = "is not valid base64 or exceeds 32 MiB";
+      return std::nullopt;
+    }
+  }
+  minimax_h3::AudioWaveform waveform;
+  if (!minimax_h3::DecodeGuideAudio(
+          std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                    bytes.size()),
+          &waveform, error)) {
+    return std::nullopt;
+  }
+  return waveform;
 }
 
 std::optional<int> JsonFrame(const json::Value* value) {
@@ -704,7 +759,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "unsupported_input_reference");
   }
   if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo",
-                             "input_reference", "first_frame", "last_frame"})) {
+                             "input_reference", "first_frame", "last_frame",
+                             "audio_reference"})) {
     return Error(400, "Bad Request",
                  "request contains an unsupported video field",
                  "unsupported_field");
@@ -769,11 +825,14 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::optional<double> lora_strength;
   int interpolate = 1;
   bool preset_explicit = false;
+  int audio_reference_frame = 0;
+  const json::Value* guide_keyframes = nullptr;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
                                      "output_format", "selected_frame", "steps",
-                                     "lora", "lora_strength", "interpolate"})) {
+                                     "lora", "lora_strength", "interpolate",
+                                     "keyframes", "audio_reference_frame"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -845,6 +904,25 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       }
       interpolate = *parsed;
     }
+    if (extension->contains("keyframes")) {
+      guide_keyframes = extension->find("keyframes");
+      if (!guide_keyframes->is_array()) {
+        return Error(400, "Bad Request",
+                     "'gufo.keyframes' must be an array of {\"frame\", "
+                     "\"image\"} objects",
+                     "invalid_keyframes");
+      }
+    }
+    if (extension->contains("audio_reference_frame")) {
+      const auto parsed =
+          JsonSignedFrame(extension->find("audio_reference_frame"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.audio_reference_frame' must be an integer",
+                     "invalid_audio_reference");
+      }
+      audio_reference_frame = *parsed;
+    }
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
       if (!selected_frame.has_value()) {
@@ -860,6 +938,17 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "preset_model_mismatch");
   }
 
+  // "exact" at any other accepted canvas (e.g. FilmStudio's 832x512) is
+  // the "exact-WxH" preset; the fixed presets keep their own sizes.
+  if (preset == "exact" && size != "512x512" && size != "256x256") {
+    if (!minimax_h3::ParseCanvasSize(size).has_value()) {
+      return Error(400, "Bad Request",
+                   "'size' must be WxH with multiples of 32, 256..1344 per "
+                   "side and at most 768*1344 pixels",
+                   "invalid_size");
+    }
+    preset = "exact-" + size;
+  }
   std::string preset_error;
   auto parameters = minimax_h3::ResolveGenerationPreset(preset, &preset_error);
   if (!parameters.has_value()) {
@@ -873,6 +962,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   // FL2VA keyframes: `input_reference` (OpenAI) and `first_frame` are the
   // same first-frame anchor; `last_frame` anchors the end.
   std::vector<minimax_h3::GenerationKeyframe> keyframes;
+  std::string guide_error;
   {
     core::ImageReadBudget budget;
     const auto field = [&](const char* name) -> bool {
@@ -903,6 +993,120 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       }
       keyframes.push_back(std::move(*keyframe));
     }
+    // Guide frames (MiniMaxH3AddGuide image): "gufo.keyframes" entries
+    // {"frame": N, "image": <image>} and multipart files "keyframe_<N>".
+    // Negative frames count from the end (-1 = last frame).
+    const auto add_guide = [&](int frame, const json::Value* value,
+                               const std::string* file,
+                               const std::string& label) -> bool {
+      std::string image_error;
+      auto keyframe =
+          ReadKeyframe(value, file, minimax_h3::KeyframeAnchor::kFirst, budget,
+                       &image_error);
+      if (!keyframe.has_value()) {
+        guide_error = "'" + label + "' " + image_error;
+        return false;
+      }
+      keyframe->frame = frame;
+      keyframe->vision = false;
+      keyframes.push_back(std::move(*keyframe));
+      return true;
+    };
+    if (guide_keyframes != nullptr) {
+      std::size_t index = 0;
+      for (const json::Value& entry : guide_keyframes->items()) {
+        const std::string label =
+            "gufo.keyframes[" + std::to_string(index++) + "]";
+        const auto frame = entry.is_object()
+                               ? JsonSignedFrame(entry.find("frame"))
+                               : std::nullopt;
+        if (!frame.has_value() || !HasOnlyMembers(entry, {"frame", "image"})) {
+          return Error(400, "Bad Request",
+                       "'" + label +
+                           "' must be {\"frame\": integer, \"image\": "
+                           "image}",
+                       "invalid_keyframes");
+        }
+        if (!add_guide(*frame, entry.find("image"), nullptr, label)) {
+          return Error(400, "Bad Request", guide_error, "invalid_keyframes");
+        }
+      }
+    }
+    for (const auto& [name, content] : files) {
+      if (!name.starts_with("keyframe_")) {
+        continue;
+      }
+      int frame = 0;
+      const std::string_view digits = std::string_view(name).substr(9);
+      const auto parsed =
+          std::from_chars(digits.data(), digits.data() + digits.size(), frame);
+      if (digits.empty() || parsed.ec != std::errc{} ||
+          parsed.ptr != digits.data() + digits.size()) {
+        return Error(400, "Bad Request",
+                     "multipart guide frames are named keyframe_<frame>",
+                     "invalid_keyframes");
+      }
+      if (!add_guide(frame, nullptr, &content, name)) {
+        return Error(400, "Bad Request", guide_error, "invalid_keyframes");
+      }
+    }
+  }
+  // One image per pixel frame, inside the video.
+  {
+    std::vector<int> used;
+    for (const minimax_h3::GenerationKeyframe& keyframe : keyframes) {
+      int frame = keyframe.frame == minimax_h3::kKeyframeAtAnchor
+                      ? minimax_h3::KeyframeAnchorFrame(keyframe.anchor,
+                                                        parameters->frames)
+                      : keyframe.frame;
+      if (frame < 0) {
+        frame += parameters->frames;
+      }
+      if (frame < 0 || frame >= parameters->frames) {
+        return Error(400, "Bad Request",
+                     "guide frame " + std::to_string(keyframe.frame) +
+                         " is outside the video's " +
+                         std::to_string(parameters->frames) + " frames",
+                     "invalid_keyframes");
+      }
+      if (std::ranges::find(used, frame) != used.end()) {
+        return Error(400, "Bad Request",
+                     "two images anchor frame " + std::to_string(frame),
+                     "invalid_keyframes");
+      }
+      used.push_back(frame);
+    }
+    if (keyframes.size() > minimax_h3::kH3MaximumKeyframes) {
+      return Error(400, "Bad Request",
+                   "at most " +
+                       std::to_string(minimax_h3::kH3MaximumKeyframes) +
+                       " keyframes and guide frames",
+                   "invalid_keyframes");
+    }
+  }
+  // Audio anchor (MiniMaxH3AddGuide audio): "audio_reference" as a base64
+  // (data URL) string or a multipart file, at "gufo.audio_reference_frame".
+  std::vector<minimax_h3::GenerationAudioGuide> audio_guides;
+  if (body.contains("audio_reference") || files.contains("audio_reference")) {
+    const auto file = files.find("audio_reference");
+    std::string audio_error;
+    auto waveform = ReadGuideAudio(
+        body.find("audio_reference"),
+        file == files.end() ? nullptr : &file->second, &audio_error);
+    if (!waveform.has_value()) {
+      return Error(400, "Bad Request", "'audio_reference' " + audio_error,
+                   "invalid_audio_reference");
+    }
+    int frame = audio_reference_frame;
+    if (frame < 0) {
+      frame += parameters->frames;
+    }
+    if (frame < 0 || frame >= parameters->frames) {
+      return Error(400, "Bad Request",
+                   "'gufo.audio_reference_frame' is outside the video",
+                   "invalid_audio_reference");
+    }
+    audio_guides.push_back({.frame = frame, .waveform = std::move(*waveform)});
   }
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256") {
@@ -944,6 +1148,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .parameters = std::move(*parameters),
       .seed = seed,
       .keyframes = std::move(keyframes),
+      .audio_guides = std::move(audio_guides),
       .lora = lora,
       .lora_strength = lora_strength,
       .steps_explicit = steps.has_value(),

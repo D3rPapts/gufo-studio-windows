@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
@@ -18,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
 
@@ -40,6 +42,40 @@ void Check(bool condition, const std::string& message) {
   if (!condition) {
     Fail(message);
   }
+}
+
+// A 0.25 s mono 16 kHz PCM16 WAV (a 440 Hz tone).
+std::string TinyWav() {
+  constexpr std::uint32_t kRate = 16000;
+  constexpr std::uint32_t kSamples = 4000;
+  std::string wav;
+  const auto u32 = [&](std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+      wav.push_back(static_cast<char>((value >> shift) & 255U));
+    }
+  };
+  const auto u16 = [&](std::uint16_t value) {
+    wav.push_back(static_cast<char>(value & 255U));
+    wav.push_back(static_cast<char>(value >> 8U));
+  };
+  wav += "RIFF";
+  u32(36 + kSamples * 2);
+  wav += "WAVEfmt ";
+  u32(16);
+  u16(1);
+  u16(1);
+  u32(kRate);
+  u32(kRate * 2);
+  u16(2);
+  u16(16);
+  wav += "data";
+  u32(kSamples * 2);
+  for (std::uint32_t index = 0; index < kSamples; ++index) {
+    const double phase = 2.0 * 3.14159265358979 * 440.0 * index / kRate;
+    u16(static_cast<std::uint16_t>(
+        static_cast<std::int16_t>(std::sin(phase) * 8000.0)));
+  }
+  return wav;
 }
 
 std::string NextId() {
@@ -322,6 +358,67 @@ void TestValidation(const std::filesystem::path& root) {
         "registered LoRA selects its file and default steps");
   WaitCompleted(service, CreatedId(keyframed));
 
+  {
+    // A FilmStudio shot: 832x512, first frame, an intermediate and a last
+    // guide frame, and the voice as audio anchor at frame 0.
+    const std::string audio = gufo::server::EncodeAudioBase64(TinyWav());
+    const HttpResponse guided = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","size":"832x512","seconds":"5","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","audio_reference":"data:audio/wav;base64,)" +
+            audio +
+            R"(","gufo":{"lora":"turbo","keyframes":[{"frame":60,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="},{"frame":-1,"image":{"image_url":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}}]}})");
+    Check(guided.status == 202,
+          "832x512 guided request accepted: " + guided.body);
+    runner.WaitForCalls(3);
+    const h3::GenerationRequest guided_generation = runner.latest();
+    Check(guided_generation.parameters.preset == "exact-832x512" &&
+              guided_generation.parameters.internal_width == 832 &&
+              guided_generation.parameters.internal_height == 512 &&
+              guided_generation.parameters.output_width == 832 &&
+              guided_generation.parameters.output_height == 512,
+          "832x512 maps to the exact-832x512 preset");
+    Check(guided_generation.keyframes.size() == 3 &&
+              guided_generation.keyframes[0].vision &&
+              guided_generation.keyframes[1].frame == 60 &&
+              !guided_generation.keyframes[1].vision &&
+              guided_generation.keyframes[2].frame == -1 &&
+              guided_generation.keyframes[1].rgb.size() == 12,
+          "guide frames keep their frame index and skip the vision prompt");
+    Check(guided_generation.audio_guides.size() == 1 &&
+              guided_generation.audio_guides[0].frame == 0 &&
+              guided_generation.audio_guides[0].waveform.sample_rate == 32000 &&
+              guided_generation.audio_guides[0].waveform.channels == 2 &&
+              guided_generation.audio_guides[0].waveform.samples == 8000 &&
+              guided_generation.audio_guides[0].waveform.pcm[100] ==
+                  guided_generation.audio_guides[0].waveform.pcm[8100],
+          "audio_reference decodes to 32 kHz stereo at frame 0");
+    WaitCompleted(service, CreatedId(guided));
+
+    const HttpResponse same_frame = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","first_frame":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg==","gufo":{"keyframes":[{"frame":0,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}]}})");
+    Check(same_frame.status == 400 &&
+              same_frame.body.find("invalid_keyframes") != std::string::npos,
+          "two images cannot anchor the same frame");
+    const HttpResponse outside = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"keyframes":[{"frame":500,"image":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IccFRAwQCgAdRgPBqgMWjQAAAABJRU5ErkJggg=="}]}})");
+    Check(outside.status == 400, "guide frames must lie inside the video");
+    const HttpResponse bad_audio = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","seconds":"5","audio_reference":"bm90IGF1ZGlv"})");
+    Check(
+        bad_audio.status == 400 &&
+            bad_audio.body.find("invalid_audio_reference") != std::string::npos,
+        "audio_reference must decode as audio");
+    const HttpResponse bad_size = Send(
+        service, "POST", "/v1/videos",
+        R"({"model":"minimax-h3","prompt":"x","size":"800x600","seconds":"5"})");
+    Check(bad_size.status == 400 &&
+              bad_size.body.find("invalid_size") != std::string::npos,
+          "sizes off the 32-pixel grid are rejected");
+  }
+
   const HttpResponse unknown_lora = Send(
       service, "POST", "/v1/videos",
       R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"lora":"/etc/passwd"}})");
@@ -407,7 +504,7 @@ void TestValidation(const std::filesystem::path& root) {
            {}, "multipart/form-data; boundary=\"gufo-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
-  runner.WaitForCalls(3);
+  runner.WaitForCalls(4);
   Check(runner.latest().parameters.preset == "fast-384",
         "multipart request preserves the selected H3 mode");
 

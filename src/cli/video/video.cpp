@@ -10,17 +10,20 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
 #include "src/core/image.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/models/minimax_h3/audio_input.hpp"
 #include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
@@ -70,8 +73,33 @@ struct VideoOverrides {
   bool no_mux = false;
   std::filesystem::path first_frame;
   std::filesystem::path last_frame;
+  // --guide-frame FRAME:IMAGE and --audio-guide FILE[@FRAME], repeatable.
+  std::vector<std::pair<int, std::filesystem::path>> guide_frames;
+  std::vector<std::pair<int, std::filesystem::path>> audio_guides;
   std::string lora_strength = "1";
 };
+
+// "FRAME:PATH" (guide frames) or "PATH@FRAME" (audio guides, frame optional).
+bool ParseGuide(std::string_view value, bool frame_first, int* frame,
+                std::filesystem::path* path) {
+  if (frame_first) {
+    const std::size_t colon = value.find(':');
+    if (colon == std::string_view::npos || colon == 0 ||
+        !ParseInteger(value.substr(0, colon), frame)) {
+      return false;
+    }
+    *path = std::filesystem::path(std::string(value.substr(colon + 1)));
+    return !path->empty();
+  }
+  *frame = 0;
+  const std::size_t at = value.rfind('@');
+  if (at != std::string_view::npos && at + 1 < value.size() &&
+      ParseInteger(value.substr(at + 1), frame)) {
+    value = value.substr(0, at);
+  }
+  *path = std::filesystem::path(std::string(value));
+  return !path->empty();
+}
 
 void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
                           VideoOverrides& overrides) {
@@ -92,6 +120,38 @@ void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
   parser.AddOption("", "--last-frame", "IMAGE",
                    "FL2VA: PNG/JPEG/WebP the video ends on", "Keyframes",
                    &overrides.last_frame);
+  parser.AddCustomOption(
+      "", "--guide-frame", "FRAME:IMAGE",
+      "Guide image anchored at a pixel frame (negative counts from the end); "
+      "repeatable",
+      "Keyframes",
+      [&overrides](std::string_view flag, std::string_view value,
+                   std::string* error) {
+        int frame = 0;
+        std::filesystem::path path;
+        if (!ParseGuide(value, true, &frame, &path)) {
+          SetError(error, std::string(flag) + " expects FRAME:IMAGE");
+          return false;
+        }
+        overrides.guide_frames.emplace_back(frame, std::move(path));
+        return true;
+      });
+  parser.AddCustomOption(
+      "", "--audio-guide", "AUDIO[@FRAME]",
+      "Audio (WAV/FLAC/Ogg/MP3) anchored at a pixel frame (default 0), e.g. "
+      "the voice as sound anchor; repeatable",
+      "Keyframes",
+      [&overrides](std::string_view flag, std::string_view value,
+                   std::string* error) {
+        int frame = 0;
+        std::filesystem::path path;
+        if (!ParseGuide(value, false, &frame, &path)) {
+          SetError(error, std::string(flag) + " expects AUDIO[@FRAME]");
+          return false;
+        }
+        overrides.audio_guides.emplace_back(frame, std::move(path));
+        return true;
+      });
   parser.AddOption("", "--lora", "SAFETENSORS",
                    "Transformer LoRA merged at load (e.g. the Turbo LoRA)",
                    "LoRA", &request.lora_path);
@@ -336,6 +396,42 @@ std::optional<VideoCliOptions> ParseVideoOptions(
                           exception.what());
       return std::nullopt;
     }
+  }
+  for (const auto& [frame, path] : overrides.guide_frames) {
+    try {
+      core::Image image = core::DecodeImage(core::ReadImageFile(path));
+      options.request.keyframes.push_back(
+          {.anchor = minimax_h3::KeyframeAnchor::kFirst,
+           .width = static_cast<int>(image.width),
+           .height = static_cast<int>(image.height),
+           .rgb = std::move(image.pixels),
+           .frame = frame,
+           .vision = false});
+    } catch (const std::exception& exception) {
+      SetError(error, "cannot read guide frame " + path.string() + ": " +
+                          exception.what());
+      return std::nullopt;
+    }
+  }
+  for (const auto& [frame, path] : overrides.audio_guides) {
+    std::ifstream input(path, std::ios::binary);
+    const std::vector<std::uint8_t> bytes(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    minimax_h3::GenerationAudioGuide guide{.frame = frame};
+    std::string audio_error;
+    const bool decoded =
+        !bytes.empty() &&
+        minimax_h3::DecodeGuideAudio(bytes, &guide.waveform, &audio_error);
+    if (!decoded) {
+      if (audio_error.empty()) {
+        audio_error = "cannot read file";
+      }
+      SetError(error,
+               "cannot read audio guide " + path.string() + ": " + audio_error);
+      return std::nullopt;
+    }
+    options.request.audio_guides.push_back(std::move(guide));
   }
   try {
     std::size_t used = 0;

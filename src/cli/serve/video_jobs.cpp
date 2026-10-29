@@ -120,7 +120,10 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
   if (model == "minimax-h3") {
     return true;
   }
-  return (model == "minimax-h3-exact" && preset == "exact-512") ||
+  return (model == "minimax-h3-exact" &&
+          (preset == "exact-512" ||
+           (preset.starts_with("exact-") &&
+            minimax_h3::ParseCanvasSize(preset.substr(6)).has_value()))) ||
          (model == "minimax-h3-fast" && preset == "fast-384") ||
          (model == "minimax-h3-aggressive" && preset == "aggressive-320") ||
          (model == "minimax-h3-dev" && preset == "development-256") ||
@@ -145,8 +148,18 @@ bool MatchesOutputContract(const VideoJobRequest& request) {
         parameters.internal_width == 1344 &&
         parameters.internal_height == 768 && parameters.output_width == 1344 &&
         parameters.output_height == 768;
-    return (square || released_full_resolution) && parameters.mux &&
-           parameters.decode_audio && parameters.selected_frames.empty();
+    // "exact-WxH" at any accepted canvas (e.g. 832x512), rendered natively.
+    const auto canvas = minimax_h3::ParseCanvasSize(request.size);
+    const bool exact_canvas =
+        canvas.has_value() && parameters.preset == "exact-" + request.size &&
+        parameters.internal_width == canvas->first &&
+        parameters.internal_height == canvas->second &&
+        parameters.output_width == canvas->first &&
+        parameters.output_height == canvas->second &&
+        (request.model == "minimax-h3" || request.model == "minimax-h3-exact");
+    return (square || released_full_resolution || exact_canvas) &&
+           parameters.mux && parameters.decode_audio &&
+           parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
          parameters.preset == "development-256" &&
@@ -556,7 +569,8 @@ struct VideoJobService::Impl {
                       ResolveWan22DurationFrames(job->snapshot.seconds)
                 : ((job->snapshot.output_format == "mp4" &&
                     (job->snapshot.size == "512x512" ||
-                     job->snapshot.size == "1344x768")) ||
+                     job->snapshot.size == "1344x768" ||
+                     minimax_h3::ParseCanvasSize(job->snapshot.size))) ||
                    (job->snapshot.output_format == "ppm" &&
                     job->snapshot.size == "256x256")) &&
                       IsH3Model(job->snapshot.model) &&
@@ -708,7 +722,8 @@ struct VideoJobService::Impl {
               " frames=" + std::to_string(job->request.parameters.frames) +
               " steps=" + std::to_string(job->request.parameters.evaluations) +
               " seed=" + std::to_string(job->request.seed) + " keyframes=" +
-              std::to_string(job->request.keyframes.size()) + " lora=" +
+              std::to_string(job->request.keyframes.size()) + " audio_guides=" +
+              std::to_string(job->request.audio_guides.size()) + " lora=" +
               (job->request.lora.empty() ? "none" : job->request.lora) +
               (job->request.first_frame.empty()
                    ? std::string()
@@ -728,6 +743,7 @@ struct VideoJobService::Impl {
           .seed = job->request.seed,
           .parameters = job->request.parameters,
           .keyframes = std::move(job->request.keyframes),
+          .audio_guides = std::move(job->request.audio_guides),
           .lora_path = {},
           .lora_strength = 1.0F,
           .vision_projector = options.vision_projector,
@@ -982,7 +998,8 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
         height != request.parameters.output_height || !frames ||
         *frames != request.parameters.frames ||
         !ValidateWan22Parameters(request.parameters, nullptr) ||
-        !request.keyframes.empty() || !request.lora.empty() ||
+        !request.keyframes.empty() || !request.audio_guides.empty() ||
+        !request.lora.empty() ||
         request.first_frame.size() !=
             static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
                 static_cast<std::size_t>(

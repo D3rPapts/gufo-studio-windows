@@ -607,6 +607,76 @@ inline void LaunchClipAndReorder(const float* input, float* channel_major,
                      0, stream, input, channel_major, samples);
 }
 
+// Encoder (DAC) Snake1d: x + 1 / (alpha + 1e-9) * sin(alpha * x)^2 with one
+// alpha per channel; time-major [length][channels].
+static __global__ void SnakeKernel(const float* input, const float* alpha,
+                                   float* output, std::size_t elements,
+                                   std::uint32_t channels) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) {
+    return;
+  }
+  const float a = alpha[index % channels];
+  const float x = input[index];
+  const float s = sinf(a * x);
+  output[index] = x + s * s / (a + 1.0e-9F);
+}
+
+inline void LaunchSnake(const float* input, const float* alpha, float* output,
+                        std::size_t elements, std::uint32_t channels,
+                        hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(SnakeKernel, dim3((elements + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, input, alpha, output, elements,
+                     channels);
+}
+
+// im2col for a strided, dilated, zero-padded Conv1d over one time-major
+// sequence [input_length][input_channels]; writes the rows of output times
+// [output_begin, output_begin + output_count) as [row][channel][tap].
+static __global__ void StridedIm2ColKernel(
+    const float* input, float* columns, std::uint32_t input_length,
+    std::uint32_t input_channels, std::uint32_t output_begin,
+    std::uint32_t output_count, std::uint32_t kernel, std::uint32_t stride,
+    std::uint32_t padding, std::uint32_t dilation) {
+  const std::size_t count =
+      static_cast<std::size_t>(output_count) * input_channels * kernel;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const std::uint32_t tap = static_cast<std::uint32_t>(index % kernel);
+  const std::size_t remaining = index / kernel;
+  const std::uint32_t channel =
+      static_cast<std::uint32_t>(remaining % input_channels);
+  const std::uint32_t row =
+      static_cast<std::uint32_t>(remaining / input_channels);
+  const std::int64_t time =
+      static_cast<std::int64_t>(output_begin + row) * stride -
+      static_cast<std::int64_t>(padding) +
+      static_cast<std::int64_t>(tap) * dilation;
+  columns[index] =
+      time < 0 || time >= static_cast<std::int64_t>(input_length)
+          ? 0.0F
+          : input[static_cast<std::size_t>(time) * input_channels + channel];
+}
+
+inline void LaunchStridedIm2Col(
+    const float* input, float* columns, std::uint32_t input_length,
+    std::uint32_t input_channels, std::uint32_t output_begin,
+    std::uint32_t output_count, std::uint32_t kernel, std::uint32_t stride,
+    std::uint32_t padding, std::uint32_t dilation, hipStream_t stream) {
+  const std::size_t count =
+      static_cast<std::size_t>(output_count) * input_channels * kernel;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(
+      StridedIm2ColKernel, dim3((count + kThreads - 1U) / kThreads),
+      dim3(kThreads), 0, stream, input, columns, input_length, input_channels,
+      output_begin, output_count, kernel, stride, padding, dilation);
+}
+
 }  // namespace gufo::minimax_h3::audio_vae_ops
 
 #endif  // GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_HIP_HPP_

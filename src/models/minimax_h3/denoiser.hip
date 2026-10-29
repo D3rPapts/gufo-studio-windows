@@ -653,6 +653,7 @@ struct DenoiserSession::Impl {
   std::vector<float> video_rows_host;
   std::vector<float> audio_rows_host;
   std::vector<float> condition_rows_host;
+  std::vector<float> audio_condition_rows_host;
   const LoraAdapter* lora{nullptr};
   std::vector<std::unique_ptr<DitBlockSession>> blocks;
   std::vector<double> forward_history;
@@ -677,6 +678,7 @@ struct DenoiserSession::Impl {
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
   DeviceBuffer condition_sample;
+  DeviceBuffer audio_condition_sample;
   DeviceBuffer projection_scratch_f32;
   DeviceBuffer hidden_device;
   DeviceBuffer block_row_map;
@@ -998,6 +1000,9 @@ struct DenoiserSession::Impl {
     }
     if (time_rows.condition_row != TimeRowSchedule::kNoConditionRow) {
       times[time_rows.condition_row] = kH3ConditionTime;
+    }
+    if (time_rows.audio_condition_row != TimeRowSchedule::kNoConditionRow) {
+      times[time_rows.audio_condition_row] = kH3AudioConditionTime;
     }
     std::vector<float> features(time_rows.time_rows * kTimeInputWidth);
     for (std::size_t row = 0; row < time_rows.time_rows; ++row) {
@@ -1511,7 +1516,8 @@ struct DenoiserSession::Impl {
     const std::size_t audio_rows = layout.audio_target_rows;
     const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
     const std::size_t maximum_projection_rows =
-        std::max({video_rows, audio_rows, layout.condition_rows});
+        std::max({video_rows, audio_rows, layout.condition_rows,
+                  layout.audio_condition_rows});
     const auto bf16 = [](std::size_t elements) {
       return elements * sizeof(std::uint16_t);
     };
@@ -1547,6 +1553,24 @@ struct DenoiserSession::Impl {
         return false;
       }
     }
+    if (layout.audio_condition_rows != 0) {
+      if (audio_condition_rows_host.size() !=
+              layout.audio_condition_rows * kH3AudioLatentChannels ||
+          !audio_condition_sample.Allocate(
+              audio_condition_rows_host.size() * sizeof(float), error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 audio guide rows differ from the layout";
+        }
+        return false;
+      }
+      const hipError_t status = hipMemcpy(
+          audio_condition_sample.data(), audio_condition_rows_host.data(),
+          audio_condition_sample.bytes(), hipMemcpyHostToDevice);
+      if (status != hipSuccess) {
+        SetError(error, HipError("copy H3 audio guide rows", status));
+        return false;
+      }
+    }
     video_rows_host.resize(video_elements);
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
@@ -1562,8 +1586,9 @@ struct DenoiserSession::Impl {
         &previous_video_velocity_f32,
         &previous_audio_velocity_f32,
     };
-    std::uint64_t bytes =
-        projection_gemm.workspace_bytes() + condition_sample.bytes();
+    std::uint64_t bytes = projection_gemm.workspace_bytes() +
+                          condition_sample.bytes() +
+                          audio_condition_sample.bytes();
     for (const DeviceBuffer* buffer : buffers) {
       bytes += buffer->bytes();
     }
@@ -1621,11 +1646,13 @@ struct DenoiserSession::Impl {
     const auto begin = Clock::now();
     stage_profile::Begin(step, stream);
     const std::size_t condition_offset = layout.text_rows * kDitHiddenSize;
-    const std::size_t audio_offset =
+    const std::size_t audio_condition_offset =
         (layout.text_rows + layout.condition_rows) * kDitHiddenSize;
+    const std::size_t audio_offset = (layout.text_rows + layout.condition_rows +
+                                      layout.audio_condition_rows) *
+                                     kDitHiddenSize;
     const std::size_t video_offset =
-        (layout.text_rows + layout.condition_rows + layout.audio_target_rows) *
-        kDitHiddenSize;
+        audio_offset + layout.audio_target_rows * kDitHiddenSize;
     if (layout.condition_rows != 0) {
       // The keyframe rows never change, but the trunk is carried in place,
       // so their projection is rebuilt with the other inputs every step.
@@ -1640,6 +1667,21 @@ struct DenoiserSession::Impl {
           hidden_device.As<std::uint16_t>() + condition_offset,
           static_cast<std::uint32_t>(layout.condition_rows), kDitHiddenSize,
           stream);
+    }
+    if (layout.audio_condition_rows != 0) {
+      // Audio guide rows: the audio patch projection of the clean guide.
+      if (!projection_gemm.Run(audio_patch_weight.As<float>(),
+                               audio_condition_sample.As<float>(),
+                               projection_scratch_f32.As<float>(),
+                               layout.audio_condition_rows, kDitHiddenSize,
+                               kH3AudioLatentChannels, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
+          hidden_device.As<std::uint16_t>() + audio_condition_offset,
+          static_cast<std::uint32_t>(layout.audio_condition_rows),
+          kDitHiddenSize, stream);
     }
     // Compose the token sequence directly in its first trunk input buffer.
     // Separate projected-token allocations and D2D copies serve no purpose.
@@ -1808,13 +1850,25 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
       (!conditioning.tags.empty() &&
        conditioning.tags.size() != options.text_rows) ||
       conditioning.keyframe_latents.size() !=
-          conditioning.keyframe_anchors.size() ||
+          conditioning.keyframe_frames.size() ||
       IsCancelled(cancellation)) {
     SetError(error, "invalid MiniMax H3 denoiser creation arguments");
     return nullptr;
   }
-  auto layout = BuildKeyframeLayout(options.text_rows, options.geometry,
-                                    conditioning.keyframe_anchors, error);
+  std::vector<AudioGuidePlacement> audio_placements;
+  for (const AudioGuideLatent& guide : conditioning.audio_guides) {
+    if (guide.latent_frames < 1 ||
+        guide.latent.size() != static_cast<std::size_t>(guide.latent_frames) *
+                                   kH3AudioLatentChannels * kH3AudioTracks) {
+      SetError(error, "MiniMax H3 audio guide latent has an invalid shape");
+      return nullptr;
+    }
+    audio_placements.push_back(
+        {.frame = guide.frame, .latent_frames = guide.latent_frames});
+  }
+  auto layout =
+      BuildGuideLayout(options.text_rows, options.geometry,
+                       conditioning.keyframe_frames, audio_placements, error);
   auto schedule = BuildServingSchedule(options.evaluations, error);
   if (!layout || !schedule) {
     return nullptr;
@@ -1823,8 +1877,11 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   if (!time_rows) {
     return nullptr;
   }
-  if (!conditioning.keyframe_anchors.empty()) {
+  if (!conditioning.keyframe_frames.empty()) {
     AppendConditionTimeRow(&*time_rows);
+  }
+  if (!conditioning.audio_guides.empty()) {
+    AppendAudioConditionTimeRow(&*time_rows);
   }
   auto euler_plan = BuildEulerPlan(*schedule, options.reuse_interval, error);
   if (!euler_plan) {
@@ -1864,6 +1921,26 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
       return nullptr;
     }
   }
+  // Audio guide rows in the target audio packing (stereo track major).
+  impl->audio_condition_rows_host.resize(impl->layout.audio_condition_rows *
+                                         kH3AudioLatentChannels);
+  {
+    std::size_t offset = 0;
+    for (const AudioGuideLatent& guide : conditioning.audio_guides) {
+      const std::size_t elements = guide.latent.size();
+      if (offset + elements > impl->audio_condition_rows_host.size() ||
+          !PackAudio(guide.latent, kH3AudioLatentChannels, guide.latent_frames,
+                     std::span(impl->audio_condition_rows_host)
+                         .subspan(offset, elements),
+                     error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 audio guide differs from the layout";
+        }
+        return nullptr;
+      }
+      offset += elements;
+    }
+  }
   impl->text_tags.assign(conditioning.tags.begin(), conditioning.tags.end());
   if (impl->text_tags.empty()) {
     impl->text_tags.assign(options.text_rows, 1);
@@ -1898,11 +1975,12 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   }
   if (std::getenv("GUFO_H3_TRACE") != nullptr) {
     std::fprintf(stderr,
-                 "h3 trace: rows=%zu text=%zu keyframe=%zu audio=%zu "
-                 "video=%zu time_rows=%u\n",
+                 "h3 trace: rows=%zu text=%zu keyframe=%zu audio_guide=%zu "
+                 "audio=%zu video=%zu time_rows=%u\n",
                  impl->layout.rows(), impl->layout.text_rows,
-                 impl->layout.condition_rows, impl->layout.audio_target_rows,
-                 impl->layout.video_target_rows, impl->time_rows.time_rows);
+                 impl->layout.condition_rows, impl->layout.audio_condition_rows,
+                 impl->layout.audio_target_rows, impl->layout.video_target_rows,
+                 impl->time_rows.time_rows);
   }
   Trace("build blocks");
   if (!impl->BuildBlocks(cancellation, error)) {

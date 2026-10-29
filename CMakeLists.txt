@@ -317,6 +317,7 @@ add_library(gufo_core STATIC
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
   src/core/sampling.cpp
+  src/models/minimax_h3/audio_input.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
   src/models/minimax_h3/dit.cpp
@@ -347,7 +348,7 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
   Threads::Threads PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl
-  OpenSSL::Crypto)
+  OpenSSL::Crypto PkgConfig::SNDFILE PkgConfig::SOXR)
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
@@ -1308,6 +1309,13 @@ if (BUILD_TESTING)
     target_compile_definitions(minimax_h3_video_vae_bench PRIVATE
       GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
     target_link_libraries(minimax_h3_video_vae_bench PRIVATE
+      gufo_core hip::host)
+
+    add_executable(minimax_h3_audio_guide_probe
+      tests/models/minimax_h3_audio_guide_probe.cpp)
+    target_compile_definitions(minimax_h3_audio_guide_probe PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_audio_guide_probe PRIVATE
       gufo_core hip::host)
 
     add_executable(minimax_h3_gemm_sweep

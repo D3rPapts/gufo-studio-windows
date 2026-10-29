@@ -34,13 +34,25 @@ struct DenoiserOptions {
   const LoraAdapter* lora{nullptr};
 };
 
+/// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE
+/// posterior mean `[32][2][latent_frames]` that starts at pixel frame
+/// `frame` of the target video. It is held clean for every step.
+struct AudioGuideLatent {
+  int frame{0};
+  int latent_frames{0};
+  std::vector<float> latent;
+};
+
 struct DenoiserConditioning {
   std::span<const std::uint16_t> layer50;
   std::span<const std::uint8_t> tags;
-  // FL2VA keyframes: one normalized, noise-augmented latent frame
-  // (24 x latent_height x latent_width) per anchor, in packed order.
+  // Image guides (FL2VA keyframes and intermediate guide frames): one
+  // normalized, noise-augmented latent frame (24 x latent_height x
+  // latent_width) per guide, in packed order, and the pixel frame each one
+  // is anchored at.
   std::span<const std::vector<float>> keyframe_latents;
-  std::span<const KeyframeAnchor> keyframe_anchors;
+  std::span<const int> keyframe_frames;
+  std::span<const AudioGuideLatent> audio_guides;
 };
 
 struct DenoiserVelocity {

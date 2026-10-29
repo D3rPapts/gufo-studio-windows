@@ -263,6 +263,13 @@ void AppendConditionTimeRow(TimeRowSchedule* rows) noexcept {
   }
 }
 
+void AppendAudioConditionTimeRow(TimeRowSchedule* rows) noexcept {
+  if (rows != nullptr &&
+      rows->audio_condition_row == TimeRowSchedule::kNoConditionRow) {
+    rows->audio_condition_row = rows->time_rows++;
+  }
+}
+
 std::string_view ToString(SegmentKind kind) noexcept {
   switch (kind) {
     case SegmentKind::kText:
@@ -273,6 +280,8 @@ std::string_view ToString(SegmentKind kind) noexcept {
       return "video";
     case SegmentKind::kVideoCondition:
       return "keyframe";
+    case SegmentKind::kAudioCondition:
+      return "audio_guide";
   }
   return "unknown";
 }
@@ -283,9 +292,39 @@ std::optional<PackedLayout> BuildTextOnlyLayout(
   return BuildKeyframeLayout(text_rows, geometry, {}, error);
 }
 
+int KeyframeAnchorFrame(KeyframeAnchor anchor, int frames) noexcept {
+  return anchor == KeyframeAnchor::kFirst ? 0 : std::max(frames - 1, 0);
+}
+
+int MaximumAudioGuideFrames(const GenerationGeometry& geometry,
+                            int frame) noexcept {
+  if (frame < 0 || frame >= geometry.temporal.frames) {
+    return 0;
+  }
+  const double room =
+      static_cast<double>(geometry.temporal.audio_latent_frames) -
+      kFrameRescale * static_cast<double>(frame);
+  return room < 1.0 ? 0 : static_cast<int>(std::floor(room));
+}
+
 std::optional<PackedLayout> BuildKeyframeLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const KeyframeAnchor> anchors, std::string* error) {
+  if (anchors.size() > 2) {
+    SetError(error, "MiniMax H3 accepts at most a first and a last keyframe");
+    return std::nullopt;
+  }
+  std::vector<int> frames;
+  for (const KeyframeAnchor anchor : anchors) {
+    frames.push_back(KeyframeAnchorFrame(anchor, geometry.temporal.frames));
+  }
+  return BuildGuideLayout(text_rows, geometry, frames, {}, error);
+}
+
+std::optional<PackedLayout> BuildGuideLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const int> keyframe_frames,
+    std::span<const AudioGuidePlacement> audio_guides, std::string* error) {
   if (text_rows == 0 || text_rows > std::numeric_limits<std::uint32_t>::max() ||
       geometry.width < kH3CanvasMultiple ||
       geometry.height < kH3CanvasMultiple ||
@@ -321,14 +360,43 @@ std::optional<PackedLayout> BuildKeyframeLayout(
   std::size_t video_rows = 0;
   std::size_t audio_rows = 0;
   std::size_t condition_rows = 0;
-  if (anchors.size() > 2 ||
-      !CheckedMultiply(frame_rows, anchors.size(), &condition_rows) ||
-      text_rows > std::numeric_limits<std::size_t>::max() - condition_rows) {
-    SetError(error, "MiniMax H3 accepts at most a first and a last keyframe");
+  if (keyframe_frames.size() > kH3MaximumKeyframes ||
+      audio_guides.size() > kH3MaximumAudioGuides) {
+    SetError(error,
+             "MiniMax H3 accepts at most " +
+                 std::to_string(kH3MaximumKeyframes) + " image guides and " +
+                 std::to_string(kH3MaximumAudioGuides) + " audio guides");
+    return std::nullopt;
+  }
+  for (const int frame : keyframe_frames) {
+    if (frame < 0 || frame >= geometry.temporal.frames) {
+      SetError(error, "MiniMax H3 image guide frame " + std::to_string(frame) +
+                          " is outside the video's " +
+                          std::to_string(geometry.temporal.frames) + " frames");
+      return std::nullopt;
+    }
+  }
+  std::size_t audio_condition_rows = 0;
+  for (const AudioGuidePlacement& guide : audio_guides) {
+    if (guide.latent_frames < 1 ||
+        guide.latent_frames > MaximumAudioGuideFrames(geometry, guide.frame)) {
+      SetError(error, "MiniMax H3 audio guide at frame " +
+                          std::to_string(guide.frame) +
+                          " does not fit in the video's audio track");
+      return std::nullopt;
+    }
+    audio_condition_rows += 2U * static_cast<std::size_t>(guide.latent_frames);
+  }
+  if (!CheckedMultiply(frame_rows, keyframe_frames.size(), &condition_rows) ||
+      condition_rows >
+          std::numeric_limits<std::size_t>::max() - audio_condition_rows ||
+      text_rows > std::numeric_limits<std::size_t>::max() - condition_rows -
+                      audio_condition_rows) {
+    SetError(error, "MiniMax H3 guide row count overflows");
     return std::nullopt;
   }
   // The overflow checks below run on text plus conditioning rows.
-  text_rows += condition_rows;
+  text_rows += condition_rows + audio_condition_rows;
   if (!CheckedMultiply(
           frame_rows,
           static_cast<std::size_t>(geometry.temporal.video_latent_frames),
@@ -344,11 +412,12 @@ std::optional<PackedLayout> BuildKeyframeLayout(
     SetError(error, "MiniMax H3 packed row count overflows");
     return std::nullopt;
   }
-  text_rows -= condition_rows;
+  text_rows -= condition_rows + audio_condition_rows;
 
   PackedLayout layout;
   layout.text_rows = text_rows;
   layout.condition_rows = condition_rows;
+  layout.audio_condition_rows = audio_condition_rows;
   layout.audio_target_rows = audio_rows;
   layout.video_target_rows = video_rows;
   layout.video_latent_frames = geometry.temporal.video_latent_frames;
@@ -356,9 +425,9 @@ std::optional<PackedLayout> BuildKeyframeLayout(
   layout.latent_width = geometry.latent_width;
   layout.audio_latent_frames = geometry.temporal.audio_latent_frames;
   try {
-    layout.positions.reserve(text_rows + condition_rows + audio_rows +
-                             video_rows);
-    layout.segments.reserve(4);
+    layout.positions.reserve(text_rows + condition_rows + audio_condition_rows +
+                             audio_rows + video_rows);
+    layout.segments.reserve(5);
     for (std::size_t row = 0; row < text_rows; ++row) {
       layout.positions.push_back({static_cast<double>(row), 0.0, 0.0});
     }
@@ -366,21 +435,15 @@ std::optional<PackedLayout> BuildKeyframeLayout(
 
     const std::vector<Position3D> frame =
         FrameGrid(geometry.latent_height, geometry.latent_width);
-    if (!anchors.empty()) {
-      // The reference anchors "last" at text + sum(all spans) - 5/3, which
-      // is not the rotary time of the last generated frame itself.
-      double spans = 0.0;
-      for (int index = 0; index < geometry.temporal.video_latent_frames;
-           ++index) {
-        spans +=
-            kFrameRescale * kFramesPerToken[static_cast<std::size_t>(index) %
-                                            kFramesPerToken.size()];
-      }
-      for (const KeyframeAnchor anchor : anchors) {
-        const double time =
-            anchor == KeyframeAnchor::kFirst
-                ? static_cast<double>(text_rows)
-                : static_cast<double>(text_rows) + spans - kFrameRescale;
+    // Guides count from the target timeline origin: 5/3 rotary units per
+    // pixel frame, one per audio latent frame (the reference's cond_t).
+    const auto guide_time = [text_rows](int frame_index) {
+      return static_cast<double>(text_rows) +
+             kFrameRescale * static_cast<double>(frame_index);
+    };
+    if (!keyframe_frames.empty()) {
+      for (const int frame_index : keyframe_frames) {
+        const double time = guide_time(frame_index);
         for (const Position3D& position : frame) {
           layout.positions.push_back({time, position.height, position.width});
         }
@@ -391,6 +454,19 @@ std::optional<PackedLayout> BuildKeyframeLayout(
     const double low_width = frame.front().width;
     const double high_width =
         frame[static_cast<std::size_t>(geometry.latent_width / 2) - 1].width;
+    if (!audio_guides.empty()) {
+      for (const AudioGuidePlacement& guide : audio_guides) {
+        const double origin = guide_time(guide.frame);
+        for (const double width : {low_width, high_width}) {
+          for (int index = 0; index < guide.latent_frames; ++index) {
+            layout.positions.push_back({origin + index, 0.0, width});
+          }
+        }
+      }
+      const std::size_t begin = text_rows + condition_rows;
+      layout.segments.push_back(
+          {begin, begin + audio_condition_rows, SegmentKind::kAudioCondition});
+    }
     const double cursor = static_cast<double>(text_rows);
     for (int index = 0; index < geometry.temporal.audio_latent_frames;
          ++index) {
@@ -400,7 +476,8 @@ std::optional<PackedLayout> BuildKeyframeLayout(
          ++index) {
       layout.positions.push_back({cursor + index, 0.0, high_width});
     }
-    const std::size_t audio_begin = text_rows + condition_rows;
+    const std::size_t audio_begin =
+        text_rows + condition_rows + audio_condition_rows;
     layout.segments.push_back(
         {audio_begin, audio_begin + audio_rows, SegmentKind::kAudioTarget});
 
@@ -431,7 +508,9 @@ std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
       static_cast<std::size_t>(step) >= time_rows.video_rows.size() ||
       time_rows.video_rows.size() != time_rows.audio_rows.size() ||
       layout.positions.empty() ||
-      layout.segments.size() != (layout.condition_rows == 0 ? 3U : 4U) ||
+      layout.segments.size() !=
+          3U + (layout.condition_rows == 0 ? 0U : 1U) +
+              (layout.audio_condition_rows == 0 ? 0U : 1U) ||
       (!text_tags.empty() && text_tags.size() != layout.text_rows)) {
     SetError(error, "invalid MiniMax H3 modulation row-map arguments");
     return std::nullopt;
@@ -480,6 +559,15 @@ std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
         }
         time_row = time_rows.condition_row;
         modality = 0;
+        break;
+      case SegmentKind::kAudioCondition:
+        if (time_rows.audio_condition_row == TimeRowSchedule::kNoConditionRow) {
+          SetError(error,
+                   "MiniMax H3 audio guide rows need a condition time row");
+          return std::nullopt;
+        }
+        time_row = time_rows.audio_condition_row;
+        modality = 2;
         break;
     }
     const std::uint32_t modulation = time_row * kDitModalities + modality;

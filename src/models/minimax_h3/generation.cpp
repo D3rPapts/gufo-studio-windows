@@ -420,6 +420,41 @@ void Report(GenerationProgress progress, void* opaque, std::string_view phase,
 
 }  // namespace
 
+std::optional<std::pair<int, int>> ParseCanvasSize(std::string_view size) {
+  const std::size_t x = size.find('x');
+  if (x == std::string_view::npos) {
+    return std::nullopt;
+  }
+  int width = 0;
+  int height = 0;
+  const auto parse = [](std::string_view text, int* value) {
+    const auto result =
+        std::from_chars(text.data(), text.data() + text.size(), *value);
+    return !text.empty() && result.ec == std::errc{} &&
+           result.ptr == text.data() + text.size();
+  };
+  if (!parse(size.substr(0, x), &width) ||
+      !parse(size.substr(x + 1), &height) || width < 256 || height < 256 ||
+      width > 1344 || height > 1344 || width % kH3CanvasMultiple != 0 ||
+      height % kH3CanvasMultiple != 0 ||
+      static_cast<std::int64_t>(width) * height > kH3MaximumPixels) {
+    return std::nullopt;
+  }
+  return std::pair{width, height};
+}
+
+namespace {
+
+std::optional<std::pair<int, int>> ParseExactPresetSize(std::string_view name) {
+  constexpr std::string_view kPrefix = "exact-";
+  if (!name.starts_with(kPrefix)) {
+    return std::nullopt;
+  }
+  return ParseCanvasSize(name.substr(kPrefix.size()));
+}
+
+}  // namespace
+
 std::optional<GenerationParameters> ResolveGenerationPreset(
     std::string_view name, std::string* error) {
   GenerationParameters parameters;
@@ -480,10 +515,25 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .decode_audio = false,
                   .mux = false,
                   .selected_frames = {0, 11, 21}};
+  } else if (const auto size = ParseExactPresetSize(name); size.has_value()) {
+    // "exact-WxH": the released exact recipe at any canvas the model accepts
+    // (multiples of 32, 256..1344 per side, at most 768*1344 pixels), e.g.
+    // FilmStudio's 832x512 shots. Frames come from the request duration.
+    parameters = {.preset = "exact-" + std::to_string(size->first) + "x" +
+                            std::to_string(size->second),
+                  .internal_width = size->first,
+                  .internal_height = size->second,
+                  .output_width = size->first,
+                  .output_height = size->second,
+                  .frames = 124,
+                  .evaluations = 49,
+                  .active_blocks = 50,
+                  .reuse_interval = 1,
+                  .selected_frames = {}};
   } else {
     SetError(error,
              "unknown MiniMax H3 preset; expected exact, exact-1344x768, "
-             "fast, aggressive, or dev");
+             "exact-WxH, fast, aggressive, or dev");
     return std::nullopt;
   }
   return parameters;
@@ -643,28 +693,52 @@ bool GenerateTextVideo(const GenerationRequest& request,
     return false;
   }
 
-  // FL2VA keyframes, fitted to the canvas, in packed order (first, last).
-  std::vector<KeyframeAnchor> keyframe_anchors;
+  // FL2VA keyframes and guide frames, fitted to the canvas, in frame order
+  // (first, intermediate guides, last). Only the vision keyframes get a
+  // "<Picture i>" block, numbered in that order.
+  std::vector<int> keyframe_frames;
+  // Owns the fitted pixels; KeyframeImage only views them.
   std::vector<std::vector<std::uint8_t>> canvases;
   std::vector<KeyframeImage> keyframe_images;
+  std::vector<KeyframeImage> vision_images;
   {
-    std::vector<const GenerationKeyframe*> ordered;
-    for (const KeyframeAnchor anchor :
-         {KeyframeAnchor::kFirst, KeyframeAnchor::kLast}) {
-      for (const GenerationKeyframe& keyframe : request.keyframes) {
-        if (keyframe.anchor == anchor) {
-          ordered.push_back(&keyframe);
-        }
+    std::vector<std::pair<int, const GenerationKeyframe*>> ordered;
+    for (const GenerationKeyframe& keyframe : request.keyframes) {
+      int frame =
+          keyframe.frame == kKeyframeAtAnchor
+              ? KeyframeAnchorFrame(keyframe.anchor, geometry->temporal.frames)
+              : keyframe.frame;
+      if (frame < 0 && frame != kKeyframeAtAnchor) {
+        frame += geometry->temporal.frames;
       }
+      if (frame < 0 || frame >= geometry->temporal.frames) {
+        SetError(error,
+                 "MiniMax H3 guide frame " + std::to_string(keyframe.frame) +
+                     " is outside the video's " +
+                     std::to_string(geometry->temporal.frames) + " frames");
+        return false;
+      }
+      ordered.emplace_back(frame, &keyframe);
     }
-    if (ordered.size() != request.keyframes.size() || ordered.size() > 2 ||
-        (ordered.size() == 2 && ordered[0]->anchor == ordered[1]->anchor)) {
-      SetError(error,
-               "MiniMax H3 accepts at most one first and one last "
-               "keyframe");
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto& left, const auto& right) {
+                       return left.first < right.first;
+                     });
+    if (ordered.size() > kH3MaximumKeyframes) {
+      SetError(error, "MiniMax H3 accepts at most " +
+                          std::to_string(kH3MaximumKeyframes) +
+                          " keyframes and guide frames");
       return false;
     }
-    for (const GenerationKeyframe* keyframe : ordered) {
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+      if (ordered[index].first == ordered[index - 1].first) {
+        SetError(error, "MiniMax H3 got two images for frame " +
+                            std::to_string(ordered[index].first));
+        return false;
+      }
+    }
+    canvases.reserve(ordered.size());
+    for (const auto& [frame, keyframe] : ordered) {
       canvases.push_back(FitKeyframeToCanvas(keyframe->rgb, keyframe->width,
                                              keyframe->height, geometry->width,
                                              geometry->height));
@@ -672,13 +746,21 @@ bool GenerateTextVideo(const GenerationRequest& request,
         SetError(error, "MiniMax H3 keyframe is not a valid RGB8 image");
         return false;
       }
-      keyframe_anchors.push_back(keyframe->anchor);
+      keyframe_frames.push_back(frame);
+      const KeyframeImage image{.width = geometry->width,
+                                .height = geometry->height,
+                                .rgb = canvases.back()};
+      if (keyframe->vision) {
+        vision_images.push_back(image);
+      }
+      keyframe_images.push_back(image);
     }
-    for (const auto& canvas : canvases) {
-      keyframe_images.push_back({.width = geometry->width,
-                                 .height = geometry->height,
-                                 .rgb = canvas});
-    }
+  }
+  if (request.audio_guides.size() > kH3MaximumAudioGuides) {
+    SetError(error, "MiniMax H3 accepts at most " +
+                        std::to_string(kH3MaximumAudioGuides) +
+                        " audio guides");
+    return false;
   }
 
   // The FL2VA presentation: per keyframe a "<Picture i>: " label and a
@@ -687,11 +769,11 @@ bool GenerateTextVideo(const GenerationRequest& request,
   // (EncodePromptIsolated); the image block grids follow from the canvas.
   std::vector<PromptVisionBlock> vision_blocks;
   const bool use_vision =
-      !keyframe_images.empty() && !request.vision_projector.empty();
+      !vision_images.empty() && !request.vision_projector.empty();
   const bool isolate_prompt = PromptIsolationEnabled();
   TraceStage("prompt phase start");
   if (use_vision && isolate_prompt) {
-    for (const KeyframeImage& image : keyframe_images) {
+    for (const KeyframeImage& image : vision_images) {
       if (image.width % 32 != 0 || image.height % 32 != 0) {
         SetError(error,
                  "MiniMax H3 keyframe vision needs 32-pixel canvas sides");
@@ -705,7 +787,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   } else if (use_vision) {
     Report(progress, progress_opaque, "vision", 0, 1);
     begin = Clock::now();
-    if (!EncodeKeyframeVision(request.vision_projector, keyframe_images,
+    if (!EncodeKeyframeVision(request.vision_projector, vision_images,
                               cancellation, &vision_blocks, error)) {
       return false;
     }
@@ -760,7 +842,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
         .manifest = request.source_manifest,
         .projector =
             use_vision ? request.vision_projector : std::filesystem::path(),
-        .images = use_vision ? std::span<const KeyframeImage>(keyframe_images)
+        .images = use_vision ? std::span<const KeyframeImage>(vision_images)
                              : std::span<const KeyframeImage>(),
         .tokens = tokens,
         .blocks = vision_blocks};
@@ -817,6 +899,77 @@ bool GenerateTextVideo(const GenerationRequest& request,
     TraceStage("keyframes encoded");
     Report(progress, progress_opaque, "keyframes", 1, 1);
   }
+  // Audio guides: AudioVAE posterior mean, cropped to the audio track that
+  // remains behind the guide's frame (MiniMaxH3AddGuide audio).
+  std::vector<AudioGuideLatent> audio_guides;
+  if (!request.audio_guides.empty()) {
+    Report(progress, progress_opaque, "audio_guides", 0, 1);
+    begin = Clock::now();
+    AudioVaeEncoderTelemetry encoder_telemetry;
+    auto encoder = AudioVaeEncoder::Create(*inventory, cancellation,
+                                           &encoder_telemetry, error);
+    if (encoder == nullptr) {
+      return false;
+    }
+    for (const GenerationAudioGuide& guide : request.audio_guides) {
+      int frame = guide.frame;
+      if (frame < 0) {
+        frame += geometry->temporal.frames;
+      }
+      const int room = MaximumAudioGuideFrames(*geometry, frame);
+      if (room < 1) {
+        SetError(error, "MiniMax H3 audio guide frame " +
+                            std::to_string(guide.frame) +
+                            " is past the end of the video's audio track");
+        return false;
+      }
+      // The encoder's convolutions reach about 11 latent frames ahead and its
+      // attention is causal, so 16 frames of margin keep the kept frames
+      // exact while long clips are not encoded in full.
+      AudioWaveform clip = guide.waveform;
+      const std::size_t keep_samples =
+          static_cast<std::size_t>(room + 16) * kH3AudioVaeHopLength;
+      if (static_cast<std::size_t>(clip.samples) > keep_samples) {
+        std::vector<float> cropped(keep_samples * 2U);
+        for (int track = 0; track < 2; ++track) {
+          std::copy_n(clip.pcm.begin() +
+                          static_cast<std::ptrdiff_t>(track) * clip.samples,
+                      keep_samples,
+                      cropped.begin() +
+                          static_cast<std::ptrdiff_t>(track * keep_samples));
+        }
+        clip.pcm = std::move(cropped);
+        clip.samples = static_cast<int>(keep_samples);
+      }
+      AudioGuideLatent latent{.frame = frame};
+      if (!encoder->Encode(clip, cancellation, &latent.latent,
+                           &latent.latent_frames, &encoder_telemetry, error)) {
+        return false;
+      }
+      if (latent.latent_frames > room) {
+        // Keep the first `room` frames of every [channel][track] row.
+        std::vector<float> kept(static_cast<std::size_t>(room) *
+                                kH3AudioLatentChannels * kH3AudioTracks);
+        for (std::size_t row = 0; row < kH3AudioLatentChannels * kH3AudioTracks;
+             ++row) {
+          std::copy_n(latent.latent.begin() + static_cast<std::ptrdiff_t>(row) *
+                                                  latent.latent_frames,
+                      room,
+                      kept.begin() + static_cast<std::ptrdiff_t>(row) * room);
+        }
+        latent.latent = std::move(kept);
+        latent.latent_frames = room;
+      }
+      local.audio_guide_frames +=
+          static_cast<std::size_t>(latent.latent_frames);
+      audio_guides.push_back(std::move(latent));
+    }
+    encoder.reset();
+    local.audio_guides = audio_guides.size();
+    local.audio_guide_ms = Milliseconds(begin, Clock::now());
+    TraceStage("audio guides encoded");
+    Report(progress, progress_opaque, "audio_guides", 1, 1);
+  }
   std::shared_ptr<const LoraAdapter> lora;
   if (!request.lora_path.empty()) {
     lora = LoraAdapter::Open(request.lora_path, request.lora_strength, error);
@@ -841,7 +994,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
       {.layer50 = embedding.values,
        .tags = tags,
        .keyframe_latents = keyframe_latents,
-       .keyframe_anchors = keyframe_anchors},
+       .keyframe_frames = keyframe_frames,
+       .audio_guides = audio_guides},
       cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;
@@ -981,6 +1135,10 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << "  \"prompt_ms\": " << telemetry.prompt_ms << ",\n"
          << "  \"keyframes\": " << telemetry.keyframes << ",\n"
          << "  \"keyframe_ms\": " << telemetry.keyframe_ms << ",\n"
+         << "  \"audio_guides\": " << telemetry.audio_guides << ",\n"
+         << "  \"audio_guide_frames\": " << telemetry.audio_guide_frames
+         << ",\n"
+         << "  \"audio_guide_ms\": " << telemetry.audio_guide_ms << ",\n"
          << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
          << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"
          << "  \"keyframe_encoder_load_ms\": "

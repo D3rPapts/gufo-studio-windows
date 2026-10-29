@@ -72,8 +72,10 @@ struct VideoJobRequest {
   std::string output_format{"mp4"};
   minimax_h3::GenerationParameters parameters;
   std::uint64_t seed{42};
-  // FL2VA keyframes (decoded RGB8), at most one first and one last.
+  // FL2VA keyframes and guide frames (decoded RGB8), one per pixel frame.
   std::vector<minimax_h3::GenerationKeyframe> keyframes;
+  // Audio guides (decoded 32 kHz stereo), e.g. the voice at frame 0.
+  std::vector<minimax_h3::GenerationAudioGuide> audio_guides;
   // Name of a LoRA registered with the service; empty for none.
   std::string lora;
   std::optional<double> lora_strength;
