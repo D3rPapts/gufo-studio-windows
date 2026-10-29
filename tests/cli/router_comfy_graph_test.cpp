@@ -290,9 +290,14 @@ void TestRife() {
              .find("gufo")
              ->find("interpolate")
              ->as_double() == 4);
-  bool warned = false;
+  // rife49 (FilmStudio) and rife47 are the weights gufo serves: no warning.
   for (const auto& warning : plan.warnings)
-    warned = warned || warning.find("rife49") != std::string::npos;
+    assert(warning.find("rife") == std::string::npos);
+  const comfy::Plan other =
+      PlanOf(Replace(text, "rife49.pth", "rife426.pth").c_str());
+  bool warned = false;
+  for (const auto& warning : other.warnings)
+    warned = warned || warning.find("rife426") != std::string::npos;
   assert(warned);
   // A second, plain image output of the same video conflicts.
   text = Replace(text, " \"41\": {",

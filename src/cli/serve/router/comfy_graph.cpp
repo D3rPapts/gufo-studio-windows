@@ -1093,10 +1093,11 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
           throw NodeFailure(rife.front(), "unsupported_value",
                             "gufo interpolates with a multiplier of 1..8");
         const std::string ckpt = graph.Str(rife.front(), "ckpt_name", "");
-        if (!ckpt.empty() && ckpt != "rife47.pth")
+        // gufo serves RIFE 4.7-architecture weights (rife47 or rife49).
+        if (!ckpt.empty() && ckpt != "rife47.pth" && ckpt != "rife49.pth")
           plan->warnings.push_back("node " + rife.front() +
-                                   ": gufo runs RIFE "
-                                   "4.7 instead of " +
+                                   ": gufo runs its RIFE 4.7/4.9 weights "
+                                   "instead of " +
                                    ckpt);
         if (graph.Num(rife.front(), "scale_factor", 1.0) != 1.0)
           plan->warnings.push_back("node " + rife.front() +
