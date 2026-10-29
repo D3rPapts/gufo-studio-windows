@@ -1296,6 +1296,13 @@ if (BUILD_TESTING)
     target_link_libraries(minimax_h3_video_vae_bench PRIVATE
       gufo_core hip::host)
 
+    add_executable(minimax_h3_gemm_sweep
+      tests/models/minimax_h3_gemm_sweep.hip)
+    target_link_libraries(minimax_h3_gemm_sweep PRIVATE gufo_core hip::host)
+    add_executable(minimax_h3_attention_bench
+      tests/models/minimax_h3_attention_bench.hip)
+    target_link_libraries(minimax_h3_attention_bench PRIVATE gufo_core hip::host)
+
     add_executable(minimax_h3_keyframe_hip_test
       tests/models/minimax_h3_keyframe_hip_test.cpp)
     target_compile_definitions(minimax_h3_keyframe_hip_test PRIVATE

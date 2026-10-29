@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 #include <rocblas/rocblas.h>
 
 #include <algorithm>
@@ -8,12 +9,16 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <hipblaslt/hipblaslt-ext.hpp>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -25,6 +30,7 @@
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/stage_profile.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -61,8 +67,73 @@ constexpr std::size_t kShortAttentionRows = 4'096;
 // rocBLAS database removes an index, validate its default before using it.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
 
+// Tuning hook: GUFO_H3_ROCBLAS_SOLUTIONS="ROWSxCOLUMNS=INDEX/..." pins
+// rocBLAS solutions per projection shape (validated like the defaults).
+std::optional<rocblas_int> SolutionOverride(std::size_t rows,
+                                            std::size_t columns) {
+  const char* value = std::getenv("GUFO_H3_ROCBLAS_SOLUTIONS");
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  const std::string key =
+      std::to_string(rows) + "x" + std::to_string(columns) + "=";
+  const std::string text = value;
+  for (std::size_t begin = 0; begin < text.size();) {
+    std::size_t end = text.find_first_of(",/", begin);
+    if (end == std::string::npos) {
+      end = text.size();
+    }
+    const std::string item = text.substr(begin, end - begin);
+    if (item.starts_with(key)) {
+      return static_cast<rocblas_int>(std::stol(item.substr(key.size())));
+    }
+    begin = end + 1;
+  }
+  return std::nullopt;
+}
+
+// hipBLASLt solutions (TheRock 10.0 library indices) for the DiT shapes
+// where rocBLAS BF16 is slow on gfx1151: the attention output projection
+// and fc2 (rocBLAS 17.7 TFLOPS at K = 14336). The index must support the
+// problem (matmulIsAlgoSupported); otherwise rocBLAS runs the shape.
+// GUFO_H3_DIT_HIPBLASLT="ROWSxCOLUMNS=INDEX/..." overrides; -1 disables.
+std::optional<int> HipblasltSolution(std::size_t rows, std::size_t columns) {
+  if (const char* value = std::getenv("GUFO_H3_DIT_HIPBLASLT")) {
+    const std::string key =
+        std::to_string(rows) + "x" + std::to_string(columns) + "=";
+    const std::string text = value;
+    for (std::size_t begin = 0; begin < text.size();) {
+      std::size_t end = text.find_first_of(",/", begin);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      const std::string item = text.substr(begin, end - begin);
+      if (item.starts_with(key)) {
+        const int index = std::stoi(item.substr(key.size()));
+        return index < 0 ? std::nullopt : std::optional<int>(index);
+      }
+      begin = end + 1;
+    }
+  }
+  if (rows == kDitHiddenSize && columns == kDitAttentionWidth) {
+    return 870;
+  }
+  if (rows == kDitHiddenSize && columns == kDitFeedForwardSize) {
+    return 858;
+  }
+  return std::nullopt;
+}
+
 rocblas_int PinnedBf16Solution(std::size_t batch, std::size_t rows,
                                std::size_t columns) {
+  if (const auto solution = SolutionOverride(rows, columns)) {
+    return *solution;
+  }
+  // TheRock 10.0 Tensile solution, ~5% faster than its default for fc1 at
+  // ~6k rows (validated like any pin).
+  if (rows == kDitFeedForwardSize * 2U && columns == kDitHiddenSize) {
+    return -1162086096;
+  }
   if (batch == 1872) {
     if (rows == 21504 && columns == 5376) {
       return -1162085131;
@@ -353,13 +424,34 @@ bool LoadWeight(const ModelInventory& inventory,
 
 class Bf16Gemm {
 private:
+  // hipBLASLt alternative for one projection shape.
+  struct LtPlan {
+    hipblasLtMatmulDesc_t operation{nullptr};
+    hipblasLtMatrixLayout_t weight_layout{nullptr};
+    hipblasLtMatrixLayout_t input_layout{nullptr};
+    hipblasLtMatrixLayout_t output_layout{nullptr};
+    hipblasLtMatmulAlgo_t algorithm{};
+    std::size_t workspace_bytes{0};
+    ~LtPlan() {
+      if (output_layout != nullptr)
+        (void)hipblasLtMatrixLayoutDestroy(output_layout);
+      if (input_layout != nullptr)
+        (void)hipblasLtMatrixLayoutDestroy(input_layout);
+      if (weight_layout != nullptr)
+        (void)hipblasLtMatrixLayoutDestroy(weight_layout);
+      if (operation != nullptr)
+        (void)hipblasLtMatmulDescDestroy(operation);
+    }
+  };
   struct Plan {
     std::size_t batch;
     std::size_t rows;
     std::size_t columns;
     rocblas_int solution_index;
     bool selected;
+    std::shared_ptr<LtPlan> lt;
   };
+  static constexpr std::size_t kLtWorkspaceBytes = 64ULL << 20U;
 
 public:
   Bf16Gemm() {
@@ -371,6 +463,13 @@ public:
     plans_.reserve(4);
   }
   ~Bf16Gemm() {
+    plans_.clear();
+    if (lt_workspace_ != nullptr) {
+      (void)hipFree(lt_workspace_);
+    }
+    if (lt_handle_ != nullptr) {
+      (void)hipblasLtDestroy(lt_handle_);
+    }
     if (handle_ != nullptr) {
       (void)rocblas_destroy_handle(handle_);
     }
@@ -399,7 +498,11 @@ public:
     }
     if (FindPlan(batch, rows, columns) == nullptr) {
       plans_.push_back({batch, rows, columns,
-                        PinnedBf16Solution(batch, rows, columns), false});
+                        PinnedBf16Solution(batch, rows, columns), false,
+                        nullptr});
+      if (const auto index = HipblasltSolution(rows, columns)) {
+        plans_.back().lt = CreateLtPlan(batch, rows, columns, *index);
+      }
     }
     return true;
   }
@@ -430,6 +533,7 @@ public:
       SetError(error, "cannot prepare deterministic rocBLAS DiT solution");
       return false;
     }
+    stream_ = stream;
     Plan* plan = FindPlan(batch, rows, columns);
     if (plan == nullptr) {
       SetError(error, "rocBLAS BF16 DiT plan lookup failed");
@@ -503,6 +607,7 @@ public:
       SetError(error, "cannot set rocBLAS DiT stream");
       return false;
     }
+    stream_ = stream;
     const rocblas_status status = Execute(weight, input, output, batch, rows,
                                           columns, plan->solution_index);
     if (status != rocblas_status_success) {
@@ -530,6 +635,19 @@ private:
                          rocblas_int solution_index) const {
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
+    for (const Plan& plan : plans_) {
+      if (plan.lt != nullptr && plan.batch == batch && plan.rows == rows &&
+          plan.columns == columns) {
+        const LtPlan& lt = *plan.lt;
+        return hipblasLtMatmul(
+                   lt_handle_, lt.operation, &alpha, weight, lt.weight_layout,
+                   input, lt.input_layout, &beta, output, lt.output_layout,
+                   output, lt.output_layout, &lt.algorithm, lt_workspace_,
+                   lt.workspace_bytes, stream_) == HIPBLAS_STATUS_SUCCESS
+                   ? rocblas_status_success
+                   : rocblas_status_internal_error;
+      }
+    }
     return rocblas_gemm_ex(
         handle_, rocblas_operation_transpose, rocblas_operation_none,
         static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
@@ -542,7 +660,68 @@ private:
         solution_index, 0);
   }
 
+  // nullptr (rocBLAS runs the shape) when hipBLASLt or the index is
+  // unavailable for this problem.
+  std::shared_ptr<LtPlan> CreateLtPlan(std::size_t batch, std::size_t rows,
+                                       std::size_t columns, int index) {
+    if (lt_handle_ == nullptr) {
+      if (hipblasLtCreate(&lt_handle_) != HIPBLAS_STATUS_SUCCESS) {
+        lt_handle_ = nullptr;
+        return nullptr;
+      }
+      if (hipMalloc(&lt_workspace_, kLtWorkspaceBytes) != hipSuccess) {
+        lt_workspace_ = nullptr;
+        return nullptr;
+      }
+    }
+    if (lt_workspace_ == nullptr) {
+      return nullptr;
+    }
+    auto plan = std::make_shared<LtPlan>();
+    const hipblasOperation_t transpose = HIPBLAS_OP_T;
+    if (hipblasLtMatmulDescCreate(&plan->operation, HIPBLAS_COMPUTE_32F,
+                                  HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(
+            plan->operation, HIPBLASLT_MATMUL_DESC_TRANSA, &transpose,
+            sizeof(transpose)) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&plan->weight_layout, HIP_R_16BF, columns,
+                                    rows, columns) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&plan->input_layout, HIP_R_16BF, columns,
+                                    batch, columns) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&plan->output_layout, HIP_R_16BF, rows,
+                                    batch, rows) != HIPBLAS_STATUS_SUCCESS) {
+      return nullptr;
+    }
+    std::vector<int> indices{index};
+    std::vector<hipblasLtMatmulHeuristicResult_t> results;
+    if (hipblaslt_ext::getAlgosFromIndex(lt_handle_, indices, results) !=
+            HIPBLAS_STATUS_SUCCESS ||
+        results.empty()) {
+      return nullptr;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    std::size_t workspace = 0;
+    if (hipblaslt_ext::matmulIsAlgoSupported(
+            lt_handle_, plan->operation, &alpha, plan->weight_layout,
+            plan->input_layout, &beta, plan->output_layout, plan->output_layout,
+            results.front().algo, workspace) != HIPBLAS_STATUS_SUCCESS ||
+        workspace > kLtWorkspaceBytes) {
+      return nullptr;
+    }
+    plan->algorithm = results.front().algo;
+    plan->workspace_bytes = workspace;
+    if (std::getenv("GUFO_H3_TRACE") != nullptr) {
+      std::fprintf(stderr, "h3 dit gemm: %zux%zu batch %zu hipBLASLt %d\n",
+                   rows, columns, batch, index);
+    }
+    return plan;
+  }
+
   rocblas_handle handle_{nullptr};
+  hipblasLtHandle_t lt_handle_{nullptr};
+  void* lt_workspace_{nullptr};
+  hipStream_t stream_{nullptr};
   std::vector<Plan> plans_;
 };
 
@@ -1323,6 +1502,7 @@ bool DitBlockSession::RunInternal(
     SetError(error, "cannot record MiniMax H3 DiT start event");
     return false;
   }
+  stage_profile::Mark("gap", run_stream);
   if (impl_->native_projections) {
     if (!input_rms_prepared)
       dit_ops::LaunchAttentionRmsInverse(
@@ -1368,6 +1548,7 @@ bool DitBlockSession::RunInternal(
           impl_->modulation_attention.As<std::uint16_t>(), rows, kDitHiddenSize,
           kDitModulationSlots, 0, 1, kDitNormEpsilon, run_stream);
     }
+    stage_profile::Mark("adaln1", run_stream);
     if (!CheckLaunch("H3 DiT attention AdaLN", error) ||
         !snapshot(modulation_attention, impl_->modulation_attention,
                   "snapshot H3 DiT attention modulation") ||
@@ -1378,6 +1559,7 @@ bool DitBlockSession::RunInternal(
                           error)) {
       return false;
     }
+    stage_profile::Mark("qkv_gemm", run_stream);
     dit_ops::LaunchGroupedQkvNormRope(
         impl_->qkv.As<std::uint16_t>(),
         impl_->query_norm.storage.As<std::uint16_t>(),
@@ -1392,6 +1574,7 @@ bool DitBlockSession::RunInternal(
       return false;
     }
   }
+  stage_profile::Mark("qkv_norm_rope", run_stream);
   if (impl_->native_projections) {
     dit_ops::LaunchProjectionAttention(
         impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
@@ -1420,6 +1603,7 @@ bool DitBlockSession::RunInternal(
   }
   if (!CheckLaunch("H3 DiT full SDPA", error))
     return false;
+  stage_profile::Mark("attention", run_stream);
   if (impl_->native_projections) {
     dit_ops::LaunchAttentionOutput(
         impl_->output_weight.storage.As<std::uint16_t>(),
@@ -1434,6 +1618,7 @@ bool DitBlockSession::RunInternal(
                                run_stream, error)) {
     return false;
   }
+  stage_profile::Mark("out_gemm", run_stream);
   if (!snapshot(attention_output, impl_->attention_output,
                 "snapshot H3 DiT attention output")) {
     return false;
@@ -1447,6 +1632,7 @@ bool DitBlockSession::RunInternal(
   if (!CheckLaunch("H3 DiT attention gated residual", error)) {
     return false;
   }
+  stage_profile::Mark("gate1", run_stream);
   if (impl_->native_projections) {
     dit_ops::LaunchPackedMlpAdaLn(
         impl_->gated_attention.As<std::uint16_t>(),
@@ -1465,6 +1651,7 @@ bool DitBlockSession::RunInternal(
   }
   if (!CheckLaunch("H3 DiT MLP AdaLN", error))
     return false;
+  stage_profile::Mark("adaln2", run_stream);
   if (impl_->native_projections) {
     // AdaLN and SwiGLU write directly in the native projection layout.
     // No full gate/up activation tensor or packing copy is retained.
@@ -1479,12 +1666,14 @@ bool DitBlockSession::RunInternal(
                           kDitFeedForwardSize * 2U, kDitHiddenSize, run_stream,
                           error))
       return false;
+    stage_profile::Mark("fc1_gemm", run_stream);
     dit_ops::LaunchSwiGlu(impl_->fc1.As<std::uint16_t>(),
                           impl_->activated.As<std::uint16_t>(), rows,
                           kDitFeedForwardSize, run_stream);
   }
   if (!CheckLaunch("H3 DiT SwiGLU", error))
     return false;
+  stage_profile::Mark("swiglu", run_stream);
   if (impl_->native_projections) {
     dit_ops::LaunchFfnDown(impl_->fc2_weight.storage.As<std::uint16_t>(),
                            impl_->activated.As<std::uint16_t>(),
@@ -1499,6 +1688,7 @@ bool DitBlockSession::RunInternal(
                                run_stream, error)) {
     return false;
   }
+  stage_profile::Mark("fc2_gemm", run_stream);
   if (output_rms_required) {
     dit_ops::LaunchGateRmsInverse(
         impl_->gated_attention.As<std::uint16_t>(),
@@ -1516,6 +1706,7 @@ bool DitBlockSession::RunInternal(
   if (!CheckLaunch("H3 DiT MLP gated residual", error)) {
     return false;
   }
+  stage_profile::Mark("gate2", run_stream);
   const std::uint32_t attention_dispatches =
       impl_->row_parallel_attention ? (rows > kShortAttentionRows ? 2U : 1U)
                                     : 1U;

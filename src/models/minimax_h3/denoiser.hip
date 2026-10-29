@@ -27,6 +27,7 @@
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/stage_profile.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -1618,6 +1619,7 @@ struct DenoiserSession::Impl {
       return false;
     }
     const auto begin = Clock::now();
+    stage_profile::Begin(step, stream);
     const std::size_t condition_offset = layout.text_rows * kDitHiddenSize;
     const std::size_t audio_offset =
         (layout.text_rows + layout.condition_rows) * kDitHiddenSize;
@@ -1675,6 +1677,7 @@ struct DenoiserSession::Impl {
       return false;
     }
 
+    stage_profile::Mark("patch_projections", stream);
     std::uint64_t block_dispatches = 0;
     // A block consumes its input before producing the final gated residual;
     // carry the trunk in place instead of reserving a second full hidden state.
@@ -1733,6 +1736,7 @@ struct DenoiserSession::Impl {
     if (!CheckLaunch("H3 final velocity heads", error)) {
       return false;
     }
+    stage_profile::Mark("final_heads", stream);
     if (read_velocity) {
       if (velocity == nullptr ||
           velocity->video.size() !=
@@ -1756,6 +1760,7 @@ struct DenoiserSession::Impl {
       SetError(error, HipError("synchronize H3 full forward", status));
       return false;
     }
+    stage_profile::End();
     if (read_velocity && (!IsFinite(velocity->video, "video_velocity",
                                     &base_telemetry.first_non_finite) ||
                           !IsFinite(velocity->audio, "audio_velocity",
