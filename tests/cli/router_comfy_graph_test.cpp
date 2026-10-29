@@ -189,20 +189,55 @@ void TestH3() {
   assert(body.find("gufo")->find("steps")->as_double() == 8);
 }
 
-void TestH3Unsupported() {
+void TestH3Guides() {
   std::string text = kH3;
-  // 832x512 is not one of gufo's H3 sizes.
+  // 832x512 (FilmStudio v100) is a gufo H3 size now.
   std::string resized = text;
   resized.replace(resized.find("\"width\": 1344"), 13, "\"width\": 832");
   resized.replace(resized.find("\"height\": 768"), 13, "\"height\": 512");
-  comfy::PlanError error = ErrorOf(resized);
-  assert(error.message.find("832x512") != std::string::npos);
+  const comfy::Plan plan = PlanOf(resized.c_str());
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.width == 832 && video.height == 512);
+  assert(comfy::VideoRequestBody(video).member_str("size") == "832x512");
+  // Sizes outside multiples of 32 / 256..1344 / 768x1344 pixels are a 400.
+  std::string odd = resized;
+  odd.replace(odd.find("\"width\": 832"), 12, "\"width\": 840");
+  comfy::PlanError error = ErrorOf(odd);
+  assert(error.message.find("840x512") != std::string::npos);
   assert(error.node_errors.find("20") != nullptr);
-  // An intermediate guide frame has no gufo field yet.
-  std::string middle = text;
-  middle.replace(middle.find("\"frame_idx\": -1"), 15, "\"frame_idx\": 60");
-  error = ErrorOf(middle);
-  assert(error.message.find("intermediate") != std::string::npos);
+  std::string big = text;
+  big.replace(big.find("\"height\": 768"), 13, "\"height\": 1344");
+  assert(ErrorOf(big).message.find("1344x1344") != std::string::npos);
+  // Intermediate guide images become gufo.keyframes; an audio guide becomes
+  // the audio reference.
+  std::string guides = text;
+  guides.replace(
+      guides.find(" \"30\": {"), 8,
+      " \"12\": {\"class_type\": \"LoadImage\", \"inputs\": "
+      "{\"image\": \"mid.png\"}},\n"
+      " \"13\": {\"class_type\": \"LoadAudio\", \"inputs\": "
+      "{\"audio\": \"zeile.flac\"}},\n"
+      " \"23\": {\"class_type\": \"MiniMaxH3AddGuide\", \"inputs\": "
+      "{\"positive\": [\"21\", 0], \"latent\": [\"20\", 1], "
+      "\"frame_idx\": 60, \"vae\": [\"4\", 0], \"image\": [\"12\", 0]}},\n"
+      " \"24\": {\"class_type\": \"MiniMaxH3AddGuide\", \"inputs\": "
+      "{\"positive\": [\"23\", 0], \"latent\": [\"20\", 1], "
+      "\"frame_idx\": 0, \"audio_vae\": [\"5\", 0], \"audio\": [\"13\", 0]}},\n"
+      " \"30\": {");
+  guides.replace(guides.find("\"positive\": [\"21\", 0], \"negative\""), 21,
+                 "\"positive\": [\"24\", 0]");
+  const comfy::Plan guided = PlanOf(guides.c_str());
+  const auto& h3 = std::get<comfy::VideoTask>(guided.tasks[0].spec);
+  assert(h3.keyframes.size() == 1 && h3.keyframes[0].first == 60);
+  assert((h3.keyframes[0].second == comfy::FileRef{"mid.png", "input"}));
+  assert((h3.first_frame == comfy::FileRef{"kf0.png", "input"}));
+  assert((h3.last_frame == comfy::FileRef{"kf1.png", "input"}));
+  assert((h3.audio_reference == comfy::FileRef{"zeile.flac", "input"}));
+  assert(h3.audio_reference_frame == 0);
+  assert(comfy::VideoRequestBody(h3)
+             .find("gufo")
+             ->find("audio_reference_frame")
+             ->as_double() == 0);
 }
 
 void TestWan() {
@@ -432,7 +467,7 @@ int main() {
   TestVoiceDesign();
   TestVoiceClone();
   TestH3();
-  TestH3Unsupported();
+  TestH3Guides();
   TestWan();
   TestUnsupportedNodes();
   TestImageToImage();

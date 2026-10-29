@@ -172,6 +172,8 @@ std::string ContentTypeFor(std::string_view name) {
     return "audio/wav";
   if (ext == "mp3")
     return "audio/mpeg";
+  if (ext == "ogg")
+    return "audio/ogg";
   if (ext == "mp4")
     return "video/mp4";
   if (ext == "webm")
@@ -355,6 +357,10 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->first_frame);
       if (video->last_frame)
         files->push_back(*video->last_frame);
+      for (const auto& [frame, ref] : video->keyframes)
+        files->push_back(ref);
+      if (video->audio_reference)
+        files->push_back(*video->audio_reference);
     }
   }
 }
@@ -1347,14 +1353,56 @@ json::Value Adapter::RunDialogue(const std::shared_ptr<Job>& job,
 json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                               const VideoTask& spec) {
   json::Value body = VideoRequestBody(spec);
+  // ComfyUI stretches H3 guide images to the canvas; gufo centre-crops.
+  // Stretch here (ffmpeg) so both give the same picture.
+  bool warned_stretch = false;
   const auto data_url = [&](const FileRef& ref) {
-    const std::string bytes = ReadFileRef(ref);
+    std::string bytes = ReadFileRef(ref);
+    const auto dims = ImageDimensions(bytes);
+    if (spec.family == VideoFamily::kH3 && dims &&
+        (dims->first != spec.width || dims->second != spec.height)) {
+      if (options_.ffmpeg.empty()) {
+        if (!warned_stretch)
+          job->warnings.push_back(
+              "node " + task.node_id +
+              ": guide images are centre-cropped by gufo, not stretched "
+              "(start the router with --comfy-ffmpeg)");
+        warned_stretch = true;
+      } else {
+        const fs::path png = WorkFile("png");
+        std::string error;
+        if (!RunFfmpeg({"-i", FilePath(ref), "-vf",
+                        "scale=" + std::to_string(spec.width) + ":" +
+                            std::to_string(spec.height) + ":flags=bicubic",
+                        "-frames:v", "1", png},
+                       &error))
+          throw std::runtime_error("cannot resize " + ref.name + ": " + error);
+        bytes = ReadAll(png);
+        fs::remove(png);
+      }
+    }
     return "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
   };
   if (spec.first_frame)
     body["first_frame"] = data_url(*spec.first_frame);
   if (spec.last_frame)
     body["last_frame"] = data_url(*spec.last_frame);
+  if (!spec.keyframes.empty()) {
+    json::Value keyframes = json::Value::array();
+    for (const auto& [frame, ref] : spec.keyframes) {
+      json::Value keyframe = json::Value::object();
+      keyframe["frame"] = frame;
+      keyframe["image"] = data_url(ref);
+      keyframes.push_back(std::move(keyframe));
+    }
+    body["gufo"]["keyframes"] = std::move(keyframes);
+  }
+  if (spec.audio_reference) {
+    const std::string audio = ReadFileRef(*spec.audio_reference);
+    body["audio_reference"] =
+        "data:" + ContentTypeFor(spec.audio_reference->name) + ";base64," +
+        Base64Encode(audio);
+  }
   const FetchResult created =
       Call(job, "POST", "/v1/videos", body.dump(), "application/json");
   if (created.status != 200 && created.status != 202 && created.status != 201)
