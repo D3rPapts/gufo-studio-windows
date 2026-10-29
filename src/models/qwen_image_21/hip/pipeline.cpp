@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "src/models/qwen/control_tokens.hpp"
+#include "src/models/qwen_image_21/hip/memory.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 
@@ -538,6 +539,40 @@ int ConditionRows(const EncodedPrompt& prompt) {
 
 // About one 1 MP reference: 0-1 references keep every weight resident.
 constexpr int kReleaseEncoderRows = 6144;
+// Host RAM left to Windows and other processes when shared GPU memory grows.
+constexpr std::uint64_t kHostReserveBytes = 3ULL << 30;
+constexpr std::uint64_t kMinimumFreeBytes = 512ULL << 20;
+
+/// DiT rows of encoder tokens [begin, end): 4 per image token, 1 otherwise.
+int RowsOf(const EncodedPrompt& prompt, std::size_t begin, std::size_t end) {
+  int rows = 0;
+  for (std::size_t i = prompt.drop + begin; i < prompt.drop + end; ++i)
+    rows += prompt.ids[i] == 151655 ? 4 : 1;
+  return rows;
+}
+
+/// GPU memory a large request still needs after the text encoder left:
+/// missing DiT/VAE weights, both condition caches, the larger of the prefill
+/// and per-step working sets, the bounded pool cache and a margin.
+std::uint64_t LargeRequestBytes(const Runtime& rt, const EncodedPrompt& prompt,
+                                const EncodedPrompt* negative,
+                                int target_rows) {
+  constexpr std::uint64_t kCacheRow = 32ULL * 2 * 4096 * 2;
+  // Activations of one row through a DiT block (about 19 row-sized
+  // 4096-wide BF16 tensors including the 12288-wide MLP).
+  constexpr std::uint64_t kWorkRow = 19ULL * 4096 * 2;
+  const std::uint64_t rows = ConditionRows(prompt);
+  std::uint64_t cache = rows;
+  if (negative) {
+    const auto shared = SharedConditionTokens(prompt, *negative);
+    cache += RowsOf(*negative, shared, negative->ids.size() - negative->drop);
+  }
+  const std::uint64_t prefill = 3 * rows * 4096 * 2 + 4096 * kWorkRow;
+  const std::uint64_t step = static_cast<std::uint64_t>(target_rows) * kWorkRow;
+  return rt.MissingBytes("transformer.") + rt.MissingBytes("vae.") +
+         cache * kCacheRow + std::max(prefill, step) + (2ULL << 30) +
+         (1ULL << 30);
+}
 constexpr std::size_t kDefaultCacheBytes = 8ULL << 30;
 constexpr std::size_t kLargeRequestCacheBytes = 2ULL << 30;
 
@@ -559,8 +594,8 @@ void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
     chunks[chunks.size() - 2].second += chunks.back().second;
     chunks.pop_back();
   }
-  if (rows < 128)
-    throw std::logic_error("condition prefill needs at least 128 rows");
+  if (rows < 1 || (context.shared_rows && !context.base->prefilled))
+    throw std::logic_error("invalid condition prefill");
   const float timestep = Bf16(Bf16(sigma * 1000.0F) / 1000.0F);
   std::vector<float> time(512);
   for (int row = 0; row < 2; ++row)
@@ -602,20 +637,25 @@ void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
                                    p + ".attn.norm_k", 32, rope));
       rt.CopyRows(values, start, rt.Linear(norm, p + ".attn.to_v"));
     }
+    // The caches stay in the attention kernel's head-major layout, so later
+    // steps read them in place (no per-step concatenation or reordering).
+    auto head_keys = rt.HeadLayout(keys), head_values = rt.HeadLayout(values);
+    keys = {};
+    values = {};
     // The last layer's condition outputs are never read.
     for (const auto [start, count] :
          layer == 31 ? decltype(chunks){} : chunks) {
       const std::vector<int> limits(context.limits.begin() + start,
                                     context.limits.begin() + start + count);
       const int span = *std::max_element(limits.begin(), limits.end()) - shared;
-      auto k = keys.Slice(0, span), v = values.Slice(0, span);
-      if (shared) {
-        k = Concat(rt, {context.base->keys[layer].Slice(0, shared), k});
-        v = Concat(rt, {context.base->values[layer].Slice(0, shared), v});
-      }
+      std::vector<Runtime::HeadKeys> segments;
+      if (shared)
+        segments.push_back(
+            {context.base->keys[layer], context.base->values[layer], shared});
+      segments.push_back({head_keys, head_values, span});
       const auto chunk = x.Slice(start, count);
       const auto attention = rt.Linear(
-          rt.Attention(queries.Slice(start, count), k, v, 32, 32, 128, limits),
+          rt.SegmentedAttention(queries.Slice(start, count), segments, limits),
           p + ".attn.to_out.0");
       auto out = rt.Modulate(attention, factors, 1, count, &chunk);
       const auto norm2 = rt.NormalizeModulate(out, factors, 2, count);
@@ -625,8 +665,8 @@ void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
       out = rt.Modulate(mlp, factors, 3, count, &out);
       rt.CopyRows(x, start, out);
     }
-    context.keys[layer] = std::move(keys);
-    context.values[layer] = std::move(values);
+    context.keys[layer] = std::move(head_keys);
+    context.values[layer] = std::move(head_values);
     rt.Trim();
   }
   context.prefilled = true;
@@ -672,7 +712,19 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
     auto k = rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_k"),
                               p + ".attn.norm_k", 32, rope);
     auto v = rt.Linear(norm, p + ".attn.to_v");
-    if (prefix) {
+    Matrix attended;
+    if (context.prefilled) {
+      // Head-major caches read in place: shared reference rows, own
+      // condition rows, then this step's target rows.
+      std::vector<Runtime::HeadKeys> segments;
+      if (context.shared_rows)
+        segments.push_back({context.base->keys[layer],
+                            context.base->values[layer], context.shared_rows});
+      segments.push_back(
+          {context.keys[layer], context.values[layer], context.prefix.rows});
+      segments.push_back({rt.HeadLayout(k), rt.HeadLayout(v), latent.rows});
+      attended = rt.SegmentedAttention(q, segments);
+    } else if (prefix) {
       // Copy only prefix rows: a view would pin full target K/V for all layers.
       context.keys[layer] = rt.Concat(std::array{k.Slice(0, prefix)});
       context.values[layer] = rt.Concat(std::array{v.Slice(0, prefix)});
@@ -691,10 +743,10 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
       k = Concat(rt, {context.keys[layer], k});
       v = Concat(rt, {context.values[layer], v});
     }
-    const auto attention =
-        rt.Linear(rt.Attention(q, k, v, 32, 32, 128,
-                               prefix ? context.limits : std::vector<int>{}),
-                  p + ".attn.to_out.0");
+    if (!context.prefilled)
+      attended = rt.Attention(q, k, v, 32, 32, 128,
+                              prefix ? context.limits : std::vector<int>{});
+    const auto attention = rt.Linear(attended, p + ".attn.to_out.0");
     x = rt.Modulate(attention, factors, 1, prefix, &x);
     const auto norm2 = rt.NormalizeModulate(x, factors, 2, prefix);
     const auto mlp = rt.Linear(
@@ -723,6 +775,7 @@ struct Model::Impl {
   Runtime runtime;
   std::mutex mutex;
   std::atomic<bool> lost{false};
+  std::function<void(const std::string&)> log;
   explicit Impl(const std::filesystem::path& root)
       : weights(root), tokenizer(root), runtime(weights) {}
 };
@@ -750,6 +803,31 @@ Result Model::Generate(const Request& request,
     Runtime& rt;
     ~CacheLimitReset() { rt.SetCacheLimit(kDefaultCacheBytes); }
   } cache_limit_reset{rt};
+  const auto Log = [this](const std::string& line) {
+    if (impl_->log)
+      impl_->log(line);
+  };
+  // Memory per phase: device budget, pool cache and resident weights.
+  const auto report = [&](std::string_view phase) {
+    if (!impl_->log)
+      return;
+    rt.Synchronize();
+    Log("event=memory phase=" + std::string(phase) + " " +
+        hip::QueryDeviceMemory().Describe() +
+        " pool_cached_mib=" + std::to_string(rt.CachedBytes() >> 20) +
+        " weights_mib=" + std::to_string(rt.WeightBytes() >> 20));
+  };
+  // Large requests stop cleanly when the shared segment runs out anyway.
+  const auto GuardMemory = [&](int step) {
+    const auto memory = hip::QueryDeviceMemory();
+    if (memory.Available(kHostReserveBytes) < kMinimumFreeBytes) {
+      Log("event=memory_exhausted step=" + std::to_string(step) + " " +
+          memory.Describe());
+      throw InsufficientMemory("Qwen-Image ran out of GPU memory at step " +
+                               std::to_string(step) +
+                               "; use fewer or smaller reference images");
+    }
+  };
   try {
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
@@ -771,12 +849,31 @@ Result Model::Generate(const Request& request,
     // weights, so the text encoder (16 GB) leaves until the next request.
     const int condition_rows = ConditionRows(prompt);
     result.metrics.condition_rows = condition_rows;
-    if (condition_rows > kReleaseEncoderRows) {
+    report("encoded");
+    const bool large = condition_rows > kReleaseEncoderRows;
+    if (large) {
       rt.Evict("text_encoder.model.language_model.");
       rt.Evict("text_encoder.model.visual.");
       result.metrics.released_text_encoder = true;
       // Freed temporaries stay cached up to this bound (8 GB otherwise).
       rt.SetCacheLimit(kLargeRequestCacheBytes);
+      // Refuse before the caches fill instead of failing inside a kernel:
+      // an exhausted shared segment ends in a launch failure or a driver
+      // reset, not in an allocation error.
+      const auto need = LargeRequestBytes(
+          rt, prompt, negative ? &*negative : nullptr, height * width);
+      const auto memory = hip::QueryDeviceMemory();
+      const auto available = memory.Available(kHostReserveBytes);
+      Log("event=memory_check need_mib=" + std::to_string(need >> 20) +
+          " available_mib=" + std::to_string(available >> 20) + " " +
+          memory.Describe());
+      if (need > available)
+        throw InsufficientMemory(
+            "Qwen-Image needs about " + std::to_string(need >> 30) +
+            " GiB of GPU memory for " + std::to_string(condition_rows) +
+            " condition rows, but only " + std::to_string(available >> 30) +
+            " GiB are free; use fewer or smaller reference images");
+      report("released");
     }
     std::optional<DiffusionContext> context;
     context.emplace(PrepareDiffusion(rt, impl_->weights, prompt, height, width,
@@ -805,6 +902,7 @@ Result Model::Generate(const Request& request,
     // Drop cached encoder and VAE-encoder temporaries before the caches fill.
     rt.Trim();
     result.metrics.prompt_ms = Milliseconds(start);
+    report("prepared");
     // Generate independent full-precision normal draws; seed replay never
     // depends on admission order, wall time, or another request's RNG.
     // A generated reference can otherwise reuse exactly the same noise when
@@ -828,10 +926,16 @@ Result Model::Generate(const Request& request,
       latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
       rt.Observe(observer, "init.latent", latent);
     }
-    if (result.metrics.released_text_encoder) {
+    if (large) {
+      // Condition caches in head-major layout, filled chunk by chunk.
       Prefill(rt, *context, sigmas[0], cancelled);
+      if (negative_context)
+        Prefill(rt, *negative_context, sigmas[0], cancelled);
+      report("prefilled");
     }
     for (int step = 0; step < request.steps; ++step) {
+      if (large)
+        GuardMemory(step);
       auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
                               cancelled, observer);
       if (guided) {
@@ -845,6 +949,8 @@ Result Model::Generate(const Request& request,
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
+      if (step == 0)
+        report("step0");
     }
     rt.Synchronize();
     result.metrics.denoise_ms = Milliseconds(denoise_start);
@@ -853,6 +959,7 @@ Result Model::Generate(const Request& request,
     negative_context.reset();
     context.reset();
     rt.Trim();
+    report("denoised");
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
@@ -875,6 +982,10 @@ Result Model::Generate(const Request& request,
     (void)hipStreamSynchronize(rt.stream());
     throw;
   }
+}
+
+void Model::SetLog(std::function<void(const std::string&)> log) {
+  impl_->log = std::move(log);
 }
 
 bool Model::DeviceLost() const {

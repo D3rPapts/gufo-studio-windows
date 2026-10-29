@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <tuple>
 #include <vector>
@@ -350,6 +351,43 @@ void Fused(bool masked) {
                              hipMemcpyDeviceToHost));
       assert(output == replay);
     }
+    // Condition caches read in place: the same keys split into three
+    // head-major segments with padded strides give identical results.
+    image::FusedAttention128(q.data, k.data, v.data, o.data, heads, rows, keys,
+                             0, nullptr, rows, mask);
+    image::Check(hipMemcpy(output.data(), o.data, output.size() * 2,
+                           hipMemcpyDeviceToHost));
+    const int sizes[3] = {keys / 3, keys / 2 - keys / 3, keys - keys / 2};
+    const int strides[3] = {sizes[0] + 7, sizes[1], sizes[2] + 3};
+    std::vector<std::unique_ptr<Device<std::uint16_t>>> parts;
+    image::KeySegments segments;
+    for (int s = 0, first = 0; s < 3; first += sizes[s], ++s) {
+      std::vector<std::uint16_t> part_keys(heads * strides[s] * dim, sentinel),
+          part_values(part_keys.size(), sentinel);
+      for (int head = 0; head < heads; ++head)
+        for (int row = 0; row < sizes[s]; ++row)
+          for (int d = 0; d < dim; ++d) {
+            const auto from = (head * keys + first + row) * dim + d;
+            const auto to = (head * strides[s] + row) * dim + d;
+            part_keys[to] = key_values[from];
+            part_values[to] = values[from];
+          }
+      for (auto* host : {&part_keys, &part_values}) {
+        parts.push_back(std::make_unique<Device<std::uint16_t>>(host->size()));
+        image::Check(hipMemcpy(parts.back()->data, host->data(),
+                               host->size() * 2, hipMemcpyHostToDevice));
+      }
+      segments.keys[s] = parts[parts.size() - 2]->data;
+      segments.values[s] = parts.back()->data;
+      segments.end[s] = first + sizes[s];
+      segments.stride[s] = strides[s];
+    }
+    image::FusedAttention128Segmented(q.data, segments, o.data, heads, rows, 0,
+                                      rows, nullptr, mask);
+    image::Check(hipGetLastError());
+    image::Check(hipMemcpy(replay.data(), o.data, replay.size() * 2,
+                           hipMemcpyDeviceToHost));
+    assert(output == replay);
   }
 }
 

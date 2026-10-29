@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,13 @@ struct Result {
 };
 
 using CancellationCheck = std::function<bool()>;
+/// The request does not fit into free GPU memory (checked before the
+/// condition caches fill, and per step for large requests). The model stays
+/// usable; servers answer 503.
+class InsufficientMemory : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 /// Development observer; tensors are FP32 views of the actual BF16 boundary.
 struct Observer {
   std::function<void(std::string_view, std::span<const float>, int, int)> write;
@@ -107,6 +115,8 @@ public:
   /// True after a failed request left the HIP context unusable (a sticky
   /// launch failure or a failed library call); only a new process recovers.
   bool DeviceLost() const;
+  /// Diagnostic lines (memory per phase, memory checks).
+  void SetLog(std::function<void(const std::string&)> log);
 
 private:
   struct Impl;

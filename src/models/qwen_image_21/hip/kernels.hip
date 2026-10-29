@@ -937,6 +937,71 @@ void Runtime::Evict(std::string_view prefix) {
   Trim();
 }
 
+Matrix Runtime::HeadLayout(const Matrix& x) {
+  if (x.cols != 4096 || x.packed)
+    throw std::logic_error("Qwen-Image head layout shape mismatch");
+  auto out = New(x.rows, x.cols);
+  ReorderHeads(x.data, out.data, x.rows, 32, 32, 128, false, stream_);
+  Check(hipGetLastError());
+  return out;
+}
+
+Matrix Runtime::SegmentedAttention(const Matrix& q,
+                                   std::span<const HeadKeys> segments,
+                                   const std::vector<int>& key_limits) {
+  if (q.cols != 4096 || segments.empty() || segments.size() > 3 ||
+      (!key_limits.empty() &&
+       key_limits.size() != static_cast<std::size_t>(q.rows)))
+    throw std::logic_error("segmented attention shape mismatch");
+  KeySegments keys;
+  int count = 0;
+  for (std::size_t i = 0; i < 3; ++i) {
+    if (i < segments.size()) {
+      const auto& s = segments[i];
+      if (s.rows < 0 || s.rows > s.keys.rows || s.keys.rows != s.values.rows ||
+          s.keys.cols != 4096 || s.values.cols != 4096)
+        throw std::logic_error("segmented attention segment mismatch");
+      keys.keys[i] = s.keys.data;
+      keys.values[i] = s.values.data;
+      keys.stride[i] = s.keys.rows;
+      count += s.rows;
+    }
+    keys.end[i] = count;
+  }
+  if (count < 1)
+    throw std::logic_error("segmented attention without keys");
+  auto qh = New(q.rows, 4096);
+  auto out = New(q.rows, 4096);
+  ReorderHeads(q.data, qh.data, q.rows, 32, 32, 128, false, stream_);
+  Matrix limits;
+  if (!key_limits.empty()) {
+    for (int n : key_limits)
+      if (n < 1 || n > count)
+        throw std::logic_error("invalid attention key limit");
+    limits = Raw(key_limits.size() * 4);
+    Check(hipMemcpyAsync(limits.data, key_limits.data(), key_limits.size() * 4,
+                         hipMemcpyHostToDevice, stream_));
+    Synchronize();
+  }
+  FusedAttention128Segmented(qh.data, keys, out.data, 32, q.rows, 0, q.rows,
+                             stream_,
+                             reinterpret_cast<const int*>(limits.data));
+  Check(hipGetLastError());
+  return out;
+}
+
+std::size_t Runtime::CachedBytes() const {
+  return pool_->cached_bytes;
+}
+
+std::size_t Runtime::MissingBytes(std::string_view prefix) const {
+  std::size_t bytes = 0;
+  for (const auto& [name, w] : weights_.Group(prefix))
+    if (!device_weights_.contains(name))
+      bytes += w->bytes / (w->bf16 ? 1 : 2);
+  return bytes;
+}
+
 void Runtime::SetCacheLimit(std::size_t bytes) {
   pool_->max_cached_bytes = bytes;
 }
