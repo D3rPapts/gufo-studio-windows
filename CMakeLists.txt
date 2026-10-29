@@ -411,6 +411,7 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/video_wan22.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -421,6 +422,10 @@ add_library(gufo_http STATIC
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
+if (ENGINE_ENABLE_HIP)
+  # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
+  target_link_libraries(gufo_http PUBLIC gufo_wan22)
+endif()
 
 add_executable(gufo
   src/cli/main.cpp
@@ -820,8 +825,12 @@ if (BUILD_TESTING)
   add_executable(video_jobs_test
     tests/cli/video_jobs_test.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core gufo_cache)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(video_jobs_test PRIVATE gufo_wan22)
+  endif()
   add_test(NAME video_jobs_test COMMAND video_jobs_test)
   set_tests_properties(video_jobs_test PROPERTIES
     LABELS "cpu;server;video;minimax-h3;queue;cancellation;quality")
@@ -830,8 +839,12 @@ if (BUILD_TESTING)
     tests/cli/video_api_test.cpp
     src/cli/serve/video_api.cpp
     src/cli/serve/video_jobs.cpp
+    src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core gufo_cache)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(video_api_test PRIVATE gufo_wan22)
+  endif()
   add_test(NAME video_api_test COMMAND video_api_test)
   set_tests_properties(video_api_test PROPERTIES
     LABELS "cpu;server;api;video;minimax-h3;quality")
@@ -1371,3 +1384,6 @@ endif()
 # Qwen3-Omni-30B-A3B-Captioner (GGUF arch qwen3vlmoe + qwen3a audio
 # projector): its runtime library and the gufo-omni driver.
 add_subdirectory(src/models/qwen3_omni)
+
+# Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
+add_subdirectory(src/models/wan22)

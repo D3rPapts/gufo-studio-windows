@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -436,6 +437,209 @@ std::optional<minimax_h3::GenerationKeyframe> ReadKeyframe(
   }
 }
 
+// Wan 2.2 image-to-video: one first frame with its own image budget.
+std::optional<core::Image> ReadFirstFrame(const json::Value* value,
+                                          const std::string* file,
+                                          std::string* error) {
+  core::ImageReadBudget budget;
+  auto keyframe = ReadKeyframe(value, file, minimax_h3::KeyframeAnchor::kFirst,
+                               budget, error);
+  if (!keyframe.has_value()) {
+    return std::nullopt;
+  }
+  return core::Image{.width = static_cast<std::uint32_t>(keyframe->width),
+                     .height = static_cast<std::uint32_t>(keyframe->height),
+                     .pixels = std::move(keyframe->rgb)};
+}
+
+// Wan 2.2 TI2V-5B: {"model", "prompt", "size" (default "1280x704"),
+// "seconds" (0.2..5 at 24 fps), "input_reference" or "first_frame" (image-
+// to-video; the image is scaled to cover the size and centre-cropped),
+// "gufo": {"seed", "steps" (default 50), "frames" (4k + 1, must match
+// seconds), "negative_prompt" (default ""), "guidance" (default 5; <= 1
+// disables classifier-free guidance)}}. MP4 only.
+HttpResponse CreateWan22Video(const json::Value& body,
+                              const std::map<std::string, std::string>& files,
+                              VideoJobService& service) {
+  if (body.contains("last_frame") || files.contains("last_frame") ||
+      body.contains("references")) {
+    return Error(400, "Bad Request",
+                 "Wan 2.2 supports only a first frame ('input_reference' or "
+                 "'first_frame')",
+                 "unsupported_input_reference");
+  }
+  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo",
+                             "input_reference", "first_frame"})) {
+    return Error(400, "Bad Request",
+                 "request contains an unsupported video field",
+                 "unsupported_field");
+  }
+  const auto has_field = [&](const char* name) {
+    return body.contains(name) || files.contains(name);
+  };
+  if (has_field("input_reference") && has_field("first_frame")) {
+    return Error(400, "Bad Request",
+                 "'input_reference' and 'first_frame' both set the first frame",
+                 "invalid_input_reference");
+  }
+  std::optional<core::Image> first_frame;
+  for (const char* name : {"input_reference", "first_frame"}) {
+    if (!has_field(name)) {
+      continue;
+    }
+    const auto file = files.find(name);
+    std::string image_error;
+    first_frame = ReadFirstFrame(body.find(name),
+                                 file == files.end() ? nullptr : &file->second,
+                                 &image_error);
+    if (!first_frame.has_value()) {
+      return Error(400, "Bad Request",
+                   "'" + std::string(name) + "' " + image_error,
+                   "invalid_input_reference");
+    }
+  }
+  const json::Value* model_value = body.find("model");
+  const json::Value* prompt_value = body.find("prompt");
+  const json::Value* size_value = body.find("size");
+  if (model_value == nullptr || !model_value->is_string() ||
+      prompt_value == nullptr || !prompt_value->is_string() ||
+      (size_value != nullptr && !size_value->is_string())) {
+    return Error(400, "Bad Request",
+                 "'model', 'prompt', and optional 'size' must be strings",
+                 "invalid_parameter_type");
+  }
+  const std::string model = model_value->str();
+  const std::string prompt = prompt_value->str();
+  const std::string size = body.member_str("size", "1280x704");
+  const json::Value* seconds_value = body.find("seconds");
+  std::string seconds = "5";
+  if (seconds_value != nullptr && seconds_value->is_string()) {
+    seconds = seconds_value->str();
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
+  }
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  if (prompt.empty()) {
+    return Error(400, "Bad Request", "'prompt' is required",
+                 "missing_required_parameter");
+  }
+  std::string duration_error;
+  const auto duration_frames =
+      ResolveWan22DurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  minimax_h3::GenerationParameters parameters;
+  parameters.preset = std::string(kWan22Preset);
+  parameters.frames = *duration_frames;
+  parameters.evaluations = 50;
+  parameters.mux = true;
+  parameters.decode_audio = false;
+  if (!ParseVideoSize(size, &parameters.output_width,
+                      &parameters.output_height)) {
+    return Error(400, "Bad Request", "'size' must be WIDTHxHEIGHT",
+                 "invalid_size");
+  }
+  parameters.internal_width = parameters.output_width;
+  parameters.internal_height = parameters.output_height;
+  std::uint64_t seed = 42;
+  std::string negative_prompt;
+  double guidance = 5.0;
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension, {"seed", "steps", "frames",
+                                     "negative_prompt", "guidance"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' may contain only 'seed', 'steps', 'frames', "
+                   "'negative_prompt' and 'guidance'",
+                   "invalid_strix_options");
+    }
+    if (extension->contains("negative_prompt")) {
+      const json::Value* value = extension->find("negative_prompt");
+      if (!value->is_string() || value->str().find('\0') != std::string::npos) {
+        return Error(400, "Bad Request",
+                     "'gufo.negative_prompt' must be a string",
+                     "invalid_negative_prompt");
+      }
+      negative_prompt = value->str();
+    }
+    if (extension->contains("guidance")) {
+      const json::Value* value = extension->find("guidance");
+      guidance = value->is_number() ? value->as_double(-1.0) : -1.0;
+      if (!std::isfinite(guidance) || guidance < 0.0 || guidance > 20.0) {
+        return Error(400, "Bad Request",
+                     "'gufo.guidance' must be a number in 0..20",
+                     "invalid_guidance");
+      }
+    }
+    if (extension->contains("seed")) {
+      const auto parsed = JsonUnsigned(extension->find("seed"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.seed' must be a non-negative exact integer",
+                     "invalid_seed");
+      }
+      seed = *parsed;
+    }
+    if (extension->contains("steps")) {
+      const auto parsed = JsonFrame(extension->find("steps"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.steps' must be 1..100",
+                     "invalid_steps");
+      }
+      parameters.evaluations = *parsed;
+    }
+    if (extension->contains("frames")) {
+      const auto parsed = JsonFrame(extension->find("frames"));
+      if (!parsed.has_value() || *parsed != *duration_frames) {
+        return Error(400, "Bad Request",
+                     "'gufo.frames' must match the 'seconds' duration",
+                     "invalid_frames");
+      }
+    }
+  }
+  std::string parameter_error;
+  if (!ValidateWan22Parameters(parameters, &parameter_error)) {
+    return Error(400, "Bad Request", parameter_error, "invalid_parameters");
+  }
+  const VideoJobCreateResult created = service.Create({
+      .model = model,
+      .prompt = prompt,
+      .size = size,
+      .seconds = seconds,
+      .output_format = "mp4",
+      .parameters = std::move(parameters),
+      .seed = seed,
+      .first_frame_width =
+          first_frame ? static_cast<int>(first_frame->width) : 0,
+      .first_frame_height =
+          first_frame ? static_cast<int>(first_frame->height) : 0,
+      .first_frame = first_frame ? std::move(first_frame->pixels)
+                                 : std::vector<std::uint8_t>(),
+      .negative_prompt = std::move(negative_prompt),
+      .guidance = guidance,
+  });
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   std::map<std::string, std::string> files;
@@ -468,6 +672,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (!body.is_object()) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
+  }
+  if (service.family() == VideoModelFamily::kWan22) {
+    return CreateWan22Video(body, files, service);
   }
   if (IsUnsupportedConditioning(body)) {
     return Error(400, "Bad Request",

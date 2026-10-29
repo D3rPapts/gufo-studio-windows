@@ -88,6 +88,14 @@ struct GenerationRequest {
   // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
   // blocks in the prompt. Empty: keyframes condition the latents only.
   std::filesystem::path vision_projector;
+  // Wan 2.2 runner only (MiniMax H3 ignores them): image-to-video first
+  // frame as RGB8 at its own size (empty: text-to-video), negative prompt
+  // and classifier-free guidance scale.
+  int first_frame_width{0};
+  int first_frame_height{0};
+  std::vector<std::uint8_t> first_frame;
+  std::string negative_prompt;
+  float guidance{5.0F};
 };
 
 struct GenerationTelemetry {

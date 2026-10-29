@@ -784,7 +784,16 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["architecture"] = std::move(architecture);
     data.push_back(std::move(model));
   }
-  if (video_jobs != nullptr && video_jobs->ready()) {
+  if (video_jobs != nullptr && video_jobs->ready() &&
+      video_jobs->family() == VideoModelFamily::kWan22) {
+    json::Value model = json::Value::object();
+    model["id"] = video_jobs->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-wan";
+    model["capability"] = "video";
+    data.push_back(std::move(model));
+  } else if (video_jobs != nullptr && video_jobs->ready()) {
     json::Value root_model = json::Value::object();
     root_model["id"] = "minimax-h3";
     root_model["object"] = "model";
@@ -2149,7 +2158,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
-      body["model"] = "minimax-h3";
+      body["model"] = video_jobs_ != nullptr ? video_jobs_->model_id()
+                                             : std::string("minimax-h3");
     }
     return Ok(body);
   }

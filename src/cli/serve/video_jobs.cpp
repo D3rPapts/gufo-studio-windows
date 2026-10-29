@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -24,11 +25,89 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/video_wan22.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 namespace gufo::server {
+
+bool IsWan22ModelDirectory(const std::filesystem::path& root) {
+  std::ifstream input(root / "model_index.json", std::ios::binary);
+  if (!input)
+    return false;
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  try {
+    const json::Value index = json::parse(text);
+    const json::Value* transformer_2 = index.find("transformer_2");
+    const bool single_transformer =
+        transformer_2 == nullptr || transformer_2->is_null() ||
+        (transformer_2->is_array() && !transformer_2->empty() &&
+         transformer_2->items()[0].is_null());
+    return index.member_str("_class_name") == "WanPipeline" &&
+           single_transformer &&
+           std::filesystem::exists(root / "vae" / "config.json") &&
+           std::filesystem::exists(root / "transformer" / "config.json");
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ParseVideoSize(std::string_view size, int* width, int* height) {
+  const auto x = size.find('x');
+  if (x == std::string_view::npos || x == 0 || x + 1 >= size.size())
+    return false;
+  int w = 0, h = 0;
+  const auto first = std::from_chars(size.data(), size.data() + x, w);
+  const auto second =
+      std::from_chars(size.data() + x + 1, size.data() + size.size(), h);
+  if (first.ec != std::errc() || first.ptr != size.data() + x ||
+      second.ec != std::errc() || second.ptr != size.data() + size.size())
+    return false;
+  *width = w;
+  *height = h;
+  return true;
+}
+
+bool ValidateWan22Parameters(const minimax_h3::GenerationParameters& p,
+                             std::string* error) {
+  const auto fail = [error](const char* message) {
+    if (error != nullptr)
+      *error = message;
+    return false;
+  };
+  if (p.preset != kWan22Preset)
+    return fail("Wan 2.2 jobs use the 'wan22' preset");
+  const int w = p.output_width, h = p.output_height;
+  if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 32 != 0 ||
+      h % 32 != 0 || w * h > 1280 * 704)
+    return fail(
+        "size must be WxH with multiples of 32, 256..1280 per side and at "
+        "most 1280x704 pixels");
+  if (p.frames < 5 || p.frames > 121 || (p.frames - 1) % 4 != 0)
+    return fail("frames must be 4k + 1 between 5 and 121");
+  if (p.evaluations < 1 || p.evaluations > 100)
+    return fail("steps must be 1..100");
+  return true;
+}
+
+std::optional<int> ResolveWan22DurationFrames(std::string_view seconds,
+                                              std::string* error) {
+  double value = 0;
+  const auto parsed =
+      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
+  if (parsed.ec != std::errc() ||
+      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
+      value < 0.2 || value > 5.05) {
+    if (error != nullptr)
+      *error = "'seconds' must be a number between 0.2 and 5";
+    return std::nullopt;
+  }
+  const int groups = std::max(1, static_cast<int>(std::lround(value * 6.0)));
+  return std::min(4 * groups + 1, 121);
+}
+
 namespace {
 
 bool IsH3Model(std::string_view model) {
@@ -298,12 +377,43 @@ struct VideoJobService::Impl {
     if (!options.now) {
       options.now = UnixNow;
     }
-    if (!options.runner) {
-      options.runner = minimax_h3::GenerateTextVideo;
+    const bool wan = options.family == VideoModelFamily::kWan22;
+    if (wan && options.model_id.empty()) {
+      options.model_id = std::string(kWan22ModelId);
     }
-    if (options.model_root.empty() || options.source_manifest.empty() ||
-        options.storage_root.empty() || options.queue_capacity == 0 ||
-        options.artifact_ttl <= std::chrono::seconds::zero()) {
+    if (!wan) {
+      options.model_id = "minimax-h3";
+    }
+    if (!options.runner) {
+      if (wan) {
+        options.runner = RunWan22Job;
+      } else {
+        options.runner = minimax_h3::GenerateTextVideo;
+      }
+    }
+    if (wan) {
+      if (options.model_root.empty() || options.storage_root.empty() ||
+          options.queue_capacity == 0 ||
+          options.artifact_ttl <= std::chrono::seconds::zero()) {
+        initialization_error = "invalid Wan 2.2 video job configuration";
+        return;
+      }
+#if !defined(ENGINE_ENABLE_HIP)
+      if (options.validate_model_inventory) {
+        initialization_error =
+            "Wan 2.2 video serving requires a ROCm HIP-enabled build";
+        return;
+      }
+#endif
+      if (options.validate_model_inventory &&
+          !IsWan22ModelDirectory(options.model_root)) {
+        initialization_error = "not a Wan 2.2 TI2V-5B Diffusers directory: " +
+                               options.model_root.string();
+        return;
+      }
+    } else if (options.model_root.empty() || options.source_manifest.empty() ||
+               options.storage_root.empty() || options.queue_capacity == 0 ||
+               options.artifact_ttl <= std::chrono::seconds::zero()) {
       initialization_error = "invalid MiniMax H3 video job configuration";
       return;
     }
@@ -315,7 +425,7 @@ struct VideoJobService::Impl {
       return;
     }
 #endif
-    if (options.validate_model_inventory) {
+    if (!wan && options.validate_model_inventory) {
       std::string inspection_error;
       if (!minimax_h3::ModelInventory::Inspect(
                options.model_root, options.source_manifest, &inspection_error)
@@ -433,11 +543,21 @@ struct VideoJobService::Impl {
         const double completed_at = value.member_double("completed_at", -1);
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
-        const bool valid_output = (job->snapshot.output_format == "mp4" &&
-                                   (job->snapshot.size == "512x512" ||
-                                    job->snapshot.size == "1344x768")) ||
-                                  (job->snapshot.output_format == "ppm" &&
-                                   job->snapshot.size == "256x256");
+        const bool wan = options.family == VideoModelFamily::kWan22;
+        int recovered_width = 0, recovered_height = 0;
+        const bool valid_output =
+            wan ? job->snapshot.output_format == "mp4" &&
+                      job->snapshot.model == options.model_id &&
+                      ParseVideoSize(job->snapshot.size, &recovered_width,
+                                     &recovered_height) &&
+                      ResolveWan22DurationFrames(job->snapshot.seconds)
+                : ((job->snapshot.output_format == "mp4" &&
+                    (job->snapshot.size == "512x512" ||
+                     job->snapshot.size == "1344x768")) ||
+                   (job->snapshot.output_format == "ppm" &&
+                    job->snapshot.size == "256x256")) &&
+                      IsH3Model(job->snapshot.model) &&
+                      minimax_h3::ResolveDurationFrames(job->snapshot.seconds);
         const bool valid_numbers =
             std::isfinite(progress) && std::floor(progress) == progress &&
             progress == 100.0 && std::isfinite(created_at) &&
@@ -455,8 +575,6 @@ struct VideoJobService::Impl {
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
         if (value.member_str("schema") != "gufo.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
-            !IsH3Model(job->snapshot.model) ||
-            !minimax_h3::ResolveDurationFrames(job->snapshot.seconds) ||
             !valid_output || !valid_numbers ||
             expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
@@ -588,8 +706,13 @@ struct VideoJobService::Impl {
               " steps=" + std::to_string(job->request.parameters.evaluations) +
               " seed=" + std::to_string(job->request.seed) + " keyframes=" +
               std::to_string(job->request.keyframes.size()) + " lora=" +
-              (job->request.lora.empty() ? "none" : job->request.lora) + " " +
-              Logger::MemoryStatus());
+              (job->request.lora.empty() ? "none" : job->request.lora) +
+              (job->request.first_frame.empty()
+                   ? std::string()
+                   : " first_frame=" +
+                         std::to_string(job->request.first_frame_width) + "x" +
+                         std::to_string(job->request.first_frame_height)) +
+              " " + Logger::MemoryStatus());
       minimax_h3::GenerationRequest generation{
           .model_root = options.model_root,
           .source_manifest = options.source_manifest,
@@ -605,6 +728,11 @@ struct VideoJobService::Impl {
           .lora_path = {},
           .lora_strength = 1.0F,
           .vision_projector = options.vision_projector,
+          .first_frame_width = job->request.first_frame_width,
+          .first_frame_height = job->request.first_frame_height,
+          .first_frame = std::move(job->request.first_frame),
+          .negative_prompt = job->request.negative_prompt,
+          .guidance = static_cast<float>(job->request.guidance),
       };
       if (!job->request.lora.empty()) {
         const VideoLora& lora = options.loras.at(job->request.lora);
@@ -794,17 +922,52 @@ std::string VideoJobService::initialization_error() const {
                           : impl_->initialization_error;
 }
 
+VideoModelFamily VideoJobService::family() const noexcept {
+  return impl_ == nullptr ? VideoModelFamily::kMinimaxH3
+                          : impl_->options.family;
+}
+
+std::string VideoJobService::model_id() const {
+  return impl_ == nullptr ? std::string("minimax-h3") : impl_->options.model_id;
+}
+
 VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   if (!ready()) {
     return {.result = VideoJobResult::kIoError,
             .job = std::nullopt,
             .error = initialization_error()};
   }
-  if (!IsH3Model(request.model) || request.prompt.empty() ||
-      request.prompt.find('\0') != std::string::npos ||
-      (request.output_format != "mp4" && request.output_format != "ppm") ||
-      !minimax_h3::ValidateGenerationParameters(request.parameters, nullptr) ||
-      !MatchesOutputContract(request)) {
+  if (impl_->options.family == VideoModelFamily::kWan22) {
+    int width = 0, height = 0;
+    const auto frames = ResolveWan22DurationFrames(request.seconds);
+    if (request.model != impl_->options.model_id || request.prompt.empty() ||
+        request.prompt.find('\0') != std::string::npos ||
+        request.output_format != "mp4" ||
+        !ParseVideoSize(request.size, &width, &height) ||
+        width != request.parameters.output_width ||
+        height != request.parameters.output_height || !frames ||
+        *frames != request.parameters.frames ||
+        !ValidateWan22Parameters(request.parameters, nullptr) ||
+        !request.keyframes.empty() || !request.lora.empty() ||
+        request.first_frame.size() !=
+            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
+                static_cast<std::size_t>(
+                    std::max(request.first_frame_height, 0)) *
+                3U ||
+        !std::isfinite(request.guidance) || request.guidance < 0.0 ||
+        request.guidance > 20.0 ||
+        request.negative_prompt.find('\0') != std::string::npos) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "invalid Wan 2.2 video job request"};
+    }
+  } else if (!IsH3Model(request.model) || request.prompt.empty() ||
+             request.prompt.find('\0') != std::string::npos ||
+             (request.output_format != "mp4" &&
+              request.output_format != "ppm") ||
+             !minimax_h3::ValidateGenerationParameters(request.parameters,
+                                                       nullptr) ||
+             !MatchesOutputContract(request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
             .error = "invalid MiniMax H3 video job request"};
