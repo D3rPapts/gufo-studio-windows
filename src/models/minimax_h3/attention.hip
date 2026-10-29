@@ -16,12 +16,13 @@ namespace {
 using Fragment = __attribute__((ext_vector_type(16))) unsigned short;
 using Accumulator = __attribute__((ext_vector_type(8))) float;
 
-__device__ BufferResource MakeBuffer(const std::uint16_t* pointer,
-                                     unsigned bytes) {
+__device__ __forceinline__ BufferResource
+MakeBuffer(const std::uint16_t* pointer, unsigned bytes) {
   const auto address = reinterpret_cast<std::uintptr_t>(pointer);
   return {unsigned(address), unsigned(address >> 32), bytes, 0x31004000U};
 }
-__device__ uint4 LoadBufferVector(BufferResource resource, unsigned offset) {
+__device__ __forceinline__ uint4 LoadBufferVector(BufferResource resource,
+                                                  unsigned offset) {
   union {
     BufferResource vector;
     uint4 packed;
@@ -30,7 +31,7 @@ __device__ uint4 LoadBufferVector(BufferResource resource, unsigned offset) {
   return result.packed;
 }
 
-__device__ Fragment LoadFragment(const std::uint16_t* source) {
+__device__ __forceinline__ Fragment LoadFragment(const std::uint16_t* source) {
   union {
     Fragment fragment;
     uint4 words[2];
@@ -40,7 +41,7 @@ __device__ Fragment LoadFragment(const std::uint16_t* source) {
   return value.fragment;
 }
 
-__device__ std::uint16_t Bf16(float value) {
+__device__ __forceinline__ std::uint16_t Bf16(float value) {
   const unsigned bits = __float_as_uint(value);
   const unsigned nan = 0U - unsigned((bits & 0x7fffffffU) > 0x7f800000U);
   const unsigned rounded = bits + 0x7fffU + ((bits >> 16U) & 1U);
