@@ -32,13 +32,14 @@ WanLoadBuffer(BufferResource, unsigned, unsigned,
 
 namespace {
 
-__device__ BufferResource MakeBuffer(const std::uint16_t* pointer,
-                                     unsigned bytes) {
+__device__ __forceinline__ BufferResource
+MakeBuffer(const std::uint16_t* pointer, unsigned bytes) {
   const auto address = reinterpret_cast<std::uintptr_t>(pointer);
   return {unsigned(address), unsigned(address >> 32), bytes, 0x31004000U};
 }
 
-__device__ uint4 LoadBufferVector(BufferResource resource, unsigned offset) {
+__device__ __forceinline__ uint4 LoadBufferVector(BufferResource resource,
+                                                  unsigned offset) {
   union {
     BufferResource vector;
     uint4 packed;
@@ -47,7 +48,7 @@ __device__ uint4 LoadBufferVector(BufferResource resource, unsigned offset) {
   return result.packed;
 }
 
-__device__ Fragment LoadFragment(const std::uint16_t* source) {
+__device__ __forceinline__ Fragment LoadFragment(const std::uint16_t* source) {
   union {
     Fragment fragment;
     uint4 words[2];
@@ -57,7 +58,7 @@ __device__ Fragment LoadFragment(const std::uint16_t* source) {
   return value.fragment;
 }
 
-__device__ std::uint16_t Bf16(float value) {
+__device__ __forceinline__ std::uint16_t Bf16(float value) {
   const unsigned bits = __float_as_uint(value);
   const unsigned nan = 0U - unsigned((bits & 0x7fffffffU) > 0x7f800000U);
   const unsigned rounded = bits + 0x7fffU + ((bits >> 16U) & 1U);
@@ -101,7 +102,7 @@ __global__ void PackValues(const std::uint16_t* input, std::uint16_t* output,
 }
 
 // Packs two probabilities as FP16 (round to nearest even).
-__device__ unsigned PackHalves(float low, float high) {
+__device__ __forceinline__ unsigned PackHalves(float low, float high) {
   const unsigned lo =
       __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(low));
   const unsigned hi =
@@ -110,7 +111,7 @@ __device__ unsigned PackHalves(float low, float high) {
 }
 
 // Exchanges a register between lanes l and l ^ 16.
-__device__ unsigned SwapHalves(unsigned x) {
+__device__ __forceinline__ unsigned SwapHalves(unsigned x) {
   return __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false,
                                       false);
 }

@@ -68,7 +68,7 @@ __device__ __forceinline__ float Silu(float x) {
   return x / (1.0F + expf(-x));
 }
 
-__device__ float BlockSum(float value, float* shared) {
+__device__ __forceinline__ float BlockSum(float value, float* shared) {
   const int tid = threadIdx.x;
   shared[tid] = value;
   __syncthreads();
