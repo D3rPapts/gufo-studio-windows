@@ -43,6 +43,7 @@ HttpResponse Error(int status, const std::string& message,
   return {.status = status,
           .reason = status == 400   ? "Bad Request"
                     : status == 404 ? "Not Found"
+                    : status == 503 ? "Service Unavailable"
                                     : "Internal Server Error",
           .body = body.dump(),
           .headers = {{"Content-Type", "application/json"}}};
@@ -303,6 +304,8 @@ ImageService::ImageService(const std::filesystem::path& root,
   if (!runner_) {
 #if defined(ENGINE_ENABLE_HIP)
     model_ = std::make_unique<image::Model>(root);
+    model_->SetLog(
+        [](const std::string& line) { Logger::Info("image", line); });
     runner_ = [this](const Request& request,
                      const CancellationCheck& cancelled) {
       return model_->Generate(request, cancelled);
@@ -508,6 +511,8 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
             .headers = {{"Content-Type", "application/json"}}};
   } catch (const std::invalid_argument& error) {
     return Error(400, error.what(), "invalid_request");
+  } catch (const image::InsufficientMemory& error) {
+    return Error(503, error.what(), "insufficient_gpu_memory");
   } catch (const std::exception& error) {
     return Error(500, error.what(), "image_generation_failed");
   }
