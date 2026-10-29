@@ -291,7 +291,11 @@ std::string VideoJobId(const std::string& path) {
 Resolution ResolveModel(const HttpRequest& req) {
   Resolution resolution;
   if (IsJsonModelPost(req)) {
-    resolution.model_id = JsonBodyModel(req);
+    // Image edits and video first/last frames may arrive as multipart forms.
+    resolution.model_id =
+        req.header("content-type").starts_with("multipart/form-data")
+            ? MultipartModel(req.body)
+            : JsonBodyModel(req);
     resolution.missing = resolution.model_id.empty();
     return resolution;
   }
