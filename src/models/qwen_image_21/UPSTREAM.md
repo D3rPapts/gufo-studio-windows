@@ -59,7 +59,11 @@ start image resized to the output size. Defaults (1 and 1) keep the unguided
 full-schedule path unchanged. The negative prompt reuses the positive prompt's
 condition K/V for its leading reference images: block-causal rows never see
 later tokens, so rows before the first differing prompt token are identical;
-only its own text rows get a cache.
+only its own text rows get a cache. Requests above 6144 condition rows (more
+than one 1 MP reference) fill the condition caches before the first step in
+4096-row chunks; condition rows never attend to target rows and use the
+timestep-zero modulation, so this is the joint first step split by rows (not
+checked for bit identity with the joint step).
 
 Gufo's RNG differs from PyTorch's. Compare shared initial noise, not numeric
 seeds alone. Edit RNG seeds also bind the ordered, resized RGBA references:

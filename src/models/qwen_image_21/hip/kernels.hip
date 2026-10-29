@@ -673,7 +673,7 @@ Matrix Matrix::Reshape(int r, int c) const {
 }
 
 struct Runtime::Pool {
-  static constexpr std::size_t kMaxCachedBytes = 8ULL << 30;
+  std::size_t max_cached_bytes = 8ULL << 30;
   std::multimap<std::size_t, void*> free;
   std::size_t cached_bytes{0};
   ~Pool() { Clear(); }
@@ -686,7 +686,8 @@ struct Runtime::Pool {
     cached_bytes = 0;
   }
   void Release(void* p, std::size_t bytes) noexcept {
-    if (bytes <= kMaxCachedBytes - cached_bytes) {
+    if (cached_bytes <= max_cached_bytes &&
+        bytes <= max_cached_bytes - cached_bytes) {
       try {
         free.emplace(bytes, p);
         cached_bytes += bytes;
@@ -949,6 +950,20 @@ void Runtime::Evict(std::string_view prefix) {
   }
   std::erase(prefetched_groups_, prefix);
   Trim();
+}
+
+void Runtime::SetCacheLimit(std::size_t bytes) {
+  pool_->max_cached_bytes = bytes;
+}
+
+void Runtime::CopyRows(const Matrix& destination, int row,
+                       const Matrix& source) {
+  if (destination.packed || source.packed || destination.cols != source.cols ||
+      row < 0 || row > destination.rows - source.rows)
+    throw std::logic_error("Qwen-Image row copy shape mismatch");
+  Check(hipMemcpyAsync(
+      destination.data + static_cast<std::size_t>(row) * destination.cols,
+      source.data, source.size() * 2, hipMemcpyDeviceToDevice, stream_));
 }
 
 void Runtime::Trim() {

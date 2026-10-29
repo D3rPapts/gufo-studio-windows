@@ -10,6 +10,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
@@ -418,6 +419,8 @@ struct DiffusionContext {
   // own rows; limits count keys in the full sequence.
   const DiffusionContext* base{nullptr};
   int shared_rows{0};
+  // Prefill already filled keys/values; every step then runs target rows.
+  bool prefilled{false};
 };
 
 /// Leading encoder tokens shared by two prompts with the same references,
@@ -535,11 +538,104 @@ int ConditionRows(const EncodedPrompt& prompt) {
 
 // About one 1 MP reference: 0-1 references keep every weight resident.
 constexpr int kReleaseEncoderRows = 6144;
+constexpr std::size_t kDefaultCacheBytes = 8ULL << 30;
+constexpr std::size_t kLargeRequestCacheBytes = 2ULL << 30;
+
+/// Fill the condition K/V caches before the first step, without the target
+/// rows. Block-causal condition rows never attend to the target and use the
+/// timestep-zero modulation, so this matches the joint first step; 4096-row
+/// chunks bound the temporaries of multi-reference prompts (a joint first
+/// step over 38k rows holds about 6 GB). Cached blocks of the growing key
+/// spans are returned after every layer.
+void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
+             const CancellationCheck& cancelled) {
+  constexpr int kChunk = 4096;
+  const int rows = context.prefix.rows;
+  std::vector<std::pair<int, int>> chunks;
+  for (int start = 0; start < rows; start += kChunk)
+    chunks.emplace_back(start, std::min(kChunk, rows - start));
+  // The fused attention kernel needs at least 128 query rows.
+  if (chunks.size() > 1 && chunks.back().second < 128) {
+    chunks[chunks.size() - 2].second += chunks.back().second;
+    chunks.pop_back();
+  }
+  if (rows < 128)
+    throw std::logic_error("condition prefill needs at least 128 rows");
+  const float timestep = Bf16(Bf16(sigma * 1000.0F) / 1000.0F);
+  std::vector<float> time(512);
+  for (int row = 0; row < 2; ++row)
+    for (int i = 0; i < 128; ++i) {
+      const float angle = (row == 0 ? timestep * 1000 : 0) *
+                          std::exp(-std::log(10000.0F) * i / 128.0F);
+      time[row * 256 + i] = std::cos(angle);
+      time[row * 256 + 128 + i] = std::sin(angle);
+    }
+  const auto temb = rt.Linear(
+      rt.Activate(
+          rt.Linear(rt.Upload(time, 2, 256),
+                    "transformer.time_text_embed.timestep_embedder.linear_1"),
+          Activation::kSilu),
+      "transformer.time_text_embed.timestep_embedder.linear_2");
+  const auto factors =
+      rt.ModulationFactors(rt.Linear(rt.Activate(temb, Activation::kSilu),
+                                     "transformer.modulation.1"),
+                           true);
+  auto x = rt.Concat(std::array{context.prefix});
+  const int shared = context.shared_rows;
+  for (int layer = 0; layer < 32; ++layer) {
+    Cancel(cancelled);
+    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
+    // Image rows attend to their whole image block, which can extend past a
+    // chunk: first project every chunk, then attend.
+    auto queries = rt.New(rows, 4096), keys = rt.New(rows, 4096),
+         values = rt.New(rows, 4096);
+    for (const auto [start, count] : chunks) {
+      const auto rope = context.rope.Slice(start, count);
+      // Every row is a condition row: modulation part with timestep zero.
+      const auto norm =
+          rt.NormalizeModulate(x.Slice(start, count), factors, 0, count);
+      rt.CopyRows(queries, start,
+                  rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_q"),
+                                   p + ".attn.norm_q", 32, rope));
+      rt.CopyRows(keys, start,
+                  rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_k"),
+                                   p + ".attn.norm_k", 32, rope));
+      rt.CopyRows(values, start, rt.Linear(norm, p + ".attn.to_v"));
+    }
+    // The last layer's condition outputs are never read.
+    for (const auto [start, count] :
+         layer == 31 ? decltype(chunks){} : chunks) {
+      const std::vector<int> limits(context.limits.begin() + start,
+                                    context.limits.begin() + start + count);
+      const int span = *std::max_element(limits.begin(), limits.end()) - shared;
+      auto k = keys.Slice(0, span), v = values.Slice(0, span);
+      if (shared) {
+        k = Concat(rt, {context.base->keys[layer].Slice(0, shared), k});
+        v = Concat(rt, {context.base->values[layer].Slice(0, shared), v});
+      }
+      const auto chunk = x.Slice(start, count);
+      const auto attention = rt.Linear(
+          rt.Attention(queries.Slice(start, count), k, v, 32, 32, 128, limits),
+          p + ".attn.to_out.0");
+      auto out = rt.Modulate(attention, factors, 1, count, &chunk);
+      const auto norm2 = rt.NormalizeModulate(out, factors, 2, count);
+      const auto mlp = rt.Linear(
+          rt.GatedLinear(norm2, p + ".img_mlp.gate_layer", p + ".img_mlp.proj"),
+          p + ".img_mlp.out");
+      out = rt.Modulate(mlp, factors, 3, count, &out);
+      rt.CopyRows(x, start, out);
+    }
+    context.keys[layer] = std::move(keys);
+    context.values[layer] = std::move(values);
+    rt.Trim();
+  }
+  context.prefilled = true;
+}
 
 Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
                float sigma, int step, const CancellationCheck& cancelled,
                const Observer& observer) {
-  const int prefix = step == 0 ? context.prefix.rows : 0;
+  const int prefix = step == 0 && !context.prefilled ? context.prefix.rows : 0;
   auto x = rt.Linear(latent, "transformer.img_in");
   if (prefix)
     x = Concat(rt, {context.prefix, x});
@@ -650,6 +746,10 @@ Result Model::Generate(const Request& request,
   const auto start = Clock::now();
   auto& rt = impl_->runtime;
   Result result;
+  struct CacheLimitReset {
+    Runtime& rt;
+    ~CacheLimitReset() { rt.SetCacheLimit(kDefaultCacheBytes); }
+  } cache_limit_reset{rt};
   try {
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
@@ -675,6 +775,8 @@ Result Model::Generate(const Request& request,
       rt.Evict("text_encoder.model.language_model.");
       rt.Evict("text_encoder.model.visual.");
       result.metrics.released_text_encoder = true;
+      // Freed temporaries stay cached up to this bound (8 GB otherwise).
+      rt.SetCacheLimit(kLargeRequestCacheBytes);
     }
     std::optional<DiffusionContext> context;
     context.emplace(PrepareDiffusion(rt, impl_->weights, prompt, height, width,
@@ -725,6 +827,9 @@ Result Model::Generate(const Request& request,
     if (img2img) {
       latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
       rt.Observe(observer, "init.latent", latent);
+    }
+    if (result.metrics.released_text_encoder) {
+      Prefill(rt, *context, sigmas[0], cancelled);
     }
     for (int step = 0; step < request.steps; ++step) {
       auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
