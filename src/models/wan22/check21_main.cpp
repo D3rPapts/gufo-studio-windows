@@ -27,6 +27,19 @@
 // and 19 with tools-local/wan21_uni3c_oracle.py; it also reports how much the
 // control changes the output.
 //
+//   gufo-wan-check21 --moge FILE --moge-oracle DIR
+//   gufo-wan-check21 --moge FILE --render-guide OUT.mp4 --image FILE
+//                    [--width W --height H --frames N] --camera TYPE
+//                    [--camera-amount A] [--camera-speed S]
+//                    [--camera-ease linear|ease_in_out]
+//                    [--camera-poses "f,x,y,z,yaw,pitch,roll,zoom;..."]
+//
+// `--moge-oracle` runs MoGe-2 on DIR/image.npy and compares the raw points,
+// mask and metric scale with tools-local/moge_oracle.py. `--render-guide`
+// renders the Uni3C guide of a camera path (OUT.mp4 and OUT.rgb). With
+// --i2v, --uni3c and --moge (no --guide-raw) the guide is rendered from the
+// camera path and saved next to the video (*_guide.mp4).
+//
 // `--i2v` runs the whole Wan 2.1 image-to-video pipeline (pipeline21.hpp);
 // --guide-raw is rgb24 frames at the video size (ffmpeg -f rawvideo);
 // --dump writes the pipeline intermediates as .npy for
@@ -53,9 +66,12 @@
 #include <vector>
 
 #include "src/core/image.hpp"
+#include "src/models/wan22/camera_path.hpp"
 #include "src/models/wan22/clip_vision.hpp"
+#include "src/models/wan22/moge.hpp"
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/pipeline21.hpp"
+#include "src/models/wan22/point_render.hpp"
 #include "src/models/wan22/transformer21.hpp"
 #include "src/models/wan22/uni3c.hpp"
 
@@ -468,6 +484,112 @@ int Uni3COracle(const std::filesystem::path& dit,
   return pass ? 0 : 1;
 }
 
+int MogeOracle(const std::filesystem::path& file,
+               const std::filesystem::path& dir) {
+  std::vector<float> image, points, mask, scale;
+  std::vector<std::size_t> shape, s1, s2, s3;
+  if (!ReadNpy(dir / "image.npy", &image, &shape) || shape.size() != 3 ||
+      !ReadNpy(dir / "points.npy", &points, &s1) ||
+      !ReadNpy(dir / "mask.npy", &mask, &s2) ||
+      !ReadNpy(dir / "metric_scale.npy", &scale, &s3)) {
+    std::cerr << "cannot read MoGe oracle in " << dir << "\n";
+    return 1;
+  }
+  const int height = static_cast<int>(shape[0]);
+  const int width = static_cast<int>(shape[1]);
+  std::vector<std::uint8_t> rgb(image.size());
+  for (std::size_t i = 0; i < image.size(); ++i)
+    rgb[i] = static_cast<std::uint8_t>(std::lround(image[i]));
+  std::string error;
+  auto start = Clock::now();
+  auto moge = wan22::Moge::Load(file, &error);
+  if (!moge) {
+    std::cerr << "moge: " << error << "\n";
+    return 1;
+  }
+  std::cout << "moge load " << Seconds(start) << " s\n";
+  wan22::MogeRaw raw;
+  wan22::MogeResult result;
+  start = Clock::now();
+  if (!moge->Infer(rgb, width, height, &result, &raw, &error)) {
+    std::cerr << "moge infer: " << error << "\n";
+    return 1;
+  }
+  std::cout << "moge infer " << Seconds(start) << " s, base " << raw.base_height
+            << "x" << raw.base_width << ", device used " << DeviceUsedGiB()
+            << " GiB\n";
+  const Comparison p = Compare(raw.points.data(), points.data(), points.size());
+  const Comparison m = Compare(raw.mask.data(), mask.data(), mask.size());
+  Print("points", p);
+  Print("mask", m);
+  // Depth (z) alone and the mask agreement at 0.5.
+  std::vector<float> z_ours, z_ref;
+  std::size_t agree = 0;
+  for (std::size_t i = 0; i < mask.size(); ++i) {
+    z_ours.push_back(raw.points[i * 3 + 2]);
+    z_ref.push_back(points[i * 3 + 2]);
+    agree += (raw.mask[i] > 0.5F) == (mask[i] > 0.5F);
+  }
+  Print("z", Compare(z_ours.data(), z_ref.data(), z_ours.size()));
+  std::cout << "mask agreement " << 100.0 * agree / mask.size()
+            << " %, metric scale " << raw.metric_scale << " vs " << scale[0]
+            << "\nfocal " << result.focal << ", shift " << result.shift
+            << ", fx " << result.fx << " px (fov_x "
+            << 2 * std::atan(width / (2 * result.fx)) * 180 / 3.14159265
+            << " deg), median depth " << wan22::SceneDepth(result) << " m\n";
+  WriteNpy(dir / "depth_gufo.npy", result.depth,
+           {static_cast<std::size_t>(height), static_cast<std::size_t>(width)});
+  const bool pass = p.cosine >= 0.999 && m.cosine >= 0.999 &&
+                    std::abs(raw.metric_scale / scale[0] - 1) < 0.01;
+  std::cout << (pass ? "PASS" : "FAIL") << "\n";
+  return pass ? 0 : 1;
+}
+
+int RenderGuideOnly(const wan22::I2V21Request& base,
+                    const std::filesystem::path& out,
+                    const std::filesystem::path& image_path) {
+  wan22::I2V21Request request = base;
+  std::vector<std::uint8_t> first_frame;
+  try {
+    const auto image =
+        gufo::core::DecodeImage(gufo::core::ReadImageFile(image_path));
+    first_frame = wan22::FitImage(image.pixels, static_cast<int>(image.width),
+                                  static_cast<int>(image.height), request.width,
+                                  request.height);
+  } catch (const std::exception& e) {
+    std::cerr << "cannot read " << image_path << ": " << e.what() << "\n";
+    return 1;
+  }
+  request.first_frame = first_frame;
+  std::vector<std::uint8_t> frames;
+  wan22::I2V21Telemetry tel;
+  std::string error;
+  if (!wan22::RenderCameraGuide(request, &frames, &tel, &error)) {
+    std::cerr << "render: " << error << "\n";
+    return 1;
+  }
+  std::cout << "depth " << tel.depth_ms / 1000 << " s, render "
+            << tel.render_ms / 1000 << " s, scene depth " << tel.scene_depth
+            << " m, fx " << tel.fx << " px, metric scale " << tel.metric_scale
+            << "\n";
+  std::filesystem::path raw = out;
+  raw.replace_extension(".rgb");
+  std::ofstream(raw, std::ios::binary)
+      .write(reinterpret_cast<const char*>(frames.data()),
+             static_cast<std::streamsize>(frames.size()));
+  wan22::DecodedVideo video;
+  video.frames = request.frames;
+  video.width = request.width;
+  video.height = request.height;
+  video.rgb8 = std::move(frames);
+  if (!wan22::WriteMp4(out, video, 16, &error)) {
+    std::cerr << "mp4: " << error << "\n";
+    return 1;
+  }
+  std::cout << "wrote " << out << " and " << raw << "\n";
+  return 0;
+}
+
 int RunI2V(const wan22::I2V21Request& base, const std::filesystem::path& out,
            const std::filesystem::path& image_path,
            const std::filesystem::path& guide_path,
@@ -522,6 +644,19 @@ int RunI2V(const wan22::I2V21Request& base, const std::filesystem::path& out,
       WriteNpy(dump_dir / (name + ".npy"), values, shape);
     };
   }
+  callbacks.rendered_guide = [&](const std::vector<std::uint8_t>& frames,
+                                 int count) {
+    wan22::DecodedVideo guide_video;
+    guide_video.frames = count;
+    guide_video.width = request.width;
+    guide_video.height = request.height;
+    guide_video.rgb8 = frames;
+    std::filesystem::path guide_out = out;
+    guide_out.replace_filename(out.stem().string() + "_guide.mp4");
+    std::string guide_error;
+    if (wan22::WriteMp4(guide_out, guide_video, 16, &guide_error))
+      std::cout << "guide " << guide_out << "\n";
+  };
   callbacks.progress = [](const std::string& phase, int done, int total) {
     std::cout << "  " << phase << " " << done << "/" << total << "\n"
               << std::flush;
@@ -536,7 +671,9 @@ int RunI2V(const wan22::I2V21Request& base, const std::filesystem::path& out,
   }
   std::cout << "text " << tel.text_ms / 1000 << " s, clip "
             << tel.clip_ms / 1000 << " s, condition " << tel.condition_ms / 1000
-            << " s, guide " << tel.guide_ms / 1000 << " s, dit load "
+            << " s, guide " << tel.guide_ms / 1000 << " s, depth "
+            << tel.depth_ms / 1000 << " s, render " << tel.render_ms / 1000
+            << " s (scene depth " << tel.scene_depth << " m), dit load "
             << tel.dit_load_ms / 1000 << " s, context " << tel.context_ms / 1000
             << " s, decode " << tel.decode_ms / 1000 << " s, total "
             << tel.total_ms / 1000 << " s\n";
@@ -567,6 +704,7 @@ int main(int argc, char** argv) {
   int bench[3]{};
   wan22::I2V21Request i2v;
   std::filesystem::path i2v_out, image, guide_raw, dump_dir, uni3c_oracle;
+  std::filesystem::path moge_oracle, render_out;
   for (int i = 1; i < argc; ++i) {
     const std::string name = argv[i];
     const bool more = i + 1 < argc;
@@ -606,7 +744,28 @@ int main(int argc, char** argv) {
       guide_raw = argv[++i];
     else if (name == "--uni3c-strength" && more)
       i2v.uni3c_strength = static_cast<float>(std::atof(argv[++i]));
-    else if (name == "--uni3c-oracle" && more)
+    else if (name == "--moge" && more)
+      i2v.moge_file = argv[++i];
+    else if (name == "--moge-oracle" && more)
+      moge_oracle = argv[++i];
+    else if (name == "--render-guide" && more)
+      render_out = argv[++i];
+    else if (name == "--camera" && more)
+      i2v.camera.type = argv[++i];
+    else if (name == "--camera-amount" && more)
+      i2v.camera.amount = std::atof(argv[++i]);
+    else if (name == "--camera-speed" && more)
+      i2v.camera.speed = std::atof(argv[++i]);
+    else if (name == "--camera-ease" && more)
+      i2v.camera.ease = argv[++i];
+    else if (name == "--camera-poses" && more) {
+      std::string error;
+      i2v.camera.type = "poses";
+      if (!wan22::ParseKeyframes(argv[++i], &i2v.camera.keyframes, &error)) {
+        std::cerr << error << "\n";
+        return 2;
+      }
+    } else if (name == "--uni3c-oracle" && more)
       uni3c_oracle = argv[++i];
     else if (name == "--dump" && more)
       dump_dir = argv[++i];
@@ -616,6 +775,10 @@ int main(int argc, char** argv) {
     else
       return Usage();
   }
+  if (!moge_oracle.empty())
+    return MogeOracle(i2v.moge_file, moge_oracle);
+  if (!render_out.empty())
+    return RenderGuideOnly(i2v, render_out, image);
   if (!uni3c_oracle.empty())
     return Uni3COracle(dit, lora, dit_oracle, clip_dir, i2v.uni3c_file,
                        uni3c_oracle);

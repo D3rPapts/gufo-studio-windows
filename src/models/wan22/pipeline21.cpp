@@ -9,7 +9,9 @@
 #include <utility>
 
 #include "src/models/wan22/clip_vision.hpp"
+#include "src/models/wan22/moge.hpp"
 #include "src/models/wan22/pipeline.hpp"
+#include "src/models/wan22/point_render.hpp"
 #include "src/models/wan22/text_encoder.hpp"
 #include "src/models/wan22/tokenizer.hpp"
 #include "src/models/wan22/transformer21.hpp"
@@ -51,6 +53,34 @@ std::vector<float> GuideVideo(std::span<const std::uint8_t> rgb, int count,
 }
 
 }  // namespace
+
+bool RenderCameraGuide(const I2V21Request& request,
+                       std::vector<std::uint8_t>* frames,
+                       I2V21Telemetry* telemetry, std::string* error) {
+  I2V21Telemetry local;
+  I2V21Telemetry& tel = telemetry != nullptr ? *telemetry : local;
+  auto start = Clock::now();
+  auto moge = Moge::Load(request.moge_file, error);
+  if (!moge)
+    return false;
+  MogeResult geometry;
+  if (!moge->Infer(request.first_frame, request.width, request.height,
+                   &geometry, nullptr, error))
+    return false;
+  moge.reset();
+  tel.depth_ms = Ms(start);
+  start = Clock::now();
+  tel.scene_depth = SceneDepth(geometry);
+  tel.fx = geometry.fx;
+  tel.metric_scale = geometry.metric_scale;
+  std::vector<CameraPose> poses;
+  if (!BuildCameraPath(request.camera, request.frames, tel.scene_depth, &poses,
+                       error) ||
+      !RenderGuide(geometry, request.first_frame, poses, frames, error))
+    return false;
+  tel.render_ms = Ms(start);
+  return true;
+}
 
 bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
                    std::vector<float>* final_latents, DecodedVideo* video,
@@ -135,13 +165,23 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
     TrackDevice(&tel.peak_device_bytes);
     tel.condition_ms = Ms(start);
     if (!request.uni3c_file.empty()) {
+      std::span<const std::uint8_t> guide = request.guide;
+      int guide_frames = request.guide_frames;
+      std::vector<std::uint8_t> rendered;
+      if (guide.empty() && !request.moge_file.empty()) {
+        if (!RenderCameraGuide(request, &rendered, &tel, error))
+          return false;
+        guide = rendered;
+        guide_frames = n;
+        if (callbacks.rendered_guide)
+          callbacks.rendered_guide(rendered, n);
+      }
       start = Clock::now();
-      if (request.guide_frames < 1 ||
-          request.guide.size() != frame * request.guide_frames) {
+      if (guide_frames < 1 || guide.size() != frame * guide_frames) {
         SetError(error, "Wan 2.1 I2V: guide video must be at the video size");
         return false;
       }
-      input = GuideVideo(request.guide, request.guide_frames, n, h, w);
+      input = GuideVideo(guide, guide_frames, n, h, w);
       if (!encoder->EncodeVideo(input, n, h, w, true, &guide_latent, error))
         return false;
       tel.guide_ms = Ms(start);

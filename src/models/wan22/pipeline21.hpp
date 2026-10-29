@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/wan22/camera_path.hpp"
 #include "src/models/wan22/vae.hpp"
 
 namespace gufo::models::wan22 {
@@ -44,11 +45,17 @@ struct I2V21Request {
   std::span<const std::uint8_t> guide;
   int guide_frames{0};
   float uni3c_strength{1.0F};
+  /// Instead of `guide`: render it from the first frame with MoGe-2
+  /// (`moge_file`, tools-local/moge_to_safetensors.py) along `camera`.
+  std::filesystem::path moge_file;
+  CameraSpec camera;
 };
 
 struct I2V21Telemetry {
   double text_ms{0}, clip_ms{0}, condition_ms{0}, guide_ms{0};
   double dit_load_ms{0}, context_ms{0}, decode_ms{0}, total_ms{0};
+  double depth_ms{0}, render_ms{0};
+  double scene_depth{0}, fx{0}, metric_scale{0};
   std::vector<double> step_ms;
   std::size_t peak_device_bytes{0};
 };
@@ -59,7 +66,16 @@ struct I2V21Callbacks {
                      const std::vector<std::size_t>& shape)>
       dump;
   std::function<void(const std::string& phase, int done, int total)> progress;
+  /// The rendered guide video, RGB8 [frames, height, width, 3].
+  std::function<void(const std::vector<std::uint8_t>& frames, int count)>
+      rendered_guide;
 };
+
+/// MoGe-2 + camera path + point render only: the Uni3C guide for
+/// `request.first_frame` (RGB8 [frames, height, width, 3]).
+bool RenderCameraGuide(const I2V21Request& request,
+                       std::vector<std::uint8_t>* frames,
+                       I2V21Telemetry* telemetry, std::string* error);
 
 bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
                    std::vector<float>* final_latents, DecodedVideo* video,
