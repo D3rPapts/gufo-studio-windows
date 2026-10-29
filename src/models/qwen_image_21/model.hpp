@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -22,8 +23,14 @@ std::vector<std::uint8_t> EncodePng(const Image& image);
 Image ResizeImage(const Image& image, int width, int height);
 /// Keep edit noise independent of the noise that generated its references.
 /// Supply the canonical resized RGBA references; generation retains its seed.
+/// Image to image additionally binds the start image (already resized to the
+/// output size), so its noise never replays the noise that generated it.
 std::uint64_t InitialNoiseSeed(std::uint64_t seed,
-                               std::span<const Image> images);
+                               std::span<const Image> images,
+                               const Image* init_image = nullptr);
+
+/// ComfyUI KSampler treats denoise above this as a full schedule.
+inline constexpr double kFullStrength = 0.9999;
 
 struct Request {
   std::string prompt;
@@ -32,6 +39,20 @@ struct Request {
   int height{1024};
   int steps{40};
   std::uint64_t seed{0};
+  /// True classifier-free guidance (Diffusers `true_cfg_scale`, ComfyUI
+  /// KSampler `cfg`). Above 1 every step also evaluates `negative_prompt`
+  /// (with the same reference images; empty encodes like an empty prompt)
+  /// and combines `negative + guidance * (positive - negative)`. 1 keeps the
+  /// unguided single-pass path.
+  std::string negative_prompt;
+  float guidance{1};
+  /// Image to image (ComfyUI VAEEncode -> KSampler denoise). The image is
+  /// resized to width x height and VAE-encoded; `strength` below 1 runs
+  /// `steps` steps from the tail of an int(steps / strength) schedule,
+  /// starting at sigma * noise + (1 - sigma) * image. Ignored at full
+  /// strength.
+  std::optional<Image> init_image;
+  double strength{1};
 };
 
 struct Metrics {
@@ -61,6 +82,9 @@ struct Observer {
 
 void ValidateRequest(const Request& request);
 std::vector<float> FlowSigmas(int steps, int image_tokens);
+/// `steps` + 1 sigmas: FlowSigmas for full strength, otherwise the last
+/// `steps` + 1 of FlowSigmas(int(steps / strength)) as in ComfyUI KSampler.
+std::vector<float> DenoiseSigmas(int steps, double strength, int image_tokens);
 
 class Model {
 public:

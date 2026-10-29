@@ -113,6 +113,8 @@ public:
   Matrix UpShortcut(const Matrix& x, int height, int width, int out_channels,
                     int temporal);
   Matrix Euler(const Matrix& x, const Matrix& velocity, float dt);
+  Matrix Guidance(const Matrix& positive, const Matrix& negative, float scale);
+  Matrix NoiseMix(const Matrix& noise, const Matrix& image, float sigma);
   Matrix LatentScale(const Matrix& x, std::span<const float> mean,
                      std::span<const float> stddev, bool encode);
   Matrix VisionPosition(const Matrix& x, int height, int width);
