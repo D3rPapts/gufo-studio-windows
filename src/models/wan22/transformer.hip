@@ -37,6 +37,8 @@ constexpr int kRopeTimePairs = 22;  // 44 dims; height and width get 42 each
 constexpr int kRopeSpacePairs = 21;
 constexpr float kEpsilon = 1e-6F;
 constexpr std::size_t kStagingBytes = 32U << 20U;
+constexpr std::size_t kSector = 4096;
+constexpr std::size_t kStagingSlack = 2U * kSector;
 constexpr int kRowThreads = 256;
 constexpr int kRowValues = kWidth / kRowThreads;  // 12
 
@@ -419,6 +421,19 @@ struct Block {
   DeviceBuffer modulation;  // FP32 [6, W]
 };
 
+// Reads `bytes` at `offset` into a staging buffer of kStagingBytes +
+// kStagingSlack as its sector-aligned superset, so ReadFileParallel can use
+// unbuffered parallel reads. Returns the first requested byte, or nullptr.
+const std::byte* ReadStaged(platform::PlatformFile file, std::byte* buffer,
+                            std::size_t bytes, std::uint64_t offset) {
+  const std::uint64_t aligned = offset / kSector * kSector;
+  const auto lead = static_cast<std::size_t>(offset - aligned);
+  const std::size_t span = (lead + bytes + kSector - 1U) / kSector * kSector;
+  return platform::ReadFileParallel(file, buffer, span, aligned) >= lead + bytes
+             ? buffer + lead
+             : nullptr;
+}
+
 }  // namespace
 
 struct Transformer::Impl {
@@ -622,16 +637,12 @@ bool Transformer::Impl::Upload(const TensorLocation& location,
     next_slot ^= 1;
     if (!Check(hipEventSynchronize(staged[slot]), "weight staging", error))
       return false;
-    auto* buffer = static_cast<std::byte*>(staging[slot]);
-    for (std::size_t read = 0; read < chunk;) {
-      const std::size_t result =
-          platform::ReadFileAt(shards[location.shard], buffer + read,
-                               chunk - read, location.offset + copied + read);
-      if (result == 0) {
-        SetError(error, "short read of transformer tensor " + name);
-        return false;
-      }
-      read += result;
+    const std::byte* buffer = ReadStaged(shards[location.shard],
+                                         static_cast<std::byte*>(staging[slot]),
+                                         chunk, location.offset + copied);
+    if (buffer == nullptr) {
+      SetError(error, "short read of transformer tensor " + name);
+      return false;
     }
     if (location.f32 && bf16) {
       const std::size_t count = chunk / 4;
@@ -901,9 +912,10 @@ std::unique_ptr<Transformer> Transformer::Load(const std::filesystem::path& dir,
   if (!impl->gemm.Init(impl->stream, error))
     return nullptr;
   for (int slot = 0; slot < 2; ++slot)
-    if (!Check(hipHostMalloc(&impl->staging[slot], kStagingBytes,
-                             hipHostMallocDefault),
-               "pinned staging", error) ||
+    if (!Check(
+            hipHostMalloc(&impl->staging[slot], kStagingBytes + kStagingSlack,
+                          hipHostMallocDefault),
+            "pinned staging", error) ||
         !impl->staging_device[slot].Allocate(kStagingBytes, error) ||
         !Check(
             hipEventCreateWithFlags(&impl->staged[slot], hipEventDisableTiming),
