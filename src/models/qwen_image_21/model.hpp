@@ -61,6 +61,12 @@ struct Metrics {
   double vae_ms{0};
   double total_ms{0};
   std::size_t resident_weight_bytes{0};
+  /// DiT condition rows (text + reference tokens) of the positive prompt and
+  /// the negative prompt's own rows (references are shared).
+  int condition_rows{0};
+  int negative_condition_rows{0};
+  /// The text encoder left GPU memory for this request's caches.
+  bool released_text_encoder{false};
 };
 
 struct Result {
@@ -98,6 +104,9 @@ public:
                   const CancellationCheck& cancelled = {},
                   const Observer& observer = {});
   std::vector<std::uint32_t> Tokenize(std::string_view text) const;
+  /// True after a failed request left the HIP context unusable (a sticky
+  /// launch failure or a failed library call); only a new process recovers.
+  bool DeviceLost() const;
 
 private:
   struct Impl;

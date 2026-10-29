@@ -937,6 +937,27 @@ Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
   return m;
 }
 
+void Runtime::Evict(std::string_view prefix) {
+  Synchronize();
+  for (auto it = device_weights_.begin(); it != device_weights_.end();) {
+    if (it->first.starts_with(prefix)) {
+      weight_bytes_ -= it->second.size() * 2;
+      it = device_weights_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::erase(prefetched_groups_, prefix);
+  Trim();
+}
+
+void Runtime::Trim() {
+  Synchronize();
+  packed_source_ = {};
+  packed_input_ = {};
+  pool_->Clear();
+}
+
 Matrix Runtime::PackedInput(const Matrix& x) {
   if (x.packed)
     return x;

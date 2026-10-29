@@ -15,4 +15,7 @@ Result Model::Generate(const Request&, const CancellationCheck&,
 std::vector<std::uint32_t> Model::Tokenize(std::string_view) const {
   throw std::runtime_error("Qwen-Image requires HIP");
 }
+bool Model::DeviceLost() const {
+  return false;
+}
 }  // namespace gufo::models::qwen_image_21

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -410,13 +411,41 @@ struct DiffusionContext {
   Matrix rope;
   std::vector<int> limits;
   std::array<Matrix, 32> keys, values;
+  // Leading condition rows taken from `base`'s caches instead of `prefix`.
+  // Block-causal rows never see later tokens, so a prefix that is identical
+  // in both prompts (the reference images before the prompt text) has
+  // identical K/V for the negative pass. `rope` and `limits` cover only the
+  // own rows; limits count keys in the full sequence.
+  const DiffusionContext* base{nullptr};
+  int shared_rows{0};
 };
+
+/// Leading encoder tokens shared by two prompts with the same references,
+/// ending after the last shared reference image; 0 without one. The
+/// remaining tail is never empty.
+int SharedConditionTokens(const EncodedPrompt& a, const EncodedPrompt& b) {
+  const std::size_t length =
+      std::min(a.ids.size() - a.drop, b.ids.size() - b.drop);
+  std::size_t common = 0;
+  while (common + 1 < length &&
+         a.ids[a.drop + common] == b.ids[b.drop + common])
+    ++common;
+  std::size_t shared = 0;
+  for (std::size_t i = 0; i < common; ++i)
+    if (a.ids[a.drop + i] == 151655 &&
+        (i + 1 == common || a.ids[a.drop + i + 1] != 151655))
+      shared = i + 1;
+  return static_cast<int>(shared);
+}
 
 DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
                                   const EncodedPrompt& prompt, int height,
                                   int width, const CancellationCheck& cancelled,
-                                  const Observer& observer) {
+                                  const Observer& observer,
+                                  const DiffusionContext* base = nullptr,
+                                  int shared_tokens = 0) {
   DiffusionContext context;
+  context.base = shared_tokens ? base : nullptr;
   auto text = rt.Linear(
       rt.Activate(rt.Linear(rt.Normalize(prompt.hidden, Norm::kZeroRms,
                                          "transformer.txt_in.text_norm"),
@@ -430,13 +459,19 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
   std::size_t image_index = 0;
   const int length = text.rows;
   while (cursor < length) {
+    if (cursor == shared_tokens)
+      context.shared_rows = static_cast<int>(positions.size());
+    const bool shared = cursor < shared_tokens;
     if (prompt.ids[prompt.drop + cursor] == 151655) {
       const auto& image = prompt.images.at(image_index++);
       const int slots = (image.height / 32) * (image.width / 32);
       const int h = image.height / 16, w = image.width / 16;
-      parts.push_back(
-          rt.Linear(EncodeVae(rt, weights, image, cancelled, observer),
-                    "transformer.img_in"));
+      if (shared && cursor + slots > shared_tokens)
+        throw std::logic_error("shared condition ends inside an image");
+      if (!shared)
+        parts.push_back(
+            rt.Linear(EncodeVae(rt, weights, image, cancelled, observer),
+                      "transformer.img_in"));
       const int end = static_cast<int>(positions.size()) + h * w;
       for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
@@ -447,15 +482,20 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
       cursor += slots;
     } else {
       const int start = cursor;
-      while (cursor < length && prompt.ids[prompt.drop + cursor] != 151655) {
+      const int stop = shared ? shared_tokens : length;
+      while (cursor < stop && prompt.ids[prompt.drop + cursor] != 151655) {
         positions.push_back({position, position, position});
         context.limits.push_back(static_cast<int>(positions.size()));
         ++position;
         ++cursor;
       }
-      parts.push_back(text.Slice(start, cursor - start));
+      if (!shared)
+        parts.push_back(text.Slice(start, cursor - start));
     }
   }
+  if (shared_tokens && (!context.base || shared_tokens >= length ||
+                        context.shared_rows > context.base->prefix.rows))
+    throw std::logic_error("invalid shared condition prefix");
   context.prefix = rt.Concat(parts);
   const int end = static_cast<int>(positions.size()) + height * width;
   for (int y = 0; y < height; ++y)
@@ -464,6 +504,11 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
           {position, y - (height - height / 2), x - (width - width / 2)});
       context.limits.push_back(end);
     }
+  if (context.shared_rows) {
+    positions.erase(positions.begin(), positions.begin() + context.shared_rows);
+    context.limits.erase(context.limits.begin(),
+                         context.limits.begin() + context.shared_rows);
+  }
   std::vector<float> rope(positions.size() * 128);
   for (std::size_t row = 0; row < positions.size(); ++row)
     for (int pair = 0; pair < 64; ++pair) {
@@ -479,6 +524,17 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
   context.rope = rt.UploadFloat(rope, static_cast<int>(positions.size()), 128);
   return context;
 }
+
+/// DiT condition rows of a prompt: text tokens plus 4 rows per image token.
+int ConditionRows(const EncodedPrompt& prompt) {
+  int rows = static_cast<int>(prompt.ids.size() - prompt.drop);
+  for (const auto& image : prompt.images)
+    rows += 3 * (image.height / 32) * (image.width / 32);
+  return rows;
+}
+
+// About one 1 MP reference: 0-1 references keep every weight resident.
+constexpr int kReleaseEncoderRows = 6144;
 
 Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
                float sigma, int step, const CancellationCheck& cancelled,
@@ -524,6 +580,17 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
       // Copy only prefix rows: a view would pin full target K/V for all layers.
       context.keys[layer] = rt.Concat(std::array{k.Slice(0, prefix)});
       context.values[layer] = rt.Concat(std::array{v.Slice(0, prefix)});
+      if (context.shared_rows) {
+        k = Concat(
+            rt, {context.base->keys[layer].Slice(0, context.shared_rows), k});
+        v = Concat(
+            rt, {context.base->values[layer].Slice(0, context.shared_rows), v});
+      }
+    } else if (context.shared_rows) {
+      k = Concat(rt, {context.base->keys[layer].Slice(0, context.shared_rows),
+                      context.keys[layer], k});
+      v = Concat(rt, {context.base->values[layer].Slice(0, context.shared_rows),
+                      context.values[layer], v});
     } else {
       k = Concat(rt, {context.keys[layer], k});
       v = Concat(rt, {context.values[layer], v});
@@ -559,6 +626,7 @@ struct Model::Impl {
   Tokenizer tokenizer;
   Runtime runtime;
   std::mutex mutex;
+  std::atomic<bool> lost{false};
   explicit Impl(const std::filesystem::path& root)
       : weights(root), tokenizer(root), runtime(weights) {}
 };
@@ -576,6 +644,8 @@ Result Model::Generate(const Request& request,
                        const Observer& observer) {
   ValidateRequest(request);
   std::unique_lock lock(impl_->mutex);
+  if (DeviceLost())
+    throw std::runtime_error("Qwen-Image GPU context lost; restart the server");
   Cancel(cancelled);
   const auto start = Clock::now();
   auto& rt = impl_->runtime;
@@ -584,21 +654,41 @@ Result Model::Generate(const Request& request,
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
     const int height = request.height / 16, width = request.width / 16;
-    auto context = PrepareDiffusion(rt, impl_->weights, prompt, height, width,
-                                    cancelled, observer);
-    // True CFG: a second prompt with its own condition caches. Its boundaries
-    // are observed under "negative.".
+    // True CFG: a second prompt; its boundaries are observed under
+    // "negative.".
     const bool guided = request.guidance > 1;
     const auto negative_observer = Prefixed(observer, "negative.");
+    std::optional<EncodedPrompt> negative;
+    if (guided) {
+      Request text;
+      text.prompt = request.negative_prompt;
+      text.images = request.images;
+      negative = EncodePrompt(rt, impl_->tokenizer, text, cancelled,
+                              negative_observer);
+    }
+    // Every DiT condition row keeps 32 layers of K and V (512 KiB per row).
+    // With several references these caches outgrow the memory beside all
+    // weights, so the text encoder (16 GB) leaves until the next request.
+    const int condition_rows = ConditionRows(prompt);
+    result.metrics.condition_rows = condition_rows;
+    if (condition_rows > kReleaseEncoderRows) {
+      rt.Evict("text_encoder.model.language_model.");
+      rt.Evict("text_encoder.model.visual.");
+      result.metrics.released_text_encoder = true;
+    }
+    std::optional<DiffusionContext> context;
+    context.emplace(PrepareDiffusion(rt, impl_->weights, prompt, height, width,
+                                     cancelled, observer));
     std::optional<DiffusionContext> negative_context;
     if (guided) {
-      Request negative;
-      negative.prompt = request.negative_prompt;
-      negative.images = request.images;
-      const auto encoded = EncodePrompt(rt, impl_->tokenizer, negative,
-                                        cancelled, negative_observer);
-      negative_context = PrepareDiffusion(rt, impl_->weights, encoded, height,
-                                          width, cancelled, negative_observer);
+      // The references before the prompt text share their K/V with the
+      // positive pass; only the negative text rows get their own cache.
+      negative_context.emplace(
+          PrepareDiffusion(rt, impl_->weights, *negative, height, width,
+                           cancelled, negative_observer, &*context,
+                           SharedConditionTokens(prompt, *negative)));
+      result.metrics.negative_condition_rows = negative_context->prefix.rows;
+      negative.reset();
     }
     const bool img2img =
         request.init_image && request.strength <= kFullStrength;
@@ -610,7 +700,8 @@ Result Model::Generate(const Request& request,
       init_latent = EncodeVae(rt, impl_->weights, *init_image, cancelled,
                               Prefixed(observer, "init."));
     }
-    rt.Synchronize();
+    // Drop cached encoder and VAE-encoder temporaries before the caches fill.
+    rt.Trim();
     result.metrics.prompt_ms = Milliseconds(start);
     // Generate independent full-precision normal draws; seed replay never
     // depends on admission order, wall time, or another request's RNG.
@@ -636,8 +727,8 @@ Result Model::Generate(const Request& request,
       rt.Observe(observer, "init.latent", latent);
     }
     for (int step = 0; step < request.steps; ++step) {
-      auto velocity =
-          Denoise(rt, context, latent, sigmas[step], step, cancelled, observer);
+      auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
+                              cancelled, observer);
       if (guided) {
         const auto negative =
             Denoise(rt, *negative_context, latent, sigmas[step], step,
@@ -652,6 +743,11 @@ Result Model::Generate(const Request& request,
     }
     rt.Synchronize();
     result.metrics.denoise_ms = Milliseconds(denoise_start);
+    // The condition caches and DiT temporaries are done; give the VAE
+    // decoder their memory.
+    negative_context.reset();
+    context.reset();
+    rt.Trim();
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
@@ -659,12 +755,25 @@ Result Model::Generate(const Request& request,
     result.metrics.total_ms = Milliseconds(start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();
     return result;
-  } catch (...) {
+  } catch (const std::exception& error) {
     // All launches on this request's stream must finish before temporary
     // buffers return to the pool and the next request starts.
+    const auto status = hipStreamSynchronize(rt.stream());
+    // A failed HIP or hipBLAS(Lt) call leaves this process unable to run
+    // later requests (they fail with "unspecified launch failure").
+    const std::string_view what = error.what();
+    if (status != hipSuccess || what.starts_with("Qwen-Image HIP") ||
+        what.starts_with("Qwen-Image hipBLAS"))
+      impl_->lost.store(true, std::memory_order_release);
+    throw;
+  } catch (...) {
     (void)hipStreamSynchronize(rt.stream());
     throw;
   }
+}
+
+bool Model::DeviceLost() const {
+  return impl_->lost.load(std::memory_order_acquire);
 }
 
 }  // namespace gufo::models::qwen_image_21

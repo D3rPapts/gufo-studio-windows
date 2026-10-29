@@ -122,6 +122,12 @@ public:
   void Observe(const Observer& observer, std::string_view name,
                const Matrix& matrix);
   void Synchronize();
+  /// Drop a resident weight component (e.g. the text encoder after the
+  /// prompts are encoded); it reloads on next use. Also trims the pool.
+  void Evict(std::string_view prefix);
+  /// Return cached pool blocks to HIP. Freed tensors otherwise stay cached
+  /// (up to 8 GB) and push the next phase into shared (host) memory.
+  void Trim();
   std::size_t WeightBytes() const { return weight_bytes_; }
   hipStream_t stream() const { return stream_; }
 
