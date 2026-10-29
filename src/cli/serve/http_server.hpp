@@ -25,6 +25,7 @@ class AsrService;
 class ImageService;
 class EmbeddingService;
 class OmniService;
+class MusicService;
 class WebSocket;
 
 struct HttpRequest {
@@ -129,6 +130,10 @@ public:
 
   /// Serves the Qwen3-Omni captioner; call before start().
   void set_omni(std::shared_ptr<OmniService> omni) { omni_ = std::move(omni); }
+  /// Serves ACE-Step text-to-music (/v1/audio/music); call before start().
+  void set_music(std::shared_ptr<MusicService> music) {
+    music_ = std::move(music);
+  }
 
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
@@ -159,6 +164,7 @@ private:
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
   std::shared_ptr<OmniService> omni_;
+  std::shared_ptr<MusicService> music_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

@@ -46,6 +46,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
+#include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -930,7 +931,9 @@ void PrintServeHelp(std::string_view program_name,
       << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
          "(/v1/embeddings)\n"
       << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
-         "(/v1/chat/completions with input_audio)\n\n"
+         "(/v1/chat/completions with input_audio)\n"
+      << "  music     Serve ACE-Step 1.5 XL turbo text-to-music "
+         "(/v1/audio/music)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -1024,7 +1027,8 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image" || arg == "embedding" || arg == "omni") {
+        arg == "image" || arg == "embedding" || arg == "omni" ||
+        arg == "music") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1032,7 +1036,7 @@ int RunServe(std::span<const char* const> args) {
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
-          topic != "embedding" && topic != "omni") {
+          topic != "embedding" && topic != "omni" && topic != "music") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1119,8 +1123,44 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::ImageService> images;
   std::shared_ptr<server::EmbeddingService> embeddings;
   std::shared_ptr<server::OmniService> omni;
+  std::shared_ptr<server::MusicService> music;
 
-  if (subcommand == "embedding") {
+  if (subcommand == "music") {
+    std::filesystem::path model;
+    std::string name = "ace-step-1.5-xl-turbo";
+    ArgParser parser("gufo serve music",
+                     "Serve ACE-Step 1.5 XL turbo text-to-music.");
+    parser.AddOption("-m", "--model", "DIR",
+                     "ACE-Step directory (dit.safetensors, "
+                     "text_encoder.safetensors, vae.safetensors, "
+                     "tokenizer.json, silence_latent.safetensors)",
+                     "Model", &model);
+    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
+                     "Model", &name);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", "music");
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (model.empty()) {
+      std::cerr << "Error: --model <DIR> is required for music server\n";
+      return 2;
+    }
+    ModelLoadLog load_log("ace_step", model);
+    music = std::make_shared<server::MusicService>(model, name);
+    if (!music->ready()) {
+      std::cerr << "Error loading ACE-Step: " << music->initialization_error()
+                << '\n';
+      return 1;
+    }
+    load_log.Complete("model=" + name);
+  } else if (subcommand == "embedding") {
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
     std::string default_prompt_name;
@@ -1950,6 +1990,9 @@ int RunServe(std::span<const char* const> args) {
       images, embeddings);
   if (omni != nullptr) {
     server.set_omni(omni);
+  }
+  if (music != nullptr) {
+    server.set_music(music);
   }
   std::string err;
   if (!server.start(&err)) {

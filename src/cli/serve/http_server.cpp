@@ -33,6 +33,7 @@
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/omni_api.hpp"
 #include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -2175,6 +2176,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (asr_ != nullptr && asr_->ready()) ||
                        (embeddings_ != nullptr && embeddings_->ready()) ||
                        (omni_ != nullptr && omni_->ready()) ||
+                       (music_ != nullptr && music_->ready()) ||
                        images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
@@ -2188,6 +2190,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = asr_->model_id();
     } else if (omni_ != nullptr && omni_->ready()) {
       body["model"] = omni_->model_id();
+    } else if (music_ != nullptr && music_->ready()) {
+      body["model"] = music_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
@@ -2202,8 +2206,27 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   }
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
-    return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get(), embeddings_.get(), omni_.get());
+    HttpResponse listed =
+        ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
+                   images_.get(), embeddings_.get(), omni_.get());
+    if (music_ != nullptr && music_->ready()) {
+      json::Value models = json::parse(listed.body);
+      json::Value model = json::Value::object();
+      model["id"] = music_->model_id();
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-ace-step";
+      model["capability"] = "music";
+      models["data"].push_back(std::move(model));
+      listed.body = models.dump();
+    }
+    return listed;
+  }
+  if (music_ != nullptr && IsMusicApiPath(req.path)) {
+    if (!music_->ready())
+      return Err(503, "Service Unavailable", "ACE-Step music is not ready",
+                 "server_error", "music_service_unavailable");
+    return music_->Handle(req);
   }
   if (backend_ == nullptr && omni_ != nullptr && IsOmniApiPath(req.path)) {
     if (!omni_->ready())
