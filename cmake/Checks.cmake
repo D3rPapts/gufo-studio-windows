@@ -37,7 +37,9 @@ set(gufo_pr_targets
   embedding_gemma2_batch_scheduler_test
   qwen3_tts_config_test qwen3_tts_audio_api_test fish_drama3_config_test
   qwen_image_21_test qwen_image_21_weights_test
-  video_api_test minimax_h3_sampling_test minimax_h3_runtime_test)
+  video_api_test minimax_h3_sampling_test minimax_h3_runtime_test
+  router_preset_test router_registry_test router_proxy_test router_workers_test
+  router_ws_relay_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 if(NOT WIN32)
   list(APPEND gufo_pr_tests platform_library_relocated_test)
@@ -54,7 +56,8 @@ list(APPEND gufo_pr_tests
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
-  kernel_resources_parser_test check_docs_test check_pr_title_test)
+  kernel_resources_parser_test check_docs_test check_pr_title_test
+  gufo_router_help router_contract_test)
 if (WIN32)
   # Linux-only hosted suites: RLIMIT_FSIZE and fork()-based tests, the
   # dup2/mmap/socket fixture tests, the permission-fault disk-store cases,

@@ -413,6 +413,16 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_http STATIC
+  src/cli/serve/router/comfy_adapter.cpp
+  src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/preset.cpp
+  src/cli/serve/router/proxy.cpp
+  src/cli/serve/router/registry.cpp
+  src/cli/serve/router/memory.cpp
+  src/cli/serve/router/residency.cpp
+  src/cli/serve/router/router.cpp
+  src/cli/serve/router/ws_relay.cpp
+  src/cli/serve/serve_options.cpp
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
   src/cli/serve/asr_service.cpp
@@ -436,6 +446,16 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
+# Router workers: fork/exec on Linux, CreateProcessW in a kill-on-close job on
+# Windows.
+if (WIN32)
+  target_sources(gufo_http PRIVATE src/cli/serve/router/workers_win32.cpp
+                                   src/cli/serve/router/memory_win32.cpp)
+  target_link_libraries(gufo_http PRIVATE dxgi pdh)
+else()
+  target_sources(gufo_http PRIVATE src/cli/serve/router/workers.cpp
+                                   src/cli/serve/router/memory_posix.cpp)
+endif()
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
@@ -591,6 +611,11 @@ if (BUILD_TESTING)
   add_test(NAME gufo_help COMMAND gufo --help)
   set_tests_properties(gufo_help PROPERTIES LABELS "cpu")
 
+  add_test(NAME gufo_router_help COMMAND gufo router --help)
+  set_tests_properties(gufo_router_help PROPERTIES
+    LABELS "cpu;server;cli"
+    PASS_REGULAR_EXPRESSION "\\[llm/<model-id>\\]")
+
   add_test(NAME gufo_probe COMMAND gufo probe)
   set_tests_properties(gufo_probe PROPERTIES LABELS "cpu")
 
@@ -633,6 +658,51 @@ if (BUILD_TESTING)
   target_link_libraries(arg_parser_test PRIVATE gufo_core)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
+
+
+  add_executable(router_preset_test tests/cli/router_preset_test.cpp)
+  target_link_libraries(router_preset_test PRIVATE gufo_http)
+  add_test(NAME router_preset_test COMMAND router_preset_test)
+  set_tests_properties(router_preset_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_registry_test tests/cli/router_registry_test.cpp)
+  target_link_libraries(router_registry_test PRIVATE gufo_http)
+  add_test(NAME router_registry_test COMMAND router_registry_test)
+  set_tests_properties(router_registry_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_memory_test tests/cli/router_memory_test.cpp)
+  target_link_libraries(router_memory_test PRIVATE gufo_http)
+  add_test(NAME router_memory_test COMMAND router_memory_test)
+  set_tests_properties(router_memory_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_proxy_test tests/cli/router_proxy_test.cpp)
+  target_link_libraries(router_proxy_test PRIVATE gufo_http)
+  add_test(NAME router_proxy_test COMMAND router_proxy_test)
+  set_tests_properties(router_proxy_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_workers_test tests/cli/router_workers_test.cpp)
+  target_link_libraries(router_workers_test PRIVATE gufo_http)
+  add_test(NAME router_workers_test COMMAND router_workers_test)
+  set_tests_properties(router_workers_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_comfy_graph_test tests/cli/router_comfy_graph_test.cpp
+    src/cli/serve/router/comfy_graph.cpp)
+  target_include_directories(router_comfy_graph_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_comfy_graph_test PRIVATE cxx_std_20)
+  add_test(NAME router_comfy_graph_test COMMAND router_comfy_graph_test)
+  set_tests_properties(router_comfy_graph_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_ws_relay_test tests/cli/router_ws_relay_test.cpp)
+  target_link_libraries(router_ws_relay_test PRIVATE gufo_http)
+  add_test(NAME router_ws_relay_test COMMAND router_ws_relay_test)
+  set_tests_properties(router_ws_relay_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)
@@ -742,6 +812,27 @@ if (BUILD_TESTING)
     set_tests_properties(kernel_resources_test PROPERTIES
       LABELS "cpu;kernels" TIMEOUT 120)
   endif()
+
+  add_test(NAME router_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 120)
+
+  add_test(NAME router_comfy_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_comfy_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_comfy_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
+
+  # Real-model smoke check: gpu-only labels, so the hosted check-pr name
+  # filter skips it and gpu-fast excludes it while gpu-full executes it.
+  # Missing model dirs make the script print SKIPPED and exit 0.
+  add_test(NAME router_gpu_smoke
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_gpu_smoke.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_gpu_smoke PROPERTIES
+    LABELS "gpu;hip;gfx1151;external-model;slow" TIMEOUT 600)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)

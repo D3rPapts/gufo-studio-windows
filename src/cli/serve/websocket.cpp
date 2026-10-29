@@ -2,6 +2,13 @@
 
 #include <openssl/evp.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
+
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -16,6 +23,39 @@ namespace gufo::server {
 namespace {
 constexpr std::size_t kMaximumMessage = 4U << 20;
 constexpr std::size_t kMaximumQueue = 8U << 20;
+
+#ifndef _WIN32
+// Bounded grace for a reader that has already passed its detach check but has
+// not yet entered the blocking read: the interrupt can be lost only when this
+// shorter read timeout is already installed, so the handover still returns.
+constexpr int kDetachGraceMs = 20;
+#endif
+
+#ifndef _WIN32
+// A reader parked in the blocking frame read cannot observe the detach request
+// on its own, and neither `shutdown` (which would kill the read side the relay
+// needs) nor an `SO_RCVTIMEO` change wakes a read already in progress. So a
+// dedicated real-time signal, delivered only to that reader thread, interrupts
+// the read with EINTR and the loop exits on the detach request.
+void DetachInterrupt(int) {}
+
+int DetachSignalNumber() {
+  static const int number = (SIGRTMIN + 1 <= SIGRTMAX) ? SIGRTMIN + 1 : SIGUSR1;
+  return number;
+}
+
+void EnsureDetachInterruptHandler() {
+  static const bool installed = [] {
+    struct sigaction action{};
+    action.sa_handler = DetachInterrupt;
+    (void)::sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;  // No SA_RESTART: the read must return EINTR.
+    (void)::sigaction(DetachSignalNumber(), &action, nullptr);
+    return true;
+  }();
+  (void)installed;
+}
+#endif
 
 bool ValidUtf8(std::string_view text) {
   core::Utf8Decoder decoder;
@@ -101,12 +141,16 @@ WebSocket::~WebSocket() {
   Close();
   // Cancellation can wake the consumer before the reader finishes its close
   // reply. Let that writer complete before shutting down the send half.
-  reader_.join();
+  if (reader_.joinable())
+    reader_.join();
   (void)net::ShutdownSocket(fd_, net::ShutdownHow::kReadWrite);
 }
 
 bool WebSocket::Read(char* data, std::size_t size) {
-  while (size != 0 && !closed_.load()) {
+#ifdef _WIN32
+  auto wait_start = std::chrono::steady_clock::now();
+#endif
+  while (size != 0 && !closed_.load() && !detached_.load()) {
     if (offset_ < buffered_.size()) {
       const auto count = std::min(size, buffered_.size() - offset_);
       std::memcpy(data, buffered_.data() + offset_, count);
@@ -115,6 +159,25 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
+#if defined(_WIN32)
+    // A reader blocked in recv cannot observe a relay detach request, so on
+    // Windows it waits in 50 ms slices. The receive timeout then never fires;
+    // apply the idle limit here instead.
+    if (net::PollReadable(fd_, 50) == 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (idle_ <= std::chrono::steady_clock::duration::zero() ||
+          now - wait_start < idle_)
+        continue;
+      wait_start = now;
+      const std::chrono::steady_clock::duration since_send(
+          now.time_since_epoch().count() - last_send_.load());
+      if (since_send < idle_)
+        continue;
+      Close(1001);
+      return false;
+    }
+    wait_start = std::chrono::steady_clock::now();
+#endif
     const auto count = net::Receive(fd_, data, size, 0);
     if (count < 0 && net::IsSocketInterrupted())
       continue;
@@ -201,6 +264,37 @@ void WebSocket::Close(std::uint16_t code) {
   (void)net::ShutdownSocket(fd_, net::ShutdownHow::kReadWrite);
 }
 
+bool WebSocket::DetachForRelay(int* fd, std::string* pending) {
+  if (fd == nullptr || pending == nullptr) {
+    return false;
+  }
+  *fd = -1;
+  pending->clear();
+  if (detached_.exchange(true) || closed_.load()) {
+    return false;
+  }
+#ifndef _WIN32
+  if (reader_.joinable()) {
+    // Install the short grace timeout before interrupting: a parked read is
+    // woken by the signal, and a signal lost in the window before `recv` is
+    // entered still returns within the grace because the shorter timeout is
+    // already installed. Either way the handover does not wait out the socket
+    // idle timeout, and the relay ignores `SO_RCVTIMEO` once it owns the fd.
+    const timeval grace{kDetachGraceMs / 1000, (kDetachGraceMs % 1000) * 1000};
+    (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &grace, sizeof(grace));
+    EnsureDetachInterruptHandler();
+    (void)::pthread_kill(reader_.native_handle(), DetachSignalNumber());
+  }
+#endif
+  // Windows: the reader waits in 50 ms slices (see Read) and leaves its loop
+  // on detached_, so joining needs no interrupt.
+  reader_.join();
+  *pending =
+      offset_ < buffered_.size() ? buffered_.substr(offset_) : std::string();
+  *fd = fd_;
+  return true;
+}
+
 bool WebSocket::MarkClosed() {
   bool changed;
   {
@@ -229,7 +323,7 @@ void WebSocket::ReadLoop() {
   try {
     std::string message;
     bool fragmented = false;
-    while (!closed_.load()) {
+    while (!closed_.load() && !detached_.load()) {
       std::array<unsigned char, 2> header{};
       if (!Read(reinterpret_cast<char*>(header.data()), 2))
         break;
@@ -334,7 +428,8 @@ void WebSocket::ReadLoop() {
   } catch (const std::exception&) {
     Close(1011);
   }
-  MarkClosed();
+  if (!detached_.load())
+    MarkClosed();
 }
 
 }  // namespace gufo::server

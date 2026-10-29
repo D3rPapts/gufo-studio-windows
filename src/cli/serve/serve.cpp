@@ -1,4 +1,5 @@
 #include "src/cli/serve/serve.hpp"
+#include "src/cli/serve/serve_options.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -220,14 +221,6 @@ std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
 // `gufo serve <modality> --help`, and the parser that actually consumes them
 // from drifting apart.
 
-/// `--log-level` and its `-v/--verbose` shorthand share one sink. `level`
-/// holds the canonical spelling when given and stays empty otherwise; the two
-/// spellings together are a conflict, reported where the level is armed.
-struct ServerLogOptions {
-  bool verbose = false;
-  std::optional<server::LogLevel> level;
-};
-
 // Verbosity help text. `gufo serve --help` lists these options by hand while
 // every modality help registers them through the parser, so both readings share
 // one source for the wording.
@@ -256,6 +249,8 @@ void AddCacheRamOption(gufo::cli::ArgParser& parser,
         return parsed.has_value();
       });
 }
+
+}  // namespace
 
 void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
@@ -288,6 +283,12 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
       });
   parser.AddFlag("-v", "--verbose", kVerboseHelp, "Logging", &log->verbose);
 }
+
+namespace {
+
+// Validation-only runs (ValidateServeArgv) parse a modality's options and
+// return before any side effect: no log level, queue plan or model load.
+thread_local bool validate_only = false;
 
 // Help-only sinks for AddServerOptions, so subcommand help can list the
 // server options it shares with `gufo serve` without parsing into them.
@@ -1053,6 +1054,8 @@ int RunServe(std::span<const char* const> args) {
   // and returns before that point.
 
   const auto prepare_server_options = [&] {
+    if (validate_only)
+      return true;
     if (!gufo::server::IsListenAddress(host)) {
       std::cerr << "Error: --host must be an IPv4 or IPv6 address\n";
       return false;
@@ -1152,6 +1155,8 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <DIR> is required for music server\n";
       return 2;
     }
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log("ace_step", model);
     music = std::make_shared<server::MusicService>(model, name);
     if (!music->ready()) {
@@ -1183,6 +1188,8 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <DIR> is required for embedding server\n";
       return 2;
     }
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log("embedding_gemma2", model);
     std::map<std::string, std::string> prompts;
     std::string prompts_error;
@@ -1249,6 +1256,8 @@ int RunServe(std::span<const char* const> args) {
     const bool moss = models::moss_image::IsMossImageDirectory(model);
     if (name.empty())
       name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log(moss ? "moss_image" : "qwen_image_21", model);
     try {
       if (moss) {
@@ -1370,6 +1379,8 @@ int RunServe(std::span<const char* const> args) {
     // validated as MiniMax H3.
     const bool wan21 = server::IsWan21CameraDirectory(video_model);
     const bool wan22 = !wan21 && server::IsWan22ModelDirectory(video_model);
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
@@ -1435,6 +1446,8 @@ int RunServe(std::span<const char* const> args) {
                 << '\n';
       return 2;
     }
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log(subcommand, options.model);
     if (is_tts) {
       std::map<std::string, server::TtsVoicePreset> voice_presets;
@@ -1515,6 +1528,8 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 #if defined(GUFO_HAVE_QWEN3_OMNI)
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log(subcommand, options.model);
     std::string error;
     std::shared_ptr<models::qwen3_omni::Captioner> captioner =
@@ -1859,6 +1874,8 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
     std::string err;
+    if (validate_only)
+      return 0;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
     // The disk snapshot tier is walked during load, which can take minutes.
@@ -2016,5 +2033,53 @@ int RunServe(std::span<const char* const> args) {
   exit_if_device_lost();
   return 0;
 }
+
+namespace {
+
+/// Parses `argv` exactly as `gufo serve <modality> argv...` would and
+/// returns before loading anything.
+std::string ValidateServeArgvByParsing(std::string_view modality,
+                                       const std::vector<std::string>& argv) {
+  static constexpr std::string_view kModalities[] = {
+      "llm", "image", "video", "tts", "asr", "embedding", "omni", "music"};
+  if (std::ranges::find(kModalities, modality) == std::end(kModalities)) {
+    return "unknown modality '" + std::string(modality) + "'";
+  }
+  const std::string owned_modality(modality);
+  std::vector<const char*> args{owned_modality.c_str()};
+  for (const std::string& value : argv) {
+    args.push_back(value.c_str());
+  }
+  std::ostringstream captured;
+  std::streambuf* const err = std::cerr.rdbuf(captured.rdbuf());
+  std::streambuf* const out = std::cout.rdbuf(captured.rdbuf());
+  validate_only = true;
+  int status = 0;
+  try {
+    status = RunServe(args);
+  } catch (const std::exception& error) {
+    captured << error.what();
+    status = 2;
+  }
+  validate_only = false;
+  std::cerr.rdbuf(err);
+  std::cout.rdbuf(out);
+  if (status == 0) {
+    return {};
+  }
+  // serve prints its usage after the error; the first line is the message.
+  std::string message = captured.str();
+  message.resize(std::min(message.find('\n'), message.size()));
+  while (!message.empty() && message.back() == '\r')
+    message.pop_back();
+  if (message.starts_with("Error: "))
+    message.erase(0, 7);
+  return message.empty() ? "invalid " + owned_modality + " options" : message;
+}
+
+const bool kServeArgvValidatorInstalled =
+    (SetServeArgvValidator(&ValidateServeArgvByParsing), true);
+
+}  // namespace
 
 }  // namespace gufo::cli
