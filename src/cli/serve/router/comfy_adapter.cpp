@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1136,8 +1137,11 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       const auto dims = ImageDimensions(ReadFileRef(spec.canvas));
       if (!dims)
         throw std::runtime_error("cannot read the size of " + spec.canvas.name);
-      width = dims->first / 16 * 16;
-      height = dims->second / 16 * 16;
+      // gufo Qwen-Image sizes are multiples of 32.
+      width =
+          std::max(32, static_cast<int>(std::lround(dims->first / 32.0)) * 32);
+      height =
+          std::max(32, static_cast<int>(std::lround(dims->second / 32.0)) * 32);
       break;
     }
   }
@@ -1173,8 +1177,10 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       parts.push_back({"gufo", "", "application/json", extension.dump()});
     if (!init_image.empty()) {
       const std::string type = SniffImageType(init_image);
+      // The start image is the single "image" part, or "init_image" next
+      // to "image[]" references.
       parts.push_back(
-          {"image",
+          {references.empty() ? "image" : "init_image",
            std::string("init") + (type == "image/jpeg" ? ".jpg" : ".png"), type,
            init_image});
     }

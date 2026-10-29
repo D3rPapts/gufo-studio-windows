@@ -134,8 +134,8 @@ def serve_fake_worker(argv):
                     data = part.get_payload(decode=True)
                     if name == "image[]":
                         images.append(hashlib.sha256(data).hexdigest())
-                    elif name == "image":
-                        init = hashlib.sha256(data).hexdigest()
+                    elif name in ("image", "init_image"):
+                        init = name + ":" + hashlib.sha256(data).hexdigest()
                     else:
                         fields[name] = data.decode()
                 if "gufo" in fields:
@@ -459,8 +459,20 @@ def check_qwen_references(router):
     router.run(graph)
     call = router.fake_entries()[-1]
     assert call["path"] == "/v1/images/edits" and call["images"] == [], call
-    assert call["init"] == hashlib.sha256(make_png(1344, 832)).hexdigest()
+    assert call["init"] == "image:" + hashlib.sha256(make_png(1344, 832)).hexdigest()
     assert call["fields"]["gufo"]["strength"] == 0.55, call
+    assert call["fields"]["size"] == "1344x832", call
+    # With references the start image is the "init_image" part.
+    graph = qwen_graph(refs=["ref.png"], canvas="leinwand.png", prefix="film/keyframes/i2i")
+    graph["6"]["inputs"]["denoise"] = 0.7
+    router.run(graph)
+    call = router.fake_entries()[-1]
+    assert len(call["images"]) == 1, call
+    assert call["init"] == "init_image:" + hashlib.sha256(make_png(1344, 832)).hexdigest()
+    # Canvas sizes round to multiples of 32 (gufo rejects others).
+    router.upload("leinwand-odd.png", make_png(1000, 570))
+    router.run(qwen_graph(canvas="leinwand-odd.png", prefix="film/keyframes/odd"))
+    assert router.fake_entries()[-1]["fields"]["size"] == "992x576"
     # An image worker without the gufo fields: rendered without them + warning.
     entry = router.run(qwen_graph(prompt="OLDGUFO office", prefix="film/stil/old"))
     calls = router.fake_entries()[-2:]
