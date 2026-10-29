@@ -167,6 +167,31 @@ void ShutdownAfterDeviceLoss() {
   (void)std::raise(SIGTERM);
 }
 
+// MiniMax H3 worker recycling (VideoJobServiceOptions::recycle): about
+// 512x512 at 5 s (37 latent frames x 256 rows) and larger.
+constexpr std::size_t kDefaultH3RecycleRows = 8000;
+
+// Leaves through the SIGTERM shutdown path a few seconds after a large H3 job
+// so pollers can still read its status; the router restarts the worker on
+// the next request and the new process serves the persisted result. A
+// watchdog bounds the teardown.
+void RecycleVideoWorker(const std::string& job_id) {
+  try {
+    std::thread([job_id] {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      server::Logger::Info("server", "event=video_worker_recycle job=" +
+                                         job_id + " exit_status=0");
+      std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        ::_exit(0);
+      }).detach();
+      (void)std::raise(SIGTERM);
+    }).detach();
+  } catch (...) {
+    ::_exit(0);
+  }
+}
+
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
     return ReasoningEffort::kMinimal;
@@ -641,6 +666,12 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--rife-model", "SAFETENSORS",
                      "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}",
                      "Model", &video_rife_model);
+    std::size_t video_recycle_rows = kDefaultH3RecycleRows;
+    parser.AddOption("", "--recycle-rows", "N",
+                     "MiniMax H3: exit the worker after a completed job with "
+                     "at least N denoiser video rows so a supervisor restarts "
+                     "it with all GPU memory (default 8000; 0 = never)",
+                     "Storage", &video_recycle_rows);
     std::map<std::string, server::VideoLora, std::less<>> video_loras;
     parser.AddCustomOption(
         "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
@@ -1215,6 +1246,13 @@ int RunServe(std::span<const char* const> args) {
         "", "--rife-model", "SAFETENSORS",
         "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}", "Model",
         &video_rife_model);
+    std::size_t video_recycle_rows = kDefaultH3RecycleRows;
+    video_parser.AddOption(
+        "", "--recycle-rows", "N",
+        "MiniMax H3: exit the worker after a completed job with at least N "
+        "denoiser video rows so a supervisor restarts it with all GPU memory "
+        "(default 8000, about 512x512 at 5 s; 0 = never)",
+        "Storage", &video_recycle_rows);
     std::map<std::string, server::VideoLora, std::less<>> video_loras;
     video_parser.AddCustomOption(
         "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
@@ -1293,6 +1331,8 @@ int RunServe(std::span<const char* const> args) {
             .loras = std::move(video_loras),
             .vision_projector = video_vision_projector,
             .interpolator = std::move(video_interpolator),
+            .recycle_rows = wan22 ? 0 : video_recycle_rows,
+            .recycle = RecycleVideoWorker,
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling " << (wan22 ? "Wan 2.2" : "MiniMax H3")

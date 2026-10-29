@@ -943,11 +943,43 @@ struct VideoJobService::Impl {
         }
       }
       condition.notify_all();
+      if (!deleted && snapshot.status == VideoJobStatus::kCompleted &&
+          options.family == VideoModelFamily::kMinimaxH3 &&
+          options.recycle_rows > 0 && options.recycle) {
+        const auto& parameters = job->request.parameters;
+        const std::size_t rows =
+            static_cast<std::size_t>(
+                minimax_h3::VideoLatentFrameCount(parameters.frames)) *
+            static_cast<std::size_t>(parameters.internal_width / 32) *
+            static_cast<std::size_t>(parameters.internal_height / 32);
+        if (rows >= options.recycle_rows) {
+          bool idle = false;
+          {
+            const std::lock_guard<std::mutex> lock(mutex);
+            idle = queue.empty();
+            recycling = idle;
+          }
+          if (idle) {
+            Logger::Info("video", "job=" + job->snapshot.id +
+                                      " event=recycle video_rows=" +
+                                      std::to_string(rows) +
+                                      " reason=release_gpu_memory");
+            options.recycle(job->snapshot.id);
+            return;
+          }
+          Logger::Warn("video", "job=" + job->snapshot.id +
+                                    " event=recycle_skipped video_rows=" +
+                                    std::to_string(rows) +
+                                    " reason=another_job_queued");
+        }
+      }
     }
   }
 
   VideoJobServiceOptions options;
   bool ready{false};
+  // Set (under mutex) once the worker hands the process to `recycle`.
+  bool recycling{false};
   std::string initialization_error;
   std::filesystem::path canonical_storage_root;
   std::mutex mutex;
@@ -1068,6 +1100,14 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->SweepExpiredLocked();
+    if (impl_->recycling) {
+      WipeString(&job->request.prompt);
+      return {.result = VideoJobResult::kIoError,
+              .job = std::nullopt,
+              .error =
+                  "video worker is restarting to release GPU memory; "
+                  "retry shortly"};
+    }
     if (impl_->queue.size() >= impl_->options.queue_capacity) {
       WipeString(&job->request.prompt);
       return {.result = VideoJobResult::kQueueFull,

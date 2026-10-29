@@ -147,6 +147,16 @@ struct VideoJobServiceOptions {
                      int, const minimax_h3::CancellationToken*,
                      minimax_h3::GenerationProgress, void*, std::string*)>
       interpolator;
+  // MiniMax H3 worker recycling. After a large job the process keeps GPU
+  // memory that a following large job (e.g. 832x512, 124 frames) cannot do
+  // without, and that job fails with a device fault. When a completed job's
+  // denoiser had at least `recycle_rows` video rows and no other job waits,
+  // `recycle` is called once (with the job id) after the result is
+  // persisted; new requests are then refused with 503 until the process
+  // exits. Completed jobs are recovered from storage by the next process.
+  // 0 or an empty callback disables recycling.
+  std::size_t recycle_rows{0};
+  std::function<void(const std::string& job_id)> recycle;
 };
 
 struct VideoJobCreateResult {
