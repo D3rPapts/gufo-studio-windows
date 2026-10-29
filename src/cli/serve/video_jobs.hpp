@@ -86,6 +86,9 @@ struct VideoJobRequest {
   std::vector<std::uint8_t> first_frame;
   std::string negative_prompt;
   double guidance{5.0};
+  // RIFE frame multiplier for the finished MP4 (1 = off, 2..8); needs
+  // VideoJobServiceOptions::interpolator.
+  int interpolate{1};
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).
@@ -136,6 +139,12 @@ struct VideoJobServiceOptions {
   std::map<std::string, VideoLora, std::less<>> loras;
   // Qwen3-VL vision tower for keyframe prompt blocks; empty disables them.
   std::filesystem::path vision_projector;
+  // Frame interpolation of a finished MP4 (input, output, multiplier); empty
+  // rejects requests with interpolate > 1. Progress phase "interpolate".
+  std::function<bool(const std::filesystem::path&, const std::filesystem::path&,
+                     int, const minimax_h3::CancellationToken*,
+                     minimax_h3::GenerationProgress, void*, std::string*)>
+      interpolator;
 };
 
 struct VideoJobCreateResult {

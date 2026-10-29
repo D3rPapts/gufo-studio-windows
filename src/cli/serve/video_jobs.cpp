@@ -335,6 +335,9 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "media") {
     return scaled(97, 99);
   }
+  if (phase == "interpolate") {
+    return scaled(98, 99);
+  }
   return 1;
 }
 
@@ -791,6 +794,37 @@ struct VideoJobService::Impl {
       std::filesystem::path content_path;
       std::string media_type;
       bool output_ready = success && !job->cancellation.IsCancelled();
+      if (output_ready && job->request.output_format == "mp4" &&
+          job->request.interpolate > 1) {
+        // RIFE: output.mp4 -> generated.mp4 -> interpolated output.mp4.
+        const auto generated = job->directory / "generated.mp4";
+        const auto interpolate_start = std::chrono::steady_clock::now();
+        std::error_code rename_error;
+        std::filesystem::rename(job->directory / "output.mp4", generated,
+                                rename_error);
+        std::string interpolate_error =
+            rename_error ? "cannot stage the generated MP4" : "";
+        output_ready =
+            !rename_error &&
+            options.interpolator(generated, job->directory / "output.mp4",
+                                 job->request.interpolate, &job->cancellation,
+                                 Progress, &progress, &interpolate_error);
+        std::filesystem::remove(generated, rename_error);
+        if (!output_ready && !job->cancellation.IsCancelled()) {
+          Logger::Error("video", "job=" + job->snapshot.id +
+                                     " event=interpolate_failed detail=" +
+                                     interpolate_error);
+        } else if (output_ready) {
+          Logger::Info(
+              "video",
+              "job=" + job->snapshot.id + " event=interpolated multiplier=" +
+                  std::to_string(job->request.interpolate) + " elapsed_ms=" +
+                  std::to_string(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - interpolate_start)
+                          .count()));
+        }
+      }
       if (output_ready && job->request.output_format == "mp4") {
         content_path = job->directory / "output.mp4";
         media_type = "video/mp4";
@@ -973,6 +1007,17 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .error = "invalid MiniMax H3 video job request"};
   }
 
+  if (request.interpolate < 1 || request.interpolate > 8 ||
+      (request.interpolate > 1 &&
+       (request.output_format != "mp4" || !impl_->options.interpolator))) {
+    return {.result = VideoJobResult::kInvalid,
+            .job = std::nullopt,
+            .error = request.interpolate > 1 && request.interpolate <= 8 &&
+                             request.output_format == "mp4"
+                         ? "frame interpolation is not enabled on this "
+                           "server (gufo serve video --rife-model)"
+                         : "'interpolate' must be 1..8 with MP4 output"};
+  }
   auto job = std::make_shared<Impl::Job>();
   job->request = request;
   if (!request.lora.empty()) {

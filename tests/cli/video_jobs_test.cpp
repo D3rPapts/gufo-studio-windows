@@ -588,6 +588,84 @@ void TestRunnerOutputBoundary(const std::filesystem::path& root) {
         "runner output rejection preserves the external target");
 }
 
+void TestInterpolation(const std::filesystem::path& root) {
+  const auto runner = [](const h3::GenerationRequest& request,
+                         const h3::CancellationToken*, h3::GenerationProgress,
+                         void*, h3::GenerationTelemetry*, std::string*) {
+    std::filesystem::create_directories(request.output_path.parent_path());
+    std::ofstream(request.output_path, std::ios::binary) << "generated";
+    return true;
+  };
+  {
+    VideoJobService plain({
+        .model_root = "/models/h3",
+        .source_manifest = "/manifest.json",
+        .storage_root = root / "plain",
+        .queue_capacity = 1,
+        .artifact_ttl = std::chrono::hours(1),
+        .validate_model_inventory = false,
+        .id_factory = NextId,
+        .now = [] { return 7000; },
+        .runner = runner,
+    });
+    Check(plain.ready(), plain.initialization_error());
+    auto request = Mp4Request("interpolate without RIFE");
+    request.interpolate = 4;
+    const auto rejected = plain.Create(request);
+    Check(rejected.result == VideoJobResult::kInvalid &&
+              rejected.error.find("--rife-model") != std::string::npos,
+          "interpolate without an interpolator is rejected");
+  }
+  int seen_multiplier = 0;
+  bool input_was_generated = false;
+  VideoJobService service({
+      .model_root = "/models/h3",
+      .source_manifest = "/manifest.json",
+      .storage_root = root / "rife",
+      .queue_capacity = 1,
+      .artifact_ttl = std::chrono::hours(1),
+      .validate_model_inventory = false,
+      .id_factory = NextId,
+      .now = [] { return 7000; },
+      .runner = runner,
+      .interpolator =
+          [&](const std::filesystem::path& input,
+              const std::filesystem::path& output, int multiplier,
+              const h3::CancellationToken*, h3::GenerationProgress progress,
+              void* opaque, std::string*) {
+            progress("interpolate", 1, 2, opaque);
+            seen_multiplier = multiplier;
+            input_was_generated = ReadAll(input) == "generated";
+            std::ofstream(output, std::ios::binary) << "interpolated";
+            return true;
+          },
+  });
+  Check(service.ready(), service.initialization_error());
+  auto request = Mp4Request("interpolate x4");
+  request.interpolate = 9;
+  Check(service.Create(request).result == VideoJobResult::kInvalid,
+        "interpolate above 8 is rejected");
+  request.interpolate = 4;
+  const auto created = service.Create(request);
+  Check(created.job.has_value(), "interpolation request admitted");
+  WaitUntil(
+      [&] {
+        const auto lookup = service.Get(created.job->id);
+        return lookup.job.has_value() &&
+               lookup.job->status == VideoJobStatus::kCompleted;
+      },
+      "interpolated job did not complete");
+  const auto content = service.Content(created.job->id);
+  Check(content.result == VideoJobResult::kOk && content.content.has_value() &&
+            ReadAll(content.content->path) == "interpolated",
+        "interpolated MP4 is published");
+  Check(seen_multiplier == 4 && input_was_generated,
+        "interpolator sees the generated MP4 and the multiplier");
+  Check(!std::filesystem::exists(root / "rife" / created.job->id /
+                                 "generated.mp4"),
+        "staged generated MP4 is removed");
+}
+
 }  // namespace
 
 int main() {
@@ -603,6 +681,7 @@ int main() {
   TestRecoveryHardening(base / "recovery-hardening");
   TestRunnerExceptionRecovery(base / "runner-exception");
   TestRunnerOutputBoundary(base / "runner-output-boundary");
+  TestInterpolation(base / "interpolation");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video job lifecycle tests passed.\n";
   return 0;

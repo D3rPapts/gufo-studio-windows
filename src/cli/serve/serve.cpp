@@ -49,6 +49,7 @@
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
+#include "src/cli/serve/video_rife.hpp"
 #include "src/cli/video/video.hpp"
 #include "src/models/moss_image/model.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
@@ -636,6 +637,10 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--vision-projector", "GGUF",
                      "Qwen3-VL vision tower for keyframe prompt blocks",
                      "Model", &video_vision_projector);
+    std::filesystem::path video_rife_model;
+    parser.AddOption("", "--rife-model", "SAFETENSORS",
+                     "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}",
+                     "Model", &video_rife_model);
     std::map<std::string, server::VideoLora, std::less<>> video_loras;
     parser.AddCustomOption(
         "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
@@ -1205,6 +1210,11 @@ int RunServe(std::span<const char* const> args) {
     video_parser.AddOption("", "--vision-projector", "GGUF",
                            "Qwen3-VL vision tower for keyframe prompt blocks",
                            "Model", &video_vision_projector);
+    std::filesystem::path video_rife_model;
+    video_parser.AddOption(
+        "", "--rife-model", "SAFETENSORS",
+        "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}", "Model",
+        &video_rife_model);
     std::map<std::string, server::VideoLora, std::less<>> video_loras;
     video_parser.AddCustomOption(
         "", "--lora", "NAME=PATH[,steps=N][,strength=S]",
@@ -1240,6 +1250,26 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "video");
       return 2;
     }
+    if (!video_rife_model.empty() &&
+        !std::filesystem::is_regular_file(video_rife_model)) {
+      std::cerr << "Error: --rife-model file not found: "
+                << video_rife_model.string() << "\n";
+      return 2;
+    }
+    decltype(server::VideoJobServiceOptions::interpolator) video_interpolator;
+    if (!video_rife_model.empty()) {
+      video_interpolator =
+          [video_rife_model](const std::filesystem::path& input,
+                             const std::filesystem::path& output,
+                             int multiplier,
+                             const minimax_h3::CancellationToken* cancellation,
+                             minimax_h3::GenerationProgress progress,
+                             void* opaque, std::string* error) {
+            return server::RunRifeInterpolation(video_rife_model, input, output,
+                                                multiplier, cancellation,
+                                                progress, opaque, error);
+          };
+    }
 
     // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B; anything
     // else is validated as MiniMax H3.
@@ -1262,6 +1292,7 @@ int RunServe(std::span<const char* const> args) {
             .runner = {},
             .loras = std::move(video_loras),
             .vision_projector = video_vision_projector,
+            .interpolator = std::move(video_interpolator),
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling " << (wan22 ? "Wan 2.2" : "MiniMax H3")
@@ -1271,7 +1302,8 @@ int RunServe(std::span<const char* const> args) {
     }
     load_log.Complete("model=" + video_jobs->model_id() +
                           " sessions=1 queue_capacity=1 weights=lazy loras=" +
-                          std::to_string(video_loras.size()),
+                          std::to_string(video_loras.size()) +
+                          " rife=" + (video_rife_model.empty() ? "off" : "on"),
                       false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";

@@ -483,6 +483,11 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 
+`gufo serve video --rife-model rife49.safetensors` adds RIFE frame
+interpolation of the finished video: `"gufo": {"interpolate": 4}` on
+`POST /v1/videos` (H3 and Wan 2.2) returns 4x the frame rate at the same
+speed with the audio kept. See [RIFE](models/rife/README.md).
+
 Use `gufo serve image --model SNAPSHOT_DIR` for
 [Qwen-Image-2.1](models/qwen-image-2.1/README.md). Generation accepts JSON;
 editing accepts multipart PNG/JPEG references. Both return base64 PNG data

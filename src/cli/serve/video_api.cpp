@@ -452,12 +452,23 @@ std::optional<core::Image> ReadFirstFrame(const json::Value* value,
                      .pixels = std::move(keyframe->rgb)};
 }
 
+// "gufo.interpolate": RIFE frame multiplier applied to the finished MP4
+// (1 = off, 2..8; 4 turns 24 fps into 96 fps at the same speed).
+std::optional<int> JsonInterpolate(const json::Value* value) {
+  const auto parsed = JsonFrame(value);
+  if (!parsed.has_value() || *parsed < 1 || *parsed > 8) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
 // Wan 2.2 TI2V-5B: {"model", "prompt", "size" (default "1280x704"),
 // "seconds" (0.2..5 at 24 fps), "input_reference" or "first_frame" (image-
 // to-video; the image is scaled to cover the size and centre-cropped),
 // "gufo": {"seed", "steps" (default 50), "frames" (4k + 1, must match
 // seconds), "negative_prompt" (default ""), "guidance" (default 5; <= 1
-// disables classifier-free guidance)}}. MP4 only.
+// disables classifier-free guidance), "interpolate" (RIFE multiplier)}}.
+// MP4 only.
 HttpResponse CreateWan22Video(const json::Value& body,
                               const std::map<std::string, std::string>& files,
                               VideoJobService& service) {
@@ -548,14 +559,24 @@ HttpResponse CreateWan22Video(const json::Value& body,
   std::uint64_t seed = 42;
   std::string negative_prompt;
   double guidance = 5.0;
+  int interpolate = 1;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
-        !HasOnlyMembers(*extension, {"seed", "steps", "frames",
-                                     "negative_prompt", "guidance"})) {
+        !HasOnlyMembers(*extension,
+                        {"seed", "steps", "frames", "negative_prompt",
+                         "guidance", "interpolate"})) {
       return Error(400, "Bad Request",
                    "'gufo' may contain only 'seed', 'steps', 'frames', "
-                   "'negative_prompt' and 'guidance'",
+                   "'negative_prompt', 'guidance' and 'interpolate'",
                    "invalid_strix_options");
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
     }
     if (extension->contains("negative_prompt")) {
       const json::Value* value = extension->find("negative_prompt");
@@ -621,6 +642,7 @@ HttpResponse CreateWan22Video(const json::Value& body,
                                  : std::vector<std::uint8_t>(),
       .negative_prompt = std::move(negative_prompt),
       .guidance = guidance,
+      .interpolate = interpolate,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
@@ -745,12 +767,13 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::optional<int> steps;
   std::string lora;
   std::optional<double> lora_strength;
+  int interpolate = 1;
   bool preset_explicit = false;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
-        !HasOnlyMembers(*extension,
-                        {"preset", "seed", "frames", "output_format",
-                         "selected_frame", "steps", "lora", "lora_strength"})) {
+        !HasOnlyMembers(*extension, {"preset", "seed", "frames",
+                                     "output_format", "selected_frame", "steps",
+                                     "lora", "lora_strength", "interpolate"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -813,6 +836,14 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                      "invalid_lora");
       }
       lora_strength = value->as_double(1.0);
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
     }
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
@@ -916,6 +947,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .lora = lora,
       .lora_strength = lora_strength,
       .steps_explicit = steps.has_value(),
+      .interpolate = interpolate,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

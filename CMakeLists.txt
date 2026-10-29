@@ -422,6 +422,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
   src/cli/serve/video_wan22.cpp
+  src/cli/serve/video_rife.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -435,6 +436,8 @@ target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts guf
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
   target_link_libraries(gufo_http PUBLIC gufo_wan22)
+  # RIFE frame interpolation of finished videos ("gufo":{"interpolate":N}).
+  target_link_libraries(gufo_http PUBLIC gufo_rife)
 endif()
 
 add_executable(gufo
@@ -443,6 +446,7 @@ add_executable(gufo
   src/cli/eval/eval.cpp
   src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
+  src/cli/video/video_interpolate.cpp
   src/cli/serve/serve.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/continuation_disk_store.cpp
@@ -452,7 +456,7 @@ add_executable(gufo
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
-target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
+target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http gufo_rife CURL::libcurl)
 gufo_stage_hip_runtime(gufo)
 target_compile_definitions(gufo PRIVATE
   GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
@@ -1404,3 +1408,4 @@ add_subdirectory(src/models/qwen3_omni)
 
 # Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
 add_subdirectory(src/models/wan22)
+add_subdirectory(src/models/rife)
