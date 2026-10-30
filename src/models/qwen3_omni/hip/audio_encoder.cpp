@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -48,19 +49,21 @@ Bf16 FloatToBf16(float value) {
   return result;
 }
 
-/// Host BF16 copy of an F16 or F32 weight (round to nearest even; exact for
-/// values that were BF16 before the GGUF conversion).
-std::vector<Bf16> ToBf16(const Weight& weight) {
+/// Host BF16 copy of an F16 or F32 weight from its `encoded` bytes (round to
+/// nearest even; exact for values that were BF16 before the GGUF conversion).
+std::vector<Bf16> ToBf16(const Weight& weight,
+                         std::span<const std::byte> encoded) {
   const std::size_t count =
       static_cast<std::size_t>(weight.cols * weight.rows * weight.experts);
   std::vector<Bf16> result(count);
   if (weight.type == core::GgmlType::kF32) {
-    const float* values = weight.F32();
+    const auto* values = reinterpret_cast<const float*>(encoded.data());
     for (std::size_t index = 0; index < count; ++index) {
       result[index] = FloatToBf16(values[index]);
     }
   } else if (weight.type == core::GgmlType::kF16) {
-    const auto* values = static_cast<const std::uint16_t*>(weight.data);
+    const auto* values =
+        reinterpret_cast<const std::uint16_t*>(encoded.data());
     for (std::size_t index = 0; index < count; ++index) {
       result[index] = FloatToBf16(quant::Fp16ToFloat(values[index]));
     }
@@ -146,13 +149,17 @@ void RequireHipblas(hipblasStatus_t status, const char* operation) {
 
 struct AudioEncoder::Impl {
   Impl(const Model& model, hipStream_t stream_in)
-      : config(model.audio_config()), stream(stream_in) {
+      : config(model.audio_config()),
+        projector(&model.projector_reader()),
+        stream(stream_in) {
     RequireHipblas(hipblasCreate(&blas), "hipblasCreate Qwen3-Omni audio");
     RequireHipblas(hipblasSetStream(blas, stream), "hipblasSetStream");
     RequireHipblas(hipblasSetAtomicsMode(blas, HIPBLAS_ATOMICS_NOT_ALLOWED),
                    "hipblasSetAtomicsMode");
     lt = std::make_unique<asr::GemmLt>();
     Load(model.audio());
+    // The read buffer only serves the load.
+    std::vector<std::byte>().swap(scratch);
   }
 
   ~Impl() {
@@ -162,7 +169,10 @@ struct AudioEncoder::Impl {
   }
 
   DeviceBuffer<Bf16> Upload(const Weight& weight) {
-    const std::vector<Bf16> host = ToBf16(weight);
+    // From the file, not the mapping: mapped pages read here would stay in
+    // the working set for the life of the process on Windows.
+    const std::vector<Bf16> host =
+        ToBf16(weight, ReadWeightBytes(*projector, weight, &scratch));
     DeviceBuffer<Bf16> device(host.size());
     RequireHip(hipMemcpy(device.get(), host.data(), host.size() * sizeof(Bf16),
                          hipMemcpyHostToDevice),
@@ -395,6 +405,8 @@ struct AudioEncoder::Impl {
   }
 
   AudioConfig config;
+  const core::GgufReader* projector{nullptr};
+  std::vector<std::byte> scratch;
   hipStream_t stream{nullptr};
   hipblasHandle_t blas{nullptr};
   std::unique_ptr<asr::GemmLt> lt;

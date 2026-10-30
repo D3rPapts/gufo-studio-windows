@@ -8,11 +8,13 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "ds4_mmq.h"
-#include "src/core/platform/pages.hpp"
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen3_omni/hip/device_buffer.hpp"
 #include "src/models/qwen3_omni/hip/thinker_kernels.hpp"
 
@@ -121,12 +123,27 @@ struct Thinker::Impl {
       throw std::runtime_error("Qwen3-Omni thinker geometry unsupported");
     }
     Check(ds4_mmq_init(0), "ds4_mmq_init");
+    // Stream the weights from the GGUF file through bounded pinned buffers.
+    // Copying through the mapping faults every page into the working set,
+    // and Windows keeps them there: the 17 GB thinker then fills a 32 GB
+    // host beside the GPU carve-out. Memory images keep the mapped copy.
+    std::string upload_error;
+    std::unique_ptr<gufo::hip::WeightUpload> upload =
+        gufo::hip::WeightUpload::Create(
+            model.text_reader().GetMappedRegions(), &upload_error);
+    if (upload == nullptr) {
+      std::cerr << "[omni] weights copied through the mapping: "
+                << upload_error << '\n';
+    }
+    uploader = upload.get();
     const TextWeights& weights = model.text();
     output_norm = Upload(weights.output_norm);
     output = Upload(weights.output);
     layers.reserve(weights.layers.size());
     for (const TextLayer& source : weights.layers) {
-      Layer layer;
+      // Built in place: queued copies target its buffers, which must outlive
+      // `upload` if a later step throws.
+      Layer& layer = layers.emplace_back();
       layer.attn_norm = Upload(source.attn_norm);
       if (source.k.type != source.q.type) {
         throw std::runtime_error("Qwen3-Omni q and k differ in type");
@@ -146,10 +163,11 @@ struct Thinker::Impl {
       layer.gate_exps = Upload(source.gate_exps);
       layer.up_exps = Upload(source.up_exps);
       layer.down_exps = Upload(source.down_exps);
-      layers.push_back(std::move(layer));
-      // The uploads above are synchronous. Drop the layer's mapped pages:
-      // Windows keeps them resident and the 21 GB GGUF fills the host.
-      gufo::platform::TrimResidentPages();
+    }
+    uploader = nullptr;
+    if (upload != nullptr && !upload->Finish(&upload_error)) {
+      throw std::runtime_error("Qwen3-Omni thinker weight upload failed: " +
+                               upload_error);
     }
     const std::size_t kv = capacity * config.KvDim();
     keys.resize(config.layers);
@@ -211,11 +229,25 @@ struct Thinker::Impl {
     weight.rows = static_cast<int>(source.rows);
     weight.experts = static_cast<int>(source.experts);
     weight.bytes.Reset(source.Bytes());
-    RequireHip(hipMemcpy(weight.bytes.get(), source.data, source.Bytes(),
-                         hipMemcpyHostToDevice),
-               "hipMemcpy Qwen3-Omni thinker weight");
+    Copy(source, weight.bytes.get());
     bytes += source.Bytes();
     return weight;
+  }
+
+  /// Queues `source` into `device` on the streaming uploader, or copies it
+  /// synchronously from memory when there is none.
+  void Copy(const Weight& source, void* device) {
+    if (uploader == nullptr) {
+      RequireHip(hipMemcpy(device, source.data, source.Bytes(),
+                           hipMemcpyHostToDevice),
+                 "hipMemcpy Qwen3-Omni thinker weight");
+      return;
+    }
+    std::string error;
+    if (!uploader->CopyMapped(source.data, source.Bytes(), device, &error)) {
+      throw std::runtime_error("Qwen3-Omni thinker weight upload failed: " +
+                               error);
+    }
   }
 
   /// Matrices of one type and width, stacked row-wise into one weight.
@@ -235,9 +267,7 @@ struct Thinker::Impl {
     weight.bytes.Reset(total);
     std::size_t offset = 0;
     for (const Weight* part : parts) {
-      RequireHip(hipMemcpy(weight.bytes.get() + offset, part->data,
-                           part->Bytes(), hipMemcpyHostToDevice),
-                 "hipMemcpy Qwen3-Omni stacked weight");
+      Copy(*part, weight.bytes.get() + offset);
       offset += part->Bytes();
     }
     bytes += total;
@@ -429,6 +459,8 @@ struct Thinker::Impl {
   hipStream_t stream{nullptr};
   std::size_t position{0};
   std::size_t bytes{0};
+  // Only while the constructor uploads the weights.
+  gufo::hip::WeightUpload* uploader{nullptr};
 
   DeviceWeight output_norm, output;
   std::vector<Layer> layers;

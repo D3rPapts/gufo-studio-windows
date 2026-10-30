@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -160,6 +161,16 @@ private:
 
 /// Bytes of one row of `cols` elements in `type`; zero when unsupported.
 [[nodiscard]] std::size_t RowBytes(core::GgmlType type, std::uint64_t cols);
+
+/// The encoded bytes of `weight`, a view into `reader`, read from the GGUF
+/// file with unbuffered reads into `scratch` instead of through the mapping:
+/// Windows keeps every mapped page a loader touches in the process working
+/// set, so converting a whole tower through the mapping pins it in host RAM.
+/// The span points into `scratch` (reused across calls), or into the mapping
+/// when the reader has no file behind it. Throws when the read fails.
+[[nodiscard]] std::span<const std::byte> ReadWeightBytes(
+    const core::GgufReader& reader, const Weight& weight,
+    std::vector<std::byte>* scratch);
 
 }  // namespace gufo::models::qwen3_omni
 

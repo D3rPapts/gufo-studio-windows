@@ -1,10 +1,12 @@
 #include "src/models/qwen3_omni/model.hpp"
 
+#include <cstdint>
 #include <initializer_list>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 
+#include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen3_omni {
@@ -126,6 +128,44 @@ constexpr std::initializer_list<GgmlType> kF16 = {GgmlType::kF16};
 
 std::size_t RowBytes(core::GgmlType type, std::uint64_t cols) {
   return quant::EncodedSizeBytes(type, static_cast<std::size_t>(cols));
+}
+
+std::span<const std::byte> ReadWeightBytes(const core::GgufReader& reader,
+                                           const Weight& weight,
+                                           std::vector<std::byte>* scratch) {
+  constexpr std::size_t kSector = 4096;
+  const std::size_t bytes = weight.Bytes();
+  const auto address = reinterpret_cast<std::uintptr_t>(weight.data);
+  for (const core::GgufMappedRegion& region : reader.GetMappedRegions()) {
+    const auto base = reinterpret_cast<std::uintptr_t>(region.data);
+    if (region.data == nullptr || address < base ||
+        address - base > region.size ||
+        bytes > region.size - (address - base)) {
+      continue;
+    }
+    if (!platform::FileValid(region.file_descriptor)) {
+      break;
+    }
+    // The sector-aligned superset into a sector-aligned buffer, so the
+    // reads bypass the file cache.
+    const std::uint64_t offset = address - base;
+    const std::uint64_t aligned = offset & ~std::uint64_t{kSector - 1U};
+    const auto lead = static_cast<std::size_t>(offset - aligned);
+    const std::size_t span = (lead + bytes + kSector - 1U) & ~(kSector - 1U);
+    if (scratch->size() < span + kSector) {
+      scratch->resize(span + kSector);
+    }
+    const auto start = reinterpret_cast<std::uintptr_t>(scratch->data());
+    std::byte* buffer =
+        scratch->data() + ((kSector - start % kSector) % kSector);
+    if (platform::ReadFileParallel(region.file_descriptor, buffer, span,
+                                   aligned) < lead + bytes) {
+      throw std::runtime_error("cannot read a Qwen3-Omni weight from " +
+                               region.source_path.string());
+    }
+    return {buffer + lead, bytes};
+  }
+  return {static_cast<const std::byte*>(weight.data), bytes};
 }
 
 std::size_t AudioTokenCount(std::size_t frames, std::uint32_t n_window) {
