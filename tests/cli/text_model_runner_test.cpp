@@ -1540,6 +1540,30 @@ void TestInstructionsCheckpointServesANewQuestion() {
                : "without the boundary a new question restores a grid point");
   }
 
+  // A request that does not reuse the cache (cache_prompt=false) after the
+  // instructions checkpoint exists still splits its prefill there, so it is
+  // prefilled in the same pieces as the request that captured it.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    TextRunnerPool pool(
+        std::make_shared<LongSnapshotRunner>(stats, 64, 256, 4096), 1);
+    const auto first = ask(5000, 200, 2);
+    (void)run(pool, first, 5000);
+    stats->prefill_spans.clear();
+    auto request = pool.Acquire(first, {}, {}, {}, false, first.size() - 10,
+                                true, true, 5000);
+    while (!request.prefill_complete())
+      (void)request.Prefill(32768);
+    std::size_t position = 0;
+    bool split = false;
+    for (const auto span : stats->prefill_spans) {
+      position += span;
+      split = split || position == 5000;
+    }
+    Expect(split, "an uncached request splits at the cached instructions");
+    request.Invalidate();
+  }
+
   // Short instructions, or a grid checkpoint just before their end, keep no
   // extra copy: prefilling the gap costs less.
   for (const auto [instructions, question] :

@@ -1013,10 +1013,18 @@ struct TextRunnerPool::Request::Impl {
       return planned != 0 && planned <= position && position - planned <= slack;
     };
     if (near(snapshot_tokens.size()) || near(stable_prefix_position) ||
-        std::ranges::any_of(checkpoints, near) ||
-        lease.HasSnapshotFor(
-            std::span<const TextRunnerToken>(prompt).first(position)))
+        std::ranges::any_of(checkpoints, near))
       return;
+    // Already cached (a request that does not reuse it, cache_prompt=false):
+    // still split the prefill there without a second capture, so this prompt
+    // is prefilled in the same pieces as the request that captured it. A
+    // different split changes the tail chunk's GEMM route and rounding, and
+    // greedy text after a restore would then differ from an uncached run.
+    if (lease.HasSnapshotFor(
+            std::span<const TextRunnerToken>(prompt).first(position))) {
+      prefill_splits.push_back(position);
+      return;
+    }
     checkpoints.insert(std::ranges::upper_bound(checkpoints, position),
                        position);
   }
@@ -1285,6 +1293,8 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
+  /// Ascending positions where prefill splits without a capture.
+  std::vector<std::size_t> prefill_splits;
   bool boundary_capture{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
@@ -1534,6 +1544,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   if (!impl_->checkpoints.empty())
     max_input_tokens = std::min(
         max_input_tokens, impl_->checkpoints.front() - impl_->prefill_offset);
+  std::erase_if(impl_->prefill_splits, [&](std::size_t position) {
+    return position <= impl_->prefill_offset;
+  });
+  if (!impl_->prefill_splits.empty())
+    max_input_tokens =
+        std::min(max_input_tokens,
+                 impl_->prefill_splits.front() - impl_->prefill_offset);
 
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   bool in_pass = false;
