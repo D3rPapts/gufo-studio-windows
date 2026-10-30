@@ -59,13 +59,18 @@ void TestHappyPath() {
   assert(LoadPreset(file, "/models", &models, &error));
   assert(error.empty());
   assert(models.size() == 2);
+  // Relative paths resolve as models_dir / value with the native separator
+  // ("/models\\rel/x.gguf" on Windows), exactly as the worker receives them.
+  const auto resolved = [](const char* value) {
+    return (std::filesystem::path("/models") / value).string();
+  };
   const std::vector<std::string> expected_a = {
-      "--model",        "/models/rel/x.gguf",  "--sessions", "2",
-      "--log-progress", "--served-model-name", "a"};
+      "--model",        resolved("rel/x.gguf"), "--sessions", "2",
+      "--log-progress", "--served-model-name",  "a"};
   assert(models[0].modality == "llm");
   assert(models[0].id == "a");
   assert(models[0].argv == expected_a);
-  const std::vector<std::string> expected_b = {"--model", "/models/rel/asr",
+  const std::vector<std::string> expected_b = {"--model", resolved("rel/asr"),
                                                "--served-model-name", "b"};
   assert(models[1].modality == "asr");
   assert(models[1].id == "b");
@@ -143,12 +148,16 @@ void TestIsReservedKey() {
 }
 
 // serve.cpp installs the real check in the gufo binary; this stand-in rejects
-// the one unknown key the tests use, with serve's wording.
+// the one unknown key the tests use and a missing model, with serve's wording.
 std::string RejectBogus(std::string_view, const std::vector<std::string>& argv) {
+  bool has_model = false;
   for (const std::string& value : argv) {
     if (value == "--bogus")
       return "unknown option: --bogus";
+    has_model = has_model || value == "--model";
   }
+  if (!has_model)
+    return "--model <PATH> is required";
   return {};
 }
 

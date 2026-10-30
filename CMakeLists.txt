@@ -833,11 +833,15 @@ if (BUILD_TESTING)
       LABELS "cpu;kernels" TIMEOUT 120)
   endif()
 
-  add_test(NAME router_contract_test
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_test.py
-      $<TARGET_FILE:gufo>)
-  set_tests_properties(router_contract_test PROPERTIES
-    LABELS "cpu;server;router" TIMEOUT 120)
+  # The fake workers are .py scripts the router starts directly: POSIX only
+  # (CreateProcess cannot run them).
+  if (NOT WIN32)
+    add_test(NAME router_contract_test
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_test.py
+        $<TARGET_FILE:gufo>)
+    set_tests_properties(router_contract_test PROPERTIES
+      LABELS "cpu;server;router" TIMEOUT 120)
+  endif()
 
   add_test(NAME router_comfy_contract_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_comfy_test.py

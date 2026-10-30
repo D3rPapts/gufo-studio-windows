@@ -323,7 +323,9 @@ void TestJobOwnerRoundTrip() {
   assert(registry.Busy("v"));
   assert(registry.EvictionCandidate().empty());
   registry.CompleteVideoJob("job1");
-  assert(registry.JobOwner("job1").empty());
+  // A finished job keeps its owner so GET /v1/videos/{id}/content still
+  // reaches the right worker; it no longer keeps the model busy.
+  assert(registry.JobOwner("job1") == "v");
   assert(!registry.Busy("v"));
   registry.CompleteVideoJob("job1");
   assert(registry.EvictionCandidate() == "v");
