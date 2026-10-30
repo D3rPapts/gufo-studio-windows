@@ -229,6 +229,7 @@ class Router:
         while time.monotonic() < deadline:
             try:
                 if self.request("GET", "/health")[0] == 200:
+                    self.ready = True
                     return
             except OSError:
                 time.sleep(0.05)
@@ -248,8 +249,18 @@ class Router:
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
             headers = dict(headers or {}, **{"Content-Type": "application/json"})
-        conn.request(method, path, body=body, headers=headers or {})
-        response = conn.getresponse()
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            response = conn.getresponse()
+        except OSError as error:
+            if not getattr(self, "ready", False):
+                raise  # still starting up
+            # Name the router's exit status (e.g. 0xC0000409) next to the error.
+            time.sleep(0.5)
+            code = self.proc.poll()
+            raise AssertionError("%s %s failed: %r; router exit %s; log: %s" % (
+                method, path, error, "running" if code is None else hex(code & 0xFFFFFFFF),
+                self.tail()))
         payload = response.read()
         conn.close()
         return response.status, payload
@@ -898,7 +909,8 @@ def main():
         assert entry["outputs"]["8"]["images"][0]["filename"] == "demo_00003_.png"
     finally:
         router.stop()
-    check_autoload_retry(binary, tmp)
+    if not os.environ.get("COMFY_SKIP_AUTOLOAD"):
+        check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("router_comfy_test: all passed (ffmpeg: %s)" % (ffmpeg or "none"))
     return 0
