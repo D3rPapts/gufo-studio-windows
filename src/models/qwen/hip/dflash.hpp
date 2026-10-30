@@ -17,6 +17,7 @@
 #include "src/models/qwen/dflash_policy.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/dflash/prompt_lookup_27b.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -386,6 +387,8 @@ private:
   QwenDFlashGpuDraftConfig config_;
   speculative::DFlashLengthController controller_;
   std::array<tokenization::TokenId, 3> lookup_boundaries_{};
+  tokenization::TokenId think_start_{tokenization::kInvalidTokenId};
+  tokenization::TokenId think_end_{tokenization::kInvalidTokenId};
   speculative::PromptLookup<tokenization::TokenId> lookup_;
   std::size_t lookup_start_{0};
   bool lookup_proposal_{false};

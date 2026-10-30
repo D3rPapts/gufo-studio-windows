@@ -15,7 +15,9 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
+#include "src/models/qwen/hip/kernels/copy_27b.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
@@ -622,6 +624,7 @@ std::size_t QwenDFlashGpuExecutor::SnapshotPayloadBytes() const noexcept {
 
 std::unique_ptr<QwenDFlashGpuSnapshot> QwenDFlashGpuExecutor::SaveSnapshot()
     const {
+  const qwen27::ScopedPromptStep step("draft_snapshot", injected_context_len_);
   const std::size_t kv_width =
       static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
       model_->GetConfig().head_dim;
@@ -805,6 +808,7 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
       target_features.size() != static_cast<std::size_t>(num_tokens) * width) {
     return false;
   }
+  const qwen27::ScopedPromptStep step("draft_inject", num_tokens, 9);
   // Only the final attention window survives this injection. Skip complete
   // scratch chunks that it overwrites, keeping the original batch boundaries
   // and absolute RoPE positions for every surviving row.
@@ -839,6 +843,7 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
       position + num_tokens > max_context_) {
     return false;
   }
+  qwen27::PhaseScope profile(qwen27::Phase::kInject);
 
   // Upload target features
   const std::size_t bytes = target_features.size() * sizeof(float);
@@ -902,6 +907,17 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
       const auto count =
           std::min(num_tokens - offset, history_capacity_ - slot);
       const std::size_t cache_bytes = count * kv_dim * sizeof(float);
+#ifdef _WIN32
+      // Copy kernels avoid a copy-engine hand-off per layer on Windows.
+      if (qwen27::Copy27On()) {
+        LaunchDeviceCopy27(d_injected_k_[i] + slot * kv_dim,
+                           d_k_block_ + offset * kv_dim, cache_bytes, stream_);
+        LaunchDeviceCopy27(d_injected_v_[i] + slot * kv_dim,
+                           d_v_block_ + offset * kv_dim, cache_bytes, stream_);
+        offset += count;
+        continue;
+      }
+#endif
       HIP_CHECK(hipMemcpyAsync(d_injected_k_[i] + slot * kv_dim,
                                d_k_block_ + offset * kv_dim, cache_bytes,
                                hipMemcpyDeviceToDevice, stream_));
@@ -914,6 +930,7 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
 
   injected_context_len_ =
       std::max(injected_context_len_, position + num_tokens);
+  profile.Enqueued();
   return true;
 }
 
@@ -1016,6 +1033,9 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     return {};
   }
   const std::uint32_t block_count = draft_count + 1U;
+  if (qwen27::ProfileEnabled())
+    qwen27::ProfileState::Get().CycleStart();
+  qwen27::PhaseScope profile(qwen27::Phase::kDraft);
 
   // Slot zero stays the selector's predecessor until its first step. Proposal
   // slots start as masks and are overwritten only after the embedding lookup.
@@ -1033,6 +1053,15 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   }
   TraceTensor(trace, "embedding", d_block_hidden_, block_count * hidden_size,
               stream_);
+  // Diagnostics (GUFO_QWEN27_PROFILE=2): GPU time of this block by part.
+  const bool gpu_timeline = qwen27::GpuTimeline::Enabled();
+  auto& timeline = qwen27::GpuTimeline::Draft();
+  const auto mark = [&](qwen27::GpuPart part) {
+    if (gpu_timeline)
+      timeline.Mark(stream_, part);
+  };
+  if (gpu_timeline)
+    timeline.Begin(stream_);
 
   // Five DFlash-2 decoder blocks.
   for (std::size_t i = 0; i < df_cfg.num_layers; ++i) {
@@ -1050,15 +1079,18 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         d_block_hidden_, static_cast<const float*>(layer.attn_norm.data),
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
     emit("attn_norm", d_block_normed_, hidden_size);
+    mark(qwen27::GpuPart::kOther);
 
     RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
                  d_dynamic_coefficients_, block_count, dynamic_size,
                  hidden_size);
+    mark(qwen27::GpuPart::kSsmProj);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_block_normed_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.attention_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 0, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("attn_conv_in", d_conv_hidden_, hidden_size);
 
     RunBlockGemm(layer.attn_q, d_conv_hidden_, d_q_, block_count, q_dim,
@@ -1067,6 +1099,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
                  hidden_size);
     RunBlockGemm(layer.attn_v, d_conv_hidden_, d_v_block_, block_count, kv_dim,
                  hidden_size);
+    mark(qwen27::GpuPart::kAttnProj);
 
     NormalizeAndRotateQK(d_q_, d_k_block_,
                          static_cast<const float*>(layer.attn_q_norm.data),
@@ -1084,16 +1117,19 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         static_cast<std::uint32_t>(num_kv_heads),
         static_cast<std::uint32_t>(head_dim), scale, stream_,
         history_capacity_);
+    mark(qwen27::GpuPart::kAttnCore);
     emit("attention", d_attn_out_, q_dim);
 
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,
                  hidden_size, q_dim);
+    mark(qwen27::GpuPart::kAttnProj);
     emit("attn_output", d_fused_features_, hidden_size);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_fused_features_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.attention_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 1, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("attn_conv_out", d_conv_hidden_, hidden_size);
 
     LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
@@ -1103,16 +1139,19 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     LaunchBatchedRMSNorm(
         d_block_hidden_, static_cast<const float*>(layer.ffn_norm.data),
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+    mark(qwen27::GpuPart::kOther);
     emit("ffn_norm", d_block_normed_, hidden_size);
 
     RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
                  d_dynamic_coefficients_, block_count, dynamic_size,
                  hidden_size);
+    mark(qwen27::GpuPart::kSsmProj);
     kernels::LaunchDFlashGroupedDynamicConv(
         d_block_normed_, d_dynamic_coefficients_,
         static_cast<const float*>(dflash_layer.ffn_conv_base.data),
         d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
         df_cfg.conv_group_size, 0, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("ffn_conv_in", d_conv_hidden_, hidden_size);
 
     RunBlockGemm(layer.ffn_gate, d_conv_hidden_, d_ffn_gate_, block_count,
@@ -1121,8 +1160,10 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
                  intermediate_size, hidden_size);
     kernels::LaunchDFlashSiLUMul(d_ffn_gate_, d_ffn_up_,
                                  block_count * intermediate_size, stream_);
+    mark(qwen27::GpuPart::kFfnGateUp);
     RunBlockGemm(layer.ffn_down, d_ffn_gate_, d_ffn_down_, block_count,
                  hidden_size, intermediate_size);
+    mark(qwen27::GpuPart::kFfnDown);
     emit("ffn_down", d_ffn_down_, hidden_size);
 
     kernels::LaunchDFlashGroupedDynamicConv(
@@ -1134,7 +1175,10 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
 
     LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
                              block_count, hidden_size, stream_);
+    mark(qwen27::GpuPart::kSsmCore);
     emit("output", d_block_hidden_, hidden_size);
+    if (qwen27::FlushInterval() != 0)
+      (void)hipStreamQuery(stream_);
   }
 
   LaunchBatchedRMSNorm(
@@ -1142,6 +1186,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
   TraceTensor(trace, "normalized", d_block_normed_, block_count * hidden_size,
               stream_);
+  mark(qwen27::GpuPart::kOther);
 
   std::vector<tokenization::TokenId> tokens(draft_count, 0);
   RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
@@ -1153,6 +1198,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
                draft_count, vocab_size, hidden_size);
   TraceTensor(trace, "logits", d_logits_, draft_count * vocab_size, stream_);
+  mark(qwen27::GpuPart::kHead);
 
   if (temperature > 0.0F) {
     const auto uniform_copy = hipMemcpyAsync(
@@ -1185,6 +1231,9 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
           : nullptr,
       sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
       stream_);
+  mark(qwen27::GpuPart::kSelector);
+  // The pageable downloads below block until the GPU is done.
+  profile.Enqueued();
 
   const auto token_copy =
       hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
@@ -1229,6 +1278,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   if (hipStreamSynchronize(stream_) != hipSuccess) {
     throw std::runtime_error("DFlash GPU block synchronization failed");
   }
+  if (gpu_timeline)
+    timeline.Collect(qwen27::ProfileState::Get().draft_gpu);
 
   sampling_upload.pending = false;
   return tokens;
