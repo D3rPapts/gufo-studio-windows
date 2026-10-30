@@ -89,6 +89,45 @@ constexpr const char* kWan = R"({
  "58": {"class_type": "SaveVideo", "inputs": {"video": ["57", 0], "filename_prefix": "video/wan", "format": "auto", "codec": "auto"}}
 })";
 
+// ACE-Step 1.5 as ComfyUI's audio_ace_step_1_5 template wires it (node
+// signatures from /object_info on .56).
+constexpr const char* kAceStep = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "acestep_v1.5_xl_turbo_bf16.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "qwen_0.6b_ace15.safetensors", "clip_name2": "qwen_4b_ace15.safetensors", "type": "ace", "device": "default"}},
+ "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ace_1.5_vae.safetensors"}},
+ "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3}},
+ "5": {"class_type": "TextEncodeAceStepAudio1.5", "inputs": {"clip": ["2", 0], "tags": "90s anime opening, synth pop, female vocals", "lyrics": "[verse]\nNeon im Regen", "seed": 11, "bpm": 128, "duration": 45, "timesignature": "4", "language": "de", "keyscale": "A minor", "generate_audio_codes": true, "cfg_scale": 2.0, "temperature": 0.85, "top_p": 0.9, "top_k": 0, "min_p": 0.0}},
+ "6": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["5", 0]}},
+ "7": {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 45, "batch_size": 1}},
+ "8": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0], "seed": 11, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "9": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+ "10": {"class_type": "SaveAudio", "inputs": {"audio": ["9", 0], "filename_prefix": "film/musik/titel"}}
+})";
+
+// Wan 2.1 I2V 14B + Uni3C the ComfyUI-core way (WanUni3CControlnetApply on
+// the model, WanImageToVideo for the start image); the camera comes from
+// gufo's GufoCameraMove node.
+constexpr const char* kUni3C = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength_model": 1.0}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp16.safetensors", "type": "wan", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "5": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+ "6": {"class_type": "ModelPatchLoader", "inputs": {"name": "Wan21_Uni3C_controlnet_fp16.safetensors"}},
+ "10": {"class_type": "LoadImage", "inputs": {"image": "kf_shot07.png"}},
+ "11": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["5", 0], "image": ["10", 0], "crop": "none"}},
+ "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "slow orbit around the office desk"}},
+ "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": ""}},
+ "14": {"class_type": "GufoCameraMove", "inputs": {"camera": "orbit_left", "speed": 0.5, "ease": "ease_in_out", "amount": -1}},
+ "15": {"class_type": "WanUni3CControlnetApply", "inputs": {"model": ["2", 0], "model_patch": ["6", 0], "vae": ["4", 0], "render_video": ["14", 0], "strength": 1.0, "start_percent": 0.0, "end_percent": 1.0}},
+ "16": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["15", 0], "shift": 5}},
+ "20": {"class_type": "WanImageToVideo", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": 81, "batch_size": 1, "clip_vision_output": ["11", 0], "start_image": ["10", 0]}},
+ "30": {"class_type": "KSampler", "inputs": {"model": ["16", 0], "positive": ["20", 0], "negative": ["20", 1], "latent_image": ["20", 2], "seed": 99, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "31": {"class_type": "VAEDecode", "inputs": {"samples": ["30", 0], "vae": ["4", 0]}},
+ "32": {"class_type": "CreateVideo", "inputs": {"images": ["31", 0], "fps": 16}},
+ "33": {"class_type": "SaveVideo", "inputs": {"video": ["32", 0], "filename_prefix": "film/kamera/shot07", "format": "mp4", "codec": "h264"}}
+})";
+
 comfy::Plan PlanOf(const char* text) {
   comfy::Plan plan;
   comfy::PlanError error;
@@ -274,13 +313,13 @@ void TestWan() {
 void TestUnsupportedNodes() {
   const comfy::PlanError error = ErrorOf(R"({
     "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
-    "2": {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 30, "batch_size": 1}},
+    "2": {"class_type": "EmptyAceStepLatentAudio", "inputs": {"seconds": 30, "batch_size": 1}},
     "3": {"class_type": "FancyUpscaler", "inputs": {"image": ["2", 0]}},
     "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": "x"}}
   })");
   assert(error.type == "invalid_prompt");
   assert(error.message.find("FancyUpscaler (node 3)") != std::string::npos);
-  assert(error.message.find("EmptyAceStep1.5LatentAudio (node 2)") !=
+  assert(error.message.find("EmptyAceStepLatentAudio (node 2)") !=
          std::string::npos);
   assert(error.message.find("port pending") != std::string::npos);
   assert(error.node_errors.find("2") != nullptr);
@@ -406,6 +445,348 @@ void TestDialogue() {
   assert(error.message.find("Carl") != std::string::npos);
 }
 
+void TestAceStep() {
+  const comfy::Plan plan = PlanOf(kAceStep);
+  assert(plan.tasks.size() == 1);
+  const auto& task = plan.tasks[0];
+  assert(task.node_id == "8");
+  const auto& music = std::get<comfy::MusicTask>(task.spec);
+  assert(music.model == "ace-step-1.5-xl-turbo");
+  assert(music.tags == "90s anime opening, synth pop, female vocals");
+  assert(music.duration == 45 && music.seed == 11 && music.steps == 8);
+  assert(task.outputs.size() == 1 &&
+         task.outputs[0].kind == comfy::OutputKind::kAudio);
+  assert(task.outputs[0].prefix == "film/musik/titel");
+  const json::Value body = comfy::MusicRequestBody(music);
+  assert(body.member_str("model") == "ace-step-1.5-xl-turbo");
+  assert(body.member_str("prompt") == music.tags);
+  assert(body.member_str("lyrics") == "[verse]\nNeon im Regen");
+  assert(body.find("duration")->as_double() == 45);
+  assert(body.find("seed")->as_double() == 11);
+  assert(body.find("steps")->as_double() == 8);
+  assert(body.find("bpm")->as_double() == 128);
+  assert(body.member_str("timesignature") == "4");
+  assert(body.member_str("language") == "de");
+  assert(body.member_str("keyscale") == "A minor");
+  assert(body.find("audio_codes")->as_bool());
+  assert(body.find("lm_cfg")->as_double() == 2.0);
+  assert(body.find("lm_temperature")->as_double() == 0.85);
+  assert(body.find("lm_top_p")->as_double() == 0.9);
+  assert(body.member_str("response_format") == "wav");
+  assert(plan.warnings.empty());
+  // A different encoder duration, seed or a top_k is reported, not fatal.
+  std::string text = Replace(kAceStep, "\"duration\": 45", "\"duration\": 60");
+  text = Replace(text, "\"top_k\": 0", "\"top_k\": 40");
+  assert(PlanOf(text.c_str()).warnings.size() == 2);
+  // PreviewAudio works too; a SaveImage of music does not.
+  const comfy::Plan preview = PlanOf(
+      Replace(kAceStep,
+              "\"SaveAudio\", \"inputs\": {\"audio\": [\"9\", 0], "
+              "\"filename_prefix\": \"film/musik/titel\"}",
+              "\"PreviewAudio\", \"inputs\": {\"audio\": [\"9\", 0]}")
+          .c_str());
+  assert(preview.tasks[0].outputs[0].temp);
+  assert(ErrorOf(Replace(kAceStep, "\"SaveAudio\", \"inputs\": {\"audio\"",
+                         "\"SaveImage\", \"inputs\": {\"images\""))
+             .message.find("cannot store") != std::string::npos);
+  assert(ErrorOf(Replace(kAceStep, "\"seconds\": 45", "\"seconds\": 700"))
+             .message.find("1..600") != std::string::npos);
+  assert(ErrorOf(Replace(kAceStep, "\"batch_size\": 1", "\"batch_size\": 2"))
+             .node_errors.find("7") != nullptr);
+}
+
+void TestUni3C() {
+  const comfy::Plan plan = PlanOf(kUni3C);
+  assert(plan.tasks.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kCamera);
+  assert(video.model == "wan2.1-uni3c");
+  assert(video.prompt == "slow orbit around the office desk");
+  assert(video.width == 832 && video.height == 480 && video.frames == 81);
+  assert(video.fps == 16 && video.steps == 4 && video.seed == 99);
+  assert((video.first_frame == comfy::FileRef{"kf_shot07.png", "input"}));
+  assert(video.camera && video.camera->type == "orbit_left");
+  assert(video.camera->speed == 0.5 && video.camera->ease == "ease_in_out");
+  assert(!video.camera->amount && !video.render_video);
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "wan2.1-uni3c");
+  assert(body.member_str("size") == "832x480");
+  assert(body.find("seconds")->as_double() == 5);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("frames")->as_double() == 81);
+  assert(gufo->find("steps")->as_double() == 4);
+  assert(gufo->find("seed")->as_double() == 99);
+  assert(gufo->find("negative_prompt") == nullptr);
+  assert(gufo->find("guidance") == nullptr);
+  const json::Value* camera = gufo->find("camera");
+  assert(camera->member_str("type") == "orbit_left");
+  assert(camera->find("speed")->as_double() == 0.5);
+  assert(camera->member_str("ease") == "ease_in_out");
+  assert(camera->find("amount") == nullptr);
+  // 33 frames = 2 s; an explicit amount is sent.
+  std::string shorter = Replace(kUni3C, "\"length\": 81", "\"length\": 33");
+  shorter = Replace(shorter, "\"amount\": -1", "\"amount\": 30");
+  const comfy::Plan two_plan = PlanOf(shorter.c_str());
+  const auto& two = std::get<comfy::VideoTask>(two_plan.tasks[0].spec);
+  const json::Value two_body = comfy::VideoRequestBody(two);
+  assert(two_body.find("seconds")->as_double() == 2);
+  assert(two_body.find("gufo")->find("camera")->find("amount")->as_double() ==
+         30);
+  // A rendered guide video (LoadVideo -> GetVideoComponents) instead.
+  std::string rendered = Replace(
+      kUni3C,
+      "\"14\": {\"class_type\": \"GufoCameraMove\", \"inputs\": {\"camera\": "
+      "\"orbit_left\", \"speed\": 0.5, \"ease\": \"ease_in_out\", "
+      "\"amount\": -1}}",
+      "\"14\": {\"class_type\": \"GetVideoComponents\", \"inputs\": "
+      "{\"video\": [\"17\", 0]}},\n \"17\": {\"class_type\": \"LoadVideo\", "
+      "\"inputs\": {\"file\": \"render_shot07.mp4\"}}");
+  const comfy::Plan guided_plan = PlanOf(rendered.c_str());
+  const auto& guided =
+      std::get<comfy::VideoTask>(guided_plan.tasks[0].spec);
+  assert(!guided.camera);
+  assert((guided.render_video ==
+          comfy::FileRef{"render_shot07.mp4", "input"}));
+  // Errors: unknown move, bad ease, too large, wrong length, no start image,
+  // a foreign LoRA.
+  assert(ErrorOf(Replace(kUni3C, "\"orbit_left\"", "\"spiral\""))
+             .message.find("spiral") != std::string::npos);
+  assert(ErrorOf(Replace(kUni3C, "\"ease_in_out\"", "\"bounce\""))
+             .message.find("ease") != std::string::npos);
+  assert(ErrorOf(Replace(kUni3C, "\"height\": 480", "\"height\": 832"))
+             .message.find("832x832") != std::string::npos);
+  assert(ErrorOf(Replace(kUni3C, "\"length\": 81", "\"length\": 80"))
+             .message.find("4k+1") != std::string::npos);
+  assert(ErrorOf(Replace(kUni3C, ", \"start_image\": [\"10\", 0]", ""))
+             .message.find("start_image") != std::string::npos);
+  assert(ErrorOf(Replace(kUni3C, "lightx2v_I2V_14B_480p_cfg_step_distill",
+                         "anime_style"))
+             .message.find("LoRA") != std::string::npos);
+  // RIFE after the camera video doubles 16 fps.
+  const std::string rife = Replace(
+      kUni3C, "\"32\": {\"class_type\": \"CreateVideo\", \"inputs\": "
+              "{\"images\": [\"31\", 0]",
+      "\"34\": {\"class_type\": \"RIFE VFI\", \"inputs\": {\"frames\": "
+      "[\"31\", 0], \"multiplier\": 2}},\n \"32\": {\"class_type\": "
+      "\"CreateVideo\", \"inputs\": {\"images\": [\"34\", 0]");
+  const comfy::Plan smooth_plan = PlanOf(rife.c_str());
+  const auto& smooth =
+      std::get<comfy::VideoTask>(smooth_plan.tasks[0].spec);
+  assert(smooth.interpolate == 2 && smooth.fps == 32);
+}
+
+void TestWanFunCamera() {
+  // ComfyUI's Wan Fun Camera form: WanCameraEmbedding -> WanCameraImageToVideo.
+  std::string text = Replace(
+      kUni3C, "\"model\": [\"15\", 0], \"shift\": 5",
+      "\"model\": [\"2\", 0], \"shift\": 5");
+  text = Replace(
+      text,
+      "\"20\": {\"class_type\": \"WanImageToVideo\", \"inputs\": "
+      "{\"positive\": [\"12\", 0], \"negative\": [\"13\", 0], \"vae\": "
+      "[\"4\", 0], \"width\": 832, \"height\": 480, \"length\": 81, "
+      "\"batch_size\": 1,",
+      "\"18\": {\"class_type\": \"WanCameraEmbedding\", \"inputs\": "
+      "{\"camera_pose\": \"Zoom In\", \"width\": 832, \"height\": 480, "
+      "\"length\": 81, \"speed\": 2.0}},\n \"20\": {\"class_type\": "
+      "\"WanCameraImageToVideo\", \"inputs\": {\"positive\": [\"12\", 0], "
+      "\"negative\": [\"13\", 0], \"vae\": [\"4\", 0], \"width\": 832, "
+      "\"height\": 480, \"length\": 81, \"batch_size\": 1, "
+      "\"camera_conditions\": [\"18\", 0],");
+  // Nodes 6, 14 and 15 stay in the graph unconnected: harmless plumbing.
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kCamera);
+  assert(video.camera && video.camera->type == "dolly_in");
+  assert(video.camera->speed == 2.0);
+  assert(plan.warnings.size() == 1 &&
+         plan.warnings[0].find("Fun Camera") != std::string::npos);
+  // Roll has no gufo preset.
+  assert(ErrorOf(Replace(text, "\"Zoom In\"", "\"ClockWise (CW)\""))
+             .message.find("GufoCameraMove") != std::string::npos);
+  // Without a camera it is plain image to video on wan2.1-uni3c.
+  const comfy::Plan plain = PlanOf(
+      Replace(text, ", \"camera_conditions\": [\"18\", 0]", "").c_str());
+  const auto& still = std::get<comfy::VideoTask>(plain.tasks[0].spec);
+  assert(!still.camera && !still.render_video);
+  assert(comfy::VideoRequestBody(still).find("gufo")->find("camera") ==
+         nullptr);
+}
+
+// FilmStudio delivery after Wan 2.2: RIFE x2 (ComfyUI-Frame-Interpolation),
+// Real-ESRGAN x4 + ImageScale to 1920x1080, VideoHelperSuite at 60 fps.
+constexpr const char* kWanDelivery = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+ "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
+ "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "a fox in the snow"}},
+ "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
+ "55": {"class_type": "Wan22ImageToVideoLatent", "inputs": {"vae": ["3", 0], "width": 1280, "height": 704, "length": 49, "batch_size": 1}},
+ "3s": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["55", 0], "seed": 42, "steps": 20, "cfg": 5, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1}},
+ "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3s", 0], "vae": ["3", 0]}},
+ "60": {"class_type": "RIFE VFI", "inputs": {"ckpt_name": "rife49.pth", "frames": ["8", 0], "clear_cache_after_n_frames": 10, "multiplier": 2, "fast_mode": true, "ensemble": true, "scale_factor": 1.0}},
+ "61": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "realesr-animevideov3.pth"}},
+ "62": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["61", 0], "image": ["60", 0]}},
+ "63": {"class_type": "ImageScale", "inputs": {"image": ["62", 0], "upscale_method": "lanczos", "width": 1920, "height": 1080, "crop": "center"}},
+ "64": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["63", 0], "frame_rate": 60, "loop_count": 0, "filename_prefix": "film/lieferung/shot01", "format": "video/h264-mp4", "pingpong": false, "save_output": true}}
+})";
+
+void TestDelivery() {
+  const comfy::Plan plan = PlanOf(kWanDelivery);
+  const auto& wan = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(wan.interpolate == 2 && wan.fps_num == 60 && wan.fps_den == 1);
+  assert(wan.fps == 60);
+  assert(wan.upscale && wan.upscale->width == 1920 &&
+         wan.upscale->height == 1080);
+  assert(wan.upscale->fit == "crop" &&
+         wan.upscale->model == "realesr-animevideov3");
+  const auto& out = plan.tasks[0].outputs[0];
+  assert(out.class_type == "VHS_VideoCombine" &&
+         out.kind == comfy::OutputKind::kVideo && !out.temp);
+  assert(out.prefix == "film/lieferung/shot01");
+  const json::Value body = comfy::VideoRequestBody(wan);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("interpolate")->find("fps")->as_double() == 60);
+  const json::Value* upscale = gufo->find("upscale");
+  assert(upscale->find("width")->as_double() == 1920);
+  assert(upscale->find("height")->as_double() == 1080);
+  assert(upscale->member_str("fit") == "crop");
+  assert(upscale->member_str("model") == "realesr-animevideov3");
+  bool speed_note = false;
+  for (const auto& warning : plan.warnings)
+    speed_note = speed_note || warning.find("resamples") != std::string::npos;
+  assert(speed_note);
+  // 59.94 is NTSC 60000/1001.
+  const comfy::Plan ntsc = PlanOf(
+      Replace(kWanDelivery, "\"frame_rate\": 60", "\"frame_rate\": 59.94")
+          .c_str());
+  const auto& ntsc_video = std::get<comfy::VideoTask>(ntsc.tasks[0].spec);
+  assert(ntsc_video.fps_num == 60000 && ntsc_video.fps_den == 1001);
+  assert(comfy::VideoRequestBody(ntsc_video)
+             .find("gufo")
+             ->find("interpolate")
+             ->member_str("fps") == "60000/1001");
+  // frame_rate = 24 * multiplier keeps the plain multiplier.
+  const comfy::Plan plain = PlanOf(
+      Replace(kWanDelivery, "\"frame_rate\": 60", "\"frame_rate\": 48")
+          .c_str());
+  const auto& doubled = std::get<comfy::VideoTask>(plain.tasks[0].spec);
+  assert(doubled.fps_num == 0 && doubled.interpolate == 2);
+  assert(comfy::VideoRequestBody(doubled)
+             .find("gufo")
+             ->find("interpolate")
+             ->as_double() == 2);
+  // Without ImageScale the x4 size, stretched; ImageScaleBy scales it; a
+  // zero side keeps the aspect ratio.
+  std::string bare = Replace(
+      kWanDelivery,
+      "\"63\": {\"class_type\": \"ImageScale\", \"inputs\": {\"image\": "
+      "[\"62\", 0], \"upscale_method\": \"lanczos\", \"width\": 1920, "
+      "\"height\": 1080, \"crop\": \"center\"}},\n",
+      "");
+  bare = Replace(bare, "\"images\": [\"63\", 0]", "\"images\": [\"62\", 0]");
+  const comfy::Plan x4 = PlanOf(bare.c_str());
+  const auto& big = std::get<comfy::VideoTask>(x4.tasks[0].spec);
+  assert(big.upscale->width == 5120 && big.upscale->height == 2816 &&
+         big.upscale->fit == "stretch");
+  const comfy::Plan by = PlanOf(
+      Replace(kWanDelivery,
+              "\"ImageScale\", \"inputs\": {\"image\": [\"62\", 0], "
+              "\"upscale_method\": \"lanczos\", \"width\": 1920, \"height\": "
+              "1080, \"crop\": \"center\"}",
+              "\"ImageScaleBy\", \"inputs\": {\"image\": [\"62\", 0], "
+              "\"upscale_method\": \"lanczos\", \"scale_by\": 0.375}")
+          .c_str());
+  const auto& scaled = std::get<comfy::VideoTask>(by.tasks[0].spec);
+  assert(scaled.upscale->width == 1920 && scaled.upscale->height == 1056);
+  const comfy::Plan aspect = PlanOf(
+      Replace(kWanDelivery, "\"height\": 1080, \"crop\": \"center\"",
+              "\"height\": 0, \"crop\": \"disabled\"")
+          .c_str());
+  const auto& kept = std::get<comfy::VideoTask>(aspect.tasks[0].spec);
+  assert(kept.upscale->width == 1920 && kept.upscale->height == 1056 &&
+         kept.upscale->fit == "stretch");
+  // general-x4v3 is served; AnimeSharp (non-commercial) is not.
+  const comfy::Plan general = PlanOf(
+      Replace(kWanDelivery, "realesr-animevideov3.pth",
+              "realesr-general-x4v3.pth")
+          .c_str());
+  assert(std::get<comfy::VideoTask>(general.tasks[0].spec).upscale->model ==
+         "realesr-general-x4v3");
+  const comfy::PlanError sharp = ErrorOf(
+      Replace(kWanDelivery, "realesr-animevideov3.pth",
+              "2x-AnimeSharpV4_Fast_RCAN_PU.safetensors"));
+  assert(sharp.message.find("AnimeSharp") != std::string::npos);
+  assert(sharp.message.find("not served by gufo") != std::string::npos);
+  assert(sharp.node_errors.find("61") != nullptr);
+  // A frame rate without RIFE is only a warning; ImageScale without an
+  // upscaler and an upscale of a still image are errors.
+  std::string no_rife =
+      Replace(kWanDelivery, "\"image\": [\"60\", 0]", "\"image\": [\"8\", 0]");
+  no_rife = Replace(
+      no_rife,
+      " \"60\": {\"class_type\": \"RIFE VFI\", \"inputs\": {\"ckpt_name\": "
+      "\"rife49.pth\", \"frames\": [\"8\", 0], "
+      "\"clear_cache_after_n_frames\": 10, \"multiplier\": 2, \"fast_mode\": "
+      "true, \"ensemble\": true, \"scale_factor\": 1.0}},\n",
+      "");
+  const comfy::Plan unsampled = PlanOf(no_rife.c_str());
+  const auto& as_is = std::get<comfy::VideoTask>(unsampled.tasks[0].spec);
+  assert(as_is.fps_num == 0 && as_is.interpolate == 1 && as_is.upscale);
+  assert(!unsampled.warnings.empty());
+  assert(ErrorOf(Replace(kWanDelivery, "\"image\": [\"62\", 0]",
+                         "\"image\": [\"60\", 0]"))
+             .message.find("ImageUpscaleWithModel") != std::string::npos);
+  assert(ErrorOf(Replace(kQwenText, "\"images\": [\"7\", 0]",
+                         "\"images\": [\"9\", 0]}}, \"9\": {\"class_type\": "
+                         "\"ImageUpscaleWithModel\", \"inputs\": "
+                         "{\"upscale_model\": [\"10\", 0], \"image\": [\"7\", "
+                         "0]}}, \"10\": {\"class_type\": "
+                         "\"UpscaleModelLoader\", \"inputs\": {\"model_name\": "
+                         "\"realesr-animevideov3.pth\""))
+             .message.find("video") != std::string::npos);
+  // H3: RIFE x4 + CreateVideo at 96 fps stays the multiplier; the camera
+  // family upscales its 832x480 x4 picture with ImageScaleBy 0.5.
+  const std::string h3_rife = Replace(
+      kH3,
+      "\"40\": {\"class_type\": \"SaveImage\", \"inputs\": {\"images\": "
+      "[\"32\", 0]",
+      "\"39\": {\"class_type\": \"RIFE VFI\", \"inputs\": {\"frames\": "
+      "[\"32\", 0], \"multiplier\": 4}},\n \"38\": {\"class_type\": "
+      "\"CreateVideo\", \"inputs\": {\"images\": [\"39\", 0], \"fps\": 96}},\n "
+      "\"40\": {\"class_type\": \"SaveVideo\", \"inputs\": {\"video\": "
+      "[\"38\", 0]");
+  const comfy::Plan h3 = PlanOf(h3_rife.c_str());
+  const auto& h3_video = std::get<comfy::VideoTask>(h3.tasks[0].spec);
+  assert(h3_video.interpolate == 4 && h3_video.fps_num == 0 &&
+         !h3_video.upscale);
+  const comfy::Plan h3_60 =
+      PlanOf(Replace(h3_rife, "\"fps\": 96", "\"fps\": 60").c_str());
+  assert(std::get<comfy::VideoTask>(h3_60.tasks[0].spec).fps_num == 60);
+  const std::string camera = Replace(
+      kUni3C,
+      "\"32\": {\"class_type\": \"CreateVideo\", \"inputs\": {\"images\": "
+      "[\"31\", 0]",
+      "\"34\": {\"class_type\": \"UpscaleModelLoader\", \"inputs\": "
+      "{\"model_name\": \"realesr-general-x4v3.pth\"}},\n \"35\": "
+      "{\"class_type\": \"ImageUpscaleWithModel\", \"inputs\": "
+      "{\"upscale_model\": [\"34\", 0], \"image\": [\"31\", 0]}},\n \"36\": "
+      "{\"class_type\": \"ImageScaleBy\", \"inputs\": {\"image\": [\"35\", "
+      "0], \"upscale_method\": \"lanczos\", \"scale_by\": 0.5}},\n \"32\": "
+      "{\"class_type\": \"CreateVideo\", \"inputs\": {\"images\": [\"36\", "
+      "0]");
+  const comfy::Plan cam = PlanOf(camera.c_str());
+  const auto& cam_video = std::get<comfy::VideoTask>(cam.tasks[0].spec);
+  assert(cam_video.upscale->width == 1664 && cam_video.upscale->height == 960);
+  assert(cam_video.upscale->model == "realesr-general-x4v3");
+  assert(comfy::VideoRequestBody(cam_video)
+             .find("gufo")
+             ->find("upscale")
+             ->find("width")
+             ->as_double() == 1664);
+}
+
 void TestWavJoin() {
   comfy::Wav a{24000, 1, std::string(4, '\x01')};
   comfy::Wav b{24000, 1, std::string(2, '\x02')};
@@ -516,6 +897,10 @@ int main() {
   TestImageToImage();
   TestRife();
   TestDialogue();
+  TestAceStep();
+  TestUni3C();
+  TestWanFunCamera();
+  TestDelivery();
   TestWavJoin();
   TestHelpers();
   TestPreviewFrames();

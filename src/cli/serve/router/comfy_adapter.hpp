@@ -110,7 +110,8 @@ private:
   json::Value SaveSpeech(const Task& task,
                          const std::vector<std::string>& wavs);
   json::Value RunVideo(const std::shared_ptr<Job>& job, const Task& task,
-                       const VideoTask& spec);
+                       const VideoTask& spec);  json::Value RunMusic(const std::shared_ptr<Job>& job, const Task& task,
+                       const MusicTask& spec);
 
   std::filesystem::path FilePath(const FileRef& ref) const;
   std::string ReadFileRef(const FileRef& ref) const;

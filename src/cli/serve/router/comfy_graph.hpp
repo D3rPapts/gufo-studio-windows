@@ -14,8 +14,20 @@
 //   wan    KSampler <- Wan22ImageToVideoLatent -> /v1/videos (wan2.2-ti2v-5b)
 //   speech FB_Qwen3TTSVoiceDesign / VoiceClone / CustomVoice
 //          -> /v1/audio/speech
-// A new family (RIFE, ACE-Step) adds its node classes to the tables in
-// comfy_graph.cpp, a task type here and an executor in comfy_adapter.cpp.
+//   music  KSampler <- EmptyAceStep1.5LatentAudio + TextEncodeAceStepAudio1.5
+//          -> /v1/audio/music (ace-step-1.5-xl-turbo)
+//   camera KSampler <- WanImageToVideo with the model through
+//          WanUni3CControlnetApply (render_video from LoadVideo or a
+//          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
+//          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+// A new family adds its node classes to the tables in comfy_graph.cpp, a
+// task type here and an executor in comfy_adapter.cpp.
+//
+// GufoCameraMove is gufo's own node (no ComfyUI counterpart): inputs
+// camera ("orbit_left", "dolly_in", ... as gufo.camera.type), speed, ease
+// ("linear" | "ease_in_out") and optional amount (< 0 = type default). It
+// may feed WanUni3CControlnetApply.render_video or
+// WanCameraImageToVideo.camera_conditions.
 
 #include <cstdint>
 #include <optional>
@@ -37,6 +49,8 @@ struct ModelIds {
   std::string tts_custom{"qwen3-tts"};
   std::string tts_design{"qwen3-tts-voicedesign"};
   std::string tts_clone{"qwen3-tts-clone"};
+  std::string music{"ace-step-1.5-xl-turbo"};
+  std::string camera{"wan2.1-uni3c"};
 };
 
 /// A file a Load* node names, e.g. "sub/name.png [output]".
@@ -104,7 +118,45 @@ struct DialogueTask {
   bool merge{true};               // false: one output file per line
 };
 
-enum class VideoFamily { kH3, kWan };
+/// ACE-Step 1.5 text to music (/v1/audio/music).
+struct MusicTask {
+  std::string model;
+  std::string tags;    // -> prompt
+  std::string lyrics;
+  double duration{30.0};  // EmptyAceStep1.5LatentAudio seconds
+  std::uint64_t seed{0};
+  int steps{8};
+  int bpm{0};  // 0 = not sent
+  std::string timesignature;
+  std::string language;
+  std::string keyscale;
+  std::optional<bool> audio_codes;  // generate_audio_codes
+  std::optional<double> lm_cfg;
+  std::optional<double> lm_temperature;
+  std::optional<double> lm_top_p;
+};
+
+/// The /v1/audio/music body for `task` (synchronous, WAV).
+json::Value MusicRequestBody(const MusicTask& task);
+
+enum class VideoFamily { kH3, kWan, kCamera };
+
+/// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
+struct VideoUpscale {
+  int width{0};
+  int height{0};
+  std::string fit{"stretch"};  // "pad", "crop" or "stretch"
+  std::string model;           // e.g. "realesr-animevideov3"
+  bool operator==(const VideoUpscale&) const = default;
+};
+
+/// A preset camera move -> gufo.camera {type, amount, speed, ease}.
+struct CameraMove {
+  std::string type{"static"};
+  std::optional<double> amount;
+  double speed{1.0};
+  std::string ease{"linear"};
+};
 
 struct VideoTask {
   VideoFamily family{VideoFamily::kH3};
@@ -123,6 +175,12 @@ struct VideoTask {
   std::optional<double> lora_strength;
   int fps{24};
   int interpolate{1};  // RIFE multiplier from a "RIFE VFI" node (gufo 1..8)
+  /// Target frame rate fps_num / fps_den (gufo.interpolate {"fps"}) when a
+  /// RIFE VFI feeds an output with another frame rate; 0 = none.
+  int fps_num{0};
+  int fps_den{1};
+  /// ImageUpscaleWithModel (+ ImageScale / ImageScaleBy) after the decode.
+  std::optional<VideoUpscale> upscale;
   /// H3 MiniMaxH3AddGuide images between first and last frame (frame index,
   /// negative = from the end) -> gufo.keyframes.
   std::vector<std::pair<int, FileRef>> keyframes;
@@ -130,6 +188,10 @@ struct VideoTask {
   /// gufo.audio_reference_frame.
   std::optional<FileRef> audio_reference;
   int audio_reference_frame{0};
+  /// Camera family: a preset move or a rendered guide video (LoadVideo),
+  /// sent as gufo.camera.render_video by the executor.
+  std::optional<CameraMove> camera;
+  std::optional<FileRef> render_video;
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds
@@ -139,7 +201,7 @@ json::Value VideoRequestBody(const VideoTask& task);
 struct Task {
   std::string node_id;  // the sampler / TTS node producing the media
   std::string class_type;
-  std::variant<ImageTask, SpeechTask, VideoTask, DialogueTask> spec;
+  std::variant<ImageTask, SpeechTask, VideoTask, DialogueTask, MusicTask> spec;
   std::vector<OutputTarget> outputs;
 };
 

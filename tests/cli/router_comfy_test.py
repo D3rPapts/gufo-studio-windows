@@ -79,6 +79,15 @@ def serve_fake_worker(argv):
     port = int(argv[argv.index("--port") + 1])
     model = argv[argv.index("--served-model-name") + 1]
     log_path = os.environ["COMFY_FAKE_LOG"]
+    # One-shot start failure (a load that dies with "bad allocation"): while
+    # <dir>/<model>.fail exists, remove it and exit with status 1.
+    fail_dir = os.environ.get("COMFY_FAKE_FAIL_DIR")
+    if fail_dir:
+        marker = os.path.join(fail_dir, model + ".fail")
+        if os.path.exists(marker):
+            os.remove(marker)
+            time.sleep(0.3)
+            sys.exit(1)
     lock = threading.Lock()
     videos = {}
     previews = {}  # id -> polls answered
@@ -179,6 +188,10 @@ def serve_fake_worker(argv):
                         base64.b64decode(fields["reference_audio"])).hexdigest()
                 log({"path": path, "fields": fields})
                 return self.send(200, make_wav(), "audio/wav")
+            if path == "/v1/audio/music":
+                fields = json.loads(raw)
+                log({"path": path, "fields": fields})
+                return self.send(200, make_wav(0.5, 48000), "audio/wav")
             if path == "/v1/videos":
                 fields = json.loads(raw)
                 def describe(url):
@@ -193,8 +206,13 @@ def serve_fake_worker(argv):
                         fields[key] = describe(fields[key])
                 for keyframe in fields.get("gufo", {}).get("keyframes", []):
                     keyframe["image"] = describe(keyframe["image"])
+                camera = fields.get("gufo", {}).get("camera", {})
+                if "render_video" in camera:
+                    camera["render_video"] = describe(camera["render_video"])
                 log({"path": path, "fields": fields})
-                video_id = "video_%d" % (len(videos) + 1)
+                # Unique across fake workers, like gufo's random job ids: the
+                # router routes status/content reads by job id.
+                video_id = "video_%s_%d" % (model.replace(".", "_"), len(videos) + 1)
                 videos[video_id] = b"FAKEMP4-" + model.encode()
                 return self.send(202, {"id": video_id, "object": "video",
                                        "status": "queued", "progress": 0})
@@ -222,7 +240,8 @@ class Router:
         python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
         sections = []
         for model in ("qwen-image-2.1", "qwen3-tts", "qwen3-tts-voicedesign",
-                      "qwen3-tts-clone", "minimax-h3", "wan2.2-ti2v-5b"):
+                      "qwen3-tts-clone", "minimax-h3", "wan2.2-ti2v-5b",
+                      "ace-step-1.5-xl-turbo", "wan2.1-uni3c"):
             sections.append("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
                             "served-model-name = %s\n" % (model, python, THIS, model))
         with open(preset, "w") as handle:
@@ -240,6 +259,7 @@ class Router:
         while time.monotonic() < deadline:
             try:
                 if self.request("GET", "/health")[0] == 200:
+                    self.ready = True
                     return
             except OSError:
                 time.sleep(0.05)
@@ -259,8 +279,18 @@ class Router:
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
             headers = dict(headers or {}, **{"Content-Type": "application/json"})
-        conn.request(method, path, body=body, headers=headers or {})
-        response = conn.getresponse()
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            response = conn.getresponse()
+        except OSError as error:
+            if not getattr(self, "ready", False):
+                raise  # still starting up
+            # Name the router's exit status (e.g. 0xC0000409) next to the error.
+            time.sleep(0.5)
+            code = self.proc.poll()
+            raise AssertionError("%s %s failed: %r; router exit %s; log: %s" % (
+                method, path, error, "running" if code is None else hex(code & 0xFFFFFFFF),
+                self.tail()))
         payload = response.read()
         conn.close()
         return response.status, payload
@@ -384,6 +414,49 @@ def h3_graph(first, last, width=512, height=512, rife=0, middle=None, audio=None
     return graph
 
 
+def ace_graph(prefix="film/musik/titel"):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "acestep_v1.5_xl_turbo_bf16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "qwen_0.6b_ace15.safetensors", "clip_name2": "qwen_4b_ace15.safetensors", "type": "ace", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ace_1.5_vae.safetensors"}},
+        "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3}},
+        "5": {"class_type": "TextEncodeAceStepAudio1.5", "inputs": {"clip": ["2", 0], "tags": "synth pop, 90s anime", "lyrics": "[verse]\nNeon", "seed": 5, "bpm": 120, "duration": 30, "timesignature": "4", "language": "de", "keyscale": "C major", "generate_audio_codes": False, "cfg_scale": 2.0, "temperature": 0.85, "top_p": 0.9, "top_k": 0, "min_p": 0.0}},
+        "6": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["5", 0]}},
+        "7": {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 30, "batch_size": 1}},
+        "8": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0], "seed": 5, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+        "9": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "SaveAudio", "inputs": {"audio": ["9", 0], "filename_prefix": prefix}},
+    }
+
+
+def camera_graph(start, move=None, render=None, length=81):
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength_model": 1.0}},
+        "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp16.safetensors", "type": "wan", "device": "default"}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+        "5": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+        "6": {"class_type": "ModelPatchLoader", "inputs": {"name": "Wan21_Uni3C_controlnet_fp16.safetensors"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": start}},
+        "11": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["5", 0], "image": ["10", 0], "crop": "none"}},
+        "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "slow camera move through the office"}},
+        "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": ""}},
+        "15": {"class_type": "WanUni3CControlnetApply", "inputs": {"model": ["2", 0], "model_patch": ["6", 0], "vae": ["4", 0], "render_video": ["14", 0], "strength": 1.0, "start_percent": 0.0, "end_percent": 1.0}},
+        "16": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["15", 0], "shift": 5}},
+        "20": {"class_type": "WanImageToVideo", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": length, "batch_size": 1, "clip_vision_output": ["11", 0], "start_image": ["10", 0]}},
+        "30": {"class_type": "KSampler", "inputs": {"model": ["16", 0], "positive": ["20", 0], "negative": ["20", 1], "latent_image": ["20", 2], "seed": 99, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+        "31": {"class_type": "VAEDecode", "inputs": {"samples": ["30", 0], "vae": ["4", 0]}},
+        "32": {"class_type": "CreateVideo", "inputs": {"images": ["31", 0], "fps": 16}},
+        "33": {"class_type": "SaveVideo", "inputs": {"video": ["32", 0], "filename_prefix": "film/kamera/shot", "format": "mp4", "codec": "h264"}},
+    }
+    if render:
+        graph["14"] = {"class_type": "GetVideoComponents", "inputs": {"video": ["17", 0]}}
+        graph["17"] = {"class_type": "LoadVideo", "inputs": {"file": render}}
+    else:
+        graph["14"] = {"class_type": "GufoCameraMove", "inputs": dict({"camera": "orbit_left", "speed": 1.0, "ease": "linear"}, **(move or {}))}
+    return graph
+
+
 def dialogue_graph():
     return {
         "1": {"class_type": "LoadAudio", "inputs": {"audio": "anna.wav"}},
@@ -465,7 +538,7 @@ def check_front(router):
     assert list(one) == ["LoadImage"], one
     # /v1 routing stays with the router.
     status, models = router.json("GET", "/v1/models")
-    assert status == 200 and len(models["data"]) == 6
+    assert status == 200 and len(models["data"]) == 8
 
 
 def check_uploads(router):
@@ -621,10 +694,112 @@ def check_video(router, stretched):
     assert fields["gufo"]["audio_reference_frame"] == 0, fields
 
 
+def check_music(router, audio_ext):
+    entry = router.run(ace_graph())
+    audio = entry["outputs"]["10"]["audio"][0]
+    assert audio["filename"] == "titel_00001." + audio_ext, audio
+    status, data = router.request("GET", "/view?" + urllib.parse.urlencode(audio))
+    assert status == 200 and len(data) > 100
+    call = router.fake_entries()[-1]
+    assert call["path"] == "/v1/audio/music" and call["model"] == "ace-step-1.5-xl-turbo", call
+    assert call["fields"] == {"model": "ace-step-1.5-xl-turbo", "prompt": "synth pop, 90s anime",
+                              "lyrics": "[verse]\nNeon", "duration": 30, "seed": 5, "steps": 8,
+                              "bpm": 120, "timesignature": "4", "language": "de",
+                              "keyscale": "C major", "audio_codes": False, "lm_cfg": 2.0,
+                              "lm_temperature": 0.85, "lm_top_p": 0.9,
+                              "response_format": "wav"}, call
+
+
+def check_camera(router):
+    entry = router.run(camera_graph("ref.png", {"camera": "dolly_in", "speed": 0.5, "ease": "ease_in_out"}))
+    video = entry["outputs"]["33"]
+    assert video["images"][0]["filename"] == "shot_00001_.mp4", video
+    status, data = router.request("GET", "/view?" + urllib.parse.urlencode(video["images"][0]))
+    assert status == 200 and data == b"FAKEMP4-wan2.1-uni3c"
+    call = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]
+    fields = call["fields"]
+    assert call["model"] == "wan2.1-uni3c", call
+    assert fields == {"model": "wan2.1-uni3c", "prompt": "slow camera move through the office",
+                      "size": "832x480", "seconds": 5,
+                      "first_frame": "data:image/png;base64,64x48",
+                      "gufo": {"seed": 99, "steps": 4, "frames": 81,
+                               "camera": {"type": "dolly_in", "speed": 0.5,
+                                          "ease": "ease_in_out"}}}, fields
+    # A rendered guide video goes as gufo.camera.render_video.
+    render = b"\x00\x00\x00\x18ftypmp42" + bytes(range(256)) * 2
+    router.upload("render.mp4", render)
+    router.run(camera_graph("ref.png", render="render.mp4", length=33))
+    fields = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]["fields"]
+    assert fields["seconds"] == 2 and fields["gufo"]["frames"] == 33, fields
+    assert fields["gufo"]["camera"] == {
+        "render_video": "data:video/mp4;base64," + hashlib.sha256(render).hexdigest()}, fields
+    status, body = router.json("POST", "/prompt", {"prompt": camera_graph("ref.png", {"camera": "spiral"})})
+    assert status == 400 and "spiral" in body["error"]["message"], body
+
+
+def wan_delivery_graph(model_file="realesr-animevideov3.pth"):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "a fox in the snow"}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
+        "55": {"class_type": "Wan22ImageToVideoLatent", "inputs": {"vae": ["3", 0], "width": 1280, "height": 704, "length": 49, "batch_size": 1}},
+        "9": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["55", 0], "seed": 42, "steps": 20, "cfg": 5, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["3", 0]}},
+        "60": {"class_type": "RIFE VFI", "inputs": {"ckpt_name": "rife49.pth", "frames": ["8", 0], "multiplier": 2}},
+        "61": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": model_file}},
+        "62": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["61", 0], "image": ["60", 0]}},
+        "63": {"class_type": "ImageScale", "inputs": {"image": ["62", 0], "upscale_method": "lanczos", "width": 1920, "height": 1080, "crop": "center"}},
+        "64": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["63", 0], "frame_rate": 60, "loop_count": 0, "filename_prefix": "film/lieferung/shot", "format": "video/h264-mp4", "pingpong": False, "save_output": True}},
+    }
+
+
+def check_delivery(router):
+    entry = router.run(wan_delivery_graph())
+    gifs = entry["outputs"]["64"]["gifs"]
+    assert gifs[0]["filename"] == "shot_00001_.mp4" and gifs[0]["frame_rate"] == 60, gifs
+    assert gifs[0]["format"] == "video/h264-mp4", gifs
+    status, data = router.request("GET", "/view?" + urllib.parse.urlencode(
+        {k: gifs[0][k] for k in ("filename", "subfolder", "type")}))
+    assert status == 200 and data == b"FAKEMP4-wan2.2-ti2v-5b"
+    call = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]
+    assert call["model"] == "wan2.2-ti2v-5b", call
+    gufo = call["fields"]["gufo"]
+    assert gufo["interpolate"] == {"fps": 60}, gufo
+    assert gufo["upscale"] == {"width": 1920, "height": 1080, "fit": "crop",
+                               "model": "realesr-animevideov3"}, gufo
+    status, body = router.json("POST", "/prompt", {"prompt": wan_delivery_graph(
+        "2x-AnimeSharpV4_Fast_RCAN_PU.safetensors")})
+    assert status == 400 and "not served by gufo" in body["error"]["message"], body
+    assert "61" in body["node_errors"], body
+
+
+def check_models_control(router):
+    # llama.cpp router mode: POST /models/load and /models/unload {"model"}.
+    status, body = router.json("POST", "/models/unload", {"model": "nope"})
+    assert status == 400 and body == {"error": {"code": 400, "message": "model is not found",
+                                                "type": "invalid_request_error"}}, body
+    status, body = router.json("POST", "/models/load", {"model": "nope"})
+    assert status == 404 and body["error"]["type"] == "not_found_error", body
+    status, body = router.json("POST", "/models/load", {"model": "qwen3-tts"})
+    assert status == 200 and body == {"success": True}, body
+    loaded = {m["id"]: m["status"]["value"] for m in router.json("GET", "/models")[1]["data"]}
+    assert loaded["qwen3-tts"] == "loaded", loaded
+    status, body = router.json("POST", "/models/load", {"model": "qwen3-tts"})
+    assert status == 400 and body["error"]["message"] == "model is already running", body
+    status, body = router.json("POST", "/models/unload", {"model": "qwen3-tts"})
+    assert status == 200 and body == {"success": True}, body
+    loaded = {m["id"]: m["loaded"] for m in router.json("GET", "/v1/models")[1]["data"]}
+    assert not loaded["qwen3-tts"], loaded
+    status, body = router.json("POST", "/models/unload", {"model": "qwen3-tts"})
+    assert status == 400 and body["error"]["message"] == "model is not running", body
+
+
 def check_errors(router):
     graph = qwen_graph()
     graph["9"] = {"class_type": "FancyUpscaler", "inputs": {"image": ["7", 0]}}
-    graph["10"] = {"class_type": "EmptyAceStep1.5LatentAudio", "inputs": {"seconds": 30, "batch_size": 1}}
+    graph["10"] = {"class_type": "EmptyAceStepLatentAudio", "inputs": {"seconds": 30, "batch_size": 1}}
     status, body = router.json("POST", "/prompt", {"prompt": graph})
     assert status == 400, body
     assert "FancyUpscaler (node 9)" in body["error"]["message"], body
@@ -768,6 +943,98 @@ def check_queue_history_free(router):
     return list(router.json("GET", "/history")[1])
 
 
+def check_autoload_retry(binary, tmp):
+    """A failed --autoload keeps the router up: the model is listed as
+    failed, other models and pages answer, and a later retry loads it."""
+    work = os.path.join(tmp, "autoload")
+    pages = os.path.join(work, "pages", "status")
+    os.makedirs(pages)
+    with open(os.path.join(pages, "index.html"), "w") as handle:
+        handle.write("<p>status</p>")
+    fail_dir = os.path.join(work, "fail")
+    os.makedirs(fail_dir)
+    open(os.path.join(fail_dir, "flaky.fail"), "w").close()
+    python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
+    preset = os.path.join(work, "autoload.preset")
+    with open(preset, "w") as handle:
+        for model in ("flaky", "steady"):
+            handle.write("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
+                         "served-model-name = %s\n\n" % (model, python, THIS, model))
+    port = free_port()
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
+    env["COMFY_FAKE_LOG"] = os.path.join(work, "fake.jsonl")
+    env["COMFY_FAKE_FAIL_DIR"] = fail_dir
+    log = open(os.path.join(work, "router.log"), "ab")
+    proc = subprocess.Popen(
+        [binary, "router", "--models-preset", preset, "--host", "127.0.0.1",
+         "--port", str(port), "--models-max", "0", "--autoload",
+         "--autoload-retry-seconds", "3,60", "--pages-dir",
+         os.path.join(work, "pages")],
+        env=env, stdout=log, stderr=subprocess.STDOUT)
+
+    def get(path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        if body is None:
+            conn.request("GET", path)
+        else:
+            conn.request("POST", path, body=json.dumps(body).encode(),
+                         headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read()
+        conn.close()
+        return response.status, data
+
+    def tail():
+        with open(os.path.join(work, "router.log"), "rb") as handle:
+            return handle.read()[-3000:].decode(errors="replace")
+
+    def status_of(model):
+        listing = json.loads(get("/v1/models")[1])["data"]
+        return [m for m in listing if m["id"] == model][0]["status"]
+
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if get("/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        # The first start of "flaky" exits with status 1.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not status_of("flaky").get("failed"):
+            assert proc.poll() is None, "router exited: " + tail()
+            time.sleep(0.1)
+        status = status_of("flaky")
+        assert status["value"] == "unloaded" and status["failed"] is True, status
+        assert status["attempts"] == 1 and status["retry_in_s"] <= 3, status
+        status, body = get("/router/status")
+        assert status == 200 and "flaky" in json.loads(body)["autoload_failed"], body
+        # Meanwhile other models and pages answer.
+        status, body = get("/v1/audio/speech", {"model": "steady", "input": "Hallo",
+                                                 "voice": "ryan"})
+        assert status == 200 and body[:4] == b"RIFF", (status, body[:200])
+        status, body = get("/status/")
+        assert status == 200 and b"status" in body, status
+        # The retry after 3 s loads it; the failure mark goes away.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and status_of("flaky")["value"] != "loaded":
+            assert proc.poll() is None, "router exited: " + tail()
+            time.sleep(0.2)
+        status = status_of("flaky")
+        assert status["value"] == "loaded" and "failed" not in status, status
+        assert json.loads(get("/router/status")[1])["autoload_failed"] == {}
+        assert proc.poll() is None
+    except BaseException:
+        print(tail())
+        raise
+    finally:
+        proc.terminate()
+        proc.wait(10)
+        log.close()
+
+
 def main():
     if "--fake-worker" in sys.argv:
         return serve_fake_worker(sys.argv)
@@ -783,6 +1050,10 @@ def main():
         check_qwen_references(router)
         check_speech(router, "flac" if ffmpeg else "wav")
         check_video(router, bool(ffmpeg))
+        check_music(router, "flac" if ffmpeg else "wav")
+        check_camera(router)
+        check_delivery(router)
+        check_models_control(router)
         check_errors(router)
         check_websocket(router)
         check_previews(router)
@@ -800,6 +1071,8 @@ def main():
         assert entry["outputs"]["8"]["images"][0]["filename"] == "demo_00003_.png"
     finally:
         router.stop()
+    if not os.environ.get("COMFY_SKIP_AUTOLOAD"):
+        check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("router_comfy_test: all passed (ffmpeg: %s)" % (ffmpeg or "none"))
     return 0
