@@ -193,7 +193,10 @@ QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
     : executor_(std::move(executor)),
       config_(config),
       controller_(
-          config.policy, config.max_draft_tokens,
+          config.policy,
+          qwen27::LookupDFlashCap() != 0
+              ? std::min(config.max_draft_tokens, qwen27::LookupDFlashCap())
+              : config.max_draft_tokens,
           // The tied output tensor distinguishes the qualified Q8 target
           // (Q8_0 head) from Q4 (Q6_K head) for verification cost selection.
           executor_->GetModel().GetWeights().output.type ==
@@ -204,6 +207,10 @@ QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
   for (std::size_t i = 0; i < names.size(); ++i)
     lookup_boundaries_[i] = tokenizer.FindSpecialToken(names[i]).value_or(
         tokenization::kInvalidTokenId);
+  think_start_ =
+      tokenizer.FindSpecialToken("<think>").value_or(tokenization::kInvalidTokenId);
+  think_end_ = tokenizer.FindSpecialToken("</think>").value_or(
+      tokenization::kInvalidTokenId);
 }
 
 std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
@@ -456,14 +463,21 @@ std::optional<speculative::DraftProposal> QwenDFlashGpuDraftBackend::TryLookup(
   const bool weak_neural =
       controller_.State() <
       std::min(3.0F, static_cast<float>(config_.max_draft_tokens));
+  // GUFO_QWEN27_LOOKUP_MIN[_REASONING|_ANSWER] replace the strict gate; the
+  // phase follows the latest <think>/</think> token (prompt_lookup_27b.hpp).
+  const auto& gate = qwen27::LookupStrictGate(Lookup::kSampledMinMatch);
+  const auto strict =
+      gate.PhaseAware() && qwen27::InReasoning(tokens, think_start_, think_end_)
+          ? gate.reasoning
+          : gate.answer;
   const auto minimum =
-      !sampled && weak_neural ? Lookup::kMinMatch : Lookup::kSampledMinMatch;
+      !sampled && weak_neural ? std::min(Lookup::kMinMatch, strict) : strict;
   const auto state = lookup_.Save();
   if (state.resume == Lookup::kNoState &&
       tokens.size() - state.request_start < minimum)
     return std::nullopt;
   const auto committed = tokens.first(position);
-  lookup_.Extend(committed, sampled);
+  lookup_.Extend(committed, sampled && !qwen27::LookupIndexesGenerated());
   const auto cap = std::min(limit, config_.max_draft_tokens);
   const auto match =
       lookup_.Find(committed, tokens.last(1), minimum, [&](std::size_t start) {
