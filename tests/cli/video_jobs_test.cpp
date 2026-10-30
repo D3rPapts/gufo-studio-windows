@@ -21,6 +21,7 @@
 namespace {
 
 namespace h3 = gufo::minimax_h3;
+using gufo::server::VideoInterpolation;
 using gufo::server::VideoJobRequest;
 using gufo::server::VideoJobResult;
 using gufo::server::VideoJobService;
@@ -617,6 +618,7 @@ void TestInterpolation(const std::filesystem::path& root) {
           "interpolate without an interpolator is rejected");
   }
   int seen_multiplier = 0;
+  int seen_fps = 0;
   bool input_was_generated = false;
   VideoJobService service({
       .model_root = "/models/h3",
@@ -630,11 +632,13 @@ void TestInterpolation(const std::filesystem::path& root) {
       .runner = runner,
       .interpolator =
           [&](const std::filesystem::path& input,
-              const std::filesystem::path& output, int multiplier,
+              const std::filesystem::path& output,
+              const VideoInterpolation& spec,
               const h3::CancellationToken*, h3::GenerationProgress progress,
               void* opaque, std::string*) {
             progress("interpolate", 1, 2, opaque);
-            seen_multiplier = multiplier;
+            seen_multiplier = spec.multiplier;
+            seen_fps = spec.fps_num;
             input_was_generated = ReadAll(input) == "generated";
             std::ofstream(output, std::ios::binary) << "interpolated";
             return true;
@@ -664,6 +668,127 @@ void TestInterpolation(const std::filesystem::path& root) {
   Check(!std::filesystem::exists(root / "rife" / created.job->id /
                                  "generated.mp4"),
         "staged generated MP4 is removed");
+
+  auto target = Mp4Request("interpolate to 60 fps");
+  target.interpolate = 2;
+  target.interpolate_fps_num = 60;
+  Check(service.Create(target).result == VideoJobResult::kInvalid,
+        "a multiplier and a target frame rate together are rejected");
+  target.interpolate = 1;
+  target.interpolate_fps_num = 241;
+  Check(service.Create(target).result == VideoJobResult::kInvalid,
+        "a target frame rate above 240 is rejected");
+  target.interpolate_fps_num = 60;
+  const auto resampled = service.Create(target);
+  Check(resampled.job.has_value(), "target frame rate request admitted");
+  WaitUntil(
+      [&] {
+        const auto lookup = service.Get(resampled.job->id);
+        return lookup.job.has_value() &&
+               lookup.job->status == VideoJobStatus::kCompleted;
+      },
+      "target frame rate job did not complete");
+  Check(seen_fps == 60 && seen_multiplier == 1,
+        "interpolator sees the target frame rate");
+}
+
+void TestUpscale(const std::filesystem::path& root) {
+  const auto runner = [](const h3::GenerationRequest& request,
+                         const h3::CancellationToken*, h3::GenerationProgress,
+                         void*, h3::GenerationTelemetry*, std::string*) {
+    std::filesystem::create_directories(request.output_path.parent_path());
+    std::ofstream(request.output_path, std::ios::binary) << "generated";
+    return true;
+  };
+  {
+    VideoJobService plain({
+        .model_root = "/models/h3",
+        .source_manifest = "/manifest.json",
+        .storage_root = root / "plain",
+        .queue_capacity = 1,
+        .artifact_ttl = std::chrono::hours(1),
+        .validate_model_inventory = false,
+        .id_factory = NextId,
+        .now = [] { return 7500; },
+        .runner = runner,
+    });
+    Check(plain.ready(), plain.initialization_error());
+    auto request = Mp4Request("upscale without a model");
+    request.upscale = {.width = 1920, .height = 1200};
+    const auto rejected = plain.Create(request);
+    Check(rejected.result == VideoJobResult::kInvalid &&
+              rejected.error.find("--upscale-model") != std::string::npos,
+          "upscale without an upscaler is rejected");
+  }
+  std::vector<std::string> order;
+  gufo::server::VideoUpscale seen;
+  std::string upscale_input;
+  VideoJobService service({
+      .model_root = "/models/h3",
+      .source_manifest = "/manifest.json",
+      .storage_root = root / "esrgan",
+      .queue_capacity = 1,
+      .artifact_ttl = std::chrono::hours(1),
+      .validate_model_inventory = false,
+      .id_factory = NextId,
+      .now = [] { return 7500; },
+      .runner = runner,
+      .interpolator =
+          [&](const std::filesystem::path& input,
+              const std::filesystem::path& output, const VideoInterpolation&,
+              const h3::CancellationToken*, h3::GenerationProgress, void*,
+              std::string*) {
+            order.push_back("interpolate:" + ReadAll(input));
+            std::ofstream(output, std::ios::binary) << "interpolated";
+            return true;
+          },
+      .upscaler =
+          [&](const std::filesystem::path& input,
+              const std::filesystem::path& output,
+              const gufo::server::VideoUpscale& spec,
+              const h3::CancellationToken*, h3::GenerationProgress progress,
+              void* opaque, std::string*) {
+            progress("upscale", 1, 2, opaque);
+            order.push_back("upscale:" + ReadAll(input));
+            seen = spec;
+            std::ofstream(output, std::ios::binary) << "upscaled";
+            return true;
+          },
+      .upscale_models = {"anime", "general"},
+  });
+  Check(service.ready(), service.initialization_error());
+  auto request = Mp4Request("upscale to 1920x1200");
+  request.upscale = {.width = 1921, .height = 1200};
+  Check(service.Create(request).result == VideoJobResult::kInvalid,
+        "an odd upscale width is rejected");
+  request.upscale = {.width = 1920, .height = 1200, .fit = "zoom"};
+  Check(service.Create(request).result == VideoJobResult::kInvalid,
+        "an unknown fit is rejected");
+  request.upscale = {.width = 1920, .height = 1200, .model = "missing"};
+  Check(service.Create(request).result == VideoJobResult::kInvalid,
+        "an unknown upscale model is rejected");
+  request.upscale = {
+      .width = 1920, .height = 1080, .fit = "crop", .model = "general"};
+  request.interpolate_fps_num = 60;
+  const auto created = service.Create(request);
+  Check(created.job.has_value(), "upscale request admitted");
+  WaitUntil(
+      [&] {
+        const auto lookup = service.Get(created.job->id);
+        return lookup.job.has_value() &&
+               lookup.job->status == VideoJobStatus::kCompleted;
+      },
+      "upscaled job did not complete");
+  const auto content = service.Content(created.job->id);
+  Check(content.result == VideoJobResult::kOk && content.content.has_value() &&
+            ReadAll(content.content->path) == "upscaled",
+        "upscaled MP4 is published");
+  Check(order.size() == 2 && order[0] == "interpolate:generated" &&
+            order[1] == "upscale:interpolated",
+        "the upscaler runs after the interpolator on its output");
+  Check(seen.width == 1920 && seen.height == 1080 && seen.fit == "crop" &&
+            seen.model == "general",
+        "upscaler sees the requested size, fit and model");
 }
 
 void TestRecycle(const std::filesystem::path& root) {
@@ -747,6 +872,7 @@ int main() {
   TestRunnerExceptionRecovery(base / "runner-exception");
   TestRunnerOutputBoundary(base / "runner-output-boundary");
   TestInterpolation(base / "interpolation");
+  TestUpscale(base / "upscale");
   TestRecycle(base / "recycle");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video job lifecycle tests passed.\n";

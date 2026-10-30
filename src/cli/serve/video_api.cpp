@@ -508,14 +508,89 @@ std::optional<core::Image> ReadFirstFrame(const json::Value* value,
                      .pixels = std::move(keyframe->rgb)};
 }
 
-// "gufo.interpolate": RIFE frame multiplier applied to the finished MP4
-// (1 = off, 2..8; 4 turns 24 fps into 96 fps at the same speed).
-std::optional<int> JsonInterpolate(const json::Value* value) {
+// "gufo.interpolate": RIFE applied to the finished MP4, either a whole-number
+// multiplier (1 = off, 2..8; 4 turns 24 fps into 96 fps at the same speed) or
+// {"fps": N} / {"fps": "N/D"}, a target frame rate at the same speed (60 from
+// H3's 24 or Wan's 16 fps; 1..240).
+std::optional<VideoInterpolation> JsonInterpolate(const json::Value* value) {
+  if (value != nullptr && value->is_object()) {
+    const json::Value* fps = value->find("fps");
+    if (!HasOnlyMembers(*value, {"fps"}) || fps == nullptr) {
+      return std::nullopt;
+    }
+    VideoInterpolation spec;
+    if (fps->is_string()) {
+      const std::string& text = fps->str();
+      const std::size_t slash = text.find('/');
+      const auto parse = [](std::string_view part, int* out) {
+        const auto result =
+            std::from_chars(part.data(), part.data() + part.size(), *out);
+        return result.ec == std::errc{} &&
+               result.ptr == part.data() + part.size();
+      };
+      const std::string_view whole(text);
+      if (!parse(whole.substr(0, slash), &spec.fps_num) ||
+          (slash != std::string::npos &&
+           !parse(whole.substr(slash + 1), &spec.fps_den))) {
+        return std::nullopt;
+      }
+    } else {
+      const auto parsed = JsonFrame(fps);
+      if (!parsed.has_value()) {
+        return std::nullopt;
+      }
+      spec.fps_num = *parsed;
+    }
+    if (spec.fps_num < 1 || spec.fps_den < 1 || spec.fps_den > 1001 ||
+        spec.fps_num > 240 * spec.fps_den) {
+      return std::nullopt;
+    }
+    return spec;
+  }
   const auto parsed = JsonFrame(value);
   if (!parsed.has_value() || *parsed < 1 || *parsed > 8) {
     return std::nullopt;
   }
-  return parsed;
+  return VideoInterpolation{.multiplier = *parsed};
+}
+
+// "gufo.upscale": Real-ESRGAN applied to the finished (interpolated) MP4:
+// "WxH" or {"width", "height", "fit" ("pad" default, "crop", "stretch"),
+// "model" (a name registered with --upscale-model)}. The job service checks
+// the values.
+std::optional<VideoUpscale> JsonUpscale(const json::Value* value) {
+  VideoUpscale spec;
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (value->is_string()) {
+    if (!ParseVideoSize(value->str(), &spec.width, &spec.height)) {
+      return std::nullopt;
+    }
+    return spec;
+  }
+  if (!value->is_object() ||
+      !HasOnlyMembers(*value, {"width", "height", "fit", "model"})) {
+    return std::nullopt;
+  }
+  const auto width = JsonFrame(value->find("width"));
+  const auto height = JsonFrame(value->find("height"));
+  if (!width.has_value() || !height.has_value() || *width < 2 ||
+      *height < 2) {
+    return std::nullopt;
+  }
+  spec.width = *width;
+  spec.height = *height;
+  for (const char* key : {"fit", "model"}) {
+    if (const json::Value* text = value->find(key)) {
+      if (!text->is_string() || text->str().empty() ||
+          text->str().size() > 128) {
+        return std::nullopt;
+      }
+      (std::string_view(key) == "fit" ? spec.fit : spec.model) = text->str();
+    }
+  }
+  return spec;
 }
 
 // Wan 2.2 TI2V-5B: {"model", "prompt", "size" (default "1280x704"),
@@ -523,7 +598,8 @@ std::optional<int> JsonInterpolate(const json::Value* value) {
 // to-video; the image is scaled to cover the size and centre-cropped),
 // "gufo": {"seed", "steps" (default 50), "frames" (4k + 1, must match
 // seconds), "negative_prompt" (default ""), "guidance" (default 5; <= 1
-// disables classifier-free guidance), "interpolate" (RIFE multiplier)}}.
+// disables classifier-free guidance), "interpolate" (RIFE multiplier or
+// {"fps": N}), "upscale" (Real-ESRGAN, see JsonUpscale)}}.
 // MP4 only.
 HttpResponse CreateWan22Video(const json::Value& body,
                               const std::map<std::string, std::string>& files,
@@ -615,24 +691,37 @@ HttpResponse CreateWan22Video(const json::Value& body,
   std::uint64_t seed = 42;
   std::string negative_prompt;
   double guidance = 5.0;
-  int interpolate = 1;
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension,
                         {"seed", "steps", "frames", "negative_prompt",
-                         "guidance", "interpolate"})) {
+                         "guidance", "interpolate", "upscale"})) {
       return Error(400, "Bad Request",
                    "'gufo' may contain only 'seed', 'steps', 'frames', "
-                   "'negative_prompt', 'guidance' and 'interpolate'",
+                   "'negative_prompt', 'guidance', 'interpolate' and "
+                   "'upscale'",
                    "invalid_strix_options");
     }
     if (extension->contains("interpolate")) {
       const auto parsed = JsonInterpolate(extension->find("interpolate"));
       if (!parsed.has_value()) {
-        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
                      "invalid_interpolate");
       }
       interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
     }
     if (extension->contains("negative_prompt")) {
       const json::Value* value = extension->find("negative_prompt");
@@ -698,7 +787,10 @@ HttpResponse CreateWan22Video(const json::Value& body,
                                  : std::vector<std::uint8_t>(),
       .negative_prompt = std::move(negative_prompt),
       .guidance = guidance,
-      .interpolate = interpolate,
+      .interpolate = interpolate.multiplier,
+      .interpolate_fps_num = interpolate.fps_num,
+      .interpolate_fps_den = interpolate.fps_den,
+      .upscale = std::move(upscale),
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
@@ -1086,7 +1178,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::optional<int> steps;
   std::string lora;
   std::optional<double> lora_strength;
-  int interpolate = 1;
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
   bool preset_explicit = false;
   int audio_reference_frame = 0;
   const json::Value* guide_keyframes = nullptr;
@@ -1095,6 +1188,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
                                      "output_format", "selected_frame", "steps",
                                      "lora", "lora_strength", "interpolate",
+                                     "upscale",
                                      "keyframes", "audio_reference_frame"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
@@ -1162,10 +1256,21 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     if (extension->contains("interpolate")) {
       const auto parsed = JsonInterpolate(extension->find("interpolate"));
       if (!parsed.has_value()) {
-        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
                      "invalid_interpolate");
       }
       interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
     }
     if (extension->contains("keyframes")) {
       guide_keyframes = extension->find("keyframes");
@@ -1415,7 +1520,10 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .lora = lora,
       .lora_strength = lora_strength,
       .steps_explicit = steps.has_value(),
-      .interpolate = interpolate,
+      .interpolate = interpolate.multiplier,
+      .interpolate_fps_num = interpolate.fps_num,
+      .interpolate_fps_den = interpolate.fps_den,
+      .upscale = std::move(upscale),
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

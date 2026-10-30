@@ -635,7 +635,11 @@ then terminates every worker and exits 0.
 `gufo serve video --rife-model rife49.safetensors` adds RIFE frame
 interpolation of the finished video: `"gufo": {"interpolate": 4}` on
 `POST /v1/videos` (H3 and Wan 2.2) returns 4x the frame rate at the same
-speed with the audio kept. See [RIFE](models/rife/README.md).
+speed with the audio kept; `"interpolate": {"fps": 60}` resamples to a
+target rate instead (24 or 16 fps -> 60 fps). See [RIFE](models/rife/README.md).
+`--upscale-model realesr-animevideov3.safetensors` adds Real-ESRGAN upscaling
+after it: `"gufo": {"upscale": {"width": 1920, "height": 1200}}`. See
+[Real-ESRGAN](models/realesrgan/README.md).
 
 Use `gufo serve image --model SNAPSHOT_DIR` for
 [Qwen-Image-2.1](models/qwen-image-2.1/README.md). Generation accepts JSON;

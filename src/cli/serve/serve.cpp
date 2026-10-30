@@ -52,6 +52,7 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/serve/video_rife.hpp"
+#include "src/cli/serve/video_upscale.hpp"
 #include "src/cli/video/video.hpp"
 #include "src/models/moss_image/model.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
@@ -685,8 +686,18 @@ void PrintServeHelp(std::string_view program_name,
                      "Model", &video_vision_projector);
     std::filesystem::path video_rife_model;
     parser.AddOption("", "--rife-model", "SAFETENSORS",
-                     "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}",
+                     "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N "
+                     "or {\"fps\":N}}",
                      "Model", &video_rife_model);
+    parser.AddCustomOption(
+        "", "--upscale-model", "[NAME=]SAFETENSORS",
+        "Real-ESRGAN SRVGGNetCompact weights (converted); enables "
+        "\"gufo\":{\"upscale\":{\"width\",\"height\",\"fit\",\"model\"}}; "
+        "NAME defaults to the file stem; repeatable, the first is the "
+        "default",
+        "Model", [](std::string_view, std::string_view, std::string*) {
+          return true;
+        });
     std::size_t video_recycle_rows = kDefaultH3RecycleRows;
     parser.AddOption("", "--recycle-rows", "N",
                      "MiniMax H3: exit the worker after a completed job with "
@@ -1309,8 +1320,40 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path video_rife_model;
     video_parser.AddOption(
         "", "--rife-model", "SAFETENSORS",
-        "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N}", "Model",
-        &video_rife_model);
+        "RIFE 4.7 weights; enables \"gufo\":{\"interpolate\":N or "
+        "{\"fps\":N}}",
+        "Model", &video_rife_model);
+    std::vector<std::pair<std::string, std::filesystem::path>>
+        video_upscale_models;
+    video_parser.AddCustomOption(
+        "", "--upscale-model", "[NAME=]SAFETENSORS",
+        "Real-ESRGAN SRVGGNetCompact weights (converted); enables "
+        "\"gufo\":{\"upscale\":{\"width\",\"height\",\"fit\",\"model\"}}; "
+        "NAME defaults to the file stem; repeatable, the first is the "
+        "default",
+        "Model",
+        [&video_upscale_models](std::string_view, std::string_view value,
+                                std::string* error) {
+          const std::size_t equals = value.find('=');
+          std::filesystem::path path(std::string(
+              equals == std::string_view::npos ? value
+                                               : value.substr(equals + 1)));
+          std::string name = equals == std::string_view::npos
+                                 ? path.stem().string()
+                                 : std::string(value.substr(0, equals));
+          if (name.empty() || path.empty()) {
+            *error = "--upscale-model expects [NAME=]SAFETENSORS";
+            return false;
+          }
+          for (const auto& [known, unused] : video_upscale_models) {
+            if (known == name) {
+              *error = "--upscale-model name '" + name + "' is repeated";
+              return false;
+            }
+          }
+          video_upscale_models.emplace_back(std::move(name), std::move(path));
+          return true;
+        });
     std::size_t video_recycle_rows = kDefaultH3RecycleRows;
     video_parser.AddOption(
         "", "--recycle-rows", "N",
@@ -1359,17 +1402,49 @@ int RunServe(std::span<const char* const> args) {
                 << video_rife_model.string() << "\n";
       return 2;
     }
+    for (const auto& [name, path] : video_upscale_models) {
+      if (!std::filesystem::is_regular_file(path)) {
+        std::cerr << "Error: --upscale-model file not found: " << path.string()
+                  << "\n";
+        return 2;
+      }
+    }
+    decltype(server::VideoJobServiceOptions::upscaler) video_upscaler;
+    std::vector<std::string> video_upscale_names;
+    if (!video_upscale_models.empty()) {
+      for (const auto& [name, path] : video_upscale_models) {
+        video_upscale_names.push_back(name);
+      }
+      video_upscaler =
+          [video_upscale_models](
+              const std::filesystem::path& input,
+              const std::filesystem::path& output,
+              const server::VideoUpscale& spec,
+              const minimax_h3::CancellationToken* cancellation,
+              minimax_h3::GenerationProgress progress, void* opaque,
+              std::string* error) {
+            std::filesystem::path weights = video_upscale_models.front().second;
+            for (const auto& [name, path] : video_upscale_models) {
+              if (name == spec.model) {
+                weights = path;
+              }
+            }
+            return server::RunRealEsrganUpscale(weights, input, output, spec,
+                                                cancellation, progress, opaque,
+                                                error);
+          };
+    }
     decltype(server::VideoJobServiceOptions::interpolator) video_interpolator;
     if (!video_rife_model.empty()) {
       video_interpolator =
           [video_rife_model](const std::filesystem::path& input,
                              const std::filesystem::path& output,
-                             int multiplier,
+                             const server::VideoInterpolation& spec,
                              const minimax_h3::CancellationToken* cancellation,
                              minimax_h3::GenerationProgress progress,
                              void* opaque, std::string* error) {
             return server::RunRifeInterpolation(video_rife_model, input, output,
-                                                multiplier, cancellation,
+                                                spec, cancellation,
                                                 progress, opaque, error);
           };
     }
@@ -1401,6 +1476,8 @@ int RunServe(std::span<const char* const> args) {
             .loras = std::move(video_loras),
             .vision_projector = video_vision_projector,
             .interpolator = std::move(video_interpolator),
+            .upscaler = std::move(video_upscaler),
+            .upscale_models = std::move(video_upscale_names),
             .recycle_rows = wan22 ? 0 : video_recycle_rows,
             .recycle = RecycleVideoWorker,
         });
@@ -1416,7 +1493,9 @@ int RunServe(std::span<const char* const> args) {
     load_log.Complete("model=" + video_jobs->model_id() +
                           " sessions=1 queue_capacity=1 weights=lazy loras=" +
                           std::to_string(video_loras.size()) +
-                          " rife=" + (video_rife_model.empty() ? "off" : "on"),
+                          " rife=" + (video_rife_model.empty() ? "off" : "on") +
+                          " upscale=" +
+                          std::to_string(video_upscale_models.size()),
                       false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";

@@ -13,6 +13,7 @@
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
 #include "src/cli/video/video_interpolate.hpp"
+#include "src/cli/video/video_upscale.hpp"
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -46,6 +47,7 @@ void print_help(std::string_view program_name) {
       << "  eval           Evaluate an OpenAI-compatible text server\n"
       << "  video          Generate MiniMax H3 text-to-video\n"
       << "  video-interpolate  RIFE frame interpolation of an MP4\n"
+      << "  video-upscale  Real-ESRGAN upscaling of an MP4 or image\n"
       << "  transcribe     Transcribe WAV audio with Qwen3-ASR-1.7B\n"
       << "  diagnose       Inspect system hardware, memory, and drivers\n"
       << "  help           Print help for a specific command\n\n"
@@ -115,6 +117,9 @@ int run(std::span<const char* const> args) {
     if (sub == "video-interpolate") {
       return gufo::cli::RunVideoInterpolate(help_flag);
     }
+    if (sub == "video-upscale") {
+      return gufo::cli::RunVideoUpscale(help_flag);
+    }
     if (sub == "transcribe") {
       return gufo::cli::RunTranscribe(help_flag);
     }
@@ -160,6 +165,10 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "video-interpolate") {
     return gufo::cli::RunVideoInterpolate(options.subspan(1));
+  }
+
+  if (first_arg == "video-upscale") {
+    return gufo::cli::RunVideoUpscale(options.subspan(1));
   }
 
   if (first_arg == "transcribe") {

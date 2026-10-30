@@ -78,6 +78,29 @@ inline constexpr std::string_view kWan21Preset = "wan21";
 [[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
                                   int* height);
 
+// RIFE post-processing of a finished MP4 ("gufo.interpolate"): a whole-number
+// multiplier (frames (n - 1) * m + 1 at m times the rate) or, when fps_num >
+// 0, a target frame rate at the same speed (e.g. 60 from 24 or 16 fps).
+struct VideoInterpolation {
+  int multiplier{1};  // 1 = off, 2..8
+  int fps_num{0};     // > 0 replaces the multiplier
+  int fps_den{1};
+  [[nodiscard]] bool enabled() const { return fps_num > 0 || multiplier > 1; }
+};
+
+// Real-ESRGAN post-processing of a finished MP4 ("gufo.upscale"), after any
+// interpolation: every frame upscaled into width x height (both even), the
+// picture fitted by `fit` ("pad": keep the aspect ratio with black bars,
+// "crop": keep it and centre-crop, "stretch").
+struct VideoUpscale {
+  int width{0};  // 0 = off
+  int height{0};
+  std::string fit{"pad"};
+  // A name registered with --upscale-model; empty: the first registered.
+  std::string model;
+  [[nodiscard]] bool enabled() const { return width > 0 || height > 0; }
+};
+
 struct VideoJobRequest {
   std::string model{"minimax-h3"};
   std::string prompt;
@@ -102,13 +125,19 @@ struct VideoJobRequest {
   std::vector<std::uint8_t> first_frame;
   std::string negative_prompt;
   double guidance{5.0};
-  // RIFE frame multiplier for the finished MP4 (1 = off, 2..8); needs
+  // RIFE frame multiplier for the finished MP4 (1 = off, 2..8) or, when
+  // interpolate_fps_num > 0, its target frame rate; needs
   // VideoJobServiceOptions::interpolator.
   int interpolate{1};
   // Wan 2.1 camera: the "gufo.camera" object as JSON (type/amount/speed/ease
   // or poses), and an uploaded guide video (MP4 bytes) instead.
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
+  int interpolate_fps_num{0};
+  int interpolate_fps_den{1};
+  // Upscaling of the finished (interpolated) MP4; needs
+  // VideoJobServiceOptions::upscaler.
+  VideoUpscale upscale;
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).
@@ -159,12 +188,23 @@ struct VideoJobServiceOptions {
   std::map<std::string, VideoLora, std::less<>> loras;
   // Qwen3-VL vision tower for keyframe prompt blocks; empty disables them.
   std::filesystem::path vision_projector;
-  // Frame interpolation of a finished MP4 (input, output, multiplier); empty
-  // rejects requests with interpolate > 1. Progress phase "interpolate".
+  // Frame interpolation of a finished MP4 (input, output, multiplier or
+  // target rate); empty rejects interpolation requests. Progress phase
+  // "interpolate".
   std::function<bool(const std::filesystem::path&, const std::filesystem::path&,
-                     int, const minimax_h3::CancellationToken*,
+                     const VideoInterpolation&,
+                     const minimax_h3::CancellationToken*,
                      minimax_h3::GenerationProgress, void*, std::string*)>
       interpolator;
+  // Upscaling of a finished MP4 after any interpolation (input, output,
+  // request); empty rejects upscale requests. `upscale_models` lists the
+  // accepted model names (the first is the default). Progress phase
+  // "upscale".
+  std::function<bool(const std::filesystem::path&, const std::filesystem::path&,
+                     const VideoUpscale&, const minimax_h3::CancellationToken*,
+                     minimax_h3::GenerationProgress, void*, std::string*)>
+      upscaler;
+  std::vector<std::string> upscale_models;
   // MiniMax H3 worker recycling. After a large job the process keeps GPU
   // memory that a following large job (e.g. 832x512, 124 frames) cannot do
   // without, and that job fails with a device fault. When a completed job's

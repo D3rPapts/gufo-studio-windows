@@ -437,6 +437,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
   src/cli/serve/music_api.cpp
+  src/cli/serve/video_upscale.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -464,6 +465,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_http PUBLIC gufo_rife)
   # ACE-Step 1.5 behind `gufo serve music` (src/models/ace_step).
   target_link_libraries(gufo_http PUBLIC gufo_ace_step)
+  # Real-ESRGAN upscaling of finished videos ("gufo":{"upscale":...}).
+  target_link_libraries(gufo_http PUBLIC gufo_realesrgan)
 endif()
 
 add_executable(gufo
@@ -473,6 +476,7 @@ add_executable(gufo
   src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
   src/cli/video/video_interpolate.cpp
+  src/cli/video/video_upscale.cpp
   src/cli/serve/serve.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/continuation_disk_store.cpp
@@ -1551,3 +1555,4 @@ add_subdirectory(src/models/rife)
 
 # ACE-Step 1.5 XL turbo (music): text encoder, DiT, VAE and gufo-ace-check.
 add_subdirectory(src/models/ace_step)
+add_subdirectory(src/models/realesrgan)

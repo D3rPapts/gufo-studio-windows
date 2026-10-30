@@ -29,6 +29,7 @@ struct Options {
   int multiplier{2};
   float scale{1.0F};
   std::string fps;
+  std::string target_fps;
   bool no_audio{false};
   bool fp32{false};
   std::filesystem::path reference;
@@ -240,6 +241,11 @@ int RunVideoInterpolate(std::span<const char* const> args) {
                    "Output frame rate (default: input rate x multiplier; any "
                    "other rate is slow/fast motion without audio)",
                    "Interpolation", &options.fps);
+  parser.AddOption("", "--target-fps", "N[/D]",
+                   "Resample to this frame rate at the same speed (e.g. 60 "
+                   "from 24 or 16 fps; RIFE at each output frame's time, "
+                   "audio kept); replaces --multiplier and --fps",
+                   "Interpolation", &options.target_fps);
   parser.AddFlag("", "--no-audio", "Drop the audio track", "Interpolation",
                  &options.no_audio);
   parser.AddFlag("", "--fp32", "FP32 direct convolutions (validation)",
@@ -279,6 +285,13 @@ int RunVideoInterpolate(std::span<const char* const> args) {
     std::cerr << "Error: --fps must be N or N/D\n";
     return 2;
   }
+  if (!options.target_fps.empty() &&
+      (!options.fps.empty() || !ParseFps(options.target_fps,
+                                         &run.target_fps_num,
+                                         &run.target_fps_den))) {
+    std::cerr << "Error: --target-fps must be N or N/D (without --fps)\n";
+    return 2;
+  }
   auto interpolator = rife::Interpolator::Load(
       options.model,
       options.fp32 ? rife::Precision::kFp32 : rife::Precision::kFp16, &error);
@@ -315,7 +328,7 @@ int RunVideoInterpolate(std::span<const char* const> args) {
     std::cerr << "Error: " << error << "\n";
     return 1;
   }
-  const int created = stats.output_frames - stats.input_frames;
+  const int created = stats.interpolated_frames;
   std::cout << std::fixed << std::setprecision(2) << stats.input_frames
             << " -> " << stats.output_frames << " frames at " << stats.fps_num
             << "/" << stats.fps_den << " fps, " << stats.width << "x"

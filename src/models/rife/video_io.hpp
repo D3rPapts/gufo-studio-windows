@@ -42,9 +42,10 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-/// Encodes RGB24 frames to H.264 MP4 (CRF 18, yuv420p) through FFmpeg's
-/// stdin. When `audio_source` is not empty its first audio stream is copied
-/// unchanged. The file appears at `path` only after FFmpeg succeeded.
+/// Encodes RGB24 frames to H.264 MP4 (CRF 18 unless SetCrf, yuv420p) through
+/// FFmpeg's stdin. When `audio_source` is not empty its first audio stream is
+/// copied unchanged. A `path` ending in ".png" writes the first frame as a
+/// PNG instead. The file appears at `path` only after FFmpeg succeeded.
 class FrameWriter {
 public:
   FrameWriter();
@@ -56,6 +57,8 @@ public:
             int fps_num, int fps_den, const std::filesystem::path& audio_source,
             std::string* error);
   bool Write(const std::uint8_t* rgb24, std::string* error);
+  /// H.264 constant rate factor (0..51) for the next Open.
+  void SetCrf(int crf);
   /// Closes FFmpeg's input, waits and publishes the file.
   bool Finish(std::string* error);
   /// Kills FFmpeg and removes the partial file.

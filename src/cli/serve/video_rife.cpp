@@ -8,7 +8,8 @@ namespace gufo::server {
 
 bool RunRifeInterpolation(const std::filesystem::path& weights,
                           const std::filesystem::path& input,
-                          const std::filesystem::path& output, int multiplier,
+                          const std::filesystem::path& output,
+                          const VideoInterpolation& spec,
                           const minimax_h3::CancellationToken* cancellation,
                           minimax_h3::GenerationProgress progress,
                           void* progress_opaque, std::string* error) {
@@ -21,7 +22,9 @@ bool RunRifeInterpolation(const std::filesystem::path& weights,
   if (!interpolator)
     return false;
   rife::InterpolateVideoOptions options;
-  options.multiplier = multiplier;
+  options.multiplier = spec.multiplier;
+  options.target_fps_num = spec.fps_num;
+  options.target_fps_den = spec.fps_den;
   options.progress = [&](int done, int total) {
     if (progress != nullptr)
       progress("interpolate", done, total, progress_opaque);
@@ -35,7 +38,7 @@ bool RunRifeInterpolation(const std::filesystem::path& weights,
   (void)weights;
   (void)input;
   (void)output;
-  (void)multiplier;
+  (void)spec;
   (void)cancellation;
   (void)progress;
   (void)progress_opaque;

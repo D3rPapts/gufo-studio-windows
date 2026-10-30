@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <string_view>
@@ -226,6 +227,14 @@ bool ParseInt(std::string_view text, int* out) {
   return ec == std::errc{} && end == text.data() + text.size();
 }
 
+// Single-image output ("*.png", any case) instead of an H.264 MP4.
+bool IsPngPath(const std::filesystem::path& path) {
+  std::string extension = path.extension().string();
+  for (char& c : extension)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return extension == ".png";
+}
+
 }  // namespace
 
 bool ProbeVideo(const std::filesystem::path& path, VideoInfo* info,
@@ -377,9 +386,14 @@ struct FrameWriter::Impl {
   std::filesystem::path path;
   std::filesystem::path partial;
   std::size_t frame_bytes{0};
+  int crf{18};
 };
 
 FrameWriter::FrameWriter() : impl_(std::make_unique<Impl>()) {}
+
+void FrameWriter::SetCrf(int crf) {
+  impl_->crf = crf < 0 ? 0 : (crf > 51 ? 51 : crf);
+}
 FrameWriter::~FrameWriter() {
   Abort();
 }
@@ -389,7 +403,8 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
                        const std::filesystem::path& audio_source,
                        std::string* error) {
   Abort();
-  if ((width & 1) != 0 || (height & 1) != 0) {
+  const bool png = IsPngPath(path);
+  if (!png && ((width & 1) != 0 || (height & 1) != 0)) {
     SetError(error, "H.264 yuv420p output needs an even width and height");
     return false;
   }
@@ -398,7 +413,8 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
   impl_->partial =
       path.parent_path() / (path.filename().wstring() + L".gufo-partial-" +
                             std::to_wstring(GetCurrentProcessId()) + L"-" +
-                            std::to_wstring(sequence.fetch_add(1)) + L".mp4");
+                            std::to_wstring(sequence.fetch_add(1)) +
+                            (png ? L".png" : L".mp4"));
   std::error_code ignored;
   if (!path.parent_path().empty())
     std::filesystem::create_directories(path.parent_path(), ignored);
@@ -424,10 +440,17 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
          {L"-map", L"0:v:0", L"-map", L"1:a:0?", L"-c:a", L"copy"})
       arguments.emplace_back(a);
   }
-  for (const wchar_t* a :
-       {L"-c:v", L"libx264", L"-preset", L"fast", L"-crf", L"18", L"-pix_fmt",
-        L"yuv420p", L"-movflags", L"+faststart"})
-    arguments.emplace_back(a);
+  if (png) {
+    for (const wchar_t* a : {L"-frames:v", L"1", L"-c:v", L"png"})
+      arguments.emplace_back(a);
+  } else {
+    for (const wchar_t* a : {L"-c:v", L"libx264", L"-preset", L"fast", L"-crf"})
+      arguments.emplace_back(a);
+    arguments.push_back(std::to_wstring(impl_->crf));
+    for (const wchar_t* a :
+         {L"-pix_fmt", L"yuv420p", L"-movflags", L"+faststart"})
+      arguments.emplace_back(a);
+  }
   arguments.push_back(impl_->partial.wstring());
   Handle child_end;
   if (!CreateChildPipe(true, &impl_->pipe, &child_end, error))
