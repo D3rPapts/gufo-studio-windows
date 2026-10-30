@@ -8,6 +8,11 @@
 // /history/{id}, /view?filename=.., /queue, /upload/image, /free,
 // /interrupt, /system_stats, /object_info and the /ws progress socket.
 //
+// Live previews: while a /ws client of the prompt is connected, the running
+// image or video task's newest worker preview (/v1/previews) goes to it as
+// a binary frame (type 4 with node metadata for clients that announced
+// supports_preview_metadata, otherwise type 1), like a KSampler preview.
+//
 // Files live below DIR: input/ (uploads), output/ (Save* nodes), temp/
 // (Preview* nodes and work files) and history.json (finished prompts).
 
@@ -24,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -53,6 +59,8 @@ struct AdapterOptions {
   /// POST /free: unloads idle workers. Optional.
   std::function<void()> unload;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// Preview poll interval while a /ws client watches.
+  std::chrono::milliseconds preview_poll{std::chrono::milliseconds(400)};
   std::size_t history_limit{2000};
 };
 
@@ -120,6 +128,14 @@ private:
                    std::string content_type);
 
   void Emit(const std::string& client, std::string_view type, json::Value data);
+  /// Polls the worker preview `preview_id` until `stop`, while a socket of
+  /// the job's client is open, and forwards new ones (EmitPreview).
+  void RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
+                     const std::string& preview_id, const std::string& model,
+                     bool image_progress, std::stop_token stop);
+  void EmitPreview(const std::string& client, const std::string& prompt_id,
+                   const std::string& node_id, std::string jpeg);
+  bool WatchedLocked(const std::string& client) const;
   void EmitStatusLocked();
   json::Value QueueItemLocked(const Job& job) const;
   int QueueRemainingLocked() const;
@@ -143,6 +159,17 @@ private:
     std::string text;
   };
   std::deque<Event> events_;
+  /// Open /ws sockets per client id.
+  std::map<std::string, int, std::less<>> sockets_;
+  /// Newest preview per client id ("" = every client).
+  struct Preview {
+    std::uint64_t seq{0};
+    std::string prompt_id;
+    std::string node_id;
+    std::string jpeg;
+  };
+  std::map<std::string, Preview, std::less<>> previews_;
+  std::uint64_t next_preview_{1};
   std::uint64_t next_event_{1};
   std::uint64_t work_counter_{0};
 };

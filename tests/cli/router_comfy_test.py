@@ -60,12 +60,28 @@ def make_wav(seconds=0.25, rate=24000):
 
 # ---------------------------------------------------------------- fake worker
 
+FAKE_JPEG = b"\xff\xd8\xff\xe0fake-preview\xff\xd9"
+
+
+def without_preview(entry):
+    """Logs gufo.preview apart, so the field checks stay as they were."""
+    fields = json.loads(json.dumps(entry["fields"]))
+    gufo = fields.get("gufo")
+    if isinstance(gufo, dict) and "preview" in gufo:
+        entry["preview"] = gufo.pop("preview")
+        if not gufo:
+            del fields["gufo"]
+    entry["fields"] = fields
+    return entry
+
+
 def serve_fake_worker(argv):
     port = int(argv[argv.index("--port") + 1])
     model = argv[argv.index("--served-model-name") + 1]
     log_path = os.environ["COMFY_FAKE_LOG"]
     lock = threading.Lock()
     videos = {}
+    previews = {}  # id -> polls answered
 
     def log(entry):
         entry["model"] = model
@@ -92,9 +108,20 @@ def serve_fake_worker(argv):
             return self.rfile.read(length) if length else b""
 
         def do_GET(self):
-            path = self.path.split("?")[0]
+            path, _, query = self.path.partition("?")
             if path == "/health":
                 return self.send(200, {"status": "ok"})
+            if path.startswith("/v1/previews/"):
+                # Every poll is a newer step of a fake JPEG preview.
+                preview_id = path[len("/v1/previews/"):]
+                with lock:
+                    previews[preview_id] = previews.get(preview_id, 0) + 1
+                    seq = previews[preview_id]
+                log({"path": "/v1/previews", "id": preview_id, "query": query})
+                return self.send(200, {"id": preview_id, "seq": seq, "step": seq,
+                                       "steps": 20, "state": "running",
+                                       "mime": "image/jpeg",
+                                       "data": base64.b64encode(FAKE_JPEG).decode()})
             if path.startswith("/v1/videos/"):
                 rest = path[len("/v1/videos/"):]
                 if rest.endswith("/content"):
@@ -107,6 +134,8 @@ def serve_fake_worker(argv):
             self.send(200, {"deleted": True})
 
         def image_reply(self, fields, size, count):
+            if "SLOW" in fields.get("prompt", ""):
+                time.sleep(2.0)  # long enough for preview polls
             if "FAIL" in fields.get("prompt", ""):
                 return self.send(500, {"error": {"message": "fake failure"}})
             if "OLDGUFO" in fields.get("prompt", "") and "gufo" in fields:
@@ -122,7 +151,7 @@ def serve_fake_worker(argv):
             raw = self.body()
             if path == "/v1/images/generations":
                 fields = json.loads(raw)
-                log({"path": path, "fields": fields})
+                log(without_preview({"path": path, "fields": fields}))
                 return self.image_reply(fields, fields["size"], fields.get("n", 1))
             if path == "/v1/images/edits":
                 message = BytesParser(policy=HTTP).parsebytes(
@@ -140,7 +169,8 @@ def serve_fake_worker(argv):
                         fields[name] = data.decode()
                 if "gufo" in fields:
                     fields["gufo"] = json.loads(fields["gufo"])
-                log({"path": path, "fields": fields, "images": images, "init": init})
+                log(without_preview({"path": path, "fields": fields, "images": images,
+                                     "init": init}))
                 return self.image_reply(fields, fields["size"], int(fields.get("n", 1)))
             if path == "/v1/audio/speech":
                 fields = json.loads(raw)
@@ -389,16 +419,31 @@ class WsClient:
         out, self.buffer = self.buffer[:count], self.buffer[count:]
         return out
 
-    def message(self):
+    def frame(self):
         first, second = self.read(2)
         length = second & 0x7F
         if length == 126:
             length = struct.unpack(">H", self.read(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", self.read(8))[0]
-        payload = self.read(length)
-        assert first & 0x0F == 1, first
-        return json.loads(payload)
+        return first & 0x0F, self.read(length)
+
+    def message(self):
+        while True:
+            opcode, payload = self.frame()
+            if opcode == 2:
+                continue  # previews; see check_previews
+            assert opcode == 1, opcode
+            return json.loads(payload)
+
+    def send_text(self, text):
+        payload, mask = text.encode(), os.urandom(4)
+        head = bytes([0x81])
+        if len(payload) < 126:
+            head += bytes([0x80 | len(payload)])
+        else:
+            head += bytes([0x80 | 126]) + struct.pack(">H", len(payload))
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
     def close(self):
         self.sock.close()
@@ -624,6 +669,83 @@ def check_websocket(router):
     assert "execution_success" in seen, seen
 
 
+def check_previews(router):
+    """Live previews reach /ws clients as ComfyUI binary frames, only while
+    one is connected, and /v1/previews routes through the router."""
+    # Nobody watches: the image request names a preview, nobody polls it.
+    before = len([e for e in router.fake_entries() if e["path"] == "/v1/previews"])
+    router.run(qwen_graph(prompt="SLOW unwatched", prefix="film/stil/unwatched"),
+               client_id="nobody")
+    call = router.fake_entries()[-1]
+    assert call["preview"]["id"].endswith("_6"), call
+    polls = [e for e in router.fake_entries() if e["path"] == "/v1/previews"]
+    assert len(polls) == before, polls[before:]
+
+    # A frontend announcing preview metadata gets type 4 frames.
+    ws = WsClient(router.port, "/ws?clientId=viewer")
+    assert ws.message()["type"] == "status"
+    ws.send_text(json.dumps({"type": "feature_flags",
+                             "data": {"supports_preview_metadata": True}}))
+    reply = ws.message()
+    while reply["type"] == "status":
+        reply = ws.message()
+    assert reply == {"type": "feature_flags",
+                     "data": {"supports_preview_metadata": True}}, reply
+    prompt_id = router.submit(qwen_graph(prompt="SLOW watched", prefix="film/stil/watched"),
+                              client_id="viewer")
+    frames, progress = [], []
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        opcode, payload = ws.frame()
+        if opcode == 2:
+            frames.append(payload)
+            continue
+        message = json.loads(payload)
+        if message["data"].get("prompt_id") != prompt_id:
+            continue
+        if message["type"] == "progress":
+            progress.append(message["data"])
+        if message["type"] == "executing" and message["data"]["node"] is None:
+            break
+    ws.close()
+    assert frames, "no preview frames"
+    for frame in frames:
+        kind, length = struct.unpack(">II", frame[:8])
+        assert kind == 4, kind
+        meta = json.loads(frame[8:8 + length])
+        assert meta["prompt_id"] == prompt_id and meta["node_id"] == "6", meta
+        assert meta["display_node_id"] == "6" and meta["image_type"] == "image/jpeg", meta
+        assert frame[8 + length:] == FAKE_JPEG
+    assert progress and progress[0]["node"] == "6" and progress[0]["max"] == 20, progress
+    preview_id = [e for e in router.fake_entries() if e.get("path") == "/v1/images/generations"][-1]["preview"]["id"]
+
+    # A client without feature flags gets plain type 1 frames.
+    ws = WsClient(router.port, "/ws?clientId=plain")
+    assert ws.message()["type"] == "status"
+    prompt_id = router.submit(qwen_graph(prompt="SLOW plain", prefix="film/stil/plain"),
+                              client_id="plain")
+    frames = []
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        opcode, payload = ws.frame()
+        if opcode == 2:
+            frames.append(payload)
+            continue
+        message = json.loads(payload)
+        if (message["data"].get("prompt_id") == prompt_id and message["type"] == "executing"
+                and message["data"]["node"] is None):
+            break
+    ws.close()
+    assert frames and all(f[:8] == struct.pack(">II", 1, 1) and f[8:] == FAKE_JPEG
+                          for f in frames), frames[:2]
+
+    # Plain HTTP for pages: the router asks the loaded image worker.
+    status, body = router.json("GET", "/v1/previews/%s?model=qwen-image-2.1&format=json" % preview_id)
+    assert status == 200 and body["id"] == preview_id, (status, body)
+    status, body = router.json("GET", "/v1/previews/unknown-id")
+    assert status == 404 and body["error"]["code"] == "preview_not_found", body
+
+
 def check_queue_history_free(router):
     status, _ = router.request("POST", "/interrupt", b"")
     assert status == 200
@@ -663,6 +785,7 @@ def main():
         check_video(router, bool(ffmpeg))
         check_errors(router)
         check_websocket(router)
+        check_previews(router)
         remaining = check_queue_history_free(router)
     except BaseException:
         print(router.tail())

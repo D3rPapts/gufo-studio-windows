@@ -595,6 +595,8 @@ public:
       return Err(405, "Method Not Allowed", "method is not allowed",
                  "invalid_request_error", "method_not_allowed");
     }
+    if (req.path.starts_with("/v1/previews/"))
+      return PreviewLocked(req, lock);
     const Resolution resolution = ResolveModel(req);
     if (resolution.missing) {
       return Err(400, "Bad Request", "missing 'model' field",
@@ -734,6 +736,34 @@ public:
     }
     busy->Release();
     return response;
+  }
+
+  /// Live previews (/v1/previews/{id}[/events]) of a running image or video
+  /// job: the model comes from `?model=` or, for a video job, its owner.
+  /// Only a loaded worker is asked; a preview never starts or keeps one.
+  HttpResponse PreviewLocked(const HttpRequest& req,
+                             std::unique_lock<std::mutex>& lock) {
+    std::string model_id = req.query_param("model");
+    if (model_id.empty()) {
+      std::string_view id(req.path);
+      id.remove_prefix(std::string_view("/v1/previews/").size());
+      if (id.ends_with("/events"))
+        id.remove_suffix(std::string_view("/events").size());
+      model_id = registry.JobOwner(id);
+    }
+    const auto worker = model_id.empty() || !LoadedLocked(model_id)
+                            ? nullptr
+                            : FindWorkerLocked(model_id);
+    if (worker == nullptr)
+      return Err(404, "Not Found",
+                 "no loaded image or video model runs this preview "
+                 "(pass ?model= for images)",
+                 "invalid_request_error", "preview_not_found");
+    router::UpstreamTarget target;
+    target.host = "127.0.0.1";
+    target.port = worker->port();
+    lock.unlock();
+    return router::ProxyToWorker(target, req);
   }
 
   /// Stops every loaded worker that serves no request (ComfyUI /free).
