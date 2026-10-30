@@ -784,6 +784,10 @@ Model::Model(const std::filesystem::path& root)
     : impl_(std::make_unique<Impl>(root)) {}
 Model::~Model() = default;
 
+const SamplingConfig& Model::sampling() const {
+  return impl_->weights.Sampling();
+}
+
 std::vector<std::uint32_t> Model::Tokenize(std::string_view text) const {
   return impl_->tokenizer.Encode(text);
 }
@@ -792,6 +796,7 @@ Result Model::Generate(const Request& request,
                        const CancellationCheck& cancelled,
                        const Observer& observer) {
   ValidateRequest(request);
+  const int steps = sampling().ResolveSteps(request.steps);
   std::unique_lock lock(impl_->mutex);
   if (DeviceLost())
     throw std::runtime_error("Qwen-Image GPU context lost; restart the server");
@@ -918,8 +923,15 @@ Result Model::Generate(const Request& request,
     auto latent = rt.Upload(noise, height * width, 64);
     rt.Observe(observer, "noise", latent);
     const auto denoise_start = Clock::now();
+    // Turbo uses its checkpoint schedule; partial-strength img2img keeps
+    // the base model's KSampler-style truncated schedule.
+    if (sampling().IsTurbo() && img2img)
+      throw std::invalid_argument(
+          "Qwen-Image-2.1-Turbo does not support partial-strength img2img");
     const auto sigmas =
-        DenoiseSigmas(request.steps, request.strength, height * width);
+        sampling().IsTurbo()
+            ? sampling().Sigmas(steps, height * width)
+            : DenoiseSigmas(steps, request.strength, height * width);
     if (observer.Wants("sigmas"))
       observer.write("sigmas", sigmas, 1, static_cast<int>(sigmas.size()));
     if (img2img) {
@@ -933,7 +945,7 @@ Result Model::Generate(const Request& request,
         Prefill(rt, *negative_context, sigmas[0], cancelled);
       report("prefilled");
     }
-    for (int step = 0; step < request.steps; ++step) {
+    for (int step = 0; step < steps; ++step) {
       if (large)
         GuardMemory(step);
       auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
@@ -949,7 +961,7 @@ Result Model::Generate(const Request& request,
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
-      if (request.preview.Wants(step + 1, request.steps)) {
+      if (request.preview.Wants(step + 1, steps)) {
         // Flow matching: x0 = x_t - sigma_t * v at the step just taken.
         const auto x = rt.Download(latent), v = rt.Download(velocity);
         const float sigma = sigmas[step + 1];
@@ -957,7 +969,7 @@ Result Model::Generate(const Request& request,
         for (std::size_t i = 0; i < x0.size(); ++i)
           x0[i] = x[i] - sigma * v[i];
         request.preview.publish({.step = step + 1,
-                                 .steps = request.steps,
+                                 .steps = steps,
                                  .height = height,
                                  .width = width,
                                  .channels = 64,

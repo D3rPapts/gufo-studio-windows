@@ -257,7 +257,7 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument(
         "image size must be multiples of 32, at most 4096 per side and 4 "
         "megapixels");
-  if (request.steps < 2 || request.steps > 100)
+  if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
     throw std::invalid_argument("image steps must be between 2 and 100");
   if (request.images.size() > 10)
     throw std::invalid_argument(
@@ -320,6 +320,26 @@ std::vector<float> DenoiseSigmas(int steps, double strength, int image_tokens) {
   auto sigmas = Schedule(total, image_tokens);
   sigmas.erase(sigmas.begin(), sigmas.end() - (steps + 1));
   return sigmas;
+}
+
+int SamplingConfig::ResolveSteps(int requested) const {
+  const int steps = requested == 0 ? DefaultSteps() : requested;
+  if (IsTurbo() && steps != 8)
+    throw std::invalid_argument(
+        "Qwen-Image-2.1-Turbo requires its fixed eight-step schedule");
+  if (steps < 2 || steps > 100)
+    throw std::invalid_argument("image steps must be between 2 and 100");
+  return steps;
+}
+
+std::vector<float> SamplingConfig::Sigmas(int requested,
+                                          int image_tokens) const {
+  const int steps = ResolveSteps(requested);
+  if (!IsTurbo())
+    return FlowSigmas(steps, image_tokens);
+  auto result = sample_sigmas;
+  result.push_back(0);
+  return result;
 }
 
 }  // namespace gufo::models::qwen_image_21
