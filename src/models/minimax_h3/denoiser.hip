@@ -2072,6 +2072,8 @@ bool DenoiserSession::DenoiseWithProgress(
     return false;
   }
   double sampler_ms = 0.0;
+  double preview_ms = 0.0;
+  int previews = 0;
   bool have_velocity = false;
   for (int step = 0; step < impl_->schedule.evaluations(); ++step) {
     const EulerStepPlan& plan =
@@ -2114,10 +2116,13 @@ bool DenoiserSession::DenoiseWithProgress(
     const void* previous_audio = impl_->reuse_interval > 1
                                      ? impl_->previous_audio_velocity_f32.data()
                                      : impl_->audio_velocity_f32.data();
-    if (impl_->preview.Wants(step + 1, impl_->schedule.evaluations()) &&
+    // A reused step (no new velocity) would show the previous estimate again.
+    if (plan.evaluate &&
+        impl_->preview.Wants(step + 1, impl_->schedule.evaluations()) &&
         impl_->video_velocity_f32.bytes() == impl_->video_sample.bytes()) {
       // Denoised estimate as the Euler kernel forms it (without the
       // velocity extrapolation of reused steps), read before the update.
+      const auto preview_begin = Clock::now();
       const std::size_t count = impl_->video_sample.bytes() / sizeof(float);
       std::vector<float> sample(count), velocity(count), latent(count);
       if (!impl_->CopyAsync(sample.data(), impl_->video_sample.data(),
@@ -2149,6 +2154,8 @@ bool DenoiserSession::DenoiseWithProgress(
              .channels = static_cast<int>(kH3VideoLatentChannels),
              .channel_major = true,
              .data = latent});
+      preview_ms += Milliseconds(preview_begin, Clock::now());
+      ++previews;
     }
     const auto sampler_begin = Clock::now();
     if (!HipEulerUpdate(impl_->video_sample.data(),
@@ -2213,6 +2220,8 @@ bool DenoiserSession::DenoiseWithProgress(
     return false;
   }
   impl_->base_telemetry.sampler_ms = sampler_ms;
+  impl_->base_telemetry.preview_ms = preview_ms;
+  impl_->base_telemetry.previews = previews;
   const Faults faults_after = ReadFaults();
   impl_->base_telemetry.minor_page_faults +=
       faults_after.minor - faults_before.minor;

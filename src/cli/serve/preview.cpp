@@ -333,6 +333,7 @@ std::string ParsePreviewRequest(const json::Value& object,
       options->always = value.as_bool();
     } else if (name == "every") {
       options->every = integer(1, 100);
+      options->dense_up_to = 0;
     } else if (name == "max_side") {
       options->max_side = integer(32, 1024);
     } else if (name == "method") {
@@ -354,9 +355,15 @@ struct PreviewHub::Job {
   Clock::time_point watched_until{};
   int streams{0};
   Clock::time_point touched{Clock::now()};
-  // One queued latent at a time: a step that finds the previous preview
-  // still encoding skips its own (no read-back, no copy).
+  // At most one latent waits for the encoder: a step that finds one still
+  // waiting skips its own (no read-back, no copy). The encoder takes it off
+  // the queue before encoding, so the next step may already queue one.
   bool queued{false};
+  // Earliest step of the next preview: `every` steps after the last one.
+  // Counting from the last preview (instead of step % every) keeps the
+  // cadence when a model skips steps that would repeat the previous
+  // estimate (MiniMax H3's reused steps).
+  int next_step{0};
   models::LatentPreview pending;
   std::vector<float> pending_data;
   Snapshot snapshot;
@@ -452,6 +459,7 @@ models::PreviewHook PreviewHub::Begin(const std::string& id,
     job->options = options;
     job->started = true;
     job->queued = false;
+    job->next_step = 0;
     job->touched = Clock::now();
     job->snapshot.state = "running";
     job->snapshot.steps = 0;
@@ -461,21 +469,26 @@ models::PreviewHook PreviewHub::Begin(const std::string& id,
   state_->changed.notify_all();
   State* state = state_.get();
   models::PreviewHook hook;
-  hook.wanted = [state, job](int step, int steps) {
+  const auto every = [job](int steps) {
+    return steps <= job->options.dense_up_to ? 1 : job->options.every;
+  };
+  hook.wanted = [state, job, every](int step, int steps) {
     // The final step's image follows anyway.
-    if (step >= steps || step % job->options.every != 0)
+    if (step >= steps || step < every(steps))
       return false;
     const std::lock_guard lock(state->mutex);
-    if (job->queued || job->snapshot.state != "running")
+    if (step < job->next_step || job->queued ||
+        job->snapshot.state != "running")
       return false;
     return job->options.always || job->streams > 0 ||
            Clock::now() < job->watched_until;
   };
-  hook.publish = [state, job](const models::LatentPreview& latent) {
+  hook.publish = [state, job, every](const models::LatentPreview& latent) {
     {
       const std::lock_guard lock(state->mutex);
       if (job->queued || state->stopping)
         return;
+      job->next_step = latent.step + every(latent.steps);
       job->pending = latent;
       job->pending_data.assign(latent.data.begin(), latent.data.end());
       job->pending.data = job->pending_data;
@@ -512,6 +525,7 @@ bool PreviewHub::EncodePending() {
       return false;
     job = std::move(state_->queue.front());
     state_->queue.pop_front();
+    job->queued = false;
     latent = job->pending;
     data = std::move(job->pending_data);
     latent.data = data;
@@ -549,7 +563,6 @@ bool PreviewHub::EncodePending() {
       std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
   {
     const std::lock_guard lock(state_->mutex);
-    job->queued = false;
     if (!update.mime.empty()) {
       auto& snapshot = job->snapshot;
       ++snapshot.seq;

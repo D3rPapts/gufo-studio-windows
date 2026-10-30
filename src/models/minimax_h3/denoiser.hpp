@@ -75,6 +75,10 @@ struct DenoiserTelemetry {
   double core_load_ms{0.0};
   std::vector<double> forward_ms;
   double sampler_ms{0.0};
+  // Live preview read-backs: count and time spent in the denoiser loop
+  // (device->host copy, x0 estimate, unpatchify, hand-over).
+  double preview_ms{0.0};
+  int previews{0};
   std::uint64_t core_weight_bytes{0};
   std::uint64_t persistent_bytes{0};
   std::uint64_t scratch_bytes{0};
