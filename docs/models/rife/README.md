@@ -38,6 +38,18 @@ are used. The output rate is the input rate times the multiplier (24 fps x4 =
 96 fps, same speed) and the audio stream is copied. `--fps N[/D]` sets another
 rate (slow or fast motion) and then drops the audio; `--no-audio` drops it
 always. `--scale 0.5` is the node's `scale_factor` for 4K input.
+
+`--target-fps N[/D]` resamples to any frame rate at the same speed, e.g. 60
+fps from H3's 24 or Wan's 16 fps, and keeps the audio. Output frame `j` shows
+time `j / target`, i.e. source position `p = j * in / target` (exact
+rational arithmetic): frames at a whole `p` are copied, the others are RIFE
+at timestep `frac(p)` between frames `floor(p)` and `floor(p) + 1`, and the
+time after the last source frame holds that frame. `n` input frames give
+`ceil(n * target / in)` output frames, so the duration matches the input
+(`n / in` seconds) to within one output frame: 124 frames at 24 fps -> 310
+frames at 60 fps (5.1667 s both); 81 frames at 16 fps -> 304 frames (5.0667 s
+for 5.0625 s). Every source frame is encoded once. The whole-number
+`--multiplier` path is unchanged.
 `gufo-rife` is the same driver as a standalone executable.
 
 Diagnostics: `--fp32` runs direct FP32 convolutions instead of FP16 WMMA,
@@ -54,7 +66,8 @@ PyTorch dump (`manifest.json` with `{pair, t, file}` entries of FP32
 ```
 
 on `POST /v1/videos` (JSON or the multipart `gufo` field). After the
-generation finishes, the MP4 is interpolated (1 = off, 2..8) and
+generation finishes, the MP4 is interpolated (1 = off, 2..8; or
+`{"fps": 60}` / `{"fps": "60000/1001"}` for a target rate, 1..240) and
 `/v1/videos/{id}/content` returns the interpolated video with the generated
 audio. Progress reports phase `interpolate` at 98-99 %. Without
 `--rife-model`, a request with `interpolate > 1` is rejected with 400.
