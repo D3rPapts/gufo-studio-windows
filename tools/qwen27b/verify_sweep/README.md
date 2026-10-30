@@ -6,9 +6,10 @@ projection then runs `SmallBatchKQuantExactFp32GEMMKernel`, and how its work
 is split over waves (waves per block, rows per wave, 16- or 32-lane groups,
 staging tiles) decides how close the GPU gets to its memory bandwidth.
 `src/models/qwen/hip/kernels/verify_gemm_27b.hip` holds the shapes measured
-faster on gfx1151 for Qwen3.8-27B UD-Q4_K_XL and its Q4_K_M DFlash2 draft; any
-projection it does not list keeps the generic `LaunchBatchedQuantGEMMFp32`
-dispatch.
+faster on gfx1151 for Qwen3.8-27B UD-Q4_K_XL and its Q4_K_M DFlash2 draft, one
+table for Linux (ROCm 10.1) and one for Windows (`_WIN32`, TheRock 10.0.0); any
+projection the build's table does not list keeps the generic
+`LaunchBatchedQuantGEMMFp32` dispatch.
 
 A different GGUF, quantization mix, draft setting, GPU or toolchain changes
 which projections and row counts matter, so the shapes have to be measured
@@ -44,8 +45,11 @@ the absolute file offset of the tensor and the GGUF type id (12 Q4_K, 13 Q5_K,
 
 - Weights are the real tensors from the GGUF, read at their file offset.
 - Production is what `LaunchProjection` runs: `TryLaunchVerifyGemm27`, then
-  `LaunchBatchedQuantGEMMFp32`. Every candidate's output is compared bit for
-  bit with production; inexact candidates are reported and never timed.
+  `LaunchBatchedQuantGEMMFp32`. The `generic` candidate is
+  `LaunchBatchedQuantGEMMFp32` alone, the dispatch without any listed shape;
+  where it beats production, the listed shape is a regression and is printed
+  for removal. Every candidate's output is compared bit for bit with
+  production; inexact candidates are reported and never timed.
 - Each launch uses another copy of the weights, enough copies for at least
   512 MiB, so no run reads from the 32 MiB MALL cache. Without that, matrices
   under ~35 MB look faster than the memory allows.
@@ -54,13 +58,15 @@ the absolute file offset of the tensor and the GGUF type id (12 Q4_K, 13 Q5_K,
 
 ## Taking a result over
 
-Add the shape to `verify_gemm_27b.hip` next to the existing ones (the
-`LaunchQ4KTarget`, `LaunchQ6KTarget` and `LaunchFfnShape` blocks show the
-pattern), keyed by type, `m`, `k` and row count. Check the same shape is not
-also used by the DFlash2 draft at that row count with an entry that should
-stay. Then rebuild, confirm greedy output is unchanged end to end and measure
-a real workload: a per-launch gain only matters in proportion to the
-projection's share of the cycle.
+Add the shape to the table of the platform you measured on in
+`verify_gemm_27b.hip` (the `_WIN32` block for Windows) under its format and
+projection, keyed by type, `m`, `k` and row count, only where it beats
+`generic` by the `--min-gain` margin. The target and the DFlash2 draft share some projection
+shapes (the Q4_K FFN and attention matrices), and one entry serves both, so
+sweep both GGUFs and judge a shared shape on both results. Then rebuild,
+rerun the sweep to confirm no listed shape loses to `generic`, confirm greedy
+output is unchanged end to end and measure a real workload: a per-launch gain
+only matters in proportion to the projection's share of the cycle.
 
 ## Limits
 
@@ -68,5 +74,9 @@ projection's share of the cycle.
   drafts) and the formats Q4_K, Q5_K, Q6_K and IQ4_XS.
 - The candidate set is the neighbourhood of shapes picked so far, not an
   exhaustive search.
-- The current shapes were measured on gfx1151 under Windows with TheRock ROCm
-  10.0.0; they have not been measured on Linux.
+- The Linux shapes were measured on gfx1151 with ROCm 10.1, the Windows
+  shapes on gfx1151 with TheRock 10.0.0. The two toolchains favour different
+  shapes: shapes picked under Windows were up to 29% slower than `generic` on
+  Linux (16-lane groups at six to eight rows), and Linux shapes up to 14%
+  slower than `generic` on Windows (IQ4_XS FFN projections at five rows). A
+  new toolchain needs a new sweep.

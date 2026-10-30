@@ -919,14 +919,23 @@ struct TextRunnerPool::Request::Impl {
             position - prefill_offset >= interval &&
             prompt.size() - position > tail &&
             position != snapshot_tokens.size() &&
-            position != stable_prefix_position &&
-            !lease.HasSnapshotFor(
-                std::span<const TextRunnerToken>(prompt).first(position)))
-          checkpoints.push_back(position);
+            position != stable_prefix_position) {
+          if (!lease.HasSnapshotFor(
+                  std::span<const TextRunnerToken>(prompt).first(position)))
+            checkpoints.push_back(position);
+          else
+            prefill_splits.push_back(position);
+        }
       }
     }
+    // A planned point that is already cached (it was captured by an earlier
+    // request, which this one does not reuse) still splits the prefill
+    // there, so the prompt is prefilled in the same pieces as the request
+    // that captured it; another split changes the rounding of the state at
+    // every later boundary (a request after a cancel restores that state).
     if (lease.component())
-      checkpoints = lease.PlannedCaptures(cache_prefix_tokens);
+      checkpoints = lease.PlannedCaptures(cache_prefix_tokens, &prefill_splits);
+    std::ranges::sort(prefill_splits);
   }
 
   ~Impl() {
@@ -1022,7 +1031,9 @@ struct TextRunnerPool::Request::Impl {
     // greedy text after a restore would then differ from an uncached run.
     if (lease.HasSnapshotFor(
             std::span<const TextRunnerToken>(prompt).first(position))) {
-      prefill_splits.push_back(position);
+      if (!std::ranges::binary_search(prefill_splits, position))
+        prefill_splits.insert(std::ranges::upper_bound(prefill_splits, position),
+                              position);
       return;
     }
     checkpoints.insert(std::ranges::upper_bound(checkpoints, position),

@@ -1233,9 +1233,12 @@ void TestInstructionsBoundaryKeepsStableBoundary() {
         second.instructions == first.instructions &&
             second.text.starts_with(first.text.substr(0, first.instructions)),
         "a new question keeps the instructions");
-    // An unchanged retry and the next turn extend the question; keep it.
-    Expect(first.text.compare(first.stable, std::string::npos, generation) == 0,
-           "the stable boundary stays before the generation prompt");
+    // The next request keeps the instructions and replaces the question, so
+    // the stable boundary is the end of the instructions (Windows 27B port).
+    Expect(first.stable == first.instructions &&
+               second.stable == second.instructions,
+           "the stable boundary is the end of the instructions");
+    (void)generation;
   }
   // Without leading instructions, or past the first question, none is set.
   Expect(render({{ChatRole::kUser, "Hello"}}).instructions == 0,
@@ -1272,7 +1275,7 @@ void TestInstructionsBoundaryKeepsStableBoundary() {
       *tokenizer, messages, {}, options, {}, 1024);
   Expect(
       prepared.instructions_tokens != 0 &&
-          prepared.instructions_tokens < prepared.stable_prefix_tokens &&
+          prepared.instructions_tokens == prepared.stable_prefix_tokens &&
           tokenizer->Decode(
               std::span(prepared.tokens).first(prepared.instructions_tokens)) ==
               rendered.text.substr(0, rendered.instructions),

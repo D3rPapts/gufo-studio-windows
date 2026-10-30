@@ -91,8 +91,10 @@ public:
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
+    /// Planned boundaries without a cached snapshot. Those already cached
+    /// go to `cached` when given, so a prefill can still split there.
     [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-        std::size_t stable) const;
+        std::size_t stable, std::vector<std::size_t>* cached = nullptr) const;
 
   private:
     friend class ComponentTextCache;
@@ -171,7 +173,7 @@ public:
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
   [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
+      std::size_t stable, std::vector<std::size_t>* cached = nullptr) const;
 
 private:
   ContinuationCache::Lease legacy_;
