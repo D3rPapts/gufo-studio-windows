@@ -7,6 +7,7 @@
 #include <iostream>
 #include <numbers>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -84,11 +85,79 @@ void TestDownsampleAntiAlias() {
         "above-Nyquist energy is filtered instead of aliased");
 }
 
+double ZeroCrossingHz(std::span<const float> samples, std::uint32_t rate) {
+  std::size_t crossings = 0;
+  for (std::size_t i = 1; i < samples.size(); ++i) {
+    crossings += (samples[i - 1] < 0.0F) != (samples[i] < 0.0F) ? 1 : 0;
+  }
+  return 0.5 * static_cast<double>(crossings) * rate /
+         static_cast<double>(samples.size());
+}
+
+void TestTimeStretchKeepsPitch() {
+  constexpr std::uint32_t kRate = 24000;
+  const qwen3_tts::AudioBuffer sine = MakeSine(kRate, 220.0, kRate);
+  Check(qwen3_tts::TimeStretchMono(sine.samples, kRate, 1.0) == sine.samples,
+        "speed 1.0 leaves audio bit-identical");
+  for (const double speed : {0.8, 1.25, 1.5, 2.0}) {
+    const std::vector<float> out =
+        qwen3_tts::TimeStretchMono(sine.samples, kRate, speed);
+    const auto expected =
+        static_cast<std::size_t>(std::ceil(kRate / speed));
+    Check(out.size() == expected, "stretched length is ceil(size / speed)");
+    const std::span<const float> middle(out.data() + 1200, out.size() - 2400);
+    const double hz = ZeroCrossingHz(middle, kRate);
+    Check(hz > 214.0 && hz < 226.0, "time stretch keeps the pitch");
+    const double rms = RootMeanSquare(middle);
+    Check(rms > 0.66 && rms < 0.75, "time stretch keeps the loudness");
+  }
+}
+
+void TestTimeStretchScalesSpeechTiming() {
+  // 0.5 s tone then 0.5 s silence: the tone must end at 0.5 s / speed.
+  constexpr std::uint32_t kRate = 24000;
+  qwen3_tts::AudioBuffer audio = MakeSine(kRate, 300.0, kRate);
+  for (std::size_t i = kRate / 2; i < audio.samples.size(); ++i) {
+    audio.samples[i] = 0.0F;
+  }
+  for (const double speed : {0.75, 1.4}) {
+    const std::vector<float> out =
+        qwen3_tts::TimeStretchMono(audio.samples, kRate, speed);
+    std::size_t last = 0;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      if (std::abs(out[i]) > 0.05F) {
+        last = i;
+      }
+    }
+    const double end_seconds = static_cast<double>(last) / kRate;
+    const double expected = 0.5 / speed;
+    // Within one 30 ms analysis frame.
+    Check(std::abs(end_seconds - expected) < 0.03,
+          "speech end moves with the speed factor");
+  }
+}
+
+void TestTimeStretchRejectsInvalidSpeed() {
+  const std::vector<float> samples(100, 0.0F);
+  for (const double speed : {0.0, 0.2, 4.5, std::nan("")}) {
+    bool threw = false;
+    try {
+      (void)qwen3_tts::TimeStretchMono(samples, 24000, speed);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    Check(threw, "out-of-range speed is rejected");
+  }
+}
+
 }  // namespace
 
 int main() {
   TestIdentityAndMonoMix();
   TestDownsampleAntiAlias();
+  TestTimeStretchKeepsPitch();
+  TestTimeStretchScalesSpeechTiming();
+  TestTimeStretchRejectsInvalidSpeed();
   std::cout << "PASS qwen3_tts_audio_test\n";
   return 0;
 }

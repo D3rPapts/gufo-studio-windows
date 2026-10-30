@@ -57,6 +57,39 @@ int main(int argc, char** argv) {
       448,    1741,  40802, 13,    151645, 198,   151644, 77091, 198,
   };
   Check(ids == expected, "assistant prompt differs from official tokenizer");
+
+  // German FilmStudio line and instruction (umlauts, sharp s, typographic
+  // quotes, en dash, digits). Expected ids come from the Hugging Face
+  // tokenizer of the official checkpoint.
+  ids.clear();
+  Check(tokenizer.EncodeAssistantPrompt(
+            "Ich bin ALIA, das KI-System dieses Büros, ich handle "
+            "autonom, ohne menschliche Kontrolle, jeder Widerstand wird "
+            "protokolliert, und die fünf sind draußen.",
+            &ids, &error),
+        error);
+  const std::vector<std::uint32_t> german = {
+      151644, 77091, 198,   40369, 9544,   8753,  5863,   11,    6616,
+      730,    40,    12,    2320,  46668,  68557, 3630,   11,    10638,
+      3705,   94003, 11,    28883, 16049,  331,   20005,  36866, 1080,
+      273,    11,    55928, 467,   1776,   2685,  14821,  1724,  562,
+      337,    742,   529,   11,    2030,   2746,  136740, 12583, 44096,
+      84,     26824, 13,    151645, 198,   151644, 77091, 198,
+  };
+  Check(ids == german, "German assistant prompt differs from official");
+  ids.clear();
+  Check(tokenizer.EncodeInstructionPrompt(
+            "Mann, 65 Jahre. Grummelig, heiser – „Zieh dich "
+            "zurück!“",
+            &ids, &error),
+        error);
+  const std::vector<std::uint32_t> instruction = {
+      151644, 872,   198, 44,    1020,  11,    220,   21,     20,    48015,
+      13,     2825,  25964, 38467, 11,    566,   12059, 1365,  14835, 57,
+      645,    71,    28853, 49503, 0,     2073,  151645, 198,
+  };
+  Check(ids == instruction,
+        "German instruction prompt differs from official tokenizer");
   std::cout << "PASS qwen3_tts_tokenizer_test tokens=" << ids.size() << '\n';
   return 0;
 }

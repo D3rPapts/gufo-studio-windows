@@ -355,7 +355,42 @@ void TestValidationAndVoices() {
            R"({"model":"qwen3-tts","input":"x","voice":"vivian","typo":true})")
               .status == 400,
       "unknown fields fail closed");
+  for (const char* speed : {"0.2", "4.5", "\"fast\""}) {
+    Check(Send(service, "POST", "/v1/audio/speech",
+               std::string(R"({"model":"qwen3-tts","input":"x","voice":"vivian","speed":)") +
+                   speed + "}")
+                  .status == 400,
+          "out-of-range speed fails closed");
+  }
+  Check(
+      Send(
+          service, "POST", "/v1/audio/speech",
+          R"({"model":"qwen3-tts","input":"x","voice":"vivian","speed":1.5,"response_format":"pcm"})")
+              .status == 400,
+      "speed needs the buffered WAV response");
   Check(runner.calls == 0, "invalid requests never invoke inference");
+}
+
+void TestSpeed() {
+  FakeRunner runner;
+  TtsService service = MakeService(&runner);
+  // The fake model returns 5 samples: 44-byte header + 2 bytes per sample.
+  const HttpResponse normal = Send(
+      service, "POST", "/v1/audio/speech",
+      R"({"model":"qwen3-tts","input":"x","voice":"vivian","speed":1})");
+  Check(normal.status == 200 && normal.body.size() == 44 + 2 * 5,
+        "speed 1 keeps the model's own rate");
+  const HttpResponse faster = Send(
+      service, "POST", "/v1/audio/speech",
+      R"({"model":"qwen3-tts","input":"x","voice":"vivian","speed":2.5})");
+  Check(faster.status == 200 && faster.body.size() == 44 + 2 * 2,
+        "speed 2.5 shortens the waveform to ceil(5 / 2.5) samples");
+  const HttpResponse slower = Send(
+      service, "POST", "/v1/audio/speech",
+      R"({"model":"qwen3-tts","input":"x","voice":"vivian","speed":0.5})");
+  Check(slower.status == 200 && slower.body.size() == 44 + 2 * 10,
+        "speed 0.5 doubles the waveform length");
+  Check(runner.calls == 3, "every speed request runs the model once");
 }
 
 void TestVoiceDesignContract() {
@@ -480,6 +515,7 @@ int main() {
   TestStreaming();
   TestQueuedCancellation();
   TestValidationAndVoices();
+  TestSpeed();
   TestVoiceDesignContract();
   TestBaseContract();
   TestInvalidWaveform();

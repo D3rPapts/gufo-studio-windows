@@ -726,7 +726,10 @@ predictor `subtalker_dosample`/`subtalker_temperature`/`subtalker_top_k`/`subtal
 Base additionally accepts `reference_audio`, `reference_text`, `voice_clone_mode`.
 Unknown fields are rejected. `response_format` supports buffered `wav` and
 streaming `pcm`; `stream_format: "sse"` emits OpenAI audio events with base64
-PCM. `speed` supports `1.0` only; input is capped at 16384 UTF-8 bytes and
+PCM. `speed` (0.25--4.0, default 1.0) time-stretches the finished `wav`
+without changing pitch; 1.0 keeps the model's own speaking rate, which varies
+noticeably with the seed. Streaming `pcm` requires
+`speed` 1.0. Input is capped at 16384 UTF-8 bytes and
 `max_new_tokens` at 8192 (default 3000). Output is 24 kHz mono 16-bit PCM.
 
 `GET /v1/audio/speech/stream` upgrades to the vLLM-Omni incremental-text
