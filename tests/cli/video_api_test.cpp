@@ -760,6 +760,97 @@ void TestWan22Options(const std::filesystem::path& root) {
 
 }  // namespace
 
+void TestDelivery(const std::filesystem::path& root) {
+  FakeRunner runner;
+  auto options = Options(root, &runner);
+  std::mutex mutex;
+  std::vector<gufo::server::VideoInterpolation> interpolations;
+  std::vector<gufo::server::VideoUpscale> upscales;
+  const auto copy = [](const std::filesystem::path& in,
+                       const std::filesystem::path& out) {
+    std::error_code ignored;
+    std::filesystem::copy_file(in, out, ignored);
+    return !ignored;
+  };
+  options.interpolator = [&](const std::filesystem::path& in,
+                             const std::filesystem::path& out,
+                             const gufo::server::VideoInterpolation& spec,
+                             const h3::CancellationToken*,
+                             h3::GenerationProgress, void*, std::string*) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    interpolations.push_back(spec);
+    return copy(in, out);
+  };
+  options.upscaler = [&](const std::filesystem::path& in,
+                         const std::filesystem::path& out,
+                         const gufo::server::VideoUpscale& spec,
+                         const h3::CancellationToken*, h3::GenerationProgress,
+                         void*, std::string*) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    upscales.push_back(spec);
+    return copy(in, out);
+  };
+  options.upscale_models = {"anime", "general"};
+  VideoJobService service(std::move(options));
+
+  const HttpResponse both = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"1","gufo":{"interpolate":{"fps":60},"upscale":{"width":1920,"height":1200,"model":"general"}}})");
+  Check(both.status == 202, "target fps and upscale request accepted");
+  WaitCompleted(service, CreatedId(both));
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    Check(interpolations.size() == 1 && interpolations[0].fps_num == 60 &&
+              interpolations[0].fps_den == 1 &&
+              interpolations[0].multiplier == 1,
+          "API passes the target frame rate");
+    Check(upscales.size() == 1 && upscales[0].width == 1920 &&
+              upscales[0].height == 1200 && upscales[0].fit == "pad" &&
+              upscales[0].model == "general",
+          "API passes the upscale size, default fit and model");
+  }
+
+  const HttpResponse ntsc = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":"1","gufo":{"interpolate":{"fps":"60000/1001"},"upscale":"1920x1080"}})");
+  Check(ntsc.status == 202, "fractional target fps and WxH upscale accepted");
+  WaitCompleted(service, CreatedId(ntsc));
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    Check(interpolations.size() == 2 && interpolations[1].fps_num == 60000 &&
+              interpolations[1].fps_den == 1001,
+          "API parses N/D target frame rates");
+    Check(upscales.size() == 2 && upscales[1].width == 1920 &&
+              upscales[1].height == 1080 && upscales[1].model.empty(),
+          "API parses WxH upscale strings");
+  }
+
+  for (const char* bad :
+       {R"({"interpolate":{"fps":0}})", R"({"interpolate":{"fps":241}})",
+        R"({"interpolate":{"fps":"60/0"}})",
+        R"({"interpolate":{"fps":60,"multiplier":2}})",
+        R"({"upscale":{"width":1920}})", R"({"upscale":"big"})",
+        R"({"upscale":{"width":1920,"height":1200,"fit":7}})"}) {
+    const HttpResponse rejected = Send(
+        service, "POST", "/v1/videos",
+        std::string(R"({"model":"minimax-h3","prompt":"x","seconds":"1","gufo":)") +
+            bad + "}");
+    Check(rejected.status == 400 &&
+              (rejected.body.find("invalid_interpolate") != std::string::npos ||
+               rejected.body.find("invalid_upscale") != std::string::npos),
+          std::string("malformed delivery option rejected: ") + bad);
+  }
+  for (const char* bad : {R"({"upscale":"1921x1200"})",
+                          R"({"upscale":{"width":1920,"height":1200,"fit":"zoom"}})",
+                          R"({"upscale":{"width":1920,"height":1200,"model":"x"}})"}) {
+    const HttpResponse rejected = Send(
+        service, "POST", "/v1/videos",
+        std::string(R"({"model":"minimax-h3","prompt":"x","seconds":"1","gufo":)") +
+            bad + "}");
+    Check(rejected.status == 400, std::string("invalid upscale rejected: ") + bad);
+  }
+}
+
 int main() {
   const std::filesystem::path base =
       std::filesystem::temp_directory_path() /
@@ -773,6 +864,7 @@ int main() {
   TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
   TestWan22Options(base / "wan22");
+  TestDelivery(base / "delivery");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";
   return 0;

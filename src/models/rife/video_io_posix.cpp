@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
@@ -97,6 +98,14 @@ bool MakePipe(int fds[2], std::string* error) {
   fcntl(fds[0], F_SETFD, FD_CLOEXEC);
   fcntl(fds[1], F_SETFD, FD_CLOEXEC);
   return true;
+}
+
+// Single-image output ("*.png", any case) instead of an H.264 MP4.
+bool IsPngPath(const std::filesystem::path& path) {
+  std::string extension = path.extension().string();
+  for (char& c : extension)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return extension == ".png";
 }
 
 }  // namespace
@@ -248,9 +257,14 @@ struct FrameWriter::Impl {
   std::filesystem::path path;
   std::filesystem::path partial;
   std::size_t frame_bytes{0};
+  int crf{18};
 };
 
 FrameWriter::FrameWriter() : impl_(std::make_unique<Impl>()) {}
+
+void FrameWriter::SetCrf(int crf) {
+  impl_->crf = crf < 0 ? 0 : (crf > 51 ? 51 : crf);
+}
 FrameWriter::~FrameWriter() {
   Abort();
 }
@@ -260,7 +274,8 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
                        const std::filesystem::path& audio_source,
                        std::string* error) {
   Abort();
-  if ((width & 1) != 0 || (height & 1) != 0) {
+  const bool png = IsPngPath(path);
+  if (!png && ((width & 1) != 0 || (height & 1) != 0)) {
     SetError(error, "H.264 yuv420p output needs an even width and height");
     return false;
   }
@@ -269,7 +284,7 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
   impl_->partial =
       path.parent_path() /
       (path.filename().string() + ".gufo-partial-" + std::to_string(getpid()) +
-       "-" + std::to_string(sequence.fetch_add(1)) + ".mp4");
+       "-" + std::to_string(sequence.fetch_add(1)) + (png ? ".png" : ".mp4"));
   std::error_code ignored;
   if (!path.parent_path().empty())
     std::filesystem::create_directories(path.parent_path(), ignored);
@@ -294,9 +309,16 @@ bool FrameWriter::Open(const std::filesystem::path& path, int width, int height,
     for (const char* a : {"-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy"})
       arguments.emplace_back(a);
   }
-  for (const char* a : {"-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                        "-pix_fmt", "yuv420p", "-movflags", "+faststart"})
-    arguments.emplace_back(a);
+  if (png) {
+    for (const char* a : {"-frames:v", "1", "-c:v", "png"})
+      arguments.emplace_back(a);
+  } else {
+    for (const char* a : {"-c:v", "libx264", "-preset", "fast", "-crf"})
+      arguments.emplace_back(a);
+    arguments.push_back(std::to_string(impl_->crf));
+    for (const char* a : {"-pix_fmt", "yuv420p", "-movflags", "+faststart"})
+      arguments.emplace_back(a);
+  }
   arguments.push_back(impl_->partial.string());
   int fds[2];
   if (!MakePipe(fds, error))

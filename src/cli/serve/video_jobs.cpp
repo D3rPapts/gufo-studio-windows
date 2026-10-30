@@ -348,7 +348,7 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "media") {
     return scaled(97, 99);
   }
-  if (phase == "interpolate") {
+  if (phase == "interpolate" || phase == "upscale") {
     return scaled(98, 99);
   }
   return 1;
@@ -810,36 +810,73 @@ struct VideoJobService::Impl {
       std::filesystem::path content_path;
       std::string media_type;
       bool output_ready = success && !job->cancellation.IsCancelled();
+      const VideoInterpolation interpolation{
+          .multiplier = job->request.interpolate,
+          .fps_num = job->request.interpolate_fps_num,
+          .fps_den = job->request.interpolate_fps_den};
+      // Post-processing: output.mp4 -> generated.mp4 -> processed output.mp4.
+      const auto post_process =
+          [&](const char* event, const std::string& detail,
+              const std::function<bool(const std::filesystem::path&,
+                                       const std::filesystem::path&,
+                                       std::string*)>& run) {
+            const auto generated = job->directory / "generated.mp4";
+            const auto stage_start = std::chrono::steady_clock::now();
+            std::error_code rename_error;
+            std::filesystem::rename(job->directory / "output.mp4", generated,
+                                    rename_error);
+            std::string stage_error =
+                rename_error ? "cannot stage the generated MP4" : "";
+            const bool ok =
+                !rename_error &&
+                run(generated, job->directory / "output.mp4", &stage_error);
+            std::filesystem::remove(generated, rename_error);
+            if (!ok && !job->cancellation.IsCancelled()) {
+              Logger::Error("video", "job=" + job->snapshot.id + " event=" +
+                                         event + "_failed detail=" +
+                                         stage_error);
+            } else if (ok) {
+              Logger::Info(
+                  "video",
+                  "job=" + job->snapshot.id + " event=" + event + "d " +
+                      detail + " elapsed_ms=" +
+                      std::to_string(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - stage_start)
+                              .count()));
+            }
+            return ok;
+          };
       if (output_ready && job->request.output_format == "mp4" &&
-          job->request.interpolate > 1) {
-        // RIFE: output.mp4 -> generated.mp4 -> interpolated output.mp4.
-        const auto generated = job->directory / "generated.mp4";
-        const auto interpolate_start = std::chrono::steady_clock::now();
-        std::error_code rename_error;
-        std::filesystem::rename(job->directory / "output.mp4", generated,
-                                rename_error);
-        std::string interpolate_error =
-            rename_error ? "cannot stage the generated MP4" : "";
-        output_ready =
-            !rename_error &&
-            options.interpolator(generated, job->directory / "output.mp4",
-                                 job->request.interpolate, &job->cancellation,
-                                 Progress, &progress, &interpolate_error);
-        std::filesystem::remove(generated, rename_error);
-        if (!output_ready && !job->cancellation.IsCancelled()) {
-          Logger::Error("video", "job=" + job->snapshot.id +
-                                     " event=interpolate_failed detail=" +
-                                     interpolate_error);
-        } else if (output_ready) {
-          Logger::Info(
-              "video",
-              "job=" + job->snapshot.id + " event=interpolated multiplier=" +
-                  std::to_string(job->request.interpolate) + " elapsed_ms=" +
-                  std::to_string(
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - interpolate_start)
-                          .count()));
-        }
+          interpolation.enabled()) {
+        output_ready = post_process(
+            "interpolate",
+            interpolation.fps_num > 0
+                ? "fps=" + std::to_string(interpolation.fps_num) + "/" +
+                      std::to_string(interpolation.fps_den)
+                : "multiplier=" + std::to_string(interpolation.multiplier),
+            [&](const std::filesystem::path& in,
+                const std::filesystem::path& out, std::string* stage_error) {
+              return options.interpolator(in, out, interpolation,
+                                          &job->cancellation, Progress,
+                                          &progress, stage_error);
+            });
+      }
+      if (output_ready && job->request.output_format == "mp4" &&
+          job->request.upscale.enabled()) {
+        const VideoUpscale& upscale = job->request.upscale;
+        output_ready = post_process(
+            "upscale",
+            "size=" + std::to_string(upscale.width) + "x" +
+                std::to_string(upscale.height) + " fit=" + upscale.fit +
+                " model=" +
+                (upscale.model.empty() ? options.upscale_models.front()
+                                       : upscale.model),
+            [&](const std::filesystem::path& in,
+                const std::filesystem::path& out, std::string* stage_error) {
+              return options.upscaler(in, out, upscale, &job->cancellation,
+                                      Progress, &progress, stage_error);
+            });
       }
       if (output_ready && job->request.output_format == "mp4") {
         content_path = job->directory / "output.mp4";
@@ -1056,16 +1093,48 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .error = "invalid MiniMax H3 video job request"};
   }
 
-  if (request.interpolate < 1 || request.interpolate > 8 ||
-      (request.interpolate > 1 &&
+  const bool interpolate = request.interpolate > 1 ||
+                           request.interpolate_fps_num > 0;
+  const bool interpolate_valid =
+      request.interpolate >= 1 && request.interpolate <= 8 &&
+      request.interpolate_fps_num >= 0 && request.interpolate_fps_den >= 1 &&
+      request.interpolate_fps_den <= 1001 &&
+      request.interpolate_fps_num <= 240 * request.interpolate_fps_den &&
+      !(request.interpolate > 1 && request.interpolate_fps_num > 0);
+  if (!interpolate_valid ||
+      (interpolate &&
        (request.output_format != "mp4" || !impl_->options.interpolator))) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
-            .error = request.interpolate > 1 && request.interpolate <= 8 &&
-                             request.output_format == "mp4"
+            .error = interpolate_valid && request.output_format == "mp4"
                          ? "frame interpolation is not enabled on this "
                            "server (gufo serve video --rife-model)"
-                         : "'interpolate' must be 1..8 with MP4 output"};
+                         : "'interpolate' must be 1..8 or a target fps with "
+                           "MP4 output"};
+  }
+  const VideoUpscale& upscale = request.upscale;
+  if (upscale.enabled()) {
+    const bool shape = upscale.width >= 2 && upscale.height >= 2 &&
+                       upscale.width <= 7680 && upscale.height <= 4320 &&
+                       upscale.width % 2 == 0 && upscale.height % 2 == 0 &&
+                       (upscale.fit == "pad" || upscale.fit == "crop" ||
+                        upscale.fit == "stretch");
+    const auto& models = impl_->options.upscale_models;
+    if (!shape || request.output_format != "mp4" ||
+        !impl_->options.upscaler || models.empty() ||
+        (!upscale.model.empty() &&
+         std::ranges::find(models, upscale.model) == models.end())) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = !shape || request.output_format != "mp4"
+                           ? "'upscale' needs an even width and height up to "
+                             "7680x4320, fit pad, crop or stretch, and MP4 "
+                             "output"
+                       : !impl_->options.upscaler || models.empty()
+                           ? "upscaling is not enabled on this server (gufo "
+                             "serve video --upscale-model)"
+                           : "unknown upscale model '" + upscale.model + "'"};
+    }
   }
   auto job = std::make_shared<Impl::Job>();
   job->request = request;

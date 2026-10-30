@@ -424,6 +424,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_jobs.cpp
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
+  src/cli/serve/video_upscale.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -439,6 +440,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_http PUBLIC gufo_wan22)
   # RIFE frame interpolation of finished videos ("gufo":{"interpolate":N}).
   target_link_libraries(gufo_http PUBLIC gufo_rife)
+  # Real-ESRGAN upscaling of finished videos ("gufo":{"upscale":...}).
+  target_link_libraries(gufo_http PUBLIC gufo_realesrgan)
 endif()
 
 add_executable(gufo
@@ -448,6 +451,7 @@ add_executable(gufo
   src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
   src/cli/video/video_interpolate.cpp
+  src/cli/video/video_upscale.cpp
   src/cli/serve/serve.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/continuation_disk_store.cpp
@@ -1417,3 +1421,4 @@ add_subdirectory(src/models/qwen3_omni)
 # Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
 add_subdirectory(src/models/wan22)
 add_subdirectory(src/models/rife)
+add_subdirectory(src/models/realesrgan)
