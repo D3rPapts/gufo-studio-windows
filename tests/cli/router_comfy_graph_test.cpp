@@ -357,6 +357,69 @@ void TestImageToImage() {
   assert(error.message.find("VAEEncode") != std::string::npos);
 }
 
+void TestQwenLoras() {
+  // LoraLoader -> LoraLoaderModelOnly (strength 0) -> LoraLoaderModelOnly ->
+  // KSampler: "loras" in the order ComfyUI applies them, loader side first.
+  std::string text = Replace(
+      kQwenText, R"("model": ["4", 0], "positive")",
+      R"("model": ["L3", 0], "positive")");
+  text = Replace(text, R"("clip": ["1", 0], "prompt")",
+                 R"("clip": ["L1", 1], "prompt")");
+  text = Replace(
+      text, R"( "5": {)",
+      R"( "L1": {"class_type": "LoraLoader", "inputs": {"model": ["4", 0], "clip": ["1", 0], "lora_name": "figuren\\Anime_Consistency.safetensors", "strength_model": 0.8, "strength_clip": 1.0}},
+ "L2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["L1", 0], "lora_name": "off.safetensors", "strength_model": 0.0}},
+ "L3": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["L2", 0], "lora_name": "styles/detail.sft", "strength_model": -0.5}},
+ "5": {)");
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.loras.size() == 2);
+  assert(image.loras[0].first == "Anime_Consistency" &&
+         image.loras[0].second == 0.8);
+  assert(image.loras[1].first == "detail" && image.loras[1].second == -0.5);
+  const json::Value loras = comfy::ImageLoras(image);
+  assert(loras.is_array() && loras.size() == 2);
+  assert(loras.items()[0].member_str("name") == "Anime_Consistency");
+  assert(loras.items()[1].find("scale")->as_double() == -0.5);
+  // The CLIP half of LoraLoader has no gufo counterpart: one warning.
+  int clip_warnings = 0;
+  for (const auto& warning : plan.warnings)
+    clip_warnings += warning.find("strength_clip") != std::string::npos;
+  assert(clip_warnings == 1);
+  // The extension object stays free of LoRA fields.
+  assert(comfy::ImageExtension(image).find("loras") == nullptr);
+
+  // Without LoRA nodes nothing is sent, so the worker's defaults apply.
+  const comfy::Plan plain = PlanOf(kQwenText);
+  assert(comfy::ImageLoras(std::get<comfy::ImageTask>(plain.tasks[0].spec))
+             .is_null());
+
+  // The same file twice adds up; strength_clip 0 does not warn.
+  std::string twice = Replace(
+      kQwenText, R"("model": ["4", 0], "positive")",
+      R"("model": ["L2", 0], "positive")");
+  twice = Replace(
+      twice, R"( "5": {)",
+      R"( "L1": {"class_type": "LoraLoader", "inputs": {"model": ["4", 0], "clip": ["1", 0], "lora_name": "a.safetensors", "strength_model": 0.25, "strength_clip": 0.0}},
+ "L2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["L1", 0], "lora_name": "sub/a.safetensors", "strength_model": 0.5}},
+ "5": {)");
+  const comfy::Plan summed = PlanOf(twice.c_str());
+  const auto& merged = std::get<comfy::ImageTask>(summed.tasks[0].spec);
+  assert(merged.loras.size() == 1 && merged.loras[0].first == "a" &&
+         merged.loras[0].second == 0.75);
+  assert(summed.warnings.empty());
+
+  // Out-of-range strength fails at the node.
+  const comfy::PlanError error = ErrorOf(Replace(
+      text, R"("strength_model": 0.8)", R"("strength_model": 12)"));
+  assert(error.node_errors.find("L1") != nullptr);
+
+  assert(comfy::LoraName("anime.safetensors") == "anime");
+  assert(comfy::LoraName("A/B\\c.SafeTensors") == "c");
+  assert(comfy::LoraName("plain") == "plain");
+  assert(comfy::LoraName("x.ckpt") == "x.ckpt");
+}
+
 void TestRife() {
   // VAEDecode -> RIFE VFI x4 -> SaveImage; the audio output stays plain.
   std::string text =
@@ -897,6 +960,7 @@ int main() {
   TestWan();
   TestUnsupportedNodes();
   TestImageToImage();
+  TestQwenLoras();
   TestRife();
   TestDialogue();
   TestAceStep();

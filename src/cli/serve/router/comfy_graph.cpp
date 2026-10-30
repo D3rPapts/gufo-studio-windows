@@ -311,7 +311,8 @@ FileRef AudioFile(const Graph& graph, const std::string& id,
 
 struct ModelChain {
   std::string loader;  // unet/ckpt name
-  std::vector<std::pair<std::string, double>> loras;
+  std::vector<std::pair<std::string, double>> loras;  // sampler side first
+  std::vector<std::string> lora_nodes;                 // node ids, same order
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
 };
 
@@ -323,6 +324,7 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
     if (cls == "LoraLoaderModelOnly" || cls == "LoraLoader") {
       chain.loras.emplace_back(graph.Str(link.node, "lora_name"),
                                graph.Num(link.node, "strength_model", 1.0));
+      chain.lora_nodes.push_back(link.node);
     } else if (cls == "WanUni3CControlnetApply") {
       if (!chain.uni3c.empty())
         throw NodeFailure(sampler, "unsupported_link",
@@ -404,6 +406,27 @@ std::string SeedKey(const std::string& cls) {
   return cls == "KSamplerAdvanced" ? "noise_seed" : "seed";
 }
 
+}  // namespace
+
+std::string LoraName(std::string_view lora_name) {
+  // ComfyUI lists files below models/loras, subfolders included
+  // ("style/anime.safetensors"); gufo registers adapters by bare name.
+  if (const auto slash = lora_name.find_last_of("/\\");
+      slash != std::string_view::npos)
+    lora_name.remove_prefix(slash + 1);
+  for (const std::string_view ext : {".safetensors", ".sft"}) {
+    if (lora_name.size() > ext.size() &&
+        Lower(lora_name.substr(lora_name.size() - ext.size())) ==
+            ext) {
+      lora_name.remove_suffix(ext.size());
+      break;
+    }
+  }
+  return std::string(lora_name);
+}
+
+namespace {
+
 ImageTask BuildImage(const Graph& graph, const std::string& sampler,
                      const ModelIds& models, const Link& latent,
                      std::vector<std::string>* warnings) {
@@ -422,10 +445,36 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
       cfg != nullptr && cfg->is_number())
     task.guidance = cfg->as_double();
   const ModelChain chain = FollowModel(graph, sampler);
-  if (!chain.loras.empty())
+  // LoraLoader / LoraLoaderModelOnly -> "loras", in the order ComfyUI applies
+  // them (loader side first). The worker merges them into the transformer;
+  // the CLIP half of LoraLoader has no gufo counterpart.
+  for (std::size_t i = chain.loras.size(); i-- > 0;) {
+    const auto& [file, strength] = chain.loras[i];
+    const std::string& node = chain.lora_nodes[i];
+    const std::string name = LoraName(file);
+    if (name.empty())
+      throw NodeFailure(node, "unsupported_value", "lora_name is empty");
+    if (!std::isfinite(strength) || std::abs(strength) > 10)
+      throw NodeFailure(node, "unsupported_value",
+                        "strength_model must be finite and at most 10 in "
+                        "magnitude for gufo Qwen-Image");
+    if (graph.Class(node) == "LoraLoader" &&
+        graph.Num(node, "strength_clip", 1.0) != 0.0)
+      warnings->push_back("node " + node +
+                          ": strength_clip is ignored (gufo applies " + name +
+                          " to the Qwen-Image transformer only)");
+    if (strength == 0.0)
+      continue;
+    auto same = std::find_if(task.loras.begin(), task.loras.end(),
+                             [&](const auto& l) { return l.first == name; });
+    if (same != task.loras.end())
+      same->second += strength;  // the same adapter twice adds its deltas
+    else
+      task.loras.emplace_back(name, strength);
+  }
+  if (task.loras.size() > 16)
     throw NodeFailure(sampler, "unsupported_value",
-                      "LoRAs are not supported for Qwen-Image in gufo (" +
-                          chain.loras.front().first + ")");
+                      "gufo Qwen-Image takes at most 16 LoRAs per image");
   if (!chain.loader.empty() &&
       Lower(chain.loader).find("qwen_image") == std::string::npos)
     warnings->push_back("model " + chain.loader + " is served by " +
@@ -1441,6 +1490,19 @@ json::Value ImageExtension(const ImageTask& task) {
   if (task.strength)
     gufo["strength"] = *task.strength;
   return gufo;
+}
+
+json::Value ImageLoras(const ImageTask& task) {
+  if (task.loras.empty())
+    return json::Value();
+  json::Value loras = json::Value::array();
+  for (const auto& [name, scale] : task.loras) {
+    json::Value entry = json::Value::object();
+    entry["name"] = name;
+    entry["scale"] = scale;
+    loras.push_back(std::move(entry));
+  }
+  return loras;
 }
 
 namespace {

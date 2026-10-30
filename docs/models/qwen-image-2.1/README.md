@@ -121,6 +121,15 @@ the Automatic1111 shape plus the scales in use:
   "default_scale": 0.5, "active_scale": 0.8}]
 ```
 
+The router's ComfyUI adapter maps `LoraLoader` and `LoraLoaderModelOnly`
+nodes on a Qwen-Image sampler's model input to `loras`: `lora_name` without
+folders and without `.safetensors` is the adapter name (register
+`figuren/Anime.safetensors` as `--lora Anime=PATH`), `strength_model` is the
+scale, and entries keep ComfyUI's order (loader side first). Strength 0 drops
+an entry, the same file twice adds its strengths, and `strength_clip` is
+ignored with a warning. A graph without LoRA nodes omits `loras`, so the
+`--lora-default` set applies.
+
 `path` is the file name only; `targets` counts the base weights the adapter
 patches, not the tensors in its file. `active_scale` reflects the adapters
 currently merged into the weights (none while a switch is running or after a
