@@ -26,8 +26,11 @@
   `/ws`) that runs ComfyUI API-format workflows for Qwen-Image, H3, Wan 2.2,
   Qwen3-TTS, ACE-Step, camera moves (incl. gufo's `GufoCameraMove` node), RIFE
   target fps and Real-ESRGAN upscale chains.
-- Qwen3-TTS `speed`, long-system-prompt reuse for Qwen3.8-27B, and the Omni
-  captioner streaming its weights (about 1.7 GB host RAM instead of 12+ GB).
+- Qwen3-TTS `speed`; Qwen3.8-27B reuses system prompts again (a new question
+  under a 1.25K-token system prompt answers after 0.49 s instead of 3.29 s)
+  and gets a Windows table of verification GEMM shapes; Qwen3.8-Flash-Next
+  MTP decode +17 % on a story prompt; the Omni captioner streams its weights
+  (about 1.7 GB host RAM instead of 12+ GB).
 
 This is a fork of [Gufo](https://github.com/gufo-org/gufo), the local
 inference engine for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S,
