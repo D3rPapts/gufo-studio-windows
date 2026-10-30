@@ -1509,7 +1509,7 @@ void TestInstructionsCheckpointServesANewQuestion() {
                       const std::vector<TextRunnerToken>& prompt,
                       std::size_t instructions) {
     auto request = pool.Acquire(prompt, {}, {}, {}, true, prompt.size() - 10,
-                                true, instructions);
+                                true, true, instructions);
     const auto cached = request.cached_prompt_tokens();
     while (!request.prefill_complete())
       (void)request.Prefill(32768);
