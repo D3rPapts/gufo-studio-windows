@@ -26,6 +26,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(GUFO_RELEASE_VERSION "development" CACHE STRING "Gufo release version")
 set(GUFO_REVISION "unknown" CACHE STRING "Gufo source revision")
+# gufo_windows release branches name their version here, so a local build prints it without git tags or
+# -DGUFO_RELEASE_VERSION. An explicit -DGUFO_RELEASE_VERSION=<x> (CI) still wins.
+set(GUFO_WINDOWS_VERSION "1.1.0")
+if (GUFO_WINDOWS_VERSION AND GUFO_RELEASE_VERSION STREQUAL "development")
+  set(GUFO_RELEASE_VERSION "${GUFO_WINDOWS_VERSION}")
+endif()
+# The revision falls back to the checked-out commit when git is available; source archives keep "unknown".
+if (GUFO_REVISION STREQUAL "unknown")
+  find_package(Git QUIET)
+  if (GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_SOURCE_DIR}" rev-parse --short=8 HEAD
+      OUTPUT_VARIABLE GUFO_GIT_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE GUFO_GIT_RESULT)
+    if (GUFO_GIT_RESULT EQUAL 0 AND GUFO_GIT_REVISION)
+      set(GUFO_REVISION "${GUFO_GIT_REVISION}")
+    endif()
+  endif()
+endif()
 include_directories(${CMAKE_SOURCE_DIR})
 
 # Reuse the compiler cache whenever it is installed, as the CPU check
