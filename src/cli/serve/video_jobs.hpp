@@ -129,15 +129,15 @@ struct VideoJobRequest {
   // interpolate_fps_num > 0, its target frame rate; needs
   // VideoJobServiceOptions::interpolator.
   int interpolate{1};
-  // Wan 2.1 camera: the "gufo.camera" object as JSON (type/amount/speed/ease
-  // or poses), and an uploaded guide video (MP4 bytes) instead.
-  std::string camera_json;
-  std::vector<std::uint8_t> guide_video;
   int interpolate_fps_num{0};
   int interpolate_fps_den{1};
   // Upscaling of the finished (interpolated) MP4; needs
   // VideoJobServiceOptions::upscaler.
   VideoUpscale upscale;
+  // Wan 2.1 camera: the "gufo.camera" object as JSON (type/amount/speed/ease
+  // or poses), and an uploaded guide video (MP4 bytes) instead.
+  std::string camera_json;
+  std::vector<std::uint8_t> guide_video;
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).

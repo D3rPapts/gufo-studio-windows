@@ -941,7 +941,8 @@ HttpResponse CreateWan21Video(const json::Value& body,
   parameters.internal_width = parameters.output_width;
   parameters.internal_height = parameters.output_height;
   std::uint64_t seed = 42;
-  int interpolate = 1;
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
   if (const auto upload = files.find("render_video"); upload != files.end()) {
@@ -950,19 +951,31 @@ HttpResponse CreateWan21Video(const json::Value& body,
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension,
-                        {"seed", "steps", "frames", "interpolate", "camera"})) {
+                        {"seed", "steps", "frames", "interpolate", "upscale",
+                         "camera"})) {
       return Error(400, "Bad Request",
                    "'gufo' may contain only 'seed', 'steps', 'frames', "
-                   "'interpolate' and 'camera'",
+                   "'interpolate', 'upscale' and 'camera'",
                    "invalid_strix_options");
     }
     if (extension->contains("interpolate")) {
       const auto parsed = JsonInterpolate(extension->find("interpolate"));
       if (!parsed.has_value()) {
-        return Error(400, "Bad Request", "'gufo.interpolate' must be 1..8",
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
                      "invalid_interpolate");
       }
       interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
     }
     if (extension->contains("seed")) {
       const auto parsed = JsonUnsigned(extension->find("seed"));
@@ -1047,7 +1060,10 @@ HttpResponse CreateWan21Video(const json::Value& body,
       .first_frame_width = static_cast<int>(first_frame->width),
       .first_frame_height = static_cast<int>(first_frame->height),
       .first_frame = std::move(first_frame->pixels),
-      .interpolate = interpolate,
+      .interpolate = interpolate.multiplier,
+      .interpolate_fps_num = interpolate.fps_num,
+      .interpolate_fps_den = interpolate.fps_den,
+      .upscale = std::move(upscale),
       .camera_json = std::move(camera_json),
       .guide_video = std::move(guide_video),
   });
