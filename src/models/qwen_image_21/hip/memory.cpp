@@ -23,11 +23,28 @@ namespace gufo::models::qwen_image_21::hip {
 namespace {
 
 #if defined(_WIN32)
+using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+
+// Loaded from System32 on first use so the executable does not import
+// dxgi.dll; without it the check falls back to hipMemGetInfo.
+CreateFactoryFn LoadCreateFactory() {
+  static const CreateFactoryFn create = [] {
+    HMODULE dxgi =
+        LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return dxgi ? reinterpret_cast<CreateFactoryFn>(
+                      GetProcAddress(dxgi, "CreateDXGIFactory1"))
+                : nullptr;
+  }();
+  return create;
+}
+
 // The first hardware AMD adapter; HIP on Windows allocates through it.
 bool QuerySegments(DeviceMemory* memory) {
+  const CreateFactoryFn create_factory = LoadCreateFactory();
   IDXGIFactory4* factory = nullptr;
-  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4),
-                                reinterpret_cast<void**>(&factory))))
+  if (!create_factory ||
+      FAILED(create_factory(__uuidof(IDXGIFactory4),
+                            reinterpret_cast<void**>(&factory))))
     return false;
   bool found = false;
   IDXGIAdapter1* adapter = nullptr;
