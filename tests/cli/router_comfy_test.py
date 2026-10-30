@@ -64,6 +64,15 @@ def serve_fake_worker(argv):
     port = int(argv[argv.index("--port") + 1])
     model = argv[argv.index("--served-model-name") + 1]
     log_path = os.environ["COMFY_FAKE_LOG"]
+    # One-shot start failure (a load that dies with "bad allocation"): while
+    # <dir>/<model>.fail exists, remove it and exit with status 1.
+    fail_dir = os.environ.get("COMFY_FAKE_FAIL_DIR")
+    if fail_dir:
+        marker = os.path.join(fail_dir, model + ".fail")
+        if os.path.exists(marker):
+            os.remove(marker)
+            time.sleep(0.3)
+            sys.exit(1)
     lock = threading.Lock()
     videos = {}
 
@@ -763,6 +772,98 @@ def check_queue_history_free(router):
     return list(router.json("GET", "/history")[1])
 
 
+def check_autoload_retry(binary, tmp):
+    """A failed --autoload keeps the router up: the model is listed as
+    failed, other models and pages answer, and a later retry loads it."""
+    work = os.path.join(tmp, "autoload")
+    pages = os.path.join(work, "pages", "status")
+    os.makedirs(pages)
+    with open(os.path.join(pages, "index.html"), "w") as handle:
+        handle.write("<p>status</p>")
+    fail_dir = os.path.join(work, "fail")
+    os.makedirs(fail_dir)
+    open(os.path.join(fail_dir, "flaky.fail"), "w").close()
+    python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
+    preset = os.path.join(work, "autoload.preset")
+    with open(preset, "w") as handle:
+        for model in ("flaky", "steady"):
+            handle.write("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
+                         "served-model-name = %s\n\n" % (model, python, THIS, model))
+    port = free_port()
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
+    env["COMFY_FAKE_LOG"] = os.path.join(work, "fake.jsonl")
+    env["COMFY_FAKE_FAIL_DIR"] = fail_dir
+    log = open(os.path.join(work, "router.log"), "ab")
+    proc = subprocess.Popen(
+        [binary, "router", "--models-preset", preset, "--host", "127.0.0.1",
+         "--port", str(port), "--models-max", "0", "--autoload",
+         "--autoload-retry-seconds", "3,60", "--pages-dir",
+         os.path.join(work, "pages")],
+        env=env, stdout=log, stderr=subprocess.STDOUT)
+
+    def get(path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        if body is None:
+            conn.request("GET", path)
+        else:
+            conn.request("POST", path, body=json.dumps(body).encode(),
+                         headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read()
+        conn.close()
+        return response.status, data
+
+    def tail():
+        with open(os.path.join(work, "router.log"), "rb") as handle:
+            return handle.read()[-3000:].decode(errors="replace")
+
+    def status_of(model):
+        listing = json.loads(get("/v1/models")[1])["data"]
+        return [m for m in listing if m["id"] == model][0]["status"]
+
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if get("/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        # The first start of "flaky" exits with status 1.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not status_of("flaky").get("failed"):
+            assert proc.poll() is None, "router exited: " + tail()
+            time.sleep(0.1)
+        status = status_of("flaky")
+        assert status["value"] == "unloaded" and status["failed"] is True, status
+        assert status["attempts"] == 1 and status["retry_in_s"] <= 3, status
+        status, body = get("/router/status")
+        assert status == 200 and "flaky" in json.loads(body)["autoload_failed"], body
+        # Meanwhile other models and pages answer.
+        status, body = get("/v1/audio/speech", {"model": "steady", "input": "Hallo",
+                                                 "voice": "ryan"})
+        assert status == 200 and body[:4] == b"RIFF", (status, body[:200])
+        status, body = get("/status/")
+        assert status == 200 and b"status" in body, status
+        # The retry after 3 s loads it; the failure mark goes away.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and status_of("flaky")["value"] != "loaded":
+            assert proc.poll() is None, "router exited: " + tail()
+            time.sleep(0.2)
+        status = status_of("flaky")
+        assert status["value"] == "loaded" and "failed" not in status, status
+        assert json.loads(get("/router/status")[1])["autoload_failed"] == {}
+        assert proc.poll() is None
+    except BaseException:
+        print(tail())
+        raise
+    finally:
+        proc.terminate()
+        proc.wait(10)
+        log.close()
+
+
 def main():
     if "--fake-worker" in sys.argv:
         return serve_fake_worker(sys.argv)
@@ -797,6 +898,7 @@ def main():
         assert entry["outputs"]["8"]["images"][0]["filename"] == "demo_00003_.png"
     finally:
         router.stop()
+    check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("router_comfy_test: all passed (ffmpeg: %s)" % (ffmpeg or "none"))
     return 0

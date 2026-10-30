@@ -158,9 +158,33 @@ std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                                   {"Cache-Control", "no-cache"}}};
 }
 
+/// A failed --autoload of one model: the router stays up, lists the model as
+/// failed and retries after `retry_at` (a request may load it before).
+struct AutoloadFailure {
+  std::string error;
+  int attempts{0};
+  std::chrono::steady_clock::time_point retry_at{};
+};
+using AutoloadFailures = std::map<std::string, AutoloadFailure>;
+
+long long RetryInSeconds(const AutoloadFailure& failure) {
+  const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+      failure.retry_at - std::chrono::steady_clock::now());
+  return std::max<long long>(0, left.count());
+}
+
+json::Value AutoloadFailureJson(const AutoloadFailure& failure) {
+  json::Value out = json::Value::object();
+  out["error"] = failure.error;
+  out["attempts"] = failure.attempts;
+  out["retry_in_s"] = RetryInSeconds(failure);
+  return out;
+}
+
 /// Router-managed paths answered by the front itself. Returns nullopt when
 /// the path belongs to the model-routing table instead.
 std::optional<HttpResponse> RouteFront(const router::Registry& registry,
+                                       const AutoloadFailures& failures,
                                        const HttpRequest& req) {
   if (req.method == "GET" && (req.path == "/health" || req.path == "/healthz" ||
                               req.path == "/v1/health")) {
@@ -196,6 +220,15 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
       json::Value state = json::Value::object();
       state["value"] = std::string(status);
       state["args"] = std::move(args);
+      // llama.cpp marks a failed instance with status.failed; gufo adds the
+      // error and the next --autoload retry.
+      if (const auto failed = failures.find(preset->id);
+          failed != failures.end() && std::string_view(status) == "unloaded") {
+        state["failed"] = true;
+        state["error"] = failed->second.error;
+        state["attempts"] = failed->second.attempts;
+        state["retry_in_s"] = RetryInSeconds(failed->second);
+      }
       model["status"] = std::move(state);
       data.push_back(std::move(model));
     }
@@ -546,6 +579,8 @@ public:
   std::unique_ptr<router::Residency> residency;
   /// Workers being stopped right now (status "unloading").
   std::set<std::string> stopping;
+  /// --autoload models whose load failed and wait for a retry.
+  AutoloadFailures autoload_failed;
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
 
@@ -605,7 +640,7 @@ public:
         (req.path == "/models/load" || req.path == "/models/unload")) {
       return ModelsControlLocked(req);
     }
-    if (const auto front = RouteFront(registry, req)) {
+    if (const auto front = RouteFront(registry, autoload_failed, req)) {
       return *front;
     }
     if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
@@ -853,6 +888,91 @@ public:
     return success;
   }
 
+  /// --autoload in the background, after the front listens: models load in
+  /// section order through the normal admission (memory guard, load
+  /// timeout) with one spawn per attempt. A failed load never ends the
+  /// router: the model is listed as failed and retried after `delays`
+  /// (the last delay repeats); a request may load it any time before.
+  /// Stops at --models-max loaded workers, with --memory-guard after the
+  /// first one.
+  void AutoloadMain(std::vector<std::string> ids, bool memory_guard,
+                    std::vector<std::chrono::seconds> delays) {
+    if (delays.empty())
+      delays.push_back(std::chrono::seconds(300));
+    for (const std::string& id : ids) {
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (stop_requested.load())
+          return;
+        if ((options.max_active > 0 && workers.size() >= options.max_active) ||
+            (memory_guard && !workers.empty()))
+          return;
+      }
+      for (int attempt = 0;; ++attempt) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (stop_requested.load())
+          return;
+        if (LoadedLocked(id)) {
+          autoload_failed.erase(id);
+          break;
+        }
+        const router::PresetModel* preset = registry.Find(id);
+        if (preset == nullptr)
+          break;
+        Logger::Info("router", "event=autoload_start model=" + id +
+                                   " attempt=" + std::to_string(attempt + 1));
+        auto admitted = AdmitLocked(id, *preset, /*max_spawns=*/1);
+        if (std::holds_alternative<int>(admitted)) {
+          autoload_failed.erase(id);
+          Logger::Info("router", "event=autoload_ready model=" + id);
+          if (residency != nullptr)
+            residency->Event("autoload " + id);
+          break;
+        }
+        if (stop_requested.load())
+          return;
+        std::string error = "load failed";
+        try {
+          const json::Value body =
+              json::parse(std::get<HttpResponse>(admitted).body);
+          if (const auto* detail = body.find("error"))
+            error = detail->member_str("message", error);
+        } catch (const std::exception&) {
+          // Keep the generic text.
+        }
+        const auto delay =
+            delays[std::min<std::size_t>(attempt, delays.size() - 1)];
+        AutoloadFailure& failure = autoload_failed[id];
+        failure.error = error;
+        failure.attempts = attempt + 1;
+        failure.retry_at = std::chrono::steady_clock::now() + delay;
+        Logger::Warn("router", "event=autoload_failed model=" + id +
+                                   " attempt=" + std::to_string(attempt + 1) +
+                                   " retry_in_s=" +
+                                   std::to_string(delay.count()) +
+                                   " error=\"" + error + "\"");
+        if (residency != nullptr)
+          residency->Event("autoload of " + id + " failed (" + error +
+                           "); retry in " + std::to_string(delay.count()) +
+                           " s");
+        const auto retry_at = failure.retry_at;
+        bool loaded = false;
+        while (!loaded && std::chrono::steady_clock::now() < retry_at) {
+          lock.unlock();
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          lock.lock();
+          if (stop_requested.load())
+            return;
+          loaded = LoadedLocked(id);
+        }
+        if (loaded) {
+          autoload_failed.erase(id);
+          break;
+        }
+      }
+    }
+  }
+
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
   /// for queued loads, and kill wedged loads past their deadline.
   void SuperviseOnce() {
@@ -913,6 +1033,13 @@ public:
                            ? residency->Status(residents, unloading, now)
                            : json::Value::object();
     body["models_max"] = static_cast<long long>(options.max_active);
+    json::Value failed = json::Value::object();
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      for (const auto& [id, failure] : autoload_failed)
+        failed[id] = AutoloadFailureJson(failure);
+    }
+    body["autoload_failed"] = std::move(failed);
     return HttpResponse{.status = 200,
                         .reason = "OK",
                         .body = body.dump(),
@@ -1218,7 +1345,8 @@ private:
   /// sections; the mutex stays free while waiting for worker readiness so
   /// supervision ticks and concurrent waiters are never starved.
   AdmissionResult AdmitLocked(const std::string& model_id,
-                              const router::PresetModel& preset) {
+                              const router::PresetModel& preset,
+                              int max_spawns = kSpawnAttempts) {
     int attempt = 0;
     // The whole held request (queue + spawn + readiness) is bound by
     // load_timeout even if supervision or a spawn retry clears the registry
@@ -1264,7 +1392,7 @@ private:
         }
         if (decision == router::LoadDecision::kSpawn) {
           ++attempt;
-          if (attempt > kSpawnAttempts) {
+          if (attempt > max_spawns) {
             registry.MarkUnloaded(model_id);
             return Err(502, "Bad Gateway",
                        "worker for '" + model_id + "' failed to start",
@@ -1402,6 +1530,7 @@ int RunRouter(std::span<const char* const> args) {
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
   bool autoload = false;
+  std::string autoload_retry = "30,60,120,300";
   bool memory_guard = false;
   bool memory_report = false;
   std::filesystem::path memory_file;
@@ -1452,9 +1581,15 @@ int RunRouter(std::span<const char* const> args) {
                    "0 = unlimited)",
                    "Router", &load_timeout_seconds);
   parser.AddFlag("", "--autoload",
-                 "Preload preset models at startup in section order "
-                 "(with --memory-guard only the first one)",
+                 "Preload preset models in the background after startup, "
+                 "in section order (with --memory-guard only the first "
+                 "one); a failed load is listed as failed and retried",
                  "Router", &autoload);
+  parser.AddOption("", "--autoload-retry-seconds", "LIST",
+                   "Waits before retrying a failed --autoload, comma "
+                   "separated; the last one repeats (default: "
+                   "30,60,120,300)",
+                   "Router", &autoload_retry);
   parser.AddFlag("", "--memory-guard",
                  "Admit cold loads by live free GPU/host memory: keep loaded "
                  "models beside a new one while it fits, evict idle ones "
@@ -1553,6 +1688,24 @@ int RunRouter(std::span<const char* const> args) {
   registry_options.max_active = models_max;
   registry_options.idle_timeout = std::chrono::seconds(sleep_idle_seconds);
   registry_options.load_timeout = std::chrono::seconds(load_timeout_seconds);
+  std::vector<std::chrono::seconds> autoload_retry_delays;
+  for (std::size_t start = 0; start <= autoload_retry.size();) {
+    const auto end = std::min(autoload_retry.find(',', start),
+                              autoload_retry.size());
+    const std::string_view part =
+        std::string_view(autoload_retry).substr(start, end - start);
+    long long value = 0;
+    const auto [ptr, ec] =
+        std::from_chars(part.data(), part.data() + part.size(), value);
+    if (ec != std::errc{} || ptr != part.data() + part.size() || value < 1) {
+      std::cerr << "Error: --autoload-retry-seconds wants positive whole "
+                   "seconds separated by commas, not '"
+                << autoload_retry << "'\n";
+      return 2;
+    }
+    autoload_retry_delays.emplace_back(value);
+    start = end + 1;
+  }
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
   state->pages_dir = pages_dir;
@@ -1620,59 +1773,6 @@ int RunRouter(std::span<const char* const> args) {
     }
   }
 
-  // --autoload preloads in section order up to --models-max, waiting for each
-  // worker's health endpoint within --load-timeout-seconds.
-  if (autoload) {
-    for (const auto& model : models) {
-      if ((registry_options.max_active > 0 &&
-           state->workers.size() >= registry_options.max_active) ||
-          (memory_guard && !state->workers.empty())) {
-        break;
-      }
-      std::string spawn_error;
-      const int worker_port = router::ReserveLoopbackPort(&spawn_error);
-      if (worker_port < 0) {
-        std::cerr << "Error: model '" << model.id << "': " << spawn_error
-                  << "\n";
-        return 2;
-      }
-      const router::WorkerSpec spec{.model_id = model.id,
-                                    .modality = model.modality,
-                                    .args = model.argv,
-                                    .port = worker_port,
-                                    .command = model.command};
-      auto worker = router::Worker::Spawn(spec, state->exe_path, &spawn_error);
-      if (worker == nullptr) {
-        std::cerr << "Error: model '" << model.id << "': " << spawn_error
-                  << "\n";
-        return 2;
-      }
-      Logger::Info("router", "event=autoload_spawn model=" + model.id +
-                                 " port=" + std::to_string(worker_port));
-      const auto started = std::chrono::steady_clock::now();
-      while (!worker->Healthy()) {
-        int exit_status = 0;
-        if (worker->PollExit(&exit_status)) {
-          std::cerr << "Error: model '" << model.id
-                    << "' worker exited with status " << exit_status << "\n";
-          return 2;
-        }
-        if (load_timeout_seconds > 0 &&
-            std::chrono::steady_clock::now() - started >=
-                std::chrono::seconds(load_timeout_seconds)) {
-          std::cerr << "Error: model '" << model.id << "' load timed out\n";
-          return 2;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-      }
-      state->registry.MarkReady(model.id);
-      Logger::Info("router", "event=autoload_ready model=" + model.id);
-      state->workers[model.id] = std::move(worker);
-      state->residency->OnSpawn(model.id);
-      state->residency->Event("autoload " + model.id);
-    }
-  }
-
   HttpServerOptions options;
   options.max_request_body_bytes = max_request_body_bytes;
   options.max_connections = max_connections;
@@ -1705,6 +1805,20 @@ int RunRouter(std::span<const char* const> args) {
       std::this_thread::sleep_for(kSupervisionTick);
     }
   });
+  // --autoload runs behind the listening front so a failed load (e.g. "bad
+  // allocation" under memory pressure) never ends the router and other
+  // models and pages stay reachable meanwhile.
+  std::thread autoloader;
+  if (autoload) {
+    std::vector<std::string> ids;
+    for (const auto& model : models)
+      ids.push_back(model.id);
+    autoloader = std::thread(
+        [&state, ids = std::move(ids), memory_guard,
+         delays = std::move(autoload_retry_delays)]() mutable {
+          state->AutoloadMain(std::move(ids), memory_guard, std::move(delays));
+        });
+  }
   server.run(true);
 
   // Graceful shutdown: stop accepting, refuse new loads, drain in-flight
@@ -1746,6 +1860,8 @@ int RunRouter(std::span<const char* const> args) {
     }
   }
   supervision.join();
+  if (autoloader.joinable())
+    autoloader.join();
   state->StopSpawner();
   return 0;
 }
