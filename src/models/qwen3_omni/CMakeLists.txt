@@ -37,3 +37,12 @@ if (GUFO_WITH_OMNI)
   target_link_libraries(gufo PRIVATE gufo_qwen3_omni)
   target_compile_definitions(gufo PRIVATE GUFO_HAVE_QWEN3_OMNI=1)
 endif()
+
+if (BUILD_TESTING)
+  # CPU only: reads weight bytes from a GGUF fixture file.
+  add_executable(qwen3_omni_model_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen3_omni/model_test.cpp)
+  target_link_libraries(qwen3_omni_model_test PRIVATE gufo_qwen3_omni)
+  add_test(NAME qwen3_omni_model_test COMMAND qwen3_omni_model_test)
+  set_tests_properties(qwen3_omni_model_test PROPERTIES LABELS "cpu;models;omni")
+endif()
