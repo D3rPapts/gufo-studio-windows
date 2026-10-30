@@ -72,6 +72,11 @@ struct MemoryNeed {
   /// buffers such as an in-RAM prompt cache); it is already counted in
   /// `host`, so it is no spill. 0 for estimates (unknown).
   std::int64_t shared{0};
+  /// Dedicated bytes the model was measured to hold (complete learned peak,
+  /// without the safety factor). Only this part can spill into shared = host
+  /// RAM when dedicated is short; the factor's headroom is guarded by the
+  /// GPU total check and reserve_host. 0 = unknown: gpu - shared is used.
+  std::int64_t dedicated{0};
 };
 
 struct MemoryPolicy {

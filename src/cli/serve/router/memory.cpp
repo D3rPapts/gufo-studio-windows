@@ -75,9 +75,16 @@ bool Fits(const Room& room, const MemoryNeed& need,
     return false;
   }
   // Only what the model wants in dedicated but does not find there spills;
-  // its own shared buffers are already in need.host.
+  // its own shared buffers are already in need.host. For a complete measured
+  // peak that is the measured dedicated part: scaling it by the safety factor
+  // as well would charge the same headroom twice on this UMA machine (once as
+  // need.host x factor, once as spill), which kept the 27B (28.9 GB measured
+  // dedicated, 30.0 GB free) waiting forever at 14.6 GB free host RAM although
+  // a real load leaves 6.5 GB free.
+  const std::int64_t wants_dedicated =
+      need.dedicated > 0 ? need.dedicated : need.gpu - need.shared;
   const std::int64_t spill =
-      std::max<std::int64_t>(0, need.gpu - need.shared - dedicated_part);
+      std::max<std::int64_t>(0, wants_dedicated - dedicated_part);
   return room.host - policy.reserve_host - spill >= need.host;
 }
 
@@ -498,6 +505,10 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
                            scale(record.learned.gpu, learned_factor));
     need.gpu = std::max(need.gpu, scale(record.learned.gpu, learned_factor));
     need.host = std::max(need.host, scale(record.learned.host, learned_factor));
+    if (record.learned_complete) {
+      need.dedicated = std::max<std::int64_t>(
+          0, record.learned.gpu - record.learned.shared);
+    }
   }
   return need;
 }

@@ -242,6 +242,52 @@ void TestOwnSharedIsNoSpill() {
   CHECK(plan.action == Action::kWait);
 }
 
+void TestReload27bAfterIdleUnload() {
+  // 30.10.: the 27B (complete learned peak 35.12 GB gpu, 6.22 GB of it shared,
+  // 8.29 GB host) was idle-unloaded; the reload saw 30.0 GB dedicated + 15.1
+  // GB shared and 14.6 GB host free and waited forever, because the factored
+  // dedicated part (31.8 GB) "spilled" 1.8 GB on top of host x 1.1. A real
+  // load at that free memory left 6.5 GB host free.
+  MemoryBook book({});
+  ProcessMemory usage;
+  usage.valid = true;
+  usage.gpu_dedicated = Gb(35.12 - 6.22);
+  usage.gpu_shared = Gb(6.22);
+  usage.host_working_set = Gb(8.29);
+  book.Observe("qwen3.8-27b", usage);
+  bool exclusive = false;
+  const MemoryPolicy policy;
+  // Before a complete run the factored split stays (no measured dedicated).
+  CHECK(book.Need("qwen3.8-27b", policy.factor, policy.learned_factor,
+                  &exclusive)
+            .dedicated == 0);
+  book.MarkComplete("qwen3.8-27b");
+  const MemoryNeed need = book.Need("qwen3.8-27b", policy.factor,
+                                    policy.learned_factor, &exclusive);
+  CHECK(need.dedicated == Gb(35.12 - 6.22));
+  const SystemMemory reload = Machine(2.0, 0.4, 14.6);
+  auto plan = PlanAdmission(reload, {}, "qwen3.8-27b", need, false, policy);
+  CHECK(plan.action == Action::kSpawn && !plan.alone);
+  // The old rule (factored dedicated part spills) waits here.
+  MemoryNeed old = need;
+  old.dedicated = 0;
+  plan = PlanAdmission(reload, {}, "qwen3.8-27b", old, false, policy);
+  CHECK(plan.action == Action::kWait);
+  // Still safe: too little host RAM (12 GB - 4 reserve < 9.1) waits ...
+  plan = PlanAdmission(Machine(2.0, 0.4, 12), {}, "qwen3.8-27b", need, false,
+                       policy);
+  CHECK(plan.action == Action::kWait);
+  // ... and when dedicated really is short (28 GB free), the measured part
+  // that does not fit (0.9 GB) still counts as host spill: 13.5 GB host
+  // would do without it, with it the load waits.
+  plan = PlanAdmission(Machine(4.0, 0.4, 13.5), {}, "qwen3.8-27b", need, false,
+                       policy);
+  CHECK(plan.action == Action::kWait);
+  plan = PlanAdmission(Machine(4.0, 0.4, 14.6), {}, "qwen3.8-27b", need, false,
+                       policy);
+  CHECK(plan.action == Action::kSpawn && !plan.alone);
+}
+
 void TestWatchdog() {
   const MemoryPolicy policy;
   const std::vector<ResidentView> residents = {
@@ -395,6 +441,7 @@ int main() {
   TestHostLimit();
   TestSpillCountsAgainstHost();
   TestOwnSharedIsNoSpill();
+  TestReload27bAfterIdleUnload();
   TestWatchdog();
   TestFactors();
   TestMemoryBook();
