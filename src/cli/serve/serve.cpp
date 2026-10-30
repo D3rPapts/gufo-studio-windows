@@ -1313,8 +1313,7 @@ int RunServe(std::span<const char* const> args) {
     if (name.empty())
       name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
     if (moss && !options.loras.files.empty()) {
-      std::cerr << "Error: --lora is only supported for Qwen-Image-2.1
-";
+      std::cerr << "Error: --lora is only supported for Qwen-Image-2.1\n";
       return 2;
     }
     if (validate_only)
