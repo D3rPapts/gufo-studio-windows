@@ -69,6 +69,38 @@ std::string Base64(std::string_view bytes) {
   return output;
 }
 
+// Flux2 latents carry fine texture in channels a linear map turns into
+// coloured noise. Keep each pixel's luma, take the colour from a 3x3 box
+// average: rgb' = box(rgb) + (Y - box(Y)).
+void SmoothChroma(std::vector<float>& rgb, int width, int height) {
+  const std::vector<float> source = rgb;
+  const auto luma = [&](std::size_t p) {
+    return 0.299F * source[p * 3] + 0.587F * source[p * 3 + 1] +
+           0.114F * source[p * 3 + 2];
+  };
+  for (int y = 0; y < height; ++y)
+    for (int x = 0; x < width; ++x) {
+      float sum[3] = {0, 0, 0};
+      int count = 0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int yy = y + dy, xx = x + dx;
+          if (yy < 0 || yy >= height || xx < 0 || xx >= width)
+            continue;
+          const auto q = static_cast<std::size_t>(yy) * width + xx;
+          for (int k = 0; k < 3; ++k)
+            sum[k] += source[q * 3 + k];
+          ++count;
+        }
+      const auto p = static_cast<std::size_t>(y) * width + x;
+      const float box_luma =
+          (0.299F * sum[0] + 0.587F * sum[1] + 0.114F * sum[2]) / count;
+      const float detail = luma(p) - box_luma;
+      for (int k = 0; k < 3; ++k)
+        rgb[p * 3 + k] = sum[k] / count + detail;
+    }
+}
+
 struct JpegError {
   jpeg_error_mgr manager{};
   std::jmp_buf jump{};
@@ -124,6 +156,8 @@ std::vector<PreviewRgb> LatentToRgb(LatentFormat format,
         rgb[p * 3 + 2] = b;
       }
     }
+    if (format == LatentFormat::kFlux2Patched)
+      SmoothChroma(rgb, width, height);
     auto& image = images[static_cast<std::size_t>(f)];
     image.width = width;
     image.height = height;
