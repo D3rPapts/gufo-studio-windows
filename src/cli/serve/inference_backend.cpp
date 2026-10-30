@@ -159,8 +159,9 @@ TextPreparedPrompt PrepareQwenPrompt(
                          stats.misses, stats.evictions);
   }
   const auto cache_prefix = prompt->stable_prefix_tokens;
+  const auto instructions = prompt->instructions_tokens;
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}, cache_prefix};
+    return {std::move(prompt->tokens), {}, cache_prefix, instructions};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
@@ -172,7 +173,7 @@ TextPreparedPrompt PrepareQwenPrompt(
         {image.grid.offset, {identity.begin(), identity.end()}});
   }
   context->prompt = prompt;
-  return {prompt->tokens, std::move(context), cache_prefix};
+  return {prompt->tokens, std::move(context), cache_prefix, instructions};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -3041,7 +3042,7 @@ struct InferenceBackend::Impl {
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
-      bool cache_persist = true) const {
+      bool cache_persist = true, std::size_t instructions_tokens = 0) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3064,6 +3065,7 @@ struct InferenceBackend::Impl {
             .cache_prompt = cache_prompt,
             .cache_persist = cache_persist,
             .cache_prefix_tokens = cache_prefix_tokens,
+            .instructions_tokens = instructions_tokens,
             .stop_sequences = stop_sequences,
         });
     ScheduledGenerationRequest generation(std::move(current),
@@ -3899,7 +3901,7 @@ InferenceBackend::Result InferenceBackend::chat(
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
-      request.cache_persist);
+      request.cache_persist, prompt->instructions_tokens);
 #else
   (void)request;
   (void)max_tokens;
@@ -3996,6 +3998,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prompt = request.cache_prompt,
           .cache_persist = request.cache_persist,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
+          .instructions_tokens = prompt->instructions_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
       });

@@ -80,6 +80,7 @@ public:
     /// False keeps this request's checkpoints out of the disk cache.
     bool cache_persist{true};
     std::size_t cache_prefix_tokens{0};
+    std::size_t instructions_tokens{0};
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
