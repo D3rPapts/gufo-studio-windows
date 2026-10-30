@@ -4,10 +4,30 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [gufo_windows 1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0)**
-> (0.16 GB zip): text, images, speech and video from one OpenAI-compatible
-> port on Windows 11. Unpack it, edit `examples\router.ini`, run
-> `start-router.cmd`. The release notes list the 13 models tested.
+> **Download [gufo_windows 1.1.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.0)**
+> (zip, branch `release/1.1`): text, images, speech, music and video from one
+> OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
+> it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
+> first request. The release notes list what was tested.
+> Previous: [1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0).
+
+### New in 1.1
+
+- The router is part of `gufo.exe` (`gufo router`); models load on demand and
+  unload when idle; `POST /models/load` and `/models/unload`; an optional
+  memory guard keeps several models loaded while they fit.
+- Live previews for Qwen-Image, MOSS-Image, Wan 2.2 and MiniMax H3
+  (`/v1/previews/<id>/events`), shown on the `/bild/` and `/video/` pages and
+  at the KSampler node in ComfyUI.
+- ACE-Step 1.5 music (`/v1/audio/music`, page `/musik/`), Wan 2.1 + Uni3C
+  camera moves, RIFE to any frame rate (24 to 60 fps) and Real-ESRGAN
+  upscaling for video delivery.
+- A ComfyUI-compatible API in the router (`/prompt`, `/history`, `/view`,
+  `/ws`) that runs ComfyUI API-format workflows for Qwen-Image, H3, Wan 2.2,
+  Qwen3-TTS, ACE-Step, camera moves (incl. gufo's `GufoCameraMove` node), RIFE
+  target fps and Real-ESRGAN upscale chains.
+- Qwen3-TTS `speed`, long-system-prompt reuse for Qwen3.8-27B, and the Omni
+  captioner streaming its weights (about 1.7 GB host RAM instead of 12+ GB).
 
 This is a fork of [Gufo](https://github.com/gufo-org/gufo), the local
 inference engine for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S,
@@ -69,9 +89,10 @@ stayed a real call inside the kernels. Building HIP sources with `/Ob2`
 with bit-identical output; the 27B and Flash-Next kernels were already
 inlined and are unchanged.
 
-In progress: a ComfyUI-compatible API in the router (next to the
-OpenAI-style one), memory-aware loading of several models at once in the
-router, and ACE-Step 1.5 music.
+Since 1.1 (branch `release/1.1`): a ComfyUI-compatible API in the router
+(next to the OpenAI-style one), memory-aware loading of several models at
+once in the router, ACE-Step 1.5 music, Wan 2.1 + Uni3C camera moves,
+Real-ESRGAN upscaling and live previews.
 
 Not working here: Fish Audio Drama-3 TTS (its weights alone take 39.6 GB of
 GPU memory; not yet tried on the 128 GB machine), DeepSeek V4 Flash (too
