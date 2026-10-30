@@ -838,9 +838,20 @@ std::optional<std::string> QwenChatTemplate::Render(
     }
   }
 
+  // Windows 27B port (production since 24.10.): the stable boundary of
+  // instructions followed by one question is the end of the instructions,
+  // whatever their length. The runner's instructions checkpoint only covers
+  // instructions of at least one 2,048-token interval, so without this a
+  // new question under a shorter system prompt prefilled everything again
+  // (1.1k-token system prompt: 3.3 s instead of 0.2 s), and the uncached
+  // prefill put all but the generation prompt into its first chunk (a
+  // 270-token system + user prompt: 1.97 s instead of 1.60 s). A retry still
+  // restores the complete prompt, captured after the first token.
   if (stable_prefix_bytes != nullptr)
-    *stable_prefix_bytes = std::min(mutable_reasoning.value_or(output.size()),
-                                    final_user_start.value_or(output.size()));
+    *stable_prefix_bytes =
+        std::min({mutable_reasoning.value_or(output.size()),
+                  final_user_start.value_or(output.size()),
+                  instructions_end.value_or(output.size())});
   if (instructions_bytes != nullptr)
     *instructions_bytes = instructions_end.value_or(0);
   if (options.add_generation_prompt)

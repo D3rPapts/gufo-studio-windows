@@ -1782,7 +1782,7 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
 }
 
 std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
-    std::size_t stable) const {
+    std::size_t stable, std::vector<std::size_t>* cached) const {
   // Off with no disk cache keeps no checkpoint, so skip the planning.
   if (!impl_->cache->ram_enabled && !impl_->cache->queue)
     return {};
@@ -1802,16 +1802,20 @@ std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
        {},
        cache::GridLimit(impl_->cache->budget, private_bytes)});
   std::vector<std::size_t> boundaries;
-  for (const auto& capture : plan)
-    if (!capture.required &&
-        !HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
+  for (const auto& capture : plan) {
+    if (capture.required)
+      continue;
+    if (!HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
                             .first(capture.boundary)))
       boundaries.push_back(capture.boundary);
+    else if (cached != nullptr)
+      cached->push_back(capture.boundary);
+  }
   return boundaries;
 }
 std::vector<std::size_t> ServingCacheLease::PlannedCaptures(
-    std::size_t stable) const {
-  return component_->PlannedCaptures(stable);
+    std::size_t stable, std::vector<std::size_t>* cached) const {
+  return component_->PlannedCaptures(stable, cached);
 }
 
 ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {
