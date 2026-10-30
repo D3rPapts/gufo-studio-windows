@@ -692,6 +692,44 @@ def check_camera(router):
     assert status == 400 and "spiral" in body["error"]["message"], body
 
 
+def wan_delivery_graph(model_file="realesr-animevideov3.pth"):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "a fox in the snow"}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
+        "55": {"class_type": "Wan22ImageToVideoLatent", "inputs": {"vae": ["3", 0], "width": 1280, "height": 704, "length": 49, "batch_size": 1}},
+        "9": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["55", 0], "seed": 42, "steps": 20, "cfg": 5, "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["3", 0]}},
+        "60": {"class_type": "RIFE VFI", "inputs": {"ckpt_name": "rife49.pth", "frames": ["8", 0], "multiplier": 2}},
+        "61": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": model_file}},
+        "62": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["61", 0], "image": ["60", 0]}},
+        "63": {"class_type": "ImageScale", "inputs": {"image": ["62", 0], "upscale_method": "lanczos", "width": 1920, "height": 1080, "crop": "center"}},
+        "64": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["63", 0], "frame_rate": 60, "loop_count": 0, "filename_prefix": "film/lieferung/shot", "format": "video/h264-mp4", "pingpong": False, "save_output": True}},
+    }
+
+
+def check_delivery(router):
+    entry = router.run(wan_delivery_graph())
+    gifs = entry["outputs"]["64"]["gifs"]
+    assert gifs[0]["filename"] == "shot_00001_.mp4" and gifs[0]["frame_rate"] == 60, gifs
+    assert gifs[0]["format"] == "video/h264-mp4", gifs
+    status, data = router.request("GET", "/view?" + urllib.parse.urlencode(
+        {k: gifs[0][k] for k in ("filename", "subfolder", "type")}))
+    assert status == 200 and data == b"FAKEMP4-wan2.2-ti2v-5b"
+    call = [e for e in router.fake_entries() if e["path"] == "/v1/videos"][-1]
+    assert call["model"] == "wan2.2-ti2v-5b", call
+    gufo = call["fields"]["gufo"]
+    assert gufo["interpolate"] == {"fps": 60}, gufo
+    assert gufo["upscale"] == {"width": 1920, "height": 1080, "fit": "crop",
+                               "model": "realesr-animevideov3"}, gufo
+    status, body = router.json("POST", "/prompt", {"prompt": wan_delivery_graph(
+        "2x-AnimeSharpV4_Fast_RCAN_PU.safetensors")})
+    assert status == 400 and "not served by gufo" in body["error"]["message"], body
+    assert "61" in body["node_errors"], body
+
+
 def check_models_control(router):
     # llama.cpp router mode: POST /models/load and /models/unload {"model"}.
     status, body = router.json("POST", "/models/unload", {"model": "nope"})
@@ -892,6 +930,7 @@ def main():
         check_video(router, bool(ffmpeg))
         check_music(router, "flac" if ffmpeg else "wav")
         check_camera(router)
+        check_delivery(router)
         check_models_control(router)
         check_errors(router)
         check_websocket(router)

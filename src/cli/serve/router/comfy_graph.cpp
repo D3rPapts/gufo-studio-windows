@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <map>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -70,6 +71,10 @@ constexpr std::string_view kPlumbing[] = {
     "GetVideoComponents",
     "VHS_LoadVideo",
     "GufoCameraMove",
+    "UpscaleModelLoader",
+    "ImageUpscaleWithModel",
+    "ImageScale",
+    "ImageScaleBy",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -84,7 +89,8 @@ constexpr std::string_view kGenerators[] = {
 };
 
 constexpr std::string_view kOutputs[] = {
-    "SaveImage", "PreviewImage", "SaveAudio", "PreviewAudio", "SaveVideo"};
+    "SaveImage", "PreviewImage", "SaveAudio", "PreviewAudio", "SaveVideo",
+    "VHS_VideoCombine"};
 
 // Node families other gufo ports are bringing; named so the error says so.
 // (ACE-Step 1.0; gufo serves ACE-Step 1.5.)
@@ -1072,9 +1078,216 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
 OutputKind KindOf(std::string_view class_type) {
   if (class_type == "SaveAudio" || class_type == "PreviewAudio")
     return OutputKind::kAudio;
-  if (class_type == "SaveVideo")
+  if (class_type == "SaveVideo" || class_type == "VHS_VideoCombine")
     return OutputKind::kVideo;
   return OutputKind::kImage;
+}
+
+/// What the frame nodes between a video decode and one output ask for:
+/// RIFE multiplier or target frame rate, and Real-ESRGAN upscaling.
+struct Delivery {
+  int multiplier{1};
+  int fps_num{0};
+  int fps_den{1};
+  std::optional<VideoUpscale> upscale;
+  bool operator==(const Delivery&) const = default;
+};
+
+/// 60 -> 60/1, 59.94 -> 60000/1001, 12.5 -> 25/2.
+std::pair<int, int> FpsRational(double fps) {
+  if (std::abs(fps - std::round(fps)) < 1e-6)
+    return {static_cast<int>(std::lround(fps)), 1};
+  const double ntsc = fps * 1.001;
+  if (std::abs(ntsc - std::round(ntsc)) < 0.01)
+    return {static_cast<int>(std::lround(ntsc)) * 1000, 1001};
+  const int num = static_cast<int>(std::lround(fps * 1000));
+  const int divisor = std::gcd(num, 1000);
+  return {num / divisor, 1000 / divisor};
+}
+
+/// gufo's Real-ESRGAN checkpoints (BSD-3-Clause) by ComfyUI model file.
+std::string UpscaleModelName(std::string_view file) {
+  const std::string lower = Lower(file);
+  for (const char* name : {"realesr-general-wdn-x4v3", "realesr-general-x4v3",
+                           "realesr-animevideov3"})
+    if (lower.find(name) != std::string::npos)
+      return name;
+  return "";
+}
+
+int RoundEven(double value) {
+  return std::max(2, static_cast<int>(std::lround(value / 2.0)) * 2);
+}
+
+/// RIFE VFI, ImageUpscaleWithModel and ImageScale / ImageScaleBy between
+/// the decode of `video` and output `id` (`upstream` = its ancestors).
+Delivery DeliveryOf(const Graph& graph, const std::string& id,
+                    const std::set<std::string>& upstream,
+                    const VideoTask* video,
+                    std::vector<std::string>* warnings) {
+  std::vector<std::string> rife, upscalers, scalers;
+  for (const std::string& node_id : upstream) {
+    const std::string cls = graph.Class(node_id);
+    if (cls == "RIFE VFI")
+      rife.push_back(node_id);
+    else if (cls == "ImageUpscaleWithModel")
+      upscalers.push_back(node_id);
+    else if (cls == "ImageScale" || cls == "ImageScaleBy")
+      scalers.push_back(node_id);
+  }
+  Delivery delivery;
+  if (video == nullptr) {
+    if (!rife.empty())
+      throw NodeFailure(rife.front(), "unsupported_link",
+                        "RIFE VFI is served only after an H3 or Wan video "
+                        "(or a camera move) in the same workflow");
+    if (!upscalers.empty())
+      throw NodeFailure(upscalers.front(), "unsupported_link",
+                        "ImageUpscaleWithModel is served only after an H3, "
+                        "Wan or camera video (gufo.upscale)");
+    if (!scalers.empty())
+      throw NodeFailure(scalers.front(), "unsupported_link",
+                        "ImageScale on an output is served only after "
+                        "ImageUpscaleWithModel on a video");
+    return delivery;
+  }
+  const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+  if (!rife.empty()) {
+    if (rife.size() > 1)
+      throw NodeFailure(rife.back(), "unsupported_link",
+                        "chained RIFE VFI nodes are not supported");
+    delivery.multiplier =
+        static_cast<int>(graph.Num(rife.front(), "multiplier", 2));
+    if (delivery.multiplier < 1 || delivery.multiplier > 8)
+      throw NodeFailure(rife.front(), "unsupported_value",
+                        "gufo interpolates with a multiplier of 1..8");
+    const std::string ckpt = graph.Str(rife.front(), "ckpt_name", "");
+    // gufo serves RIFE 4.7-architecture weights (rife47 or rife49).
+    if (!ckpt.empty() && ckpt != "rife47.pth" && ckpt != "rife49.pth")
+      warnings->push_back("node " + rife.front() +
+                          ": gufo runs its RIFE 4.7/4.9 weights instead of " +
+                          ckpt);
+    if (graph.Num(rife.front(), "scale_factor", 1.0) != 1.0)
+      warnings->push_back("node " + rife.front() +
+                          ": scale_factor is ignored");
+  }
+  // The playback rate the output asks for: VHS_VideoCombine frame_rate or
+  // the CreateVideo fps in front of a SaveVideo.
+  double out_fps = 0;
+  std::string fps_node;
+  if (graph.Class(id) == "VHS_VideoCombine") {
+    out_fps = graph.Num(id, "frame_rate", 8);
+    fps_node = id;
+  } else if (graph.Class(id) == "SaveVideo") {
+    for (const std::string& node_id : upstream)
+      if (graph.Class(node_id) == "CreateVideo") {
+        out_fps = graph.Num(node_id, "fps", 0);
+        fps_node = node_id;
+      }
+  }
+  const double natural = static_cast<double>(base * delivery.multiplier);
+  if (out_fps > 0 && std::abs(out_fps - natural) > 1e-6) {
+    if (rife.empty() || out_fps <= base) {
+      // A rate at or below the generated one (e.g. CreateVideo left at 16 or
+      // 24 after RIFE) is not a delivery rate: keep real time.
+      warnings->push_back(
+          "node " + fps_node + ": fps " + std::to_string(out_fps) +
+          " ignored; gufo writes " +
+          std::to_string(static_cast<int>(natural)) +
+          " fps at the original speed" +
+          (rife.empty() ? " (add a RIFE VFI node to resample)" : ""));
+    } else {
+      // With RIFE in the chain a higher playback rate is the delivery rate:
+      // gufo resamples to it in real time. (ComfyUI would play the
+      // interpolated frames at that rate, i.e. change the speed.)
+      const auto [num, den] = FpsRational(out_fps);
+      if (num < 1 || den > 1001 || num > 240 * den)
+        throw NodeFailure(fps_node, "unsupported_value",
+                          "gufo resamples to 1..240 fps");
+      delivery.fps_num = num;
+      delivery.fps_den = den;
+      warnings->push_back(
+          "node " + fps_node + ": " + std::to_string(out_fps) +
+          " fps with RIFE x" + std::to_string(delivery.multiplier) +
+          " -> gufo resamples the video to " +
+          (den == 1 ? std::to_string(num)
+                    : std::to_string(num) + "/" + std::to_string(den)) +
+          " fps at the original speed");
+    }
+  }
+  if (upscalers.size() > 1)
+    throw NodeFailure(upscalers.back(), "unsupported_link",
+                      "chained ImageUpscaleWithModel nodes are not supported");
+  if (upscalers.empty()) {
+    if (!scalers.empty())
+      throw NodeFailure(scalers.front(), "unsupported_link",
+                        "ImageScale on a video output is served only after "
+                        "ImageUpscaleWithModel (gufo.upscale)");
+    return delivery;
+  }
+  const std::string& upscaler = upscalers.front();
+  const Link loader = graph.RequireLink(upscaler, "upscale_model");
+  if (graph.Class(loader.node) != "UpscaleModelLoader")
+    throw NodeFailure(upscaler, "unsupported_link",
+                      "upscale_model must come from UpscaleModelLoader");
+  const std::string file = graph.Str(loader.node, "model_name");
+  VideoUpscale upscale;
+  upscale.model = UpscaleModelName(file);
+  if (upscale.model.empty())
+    throw NodeFailure(loader.node, "unsupported_value",
+                      "upscale model '" + file +
+                          "' is not served by gufo; gufo upscales with the "
+                          "Real-ESRGAN models realesr-animevideov3, "
+                          "realesr-general-x4v3 and realesr-general-wdn-x4v3 "
+                          "(BSD-3-Clause)");
+  const double w4 = 4.0 * video->width;
+  const double h4 = 4.0 * video->height;
+  double width = w4;
+  double height = h4;
+  std::vector<std::string> after;
+  for (const std::string& scaler : scalers) {
+    if (!graph.Ancestors(scaler).contains(upscaler))
+      throw NodeFailure(scaler, "unsupported_link",
+                        "ImageScale before ImageUpscaleWithModel is not "
+                        "supported (gufo scales the upscaled video)");
+    after.push_back(scaler);
+  }
+  if (after.size() > 1)
+    throw NodeFailure(after.back(), "unsupported_link",
+                      "one ImageScale / ImageScaleBy after the upscaler");
+  if (!after.empty()) {
+    const std::string& scaler = after.front();
+    if (graph.Class(scaler) == "ImageScale") {
+      width = graph.Num(scaler, "width", 0);
+      height = graph.Num(scaler, "height", 0);
+      if (width <= 0 && height <= 0) {
+        width = w4;
+        height = h4;
+      } else if (width <= 0) {
+        width = height * w4 / h4;
+      } else if (height <= 0) {
+        height = width * h4 / w4;
+      }
+      upscale.fit =
+          graph.Str(scaler, "crop", "disabled") == "center" ? "crop" : "stretch";
+    } else {
+      const double by = graph.Num(scaler, "scale_by", 1.0);
+      if (!(by > 0))
+        throw NodeFailure(scaler, "unsupported_value", "scale_by must be > 0");
+      width = w4 * by;
+      height = h4 * by;
+    }
+  }
+  upscale.width = RoundEven(width);
+  upscale.height = RoundEven(height);
+  if (upscale.width > 7680 || upscale.height > 4320)
+    throw NodeFailure(after.empty() ? upscaler : after.front(),
+                      "unsupported_value",
+                      "gufo upscales to at most 7680x4320, not " +
+                          std::to_string(upscale.width) + "x" +
+                          std::to_string(upscale.height));
+  delivery.upscale = upscale;
+  return delivery;
 }
 
 json::Value NodeError(const std::string& class_type, const std::string& type,
@@ -1139,8 +1352,6 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["lora"] = task.lora;
     if (task.lora_strength)
       gufo["lora_strength"] = *task.lora_strength;
-    if (task.interpolate > 1)
-      gufo["interpolate"] = task.interpolate;
     if (task.audio_reference)
       gufo["audio_reference_frame"] = task.audio_reference_frame;
   } else if (task.family == VideoFamily::kCamera) {
@@ -1149,8 +1360,6 @@ json::Value VideoRequestBody(const VideoTask& task) {
         std::to_string(task.width) + "x" + std::to_string(task.height);
     body["seconds"] = (task.frames - 1) / 16.0;
     gufo["frames"] = task.frames;
-    if (task.interpolate > 1)
-      gufo["interpolate"] = task.interpolate;
     if (task.camera) {
       json::Value camera = json::Value::object();
       camera["type"] = task.camera->type;
@@ -1168,8 +1377,25 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["guidance"] = *task.guidance;
     if (!task.negative_prompt.empty())
       gufo["negative_prompt"] = task.negative_prompt;
-    if (task.interpolate > 1)
-      gufo["interpolate"] = task.interpolate;
+  }
+  if (task.fps_num > 0) {
+    json::Value interpolate = json::Value::object();
+    if (task.fps_den == 1)
+      interpolate["fps"] = task.fps_num;
+    else
+      interpolate["fps"] = std::to_string(task.fps_num) + "/" +
+                           std::to_string(task.fps_den);
+    gufo["interpolate"] = std::move(interpolate);
+  } else if (task.interpolate > 1) {
+    gufo["interpolate"] = task.interpolate;
+  }
+  if (task.upscale) {
+    json::Value upscale = json::Value::object();
+    upscale["width"] = task.upscale->width;
+    upscale["height"] = task.upscale->height;
+    upscale["fit"] = task.upscale->fit;
+    upscale["model"] = task.upscale->model;
+    gufo["upscale"] = std::move(upscale);
   }
   body["gufo"] = std::move(gufo);
   return body;
@@ -1369,7 +1595,7 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
   }
   // 2. Each output node is fed by exactly one generator.
   std::map<std::string, std::size_t> task_of;
-  std::map<std::size_t, std::optional<int>> rife_of;
+  std::map<std::size_t, std::optional<Delivery>> delivery_of;
   bool any_output = false;
   try {
     for (const auto& [id, node] : prompt.members()) {
@@ -1443,61 +1669,42 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
         throw NodeFailure(
             id, "unsupported_link",
             cls + " cannot store the output of " + task.class_type);
-      // RIFE VFI between the video decode and this output: gufo
-      // interpolates the whole video job (gufo.interpolate).
-      std::vector<std::string> rife;
-      for (const std::string& node_id : upstream)
-        if (graph.Class(node_id) == "RIFE VFI")
-          rife.push_back(node_id);
-      int multiplier = 1;
-      if (!rife.empty()) {
-        if (!std::holds_alternative<VideoTask>(task.spec))
-          throw NodeFailure(rife.front(), "unsupported_link",
-                            "RIFE VFI is served only after an H3 or Wan video "
-                            "in the same workflow");
-        if (rife.size() > 1)
-          throw NodeFailure(rife.back(), "unsupported_link",
-                            "chained RIFE VFI nodes are not supported");
-        multiplier = static_cast<int>(graph.Num(rife.front(), "multiplier", 2));
-        if (multiplier < 1 || multiplier > 8)
-          throw NodeFailure(rife.front(), "unsupported_value",
-                            "gufo interpolates with a multiplier of 1..8");
-        const std::string ckpt = graph.Str(rife.front(), "ckpt_name", "");
-        // gufo serves RIFE 4.7-architecture weights (rife47 or rife49).
-        if (!ckpt.empty() && ckpt != "rife47.pth" && ckpt != "rife49.pth")
-          plan->warnings.push_back("node " + rife.front() +
-                                   ": gufo runs its RIFE 4.7/4.9 weights "
-                                   "instead of " +
-                                   ckpt);
-        if (graph.Num(rife.front(), "scale_factor", 1.0) != 1.0)
-          plan->warnings.push_back("node " + rife.front() +
-                                   ": scale_factor is ignored");
-      }
-      // The audio track is not interpolated, so audio outputs do not count.
+      // RIFE VFI / upscale nodes between the decode and this output: gufo
+      // interpolates and upscales the whole video job (gufo.interpolate,
+      // gufo.upscale). The audio track is neither, so audio outputs do not
+      // count.
       auto* video = std::get_if<VideoTask>(&task.spec);
-      if (video != nullptr && target.kind != OutputKind::kAudio) {
-        auto& seen = rife_of[found->second];
-        if (seen && *seen != multiplier)
-          throw NodeFailure(id, "unsupported_link",
-                            "outputs of one video need the same RIFE "
-                            "interpolation (gufo interpolates the whole job)");
-        seen = multiplier;
-        video->interpolate = multiplier;
-        video->fps =
-            (video->family == VideoFamily::kCamera ? 16 : 24) * multiplier;
-        if (target.kind == OutputKind::kVideo) {
-          // CreateVideo's fps sets the playback speed; gufo keeps real time.
-          for (const std::string& node_id : upstream)
-            if (graph.Class(node_id) == "CreateVideo" &&
-                graph.Num(node_id, "fps", video->fps) != video->fps)
-              plan->warnings.push_back(
-                  "node " + node_id + ": fps " +
-                  std::to_string(graph.Num(node_id, "fps", 0)) +
-                  " ignored; gufo writes " + std::to_string(video->fps) +
-                  " fps at the original speed");
+      if (video == nullptr || target.kind != OutputKind::kAudio) {
+        const Delivery delivery =
+            DeliveryOf(graph, id, upstream, video, &plan->warnings);
+        if (video != nullptr) {
+          auto& seen = delivery_of[found->second];
+          if (seen && !(*seen == delivery))
+            throw NodeFailure(id, "unsupported_link",
+                              "outputs of one video need the same RIFE "
+                              "interpolation and upscale (gufo interpolates "
+                              "and upscales the whole job)");
+          seen = delivery;
+          video->interpolate = delivery.multiplier;
+          video->fps_num = delivery.fps_num;
+          video->fps_den = delivery.fps_den;
+          video->upscale = delivery.upscale;
+          const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+          video->fps = delivery.fps_num > 0
+                           ? static_cast<int>(std::lround(
+                                 static_cast<double>(delivery.fps_num) /
+                                 delivery.fps_den))
+                           : base * delivery.multiplier;
         }
       }
-      task.outputs.push_back(std::move(target));
+      if (cls == "VHS_VideoCombine") {
+        target.temp = !graph.Bool(id, "save_output", true);
+        target.prefix = graph.Str(id, "filename_prefix", "AnimateDiff");
+        const std::string format = graph.Str(id, "format", "video/h264-mp4");
+        if (format.find("mp4") == std::string::npos)
+          plan->warnings.push_back("node " + id + ": format " + format +
+                                   " -> gufo writes an H.264 MP4");
+      }      task.outputs.push_back(std::move(target));
     }
   } catch (const NodeFailure& failure) {
     error->type = "prompt_outputs_failed_validation";

@@ -141,6 +141,15 @@ json::Value MusicRequestBody(const MusicTask& task);
 
 enum class VideoFamily { kH3, kWan, kCamera };
 
+/// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
+struct VideoUpscale {
+  int width{0};
+  int height{0};
+  std::string fit{"stretch"};  // "pad", "crop" or "stretch"
+  std::string model;           // e.g. "realesr-animevideov3"
+  bool operator==(const VideoUpscale&) const = default;
+};
+
 /// A preset camera move -> gufo.camera {type, amount, speed, ease}.
 struct CameraMove {
   std::string type{"static"};
@@ -166,6 +175,12 @@ struct VideoTask {
   std::optional<double> lora_strength;
   int fps{24};
   int interpolate{1};  // RIFE multiplier from a "RIFE VFI" node (gufo 1..8)
+  /// Target frame rate fps_num / fps_den (gufo.interpolate {"fps"}) when a
+  /// RIFE VFI feeds an output with another frame rate; 0 = none.
+  int fps_num{0};
+  int fps_den{1};
+  /// ImageUpscaleWithModel (+ ImageScale / ImageScaleBy) after the decode.
+  std::optional<VideoUpscale> upscale;
   /// H3 MiniMaxH3AddGuide images between first and last frame (frame index,
   /// negative = from the end) -> gufo.keyframes.
   std::vector<std::pair<int, FileRef>> keyframes;

@@ -1493,7 +1493,23 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
   json::Value ui = json::Value::object();
   try {
     for (const OutputTarget& target : task.outputs) {
-      if (target.kind == OutputKind::kVideo) {
+      if (target.kind == OutputKind::kVideo &&
+          target.class_type == "VHS_VideoCombine") {
+        // VideoHelperSuite reports its file under "gifs" with the format
+        // and frame rate.
+        json::Value saved = SaveBytes(target, "mp4", content.body);
+        json::Value entry = saved["images"].items().front();
+        entry["format"] = "video/h264-mp4";
+        entry["frame_rate"] =
+            spec.fps_num > 0
+                ? static_cast<double>(spec.fps_num) / spec.fps_den
+                : static_cast<double>(spec.fps);
+        json::Value gifs = json::Value::array();
+        gifs.push_back(std::move(entry));
+        json::Value node = json::Value::object();
+        node["gifs"] = std::move(gifs);
+        ui[target.node_id] = std::move(node);
+      } else if (target.kind == OutputKind::kVideo) {
         json::Value saved = SaveBytes(target, "mp4", content.body);
         saved["animated"] = json::Value::array();
         saved["animated"].push_back(true);
