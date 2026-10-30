@@ -70,6 +70,11 @@ struct PreviewOptions {
   /// Preview every N-th step (the last step is never previewed: the result
   /// follows anyway).
   int every{1};
+  /// Preview every step instead while the schedule has at most this many
+  /// steps (0 = never): a short, distilled schedule (MiniMax H3 Turbo, 8
+  /// steps) changes a lot per step and would otherwise show only 3 previews.
+  /// An explicit "every" in the request turns it off.
+  int dense_up_to{0};
   /// Longer side of the preview in pixels.
   int max_side{512};
   /// Video: pixel frames of the whole video (for the frame range header and

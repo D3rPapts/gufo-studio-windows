@@ -1186,6 +1186,9 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << ",\n"
          << "  \"denoiser_sampler_ms\": " << telemetry.denoiser.sampler_ms
          << ",\n"
+         << "  \"denoiser_previews\": " << telemetry.denoiser.previews << ",\n"
+         << "  \"denoiser_preview_ms\": " << telemetry.denoiser.preview_ms
+         << ",\n"
          << "  \"denoiser_evaluations\": "
          << telemetry.denoiser.forward_ms.size() << ",\n"
          << "  \"denoiser_forward_ms\": [";

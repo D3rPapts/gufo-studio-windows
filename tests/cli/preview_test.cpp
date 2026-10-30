@@ -193,6 +193,39 @@ void TestWatchers() {
         "single frame of a video");
   Check(Get(hub, "/v1/previews/job2", "format=gif").status == 400,
         "unknown format");
+
+  // Short schedules (H3 Turbo, 8 steps) preview every step but the last;
+  // long ones keep every N-th.
+  auto dense = hub.Begin("job3", LatentFormat::kMinimaxH3,
+                         {.always = true, .every = 2, .dense_up_to = 16});
+  bool all_short = true;
+  for (int step = 1; step < 8; ++step)
+    all_short = all_short && dense.Wants(step, 8);
+  Check(all_short && !dense.Wants(8, 8), "dense cadence: steps 1..7 of 8");
+  Check(!dense.Wants(1, 49) && dense.Wants(2, 49) && !dense.Wants(49, 49),
+        "long schedule keeps every second step");
+  // The cadence counts from the last preview, so a model may skip steps
+  // (H3 reused steps) and still preview every `every` steps after that.
+  const auto encoded = hub.stats().encoded;
+  std::vector<float> h3(24 * 2 * 3 * 5, 0.3F);
+  dense.publish({.step = 3, .steps = 49, .frames = 2, .height = 3, .width = 5,
+                 .channels = 24, .channel_major = true, .data = h3});
+  for (int i = 0; i < 200 && hub.stats().encoded == encoded; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  Check(!dense.Wants(4, 49) && dense.Wants(5, 49) && dense.Wants(6, 49),
+        "next preview due two steps after the last one");
+}
+
+void TestDenseParse() {
+  // Video defaults keep the dense cadence; an explicit "every" wins.
+  PreviewOptions options{.every = 2, .dense_up_to = 16};
+  (void)gufo::server::ParsePreviewRequest(json::parse(R"({"always":true})"),
+                                          &options);
+  Check(options.dense_up_to == 16, "dense cadence kept without every");
+  (void)gufo::server::ParsePreviewRequest(json::parse(R"({"every":3})"),
+                                          &options);
+  Check(options.every == 3 && options.dense_up_to == 0,
+        "explicit every turns the dense cadence off");
 }
 
 }  // namespace
@@ -202,6 +235,7 @@ int main() {
   TestEncoders();
   TestParse();
   TestWatchers();
+  TestDenseParse();
   std::cout << "preview_test: ok\n";
   return 0;
 }

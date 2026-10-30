@@ -140,8 +140,10 @@ struct VideoJobRequest {
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
   // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
-  // every second step by default ("gufo": {"preview": {...}}).
-  PreviewOptions preview{.always = false, .every = 2, .max_side = 320};
+  // every second step by default, every step of a MiniMax H3 schedule with
+  // at most 16 steps (Turbo) ("gufo": {"preview": {...}}).
+  PreviewOptions preview{
+      .always = false, .every = 2, .dense_up_to = 16, .max_side = 320};
 };
 
 /// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).

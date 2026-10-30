@@ -869,6 +869,8 @@ struct VideoJobService::Impl {
       }
       // Live preview under the job id while someone watches it.
       PreviewOptions preview = job->request.preview;
+      if (options.family != VideoModelFamily::kMinimaxH3)
+        preview.dense_up_to = 0;
       preview.pixel_frames = job->request.parameters.frames;
       preview.fps = 24;
       generation.preview = PreviewHub::Global().Begin(
@@ -876,6 +878,7 @@ struct VideoJobService::Impl {
           options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
                                                      : LatentFormat::kMinimaxH3,
           preview);
+      const auto preview_before = PreviewHub::Global().stats();
       ProgressContext progress{this, job};
       minimax_h3::GenerationTelemetry telemetry;
       std::string error;
@@ -891,6 +894,20 @@ struct VideoJobService::Impl {
       WipeString(&generation.prompt);
       PreviewHub::Global().End(job->snapshot.id,
                                success && !job->cancellation.IsCancelled());
+      if (const auto stats = PreviewHub::Global().stats();
+          stats.published > preview_before.published) {
+        // Previews handed over during this job (process totals, so a
+        // concurrent image job would count too) and their encode time.
+        std::ostringstream line;
+        line << "job=" << job->snapshot.id << " event=previews published="
+             << stats.published - preview_before.published
+             << " encoded=" << stats.encoded - preview_before.encoded
+             << " encode_ms=" << std::lround(stats.encode_ms -
+                                             preview_before.encode_ms)
+             << " read_ms=" << std::lround(telemetry.denoiser.preview_ms)
+             << " read=" << telemetry.denoiser.previews;
+        Logger::Info("video", line.str());
+      }
       if (!success && !job->cancellation.IsCancelled()) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);
