@@ -949,6 +949,20 @@ Result Model::Generate(const Request& request,
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
+      if (request.preview.Wants(step + 1, request.steps)) {
+        // Flow matching: x0 = x_t - sigma_t * v at the step just taken.
+        const auto x = rt.Download(latent), v = rt.Download(velocity);
+        const float sigma = sigmas[step + 1];
+        std::vector<float> x0(x.size());
+        for (std::size_t i = 0; i < x0.size(); ++i)
+          x0[i] = x[i] - sigma * v[i];
+        request.preview.publish({.step = step + 1,
+                                 .steps = request.steps,
+                                 .height = height,
+                                 .width = width,
+                                 .channels = 64,
+                                 .data = x0});
+      }
       if (step == 0)
         report("step0");
     }

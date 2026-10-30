@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/preview_hook.hpp"
 #include "src/models/wan22/vae.hpp"
 
 namespace gufo::models::wan22 {
@@ -64,6 +65,9 @@ struct VideoCallbacks {
   std::function<void(int step, std::vector<float>& latents)> before_step;
   /// The guided noise prediction of each step, before the scheduler step.
   std::function<void(int step, std::span<const float> noise)> on_noise;
+  /// Live preview: the denoised estimate x0 = x - sigma * v of a step,
+  /// channel-major [48][latent frames][height / 16][width / 16].
+  PreviewHook preview;
 };
 
 /// Checks width/height (multiples of 32) and frames (4k + 1).

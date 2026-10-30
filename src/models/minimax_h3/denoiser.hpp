@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/runtime.hpp"
+#include "src/models/preview_hook.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
 namespace gufo::minimax_h3 {
@@ -127,6 +128,10 @@ public:
                                          void* progress_opaque,
                                          DenoiserTelemetry* telemetry,
                                          std::string* error = nullptr);
+
+  /// Live preview of the denoised video estimate before each Euler update
+  /// (channel-major [24][latent frames][height][width]); reads only.
+  void SetPreview(models::PreviewHook preview);
 
   [[nodiscard]] const GenerationGeometry& geometry() const noexcept;
   [[nodiscard]] const PackedLayout& layout() const noexcept;

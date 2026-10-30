@@ -26,6 +26,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/video_wan21.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/cli/serve/video_wan22.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -866,6 +867,15 @@ struct VideoJobService::Impl {
         condition.notify_all();
         continue;
       }
+      // Live preview under the job id while someone watches it.
+      PreviewOptions preview = job->request.preview;
+      preview.pixel_frames = job->request.parameters.frames;
+      preview.fps = 24;
+      generation.preview = PreviewHub::Global().Begin(
+          job->snapshot.id,
+          options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
+                                                     : LatentFormat::kMinimaxH3,
+          preview);
       ProgressContext progress{this, job};
       minimax_h3::GenerationTelemetry telemetry;
       std::string error;
@@ -879,6 +889,8 @@ struct VideoJobService::Impl {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
+      PreviewHub::Global().End(job->snapshot.id,
+                               success && !job->cancellation.IsCancelled());
       if (!success && !job->cancellation.IsCancelled()) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);

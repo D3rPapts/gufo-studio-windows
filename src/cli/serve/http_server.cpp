@@ -2252,6 +2252,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                  "omni_service_unavailable");
     return HandleOmniApiRequest(req, *omni_);
   }
+  if (IsPreviewPath(req.path) && (images_ || video_jobs_))
+    return HandlePreviewRequest(req, PreviewHub::Global());
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
       return Err(503, "Service Unavailable", "image service is not configured",

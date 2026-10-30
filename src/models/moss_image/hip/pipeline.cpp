@@ -500,6 +500,20 @@ Result Model::Generate(const Request& request,
       const float dt = sigmas[step + 1] - sigmas[step];
       for (std::size_t i = 0; i < latent.size(); ++i)
         latent[i] += dt * prediction[i];
+      const int done = static_cast<int>(step) + 1;
+      const int total = static_cast<int>(sigmas.size()) - 1;
+      if (request.preview.Wants(done, total)) {
+        // Flow matching: x0 = x_t - sigma_t * v at the step just taken.
+        std::vector<float> x0(latent.size());
+        for (std::size_t i = 0; i < x0.size(); ++i)
+          x0[i] = latent[i] - sigmas[step + 1] * prediction[i];
+        request.preview.publish({.step = done,
+                                 .steps = total,
+                                 .height = height,
+                                 .width = width,
+                                 .channels = kLatentChannels,
+                                 .data = x0});
+      }
       if (observer.Wants("latent." + std::to_string(step)))
         observer.write("latent." + std::to_string(step), latent, tokens,
                        kLatentChannels);

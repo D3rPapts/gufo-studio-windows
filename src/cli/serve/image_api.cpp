@@ -15,6 +15,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 
@@ -130,8 +131,8 @@ struct Parsed {
   std::optional<image::Image> init_image;
 };
 
-constexpr std::array<std::string_view, 4> kExtensionFields{
-    "negative_prompt", "guidance", "strength", "init_image"};
+constexpr std::array<std::string_view, 5> kExtensionFields{
+    "negative_prompt", "guidance", "strength", "init_image", "preview"};
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -239,7 +240,8 @@ Parsed Multipart(const HttpRequest& request) {
         auto& extension = parsed.fields["gufo"];
         if (!extension.is_object() || extension.contains(key))
           throw std::invalid_argument("duplicate field " + name);
-        extension[key] = key == "guidance" || key == "strength"
+        extension[key] = key == "guidance" || key == "strength" ||
+                                 key == "preview"
                              ? ParseJson(data)
                              : json::Value(std::string(data));
       } else if (name == "gufo") {
@@ -464,6 +466,26 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
                (1ULL << 53) - 1);
     const auto count = Number(fields, "n", 1, 1, 10);
     image::ValidateRequest(generation);
+    // Live preview ("gufo": {"preview": {"id": ...}}): rendered while someone
+    // watches /v1/previews/{id} (or always, when asked).
+    struct PreviewScope {
+      std::string id;
+      bool ok{false};
+      ~PreviewScope() {
+        if (!id.empty())
+          PreviewHub::Global().End(id, ok);
+      }
+    } preview;
+    if (const auto* options =
+            extension != nullptr ? extension->find("preview") : nullptr) {
+      PreviewOptions preview_options;
+      const auto id = ParsePreviewRequest(*options, &preview_options);
+      if (id.empty())
+        throw std::invalid_argument("gufo.preview needs an id");
+      generation.preview = PreviewHub::Global().Begin(
+          id, service.preview_format(), preview_options);
+      preview.id = id;
+    }
     auto body = json::Value::object();
     body["created"] = static_cast<double>(std::time(nullptr));
     auto data = json::Value::array();
@@ -501,10 +523,18 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << (result.metrics.released_text_encoder ? 1 : 0)
               << " resident_weight_mib="
               << result.metrics.resident_weight_bytes / (1024 * 1024);
+      if (!preview.id.empty()) {
+        // Process totals: latents handed over, previews encoded, encode time.
+        const auto stats = PreviewHub::Global().stats();
+        details << " preview_published=" << stats.published
+                << " preview_encoded=" << stats.encoded
+                << " preview_encode_ms=" << stats.encode_ms;
+      }
       Logger::Info("image", details.str());
       generation.seed = (generation.seed + 1) & ((1ULL << 53) - 1);
     }
     body["data"] = std::move(data);
+    preview.ok = true;
     return {.status = 200,
             .reason = "OK",
             .body = body.dump(),

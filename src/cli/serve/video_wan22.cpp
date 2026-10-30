@@ -46,6 +46,7 @@ bool RunWan22Job(const minimax_h3::GenerationRequest& request,
     if (progress != nullptr)
       progress(phase, done, total, progress_opaque);
   };
+  callbacks.preview = request.preview;
   callbacks.keep_going = [cancellation] {
     return cancellation == nullptr || !cancellation->IsCancelled();
   };

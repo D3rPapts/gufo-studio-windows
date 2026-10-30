@@ -127,6 +127,8 @@ struct GenerationRequest {
   // video file.
   std::string camera_json;
   std::filesystem::path guide_video_path;
+  // Live preview of the denoised latents (MiniMax H3 and Wan 2.2).
+  models::PreviewHook preview;
 };
 
 struct GenerationTelemetry {

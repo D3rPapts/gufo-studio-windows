@@ -1001,6 +1001,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
     return false;
   }
   ProgressBridge denoiser_progress{progress, progress_opaque, "denoiser"};
+  denoiser->SetPreview(request.preview);
   begin = Clock::now();
   if (!denoiser->DenoiseWithProgress(
           noise->video, noise->audio, cancellation, ForwardDenoiserProgress,
