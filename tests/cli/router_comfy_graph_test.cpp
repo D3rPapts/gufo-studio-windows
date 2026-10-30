@@ -435,6 +435,8 @@ void TestDialogue() {
   assert(dialogue.lines[2].text == "Wie geht es dir?");
   assert(dialogue.lines[2].model == "qwen3-tts-clone");
   assert(dialogue.lines[2].seed && *dialogue.lines[2].seed == 9);
+  // ComfyUI "Auto" stays automatic; dropping it would make gufo speak English.
+  assert(dialogue.lines[0].language == "auto");
   const auto& clone = std::get<comfy::SpeechTask>(clone_task->spec);
   assert((clone.reference_audio == comfy::FileRef{"anna.wav", "input"}));
   assert(clone.reference_text == "Hallo, ich bin Anna.");

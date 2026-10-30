@@ -324,4 +324,76 @@ std::vector<float> ResampleMono(const AudioBuffer& audio,
   return result;
 }
 
+std::vector<float> TimeStretchMono(std::span<const float> mono,
+                                   std::uint32_t sample_rate, double speed) {
+  if (!std::isfinite(speed) || speed < kMinimumSpeechSpeed ||
+      speed > kMaximumSpeechSpeed || sample_rate == 0) {
+    throw std::invalid_argument("speech speed or sample rate is invalid");
+  }
+  if (speed == 1.0 || mono.empty()) {
+    return {mono.begin(), mono.end()};
+  }
+  const auto input_size = static_cast<std::int64_t>(mono.size());
+  const auto output_size = static_cast<std::int64_t>(
+      std::ceil(static_cast<double>(mono.size()) / speed));
+  // Even frame length so a periodic Hann window at 50 % overlap sums to 1.
+  const std::int64_t frame =
+      std::max<std::int64_t>(4, (sample_rate * 3 / 100) & ~std::int64_t{1});
+  const std::int64_t hop = frame / 2;
+  const std::int64_t tolerance = std::max<std::int64_t>(1, sample_rate / 100);
+  std::vector<double> window(static_cast<std::size_t>(frame));
+  for (std::int64_t n = 0; n < frame; ++n) {
+    window[static_cast<std::size_t>(n)] =
+        0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * static_cast<double>(n) /
+                             static_cast<double>(frame));
+  }
+  const auto at = [&](std::int64_t index) {
+    return index >= 0 && index < input_size
+               ? static_cast<double>(mono[static_cast<std::size_t>(index)])
+               : 0.0;
+  };
+  std::vector<double> sum(static_cast<std::size_t>(output_size + frame), 0.0);
+  std::vector<double> weight(sum.size(), 0.0);
+  std::int64_t previous = 0;
+  for (std::int64_t k = 0; k * hop < output_size; ++k) {
+    const auto nominal = static_cast<std::int64_t>(
+        std::llround(static_cast<double>(k * hop) * speed));
+    std::int64_t chosen = nominal;
+    if (k > 0) {
+      // Pick the input frame near the nominal position that best continues
+      // the waveform the previous frame would have produced naturally.
+      const std::int64_t natural = previous + hop;
+      double best = -std::numeric_limits<double>::infinity();
+      for (std::int64_t delta = -tolerance; delta <= tolerance; ++delta) {
+        const std::int64_t candidate = nominal + delta;
+        if (candidate < 0) {
+          continue;
+        }
+        double score = 0.0;
+        for (std::int64_t n = 0; n < frame; n += 2) {
+          score += at(candidate + n) * at(natural + n);
+        }
+        if (score > best) {
+          best = score;
+          chosen = candidate;
+        }
+      }
+    }
+    const std::int64_t base = k * hop;
+    for (std::int64_t n = 0; n < frame; ++n) {
+      const double w = window[static_cast<std::size_t>(n)];
+      sum[static_cast<std::size_t>(base + n)] += at(chosen + n) * w;
+      weight[static_cast<std::size_t>(base + n)] += w;
+    }
+    previous = chosen;
+  }
+  std::vector<float> result(static_cast<std::size_t>(output_size));
+  for (std::size_t i = 0; i < result.size(); ++i) {
+    result[i] = weight[i] > 1e-6
+                    ? static_cast<float>(sum[i] / weight[i])
+                    : 0.0F;
+  }
+  return result;
+}
+
 }  // namespace gufo::models::qwen3_tts

@@ -675,8 +675,10 @@ void ApplyClonePrompt(const Graph& graph, const std::string& id,
 /// Language, seed and sampling fields shared by every TTS node.
 void ApplySpeechCommon(const Graph& graph, const std::string& id,
                        SpeechTask* task, std::vector<std::string>* warnings) {
-  const std::string language = graph.Str(id, "language", "Auto");
-  task->language = language == "Auto" ? "" : Lower(language);
+  // ComfyUI "Auto" lets Qwen3-TTS pick the language (codec "nothink"
+  // prefix). gufo's own default for an omitted language is English, so
+  // "Auto" must be sent as "auto" rather than left out.
+  task->language = Lower(graph.Str(id, "language", "Auto"));
   if (const json::Value* seed = graph.Literal(id, "seed");
       seed != nullptr && seed->is_number())
     task->seed = Seed(seed->as_double());

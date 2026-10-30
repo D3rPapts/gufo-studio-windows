@@ -27,6 +27,18 @@ struct AudioBuffer {
 [[nodiscard]] std::vector<float> ResampleMono(const AudioBuffer& audio,
                                               std::uint32_t output_sample_rate);
 
+inline constexpr double kMinimumSpeechSpeed = 0.25;
+inline constexpr double kMaximumSpeechSpeed = 4.0;
+
+/// Changes the speaking rate of mono audio without changing its pitch
+/// (WSOLA: 30 ms Hann frames, 50 % overlap, +-10 ms similarity search).
+/// speed > 1 is faster/shorter: the result has ceil(size / speed) samples.
+/// speed == 1 returns the input unchanged. Throws std::invalid_argument for
+/// a speed outside [kMinimumSpeechSpeed, kMaximumSpeechSpeed] or a zero rate.
+[[nodiscard]] std::vector<float> TimeStretchMono(std::span<const float> mono,
+                                                 std::uint32_t sample_rate,
+                                                 double speed);
+
 }  // namespace gufo::models::qwen3_tts
 
 #endif  // GUFO_MODELS_QWEN3_TTS_AUDIO_HPP_

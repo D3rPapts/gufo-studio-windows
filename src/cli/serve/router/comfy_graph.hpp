@@ -102,7 +102,7 @@ struct SpeechTask {
   std::string voice;
   std::string text;
   std::string instructions;
-  std::string language;  // gufo spelling ("german"); empty = model default
+  std::string language;  // gufo spelling ("german", "auto"); empty = model default
   std::optional<std::uint64_t> seed;
   std::optional<FileRef> reference_audio;
   std::string reference_text;

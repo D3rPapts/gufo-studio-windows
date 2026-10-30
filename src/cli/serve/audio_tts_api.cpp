@@ -325,10 +325,22 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   if (sse && !pcm)
     return Error(400, "Bad Request", "SSE audio requires response_format 'pcm'",
                  "invalid_response_format");
-  if (const json::Value* speed = body.find("speed");
-      speed != nullptr && (!speed->is_number() || speed->as_double() != 1.0)) {
+  // OpenAI "speed": a pitch-preserving time stretch of the finished
+  // waveform. 1.0 (the default) leaves the model's own speaking rate
+  // untouched, so default output is unchanged.
+  double speed = 1.0;
+  if (const json::Value* value = body.find("speed"); value != nullptr) {
+    if (!value->is_number() || !std::isfinite(value->as_double()) ||
+        value->as_double() < models::qwen3_tts::kMinimumSpeechSpeed ||
+        value->as_double() > models::qwen3_tts::kMaximumSpeechSpeed) {
+      return Error(400, "Bad Request", "'speed' must be between 0.25 and 4.0",
+                   "invalid_speed");
+    }
+    speed = value->as_double();
+  }
+  if (speed != 1.0 && pcm) {
     return Error(400, "Bad Request",
-                 "Qwen3-TTS currently supports speed 1.0 only",
+                 "'speed' other than 1.0 requires response_format 'wav'",
                  "invalid_speed");
   }
   for (const std::string_view name : {"language", "instructions"}) {
@@ -495,6 +507,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     }
     return Error(500, "Internal Server Error", std::move(error),
                  "generation_failed");
+  }
+  if (speed != 1.0) {
+    result.samples = models::qwen3_tts::TimeStretchMono(
+        result.samples, result.sample_rate, speed);
+    result.sample_count = result.samples.size();
   }
   std::string wav = EncodeWav(result.samples, result.sample_rate);
   if (wav.empty()) {
