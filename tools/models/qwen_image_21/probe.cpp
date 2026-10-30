@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: qwen_image_21_probe MODEL_DIR OUTPUT_DIR [PROMPT] "
                  "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N] "
                  "[--negative TEXT] "
-                 "[--guidance X] [--init IMAGE --strength S]\n";
+                 "[--guidance X] [--init IMAGE --strength S] "
                  "[--lora NAME=PATH]... [--lora-default NAME:SCALE]...\n";
     return 2;
   }
