@@ -93,6 +93,8 @@ constexpr std::chrono::seconds kShutdownDrain{10};
 /// Remote routers: model list refresh period and the bound of one probe.
 constexpr std::chrono::seconds kRemoteProbeEvery{5};
 constexpr std::chrono::milliseconds kRemoteProbeTimeout{2000};
+/// Busy-check url: poll period while it reports work.
+constexpr std::chrono::seconds kBusyCheckEvery{2};
 
 HttpResponse Err(int status, std::string_view reason, std::string_view message,
                  std::string_view type, std::string_view code) {
@@ -569,9 +571,10 @@ private:
 };
 
 /// Everything one remote relay holds until its response is done: the busy
-/// count (job reads route back, /models/unload sees it) and the in-flight
-/// count the shutdown drain waits for. Release is idempotent and takes the
-/// state mutex itself (through HeldBusy).
+/// count (job reads route back, /models/unload sees it), the in-flight
+/// count the shutdown drain waits for and, with gpu-slot, the remote GPU
+/// slot unless a started job takes it over. Release is idempotent and takes
+/// the state mutex itself (through HeldBusy).
 class RemoteHold {
 public:
   RemoteHold(std::shared_ptr<HeldBusy> busy, std::atomic<int>& inflight)
@@ -582,18 +585,46 @@ public:
   RemoteHold& operator=(const RemoteHold&) = delete;
   ~RemoteHold() { Release(); }
 
+  void AttachSlot(std::shared_ptr<router::GpuSlots::Hold> slot) {
+    slot_ = std::move(slot);
+  }
+  /// Hands the slot to a started job (nullptr without one).
+  std::shared_ptr<router::GpuSlots::Hold> TakeSlot() {
+    return std::move(slot_);
+  }
+
   void Release() {
     if (released_.exchange(true)) {
       return;
     }
     busy_->Release();
     --inflight_;
+    if (slot_ != nullptr) {
+      slot_->Release();
+    }
   }
 
 private:
   std::shared_ptr<HeldBusy> busy_;
   std::atomic<int>& inflight_;
+  std::shared_ptr<router::GpuSlots::Hold> slot_;
   std::atomic<bool> released_{false};
+};
+
+/// True for remote requests that start GPU work there (generation,
+/// transcription, chat, a job, a load); reads never wait for the slot.
+bool StartsRemoteGpuWork(const HttpRequest& req) {
+  return req.method == "POST";
+}
+
+/// A remote video or async music job that holds its model's GPU slot until
+/// it ends. The remote thread polls its status; a client read that sees it
+/// end releases it as well.
+struct RemoteJob {
+  std::string model_id;
+  router::RemoteSpec spec;
+  bool music{false};
+  std::shared_ptr<router::GpuSlots::Hold> slot;
 };
 
 bool IsVideoCreate(const HttpRequest& req) {
@@ -688,6 +719,8 @@ public:
 
   /// The job id a create response recorded (after Commit); "" otherwise.
   const std::string& tracked() const { return tracked_; }
+  /// The job a status, content or DELETE read is about; "" for a create.
+  const std::string& job_id() const { return job_id_; }
 
 private:
   /// Releases the job only for the model that answered: music ids are
@@ -741,6 +774,12 @@ public:
   /// Reachability and model states of the remote routers; null without
   /// [remote/<id>] sections.
   std::unique_ptr<router::RemoteHub> remotes;
+  /// Remote GPU slots (preset gpu-slot).
+  router::GpuSlots gpu_slots;
+  /// Remote jobs holding a GPU slot, by job id (own mutex, never nested
+  /// inside the state mutex).
+  std::mutex remote_jobs_mutex_;
+  std::map<std::string, RemoteJob> remote_jobs_;
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -1013,6 +1052,12 @@ public:
         std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
         remote_inflight);
     lock.unlock();
+    if (StartsRemoteGpuWork(req)) {
+      if (auto refused = WaitForRemoteGpu(req, model_id, spec, *hold)) {
+        hold->Release();
+        return std::move(*refused);
+      }
+    }
     HttpResponse response = RelayRemote(model_id, spec, req);
     if (response.status == 503 && !response.streaming_body) {
       hold->Release();
@@ -1027,10 +1072,12 @@ public:
       hold->Release();
       return response;
     }
-    // The hold lives until the streamed body completes or cancels.
+    // The hold lives until the streamed body completes or cancels; a video
+    // or async music job keeps the GPU slot until it ends.
     HttpResponse streamed = std::move(response);
-    streamed.streaming_body = [inner = std::move(streamed.streaming_body),
-                               hold, sniffer](
+    const bool music = IsMusicCreate(req);
+    streamed.streaming_body = [this, inner = std::move(streamed.streaming_body),
+                               hold, sniffer, model_id, spec, music](
                                   const HttpResponse::BodyWriter& writer) {
       const HttpResponse::BodyWriter sink =
           sniffer == nullptr ? writer
@@ -1045,10 +1092,152 @@ public:
       }
       if (sniffer != nullptr) {
         sniffer->Commit();
+        if (!sniffer->tracked().empty()) {
+          if (auto slot = hold->TakeSlot()) {
+            HoldSlotForJob(sniffer->tracked(), model_id, spec, music,
+                           std::move(slot));
+          }
+        } else if (!sniffer->job_id().empty()) {
+          ReleaseJobSlotIfDone(sniffer->job_id());
+        }
       }
       hold->Release();
     };
     return streamed;
+  }
+
+  /// Hands the GPU slot of the request that started a remote job to the
+  /// job, until the remote thread or a client read sees it end.
+  void HoldSlotForJob(const std::string& job_id, const std::string& model_id,
+                      const router::RemoteSpec& spec, bool music,
+                      std::shared_ptr<router::GpuSlots::Hold> slot) {
+    slot->Describe(std::string(music ? "music" : "video") + " job " + job_id +
+                   " on " + model_id);
+    const std::lock_guard<std::mutex> lock(remote_jobs_mutex_);
+    auto& job = remote_jobs_[job_id];
+    if (job.slot != nullptr && job.slot != slot) {
+      job.slot->Release();
+    }
+    job = RemoteJob{model_id, spec, music, std::move(slot)};
+  }
+
+  /// Releases the slot of a job the registry no longer counts as open.
+  void ReleaseJobSlotIfDone(const std::string& job_id) {
+    bool open = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      open = registry.JobOpen(job_id);
+    }
+    if (!open) {
+      ReleaseJobSlot(job_id, "finished");
+    }
+  }
+
+  void ReleaseJobSlot(const std::string& job_id, std::string_view why) {
+    std::shared_ptr<router::GpuSlots::Hold> slot;
+    std::string model_id;
+    {
+      const std::lock_guard<std::mutex> lock(remote_jobs_mutex_);
+      const auto it = remote_jobs_.find(job_id);
+      if (it == remote_jobs_.end()) {
+        return;
+      }
+      slot = std::move(it->second.slot);
+      model_id = it->second.model_id;
+      remote_jobs_.erase(it);
+    }
+    Logger::Info("router", "event=remote_job_end job=" + job_id +
+                               " model=" + model_id + " reason=" +
+                               std::string(why));
+    if (slot != nullptr) {
+      slot->Release();
+    }
+  }
+
+  /// Before a GPU-starting remote request (state mutex free): takes the
+  /// model's gpu slot, then waits while the busy-check url reports work,
+  /// both within queue-timeout-seconds. Returns the 503 remote_busy when
+  /// the wait ran out (or the client left), nullopt to go ahead.
+  std::optional<HttpResponse> WaitForRemoteGpu(const HttpRequest& req,
+                                               const std::string& model_id,
+                                               const router::RemoteSpec& spec,
+                                               RemoteHold& hold) {
+    const auto began = std::chrono::steady_clock::now();
+    const auto deadline =
+        began + std::chrono::seconds(spec.queue_timeout_seconds);
+    const auto busy = [&](const std::string& what) {
+      Logger::Warn("router", "event=remote_busy model=" + model_id +
+                                 " waited_ms=" +
+                                 std::to_string(
+                                     std::chrono::duration_cast<
+                                         std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() -
+                                         began)
+                                         .count()) +
+                                 " reason=\"" + what + "\"");
+      HttpResponse refused =
+          Err(503, "Service Unavailable",
+              "remote model '" + model_id + "' is busy: " + what,
+              "server_error", "remote_busy");
+      refused.headers.emplace_back("Retry-After", "30");
+      return refused;
+    };
+    if (!spec.gpu_slot.empty()) {
+      auto slot = gpu_slots.Acquire(
+          spec.gpu_slot, req.method + " " + req.path + " " + model_id,
+          std::chrono::milliseconds(std::chrono::seconds(
+              spec.queue_timeout_seconds)),
+          req.is_cancelled);
+      if (slot == nullptr) {
+        return busy("gpu slot '" + spec.gpu_slot + "' stayed taken");
+      }
+      hold.AttachSlot(std::move(slot));
+    }
+    if (!spec.busy_check.has_value()) {
+      return std::nullopt;
+    }
+    const router::RemoteEndpoint& check = *spec.busy_check;
+    for (;;) {
+      router::UpstreamTarget target;
+      target.host = check.host;
+      target.port = check.port;
+      target.connect_timeout = kRemoteProbeTimeout;
+      target.head_timeout = kRemoteProbeTimeout;
+      HttpRequest probe;
+      probe.method = "GET";
+      const auto query = check.path.find('?');
+      probe.path = check.path.substr(0, query);
+      if (query != std::string::npos)
+        probe.query = check.path.substr(query + 1);
+      const auto probe_deadline =
+          std::chrono::steady_clock::now() + 2 * kRemoteProbeTimeout;
+      probe.is_cancelled = [probe_deadline] {
+        return std::chrono::steady_clock::now() >= probe_deadline;
+      };
+      const router::comfy::FetchResult answer =
+          CollectResponse(router::ProxyToWorker(target, probe));
+      std::string result = "free";
+      if (answer.status == 502 && answer.body.find("upstream_unavailable") !=
+                                      std::string::npos) {
+        // Nothing answers (ComfyUI paused while gufo runs): free.
+        result = "unreachable (counts as free)";
+      } else if (answer.status == 200 &&
+                 router::BusyCheckSaysBusy(answer.body)) {
+        result = "busy";
+      }
+      remotes->NoteBusyCheck(check, result);
+      if (result != "busy") {
+        return std::nullopt;
+      }
+      if (req.is_cancelled && req.is_cancelled()) {
+        return busy("client left while the busy check reported work");
+      }
+      if (std::chrono::steady_clock::now() + kBusyCheckEvery >= deadline) {
+        return busy("busy check http://" + router::EndpointKey(check) +
+                    check.path + " kept reporting work");
+      }
+      std::this_thread::sleep_for(kBusyCheckEvery);
+    }
   }
 
   /// One relay to a remote router (state mutex free). A connect failure or
@@ -1183,8 +1372,33 @@ public:
                                  " model=" + model_id + " remote=" +
                                  spec.url.host + ":" +
                                  std::to_string(spec.url.port));
+      auto hold = std::make_shared<RemoteHold>(
+          std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
+          remote_inflight);
       lock.unlock();
-      return RelayRemote(model_id, spec, req);
+      if (!unload) {
+        // A load fills the remote GPU like a request does.
+        if (auto refused = WaitForRemoteGpu(req, model_id, spec, *hold)) {
+          hold->Release();
+          return std::move(*refused);
+        }
+      }
+      HttpResponse answer = RelayRemote(model_id, spec, req);
+      if (!answer.streaming_body) {
+        hold->Release();
+        return answer;
+      }
+      answer.streaming_body = [inner = std::move(answer.streaming_body),
+                               hold](const HttpResponse::BodyWriter& writer) {
+        try {
+          inner(writer);
+        } catch (...) {
+          hold->Release();
+          throw;
+        }
+        hold->Release();
+      };
+      return answer;
     }
     bool resident = false;
     bool busy = false;
@@ -1347,9 +1561,69 @@ public:
                                      " url=" + key);
         }
       }
+      PollRemoteJobs();
       const auto next = std::chrono::steady_clock::now() + kRemoteProbeEvery;
       while (!stop_requested.load() && std::chrono::steady_clock::now() < next)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
+  /// Asks the remote router how each slot-holding job is doing (no lock
+  /// held while asking). A terminal status, an unknown job or an
+  /// unreachable router ends the job here: its slot goes to the next
+  /// request and the registry stops counting it.
+  void PollRemoteJobs() {
+    std::vector<std::pair<std::string, RemoteJob>> jobs;
+    {
+      const std::lock_guard<std::mutex> lock(remote_jobs_mutex_);
+      for (const auto& [id, job] : remote_jobs_)
+        jobs.emplace_back(id, RemoteJob{job.model_id, job.spec, job.music,
+                                        nullptr});
+    }
+    for (const auto& [job_id, job] : jobs) {
+      if (stop_requested.load())
+        return;
+      router::UpstreamTarget target = router::RemoteTarget(job.spec);
+      target.connect_timeout = kRemoteProbeTimeout;
+      target.head_timeout = kRemoteProbeTimeout;
+      HttpRequest status;
+      status.method = "GET";
+      status.path = (job.music ? "/v1/audio/music/" : "/v1/videos/") + job_id;
+      if (job.music)
+        status.query = "model=" + job.model_id;
+      const auto deadline =
+          std::chrono::steady_clock::now() + 2 * kRemoteProbeTimeout;
+      status.is_cancelled = [deadline] {
+        return std::chrono::steady_clock::now() >= deadline;
+      };
+      const router::comfy::FetchResult answer =
+          CollectResponse(router::ProxyToWorker(target, status));
+      std::string end;
+      if (answer.status == 502 &&
+          answer.body.find("upstream_unavailable") != std::string::npos) {
+        end = "remote unreachable";
+      } else if (answer.status == 404) {
+        end = "unknown on the remote";
+      } else if (answer.status >= 200 && answer.status < 300) {
+        try {
+          const std::string value =
+              json::parse(answer.body).member_str("status");
+          if (value == "completed" || value == "failed" ||
+              value == "cancelled")
+            end = value;
+        } catch (const std::exception&) {
+          // Not a job object: ask again next round.
+        }
+      }
+      if (end.empty())
+        continue;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (registry.JobOwner(job_id) == job.model_id &&
+            registry.JobOpen(job_id))
+          registry.CompleteVideoJob(job_id);
+      }
+      ReleaseJobSlot(job_id, end);
     }
   }
 
@@ -1441,6 +1715,20 @@ public:
       }
       remote["models"] = std::move(models);
       remote["inflight"] = static_cast<long long>(remote_inflight.load());
+      remote["gpu_slots"] = gpu_slots.Status();
+      remote["busy_checks"] = remotes->BusyCheckStatus();
+      json::Value jobs_held = json::Value::object();
+      {
+        const std::lock_guard<std::mutex> lock(remote_jobs_mutex_);
+        for (const auto& [id, job] : remote_jobs_) {
+          json::Value entry = json::Value::object();
+          entry["model"] = job.model_id;
+          entry["kind"] = job.music ? "music" : "video";
+          entry["gpu_slot"] = job.spec.gpu_slot;
+          jobs_held[id] = std::move(entry);
+        }
+      }
+      remote["jobs"] = std::move(jobs_held);
       body["remote"] = std::move(remote);
     }
     return HttpResponse{.status = 200,

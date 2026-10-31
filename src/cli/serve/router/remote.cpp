@@ -285,4 +285,127 @@ json::Value RemoteHub::Status() const {
   return out;
 }
 
+void RemoteHub::NoteBusyCheck(const RemoteEndpoint& url,
+                              const std::string& result) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  busy_checks_["http://" + EndpointKey(url) + url.path] = {result,
+                                                           Clock::now()};
+}
+
+json::Value RemoteHub::BusyCheckStatus() const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto now = Clock::now();
+  json::Value out = json::Value::object();
+  for (const auto& [url, entry] : busy_checks_) {
+    json::Value check = json::Value::object();
+    check["result"] = entry.first;
+    check["checked_s_ago"] = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - entry.second)
+            .count());
+    out[url] = std::move(check);
+  }
+  return out;
+}
+
+struct GpuSlots::Hold::Table {
+  struct Slot {
+    bool held{false};
+    std::string holder;
+    Clock::time_point since{};
+    std::deque<std::uint64_t> queue;  // waiting tickets, arrival order
+  };
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::map<std::string, Slot> slots;
+  std::uint64_t next_ticket{0};
+};
+
+GpuSlots::GpuSlots() : table_(std::make_shared<Hold::Table>()) {}
+
+void GpuSlots::Hold::Release() {
+  {
+    const std::lock_guard<std::mutex> lock(table_->mutex);
+    if (released_) {
+      return;
+    }
+    released_ = true;
+    auto& slot = table_->slots[slot_];
+    slot.held = false;
+    slot.holder.clear();
+  }
+  table_->changed.notify_all();
+}
+
+void GpuSlots::Hold::Describe(const std::string& holder) {
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  if (!released_) {
+    table_->slots[slot_].holder = holder;
+  }
+}
+
+std::shared_ptr<GpuSlots::Hold> GpuSlots::Acquire(
+    const std::string& slot, const std::string& holder,
+    std::chrono::milliseconds wait, const std::function<bool()>& cancelled) {
+  const auto deadline = Clock::now() + wait;
+  std::unique_lock<std::mutex> lock(table_->mutex);
+  auto& entry = table_->slots[slot];
+  const std::uint64_t ticket = table_->next_ticket++;
+  entry.queue.push_back(ticket);
+  for (;;) {
+    if (!entry.held && entry.queue.front() == ticket) {
+      entry.queue.pop_front();
+      entry.held = true;
+      entry.holder = holder;
+      entry.since = Clock::now();
+      return std::shared_ptr<Hold>(new Hold(table_, slot));
+    }
+    // Wake in slices so a client that went away stops waiting.
+    const bool gone = cancelled && cancelled();
+    if (gone || Clock::now() >= deadline) {
+      entry.queue.erase(
+          std::find(entry.queue.begin(), entry.queue.end(), ticket));
+      lock.unlock();
+      table_->changed.notify_all();
+      return nullptr;
+    }
+    table_->changed.wait_for(
+        lock, std::min<Clock::duration>(std::chrono::milliseconds(200),
+                                        deadline - Clock::now()));
+  }
+}
+
+json::Value GpuSlots::Status() const {
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  const auto now = Clock::now();
+  json::Value out = json::Value::object();
+  for (const auto& [name, slot] : table_->slots) {
+    json::Value entry = json::Value::object();
+    entry["held"] = slot.held;
+    entry["waiting"] = static_cast<long long>(slot.queue.size());
+    if (slot.held) {
+      entry["holder"] = slot.holder;
+      entry["held_s"] = static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::seconds>(now - slot.since)
+              .count());
+    }
+    out[name] = std::move(entry);
+  }
+  return out;
+}
+
+bool BusyCheckSaysBusy(const std::string& body) {
+  try {
+    const json::Value queue = json::parse(body);
+    for (const char* key : {"queue_running", "queue_pending"}) {
+      const json::Value* items = queue.find(key);
+      if (items != nullptr && items->is_array() && items->size() > 0) {
+        return true;
+      }
+    }
+  } catch (const std::exception&) {
+    // Not a queue answer: nothing to wait for.
+  }
+  return false;
+}
+
 }  // namespace gufo::router

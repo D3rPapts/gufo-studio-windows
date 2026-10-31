@@ -5,8 +5,13 @@
 // and the shared state the router keeps about the remote routers.
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -96,6 +101,11 @@ public:
   /// {"<host:port>": {reachable, error, checked_s_ago, models}}.
   [[nodiscard]] json::Value Status() const;
 
+  /// Last answer of a busy-check url ("free", "busy", "unreachable: ...").
+  void NoteBusyCheck(const RemoteEndpoint& url, const std::string& result);
+  /// {"http://<host:port><path>": {result, checked_s_ago}}.
+  [[nodiscard]] json::Value BusyCheckStatus() const;
+
 private:
   struct RouterInfo {
     RemoteEndpoint url;
@@ -110,7 +120,58 @@ private:
   };
   mutable std::mutex mutex_;
   std::map<std::string, RouterInfo> routers_;
+  std::map<std::string, std::pair<std::string, Clock::time_point>>
+      busy_checks_;
 };
+
+/// Remote GPU slots: per gpu-slot name, one GPU-starting request (or a
+/// video/music job it started) at a time; the others wait in arrival order
+/// up to their queue timeout. Thread-safe; a Hold outlives nothing it needs
+/// (it shares the slot table).
+class GpuSlots {
+public:
+  using Clock = std::chrono::steady_clock;
+
+  GpuSlots();
+
+  class Hold {
+  public:
+    ~Hold() { Release(); }
+    Hold(const Hold&) = delete;
+    Hold& operator=(const Hold&) = delete;
+    /// Frees the slot (idempotent) and wakes the next waiter.
+    void Release();
+    /// What holds the slot, for /router/status ("job video_x on m").
+    void Describe(const std::string& holder);
+    [[nodiscard]] const std::string& slot() const { return slot_; }
+
+  private:
+    friend class GpuSlots;
+    struct Table;
+    Hold(std::shared_ptr<Table> table, std::string slot)
+        : table_(std::move(table)), slot_(std::move(slot)) {}
+    std::shared_ptr<Table> table_;
+    std::string slot_;
+    bool released_{false};
+  };
+
+  /// Waits until `slot` is free and takes it for `holder`. Returns nullptr
+  /// when `wait` passed or `cancelled()` turned true first.
+  [[nodiscard]] std::shared_ptr<Hold> Acquire(
+      const std::string& slot, const std::string& holder,
+      std::chrono::milliseconds wait, const std::function<bool()>& cancelled);
+
+  /// {"<slot>": {held, holder, held_s, waiting}} for the slots ever used.
+  [[nodiscard]] json::Value Status() const;
+
+private:
+  std::shared_ptr<Hold::Table> table_;
+};
+
+/// Whether a busy-check answer says the remote GPU is busy: a ComfyUI
+/// /queue object with a non-empty queue_running or queue_pending. Anything
+/// else (other JSON, not JSON) counts as free.
+[[nodiscard]] bool BusyCheckSaysBusy(const std::string& body);
 
 }  // namespace gufo::router
 

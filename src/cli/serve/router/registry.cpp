@@ -313,6 +313,10 @@ std::string Registry::JobOwner(std::string_view job_id) const {
   return it == finished_owners_.end() ? std::string() : it->second;
 }
 
+bool Registry::JobOpen(std::string_view job_id) const {
+  return job_owners_.find(std::string(job_id)) != job_owners_.end();
+}
+
 bool Registry::Busy(std::string_view model_id) const {
   const Entry* entry = Lookup(model_id);
   return entry != nullptr && BusyEntry(*entry);

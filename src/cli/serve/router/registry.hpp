@@ -70,6 +70,8 @@ public:
   void CompleteVideoJob(std::string_view job_id);
   /// Owner model id; "" when the job is unknown.
   [[nodiscard]] std::string JobOwner(std::string_view job_id) const;
+  /// True while the job is tracked and not completed.
+  [[nodiscard]] bool JobOpen(std::string_view job_id) const;
 
   /// True while any request, socket or video job is open for the model.
   [[nodiscard]] bool Busy(std::string_view model_id) const;
