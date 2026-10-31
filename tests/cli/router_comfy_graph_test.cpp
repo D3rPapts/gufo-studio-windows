@@ -420,6 +420,84 @@ void TestQwenLoras() {
   assert(comfy::LoraName("x.ckpt") == "x.ckpt");
 }
 
+void TestQwenTurbo() {
+  // A UNETLoader naming a Turbo checkpoint goes to the Turbo model, not to
+  // qwen-image-2.1; everything else in the graph maps as before.
+  std::string turbo = Replace(kQwenText, "qwen_image_2.1_int8_convrot",
+                              "qwen_image_2.1_turbo_bf16");
+  turbo = Replace(turbo, "\"steps\": 25, \"cfg\": 2.5",
+                  "\"steps\": 8, \"cfg\": 1.0");
+  const comfy::Plan plan = PlanOf(turbo.c_str());
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.model == "qwen-image-2.1-turbo");
+  assert(image.steps == 8);
+  assert(image.prompt == "A single mature adult male office worker");
+  assert(plan.warnings.empty());
+  assert(comfy::IsQwenImageTurboFile("Qwen_Image_2.1_TURBO.safetensors"));
+  assert(!comfy::IsQwenImageTurboFile("qwen_image_2.1_int8_convrot.safetensors"));
+
+  const auto plan_with = [](const std::string& text,
+                            const comfy::ModelIds& models, comfy::Plan* plan,
+                            comfy::PlanError* error) {
+    return comfy::BuildPlan(json::parse(text), models, plan, error);
+  };
+  // The router serves the Turbo model: same mapping.
+  comfy::ModelIds served;
+  served.available = {"qwen-image-2.1", "qwen-image-2.1-turbo"};
+  {
+    comfy::Plan p;
+    comfy::PlanError e;
+    assert(plan_with(turbo, served, &p, &e));
+    assert(std::get<comfy::ImageTask>(p.tasks[0].spec).model ==
+           "qwen-image-2.1-turbo");
+  }
+  // Without it: a validation error at the loader, never a silent fallback.
+  comfy::ModelIds base_only;
+  base_only.available = {"qwen-image-2.1"};
+  {
+    comfy::Plan p;
+    comfy::PlanError e;
+    assert(!plan_with(turbo, base_only, &p, &e));
+    assert(p.tasks.empty());
+    assert(e.type == "prompt_outputs_failed_validation");
+    const json::Value* node = e.node_errors.find("4");
+    assert(node != nullptr);
+    assert(node->member_str("class_type") == "UNETLoader");
+    assert(node->find("errors")->items()[0].member_str("type") ==
+           "value_not_in_list");
+    assert(e.message.find("qwen-image-2.1-turbo") != std::string::npos);
+    // The plain graph still runs on qwen-image-2.1 with that model list.
+    comfy::Plan plain;
+    assert(plan_with(kQwenText, base_only, &plain, &e));
+    assert(std::get<comfy::ImageTask>(plain.tasks[0].spec).model ==
+           "qwen-image-2.1");
+  }
+  // No Turbo model id configured: also an error at the loader.
+  comfy::ModelIds no_turbo;
+  no_turbo.image_turbo.clear();
+  {
+    comfy::Plan p;
+    comfy::PlanError e;
+    assert(!plan_with(turbo, no_turbo, &p, &e));
+    assert(e.node_errors.find("4") != nullptr);
+  }
+  // Turbo runs exactly 8 steps: other counts fail at the sampler.
+  const comfy::PlanError steps = ErrorOf(
+      Replace(turbo, "\"steps\": 8", "\"steps\": 20"));
+  assert(steps.node_errors.find("6") != nullptr);
+  assert(steps.message.find("exactly 8 steps, not 20") != std::string::npos);
+  // No partial-strength image to image on Turbo.
+  std::string canvas = Replace(kQwenCanvas, "qwen_image_2.1_int8_convrot",
+                               "qwen_image_2.1_turbo_bf16");
+  canvas = Replace(canvas, "\"steps\": 25", "\"steps\": 8");
+  assert(std::get<comfy::ImageTask>(PlanOf(canvas.c_str()).tasks[0].spec)
+             .model == "qwen-image-2.1-turbo");
+  const comfy::PlanError denoise =
+      ErrorOf(Replace(canvas, "\"denoise\": 1.0", "\"denoise\": 0.6"));
+  assert(denoise.node_errors.find("6") != nullptr);
+  assert(denoise.message.find("denoise") != std::string::npos);
+}
+
 void TestRife() {
   // VAEDecode -> RIFE VFI x4 -> SaveImage; the audio output stays plain.
   std::string text =
@@ -961,6 +1039,7 @@ int main() {
   TestUnsupportedNodes();
   TestImageToImage();
   TestQwenLoras();
+  TestQwenTurbo();
   TestRife();
   TestDialogue();
   TestAceStep();

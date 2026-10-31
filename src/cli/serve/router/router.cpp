@@ -1773,6 +1773,10 @@ int RunRouter(std::span<const char* const> args) {
     router::comfy::AdapterOptions comfy_options;
     comfy_options.root = comfy_dir;
     comfy_options.ffmpeg = comfy_ffmpeg;
+    // Graphs that need a model the preset lacks (Qwen-Image Turbo) fail
+    // validation instead of running on another model.
+    for (const auto& model : models)
+      comfy_options.models.available.push_back(model.id);
     RouterState* const raw = state.get();
     if (api_key.empty()) {
       // Jobs go through the front like any client, so they show up in the

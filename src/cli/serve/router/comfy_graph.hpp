@@ -8,7 +8,8 @@
 //
 // Supported families (each keyed by the node that produces the media):
 //   image  KSampler <- TextEncodeQwenImage21 / CLIPTextEncode (Qwen-Image)
-//          -> /v1/images/generations, or /v1/images/edits with references
+//          -> /v1/images/generations, or /v1/images/edits with references;
+//          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only)
 //   h3     KSampler <- MiniMaxH3ImageToVideo (+ MiniMaxH3AddGuide)
 //          -> /v1/videos (minimax-h3)
 //   wan    KSampler <- Wan22ImageToVideoLatent -> /v1/videos (wan2.2-ti2v-5b)
@@ -44,6 +45,10 @@ namespace gufo::router::comfy {
 /// Router model ids each node family is sent to.
 struct ModelIds {
   std::string image{"qwen-image-2.1"};
+  /// Qwen-Image graphs whose UNETLoader / checkpoint name contains "turbo"
+  /// (IsQwenImageTurboFile). They need exactly 8 steps and denoise 1; empty
+  /// = such graphs fail validation instead of running on `image`.
+  std::string image_turbo{"qwen-image-2.1-turbo"};
   std::string h3{"minimax-h3"};
   std::string wan{"wan2.2-ti2v-5b"};
   std::string tts_custom{"qwen3-tts"};
@@ -51,7 +56,15 @@ struct ModelIds {
   std::string tts_clone{"qwen3-tts-clone"};
   std::string music{"ace-step-1.5-xl-turbo"};
   std::string camera{"wan2.1-uni3c"};
+  /// The router's model ids. When not empty, a Turbo graph whose
+  /// `image_turbo` is not among them fails validation at the loader node
+  /// (no silent fallback to `image`). Empty = not checked.
+  std::vector<std::string> available;
 };
+
+/// True for a Qwen-Image Turbo checkpoint file name ("turbo" anywhere in it,
+/// any case), e.g. "qwen_image_2.1_turbo_bf16.safetensors".
+bool IsQwenImageTurboFile(std::string_view name);
 
 /// A file a Load* node names, e.g. "sub/name.png [output]".
 struct FileRef {

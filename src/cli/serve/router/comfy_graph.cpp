@@ -311,6 +311,7 @@ FileRef AudioFile(const Graph& graph, const std::string& id,
 
 struct ModelChain {
   std::string loader;  // unet/ckpt name
+  std::string loader_node;  // UNETLoader / CheckpointLoaderSimple node id
   std::vector<std::pair<std::string, double>> loras;  // sampler side first
   std::vector<std::string> lora_nodes;                 // node ids, same order
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
@@ -333,9 +334,11 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
       chain.uni3c = link.node;
     } else if (cls == "UNETLoader") {
       chain.loader = graph.Str(link.node, "unet_name", "");
+      chain.loader_node = link.node;
       return chain;
     } else if (cls == "CheckpointLoaderSimple") {
       chain.loader = graph.Str(link.node, "ckpt_name", "");
+      chain.loader_node = link.node;
       return chain;
     } else if (cls != "ModelSamplingAuraFlow" && cls != "ModelSamplingSD3" &&
                cls != "MiniMaxH3SigmaShift") {
@@ -425,6 +428,10 @@ std::string LoraName(std::string_view lora_name) {
   return std::string(lora_name);
 }
 
+bool IsQwenImageTurboFile(std::string_view name) {
+  return Lower(name).find("turbo") != std::string::npos;
+}
+
 namespace {
 
 ImageTask BuildImage(const Graph& graph, const std::string& sampler,
@@ -445,6 +452,38 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
       cfg != nullptr && cfg->is_number())
     task.guidance = cfg->as_double();
   const ModelChain chain = FollowModel(graph, sampler);
+  if (IsQwenImageTurboFile(chain.loader)) {
+    // A Turbo checkpoint is a different transformer with a fixed 8-step
+    // schedule: run it on the Turbo model or fail, never on `image`. Like the
+    // other value rules here, settings Turbo cannot honor fail validation
+    // instead of being changed silently.
+    const bool served =
+        !models.image_turbo.empty() &&
+        (models.available.empty() ||
+         std::find(models.available.begin(), models.available.end(),
+                   models.image_turbo) != models.available.end());
+    if (!served) {
+      const std::string id = models.image_turbo.empty()
+                                 ? std::string("qwen-image-2.1-turbo")
+                                 : models.image_turbo;
+      throw NodeFailure(chain.loader_node, "value_not_in_list",
+                        chain.loader +
+                            " is a Qwen-Image Turbo checkpoint, but the "
+                            "router serves no model '" + id +
+                            "' (add an [external/" + id +
+                            "] section to the router preset)");
+    }
+    task.model = models.image_turbo;
+    if (task.steps != 8)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "Qwen-Image-2.1-Turbo (" + chain.loader +
+                            ") runs exactly 8 steps, not " +
+                            std::to_string(task.steps) + "; set steps to 8");
+    if (task.strength)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "Qwen-Image-2.1-Turbo has no partial-strength "
+                        "image to image; set denoise to 1");
+  }
   // LoraLoader / LoraLoaderModelOnly -> "loras", in the order ComfyUI applies
   // them (loader side first). The worker merges them into the transformer;
   // the CLIP half of LoraLoader has no gufo counterpart.
