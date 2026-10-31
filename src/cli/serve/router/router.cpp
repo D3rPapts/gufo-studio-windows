@@ -870,7 +870,13 @@ public:
     }
     {
       const std::lock_guard<std::mutex> relock(mutex);
-      if (response.status == 502 && !response.streaming_body) {
+      // A client that went away while the worker had not answered yet also
+      // ends in a 502 ("client disconnected while waiting for the worker");
+      // the worker is fine then and must not be restarted (31.10.: a page
+      // that gave up after a 6-minute load wait killed the freshly loaded
+      // qwen-image-2.1-turbo worker one second after it took the request).
+      const bool client_gone = req.is_cancelled && req.is_cancelled();
+      if (response.status == 502 && !response.streaming_body && !client_gone) {
         HandleUpstreamFailureLocked(model_id);
       }
     }
