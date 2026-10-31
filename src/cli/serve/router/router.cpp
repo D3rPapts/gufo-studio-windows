@@ -1036,6 +1036,14 @@ public:
                                     const std::string& model_id,
                                     const router::RemoteSpec& spec,
                                     std::unique_lock<std::mutex>& lock) {
+    if (IsWebSocketPath(req)) {
+      // Stage 1 relays HTTP only; the WebSocket handshake would need the
+      // path and query forwarded (ws_relay sends `GET /`).
+      return Err(501, "Not Implemented",
+                 "WebSocket routes are not relayed to remote model '" +
+                     model_id + "'",
+                 "invalid_request_error", "remote_websocket_unsupported");
+    }
     if (spec.max_request_bytes > 0 &&
         req.body.size() > spec.max_request_bytes) {
       return Err(413, "Payload Too Large",
