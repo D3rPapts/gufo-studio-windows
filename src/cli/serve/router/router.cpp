@@ -773,7 +773,7 @@ public:
     std::unique_lock<std::mutex> lock(mutex);
     if (req.method == "POST" &&
         (req.path == "/models/load" || req.path == "/models/unload")) {
-      return ModelsControlLocked(req);
+      return ModelsControlLocked(req, lock);
     }
     if (const auto front = RouteFront(registry, autoload_failed, req)) {
       return *front;
@@ -1115,8 +1115,11 @@ public:
   /// unload of an unloaded model -> 400 "model is not running", load of a
   /// loaded/loading one -> 400 "model is already running". gufo addition:
   /// unloading a model that serves requests, sockets or video jobs is a 409
-  /// "model is busy" instead of cutting the work off.
-  HttpResponse ModelsControlLocked(const HttpRequest& req) {
+  /// "model is busy" instead of cutting the work off. A remote model's
+  /// load/unload goes to its router with the state mutex released; that
+  /// router answers (and decides about its memory) itself.
+  HttpResponse ModelsControlLocked(const HttpRequest& req,
+                                   std::unique_lock<std::mutex>& lock) {
     const bool unload = req.path == "/models/unload";
     std::string model_id;
     try {
@@ -1134,9 +1137,14 @@ public:
                                "not_found_error");
     }
     if (preset->remote.has_value()) {
-      return LlamaErr(501, "Not Implemented",
-                      "remote models are loaded by their own router",
-                      "not_supported_error");
+      const router::RemoteSpec spec = *preset->remote;
+      Logger::Info("router", std::string("event=models_") +
+                                 (unload ? "unload" : "load") +
+                                 " model=" + model_id + " remote=" +
+                                 spec.url.host + ":" +
+                                 std::to_string(spec.url.port));
+      lock.unlock();
+      return RelayRemote(model_id, spec, req);
     }
     bool resident = false;
     bool busy = false;
