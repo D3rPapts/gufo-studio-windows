@@ -1,5 +1,7 @@
 #include "src/cli/serve/router/preset.hpp"
 
+#include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -13,7 +15,7 @@ namespace {
 
 constexpr std::string_view kModalities[] = {"llm", "video", "image", "tts",
                                             "asr", "embedding", "omni",
-                                            "external"};
+                                            "external", "remote"};
 
 bool IsKnownModality(std::string_view modality) {
   for (const auto candidate : kModalities) {
@@ -120,7 +122,181 @@ bool ParseHint(const std::string& key, std::string_view value,
   return false;
 }
 
+/// Whole decimal number in [min, max].
+bool ParseWhole(std::string_view text, long long min, long long max,
+                long long* value) {
+  text = TrimSpaces(text);
+  const auto [ptr, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), *value);
+  return !text.empty() && ec == std::errc{} &&
+         ptr == text.data() + text.size() && *value >= min && *value <= max;
+}
+
+/// `[remote/<id>]`: only the remote keys; no worker argv, no router hints.
+bool ParseRemoteSection(const Section& section, PresetModel* model,
+                        std::string* error) {
+  RemoteSpec spec;
+  bool has_url = false;
+  for (const auto& [key, value] : section.entries) {
+    long long number = 0;
+    std::string url_error;
+    if (key == "url") {
+      if (!ParseRemoteUrl(value, /*allow_path=*/false, &spec.url,
+                          &url_error)) {
+        return SectionError(section, "url: " + url_error, error);
+      }
+      has_url = true;
+    } else if (key == "modality") {
+      if (value == "external" || value == "remote" ||
+          !IsKnownModality(value)) {
+        return SectionError(section,
+                            "modality takes llm|image|video|tts|asr|"
+                            "embedding|omni, not '" +
+                                value + "'",
+                            error);
+      }
+      model->modality = value;
+    } else if (key == "api-key-env") {
+      spec.api_key_env = std::string(TrimSpaces(value));
+    } else if (key == "gpu-slot") {
+      spec.gpu_slot = std::string(TrimSpaces(value));
+    } else if (key == "busy-check-url") {
+      RemoteEndpoint check;
+      if (!ParseRemoteUrl(value, /*allow_path=*/true, &check, &url_error)) {
+        return SectionError(section, "busy-check-url: " + url_error, error);
+      }
+      spec.busy_check = std::move(check);
+    } else if (key == "connect-timeout-seconds") {
+      if (!ParseWhole(value, 1, 300, &number)) {
+        return SectionError(section,
+                            "'connect-timeout-seconds' takes 1..300", error);
+      }
+      spec.connect_timeout_seconds = static_cast<int>(number);
+    } else if (key == "head-timeout-seconds") {
+      if (!ParseWhole(value, 0, 86400, &number)) {
+        return SectionError(section, "'head-timeout-seconds' takes 0..86400",
+                            error);
+      }
+      spec.head_timeout_seconds = static_cast<int>(number);
+    } else if (key == "queue-timeout-seconds") {
+      if (!ParseWhole(value, 0, 86400, &number)) {
+        return SectionError(section,
+                            "'queue-timeout-seconds' takes 0..86400", error);
+      }
+      spec.queue_timeout_seconds = static_cast<int>(number);
+    } else if (key == "max-request-bytes") {
+      if (!ParseWhole(value, 1, 1LL << 40, &number)) {
+        return SectionError(section,
+                            "'max-request-bytes' needs a positive number",
+                            error);
+      }
+      spec.max_request_bytes = static_cast<std::size_t>(number);
+    } else if (key == "remote-model" || key == "served-model-name") {
+      // Stage 1 routes by the same id on both routers.
+      return SectionError(section,
+                          "'" + key +
+                              "' is not supported: the remote router must "
+                              "serve this model under the same id",
+                          error);
+    } else if (key.starts_with("router-")) {
+      return SectionError(section,
+                          "'" + key +
+                              "' does not apply to remote models (the remote "
+                              "router manages their memory)",
+                          error);
+    } else if (IsReservedKey(key)) {
+      return SectionError(
+          section,
+          "reserved key '" + key + "' (use api-key-env for the remote key)",
+          error);
+    } else {
+      return SectionError(section, "unknown remote key '" + key + "'", error);
+    }
+  }
+  if (!has_url) {
+    return SectionError(section, "remote sections need 'url'", error);
+  }
+  if (model->modality.empty()) {
+    return SectionError(section, "remote sections need 'modality'", error);
+  }
+  if (!spec.api_key_env.empty()) {
+    const char* key = std::getenv(spec.api_key_env.c_str());
+    if (key == nullptr || *key == '\0') {
+      return SectionError(section,
+                          "environment variable '" + spec.api_key_env +
+                              "' (api-key-env) is not set",
+                          error);
+    }
+    spec.api_key = key;
+  }
+  model->id = section.id;
+  model->remote = std::move(spec);
+  return true;
+}
+
 }  // namespace
+
+bool ParseRemoteUrl(std::string_view text, bool allow_path,
+                    RemoteEndpoint* out, std::string* error) {
+  text = TrimSpaces(text);
+  constexpr std::string_view scheme = "http://";
+  if (!text.starts_with(scheme)) {
+    *error = "want http://<IPv4>:<port>, got '" + std::string(text) + "'";
+    return false;
+  }
+  std::string_view rest = text.substr(scheme.size());
+  std::string_view path;
+  if (const auto slash = rest.find('/'); slash != std::string_view::npos) {
+    path = rest.substr(slash);
+    rest = rest.substr(0, slash);
+  }
+  if (!allow_path && !path.empty() && path != "/") {
+    *error = "the url takes no path, got '" + std::string(text) + "'";
+    return false;
+  }
+  for (const char c : path) {
+    if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7F || c == '#') {
+      *error = "bad character in the path of '" + std::string(text) + "'";
+      return false;
+    }
+  }
+  const auto colon = rest.rfind(':');
+  long long port = 0;
+  if (colon == std::string_view::npos ||
+      !ParseWhole(rest.substr(colon + 1), 1, 65535, &port)) {
+    *error = "want http://<IPv4>:<port> with an explicit port, got '" +
+             std::string(text) + "'";
+    return false;
+  }
+  // Strict dotted quad: four decimal parts 0..255, nothing else.
+  const std::string_view host = rest.substr(0, colon);
+  std::uint32_t address = 0;
+  int parts = 0;
+  bool valid = true;
+  for (std::size_t begin = 0; valid && begin <= host.size(); ++parts) {
+    const auto end = std::min(host.find('.', begin), host.size());
+    const std::string_view digits = host.substr(begin, end - begin);
+    long long part = 0;
+    valid = !digits.empty() && digits.size() <= 3 &&
+            digits.find_first_not_of("0123456789") == std::string_view::npos &&
+            ParseWhole(digits, 0, 255, &part);
+    address = (address << 8) | static_cast<std::uint32_t>(part);
+    begin = end + 1;
+  }
+  if (!valid || parts != 4) {
+    *error = "the host must be a dotted IPv4 address, got '" +
+             std::string(host) + "'";
+    return false;
+  }
+  out->host = std::string(host);
+  out->address = address;
+  out->port = static_cast<int>(port);
+  out->path = allow_path ? std::string(path) : std::string();
+  if (allow_path && out->path.empty()) {
+    out->path = "/";
+  }
+  return true;
+}
 
 bool IsReservedKey(std::string_view key) {
   return key == "host" || key == "port" || key == "api-key";
@@ -139,6 +315,14 @@ bool LoadPreset(const std::filesystem::path& file,
   const auto flush = [&](const Section& section) -> bool {
     if (section.entries.empty()) {
       return SectionError(section, "empty section body", error);
+    }
+    if (section.modality == "remote") {
+      PresetModel model;
+      if (!ParseRemoteSection(section, &model, error)) {
+        return false;
+      }
+      models->push_back(std::move(model));
+      return true;
     }
     const bool external = section.modality == "external";
     std::vector<std::string> argv;

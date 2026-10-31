@@ -31,6 +31,7 @@
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
+#include "src/cli/serve/router/remote.hpp"
 #include "src/cli/serve/router/residency.hpp"
 #include "src/cli/serve/router/workers.hpp"
 #include "src/cli/serve/router/ws_relay.hpp"
@@ -64,7 +65,26 @@ constexpr std::string_view kPresetGrammar =
     "                          'gufo serve <modality>' shown below; boolean\n"
     "                          options take true|false.\n"
     "    host, port, api-key   are router-managed and rejected in "
-    "sections.\n\n";
+    "sections.\n"
+    "\n"
+    "    [remote/<model-id>]   a model another gufo router (1.2 or newer)\n"
+    "                          serves under the same id; nothing is started\n"
+    "                          here. Keys:\n"
+    "      url = http://<IPv4>:<port>   the remote router; must match\n"
+    "                                   --remote-allow (required)\n"
+    "      modality = image             llm|image|video|tts|asr|embedding|\n"
+    "                                   omni, as listed (required)\n"
+    "      api-key-env = NAME           environment variable with the remote\n"
+    "                                   router's --api-key\n"
+    "      connect-timeout-seconds = 3  unreachable -> 503 remote_unavailable\n"
+    "      head-timeout-seconds = 0     response head deadline (0 = none)\n"
+    "      gpu-slot = NAME              remote models sharing NAME run one\n"
+    "                                   GPU request (or video/music job) at\n"
+    "                                   a time; others wait\n"
+    "      queue-timeout-seconds = 900  longest wait, then 503 remote_busy\n"
+    "      busy-check-url = http://<IPv4>:<port>/queue  optional ComfyUI\n"
+    "                                   queue; wait while it runs anything\n"
+    "      max-request-bytes = N        413 above N bytes\n\n";
 
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
@@ -793,6 +813,11 @@ public:
     const router::PresetModel* preset = registry.Find(model_id);
     if (preset == nullptr) {
       return ModelNotFoundError();
+    }
+    if (preset->remote.has_value()) {
+      return Err(501, "Not Implemented",
+                 "remote model '" + model_id + "' is not routed yet",
+                 "server_error", "remote_not_implemented");
     }
     const bool ws_relay =
         IsWebSocketPath(req) && server::IsWebSocketUpgrade(req);
@@ -1677,6 +1702,7 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path jobs_dir;
   std::size_t jobs_parallel = 1;
   std::string jobs_webhook_allow;
+  std::string remote_allow;
   std::string jobs_webhook_secret;
   std::string jobs_webhook_retry = "5,30,120,600";
   std::size_t jobs_webhook_timeout_seconds = 10;
@@ -1747,6 +1773,12 @@ int RunRouter(std::span<const char* const> args) {
   parser.AddOption("", "--jobs-webhook-timeout-seconds", "SEC",
                    "Time one webhook attempt may take (default: 10)", "Jobs",
                    &jobs_webhook_timeout_seconds);
+  parser.AddOption("", "--remote-allow", "LIST",
+                   "Remote routers [remote/<id>] sections may name, comma "
+                   "separated: IPv4 addresses or a.b.c.d/n ranges, each "
+                   "with an optional :port. Default: none, remote sections "
+                   "are refused",
+                   "Router", &remote_allow);
   parser.AddOption("", "--models-max", "N",
                    "Maximum concurrently loaded workers (default: 2; "
                    "0 = unlimited)",
@@ -1861,6 +1893,24 @@ int RunRouter(std::span<const char* const> args) {
   if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error)) {
     std::cerr << "Error: " << preset_error << "\n";
     return 2;
+  }
+
+  // Remote models reach only the routers --remote-allow names.
+  std::vector<router::jobs::AllowEntry> remote_allow_list;
+  if (std::string allow_error; !router::jobs::ParseAllowList(
+          remote_allow, &remote_allow_list, &allow_error)) {
+    std::cerr << "Error: --remote-allow: " << allow_error << "\n";
+    return 2;
+  }
+  for (const auto& model : models) {
+    std::string remote_error;
+    if (model.remote.has_value() &&
+        !router::CheckRemoteAllowed(*model.remote, remote_allow_list,
+                                    &remote_error)) {
+      std::cerr << "Error: [remote/" << model.id << "] " << remote_error
+                << "\n";
+      return 2;
+    }
   }
 
   router::RegistryOptions registry_options;

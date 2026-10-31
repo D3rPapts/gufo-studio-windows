@@ -443,6 +443,7 @@ add_library(gufo_http STATIC
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
+  src/cli/serve/router/remote.cpp
   src/cli/serve/router/memory.cpp
   src/cli/serve/router/residency.cpp
   src/cli/serve/router/router.cpp
