@@ -309,6 +309,80 @@ void TestWatchdog() {
   CHECK(action.reason.empty() && action.abort_load.empty());
 }
 
+/// Machine() with a Windows commit reading: `commit_free` of a 75.6 GB limit.
+SystemMemory WithCommit(SystemMemory memory, double commit_free) {
+  memory.commit_valid = true;
+  memory.commit_limit = Gb(75.6);
+  memory.commit_available = Gb(commit_free);
+  return memory;
+}
+
+void TestCommitLimit() {
+  const MemoryPolicy policy;
+  // RAM and GPU fit, but GPU + host (20 + 4 GB) exceed free commit minus
+  // the 3 GB reserve: wait instead of a bad_alloc.
+  auto plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 25), {}, "m",
+                            Need(20, 4), false, policy);
+  CHECK(plan.action == Action::kWait);
+  CHECK(plan.reason.find("commit") != std::string::npos);
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 28), {}, "m",
+                       Need(20, 4), false, policy);
+  CHECK(plan.action == Action::kSpawn && !plan.alone);
+  // The model's own shared buffers are in its GPU and host need: counted once.
+  MemoryNeed with_shared = Need(20, 4);
+  with_shared.shared = Gb(3);
+  CHECK(gufo::router::CommitNeed(with_shared) == Gb(21));
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 24.5), {}, "m",
+                       with_shared, false, policy);
+  CHECK(plan.action == Action::kSpawn);
+  // An idle resident's private bytes come back when it is evicted.
+  ResidentView idle = Resident("idle", 10, 10, 1);
+  idle.current.commit = Gb(12);
+  plan = PlanAdmission(WithCommit(Machine(12, 0.2, 18), 20), {idle}, "m",
+                       Need(20, 4), false, policy);
+  CHECK(plan.action == Action::kEvict && plan.evict.size() == 1 &&
+        plan.evict[0] == "idle");
+  // A loading resident still owes commit up to its need (10 + 2 GB, holds 5).
+  ResidentView loading = Resident("l", 10, 3, 1, false, true);
+  loading.current.commit = Gb(5);
+  plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 19.5), {loading}, "m",
+                       Need(8, 2), false, policy);
+  CHECK(plan.action == Action::kWait);  // 19.5 - 7 owed - 3 < 10
+  plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 21), {loading}, "m",
+                       Need(8, 2), false, policy);
+  CHECK(plan.action == Action::kSpawn);
+  // A custom reserve.
+  MemoryPolicy loose = policy;
+  loose.reserve_commit = Gb(0.5);
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 25), {}, "m",
+                       Need(20, 4), false, loose);
+  CHECK(plan.action == Action::kSpawn);
+  // More than the whole commit limit: starts alone, the watchdog guards it.
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 30), 70), {}, "m",
+                       Need(47, 30), false, policy);
+  CHECK(plan.action == Action::kSpawn && plan.alone);
+  // Without a commit reading (POSIX) nothing changes.
+  plan = PlanAdmission(Machine(2, 0.2, 20), {}, "m", Need(20, 4), false,
+                       policy);
+  CHECK(plan.action == Action::kSpawn);
+}
+
+void TestCommitWatchdog() {
+  const MemoryPolicy policy;
+  const std::vector<ResidentView> residents = {
+      Resident("idle", 5, 5, 1), Resident("l1", 5, 5, 2, false, true)};
+  auto action = PlanWatchdog(WithCommit(Machine(10, 1, 8), 0.8), residents,
+                             {"l1"}, policy);
+  CHECK(action.abort_load == "l1");
+  CHECK(action.reason.find("commit memory critical") != std::string::npos);
+  action = PlanWatchdog(WithCommit(Machine(10, 1, 8), 0.8),
+                        {Resident("idle", 5, 5, 1)}, {}, policy);
+  CHECK(action.evict == "idle");
+  action = PlanWatchdog(WithCommit(Machine(10, 1, 8), 1.5), residents,
+                        {"l1"}, policy);
+  CHECK(action.reason.empty() && action.abort_load.empty());
+}
+
 void TestFactors() {
   // Estimates get the large factor, measured peaks the small one.
   MemoryBook book({});
@@ -443,6 +517,8 @@ int main() {
   TestOwnSharedIsNoSpill();
   TestReload27bAfterIdleUnload();
   TestWatchdog();
+  TestCommitLimit();
+  TestCommitWatchdog();
   TestFactors();
   TestMemoryBook();
   TestPresetHintsAndIdleOverride();

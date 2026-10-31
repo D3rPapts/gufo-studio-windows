@@ -24,6 +24,7 @@ struct Room {
   std::int64_t dedicated{0};
   std::int64_t shared{0};
   std::int64_t host{0};
+  std::int64_t commit{0};
 };
 
 /// Live free memory, plus what evicted residents give back, minus what the
@@ -35,12 +36,17 @@ Room Project(const SystemMemory& system,
   room.dedicated = system.gpu_valid ? system.DedicatedFree() : kUnbounded;
   room.shared = system.gpu_valid ? system.SharedFree() : kUnbounded;
   room.host = system.host_valid ? system.host_available : kUnbounded;
+  room.commit = system.commit_valid ? system.commit_available : kUnbounded;
   for (const ResidentView* view : evicted) {
     if (!view->current.valid) {
       continue;
     }
     room.dedicated += view->current.gpu_dedicated;
     room.shared += view->current.gpu_shared;
+    // Its private bytes come back; unmeasured, its GPU and host use.
+    room.commit += view->current.commit > 0
+                       ? view->current.commit
+                       : view->current.Gpu() + view->current.host_working_set;
     // A worker's own shared buffers (pinned host memory) are part of its
     // working set: measured on the 27B, host free dropped by the working set
     // alone. Count them once.
@@ -61,6 +67,13 @@ Room Project(const SystemMemory& system,
     room.dedicated -= from_dedicated;
     room.shared -= spill + owed_shared;
     room.host -= spill + owed_host;
+    // Commit still owed: the need minus what it already holds.
+    const std::int64_t held =
+        !measured ? 0
+        : view->current.commit > 0
+            ? view->current.commit
+            : view->current.Gpu() + view->current.host_working_set;
+    room.commit -= std::max<std::int64_t>(0, CommitNeed(view->need) - held);
   }
   return room;
 }
@@ -85,7 +98,13 @@ bool Fits(const Room& room, const MemoryNeed& need,
       need.dedicated > 0 ? need.dedicated : need.gpu - need.shared;
   const std::int64_t spill =
       std::max<std::int64_t>(0, wants_dedicated - dedicated_part);
-  return room.host - policy.reserve_host - spill >= need.host;
+  if (room.host - policy.reserve_host - spill < need.host) {
+    return false;
+  }
+  // Windows commits GPU and host bytes alike: a load that fits RAM but not
+  // the commit limit fails with bad_alloc (or waits for the page file to
+  // grow) instead.
+  return room.commit - policy.reserve_commit >= CommitNeed(need);
 }
 
 /// True when even an empty machine could not give `need` (estimate larger
@@ -96,6 +115,10 @@ bool NeverFits(const SystemMemory& system, const MemoryNeed& need,
   if (system.gpu_valid && system.gpu_dedicated_total + system.gpu_shared_total -
                                   policy.reserve_gpu <
                               need.gpu) {
+    return true;
+  }
+  if (system.commit_valid &&
+      system.commit_limit - policy.reserve_commit < CommitNeed(need)) {
     return true;
   }
   return system.host_valid &&
@@ -115,7 +138,10 @@ std::string RoomText(const Room& room) {
     return value >= kUnbounded / 2 ? std::string("n/a") : Gb(value);
   };
   return "free gpu " + part(room.dedicated) + "+" + part(room.shared) +
-         " GB, host " + part(room.host) + " GB";
+         " GB, host " + part(room.host) + " GB" +
+         (room.commit >= kUnbounded / 2
+              ? std::string()
+              : ", commit " + part(room.commit) + " GB");
 }
 
 std::string NowText() {
@@ -139,6 +165,10 @@ std::int64_t SystemMemory::DedicatedFree() const {
 
 std::int64_t SystemMemory::SharedFree() const {
   return std::max<std::int64_t>(0, gpu_shared_total - gpu_shared_used);
+}
+
+std::int64_t CommitNeed(const MemoryNeed& need) {
+  return need.gpu + need.host - std::min(need.shared, need.host);
 }
 
 double ToGb(std::int64_t bytes) {
@@ -286,13 +316,21 @@ WatchdogAction PlanWatchdog(const SystemMemory& system,
   const bool gpu_low =
       system.gpu_valid &&
       system.DedicatedFree() + system.SharedFree() < policy.abort_gpu;
-  if (!host_low && !gpu_low) {
+  const bool commit_low =
+      system.commit_valid && system.commit_available < policy.abort_commit;
+  if (!host_low && !gpu_low && !commit_low) {
     return action;
   }
-  action.reason = std::string(host_low ? "host" : "gpu") +
+  action.reason = std::string(host_low   ? "host"
+                              : gpu_low  ? "gpu"
+                                         : "commit") +
                   " memory critical: host free " + Gb(system.host_available) +
                   " GB, gpu free " + Gb(system.DedicatedFree()) + "+" +
-                  Gb(system.SharedFree()) + " GB";
+                  Gb(system.SharedFree()) + " GB" +
+                  (system.commit_valid
+                       ? ", commit free " + Gb(system.commit_available) +
+                             " of " + Gb(system.commit_limit) + " GB"
+                       : std::string());
   if (!loading_order.empty()) {
     action.abort_load = loading_order.back();
     return action;

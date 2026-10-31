@@ -287,6 +287,10 @@ json::Value Residency::Status(
   memory["host_free_gb"] = Round1(system_.host_available);
   memory["host_total_gb"] = Round1(system_.host_total);
   memory["gpu_valid"] = system_.gpu_valid;
+  if (system_.commit_valid) {
+    memory["commit_free_gb"] = Round1(system_.commit_available);
+    memory["commit_limit_gb"] = Round1(system_.commit_limit);
+  }
   root["memory"] = std::move(memory);
   root["memory_guard"] = options_.enabled;
   root["idle_unload_seconds"] =
@@ -298,6 +302,8 @@ json::Value Residency::Status(
   policy["reserve_host_gb"] = Round1(options_.policy.reserve_host);
   policy["abort_host_gb"] = Round1(options_.policy.abort_host);
   policy["abort_gpu_gb"] = Round1(options_.policy.abort_gpu);
+  policy["reserve_commit_gb"] = Round1(options_.policy.reserve_commit);
+  policy["abort_commit_gb"] = Round1(options_.policy.abort_commit);
   root["policy"] = std::move(policy);
 
   json::Value models = json::Value::array();

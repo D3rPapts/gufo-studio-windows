@@ -2259,6 +2259,8 @@ int RunRouter(std::span<const char* const> args) {
   double reserve_host_gb = router::ToGb(memory_policy.reserve_host);
   double abort_host_gb = router::ToGb(memory_policy.abort_host);
   double abort_gpu_gb = router::ToGb(memory_policy.abort_gpu);
+  double reserve_commit_gb = router::ToGb(memory_policy.reserve_commit);
+  double abort_commit_gb = router::ToGb(memory_policy.abort_commit);
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
@@ -2376,6 +2378,14 @@ int RunRouter(std::span<const char* const> args) {
                    "Watchdog: stop the newest load below this free GPU memory "
                    "(dedicated + shared; default: 0.5)",
                    "Memory", &abort_gpu_gb);
+  parser.AddOption("", "--memory-reserve-commit-gb", "GB",
+                   "Windows commit (RAM + page file; GPU memory counts too) "
+                   "always kept free below the commit limit (default: 3)",
+                   "Memory", &reserve_commit_gb);
+  parser.AddOption("", "--memory-abort-commit-gb", "GB",
+                   "Watchdog: stop the newest load below this free commit "
+                   "(Windows; default: 1)",
+                   "Memory", &abort_commit_gb);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
                    &max_request_body_bytes, &api_key, &log_options);
 
@@ -2418,6 +2428,9 @@ int RunRouter(std::span<const char* const> args) {
     report["gpu_shared_used_gb"] = router::ToGb(memory.gpu_shared_used);
     report["host_total_gb"] = router::ToGb(memory.host_total);
     report["host_available_gb"] = router::ToGb(memory.host_available);
+    report["commit_valid"] = memory.commit_valid;
+    report["commit_limit_gb"] = router::ToGb(memory.commit_limit);
+    report["commit_available_gb"] = router::ToGb(memory.commit_available);
     report["probe"] = probe->Describe();
     std::cout << report.dump() << "\n";
     return 0;
@@ -2489,6 +2502,8 @@ int RunRouter(std::span<const char* const> args) {
     residency_options.policy.reserve_host = router::FromGb(reserve_host_gb);
     residency_options.policy.abort_host = router::FromGb(abort_host_gb);
     residency_options.policy.abort_gpu = router::FromGb(abort_gpu_gb);
+    residency_options.policy.reserve_commit = router::FromGb(reserve_commit_gb);
+    residency_options.policy.abort_commit = router::FromGb(abort_commit_gb);
     residency_options.idle_default = registry_options.idle_timeout;
     if (memory_file.empty()) {
       memory_file = preset_path;
@@ -2514,7 +2529,9 @@ int RunRouter(std::span<const char* const> args) {
                    "event=memory_guard file=" + memory_file.string() +
                        " factor=" + std::to_string(memory_factor) +
                        " reserve_gpu_gb=" + std::to_string(reserve_gpu_gb) +
-                       " reserve_host_gb=" + std::to_string(reserve_host_gb));
+                       " reserve_host_gb=" + std::to_string(reserve_host_gb) +
+                       " reserve_commit_gb=" +
+                       std::to_string(reserve_commit_gb));
     }
   }
   // The ComfyUI adapter and the job API call the router's own API.

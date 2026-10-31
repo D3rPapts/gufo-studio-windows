@@ -32,6 +32,13 @@ struct SystemMemory {
   std::int64_t gpu_shared_used{0};
   std::int64_t host_total{0};
   std::int64_t host_available{0};
+  /// Windows commit charge: limit (RAM + page file, as it is sized right
+  /// now) and what is still free under it. On this APU dedicated and shared
+  /// GPU allocations are charged to commit as well, so a model costs its
+  /// GPU and host need here. Invalid elsewhere (no commit check).
+  bool commit_valid{false};
+  std::int64_t commit_limit{0};
+  std::int64_t commit_available{0};
 
   [[nodiscard]] std::int64_t DedicatedFree() const;
   [[nodiscard]] std::int64_t SharedFree() const;
@@ -45,6 +52,8 @@ struct ProcessMemory {
   std::int64_t gpu_shared{0};
   std::int64_t host_working_set{0};
   std::int64_t host_peak_working_set{0};
+  /// Private bytes (commit charge) of the process; 0 = unknown.
+  std::int64_t commit{0};
 
   [[nodiscard]] std::int64_t Gpu() const { return gpu_dedicated + gpu_shared; }
 };
@@ -86,7 +95,13 @@ struct MemoryPolicy {
   std::int64_t reserve_host{4 * kGiB};    // kept free in host RAM
   std::int64_t abort_host{3 * kGiB / 2};  // watchdog: host below this
   std::int64_t abort_gpu{kGiB / 2};       // watchdog: GPU (ded+shared) below
+  std::int64_t reserve_commit{3 * kGiB};  // kept free under the commit limit
+  std::int64_t abort_commit{kGiB};        // watchdog: free commit below this
 };
+
+/// Commit a model needs: its GPU need plus its host need, without its own
+/// shared buffers, which are in both (pinned host memory).
+[[nodiscard]] std::int64_t CommitNeed(const MemoryNeed& need);
 
 /// What the planner knows about one resident (loading or loaded) worker.
 struct ResidentView {
@@ -113,7 +128,9 @@ struct AdmissionPlan {
 ///    as taken, so concurrent loads cannot double-book the same free bytes;
 ///  - fits: dedicated+shared free minus reserve_gpu >= need.gpu, and host
 ///    free minus reserve_host minus the part that spills past free
-///    dedicated into shared (shared is host RAM) >= need.host;
+///    dedicated into shared (shared is host RAM) >= need.host, and (with
+///    a valid commit reading) free commit minus reserve_commit >=
+///    CommitNeed(need);
 ///  - otherwise idle, fully loaded residents are evicted least recently used
 ///    first until it fits; busy or loading residents are never evicted (wait);
 ///  - an exclusive candidate evicts every idle resident and waits for the

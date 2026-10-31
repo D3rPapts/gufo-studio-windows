@@ -4,7 +4,9 @@
 // dedicated and shared totals; current use system-wide and per process come
 // from the PDH "GPU Adapter Memory" and "GPU Process Memory" counters for that
 // adapter's LUID (the same numbers Task Manager shows). Host: available
-// physical memory (GlobalMemoryStatusEx) and each worker's working set.
+// physical memory and the commit limit/free commit (GlobalMemoryStatusEx:
+// ullTotalPageFile/ullAvailPageFile), each worker's working set and private
+// bytes.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -115,6 +117,12 @@ public:
       memory.host_valid = true;
       memory.host_total = static_cast<std::int64_t>(status.ullTotalPhys);
       memory.host_available = static_cast<std::int64_t>(status.ullAvailPhys);
+      // "PageFile" here is the commit limit (RAM + page file) and what is
+      // left under it, not the page file alone.
+      memory.commit_valid = true;
+      memory.commit_limit = static_cast<std::int64_t>(status.ullTotalPageFile);
+      memory.commit_available =
+          static_cast<std::int64_t>(status.ullAvailPageFile);
     }
     if (query_ == nullptr || dedicated_total_ <= 0) {
       diag_ = query_ == nullptr ? "pdh query unavailable" : "no dxgi adapter";
@@ -189,13 +197,16 @@ public:
       if (process == nullptr) {
         continue;
       }
-      PROCESS_MEMORY_COUNTERS counters{};
-      if (GetProcessMemoryInfo(process, &counters, sizeof(counters)) != 0) {
+      PROCESS_MEMORY_COUNTERS_EX counters{};
+      if (GetProcessMemoryInfo(
+              process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+              sizeof(counters)) != 0) {
         usage.valid = true;
         usage.host_working_set =
             static_cast<std::int64_t>(counters.WorkingSetSize);
         usage.host_peak_working_set =
             static_cast<std::int64_t>(counters.PeakWorkingSetSize);
+        usage.commit = static_cast<std::int64_t>(counters.PrivateUsage);
       }
       CloseHandle(process);
       if (usage.valid) {
