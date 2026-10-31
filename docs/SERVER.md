@@ -673,6 +673,15 @@ id must be the same on both routers.
   queue is busy; an unreachable check counts as free.
 - WebSocket routes (`/v1/realtime`, `/v1/audio/speech/stream`) answer 501
   `remote_websocket_unsupported`.
+- Two routers may name each other (load sharing both ways). Every relay
+  (requests, previews, `/models/load|unload`, probes, job polls) carries
+  `X-Gufo-Forwarded: <router id>` (random per process, shown as
+  `remote.router_id` in `/router/status`). A request that arrives with this
+  header and names a model that is remote here as well is not relayed again:
+  it gets 508 `remote_loop`; local models serve it normally. A client that
+  sets the header itself only refuses its own relay. Probes mark ids the
+  other router lists as remote: `/v1/models` shows them unloaded with
+  `"remote": {"loop": true}` and `/router/status` lists them as `remote`.
 - `GET /router/status` adds a `remote` block: routers (reachable, error,
   last check, model states), models (url, busy, gpu slot), relays in
   flight, gpu slots (holder, waiting), jobs holding a slot and the last

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <random>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -53,7 +55,8 @@ bool CheckRemoteAllowed(const RemoteSpec& spec,
   return true;
 }
 
-UpstreamTarget RemoteTarget(const RemoteSpec& spec) {
+UpstreamTarget RemoteTarget(const RemoteSpec& spec,
+                            const std::string& router_id) {
   UpstreamTarget target;
   target.host = spec.url.host;
   target.port = spec.url.port;
@@ -64,7 +67,48 @@ UpstreamTarget RemoteTarget(const RemoteSpec& spec) {
     target.extra_headers.emplace_back("Authorization",
                                       "Bearer " + spec.api_key);
   }
+  if (!router_id.empty()) {
+    // Replaces a client's header of the same name: the next router sees
+    // who relayed it.
+    target.extra_headers.emplace_back(kForwardedHeader, router_id);
+  }
   return target;
+}
+
+std::string NewRouterId() {
+  std::random_device device;
+  std::mt19937_64 generator(
+      (static_cast<std::uint64_t>(device()) << 32) ^ device() ^
+      static_cast<std::uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  constexpr char kHex[] = "0123456789abcdef";
+  std::uint64_t value = generator();
+  std::string id = "gufo-";
+  for (int i = 0; i < 12; ++i, value >>= 4) {
+    id.push_back(kHex[value & 0xF]);
+  }
+  return id;
+}
+
+server::HttpResponse RemoteLoop(const std::string& model_id,
+                                const std::string& forwarded_by) {
+  json::Value error = json::Value::object();
+  error["message"] = "model '" + model_id +
+                     "' is remote on this router too; the request was "
+                     "already relayed by router '" +
+                     forwarded_by + "' and is not relayed again";
+  error["type"] = "server_error";
+  error["code"] = "remote_loop";
+  json::Value body = json::Value::object();
+  body["error"] = std::move(error);
+  server::HttpResponse response;
+  response.status = 508;
+  response.reason = "Loop Detected";
+  response.body = body.dump();
+  response.headers = {{"Content-Type", "application/json"}};
+  response.log_details = "remote_loop model=" + model_id +
+                         " forwarded_by=" + forwarded_by;
+  return response;
 }
 
 server::HttpResponse RemoteUnavailable(const std::string& model_id,
@@ -92,11 +136,12 @@ std::string EndpointKey(const RemoteEndpoint& endpoint) {
 
 RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
                               const std::string& key,
-                              std::chrono::milliseconds timeout) {
+                              std::chrono::milliseconds timeout,
+                              const std::string& router_id) {
   RemoteSpec spec;
   spec.url = url;
   spec.api_key = key;
-  UpstreamTarget target = RemoteTarget(spec);
+  UpstreamTarget target = RemoteTarget(spec, router_id);
   target.connect_timeout = timeout;
   target.head_timeout = timeout;
   server::HttpRequest request;
@@ -149,6 +194,13 @@ RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
         continue;
       }
       std::string status;
+      if (const json::Value* remote = model.find("remote");
+          remote != nullptr && remote->is_object()) {
+        // The other router relays this id on as well: it is not served
+        // there, and relaying to it would only loop back.
+        probe.models[id->str()] = "remote";
+        continue;
+      }
       if (const json::Value* state = model.find("status");
           state != nullptr && state->is_object()) {
         status = state->member_str("value");
@@ -211,7 +263,8 @@ std::vector<std::string> RemoteHub::Record(const RemoteEndpoint& url,
   info.models = std::move(probe.models);
   std::vector<std::string> missing;
   for (const auto& id : info.ids) {
-    if (info.models.find(id) == info.models.end()) {
+    const auto model = info.models.find(id);
+    if (model == info.models.end() || model->second == "remote") {
       missing.push_back(id);
     }
   }
@@ -276,6 +329,7 @@ json::Value RemoteHub::Status() const {
     json::Value models = json::Value::object();
     for (const auto& id : info.ids) {
       const auto model = info.models.find(id);
+      // "remote": the other router relays it too (both list it as remote).
       models[id] = model == info.models.end() ? std::string("missing")
                                               : model->second;
     }

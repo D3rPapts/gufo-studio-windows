@@ -36,9 +36,24 @@ namespace gufo::router {
                                       const std::vector<jobs::AllowEntry>& allow,
                                       std::string* error);
 
+/// Header a router sets on everything it relays to a remote router, with
+/// its own router id. A router that receives it never relays the request on
+/// to another remote (loop guard); local models serve it normally.
+inline constexpr const char* kForwardedHeader = "X-Gufo-Forwarded";
+
 /// Relay target for a remote model: its router's address, the preset
-/// timeouts, keepalive and the remote router's key as Authorization.
-[[nodiscard]] UpstreamTarget RemoteTarget(const RemoteSpec& spec);
+/// timeouts, keepalive, the remote router's key as Authorization and
+/// `X-Gufo-Forwarded: <router_id>` (omitted when `router_id` is empty).
+[[nodiscard]] UpstreamTarget RemoteTarget(const RemoteSpec& spec,
+                                          const std::string& router_id = {});
+
+/// Random router id for kForwardedHeader, fixed for the process lifetime.
+[[nodiscard]] std::string NewRouterId();
+
+/// 508 remote_loop: a request another router already relayed here names a
+/// model that is remote on this router as well.
+[[nodiscard]] server::HttpResponse RemoteLoop(const std::string& model_id,
+                                              const std::string& forwarded_by);
 
 /// 503 remote_unavailable with Retry-After: 30, for a remote router that
 /// cannot be reached (never a reason to stop anything locally).
@@ -54,7 +69,8 @@ struct RemoteProbe {
   bool reachable{false};
   /// Why it failed, or a non-200 answer ("HTTP 401 ...").
   std::string error;
-  /// Model id -> llama.cpp status value ("loaded", "loading", "unloaded").
+  /// Model id -> llama.cpp status value ("loaded", "loading", "unloaded"),
+  /// or "remote" for a model the remote router itself relays elsewhere.
   std::map<std::string, std::string> models;
 };
 
@@ -63,7 +79,8 @@ struct RemoteProbe {
 /// no router lock held.
 [[nodiscard]] RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
                                             const std::string& key,
-                                            std::chrono::milliseconds timeout);
+                                            std::chrono::milliseconds timeout,
+                                            const std::string& router_id = {});
 
 /// What the router knows about each remote router (one entry per url):
 /// reachability and the model states it listed. The remote thread refreshes
@@ -86,7 +103,8 @@ public:
   [[nodiscard]] std::vector<Target> Targets() const;
 
   /// Applies a probe. Returns the preset ids for this router that the
-  /// remote does not list (once per change, for a warning).
+  /// remote does not list or itself lists as remote (once per change, for a
+  /// warning).
   std::vector<std::string> Record(const RemoteEndpoint& url,
                                   RemoteProbe probe);
   /// A relay could not connect: refuse further relays until a probe works.

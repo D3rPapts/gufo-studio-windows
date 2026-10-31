@@ -336,8 +336,8 @@ def write_preset(path, remote_port, comfy_port, dead_port, python):
 
 
 class Router:
-    def __init__(self, binary, tmp, preset, extra=()):
-        self.port = free_port()
+    def __init__(self, binary, tmp, preset, extra=(), port=None, log_name="router.log"):
+        self.port = port or free_port()
         self.tmp = tmp
         env = {k: v for k, v in os.environ.items()
                if k not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
@@ -345,7 +345,7 @@ class Router:
         args = [binary, "router", "--models-preset", preset, "--host", "127.0.0.1",
                 "--port", str(self.port), "--models-max", "0",
                 "--remote-allow", "127.0.0.1"] + list(extra)
-        self.log_path = os.path.join(tmp, "router.log")
+        self.log_path = os.path.join(tmp, log_name)
         self.log = open(self.log_path, "ab")
         self.proc = subprocess.Popen(args, env=env, stdout=self.log,
                                      stderr=subprocess.STDOUT)
@@ -793,6 +793,66 @@ def check_unsafe_presets(binary, tmp, remote_port):
         assert token in output, (index, output)
 
 
+def check_two_way_loop(binary, tmp):
+    """Routers A and B name each other: a model remote on both answers 508
+    remote_loop instead of bouncing; A -> B-local works."""
+    python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
+    port_a, port_b = free_port(), free_port()
+    preset_a = os.path.join(tmp, "a.preset")
+    preset_b = os.path.join(tmp, "b.preset")
+    with open(preset_a, "w") as handle:
+        handle.write("[remote/shared]\nurl = http://127.0.0.1:%d\nmodality = llm\n\n"
+                     "[remote/blocal]\nurl = http://127.0.0.1:%d\nmodality = llm\n"
+                     % (port_b, port_b))
+    with open(preset_b, "w") as handle:
+        handle.write("[remote/shared]\nurl = http://127.0.0.1:%d\nmodality = llm\n\n"
+                     "[external/blocal]\ncommand = %s\nargs = %s --fake-worker\n"
+                     "served-model-name = blocal\n" % (port_a, python, THIS))
+    router_b = Router(binary, tmp, preset_b, port=port_b, log_name="b.log")
+    router_a = None
+    try:
+        router_a = Router(binary, tmp, preset_a, port=port_a, log_name="a.log")
+        # A -> B, local there.
+        code, answer = router_a.json("POST", "/v1/chat/completions", {"model": "blocal"})
+        assert code == 200 and answer["model"] == "blocal", (code, answer)
+        # Remote on both: one relay, then 508 from the other side.
+        for router in (router_a, router_b):
+            began = time.monotonic()
+            code, answer = router.json("POST", "/v1/chat/completions", {"model": "shared"})
+            assert code == 508 and code_of(answer) == "remote_loop", (code, answer)
+            assert time.monotonic() - began < 5
+        code, answer = router_a.json("POST", "/models/load", {"model": "shared"})
+        assert code == 508 and code_of(answer) == "remote_loop", (code, answer)
+        code, answer = router_a.json("GET", "/v1/previews/img_1/events?model=shared")
+        assert code == 508 and code_of(answer) == "remote_loop", (code, answer)
+        # A client header only refuses the client's own relay.
+        code, answer = router_a.json("POST", "/v1/chat/completions", {"model": "blocal"},
+                                     {"X-Gufo-Forwarded": "client"})
+        assert code == 508 and code_of(answer) == "remote_loop", (code, answer)
+        code, answer = router_b.json("POST", "/v1/chat/completions", {"model": "blocal"},
+                                     {"X-Gufo-Forwarded": "client"})
+        assert code == 200 and answer["model"] == "blocal", (code, answer)
+        # The probes see that the other side relays "shared" as well.
+        wait_for(lambda: router_a.models()["shared"]["remote"].get("loop") is True, 10,
+                 "A to mark shared as a loop")
+        shared = router_a.models()["shared"]
+        assert shared["loaded"] is False, shared
+        status = router_a.status()["remote"]
+        key = "127.0.0.1:%d" % port_b
+        assert status["routers"][key]["models"]["shared"] == "remote", status
+        assert status["router_id"].startswith("gufo-"), status
+        assert status["router_id"] != router_b.status()["remote"]["router_id"]
+    except BaseException:
+        print(router_b.tail())
+        if router_a is not None:
+            print(router_a.tail())
+        raise
+    finally:
+        if router_a is not None:
+            router_a.stop()
+        router_b.stop()
+
+
 def main():
     if "--fake-worker" in sys.argv:
         return serve_fake_worker(sys.argv)
@@ -802,6 +862,8 @@ def main():
                                 "checked"))
     comfy = FakeComfy()
     check_unsafe_presets(binary, tmp, remote.port)
+    check_two_way_loop(binary, tmp)
+    print("router_remote_test: two-way loop ok", flush=True)
     preset = os.path.join(tmp, "remote.preset")
     write_preset(preset, remote.port, comfy.port, free_port(),
                  os.environ.get("COMFY_TEST_PYTHON") or sys.executable)

@@ -257,6 +257,11 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
         model["remote"] = std::move(remote);
         if (remotes != nullptr)
           remote_status = remotes->ModelStatus(url, preset->id);
+        if (remote_status == "remote") {
+          // The other router relays it as well: nothing serves it there.
+          model["remote"]["loop"] = true;
+          remote_status.clear();
+        }
         status = remote_status.empty() ? std::string_view("unloaded")
                                        : std::string_view(remote_status);
       }
@@ -774,6 +779,8 @@ public:
   /// Reachability and model states of the remote routers; null without
   /// [remote/<id>] sections.
   std::unique_ptr<router::RemoteHub> remotes;
+  /// Sent as X-Gufo-Forwarded on every relay to a remote router.
+  std::string router_id = router::NewRouterId();
   /// Remote GPU slots (preset gpu-slot).
   router::GpuSlots gpu_slots;
   /// Remote jobs holding a GPU slot, by job id (own mutex, never nested
@@ -1032,10 +1039,27 @@ public:
   /// the drain waits for it and job reads route back. The relay runs with
   /// the state mutex released. A connect failure is a 503
   /// remote_unavailable: nothing local is restarted.
+  /// Loop guard: a request another router relayed here (X-Gufo-Forwarded)
+  /// is never relayed on to a remote router. A client may set the header
+  /// itself; that only turns its own request into this refusal.
+  std::optional<HttpResponse> RefuseRelayedAgain(const HttpRequest& req,
+                                                 const std::string& model_id) {
+    const std::string forwarded_by = req.header(router::kForwardedHeader);
+    if (forwarded_by.empty()) {
+      return std::nullopt;
+    }
+    Logger::Warn("router", "event=remote_loop model=" + model_id +
+                               " forwarded_by=" + forwarded_by);
+    return router::RemoteLoop(model_id, forwarded_by);
+  }
+
   HttpResponse DispatchRemoteLocked(const HttpRequest& req,
                                     const std::string& model_id,
                                     const router::RemoteSpec& spec,
                                     std::unique_lock<std::mutex>& lock) {
+    if (auto loop = RefuseRelayedAgain(req, model_id)) {
+      return std::move(*loop);
+    }
     if (IsWebSocketPath(req)) {
       // Stage 1 relays HTTP only; the WebSocket handshake would need the
       // path and query forwarded (ws_relay sends `GET /`).
@@ -1261,7 +1285,7 @@ public:
       return router::RemoteUnavailable(model_id, known_error);
     }
     HttpResponse response =
-        router::ProxyToWorker(router::RemoteTarget(spec), req);
+        router::ProxyToWorker(router::RemoteTarget(spec, router_id), req);
     if (response.status != 502 || response.streaming_body) {
       return response;
     }
@@ -1302,6 +1326,9 @@ public:
         preset != nullptr && preset->remote.has_value()) {
       // The remote router finds the job itself: path and query go unchanged
       // and the SSE stream relays as it arrives.
+      if (auto loop = RefuseRelayedAgain(req, model_id)) {
+        return std::move(*loop);
+      }
       const router::RemoteSpec spec = *preset->remote;
       lock.unlock();
       return RelayRemote(model_id, spec, req);
@@ -1374,6 +1401,9 @@ public:
                                "not_found_error");
     }
     if (preset->remote.has_value()) {
+      if (auto loop = RefuseRelayedAgain(req, model_id)) {
+        return std::move(*loop);
+      }
       const router::RemoteSpec spec = *preset->remote;
       Logger::Info("router", std::string("event=models_") +
                                  (unload ? "unload" : "load") +
@@ -1549,7 +1579,7 @@ public:
         if (stop_requested.load())
           return;
         router::RemoteProbe probe = router::ProbeRemoteModels(
-            target.url, target.api_key, kRemoteProbeTimeout);
+            target.url, target.api_key, kRemoteProbeTimeout, router_id);
         const std::string key = router::EndpointKey(target.url);
         std::string reachable_before;
         const bool was_reachable =
@@ -1566,7 +1596,9 @@ public:
         }
         for (const auto& id : remotes->Record(target.url, std::move(probe))) {
           Logger::Warn("router", "event=remote_model_missing model=" + id +
-                                     " url=" + key);
+                                     " url=" + key +
+                                     " (not served there, or remote there "
+                                     "as well)");
         }
       }
       PollRemoteJobs();
@@ -1591,7 +1623,8 @@ public:
     for (const auto& [job_id, job] : jobs) {
       if (stop_requested.load())
         return;
-      router::UpstreamTarget target = router::RemoteTarget(job.spec);
+      router::UpstreamTarget target =
+          router::RemoteTarget(job.spec, router_id);
       target.connect_timeout = kRemoteProbeTimeout;
       target.head_timeout = kRemoteProbeTimeout;
       HttpRequest status;
@@ -1723,6 +1756,7 @@ public:
       }
       remote["models"] = std::move(models);
       remote["inflight"] = static_cast<long long>(remote_inflight.load());
+      remote["router_id"] = router_id;
       remote["gpu_slots"] = gpu_slots.Status();
       remote["busy_checks"] = remotes->BusyCheckStatus();
       json::Value jobs_held = json::Value::object();
