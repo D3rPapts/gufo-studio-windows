@@ -28,7 +28,7 @@ set(GUFO_RELEASE_VERSION "development" CACHE STRING "Gufo release version")
 set(GUFO_REVISION "unknown" CACHE STRING "Gufo source revision")
 # gufo_windows release branches name their version here, so a local build prints it without git tags or
 # -DGUFO_RELEASE_VERSION. An explicit -DGUFO_RELEASE_VERSION=<x> (CI) still wins.
-set(GUFO_WINDOWS_VERSION "1.2.0")
+set(GUFO_WINDOWS_VERSION "1.2.1")
 if (GUFO_WINDOWS_VERSION AND GUFO_RELEASE_VERSION STREQUAL "development")
   set(GUFO_RELEASE_VERSION "${GUFO_WINDOWS_VERSION}")
 endif()
