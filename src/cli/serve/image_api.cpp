@@ -132,10 +132,10 @@ struct Parsed {
   std::optional<image::Image> mask;
 };
 
-constexpr std::array<std::string_view, 11> kExtensionFields{
-    "negative_prompt", "guidance",       "strength",     "init_image",
-    "preview",         "mask",           "mask_channel", "mask_composite",
-    "mask_feather",    "mask_blur",      "mask_release"};
+constexpr std::array<std::string_view, 10> kExtensionFields{
+    "negative_prompt", "guidance",     "strength",       "init_image",
+    "preview",         "mask",         "mask_channel",   "mask_composite",
+    "mask_feather",    "mask_blur"};
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -245,8 +245,7 @@ Parsed Multipart(const HttpRequest& request) {
           throw std::invalid_argument("duplicate field " + name);
         extension[key] = key == "guidance" || key == "strength" ||
                                  key == "preview" || key == "mask_composite" ||
-                                 key == "mask_feather" || key == "mask_blur" ||
-                                 key == "mask_release"
+                                 key == "mask_feather" || key == "mask_blur"
                              ? ParseJson(data)
                              : json::Value(std::string(data));
       } else if (name == "gufo") {
@@ -535,9 +534,8 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       }
       generation.mask_feather = static_cast<int>(Number(
           *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
-      generation.mask_blur =
-          static_cast<int>(Number(*extension, "mask_blur", 0, 0, 4));
-      generation.mask_release = Real(*extension, "mask_release", 0, 0, 0.9);
+      generation.mask_blur = static_cast<int>(
+          Number(*extension, "mask_blur", image::kDefaultMaskBlur, 0, 4));
     }
     if (extension && extension->contains("strength") && !parsed.init_image) {
       // A single uploaded "image" is the start image, not a reference.
@@ -648,8 +646,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       if (generation.mask)
         details << " mask_composite=" << (generation.mask_composite ? 1 : 0)
                 << " mask_feather=" << generation.mask_feather
-                << " mask_blur=" << generation.mask_blur
-                << " mask_release=" << generation.mask_release;
+                << " mask_blur=" << generation.mask_blur;
       if (!service.loras().files.empty())
         details << " loras=" << LoraList(generation.loras)
                 << " lora_ms=" << result.metrics.lora_ms;

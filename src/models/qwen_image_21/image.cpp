@@ -466,8 +466,6 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument("mask feather must be 0 to 64 pixels");
   if (request.mask_blur < 0 || request.mask_blur > 4)
     throw std::invalid_argument("mask blur must be 0 to 4 cells");
-  if (!(request.mask_release >= 0 && request.mask_release <= 0.9))
-    throw std::invalid_argument("mask release must be between 0 and 0.9");
   if (request.mask) {
     if (!request.init_image)
       throw std::invalid_argument("a mask requires an input image to edit");
@@ -475,7 +473,7 @@ void ValidateRequest(const Request& request) {
   } else if (request.mask_channel != MaskChannel::kAuto ||
              !request.mask_composite ||
              request.mask_feather != kDefaultMaskFeather ||
-             request.mask_blur != 0 || request.mask_release != 0) {
+             request.mask_blur != kDefaultMaskBlur) {
     throw std::invalid_argument("mask options require a mask");
   }
   if (request.loras.size() > 16)

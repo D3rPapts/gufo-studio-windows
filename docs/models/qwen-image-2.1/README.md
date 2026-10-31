@@ -81,19 +81,29 @@ curl --fail-with-body http://127.0.0.1:8080/v1/images/edits \
 No inpainting checkpoint is needed. After every denoising step the latent
 cells the mask keeps are reset to the start image, noised with the same
 initial noise to the step's sigma; the masked cells denoise freely and see
-the kept area as context. At the last step (sigma 0) the kept cells are the
-start image's latent, so after the VAE they decode to the start image up to
-the VAE's own round trip (measured at 512²: 41.5 dB against the original). The
-decoder carries small changes about 32 pixels past the mask (beyond that at
-most 5 of 255 against the round trip, 58 dB; within 16 pixels up to 27). A cell
-is 16 x 16 output pixels; it is edited when any mask pixel in it is, so the
-edit area rounds outward to that grid.
+the kept area as context. A cell is 16 x 16 output pixels; it is edited when
+any mask pixel in it is, so the edit area rounds outward to that grid, and by
+default the latent mask is widened by one more cell at half weight
+(`gufo.mask_blur`), which measured a smoother seam.
+
+After decoding, the start image's pixels are copied back outside the mask with
+a linear soft edge of `gufo.mask_feather` pixels (default 16). Everything
+farther from the mask than the feather is the start image byte for byte; the
+VAE round trip alone would change it (41.5 dB at 512²) and the decoder carries
+small changes about 32 pixels past the edited cells. 16 pixels covers the
+half-weight cell and the strongest decoder spill without a visible step; 4
+pixels can cut spilled edges hard, 32 pixels shows more of the decoder's
+changes around the mask. `gufo.mask_composite=false` returns the decoded image
+as is (ComfyUI's SetLatentNoiseMask output).
 
 | Setting | Behavior |
 | --- | --- |
 | `mask` | PNG/JPEG of any size, scaled to the output size. Counts toward the 20 MiB upload limit. |
 | `gufo.mask_channel` | `auto` (default): alpha when any pixel is translucent (transparent = edit), otherwise luminance (white = edit). `alpha`: 1 - alpha only (an opaque mask keeps everything). `red`, `green`, `blue`: that channel, white = edit. Partial values blend partially. |
 | Start image | The first `image` upload, which also stays a reference so the edit model sees the whole picture; or `init_image` (multipart) / `gufo.init_image` (JSON, base64) for a start image that is not a reference. `size` `auto` keeps its canvas (rounded to 32). |
+| `gufo.mask_feather` | 0–64 output pixels of soft edge for the composite, default 16; 0 copies the start image back right up to the mask. |
+| `gufo.mask_composite` | Default `true`. `false` skips the composite. |
+| `gufo.mask_blur` | 0–4 cells (16 px each) of latent mask widening with a linear falloff, default 1. |
 | `gufo.strength` | Optional. Below 1 the masked area starts from the noised start image instead of pure noise (keeps its layout). With exactly one `image`, that image is then only the start image, not a reference. |
 
 JSON requests to `/v1/images/generations` take `gufo.mask` as base64 or a data

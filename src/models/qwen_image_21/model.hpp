@@ -71,6 +71,8 @@ void CompositeMasked(Image& result, const Image& original,
                      std::span<const float> weights);
 /// Default soft edge of the final composite, in output pixels.
 inline constexpr int kDefaultMaskFeather = 16;
+/// Default widening of the latent mask, in 16-pixel cells.
+inline constexpr int kDefaultMaskBlur = 1;
 
 /// A registered adapter selected by name; strength multiplies its alpha/rank.
 struct Lora {
@@ -114,9 +116,9 @@ struct Request {
   bool mask_composite{true};
   int mask_feather{kDefaultMaskFeather};
   /// Widen the latent mask by this many cells with a falloff (SpreadMask).
-  int mask_blur{0};
-  /// Fraction of the final steps that no longer reset kept cells.
-  double mask_release{0};
+  /// One cell (half weight 16 px past the mask) measured a smoother seam
+  /// under the default composite; the feather covers it.
+  int mask_blur{kDefaultMaskBlur};
   /// Live preview of the denoised estimate; never changes the image.
   models::PreviewHook preview;
   // Applied in order; scale 0 entries are ignored.

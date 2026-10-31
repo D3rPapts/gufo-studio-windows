@@ -440,17 +440,15 @@ int main(int argc, char** argv) {
                           .mask = openai,
                           .mask_composite = false,
                           .mask_feather = 0,
-                          .mask_blur = 4,
-                          .mask_release = 0.9});
+                          .mask_blur = 0});
   ValidateRequest(Request{.init_image = image, .strength = 0.4, .mask = openai});
   for (const auto& invalid :
        {Request{.mask = openai},
         Request{.init_image = image, .mask_channel = MaskChannel::kRed},
         Request{.init_image = image, .mask_composite = false},
-        Request{.init_image = image, .mask_blur = 1},
+        Request{.init_image = image, .mask_blur = 0},
         Request{.init_image = image, .mask = openai, .mask_feather = 65},
-        Request{.init_image = image, .mask = openai, .mask_blur = 5},
-        Request{.init_image = image, .mask = openai, .mask_release = 0.95}}) {
+        Request{.init_image = image, .mask = openai, .mask_blur = 5}}) {
     bool rejected = false;
     try {
       ValidateRequest(invalid);
@@ -500,16 +498,15 @@ int main(int argc, char** argv) {
          seen.strength == 0.6 && seen.mask_channel == MaskChannel::kAlpha &&
          seen.width == 256);
   assert(seen.mask_composite && seen.mask_feather == kDefaultMaskFeather &&
-         seen.mask_blur == 0 && seen.mask_release == 0);
+         seen.mask_blur == kDefaultMaskBlur);
   http.body = multipart({{"prompt", "a red cube"},
                          {"gufo.mask_composite", "false"},
                          {"gufo.mask_feather", "4"},
-                         {"gufo.mask_blur", "1"},
-                         {"gufo.mask_release", "0.25"}},
+                         {"gufo.mask_blur", "0"}},
                         true, true);
   assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
   assert(!seen.mask_composite && seen.mask_feather == 4 &&
-         seen.mask_blur == 1 && seen.mask_release == 0.25);
+         seen.mask_blur == 0);
   for (const auto& body :
        {multipart({{"prompt", "a"}}, false, true),
         multipart({{"prompt", "a"}}, true, true, 2),
@@ -518,7 +515,8 @@ int main(int argc, char** argv) {
                   false),
         multipart({{"prompt", "a"}, {"gufo.mask_composite", "1"}}, true, true),
         multipart({{"prompt", "a"}, {"gufo.mask_feather", "2.5"}}, true, true),
-        multipart({{"prompt", "a"}, {"gufo.mask_blur", "1"}}, true, false)}) {
+        multipart({{"prompt", "a"}, {"gufo.mask_blur", "2"}}, true, false),
+        multipart({{"prompt", "a"}, {"gufo.mask_release", "0.2"}}, true, true)}) {
     http.body = body;
     assert(gufo::server::HandleImageApiRequest(http, extended).status == 400);
   }

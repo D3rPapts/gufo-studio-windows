@@ -1056,10 +1056,7 @@ Result Model::Generate(const Request& request,
                    velocity);
       }
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
-      // The last mask_release share of the steps lets kept cells settle
-      // with the edit (the composite restores their pixels).
-      if (masked && step < steps - static_cast<int>(std::lround(
-                                        request.mask_release * steps)))
+      if (masked)
         // Kept cells follow the start image's trajectory and end on its
         // latent at sigma 0; the edited cells see them as context.
         latent = rt.MaskBlend(
