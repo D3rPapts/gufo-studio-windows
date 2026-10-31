@@ -4,12 +4,12 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1)**
-> (zip, branch `release/1.1.1-ttft`): text, images, speech, music and video from one
+> **Download [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0)**
+> (zip, branch `release/1.2`): text, images, speech, music and video from one
 > OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
 > it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
 > first request. The release notes list what was tested.
-> Previous: [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> Previous: [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
 > This repository was called `gufo_windows` until 31 October 2026; old links still work.
 
 ### Focus
