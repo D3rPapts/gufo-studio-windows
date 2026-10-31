@@ -342,15 +342,38 @@ void TestSubtitleFormats() {
         "vtt declares text/vtt");
 
   runner.pcm_samples.clear();
+  const int calls_before_json = runner.calls;
+  const HttpResponse plain = Send(service, Multipart("json", false, {}, wav));
+  Check(plain.status == 200 && runner.calls == calls_before_json + 1 &&
+            runner.pcm_samples.empty(),
+        "json transcribes the whole file in one pass");
+  const std::size_t plain_text = plain.body.find("\"text\":");
+  Check(plain_text != std::string::npos, "json carries a text member");
+  // `"text":"..."` up to and including the closing quote.
+  const std::string text_member = plain.body.substr(
+      plain_text, plain.body.find('"', plain_text + 8U) + 1U - plain_text);
+  const int calls_before_verbose = runner.calls;
   const HttpResponse verbose =
       Send(service, Multipart("verbose_json", false, {}, wav, "segment"));
-  Check(verbose.status == 200 &&
-            verbose.body.find("\"duration\":6") != std::string::npos &&
+  Check(verbose.status == 200 && runner.calls == calls_before_verbose + 3 &&
+            runner.pcm_samples.size() == 2,
+        "verbose_json runs the whole file once plus every speech segment");
+  Check(verbose.body.find(text_member) != std::string::npos &&
+            text_member == "\"text\":\"A native transcript.\"",
+        "verbose_json text equals the json text, not the joined segments");
+  Check(verbose.body.find("\"duration\":2") != std::string::npos &&
             verbose.body.find("\"language\":\"english\"") !=
+                std::string::npos,
+        "verbose_json reports the whole-file duration and language");
+  Check(verbose.body.find("\"text\":\"Hallo <Welt> & Freunde.\"") !=
                 std::string::npos &&
-            verbose.body.find("\"text\":\"Hallo <Welt> & Freunde. Zweiter "
-                              "Satz --> Ende.\"") != std::string::npos,
-        "verbose_json joins segment texts and reports duration and language");
+            verbose.body.find("\"text\":\"Zweiter Satz --> Ende.\"") !=
+                std::string::npos,
+        "verbose_json segments keep their own per-segment text");
+  Check(HasHeader(verbose, "X-Gufo-ASR-Timestamps", "vad-segments") &&
+            verbose.log_details.find("whole_file_ms=") != std::string::npos &&
+            verbose.log_details.find("A native") == std::string::npos,
+        "verbose_json diagnostics report the extra pass without the transcript");
   Check(verbose.body.find("\"id\":0") != std::string::npos &&
             verbose.body.find("\"start\":0.4") != std::string::npos &&
             verbose.body.find("\"end\":1.6") != std::string::npos &&

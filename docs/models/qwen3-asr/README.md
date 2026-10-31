@@ -56,8 +56,10 @@ formats do not use one transcription of the whole file. Instead:
 Cue start and end times are therefore the measured segment boundaries, with
 up to 100 ms padding, not word timings. A cue holds whatever was said in its
 segment, wrapped at 42 characters per line. Silence yields an empty SRT and a
-header-only WebVTT file. `verbose_json` uses the same segments, so its `text`
-can differ slightly from the single-pass `json` transcript; fields Qwen3-ASR
+header-only WebVTT file. `verbose_json` takes its `segments` from the same
+per-segment pass, but its `text`, `language` and `duration` come from one
+additional pass over the whole file, exactly as `json` returns them; the
+segment texts can therefore differ slightly from `text`. Fields Qwen3-ASR
 cannot measure (`avg_logprob`, `no_speech_prob`, `compression_ratio`) are
 omitted. Word timestamps would need a forced aligner and are rejected.
 

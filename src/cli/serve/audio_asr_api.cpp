@@ -247,6 +247,10 @@ std::uint64_t SamplesToMilliseconds(std::size_t samples) {
 /// Subtitles and verbose_json: Qwen3-ASR has no timestamps, so speech is cut
 /// at measured pauses (SegmentSpeech) and every segment is transcribed on its
 /// own. Segment times are those sample boundaries, never estimates.
+/// verbose_json additionally runs the whole file once, exactly like `json`,
+/// and reports that transcript as `text` (with its language and duration), so
+/// `text` never depends on where the pauses fell; only `segments` come from
+/// the per-segment pass.
 HttpResponse TranscribeSegments(const HttpRequest& request,
                                 AsrService& service, const std::string& wav,
                                 const std::string& context,
@@ -282,7 +286,38 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
   timings.decode_audio_ms = decode_ms;
   std::size_t audio_tokens = 0;
   std::size_t generated_tokens = 0;
-  std::vector<std::string> languages;
+  const auto failed = [&](std::string message) {
+    if (request.is_cancelled && request.is_cancelled()) {
+      return Error(499, "Client Closed Request", "transcription cancelled",
+                   "cancelled");
+    }
+    return Error(500, "Internal Server Error", std::move(message),
+                 "transcription_failed");
+  };
+
+  // The whole-file pass of verbose_json is the same request `json` makes.
+  std::optional<asr::TranscriptionResult> whole;
+  double whole_ms = 0.0;
+  if (format == "verbose_json") {
+    const auto whole_begin = std::chrono::steady_clock::now();
+    whole.emplace();
+    if (!service.Transcribe(
+            asr::TranscriptionRequest{
+                .wav = std::as_bytes(std::span(wav.data(), wav.size())),
+                .context = context,
+                .language = language,
+                .max_new_tokens = maximum_tokens,
+            },
+            request.is_cancelled, &*whole, &error)) {
+      return failed(std::move(error));
+    }
+    whole_ms = MillisecondsSince(whole_begin);
+    timings.feature_extraction_ms += whole->timings.feature_extraction_ms;
+    timings.audio_encoder_ms += whole->timings.audio_encoder_ms;
+    timings.text_decoder_ms += whole->timings.text_decoder_ms;
+    audio_tokens += whole->audio_tokens;
+    generated_tokens += whole->generated_ids.size();
+  }
   for (const asr::AudioChunk& segment : segments) {
     std::vector<float> pcm(
         waveform.begin() + static_cast<std::ptrdiff_t>(segment.offset),
@@ -304,29 +339,13 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
                 .on_text = {},
             },
             request.is_cancelled, &result, &error)) {
-      if (request.is_cancelled && request.is_cancelled()) {
-        return Error(499, "Client Closed Request", "transcription cancelled",
-                     "cancelled");
-      }
-      return Error(500, "Internal Server Error", std::move(error),
-                   "transcription_failed");
+      return failed(std::move(error));
     }
     timings.feature_extraction_ms += result.timings.feature_extraction_ms;
     timings.audio_encoder_ms += result.timings.audio_encoder_ms;
     timings.text_decoder_ms += result.timings.text_decoder_ms;
     audio_tokens += result.audio_tokens;
     generated_tokens += result.generated_ids.size();
-    std::string_view names = result.language;
-    while (!names.empty()) {
-      const std::size_t comma = names.find(',');
-      const std::string name(Trim(names.substr(0, comma)));
-      if (!name.empty() &&
-          std::ranges::find(languages, name) == languages.end()) {
-        languages.push_back(name);
-      }
-      names = comma == std::string_view::npos ? std::string_view{}
-                                              : names.substr(comma + 1U);
-    }
     std::string text = asr::NormalizeSubtitleText(
         core::Utf8Decoder{}.Push(result.text, true));
     if (!text.empty()) {
@@ -358,13 +377,9 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
       response.headers.emplace_back("Content-Type", "text/vtt; charset=utf-8");
     }
   } else {
-    std::string text;
     json::Value list = json::Value::array();
     for (std::size_t i = 0; i < transcribed.size(); ++i) {
       const Transcribed& item = transcribed[i];
-      if (!text.empty())
-        text += ' ';
-      text += item.text;
       json::Value segment = json::Value::object();
       segment["id"] = static_cast<long long>(i);
       // Whisper's seek counts 10-ms mel frames.
@@ -384,18 +399,14 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
       segment["temperature"] = 0.0;
       list.push_back(std::move(segment));
     }
-    std::string language_list;
-    for (const std::string& name : languages) {
-      if (!language_list.empty())
-        language_list += ',';
-      language_list += name;
-    }
+    // `text`, `language` and `duration` are those of the whole-file pass,
+    // identical to the `json` response for the same request.
     json::Value body = json::Value::object();
     body["task"] = "transcribe";
-    body["language"] = Lower(language_list);
-    body["duration"] =
-        static_cast<double>(SamplesToMilliseconds(waveform.size())) / 1000.0;
-    body["text"] = std::move(text);
+    body["language"] = Lower(whole->language);
+    body["duration"] = static_cast<double>(whole->audio_samples) /
+                       std::max(1U, whole->sample_rate);
+    body["text"] = core::Utf8Decoder{}.Push(whole->text, true);
     body["segments"] = std::move(list);
     response.body = body.dump();
   }
@@ -405,7 +416,8 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
   response.headers.emplace_back("X-Gufo-ASR-Timestamps", "vad-segments");
   response.headers.emplace_back(
       "Server-Timing",
-      ServerTiming(timings) + ", vad;dur=" + std::to_string(vad_ms));
+      ServerTiming(timings) + ", vad;dur=" + std::to_string(vad_ms) +
+          (whole ? ", whole_file;dur=" + std::to_string(whole_ms) : ""));
   response.log_details =
       "model=" + service.model_id() + " format=" + format +
       " segments=" + std::to_string(segments.size()) +
@@ -414,6 +426,7 @@ HttpResponse TranscribeSegments(const HttpRequest& request,
       " generated_tokens=" + std::to_string(generated_tokens) +
       " audio_ms=" + std::to_string(SamplesToMilliseconds(waveform.size())) +
       " vad_ms=" + std::to_string(vad_ms) +
+      (whole ? " whole_file_ms=" + std::to_string(whole_ms) : "") +
       " encoder_ms=" + std::to_string(timings.audio_encoder_ms) +
       " decoder_ms=" + std::to_string(timings.text_decoder_ms);
   return response;
