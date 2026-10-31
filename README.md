@@ -4,12 +4,22 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [gufo_windows 1.1.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.0)**
-> (zip, branch `release/1.1`): text, images, speech, music and video from one
+> **Download [gufo_windows 1.1.1](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.1)**
+> (zip, branch `release/1.1.1-ttft`): text, images, speech, music and video from one
 > OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
 > it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
 > first request. The release notes list what was tested.
-> Previous: [1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0).
+> Previous: [1.1.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0).
+
+### New in 1.1.1
+
+- Qwen-Image 2.1 Turbo (fixed 8 steps, about 4.7x faster than the base at
+  40 steps; weights are non-commercial only) as its own model, also chosen
+  by ComfyUI workflows whose `UNETLoader` file name contains `turbo`.
+- LoRA adapters for Qwen-Image 2.1 (`--lora NAME=PATH`, `"loras"` per
+  request, ComfyUI `LoraLoader` / `LoraLoaderModelOnly`).
+- Qwen3.8-27B with DFlash2 answers the first token about 0.7 s sooner on
+  Windows (film JSON request 0.96 s instead of 1.70 s).
 
 ### New in 1.1
 
