@@ -288,3 +288,25 @@ constexpr float kMinimaxH3Weights[] = {
 };
 constexpr float kMinimaxH3Bias[] = {-0.010720F, -0.197510F, -0.132505F};
 static_assert(sizeof(kMinimaxH3Weights) == sizeof(float) * 3 * 24);
+
+// Wan 2.1 VAE encoder (AutoencoderKLWan, Wan2.1-I2V-14B-480P), (z - mean) / std, 8x spatial: 72704 samples, R^2 0.935, 0.937, 0.936
+constexpr float kWan21Weights[] = {
+    0.069339F, -0.048131F, 0.546770F,
+    -0.049770F, -0.044402F, -0.105520F,
+    0.414942F, 0.221844F, 0.256110F,
+    0.150205F, 0.379898F, 0.226028F,
+    -0.029069F, -0.037300F, -0.069369F,
+    0.192072F, -0.031854F, 0.150819F,
+    -0.067391F, -0.263750F, -0.106840F,
+    0.007391F, 0.126847F, 0.210448F,
+    -0.206664F, -0.091296F, -0.292106F,
+    -0.000813F, 0.152717F, 0.270027F,
+    -0.247314F, 0.196951F, -0.350715F,
+    -0.055818F, 0.059066F, 0.041393F,
+    -0.008923F, 0.109641F, 0.309586F,
+    0.066971F, -0.018851F, 0.053620F,
+    0.314621F, 0.053741F, 0.231061F,
+    0.120121F, -0.024361F, 0.064261F,
+};
+constexpr float kWan21Bias[] = {-0.161041F, -0.072804F, -0.294432F};
+static_assert(sizeof(kWan21Weights) == sizeof(float) * 3 * 16);

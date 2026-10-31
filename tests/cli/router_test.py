@@ -284,6 +284,9 @@ def serve_fake_worker():
             if self.refusing():
                 self.send_refused()
                 return
+            # ?head_delay=S: answer only after S seconds (a slow first
+            # request, e.g. weights uploaded on demand).
+            time.sleep(float(params.get("head_delay", ["0"])[0]))
             if path == "/v1/videos":
                 self.send_json(200, {"id": "job-{}-{}".format(
                     model, next(job_seq)),
@@ -864,6 +867,60 @@ def run_cases(binary, tmp_root, ready_dir):
         assert poll_until(
             lambda: router.request("GET", "/v1/videos/" + job_two)[0] == 404,
             8.0), ("DELETE did not release the job", router.tail_log())
+
+    # Case 9b: a finished job nobody reads (page closed while it ran) must
+    # not keep its model busy: the router asks the worker itself (every
+    # 10 s) and releases it; a late status read still reaches the owner.
+    with RouterProcess(binary, tmp_root, "[llm/vee]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="video-unclaimed") as router:
+        status, payload = router.request(
+            "POST", "/v1/videos", {"model": "vee", "prompt": "x"})
+        assert status == 200, (status, payload, router.tail_log())
+        job_id = json.loads(payload)["id"]
+
+        def vee_busy():
+            _, body = router.request("GET", "/router/status")
+            return any(entry["id"] == "vee" and entry["busy"]
+                       for entry in json.loads(body)["models"])
+
+        assert vee_busy(), ("an open job keeps its model busy",
+                            router.tail_log())
+        assert poll_until(lambda: not vee_busy(), 25.0, 0.5), \
+            ("an unclaimed finished job kept its model busy",
+             router.tail_log())
+        with open(router.log_path, "rb") as handle:
+            assert b"event=job_released" in handle.read(), router.tail_log()
+        status, payload = router.request("GET", "/v1/videos/" + job_id)
+        assert status == 200 and json.loads(payload)["id"] == job_id, \
+            (status, payload, router.tail_log())
+
+    # Case 9c: a client that gives up before the worker answers is not a
+    # worker failure: the worker keeps running (no restart, no new spawn).
+    with RouterProcess(binary, tmp_root, "[llm/patient]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="client-gone") as router:
+        status, payload = router.request(
+            "POST", "/v1/chat/completions", {"model": "patient"})
+        assert status == 200, (status, payload, router.tail_log())
+        conn = http.client.HTTPConnection("127.0.0.1", router.port, timeout=1)
+        conn.request("POST", "/v1/chat/completions?head_delay=4",
+                     body=json.dumps({"model": "patient"}).encode(),
+                     headers={"Content-Type": "application/json"})
+        try:
+            conn.getresponse()
+        except (socket.timeout, TimeoutError, OSError):
+            pass
+        conn.close()
+        time.sleep(5)
+        assert len(router.spawns("patient")) == 1, \
+            ("a client disconnect restarted the worker", router.tail_log())
+        with open(router.log_path, "rb") as handle:
+            assert b"worker_unresponsive" not in handle.read(), \
+                router.tail_log()
+        status, payload = router.request(
+            "POST", "/v1/chat/completions", {"model": "patient"})
+        assert status == 200, (status, payload, router.tail_log())
 
     # Case 10: a live worker that answers /health but closes proxied
     # connections is killed and unloaded; the next request gets a fresh

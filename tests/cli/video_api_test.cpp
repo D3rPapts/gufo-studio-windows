@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "src/cli/serve/audio_stream.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
 
@@ -758,8 +759,99 @@ void TestWan22Options(const std::filesystem::path& root) {
   }
 }
 
-}  // namespace
+// Wan 2.1 Uni3C camera moves: "gufo.preview" is accepted, the runner gets a
+// hook that keeps the dense default (every step but the last of the 4-step
+// LCM schedule), and a 16-channel latent becomes a preview loop under the
+// job id. A bad preview object is refused.
+void TestWan21Preview(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobServiceOptions options = Options(root, &runner);
+  options.family = VideoModelFamily::kWan21Uni3C;
+  options.model_root = "/private/models/wan21-camera";
+  std::mutex mutex;
+  std::vector<int> wanted;
+  options.runner = [&](const h3::GenerationRequest& request,
+                       const h3::CancellationToken*, h3::GenerationProgress,
+                       void*, h3::GenerationTelemetry*, std::string*) {
+    // 2 latent frames of 2x3 pixels, [16][2][2][3]; the frames differ (an
+    // animated WebP drops identical frames).
+    std::vector<float> latent(16 * 2 * 2 * 3, 0.0F);
+    for (std::size_t i = 0; i < latent.size(); ++i)
+      latent[i] = (i / 6) % 2 == 0 ? -1.0F : 1.0F;
+    for (int step = 1; step <= 4; ++step) {
+      if (!request.preview.Wants(step, 4))
+        continue;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        wanted.push_back(step);
+      }
+      const auto encoded = gufo::server::PreviewHub::Global().stats().encoded;
+      request.preview.publish({.step = step, .steps = 4, .frames = 2,
+                               .height = 2, .width = 3, .channels = 16,
+                               .channel_major = true, .data = latent});
+      // Real steps are minutes apart: let the hub encode this preview
+      // before the next step asks (a queued preview defers the next one).
+      const auto until =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (gufo::server::PreviewHub::Global().stats().encoded == encoded &&
+             std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::error_code ignored;
+    std::filesystem::create_directories(request.output_path.parent_path(),
+                                        ignored);
+    std::ofstream(request.output_path, std::ios::binary) << "fake-video";
+    return true;
+  };
+  VideoJobService service(std::move(options));
+  Check(service.ready(), service.initialization_error());
+  const std::string png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+      "hKmMIQAAAABJRU5ErkJggg==";
+  const std::string prefix =
+      R"({"model":"wan2.1-uni3c","prompt":"orbit","size":"832x480","seconds":"1","first_frame":")" +
+      png + R"(","gufo":{"camera":{"type":"orbit_left"},)";
+  const HttpResponse created =
+      Send(service, "POST", "/v1/videos",
+           prefix + R"("preview":{"always":true}}})");
+  Check(created.status == 202,
+        "Wan 2.1 request with gufo.preview is accepted: " + created.body);
+  const std::string id = CreatedId(created);
+  WaitCompleted(service, id);
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    Check(wanted == std::vector<int>({1, 2, 3}),
+          "Wan 2.1 previews steps 1..3 of 4 (dense, never the last)");
+  }
+  HttpRequest poll;
+  poll.method = "GET";
+  poll.path = "/v1/previews/" + id;
+  HttpResponse preview;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  do {
+    preview = gufo::server::HandlePreviewRequest(
+        poll, gufo::server::PreviewHub::Global());
+    if (preview.status == 200)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  Check(preview.status == 200 && preview.body.starts_with("RIFF") &&
+            preview.body.find("ANIM") != std::string::npos,
+        "Wan 2.1 preview is an animated WebP under the job id");
 
+  for (const char* bad : {R"("preview":{"id":"x"}}})",
+                          R"("preview":{"every":0}}})",
+                          R"("preview":7}})"}) {
+    const HttpResponse rejected =
+        Send(service, "POST", "/v1/videos", prefix + bad);
+    Check(rejected.status == 400 &&
+              rejected.body.find("invalid_preview") != std::string::npos,
+          std::string("invalid Wan 2.1 preview rejected: ") + bad);
+  }
+}
+
+}  // namespace
 void TestDelivery(const std::filesystem::path& root) {
   FakeRunner runner;
   auto options = Options(root, &runner);
@@ -864,6 +956,7 @@ int main() {
   TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
   TestWan22Options(base / "wan22");
+  TestWan21Preview(base / "wan21");
   TestDelivery(base / "delivery");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";

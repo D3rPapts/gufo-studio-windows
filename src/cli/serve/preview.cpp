@@ -45,6 +45,8 @@ Factors FactorsFor(LatentFormat format) {
       return {48, kWan22Weights, kWan22Bias, 4};
     case LatentFormat::kMinimaxH3:
       return {24, kMinimaxH3Weights, kMinimaxH3Bias, 4};
+    case LatentFormat::kWan21:
+      return {16, kWan21Weights, kWan21Bias, 4};
   }
   throw std::logic_error("unknown latent format");
 }

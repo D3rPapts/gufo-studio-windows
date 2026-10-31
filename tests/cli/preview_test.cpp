@@ -80,6 +80,74 @@ void TestLatentToRgb() {
   Check(thrown, "shape mismatch throws");
 }
 
+// Wan 2.1 (Uni3C camera moves): 16 channels. Normalized latents of solid
+// colours from the Wan 2.1 VAE encoder ((z - mean) / std, centre of a 64x64
+// image) must preview as those colours; a 48-channel Wan 2.2 latent is not
+// a Wan 2.1 latent.
+void TestWan21Colours() {
+  struct Colour {
+    const char* name;
+    float latent[16];
+    int rgb[3];
+  };
+  const Colour colours[] = {
+      {"red",
+       {-0.3960F, 1.3660F, 1.3362F, -0.0737F, 1.0735F, 0.9857F, 0.0802F,
+        -2.0122F, -0.4179F, -2.0639F, -1.0409F, -0.0401F, -0.7723F, 1.2452F,
+        0.5258F, 0.1150F},
+       {255, 0, 0}},
+      {"green",
+       {-1.3833F, -1.7724F, 0.8222F, 1.2714F, 0.5253F, -0.9837F, -0.2091F,
+        -1.3363F, 0.4061F, 2.0203F, 0.6505F, 0.7573F, 0.9228F, -2.0237F,
+        -1.8339F, 0.8341F},
+       {0, 255, 0}},
+      {"blue",
+       {2.6825F, 1.9572F, -1.8700F, -1.4108F, -0.7144F, -1.0961F, -0.0949F,
+        1.0855F, -0.3328F, 0.4840F, -0.1448F, 0.2171F, 0.4337F, 0.9248F,
+        1.3279F, -0.5637F},
+       {0, 0, 255}},
+      {"white",
+       {0.8798F, 0.4816F, 1.1298F, 1.2294F, -0.8779F, -0.1479F, -0.8306F,
+        -0.6688F, -1.3269F, -0.3029F, 0.7377F, 0.8602F, -0.1037F, -0.9381F,
+        1.3315F, 1.2491F},
+       {255, 255, 255}},
+      {"black",
+       {-0.0585F, 0.5264F, -0.9525F, -1.4949F, 0.7660F, -0.4241F, 0.5503F,
+        -0.3844F, 0.7959F, 0.2112F, -0.8589F, -0.3128F, 0.1313F, 0.9528F,
+        -0.9413F, -1.0189F},
+       {0, 0, 0}},
+  };
+  // 2 latent frames of 2x3 pixels, channel-major like the sampler's x0.
+  const int frames = 2, height = 2, width = 3, plane = height * width;
+  for (const Colour& colour : colours) {
+    std::vector<float> latent(16 * frames * plane);
+    for (int c = 0; c < 16; ++c)
+      for (int i = 0; i < frames * plane; ++i)
+        latent[c * frames * plane + i] = colour.latent[c];
+    const auto images = gufo::server::LatentToRgb(
+        LatentFormat::kWan21,
+        {.frames = frames, .height = height, .width = width, .channels = 16,
+         .channel_major = true, .data = latent});
+    Check(images.size() == 2 && images[1].width == width &&
+              images[1].height == height,
+          "Wan 2.1: one latent-resolution image per latent frame");
+    for (const auto& image : images)
+      for (int p = 0; p < plane; ++p)
+        for (int k = 0; k < 3; ++k)
+          Check(std::abs(image.rgb[p * 3 + k] - colour.rgb[k]) <= 48,
+                std::string("Wan 2.1 previews ") + colour.name);
+  }
+  std::vector<float> wan22(48 * 4, 0.0F);
+  bool thrown = false;
+  try {
+    (void)gufo::server::LatentToRgb(
+        LatentFormat::kWan21,
+        {.frames = 1, .height = 2, .width = 2, .channels = 48, .data = wan22});
+  } catch (const std::invalid_argument&) {
+    thrown = true;
+  }
+  Check(thrown, "Wan 2.1 refuses 48 channels");
+}
 void TestEncoders() {
   PreviewRgb image{
       .width = 8, .height = 4, .rgb = std::vector<std::uint8_t>(8 * 4 * 3)};
@@ -232,6 +300,7 @@ void TestDenseParse() {
 
 int main() {
   TestLatentToRgb();
+  TestWan21Colours();
   TestEncoders();
   TestParse();
   TestWatchers();

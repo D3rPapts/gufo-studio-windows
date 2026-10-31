@@ -304,6 +304,10 @@ void Registry::CompleteVideoJob(std::string_view job_id) {
   Touch(*entry);
 }
 
+std::vector<std::pair<std::string, std::string>> Registry::OpenJobs() const {
+  return {job_owners_.begin(), job_owners_.end()};
+}
+
 std::string Registry::JobOwner(std::string_view job_id) const {
   const std::string key(job_id);
   if (const auto it = job_owners_.find(key); it != job_owners_.end()) {

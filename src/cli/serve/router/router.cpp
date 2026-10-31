@@ -127,11 +127,22 @@ HttpResponse LlamaErr(int status, std::string_view reason,
 
 /// Static file under --pages-dir: GET /<page>/ serves <dir>/<page>/index.html,
 /// GET /<page>/<file> the file itself, and /<page> redirects to /<page>/.
+/// GET / redirects to /start/ when <dir>/start/index.html exists.
 /// Same-origin pages need no CORS or private-network preflight from browsers.
 std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                                       const HttpRequest& req) {
-  if (dir.empty() || req.method != "GET" || req.path.size() < 2 ||
-      req.path.starts_with("/v1/"))
+  if (dir.empty() || req.method != "GET")
+    return std::nullopt;
+  if (req.path == "/" || req.path.starts_with("/?")) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(dir / "start" / "index.html", ec))
+      return std::nullopt;
+    return HttpResponse{.status = 302,
+                        .reason = "Found",
+                        .headers = {{"Location", "/start/"},
+                                    {"Cache-Control", "no-cache"}}};
+  }
+  if (req.path.size() < 2 || req.path.starts_with("/v1/"))
     return std::nullopt;
   std::string_view rel = std::string_view(req.path).substr(1);
   if (const auto query = rel.find('?'); query != std::string_view::npos)
@@ -770,6 +781,10 @@ public:
   std::set<std::string> stopping;
   /// --autoload models whose load failed and wait for a retry.
   AutoloadFailures autoload_failed;
+  /// Next time SweepFinishedJobsLocked asks the workers about open jobs.
+  std::chrono::steady_clock::time_point next_job_sweep{};
+  /// Sweeps in a row a job's worker left its status unanswered.
+  std::map<std::string, int> job_silent_sweeps;
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
@@ -1001,7 +1016,13 @@ public:
     }
     {
       const std::lock_guard<std::mutex> relock(mutex);
-      if (response.status == 502 && !response.streaming_body) {
+      // A client that went away while the worker had not answered yet also
+      // ends in a 502 ("client disconnected while waiting for the worker");
+      // the worker is fine then and must not be restarted (31.10.: a page
+      // that gave up after a 6-minute load wait killed the freshly loaded
+      // qwen-image-2.1-turbo worker one second after it took the request).
+      const bool client_gone = req.is_cancelled && req.is_cancelled();
+      if (response.status == 502 && !response.streaming_body && !client_gone) {
         HandleUpstreamFailureLocked(model_id);
       }
     }
@@ -1668,6 +1689,118 @@ public:
     }
   }
 
+  /// An open video or async music job keeps its model busy until a client
+  /// reads its terminal status, its result or deletes it. A job nobody comes
+  /// back for (page closed while it ran) would keep the model resident and
+  /// block every load that needs its memory (31.10.: wan2.2-ti2v-5b held
+  /// qwen-image-2.1-turbo and moss-image off for 20 minutes). Every
+  /// kJobSweep the router asks the owning worker itself and releases jobs
+  /// that are finished or unknown there; finished jobs keep their owner, so
+  /// a late status or content read still routes to it. A worker that
+  /// leaves a job's status unanswered for kJobSilentSweeps sweeps in a row
+  /// (3 minutes; a computing worker still answers status reads at once) is
+  /// hung: it is stopped like an unresponsive worker and its jobs released
+  /// (a reloaded worker reports them from its persisted job state).
+  static constexpr auto kJobSweep = std::chrono::seconds(10);
+  static constexpr int kJobSilentSweeps = 18;
+  void SweepFinishedJobsLocked(std::unique_lock<std::mutex>& lock) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_job_sweep)
+      return;
+    next_job_sweep = now + kJobSweep;
+    struct Probe {
+      std::string job, model;
+      int port{0};
+    };
+    std::vector<Probe> probes;
+    for (const auto& [job, model] : registry.OpenJobs()) {
+      if (!LoadedLocked(model))
+        continue;
+      if (const auto worker = FindWorkerLocked(model))
+        probes.push_back({job, model, worker->port()});
+    }
+    if (probes.empty())
+      return;
+    std::vector<const Probe*> finished;
+    std::vector<const Probe*> silent;
+    lock.unlock();
+    for (const Probe& probe : probes) {
+      HttpRequest poll;
+      poll.method = "GET";
+      // Async music ids are music_N; everything else is a video job.
+      poll.path = std::string(probe.job.starts_with("music_")
+                                  ? "/v1/audio/music/"
+                                  : "/v1/videos/") +
+                  probe.job;
+      poll.request_id = "router-job-sweep";
+      // A status read answers at once; a stuck worker must not hold up the
+      // supervision tick.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      poll.is_cancelled = [deadline] {
+        return std::chrono::steady_clock::now() > deadline;
+      };
+      router::UpstreamTarget target;
+      target.host = "127.0.0.1";
+      target.port = probe.port;
+      try {
+        const auto result =
+            CollectResponse(router::ProxyToWorker(target, poll));
+        if (result.status == 502) {
+          // No answer before the deadline, or the connection failed.
+          silent.push_back(&probe);
+          continue;
+        }
+        if (result.status == 404) {
+          finished.push_back(&probe);
+          continue;
+        }
+        if (result.status != 200)
+          continue;
+        const std::string status =
+            json::parse(result.body).member_str("status");
+        if (status == "completed" || status == "failed" ||
+            status == "cancelled" || status == "expired")
+          finished.push_back(&probe);
+      } catch (const std::exception&) {
+        // Worker busy or gone: the next sweep or a client read decides.
+      }
+    }
+    lock.lock();
+    for (const Probe& probe : probes)
+      if (std::find(silent.begin(), silent.end(), &probe) == silent.end())
+        job_silent_sweeps.erase(probe.job);
+    for (const Probe* probe : finished) {
+      if (registry.JobOwner(probe->job) != probe->model)
+        continue;
+      registry.CompleteVideoJob(probe->job);
+      Logger::Info("router", "event=job_released job=" + probe->job +
+                                 " model=" + probe->model +
+                                 " reason=finished_unclaimed");
+    }
+    std::set<std::string> hung;
+    for (const Probe* probe : silent)
+      if (++job_silent_sweeps[probe->job] >= kJobSilentSweeps &&
+          registry.JobOwner(probe->job) == probe->model)
+        hung.insert(probe->model);
+    for (const std::string& model : hung) {
+      if (FindWorkerLocked(model) == nullptr)
+        continue;
+      Logger::Warn("router", "event=worker_unresponsive model=" + model +
+                                 " reason=job_status action=restart");
+      for (const auto& [job, owner] : registry.OpenJobs())
+        if (owner == model) {
+          job_silent_sweeps.erase(job);
+          registry.CompleteVideoJob(job);
+          Logger::Info("router", "event=job_released job=" + job +
+                                     " model=" + model +
+                                     " reason=worker_unresponsive");
+        }
+      // Each stop releases the lock; the next tick re-reads everything.
+      StopLocked(model);
+    }
+  }
+
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
   /// for queued loads, and kill wedged loads past their deadline.
   void SuperviseOnce() {
@@ -1683,6 +1816,7 @@ public:
         ++it;
       }
     }
+    SweepFinishedJobsLocked(lock);
     for (const auto& id : registry.DueIdleUnloads()) {
       // An earlier stop in this loop released the lock: a request may have
       // made this model busy meanwhile.
@@ -2311,7 +2445,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &models_dir);
   parser.AddOption("", "--pages-dir", "DIR",
                    "Serve static pages: GET /<name>/ returns "
-                   "DIR/<name>/index.html",
+                   "DIR/<name>/index.html; GET / redirects to /start/ "
+                   "when DIR/start/index.html exists",
                    "Router", &pages_dir);
   parser.AddOption("", "--comfy-dir", "DIR",
                    "Serve a ComfyUI-compatible API (/prompt, /history, "
