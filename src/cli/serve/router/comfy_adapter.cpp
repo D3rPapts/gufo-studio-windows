@@ -366,6 +366,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->render_video);
       if (video->source_video)
         files->push_back(*video->source_video);
+      if (video->guide_video)
+        files->push_back(*video->guide_video);
     }
   }
 }
@@ -1619,7 +1621,40 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
   if (spec.source_video)
     body["source_video"] = "data:video/mp4;base64," +
                            Base64Encode(ReadFileRef(*spec.source_video));
-  if (spec.audio_reference) {
+  if (spec.guide_video) {
+    // MiniMaxH3AddGuide image from LoadVideo -> GetVideoComponents: gufo
+    // decodes the clip and anchors its first 17k + 5 frames.
+    json::Value guide = json::Value::object();
+    guide["frame"] = spec.guide_video_frame;
+    guide["video"] = "data:video/mp4;base64," +
+                     Base64Encode(ReadFileRef(*spec.guide_video));
+    body["gufo"]["guide_video"] = std::move(guide);
+  }
+  if (spec.audio_reference && spec.audio_reference_from_video) {
+    // The anchor clip's soundtrack (GetVideoComponents audio) as FLAC.
+    if (options_.ffmpeg.empty())
+      throw std::runtime_error(
+          "the H3 audio guide comes from a video; start the router with "
+          "--comfy-ffmpeg to extract it");
+    const fs::path flac = WorkFile("flac");
+    std::string error;
+    if (RunFfmpeg({"-i", FilePath(*spec.audio_reference), "-vn", "-map",
+                   "0:a:0", "-ac", "2", "-c:a", "flac", flac},
+                  &error)) {
+      body["audio_reference"] =
+          "data:audio/flac;base64," + Base64Encode(ReadAll(flac));
+    } else {
+      // ComfyUI's GetVideoComponents yields no audio for a silent clip, so
+      // the guide anchors the picture only.
+      job->warnings.push_back("node " + task.node_id + ": " +
+                              spec.audio_reference->name +
+                              " has no usable audio track, anchoring the "
+                              "picture only (" +
+                              error + ")");
+    }
+    std::error_code ignored;
+    fs::remove(flac, ignored);
+  } else if (spec.audio_reference) {
     const std::string audio = ReadFileRef(*spec.audio_reference);
     body["audio_reference"] =
         "data:" + ContentTypeFor(spec.audio_reference->name) + ";base64," +

@@ -1325,6 +1325,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   bool preset_explicit = false;
   int audio_reference_frame = 0;
   const json::Value* guide_keyframes = nullptr;
+  const json::Value* guide_video_value = nullptr;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
@@ -1332,7 +1333,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                                      "lora", "lora_strength", "interpolate",
                                      "upscale",
                                      "keyframes", "audio_reference_frame",
-                                     "preview"})) {
+                                     "guide_video", "preview"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -1425,6 +1426,15 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                      "'gufo.keyframes' must be an array of {\"frame\", "
                      "\"image\"} objects",
                      "invalid_keyframes");
+      }
+    }
+    if (extension->contains("guide_video")) {
+      guide_video_value = extension->find("guide_video");
+      if (!guide_video_value->is_object() && !guide_video_value->is_array()) {
+        return Error(400, "Bad Request",
+                     "'gufo.guide_video' must be {\"frame\", \"video\"} or "
+                     "an array of them",
+                     "invalid_guide_video");
       }
     }
     if (extension->contains("audio_reference_frame")) {
@@ -1598,6 +1608,111 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                    "invalid_keyframes");
     }
   }
+  // Guide clips (MiniMaxH3AddGuide with a frame batch, e.g. the last frames
+  // of the previous part from LoadVideo -> GetVideoComponents):
+  // "gufo.guide_video" {"frame": N, "video": MP4 data URL or base64} (or an
+  // array of them) and multipart files "guide_video_<N>". The worker decodes
+  // them; the first 17k + 5 frames are anchored from frame N on (fewer than
+  // 5 frames: the first frame only). The clip's soundtrack is a separate
+  // "audio_reference" at the same frame.
+  std::vector<VideoGuideUpload> guide_videos;
+  {
+    const auto check_frame = [&](int frame, const std::string& label)
+        -> std::optional<HttpResponse> {
+      int resolved = frame < 0 ? frame + parameters->frames : frame;
+      if (resolved < 0 || resolved >= parameters->frames) {
+        return Error(400, "Bad Request",
+                     "'" + label + "' frame " + std::to_string(frame) +
+                         " is outside the video's " +
+                         std::to_string(parameters->frames) + " frames",
+                     "invalid_guide_video");
+      }
+      return std::nullopt;
+    };
+    if (guide_video_value != nullptr) {
+      std::vector<const json::Value*> entries;
+      if (guide_video_value->is_array()) {
+        for (const json::Value& entry : guide_video_value->items()) {
+          entries.push_back(&entry);
+        }
+      } else {
+        entries.push_back(guide_video_value);
+      }
+      std::size_t index = 0;
+      for (const json::Value* entry : entries) {
+        const std::string label =
+            "gufo.guide_video[" + std::to_string(index++) + "]";
+        const auto frame = entry->is_object()
+                               ? JsonSignedFrame(entry->find("frame"))
+                               : std::nullopt;
+        const json::Value* video =
+            entry->is_object() ? entry->find("video") : nullptr;
+        if (!frame.has_value() || video == nullptr || !video->is_string() ||
+            !HasOnlyMembers(*entry, {"frame", "video"})) {
+          return Error(400, "Bad Request",
+                       "'" + label +
+                           "' must be {\"frame\": integer, \"video\": MP4 "
+                           "data URL or base64}",
+                       "invalid_guide_video");
+        }
+        if (auto failed = check_frame(*frame, label)) {
+          return *failed;
+        }
+        std::string_view text = video->str();
+        if (text.starts_with("data:")) {
+          const auto comma = text.find(',');
+          if (comma == std::string_view::npos ||
+              text.substr(0, comma).find(";base64") == std::string_view::npos) {
+            return Error(400, "Bad Request",
+                         "'" + label + ".video' data URL must be base64",
+                         "invalid_guide_video");
+          }
+          text.remove_prefix(comma + 1);
+        }
+        auto decoded = DecodeBase64(text);
+        if (!decoded.has_value() || decoded->size() < 64) {
+          return Error(400, "Bad Request",
+                       "'" + label + ".video' is not valid base64 video",
+                       "invalid_guide_video");
+        }
+        guide_videos.push_back({.frame = *frame, .mp4 = std::move(*decoded)});
+      }
+    }
+    for (const auto& [name, content] : files) {
+      if (!name.starts_with("guide_video_")) {
+        continue;
+      }
+      int frame = 0;
+      const std::string_view digits = std::string_view(name).substr(12);
+      const auto parsed =
+          std::from_chars(digits.data(), digits.data() + digits.size(), frame);
+      if (digits.empty() || parsed.ec != std::errc{} ||
+          parsed.ptr != digits.data() + digits.size()) {
+        return Error(400, "Bad Request",
+                     "multipart guide clips are named guide_video_<frame>",
+                     "invalid_guide_video");
+      }
+      if (auto failed = check_frame(frame, name)) {
+        return *failed;
+      }
+      if (content.size() < 64) {
+        return Error(400, "Bad Request",
+                     "'" + name + "' is not a video file",
+                     "invalid_guide_video");
+      }
+      guide_videos.push_back(
+          {.frame = frame,
+           .mp4 = std::vector<std::uint8_t>(content.begin(), content.end())});
+    }
+    if (keyframes.size() + guide_videos.size() >
+        minimax_h3::kH3MaximumKeyframes) {
+      return Error(400, "Bad Request",
+                   "at most " +
+                       std::to_string(minimax_h3::kH3MaximumKeyframes) +
+                       " keyframes, guide frames and guide clips",
+                   "invalid_guide_video");
+    }
+  }
   // Audio anchor (MiniMaxH3AddGuide audio): "audio_reference" as a base64
   // (data URL) string or a multipart file, at "gufo.audio_reference_frame".
   std::vector<minimax_h3::GenerationAudioGuide> audio_guides;
@@ -1663,6 +1778,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .seed = seed,
       .keyframes = std::move(keyframes),
       .audio_guides = std::move(audio_guides),
+      .h3_guide_videos = std::move(guide_videos),
       .lora = lora,
       .lora_strength = lora_strength,
       .steps_explicit = steps.has_value(),

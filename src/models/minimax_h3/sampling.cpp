@@ -321,9 +321,38 @@ std::optional<PackedLayout> BuildKeyframeLayout(
   return BuildGuideLayout(text_rows, geometry, frames, {}, error);
 }
 
+int GuideClipPixelFrames(int available) noexcept {
+  if (available < 5) {
+    return 1;
+  }
+  return 5 + ((available - 5) / 17) * 17;
+}
+
+int GuideClipLatentFrames(int pixel_frames) noexcept {
+  return pixel_frames <= 1 ? 1 : VideoLatentFrameCount(pixel_frames);
+}
+
 std::optional<PackedLayout> BuildGuideLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const int> keyframe_frames,
+    std::span<const AudioGuidePlacement> audio_guides, std::string* error) {
+  std::vector<ImageGuidePlacement> images;
+  try {
+    images.reserve(keyframe_frames.size());
+  } catch (const std::bad_alloc&) {
+    SetError(error, "out of memory allocating MiniMax H3 guide placements");
+    return std::nullopt;
+  }
+  for (const int frame : keyframe_frames) {
+    images.push_back({.frame = frame, .latent_frames = 1, .pixel_frames = 1});
+  }
+  return BuildImageGuideLayout(text_rows, geometry, images, audio_guides,
+                               error);
+}
+
+std::optional<PackedLayout> BuildImageGuideLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ImageGuidePlacement> image_guides,
     std::span<const AudioGuidePlacement> audio_guides, std::string* error) {
   if (text_rows == 0 || text_rows > std::numeric_limits<std::uint32_t>::max() ||
       geometry.width < kH3CanvasMultiple ||
@@ -360,7 +389,7 @@ std::optional<PackedLayout> BuildGuideLayout(
   std::size_t video_rows = 0;
   std::size_t audio_rows = 0;
   std::size_t condition_rows = 0;
-  if (keyframe_frames.size() > kH3MaximumKeyframes ||
+  if (image_guides.size() > kH3MaximumKeyframes ||
       audio_guides.size() > kH3MaximumAudioGuides) {
     SetError(error,
              "MiniMax H3 accepts at most " +
@@ -368,13 +397,30 @@ std::optional<PackedLayout> BuildGuideLayout(
                  std::to_string(kH3MaximumAudioGuides) + " audio guides");
     return std::nullopt;
   }
-  for (const int frame : keyframe_frames) {
-    if (frame < 0 || frame >= geometry.temporal.frames) {
-      SetError(error, "MiniMax H3 image guide frame " + std::to_string(frame) +
+  std::size_t guide_latent_frames = 0;
+  for (const ImageGuidePlacement& guide : image_guides) {
+    if (guide.frame < 0 || guide.frame >= geometry.temporal.frames) {
+      SetError(error, "MiniMax H3 image guide frame " +
+                          std::to_string(guide.frame) +
                           " is outside the video's " +
                           std::to_string(geometry.temporal.frames) + " frames");
       return std::nullopt;
     }
+    // A clip is 17k + 5 pixel frames encoded to 5k + 2 latent frames and
+    // must end inside the video (the reference's "does not fit" check).
+    if (guide.pixel_frames < 1 ||
+        (guide.pixel_frames > 1 &&
+         (guide.pixel_frames < 5 || (guide.pixel_frames - 5) % 17 != 0)) ||
+        guide.latent_frames != GuideClipLatentFrames(guide.pixel_frames) ||
+        guide.pixel_frames > geometry.temporal.frames - guide.frame) {
+      SetError(error, "a " + std::to_string(guide.pixel_frames) +
+                          " frame MiniMax H3 guide clip at frame " +
+                          std::to_string(guide.frame) +
+                          " does not fit in the video's " +
+                          std::to_string(geometry.temporal.frames) + " frames");
+      return std::nullopt;
+    }
+    guide_latent_frames += static_cast<std::size_t>(guide.latent_frames);
   }
   std::size_t audio_condition_rows = 0;
   for (const AudioGuidePlacement& guide : audio_guides) {
@@ -387,7 +433,7 @@ std::optional<PackedLayout> BuildGuideLayout(
     }
     audio_condition_rows += 2U * static_cast<std::size_t>(guide.latent_frames);
   }
-  if (!CheckedMultiply(frame_rows, keyframe_frames.size(), &condition_rows) ||
+  if (!CheckedMultiply(frame_rows, guide_latent_frames, &condition_rows) ||
       condition_rows >
           std::numeric_limits<std::size_t>::max() - audio_condition_rows ||
       text_rows > std::numeric_limits<std::size_t>::max() - condition_rows -
@@ -441,11 +487,19 @@ std::optional<PackedLayout> BuildGuideLayout(
       return static_cast<double>(text_rows) +
              kFrameRescale * static_cast<double>(frame_index);
     };
-    if (!keyframe_frames.empty()) {
-      for (const int frame_index : keyframe_frames) {
-        const double time = guide_time(frame_index);
-        for (const Position3D& position : frame) {
-          layout.positions.push_back({time, position.height, position.width});
+    if (!image_guides.empty()) {
+      for (const ImageGuidePlacement& guide : image_guides) {
+        // The reference's _video_grid(vt, frame, cond_t): latent frame k of
+        // the guide starts 5/3 * sum(FRAME_PER_TOKEN[0..k)) after cond_t.
+        double time = guide_time(guide.frame);
+        for (int index = 0; index < guide.latent_frames; ++index) {
+          for (const Position3D& position : frame) {
+            layout.positions.push_back(
+                {time, position.height, position.width});
+          }
+          time += kFrameRescale *
+                  kFramesPerToken[static_cast<std::size_t>(index) %
+                                  kFramesPerToken.size()];
         }
       }
       layout.segments.push_back({text_rows, text_rows + condition_rows,

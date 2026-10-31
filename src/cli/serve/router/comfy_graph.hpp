@@ -10,8 +10,9 @@
 //   image  KSampler <- TextEncodeQwenImage21 / CLIPTextEncode (Qwen-Image)
 //          -> /v1/images/generations, or /v1/images/edits with references;
 //          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only)
-//   h3     KSampler <- MiniMaxH3ImageToVideo (+ MiniMaxH3AddGuide)
-//          -> /v1/videos (minimax-h3)
+//   h3     KSampler <- MiniMaxH3ImageToVideo (+ MiniMaxH3AddGuide, whose
+//          image / audio may come from LoadVideo -> GetVideoComponents as a
+//          guide clip with its soundtrack) -> /v1/videos (minimax-h3)
 //   wan    KSampler <- Wan22ImageToVideoLatent -> /v1/videos (wan2.2-ti2v-5b)
 //   speech FB_Qwen3TTSVoiceDesign / VoiceClone / CustomVoice
 //          -> /v1/audio/speech
@@ -213,6 +214,15 @@ struct VideoTask {
   /// gufo.audio_reference_frame.
   std::optional<FileRef> audio_reference;
   int audio_reference_frame{0};
+  /// The audio comes from GetVideoComponents (output 1) of a LoadVideo:
+  /// `audio_reference` is that video and the executor extracts its
+  /// soundtrack (ffmpeg, FLAC) before sending it.
+  bool audio_reference_from_video{false};
+  /// H3 MiniMaxH3AddGuide image from GetVideoComponents (output 0) of a
+  /// LoadVideo: a guide clip (e.g. the last frames of the previous part),
+  /// sent as gufo.guide_video {frame, video} by the executor.
+  std::optional<FileRef> guide_video;
+  int guide_video_frame{0};
   /// Camera family: a preset move or a rendered guide video (LoadVideo),
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;

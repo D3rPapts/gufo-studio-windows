@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/core/platform/mapped_file.hpp"
+#include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/video_vae_encoder.hpp"
 
 namespace gufo::minimax_h3 {
@@ -26,6 +27,12 @@ constexpr std::array<int, kLevels> kLevelChannels = {128, 256, 256,
                                                      512, 512, 1024};
 constexpr std::array<bool, kLevels> kLevelDownsample = {true, true,  true,
                                                         true, false, false};
+// Temporal stride of each level's downsample (the reference's time_down).
+constexpr std::array<int, kLevels> kLevelTimeStride = {1, 2, 2, 1, 1, 1};
+// The reference encodes clips in chunks of 17 frames and drops the last 3
+// latent frames of the concatenation (clip_length / token_drop).
+constexpr int kClipChunkFrames = 17;
+constexpr int kClipTokenDrop = 3;
 constexpr int kGroups = 32;
 constexpr float kGroupNormEpsilon = 1.0e-6F;
 constexpr int kSpatialRatio = 16;
@@ -281,8 +288,12 @@ struct Conv {
   int input_channels{0};
   int output_channels{0};
   int kernel{0};
-  DeviceBuffer weight;  // [output][input * kernel * kernel]
+  DeviceBuffer weight;  // [output][input * kernel * kernel], last time tap
   DeviceBuffer bias;
+  // Temporal taps 0 and 1 of a 3x3x3 kernel in the same layout; loaded only
+  // for multi-frame (guide clip) encoding.
+  std::array<DeviceBuffer, 2> earlier_taps;
+  bool temporal{false};
 };
 
 struct Norm {
@@ -308,7 +319,10 @@ struct Level {
 
 class Encoder {
 public:
-  explicit Encoder(const ModelInventory& inventory) : inventory_(inventory) {}
+  // `temporal` also loads the earlier temporal taps of every 3x3x3 kernel
+  // (needed by EncodeClipTile; three times the 3x3 weight memory).
+  explicit Encoder(const ModelInventory& inventory, bool temporal = false)
+      : inventory_(inventory), temporal_(temporal) {}
   ~Encoder() {
     if (stream_ != nullptr) {
       (void)hipStreamSynchronize(stream_);
@@ -385,10 +399,13 @@ public:
            stats_.Allocate(kGroups * 2 * sizeof(float), error);
   }
 
-  bool AllocateScratch(int tile_height, int tile_width, std::string* error) {
+  bool AllocateScratch(int tile_height, int tile_width, std::string* error,
+                       int frames = 1) {
     const std::size_t plane =
         static_cast<std::size_t>(tile_height) * tile_width;
-    const std::size_t activation = plane * kLevelChannels[0];
+    // Frame-major activations; level 0 at full resolution is the largest.
+    const std::size_t activation =
+        plane * kLevelChannels[0] * static_cast<std::size_t>(frames);
     // conv_in reads 3 channels at full resolution; level 0 reads 128.
     const std::size_t columns = plane * kLevelChannels[0] * 9U;
     if (activation <= activation_elements_ && columns <= column_elements_) {
@@ -491,6 +508,103 @@ public:
     return true;
   }
 
+  // Encodes one tile of a clip: `frames` frame-major RGB8 canvases at
+  // `rgb_device` through the causal 3D encoder into host moments
+  // [latent frame][48][tile_height / 16][tile_width / 16]. Activations are
+  // frame-major ([frame][channels][height][width]) so every per-frame step
+  // reuses the 2D kernels; GroupNorm statistics are per frame as in the
+  // reference's TemporalIsolatedGroupNorm.
+  bool EncodeClipTile(const std::uint8_t* rgb_device, int image_width,
+                      int image_height, int frames, int tile_x, int tile_y,
+                      int tile_width, int tile_height,
+                      std::vector<float>* moments, int* latent_frames,
+                      std::string* error) {
+    float* x = activations_[0].As<float>();
+    float* a = activations_[1].As<float>();
+    float* b = activations_[2].As<float>();
+    float* c = activations_[3].As<float>();
+    const std::size_t plane =
+        static_cast<std::size_t>(tile_width) * tile_height;
+    const std::size_t image_bytes =
+        static_cast<std::size_t>(image_width) * image_height * 3U;
+    for (int frame = 0; frame < frames; ++frame) {
+      NormalizeTileKernel<<<Blocks(plane), 256, 0, stream_>>>(
+          rgb_device + static_cast<std::size_t>(frame) * image_bytes,
+          image_width, tile_x, tile_y, tile_width, tile_height,
+          a + static_cast<std::size_t>(frame) * 3U * plane);
+    }
+    int height = tile_height;
+    int width = tile_width;
+    int time = frames;
+    if (!ConvolveFrames(conv_in_, a, time, height, width, 1, 1, 1, x, &time,
+                        error)) {
+      return false;
+    }
+    for (std::size_t level_index = 0; level_index < levels_.size();
+         ++level_index) {
+      Level& level = levels_[level_index];
+      for (Resnet& resnet : level.resnets) {
+        // a = silu(norm1(x)); b = conv1(a); a = silu(norm2(b)); b = conv2(a)
+        if (!NormSiluFrames(resnet.norm1, x, time, height, width, a, error) ||
+            !ConvolveFrames(resnet.conv1, a, time, height, width, 1, 1, 1, b,
+                            nullptr, error) ||
+            !NormSiluFrames(resnet.norm2, b, time, height, width, a, error) ||
+            !ConvolveFrames(resnet.conv2, a, time, height, width, 1, 1, 1, b,
+                            nullptr, error)) {
+          return false;
+        }
+        const std::size_t elements =
+            static_cast<std::size_t>(resnet.conv2.output_channels) * height *
+            width * static_cast<std::size_t>(time);
+        if (resnet.has_shortcut) {
+          if (!ConvolveFrames(resnet.shortcut, x, time, height, width, 1, 0, 1,
+                              c, nullptr, error)) {
+            return false;
+          }
+          AddKernel<<<Blocks(elements), 256, 0, stream_>>>(c, b, elements);
+          std::swap(x, c);
+        } else {
+          AddKernel<<<Blocks(elements), 256, 0, stream_>>>(x, b, elements);
+        }
+      }
+      if (level.has_downsample) {
+        // Right/bottom reflect pad of one, then a 3x3x3 convolution with
+        // spatial stride 2 and the level's temporal stride.
+        if (!ConvolveFrames(level.downsample, x, time, height, width, 2, 0,
+                            kLevelTimeStride[level_index], b, &time, error)) {
+          return false;
+        }
+        height /= 2;
+        width /= 2;
+        std::swap(x, b);
+      }
+    }
+    if (!NormSiluFrames(norm_out_, x, time, height, width, a, error) ||
+        !ConvolveFrames(conv_out_, a, time, height, width, 1, 1, 1, b, nullptr,
+                        error) ||
+        !ConvolveFrames(quant_conv_, b, time, height, width, 1, 0, 1, c,
+                        nullptr, error)) {
+      return false;
+    }
+    moments->resize(static_cast<std::size_t>(kH3VideoVaeMomentChannels) *
+                    height * width * static_cast<std::size_t>(time));
+    hipError_t status = hipPeekAtLastError();
+    if (status == hipSuccess) {
+      status =
+          hipMemcpyAsync(moments->data(), c, moments->size() * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(stream_);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("H3 VisualVAE clip encoder tile", status));
+      return false;
+    }
+    *latent_frames = time;
+    return true;
+  }
+
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
 
 private:
@@ -515,24 +629,46 @@ private:
         !ReadHost(inventory_, *bias, &bias_host, error)) {
       return false;
     }
-    // A single causal frame sees only the last temporal tap.
+    // A single causal frame sees only the last temporal tap; clips also need
+    // the earlier ones (time tap `tap` of weight[o][i][kt][ky][kx]).
     const std::size_t taps = static_cast<std::size_t>(kernel) * kernel;
-    std::vector<float> spatial(static_cast<std::size_t>(output) * input * taps);
-    for (std::size_t o = 0; o < static_cast<std::size_t>(output); ++o) {
-      for (std::size_t i = 0; i < static_cast<std::size_t>(input); ++i) {
-        const std::size_t source =
-            ((o * input + i) * kernel + (kernel - 1)) * taps;
-        std::copy_n(host.begin() + static_cast<std::ptrdiff_t>(source), taps,
-                    spatial.begin() +
-                        static_cast<std::ptrdiff_t>((o * input + i) * taps));
+    const auto time_tap = [&](int tap) {
+      std::vector<float> spatial(static_cast<std::size_t>(output) * input *
+                                 taps);
+      for (std::size_t o = 0; o < static_cast<std::size_t>(output); ++o) {
+        for (std::size_t i = 0; i < static_cast<std::size_t>(input); ++i) {
+          const std::size_t source =
+              ((o * input + i) * kernel + static_cast<std::size_t>(tap)) *
+              taps;
+          std::copy_n(host.begin() + static_cast<std::ptrdiff_t>(source), taps,
+                      spatial.begin() +
+                          static_cast<std::ptrdiff_t>((o * input + i) * taps));
+        }
       }
-    }
+      return spatial;
+    };
     conv->input_channels = input;
     conv->output_channels = output;
     conv->kernel = kernel;
+    const std::vector<float> spatial = time_tap(kernel - 1);
     weight_bytes_ += (spatial.size() + bias_host.size()) * sizeof(float);
-    return Upload(spatial, &conv->weight, error) &&
-           Upload(bias_host, &conv->bias, error);
+    if (!Upload(spatial, &conv->weight, error) ||
+        !Upload(bias_host, &conv->bias, error)) {
+      return false;
+    }
+    conv->temporal = temporal_ && kernel == 3;
+    if (conv->temporal) {
+      for (int tap = 0; tap < 2; ++tap) {
+        const std::vector<float> earlier = time_tap(tap);
+        weight_bytes_ += earlier.size() * sizeof(float);
+        if (!Upload(earlier,
+                    &conv->earlier_taps[static_cast<std::size_t>(tap)],
+                    error)) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   bool LoadNorm(const std::string& prefix, int channels, Norm* norm,
@@ -595,6 +731,108 @@ private:
   // right/bottom reflect pad (output = input / 2). kernel 1: pointwise.
   bool Convolve(const Conv& conv, const float* input, int height, int width,
                 int stride, int pad, float* output, std::string* error) {
+    return ConvolveTap(conv, conv.weight.As<float>(), input, height, width,
+                       stride, pad, 0.0F, output, error) &&
+           AddBias(conv, output, height, width, stride, error);
+  }
+
+  bool NormSiluFrames(const Norm& norm, const float* input, int frames,
+                      int height, int width, float* output,
+                      std::string* error) {
+    const std::size_t elements =
+        static_cast<std::size_t>(norm.channels) * height * width;
+    for (int frame = 0; frame < frames; ++frame) {
+      const std::size_t offset = static_cast<std::size_t>(frame) * elements;
+      if (!NormSilu(norm, input + offset, height, width, output + offset,
+                    error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Causal 3D convolution of `frames` frame-major inputs: two zero frames of
+  // front padding (none for a single frame, where the reference truncates
+  // the temporal taps, which gives the same result) and temporal stride
+  // `time_stride`, so output frame o reads input frames o * stride - 2 + kt.
+  // Pointwise kernels have no temporal extent. `out_frames` may be null.
+  bool ConvolveFrames(const Conv& conv, const float* input, int frames,
+                      int height, int width, int stride, int pad,
+                      int time_stride, float* output, int* out_frames,
+                      std::string* error) {
+    const int out_height = conv.kernel == 1 ? height : height / stride;
+    const int out_width = conv.kernel == 1 ? width : width / stride;
+    const std::size_t in_elements =
+        static_cast<std::size_t>(conv.input_channels) * height * width;
+    const std::size_t out_elements =
+        static_cast<std::size_t>(conv.output_channels) * out_height *
+        out_width;
+    if (frames < 1 || time_stride < 1 ||
+        (conv.kernel == 1 && time_stride != 1)) {
+      SetError(error, "invalid H3 VisualVAE clip convolution");
+      return false;
+    }
+    const int produced = (frames - 1) / time_stride + 1;
+    const int taps = conv.kernel == 3 ? 3 : 1;
+    for (int frame = 0; frame < produced; ++frame) {
+      float* target = output + static_cast<std::size_t>(frame) * out_elements;
+      bool first = true;
+      for (int tap = 0; tap < taps; ++tap) {
+        const int source =
+            conv.kernel == 3 ? frame * time_stride + tap - 2 : frame;
+        if (source < 0) {
+          continue;  // zero front padding
+        }
+        const float* weight = nullptr;
+        if (conv.kernel != 3 || tap == 2) {
+          weight = conv.weight.As<float>();
+        } else if (conv.temporal) {
+          weight = conv.earlier_taps[static_cast<std::size_t>(tap)].As<float>();
+        } else {
+          SetError(error,
+                   "H3 VisualVAE encoder was loaded without temporal taps");
+          return false;
+        }
+        if (!ConvolveTap(conv, weight,
+                         input + static_cast<std::size_t>(source) * in_elements,
+                         height, width, stride, pad, first ? 0.0F : 1.0F,
+                         target, error)) {
+          return false;
+        }
+        first = false;
+      }
+      if (!AddBias(conv, target, height, width, stride, error)) {
+        return false;
+      }
+    }
+    if (out_frames != nullptr) {
+      *out_frames = produced;
+    }
+    return true;
+  }
+
+  bool AddBias(const Conv& conv, float* output, int height, int width,
+               int stride, std::string* error) {
+    const int out_height = conv.kernel == 1 ? height : height / stride;
+    const int out_width = conv.kernel == 1 ? width : width / stride;
+    const std::size_t outputs =
+        static_cast<std::size_t>(out_height) * out_width;
+    AddBiasKernel<<<Blocks(outputs * conv.output_channels), 256, 0, stream_>>>(
+        output, conv.bias.As<float>(), conv.output_channels,
+        static_cast<int>(outputs));
+    const hipError_t launch = hipPeekAtLastError();
+    if (launch != hipSuccess) {
+      SetError(error, HipError("H3 VisualVAE encoder convolution", launch));
+      return false;
+    }
+    return true;
+  }
+
+  // One temporal tap: output = im2col(input) x weight + beta * output,
+  // without the bias.
+  bool ConvolveTap(const Conv& conv, const float* weight, const float* input,
+                   int height, int width, int stride, int pad, float beta,
+                   float* output, std::string* error) {
     const int out_height = conv.kernel == 1 ? height : height / stride;
     const int out_width = conv.kernel == 1 ? width : width / stride;
     const std::size_t outputs =
@@ -614,23 +852,19 @@ private:
       depth *= 9;
     }
     const float alpha = 1.0F;
-    const float beta = 0.0F;
     const rocblas_status status =
         rocblas_sgemm(handle_, rocblas_operation_none, rocblas_operation_none,
                       static_cast<rocblas_int>(outputs),
                       static_cast<rocblas_int>(conv.output_channels),
                       static_cast<rocblas_int>(depth), &alpha, columns,
-                      static_cast<rocblas_int>(outputs),
-                      conv.weight.As<float>(), static_cast<rocblas_int>(depth),
-                      &beta, output, static_cast<rocblas_int>(outputs));
+                      static_cast<rocblas_int>(outputs), weight,
+                      static_cast<rocblas_int>(depth), &beta, output,
+                      static_cast<rocblas_int>(outputs));
     if (status != rocblas_status_success) {
       SetError(error, "H3 VisualVAE encoder convolution GEMM failed: " +
                           std::to_string(static_cast<int>(status)));
       return false;
     }
-    AddBiasKernel<<<Blocks(outputs * conv.output_channels), 256, 0, stream_>>>(
-        output, conv.bias.As<float>(), conv.output_channels,
-        static_cast<int>(outputs));
     const hipError_t launch = hipPeekAtLastError();
     if (launch != hipSuccess) {
       SetError(error, HipError("H3 VisualVAE encoder convolution", launch));
@@ -640,6 +874,7 @@ private:
   }
 
   const ModelInventory& inventory_;
+  bool temporal_{false};
   hipStream_t stream_{nullptr};
   rocblas_handle handle_{nullptr};
   Conv conv_in_;
@@ -859,6 +1094,145 @@ bool EncodeKeyframeMoments(const ModelInventory& inventory,
         SetError(error,
                  "MiniMax H3 keyframe encoder produced non-finite "
                  "moments");
+        return false;
+      }
+    }
+  }
+  local.encode_ms = Milliseconds(encode_begin, Clock::now());
+  local.scratch_bytes = encoder.scratch_bytes();
+  if (telemetry != nullptr) {
+    *telemetry = local;
+  }
+  return true;
+}
+
+bool EncodeGuideClipMoments(const ModelInventory& inventory, int width,
+                            int height,
+                            std::span<const std::uint8_t> rgb_frames,
+                            int frames, const CancellationToken* cancellation,
+                            std::vector<KeyframeMoments>* output,
+                            VideoVaeEncoderTelemetry* telemetry,
+                            std::string* error) {
+  const std::size_t frame_bytes =
+      static_cast<std::size_t>(std::max(width, 0)) *
+      static_cast<std::size_t>(std::max(height, 0)) * 3U;
+  if (output == nullptr || width < 32 || height < 32 || width % 32 != 0 ||
+      height % 32 != 0 || frames < 5 || (frames - 5) % 17 != 0 ||
+      rgb_frames.size() != frame_bytes * static_cast<std::size_t>(frames)) {
+    SetError(error,
+             "MiniMax H3 guide clips must be 17k + 5 RGB8 canvases with "
+             "sides that are multiples of 32");
+    return false;
+  }
+  VideoVaeEncoderTelemetry local;
+  const auto load_begin = Clock::now();
+  Encoder encoder(inventory, /*temporal=*/true);
+  if (!encoder.Load(cancellation, error)) {
+    return false;
+  }
+  local.load_ms = Milliseconds(load_begin, Clock::now());
+  local.weight_bytes = encoder.weight_bytes();
+  const auto encode_begin = Clock::now();
+  const TileAxis y_axis = SplitTiles(height);
+  const TileAxis x_axis = SplitTiles(width);
+  if (!encoder.AllocateScratch(y_axis.lengths.front(), x_axis.lengths.front(),
+                               error, kClipChunkFrames)) {
+    return false;
+  }
+  DeviceBuffer rgb;
+  if (!rgb.Allocate(frame_bytes * kClipChunkFrames, error)) {
+    return false;
+  }
+  output->clear();
+  // The reference's encode_temporal: 17-frame chunks, the last one padded by
+  // repeating its final frame, each encoded on its own (no causal cache
+  // across chunks), concatenated, then the last 3 latent frames dropped.
+  const int chunks = (frames + kClipChunkFrames - 1) / kClipChunkFrames;
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int first = chunk * kClipChunkFrames;
+    std::vector<std::uint8_t> host(frame_bytes * kClipChunkFrames);
+    for (int index = 0; index < kClipChunkFrames; ++index) {
+      const int source = std::min(first + index, frames - 1);
+      std::copy_n(rgb_frames.begin() +
+                      static_cast<std::ptrdiff_t>(frame_bytes * source),
+                  frame_bytes,
+                  host.begin() +
+                      static_cast<std::ptrdiff_t>(frame_bytes * index));
+    }
+    hipError_t status = hipMemcpy(rgb.As<std::uint8_t>(), host.data(),
+                                  host.size(), hipMemcpyHostToDevice);
+    if (status != hipSuccess) {
+      SetError(error, HipError("upload H3 guide clip", status));
+      return false;
+    }
+    // tiles[latent frame][row][column]
+    std::vector<std::vector<std::vector<LatentTile>>> tiles;
+    int chunk_latents = 0;
+    for (std::size_t i = 0; i < y_axis.starts.size(); ++i) {
+      for (std::size_t j = 0; j < x_axis.starts.size(); ++j) {
+        if (IsCancelled(cancellation)) {
+          SetError(error, "MiniMax H3 guide clip encoding cancelled");
+          return false;
+        }
+        const int tile_height = y_axis.lengths[i] / kSpatialRatio;
+        const int tile_width = x_axis.lengths[j] / kSpatialRatio;
+        std::vector<float> moments;
+        int latents = 0;
+        if (!encoder.EncodeClipTile(rgb.As<std::uint8_t>(), width, height,
+                                    kClipChunkFrames, x_axis.starts[j],
+                                    y_axis.starts[i], x_axis.lengths[j],
+                                    y_axis.lengths[i], &moments, &latents,
+                                    error)) {
+          return false;
+        }
+        if (tiles.empty()) {
+          chunk_latents = latents;
+          tiles.assign(static_cast<std::size_t>(latents),
+                       std::vector<std::vector<LatentTile>>(
+                           y_axis.starts.size()));
+        }
+        const std::size_t per_frame =
+            static_cast<std::size_t>(kH3VideoVaeMomentChannels) * tile_height *
+            tile_width;
+        if (latents != chunk_latents ||
+            moments.size() != per_frame * static_cast<std::size_t>(latents)) {
+          SetError(error, "MiniMax H3 guide clip tiles differ in shape");
+          return false;
+        }
+        for (int t = 0; t < latents; ++t) {
+          LatentTile tile;
+          tile.height = tile_height;
+          tile.width = tile_width;
+          tile.data.assign(
+              moments.begin() + static_cast<std::ptrdiff_t>(per_frame * t),
+              moments.begin() +
+                  static_cast<std::ptrdiff_t>(per_frame * (t + 1)));
+          tiles[static_cast<std::size_t>(t)][i].push_back(std::move(tile));
+        }
+        ++local.tiles;
+      }
+    }
+    for (const auto& frame_tiles : tiles) {
+      output->push_back(StitchTiles(frame_tiles, y_axis, x_axis,
+                                    height / kSpatialRatio,
+                                    width / kSpatialRatio));
+    }
+  }
+  if (output->size() <= static_cast<std::size_t>(kClipTokenDrop)) {
+    SetError(error, "MiniMax H3 guide clip produced too few latent frames");
+    return false;
+  }
+  output->resize(output->size() - kClipTokenDrop);
+  if (static_cast<int>(output->size()) != GuideClipLatentFrames(frames)) {
+    SetError(error, "MiniMax H3 guide clip latent frame count differs: " +
+                        std::to_string(output->size()));
+    return false;
+  }
+  for (const KeyframeMoments& moments : *output) {
+    for (const float value : moments.moments) {
+      if (!std::isfinite(value)) {
+        SetError(error,
+                 "MiniMax H3 guide clip encoder produced non-finite moments");
         return false;
       }
     }

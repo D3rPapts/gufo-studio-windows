@@ -53,6 +53,10 @@ struct DenoiserConditioning {
   // is anchored at.
   std::span<const std::vector<float>> keyframe_latents;
   std::span<const int> keyframe_frames;
+  // Latent frames per image guide (empty: one each). A guide clip
+  // (MiniMaxH3AddGuide with a 17k + 5 frame batch) has 5k + 2, and its
+  // latent is [24][latent frames][latent_height][latent_width].
+  std::span<const int> keyframe_latent_frames;
   std::span<const AudioGuideLatent> audio_guides;
 };
 

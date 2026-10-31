@@ -326,6 +326,24 @@ void MaskFile(const Graph& graph, const std::string& id, const Link& link,
   }
 }
 
+/// The LoadVideo file behind a GetVideoComponents output (0 = images,
+/// 1 = audio) that feeds input `key` of node `id`.
+FileRef VideoComponentsFile(const Graph& graph, const std::string& id,
+                            const std::string& key, const Link& link,
+                            int slot) {
+  if (link.slot != slot)
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key + "' must come from output " +
+                          std::to_string(slot) + " of GetVideoComponents");
+  const Link file = graph.RequireLink(link.node, "video");
+  if (graph.Class(file.node) != "LoadVideo")
+    throw NodeFailure(link.node, "unsupported_link",
+                      "the video of GetVideoComponents must come from "
+                      "LoadVideo, not " +
+                          graph.Class(file.node));
+  return ParseFileRef(graph.Str(file.node, "file"), "input");
+}
+
 FileRef AudioFile(const Graph& graph, const std::string& id,
                   const std::string& key, const Link& link) {
   const std::string source = graph.Class(link.node);
@@ -827,17 +845,39 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
   for (const std::string& guide : positive.guides) {
     const int frame = static_cast<int>(graph.Num(guide, "frame_idx", 0));
     if (auto audio = graph.LinkOf(guide, "audio")) {
-      const FileRef file = AudioFile(graph, guide, "audio", *audio);
-      if (task.audio_reference && !(*task.audio_reference == file &&
-                                    task.audio_reference_frame == frame))
+      // A LoadAudio file, or the soundtrack of a LoadVideo through
+      // GetVideoComponents (the anchor clip's own sound).
+      const bool from_video =
+          graph.Class(audio->node) == "GetVideoComponents";
+      const FileRef file =
+          from_video ? VideoComponentsFile(graph, guide, "audio", *audio, 1)
+                     : AudioFile(graph, guide, "audio", *audio);
+      if (task.audio_reference &&
+          !(*task.audio_reference == file &&
+            task.audio_reference_frame == frame &&
+            task.audio_reference_from_video == from_video))
         throw NodeFailure(guide, "unsupported_value",
                           "gufo H3 takes one audio anchor per video");
       task.audio_reference = file;
       task.audio_reference_frame = frame;
+      task.audio_reference_from_video = from_video;
     }
     auto image = graph.LinkOf(guide, "image");
     if (!image)
       continue;
+    if (graph.Class(image->node) == "GetVideoComponents") {
+      // A frame batch: gufo anchors its first 17k + 5 frames from `frame`
+      // on (fewer than 5 frames: the first one), like ComfyUI.
+      const FileRef file =
+          VideoComponentsFile(graph, guide, "image", *image, 0);
+      if (task.guide_video && !(*task.guide_video == file &&
+                                task.guide_video_frame == frame))
+        throw NodeFailure(guide, "unsupported_value",
+                          "gufo H3 takes one guide clip per video");
+      task.guide_video = file;
+      task.guide_video_frame = frame;
+      continue;
+    }
     const FileRef file = ImageFile(graph, guide, "image", *image);
     const bool is_last = frame < 0 ? frame == -1 : frame >= task.frames - 1;
     if (frame == 0) {
@@ -871,11 +911,12 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
       task.keyframes.end());
   const std::size_t anchors = task.keyframes.size() +
                               (task.first_frame ? 1 : 0) +
-                              (task.last_frame ? 1 : 0);
+                              (task.last_frame ? 1 : 0) +
+                              (task.guide_video ? 1 : 0);
   if (anchors > 8)
     throw NodeFailure(video, "unsupported_value",
-                      "gufo H3 takes at most 8 guide images including the "
-                      "first and last frame");
+                      "gufo H3 takes at most 8 guide images and clips "
+                      "including the first and last frame");
   const ModelChain chain = FollowModel(graph, sampler);
   for (const auto& [name, strength] : chain.loras) {
     if (Lower(name).find("turbo") == std::string::npos)

@@ -112,7 +112,8 @@ struct PackedLayout {
   std::vector<Position3D> positions;
   std::vector<LayoutSegment> segments;
   std::size_t text_rows{0};
-  // Image guide rows (one latent frame per keyframe).
+  // Image guide rows (one latent frame per keyframe, 5k + 2 per guide
+  // clip).
   std::size_t condition_rows{0};
   // Audio guide rows (two stereo tracks per audio latent frame).
   std::size_t audio_condition_rows{0};
@@ -162,6 +163,34 @@ struct AudioGuidePlacement {
 [[nodiscard]] std::optional<PackedLayout> BuildGuideLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const int> keyframe_frames,
+    std::span<const AudioGuidePlacement> audio_guides,
+    std::string* error = nullptr);
+
+/// An image guide in the packed sequence: `latent_frames` VAE latent frames
+/// whose first one sits on pixel frame `frame` of the target video. A single
+/// image is one latent frame; a guide clip of 17k + 5 pixel frames (the
+/// reference's MiniMaxH3AddGuide with a multi-frame image batch) is
+/// 5k + 2 latent frames, laid out on the target's own temporal grid
+/// (5/3 * {1, 4, 4, 4, 4} rotary units per latent frame) from that origin.
+struct ImageGuidePlacement {
+  int frame{0};
+  int latent_frames{1};
+  // Pixel frames the guide covers (1 for an image); frame + pixel_frames
+  // must fit in the video.
+  int pixel_frames{1};
+};
+
+/// Pixel frames MiniMaxH3AddGuide keeps of a `available`-frame image batch:
+/// 1 below 5 frames (first image only), otherwise the largest 17k + 5 that
+/// is not above `available`.
+[[nodiscard]] int GuideClipPixelFrames(int available) noexcept;
+/// VAE latent frames of a guide of `pixel_frames` (1 -> 1, 17k+5 -> 5k+2).
+[[nodiscard]] int GuideClipLatentFrames(int pixel_frames) noexcept;
+
+/// BuildGuideLayout with image guides that may span several latent frames.
+[[nodiscard]] std::optional<PackedLayout> BuildImageGuideLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ImageGuidePlacement> image_guides,
     std::span<const AudioGuidePlacement> audio_guides,
     std::string* error = nullptr);
 [[nodiscard]] std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(

@@ -701,8 +701,58 @@ bool GenerateTextVideo(const GenerationRequest& request,
   std::vector<std::vector<std::uint8_t>> canvases;
   std::vector<KeyframeImage> keyframe_images;
   std::vector<KeyframeImage> vision_images;
+  // Guide clips (MiniMaxH3AddGuide with 17k + 5 frames); shorter batches
+  // become single guide images (their first frame) owned here.
+  struct GuideClipPlan {
+    int frame{0};
+    int pixel_frames{0};
+    const GenerationVideoGuide* guide{nullptr};
+  };
+  std::vector<GuideClipPlan> guide_clips;
+  std::vector<GenerationKeyframe> clip_images;
   {
     std::vector<std::pair<int, const GenerationKeyframe*>> ordered;
+    clip_images.reserve(request.video_guides.size());
+    for (const GenerationVideoGuide& guide : request.video_guides) {
+      const std::size_t frame_bytes =
+          static_cast<std::size_t>(std::max(guide.width, 0)) *
+          static_cast<std::size_t>(std::max(guide.height, 0)) * 3U;
+      if (guide.frames < 1 || frame_bytes == 0 ||
+          guide.rgb.size() !=
+              frame_bytes * static_cast<std::size_t>(guide.frames)) {
+        SetError(error, "MiniMax H3 guide clip is not a valid RGB8 frame set");
+        return false;
+      }
+      int frame = guide.frame;
+      if (frame < 0) {
+        frame += geometry->temporal.frames;
+      }
+      const int pixel_frames = GuideClipPixelFrames(guide.frames);
+      if (frame < 0 || frame + pixel_frames > geometry->temporal.frames) {
+        SetError(error, "a " + std::to_string(pixel_frames) +
+                            " frame MiniMax H3 guide clip at frame " +
+                            std::to_string(guide.frame) +
+                            " does not fit in the video's " +
+                            std::to_string(geometry->temporal.frames) +
+                            " frames");
+        return false;
+      }
+      if (pixel_frames == 1) {
+        GenerationKeyframe image;
+        image.width = guide.width;
+        image.height = guide.height;
+        image.rgb.assign(guide.rgb.begin(),
+                         guide.rgb.begin() +
+                             static_cast<std::ptrdiff_t>(frame_bytes));
+        image.frame = frame;
+        image.vision = false;
+        clip_images.push_back(std::move(image));
+        ordered.emplace_back(frame, &clip_images.back());
+      } else {
+        guide_clips.push_back(
+            {.frame = frame, .pixel_frames = pixel_frames, .guide = &guide});
+      }
+    }
     for (const GenerationKeyframe& keyframe : request.keyframes) {
       int frame =
           keyframe.frame == kKeyframeAtAnchor
@@ -724,10 +774,10 @@ bool GenerateTextVideo(const GenerationRequest& request,
                      [](const auto& left, const auto& right) {
                        return left.first < right.first;
                      });
-    if (ordered.size() > kH3MaximumKeyframes) {
+    if (ordered.size() + guide_clips.size() > kH3MaximumKeyframes) {
       SetError(error, "MiniMax H3 accepts at most " +
                           std::to_string(kH3MaximumKeyframes) +
-                          " keyframes and guide frames");
+                          " keyframes, guide frames and guide clips");
       return false;
     }
     for (std::size_t index = 1; index < ordered.size(); ++index) {
@@ -735,6 +785,24 @@ bool GenerateTextVideo(const GenerationRequest& request,
         SetError(error, "MiniMax H3 got two images for frame " +
                             std::to_string(ordered[index].first));
         return false;
+      }
+    }
+    for (std::size_t index = 0; index < guide_clips.size(); ++index) {
+      for (std::size_t other = 0; other < index; ++other) {
+        if (guide_clips[other].frame == guide_clips[index].frame) {
+          SetError(error, "MiniMax H3 got two guide clips for frame " +
+                              std::to_string(guide_clips[index].frame));
+          return false;
+        }
+      }
+      for (const auto& [frame, keyframe] : ordered) {
+        (void)keyframe;
+        if (frame == guide_clips[index].frame) {
+          SetError(error,
+                   "MiniMax H3 got an image and a guide clip for frame " +
+                       std::to_string(frame));
+          return false;
+        }
       }
     }
     canvases.reserve(ordered.size());
@@ -899,6 +967,66 @@ bool GenerateTextVideo(const GenerationRequest& request,
     TraceStage("keyframes encoded");
     Report(progress, progress_opaque, "keyframes", 1, 1);
   }
+  // Guide clips: every frame centre-cropped to the canvas, the clip encoded
+  // by the causal 3D encoder to 5k + 2 latent frames, appended after the
+  // single-frame guides (packed order is free; rotary time places them).
+  std::vector<int> keyframe_latent_frames(keyframe_latents.size(), 1);
+  if (!guide_clips.empty()) {
+    const int total = static_cast<int>(guide_clips.size());
+    Report(progress, progress_opaque, "guide_clips", 0, total);
+    begin = Clock::now();
+    const std::size_t canvas_bytes =
+        static_cast<std::size_t>(geometry->width) *
+        static_cast<std::size_t>(geometry->height) * 3U;
+    for (std::size_t index = 0; index < guide_clips.size(); ++index) {
+      const GuideClipPlan& clip = guide_clips[index];
+      const GenerationVideoGuide& guide = *clip.guide;
+      const std::size_t source_bytes = static_cast<std::size_t>(guide.width) *
+                                       static_cast<std::size_t>(guide.height) *
+                                       3U;
+      std::vector<std::uint8_t> canvas;
+      canvas.reserve(canvas_bytes *
+                     static_cast<std::size_t>(clip.pixel_frames));
+      for (int frame = 0; frame < clip.pixel_frames; ++frame) {
+        const std::vector<std::uint8_t> fitted = FitKeyframeToCanvas(
+            std::span(guide.rgb).subspan(
+                source_bytes * static_cast<std::size_t>(frame), source_bytes),
+            guide.width, guide.height, geometry->width, geometry->height);
+        if (fitted.size() != canvas_bytes) {
+          SetError(error, "MiniMax H3 guide clip frame is not a valid image");
+          return false;
+        }
+        canvas.insert(canvas.end(), fitted.begin(), fitted.end());
+      }
+      std::vector<KeyframeMoments> moments;
+      VideoVaeEncoderTelemetry clip_telemetry;
+      if (!EncodeGuideClipMoments(*inventory, geometry->width,
+                                  geometry->height, canvas, clip.pixel_frames,
+                                  cancellation, &moments, &clip_telemetry,
+                                  error)) {
+        return false;
+      }
+      std::vector<std::uint8_t>().swap(canvas);
+      const std::size_t guide_index = keyframe_latents.size();
+      std::vector<float> latent;
+      if (!BuildGuideClipConditioning(
+              *inventory, moments, kH3KeyframeEncodeSeed,
+              request.seed ^ (0x9E3779B97F4A7C15ULL * (guide_index + 1U)),
+              &latent, error)) {
+        return false;
+      }
+      keyframe_latent_frames.push_back(static_cast<int>(moments.size()));
+      keyframe_frames.push_back(clip.frame);
+      keyframe_latents.push_back(std::move(latent));
+      local.guide_clip_latent_frames += moments.size();
+      local.keyframe_encoder.tiles += clip_telemetry.tiles;
+      Report(progress, progress_opaque, "guide_clips",
+             static_cast<int>(index) + 1, total);
+    }
+    local.guide_clips = guide_clips.size();
+    local.guide_clip_ms = Milliseconds(begin, Clock::now());
+    TraceStage("guide clips encoded");
+  }
   // Audio guides: AudioVAE posterior mean, cropped to the audio track that
   // remains behind the guide's frame (MiniMaxH3AddGuide audio).
   std::vector<AudioGuideLatent> audio_guides;
@@ -995,6 +1123,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .tags = tags,
        .keyframe_latents = keyframe_latents,
        .keyframe_frames = keyframe_frames,
+       .keyframe_latent_frames = keyframe_latent_frames,
        .audio_guides = audio_guides},
       cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
@@ -1140,6 +1269,10 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << "  \"audio_guide_frames\": " << telemetry.audio_guide_frames
          << ",\n"
          << "  \"audio_guide_ms\": " << telemetry.audio_guide_ms << ",\n"
+         << "  \"guide_clips\": " << telemetry.guide_clips << ",\n"
+         << "  \"guide_clip_latent_frames\": "
+         << telemetry.guide_clip_latent_frames << ",\n"
+         << "  \"guide_clip_ms\": " << telemetry.guide_clip_ms << ",\n"
          << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
          << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"
          << "  \"keyframe_encoder_load_ms\": "

@@ -381,6 +381,119 @@ void TestLayouts() {
                .has_value());
   }
 
+  {
+    // MiniMaxH3AddGuide with a frame batch: the first 17k + 5 frames become
+    // a guide clip of 5k + 2 latent frames on the target's own temporal grid
+    // from text + 5/3 * frame (the reference's _video_grid(vt, frame,
+    // cond_t)). Values from tools/models/minimax_h3/guide_clip_reference.py.
+    using gufo::minimax_h3::GuideClipLatentFrames;
+    using gufo::minimax_h3::GuideClipPixelFrames;
+    using gufo::minimax_h3::ImageGuidePlacement;
+    CHECK(GuideClipPixelFrames(1) == 1);
+    CHECK(GuideClipPixelFrames(4) == 1);
+    CHECK(GuideClipPixelFrames(5) == 5);
+    CHECK(GuideClipPixelFrames(21) == 5);
+    CHECK(GuideClipPixelFrames(22) == 22);
+    CHECK(GuideClipPixelFrames(48) == 39);
+    CHECK(GuideClipLatentFrames(1) == 1);
+    CHECK(GuideClipLatentFrames(5) == 2);
+    CHECK(GuideClipLatentFrames(22) == 7);
+    CHECK(GuideClipLatentFrames(39) == 12);
+
+    std::string error;
+    const GenerationGeometry geometry = Geometry(896, 512, 124);
+    const std::size_t frame_rows = 28 * 16;
+    const std::array guides = {
+        ImageGuidePlacement{
+            .frame = 0, .latent_frames = 7, .pixel_frames = 22},
+        ImageGuidePlacement{
+            .frame = 60, .latent_frames = 1, .pixel_frames = 1}};
+    auto layout = gufo::minimax_h3::BuildImageGuideLayout(6, geometry, guides,
+                                                          {}, &error);
+    CHECK(layout.has_value());
+    if (layout.has_value()) {
+      CHECK(layout->condition_rows == 8 * frame_rows);
+      CHECK(layout->segments.size() == 4);
+      CHECK(layout->segments[1].kind ==
+            gufo::minimax_h3::SegmentKind::kVideoCondition);
+      CHECK(layout->segments[1].end - layout->segments[1].begin ==
+            8 * frame_rows);
+      // A clip at frame 0 shares the rotary times of the target's first
+      // seven latent frames: 6, 6 + 5/3, 6 + 25/3, ..., 6 + 30.
+      const std::size_t video = layout->segments[3].begin;
+      const std::array<double, 7> times = {
+          6.0,  6.0 + 5.0 / 3.0,  6.0 + 25.0 / 3.0, 6.0 + 45.0 / 3.0,
+          6.0 + 65.0 / 3.0, 6.0 + 85.0 / 3.0, 36.0};
+      for (std::size_t t = 0; t < times.size(); ++t) {
+        const std::size_t row = 6 + t * frame_rows;
+        CHECK(std::abs(layout->positions[row].temporal - times[t]) < 1.0e-9);
+        CHECK(std::abs(layout->positions[row].temporal -
+                       layout->positions[video + t * frame_rows].temporal) <
+              1.0e-9);
+        CHECK(layout->positions[row + frame_rows - 1].width ==
+              layout->positions[video + frame_rows - 1].width);
+      }
+      // The single image after it sits on 6 + 5/3 * 60 = 106.
+      CHECK(std::abs(layout->positions[6 + 7 * frame_rows].temporal - 106.0) <
+            1.0e-9);
+      auto schedule = BuildServingSchedule(8, &error);
+      auto time_rows = BuildTimeRowSchedule(*schedule, &error);
+      CHECK(time_rows.has_value());
+      gufo::minimax_h3::AppendConditionTimeRow(&*time_rows);
+      auto row_map = BuildModulationRowMap(*time_rows, 1, *layout, {}, &error);
+      CHECK(row_map.has_value());
+      if (row_map.has_value()) {
+        CHECK((*row_map)[6] == time_rows->condition_row * 3);
+        CHECK((*row_map)[6 + 8 * frame_rows - 1] ==
+              time_rows->condition_row * 3);
+      }
+    }
+    // A clip at a later frame starts on text + 5/3 * frame.
+    const std::array later = {ImageGuidePlacement{
+        .frame = 17, .latent_frames = 7, .pixel_frames = 22}};
+    layout = gufo::minimax_h3::BuildImageGuideLayout(6, geometry, later, {},
+                                                     &error);
+    CHECK(layout.has_value());
+    if (layout.has_value()) {
+      CHECK(std::abs(layout->positions[6].temporal - (6.0 + 85.0 / 3.0)) <
+            1.0e-9);
+      CHECK(std::abs(layout->positions[6 + frame_rows].temporal -
+                     (6.0 + 90.0 / 3.0)) < 1.0e-9);
+    }
+    // The clip must end inside the video, and its lengths must match.
+    const std::array late = {ImageGuidePlacement{
+        .frame = 110, .latent_frames = 7, .pixel_frames = 22}};
+    CHECK(!gufo::minimax_h3::BuildImageGuideLayout(6, geometry, late, {},
+                                                   &error)
+               .has_value());
+    const std::array odd = {ImageGuidePlacement{
+        .frame = 0, .latent_frames = 3, .pixel_frames = 10}};
+    CHECK(!gufo::minimax_h3::BuildImageGuideLayout(6, geometry, odd, {},
+                                                   &error)
+               .has_value());
+    const std::array mismatched = {ImageGuidePlacement{
+        .frame = 0, .latent_frames = 6, .pixel_frames = 22}};
+    CHECK(!gufo::minimax_h3::BuildImageGuideLayout(6, geometry, mismatched,
+                                                   {}, &error)
+               .has_value());
+    // The frame-list overload is the one-latent-frame special case.
+    const std::array frames = {0, 60};
+    const std::array singles = {
+        ImageGuidePlacement{
+            .frame = 0, .latent_frames = 1, .pixel_frames = 1},
+        ImageGuidePlacement{
+            .frame = 60, .latent_frames = 1, .pixel_frames = 1}};
+    auto from_frames =
+        gufo::minimax_h3::BuildGuideLayout(6, geometry, frames, {}, &error);
+    auto from_placements = gufo::minimax_h3::BuildImageGuideLayout(
+        6, geometry, singles, {}, &error);
+    CHECK(from_frames.has_value() && from_placements.has_value());
+    if (from_frames.has_value() && from_placements.has_value()) {
+      CHECK(PackedLayoutSha256(*from_frames) ==
+            PackedLayoutSha256(*from_placements));
+    }
+  }
+
   std::string error;
   auto tiny_layout = BuildTextOnlyLayout(12, Geometry(32, 32, 5), &error);
   CHECK(tiny_layout.has_value());
