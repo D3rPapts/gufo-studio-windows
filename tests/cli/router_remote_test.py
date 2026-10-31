@@ -755,7 +755,7 @@ def check_recovery(router, remote):
 
 
 def check_unsafe_presets(binary, tmp, remote_port):
-    python = sys.executable
+    python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
     cases = [
         ([], "[remote/a]\nurl = http://127.0.0.1:%d\nmodality = image\n" % remote_port,
          "--remote-allow"),
