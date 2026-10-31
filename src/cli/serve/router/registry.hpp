@@ -68,6 +68,9 @@ public:
   void WebSocketClosed(std::string_view model_id);
   void TrackVideoJob(std::string_view job_id, std::string_view model_id);
   void CompleteVideoJob(std::string_view job_id);
+  /// Open (not yet released) jobs as (job id, owner model id).
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> OpenJobs()
+      const;
   /// Owner model id; "" when the job is unknown.
   [[nodiscard]] std::string JobOwner(std::string_view job_id) const;
 

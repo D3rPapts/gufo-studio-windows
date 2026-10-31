@@ -655,6 +655,8 @@ public:
   std::set<std::string> stopping;
   /// --autoload models whose load failed and wait for a retry.
   AutoloadFailures autoload_failed;
+  /// Next time SweepFinishedJobsLocked asks the workers about open jobs.
+  std::chrono::steady_clock::time_point next_job_sweep{};
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
@@ -1109,6 +1111,83 @@ public:
     }
   }
 
+  /// An open video or async music job keeps its model busy until a client
+  /// reads its terminal status, its result or deletes it. A job nobody comes
+  /// back for (page closed while it ran) would keep the model resident and
+  /// block every load that needs its memory (31.10.: wan2.2-ti2v-5b held
+  /// qwen-image-2.1-turbo and moss-image off for 20 minutes). Every
+  /// kJobSweep the router asks the owning worker itself and releases jobs
+  /// that are finished or unknown there; finished jobs keep their owner, so
+  /// a late status or content read still routes to it.
+  static constexpr auto kJobSweep = std::chrono::seconds(10);
+  void SweepFinishedJobsLocked(std::unique_lock<std::mutex>& lock) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_job_sweep)
+      return;
+    next_job_sweep = now + kJobSweep;
+    struct Probe {
+      std::string job, model;
+      int port{0};
+    };
+    std::vector<Probe> probes;
+    for (const auto& [job, model] : registry.OpenJobs()) {
+      if (!LoadedLocked(model))
+        continue;
+      if (const auto worker = FindWorkerLocked(model))
+        probes.push_back({job, model, worker->port()});
+    }
+    if (probes.empty())
+      return;
+    std::vector<const Probe*> finished;
+    lock.unlock();
+    for (const Probe& probe : probes) {
+      HttpRequest poll;
+      poll.method = "GET";
+      // Async music ids are music_N; everything else is a video job.
+      poll.path = std::string(probe.job.starts_with("music_")
+                                  ? "/v1/audio/music/"
+                                  : "/v1/videos/") +
+                  probe.job;
+      poll.request_id = "router-job-sweep";
+      // A status read answers at once; a stuck worker must not hold up the
+      // supervision tick.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      poll.is_cancelled = [deadline] {
+        return std::chrono::steady_clock::now() > deadline;
+      };
+      router::UpstreamTarget target;
+      target.host = "127.0.0.1";
+      target.port = probe.port;
+      try {
+        const auto result =
+            CollectResponse(router::ProxyToWorker(target, poll));
+        if (result.status == 404) {
+          finished.push_back(&probe);
+          continue;
+        }
+        if (result.status != 200)
+          continue;
+        const std::string status =
+            json::parse(result.body).member_str("status");
+        if (status == "completed" || status == "failed" ||
+            status == "cancelled" || status == "expired")
+          finished.push_back(&probe);
+      } catch (const std::exception&) {
+        // Worker busy or gone: the next sweep or a client read decides.
+      }
+    }
+    lock.lock();
+    for (const Probe* probe : finished) {
+      if (registry.JobOwner(probe->job) != probe->model)
+        continue;
+      registry.CompleteVideoJob(probe->job);
+      Logger::Info("router", "event=job_released job=" + probe->job +
+                                 " model=" + probe->model +
+                                 " reason=finished_unclaimed");
+    }
+  }
+
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
   /// for queued loads, and kill wedged loads past their deadline.
   void SuperviseOnce() {
@@ -1124,6 +1203,7 @@ public:
         ++it;
       }
     }
+    SweepFinishedJobsLocked(lock);
     for (const auto& id : registry.DueIdleUnloads()) {
       // An earlier stop in this loop released the lock: a request may have
       // made this model busy meanwhile.
