@@ -487,6 +487,7 @@ gufo router --models-preset <FILE>
             [--sleep-idle-seconds SEC]  default 900; 0 disables idle unload
             [--load-timeout-seconds S]  default 600; 0 = unlimited wait
             [--autoload]                preload preset models at startup
+            [--remote-allow LIST]       routers [remote/<id>] may name
             [--host IP] [--port N] [--api-key KEY]
             [--max-connections N] [--max-request-bytes N]
             [--log-level LEVEL] [-v]
@@ -611,6 +612,71 @@ router even after an unclean exit.
 On `SIGINT`/`SIGTERM` the front stops accepting, refuses new loads, keeps
 proxying loaded models while in-flight work drains for up to 10 seconds,
 then terminates every worker and exits 0.
+
+### Remote models
+
+A `[remote/<model-id>]` section names a model that another gufo router
+(1.2 or newer, for the async music routes) serves under the same id, for
+example a second machine on a direct cable. The local router starts
+nothing for it: it relays the requests and leaves loading, unloading and
+memory to the remote router.
+
+```ini
+[remote/qwen-image-2.1]
+url = http://192.168.100.56:8081
+modality = image
+api-key-env = GUFO_REMOTE56_KEY
+connect-timeout-seconds = 3
+gpu-slot = studio56
+busy-check-url = http://192.168.100.56:8085/queue
+queue-timeout-seconds = 900
+max-request-bytes = 67108864
+```
+
+| Key | Meaning |
+| --- | --- |
+| `url` | `http://<IPv4>:<port>` of the remote router; no host names, https or path. Required |
+| `modality` | `llm`, `image`, `video`, `tts`, `asr`, `embedding` or `omni`, as `/v1/models` lists it. Required |
+| `api-key-env` | Environment variable holding the remote router's `--api-key`; sent as `Authorization: Bearer`. Unset variable: exit 2 |
+| `connect-timeout-seconds` | Connect bound (default 3, 1..300) |
+| `head-timeout-seconds` | Response-head deadline after the request is sent (default 0 = none) |
+| `gpu-slot` | Remote models sharing the name run one GPU-starting request at a time |
+| `queue-timeout-seconds` | Longest wait for the slot and the busy check (default 900) |
+| `busy-check-url` | Optional `http://<IPv4>:<port>/path` (a ComfyUI `/queue`); wait while it reports running or pending work |
+| `max-request-bytes` | 413 `request_too_large` above this body size |
+
+The router refuses to start (exit 2) unless `--remote-allow` covers every
+`url` and `busy-check-url`: comma-separated IPv4 addresses or
+`a.b.c.d/n` ranges, each with an optional `:port`, or `*`; the default is
+empty. Router hints (`router-*`), worker options, `api-key` and
+`remote-model`/`served-model-name` are rejected in remote sections; the
+id must be the same on both routers.
+
+- Requests resolve to the model as in the table above and relay with the
+  body unchanged; the client's `Authorization` is never forwarded. Video
+  and async music job ids are recorded, so status, content and DELETE
+  reads route back. Previews (`/v1/previews/...`) and `/models/load|unload`
+  go to the remote router; the ComfyUI API and the job API use remote
+  models like local ones. ComfyUI `/free` stays local.
+- A remote model is always `unloaded` locally: it never counts for
+  `--models-max`, LRU, idle unload, the memory guard or `memory.json`, and
+  `--autoload` skips it. `/v1/models` lists it with `"remote": {"url",
+  "reachable"}`, empty args and the state the remote last listed.
+- A background probe asks every remote router for `GET /v1/models` every
+  5 s (2 s bound). A failed connect or probe answers further requests
+  with 503 `remote_unavailable` and `Retry-After: 30` at once until a probe
+  works again; nothing local restarts.
+- With `gpu-slot`, every POST (and `/models/load`) waits for the slot in
+  arrival order; a video or async music job keeps it until it ends (the
+  probe polls its status). After `queue-timeout-seconds` the answer is 503
+  `remote_busy`. With `busy-check-url` the request also waits while that
+  queue is busy; an unreachable check counts as free.
+- WebSocket routes (`/v1/realtime`, `/v1/audio/speech/stream`) answer 501
+  `remote_websocket_unsupported`.
+- `GET /router/status` adds a `remote` block: routers (reachable, error,
+  last check, model states), models (url, busy, gpu slot), relays in
+  flight, gpu slots (holder, waiting), jobs holding a slot and the last
+  busy-check answers.
 
 ## Endpoint Set
 
