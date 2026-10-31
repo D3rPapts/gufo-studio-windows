@@ -26,6 +26,10 @@
 //          VHS_LoadVideo, control_masks through ImageToMask / InvertMask or
 //          LoadImageMask, reference_image from LoadImage), TrimVideoLatent
 //          after it -> /v1/videos (wan2.1-vace-14b, gufo.vace)
+//   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
+//          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
+//          windows via previous_frames become one job)
+//          -> /v1/videos (wan2.1-infinitetalk-14b, gufo.talk, 25 fps)
 // A new family adds its node classes to the tables in comfy_graph.cpp, a
 // task type here and an executor in comfy_adapter.cpp.
 //
@@ -65,6 +69,8 @@ struct ModelIds {
   /// with --rife-model. When `available` is set and lacks it, `h3` serves.
   std::string process{"gufo-rife"};
   std::string vace{"wan2.1-vace-14b"};
+  std::string talk{"wan2.1-infinitetalk-14b"};
+  std::string animate{"wan2.2-animate-14b"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -170,7 +176,10 @@ json::Value MusicRequestBody(const MusicTask& task);
 
 /// kProcess: no generation, a loaded video is only interpolated / upscaled
 /// (LoadVideo -> GetVideoComponents -> RIFE VFI / ImageUpscaleWithModel).
-enum class VideoFamily { kH3, kWan, kCamera, kProcess, kVace };
+enum class VideoFamily { kH3, kWan, kCamera, kProcess, kVace, kTalk, kAnimate };
+
+/// Frames per second a family generates (16 camera / VACE, 25 talk, 24 else).
+int VideoFamilyFps(VideoFamily family);
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
 struct VideoUpscale {
@@ -247,6 +256,15 @@ struct VideoTask {
   std::string vace_sampler;  // "lcm" or "euler"; empty = bundle default
   std::optional<double> vace_shift;
   bool vace_lora{true};
+  /// Talk family (InfiniteTalk): the speakers' audio (one or two LoadAudio
+  /// files), with two speakers their masks and the mask channel ("red",
+  /// "green", "blue", or "inverted_alpha": ComfyUI's alpha masks), sent
+  /// as gufo.talk {audio, speaker_masks} by the executor.
+  std::vector<FileRef> talk_audio;
+  std::vector<FileRef> talk_masks;
+  std::vector<std::string> talk_mask_channels;
+  double audio_scale{1.0};
+  int motion_frames{9};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

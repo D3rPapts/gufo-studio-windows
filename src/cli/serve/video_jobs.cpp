@@ -26,6 +26,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/video_vace.hpp"
+#include "src/cli/serve/video_talk.hpp"
 #include "src/cli/serve/video_wan21.hpp"
 #include "src/cli/serve/preview.hpp"
 #include "src/cli/serve/video_wan22.hpp"
@@ -70,6 +71,57 @@ bool IsWan21CameraDirectory(const std::filesystem::path& root) {
   } catch (...) {
     return false;
   }
+}
+
+bool IsWan21TalkDirectory(const std::filesystem::path& root) {
+  std::ifstream input(root / "gufo-talk.json", std::ios::binary);
+  if (!input)
+    return false;
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  try {
+    return json::parse(text).member_str("_class_name") ==
+           "GufoWan21InfiniteTalk";
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ValidateWan21TalkParameters(const minimax_h3::GenerationParameters& p,
+                                 std::string* error) {
+  const auto fail = [error](const char* message) {
+    if (error != nullptr)
+      *error = message;
+    return false;
+  };
+  if (p.preset != kWan21TalkPreset)
+    return fail("InfiniteTalk jobs use the 'wan21-talk' preset");
+  const int w = p.output_width, h = p.output_height;
+  if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
+      h % 16 != 0 || w * h > 832 * 480)
+    return fail(
+        "size must be WxH with multiples of 16, 256..1024 per side and at "
+        "most 832x480 pixels");
+  if (p.frames < 1 || p.frames > 1500)
+    return fail("frames must be 1..1500 (60 s at 25 fps)");
+  if (p.evaluations < 1 || p.evaluations > 20)
+    return fail("steps must be 1..20");
+  return true;
+}
+
+std::optional<int> ResolveWan21TalkDurationFrames(std::string_view seconds,
+                                                  std::string* error) {
+  double value = 0;
+  const auto parsed =
+      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
+  if (parsed.ec != std::errc() ||
+      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
+      value < 0.04 || value > 60.0) {
+    if (error != nullptr)
+      *error = "'seconds' must be a number between 0.04 and 60";
+    return std::nullopt;
+  }
+  return std::clamp(static_cast<int>(std::lround(value * 25.0)), 1, 1500);
 }
 
 bool ValidateWan21Parameters(const minimax_h3::GenerationParameters& p,
@@ -555,11 +607,14 @@ struct VideoJobService::Impl {
       options.now = UnixNow;
     }
     const bool vace = options.family == VideoModelFamily::kWan21Vace;
+    const bool talk = options.family == VideoModelFamily::kWan21Talk;
     const bool wan21 =
         options.family == VideoModelFamily::kWan21Uni3C || vace;
-    const bool wan = options.family == VideoModelFamily::kWan22 || wan21;
+    const bool wan = options.family == VideoModelFamily::kWan22 || wan21 ||
+                     talk;
     if (wan && options.model_id.empty()) {
       options.model_id = std::string(vace    ? kWan21VaceModelId
+                                     : talk  ? kWan21TalkModelId
                                      : wan21 ? kWan21ModelId
                                              : kWan22ModelId);
     }
@@ -569,6 +624,8 @@ struct VideoJobService::Impl {
     if (!options.runner) {
       if (vace) {
         options.runner = RunWan21VaceJob;
+      } else if (talk) {
+        options.runner = RunWan21TalkJob;
       } else if (wan21) {
         options.runner = RunWan21Job;
       } else if (wan) {
@@ -605,7 +662,14 @@ struct VideoJobService::Impl {
             options.model_root.string();
         return;
       }
-      if (options.validate_model_inventory && !wan21 &&
+      if (options.validate_model_inventory && talk &&
+          !IsWan21TalkDirectory(options.model_root)) {
+        initialization_error =
+            "not a Wan 2.1 InfiniteTalk bundle (gufo-talk.json): " +
+            options.model_root.string();
+        return;
+      }
+      if (options.validate_model_inventory && !wan21 && !talk &&
           !IsWan22ModelDirectory(options.model_root)) {
         initialization_error = "not a Wan 2.2 TI2V-5B Diffusers directory: " +
                                options.model_root.string();
@@ -746,13 +810,16 @@ struct VideoJobService::Impl {
         const bool wan = options.family != VideoModelFamily::kMinimaxH3;
         const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C ||
                            options.family == VideoModelFamily::kWan21Vace;
+        const bool talk = options.family == VideoModelFamily::kWan21Talk;
         int recovered_width = 0, recovered_height = 0;
         const bool valid_output =
             wan ? job->snapshot.output_format == "mp4" &&
                       job->snapshot.model == options.model_id &&
                       ParseVideoSize(job->snapshot.size, &recovered_width,
                                      &recovered_height) &&
-                      (wan21
+                      (talk ? ResolveWan21TalkDurationFrames(
+                                  job->snapshot.seconds)
+                       : wan21
                            ? ResolveWan21DurationFrames(job->snapshot.seconds)
                            : ResolveWan22DurationFrames(job->snapshot.seconds))
                 : ((job->snapshot.output_format == "mp4" &&
@@ -944,6 +1011,8 @@ struct VideoJobService::Impl {
           .guide_video_path = {},
           .vace_json = job->request.vace_json,
           .mask_path = {},
+          .talk_json = job->request.talk_json,
+          .speaker_masks = std::move(job->request.speaker_masks),
       };
       if (!job->request.mask_file.empty()) {
         // VACE mask (MP4 or still image), decoded from the job directory.
@@ -1009,8 +1078,11 @@ struct VideoJobService::Impl {
       preview.pixel_frames = job->request.parameters.frames;
       const bool wan21_family =
           options.family == VideoModelFamily::kWan21Uni3C ||
-          options.family == VideoModelFamily::kWan21Vace;
-      preview.fps = wan21_family ? 16 : 24;
+          options.family == VideoModelFamily::kWan21Vace ||
+          options.family == VideoModelFamily::kWan21Talk;
+      preview.fps = options.family == VideoModelFamily::kWan21Talk ? 25
+                    : wan21_family                                 ? 16
+                                                                   : 24;
       generation.preview = PreviewHub::Global().Begin(
           job->snapshot.id,
           options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
@@ -1327,6 +1399,34 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
               .job = std::nullopt,
               .error = "'source_video' needs MP4 output and 'interpolate' or "
                        "'upscale'"};
+    }
+  } else if (impl_->options.family == VideoModelFamily::kWan21Talk) {
+    int width = 0, height = 0;
+    const auto frames = ResolveWan21TalkDurationFrames(request.seconds);
+    const bool two = request.audio_guides.size() == 2;
+    if (request.model != impl_->options.model_id ||
+        request.prompt.find('\0') != std::string::npos ||
+        request.output_format != "mp4" ||
+        !ParseVideoSize(request.size, &width, &height) ||
+        width != request.parameters.output_width ||
+        height != request.parameters.output_height || !frames ||
+        *frames != request.parameters.frames ||
+        !ValidateWan21TalkParameters(request.parameters, nullptr) ||
+        !request.keyframes.empty() || !request.h3_guide_videos.empty() ||
+        !request.lora.empty() ||
+        request.audio_guides.empty() || request.audio_guides.size() > 2 ||
+        request.speaker_masks.size() != (two ? 2U : 0U) ||
+        request.first_frame.empty() ||
+        request.first_frame.size() !=
+            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
+                static_cast<std::size_t>(
+                    std::max(request.first_frame_height, 0)) *
+                3U ||
+        !request.camera_json.empty() || !request.guide_video.empty() ||
+        !request.vace_json.empty() || !request.mask_file.empty()) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "invalid Wan 2.1 InfiniteTalk video job request"};
     }
   } else if (impl_->options.family == VideoModelFamily::kWan21Uni3C) {
     int width = 0, height = 0;

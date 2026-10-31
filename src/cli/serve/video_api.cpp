@@ -7,11 +7,13 @@
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "src/cli/serve/audio_stream.hpp"
+#include "src/cli/serve/video_talk.hpp"
 #include "src/cli/serve/video_wan21.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -258,7 +261,10 @@ bool IsKeyframeField(std::string_view name) {
          name == "last_frame" || name == "audio_reference" ||
          name == "render_video" || name == "source_video" ||
          name.starts_with("keyframe_") || name == "control_video" ||
-         name == "mask" || name.starts_with("reference_image");
+         name == "mask" || name.starts_with("reference_image") ||
+         // InfiniteTalk speakers and their masks.
+         name == "audio_1" || name == "audio_2" || name == "mask_1" ||
+         name == "mask_2";
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -1607,6 +1613,317 @@ HttpResponse CreateWan21VaceVideo(
   return response;
 }
 
+// Wan 2.1 I2V 14B + InfiniteTalk ("wan2.1-infinitetalk-14b"): {"model",
+// "prompt", "size" (default "832x480", multiples of 16, at most 832x480
+// pixels), "seconds" (optional, 0.04..60 at 25 fps; default: the audio
+// length), "first_frame" or "input_reference" (required), "gufo": {"seed",
+// "steps" (default 4), "interpolate", "upscale", "preview", "talk": {"audio":
+// [one or two audio files as data URLs / base64], "speaker_masks": [two
+// images, bright = the speaker; required with two speakers], "audio_scale",
+// "audio_mode" ("add": speaker 2 after speaker 1, "para": together),
+// "motion_frames"}}}. Multipart uploads may carry "audio_1", "audio_2",
+// "mask_1" and "mask_2" files instead.
+HttpResponse CreateTalkVideo(const json::Value& body,
+                             const std::map<std::string, std::string>& files,
+                             VideoJobService& service) {
+  if (body.contains("last_frame") || files.contains("last_frame") ||
+      body.contains("references")) {
+    return Error(400, "Bad Request",
+                 "InfiniteTalk takes only a start image ('first_frame' or "
+                 "'input_reference')",
+                 "unsupported_input_reference");
+  }
+  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo",
+                             "input_reference", "first_frame"})) {
+    return Error(400, "Bad Request",
+                 "request contains an unsupported video field",
+                 "unsupported_field");
+  }
+  const auto has_field = [&](const char* name) {
+    return body.contains(name) || files.contains(name);
+  };
+  if (has_field("input_reference") == has_field("first_frame")) {
+    return Error(400, "Bad Request",
+                 "exactly one of 'first_frame' and 'input_reference' is "
+                 "required",
+                 "invalid_input_reference");
+  }
+  std::optional<core::Image> first_frame;
+  for (const char* name : {"input_reference", "first_frame"}) {
+    if (!has_field(name))
+      continue;
+    const auto file = files.find(name);
+    std::string image_error;
+    first_frame = ReadFirstFrame(body.find(name),
+                                 file == files.end() ? nullptr : &file->second,
+                                 &image_error);
+    if (!first_frame.has_value()) {
+      return Error(400, "Bad Request",
+                   "'" + std::string(name) + "' " + image_error,
+                   "invalid_input_reference");
+    }
+  }
+  const json::Value* model_value = body.find("model");
+  const json::Value* prompt_value = body.find("prompt");
+  const json::Value* size_value = body.find("size");
+  if (model_value == nullptr || !model_value->is_string() ||
+      prompt_value == nullptr || !prompt_value->is_string() ||
+      (size_value != nullptr && !size_value->is_string())) {
+    return Error(400, "Bad Request",
+                 "'model', 'prompt', and optional 'size' must be strings",
+                 "invalid_parameter_type");
+  }
+  const std::string model = model_value->str();
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  const std::string prompt = prompt_value->str();
+  if (prompt.find('\0') != std::string::npos) {
+    return Error(400, "Bad Request", "'prompt' must not contain NUL",
+                 "invalid_prompt");
+  }
+  const std::string size = body.member_str("size", "832x480");
+  minimax_h3::GenerationParameters parameters;
+  parameters.preset = std::string(kWan21TalkPreset);
+  parameters.evaluations = 4;
+  parameters.mux = true;
+  parameters.decode_audio = false;
+  if (!ParseVideoSize(size, &parameters.output_width,
+                      &parameters.output_height)) {
+    return Error(400, "Bad Request", "'size' must be WIDTHxHEIGHT",
+                 "invalid_size");
+  }
+  parameters.internal_width = parameters.output_width;
+  parameters.internal_height = parameters.output_height;
+  std::uint64_t seed = 42;
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
+  PreviewOptions preview = VideoJobRequest{}.preview;
+  std::string talk_json = "{}";
+  const json::Value* talk = nullptr;
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension, {"seed", "steps", "interpolate",
+                                     "upscale", "preview", "talk"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' may contain only 'seed', 'steps', 'interpolate', "
+                   "'upscale', 'preview' and 'talk'",
+                   "invalid_strix_options");
+    }
+    if (const auto failed = ParseVideoPreview(*extension, &preview)) {
+      return *failed;
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
+    }
+    if (extension->contains("seed")) {
+      const auto parsed = JsonUnsigned(extension->find("seed"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.seed' must be a non-negative exact integer",
+                     "invalid_seed");
+      }
+      seed = *parsed;
+    }
+    if (extension->contains("steps")) {
+      const auto parsed = JsonFrame(extension->find("steps"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.steps' must be 1..20",
+                     "invalid_steps");
+      }
+      parameters.evaluations = *parsed;
+    }
+    talk = extension->find("talk");
+  }
+  // Speakers: gufo.talk.audio (array of 1..2) or multipart audio_1/audio_2.
+  std::vector<minimax_h3::GenerationAudioGuide> speakers;
+  std::vector<minimax_h3::GenerationKeyframe> masks;
+  const json::Value* audio = talk != nullptr && talk->is_object()
+                                 ? talk->find("audio")
+                                 : nullptr;
+  const json::Value* mask_values = talk != nullptr && talk->is_object()
+                                       ? talk->find("speaker_masks")
+                                       : nullptr;
+  if (talk != nullptr) {
+    if (!talk->is_object()) {
+      return Error(400, "Bad Request", "'gufo.talk' must be an object",
+                   "invalid_talk");
+    }
+    json::Value options = json::Value::object();
+    for (const auto& [key, value] : talk->members())
+      if (key != "audio" && key != "speaker_masks")
+        options[key] = value;
+    std::string talk_error;
+    if (!ParseTalkOptions(options, &talk_json, &talk_error)) {
+      return Error(400, "Bad Request", talk_error, "invalid_talk");
+    }
+  }
+  if (audio != nullptr && (!audio->is_array() || audio->empty() ||
+                           audio->size() > 2)) {
+    return Error(400, "Bad Request",
+                 "'gufo.talk.audio' must be an array of one or two audio "
+                 "files",
+                 "invalid_audio_reference");
+  }
+  for (int index = 0; index < 2; ++index) {
+    const std::string name = "audio_" + std::to_string(index + 1);
+    const auto file = files.find(name);
+    const json::Value* value =
+        audio != nullptr && static_cast<std::size_t>(index) < audio->size()
+            ? &audio->items()[index]
+            : nullptr;
+    if (value == nullptr && file == files.end())
+      continue;
+    if (value != nullptr && file != files.end()) {
+      return Error(400, "Bad Request",
+                   "speaker " + std::to_string(index + 1) +
+                       " audio is given twice",
+                   "invalid_audio_reference");
+    }
+    std::string audio_error;
+    auto waveform = ReadGuideAudio(
+        value, file == files.end() ? nullptr : &file->second, &audio_error);
+    if (!waveform.has_value()) {
+      return Error(400, "Bad Request",
+                   "speaker " + std::to_string(index + 1) + " audio " +
+                       audio_error,
+                   "invalid_audio_reference");
+    }
+    if (static_cast<int>(speakers.size()) != index) {
+      return Error(400, "Bad Request", "speaker audio 2 needs speaker 1",
+                   "invalid_audio_reference");
+    }
+    speakers.push_back({.frame = index, .waveform = std::move(*waveform)});
+  }
+  if (speakers.empty()) {
+    return Error(400, "Bad Request",
+                 "InfiniteTalk needs the speech: 'gufo.talk.audio' or an "
+                 "'audio_1' upload",
+                 "missing_audio_reference");
+  }
+  if (mask_values != nullptr &&
+      (!mask_values->is_array() || mask_values->size() != 2)) {
+    return Error(400, "Bad Request",
+                 "'gufo.talk.speaker_masks' must be an array of two images",
+                 "invalid_speaker_masks");
+  }
+  for (int index = 0; index < 2; ++index) {
+    const std::string name = "mask_" + std::to_string(index + 1);
+    const auto file = files.find(name);
+    const json::Value* value =
+        mask_values != nullptr ? &mask_values->items()[index] : nullptr;
+    if (value == nullptr && file == files.end())
+      continue;
+    std::string image_error;
+    auto image = ReadFirstFrame(value,
+                                file == files.end() ? nullptr : &file->second,
+                                &image_error);
+    if (!image.has_value()) {
+      return Error(400, "Bad Request",
+                   "speaker mask " + std::to_string(index + 1) + " " +
+                       image_error,
+                   "invalid_speaker_masks");
+    }
+    minimax_h3::GenerationKeyframe mask;
+    mask.width = static_cast<int>(image->width);
+    mask.height = static_cast<int>(image->height);
+    mask.rgb = std::move(image->pixels);
+    mask.frame = index;
+    mask.vision = false;
+    masks.push_back(std::move(mask));
+  }
+  if (masks.size() != (speakers.size() == 2 ? 2U : 0U)) {
+    return Error(400, "Bad Request",
+                 "two speakers need exactly two speaker masks (and one "
+                 "speaker none)",
+                 "invalid_speaker_masks");
+  }
+  // Duration: "seconds", or the audio ("add": the speakers in turn).
+  int audio_frames = 0;
+  const bool para = talk_json.find("\"para\"") != std::string::npos;
+  for (const auto& speaker : speakers) {
+    const int frames = TalkFramesForAudio(speaker.waveform);
+    audio_frames = para ? std::max(audio_frames, frames)
+                        : audio_frames + frames;
+  }
+  std::string seconds;
+  const json::Value* seconds_value = body.find("seconds");
+  if (seconds_value != nullptr && seconds_value->is_string()) {
+    seconds = seconds_value->str();
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
+  } else {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(2)
+         << std::max(audio_frames, 1) / 25.0;
+    seconds = text.str();
+  }
+  std::string duration_error;
+  const auto duration_frames =
+      ResolveWan21TalkDurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  parameters.frames = *duration_frames;
+  std::string parameter_error;
+  if (!ValidateWan21TalkParameters(parameters, &parameter_error)) {
+    return Error(400, "Bad Request", parameter_error, "invalid_parameters");
+  }
+  const VideoJobCreateResult created = service.Create({
+      .model = model,
+      .prompt = prompt,
+      .size = size,
+      .seconds = seconds,
+      .output_format = "mp4",
+      .parameters = std::move(parameters),
+      .seed = seed,
+      .audio_guides = std::move(speakers),
+      .first_frame_width = static_cast<int>(first_frame->width),
+      .first_frame_height = static_cast<int>(first_frame->height),
+      .first_frame = std::move(first_frame->pixels),
+      .interpolate = interpolate.multiplier,
+      .interpolate_fps_num = interpolate.fps_num,
+      .interpolate_fps_den = interpolate.fps_den,
+      .upscale = std::move(upscale),
+      .talk_json = std::move(talk_json),
+      .speaker_masks = std::move(masks),
+      .preview = preview,
+  });
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   std::map<std::string, std::string> files;
@@ -1663,6 +1980,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   }
   if (service.family() == VideoModelFamily::kWan21Vace) {
     return CreateWan21VaceVideo(body, files, service);
+  }
+  if (service.family() == VideoModelFamily::kWan21Talk) {
+    return CreateTalkVideo(body, files, service);
   }
   if (IsUnsupportedConditioning(body)) {
     return Error(400, "Bad Request",

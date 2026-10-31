@@ -1659,6 +1659,51 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                      Base64Encode(ReadFileRef(*spec.guide_video));
     body["gufo"]["guide_video"] = std::move(guide);
   }
+  if (!spec.talk_audio.empty()) {
+    // InfiniteTalk speakers and their masks (gufo.talk).
+    json::Value audio = json::Value::array();
+    for (const FileRef& ref : spec.talk_audio)
+      audio.push_back(json::Value("data:" + ContentTypeFor(ref.name) +
+                                  ";base64," +
+                                  Base64Encode(ReadFileRef(ref))));
+    body["gufo"]["talk"]["audio"] = std::move(audio);
+  }
+  if (!spec.talk_masks.empty()) {
+    // gufo reads bright pixels as the speaker: extract the ComfyUI mask
+    // channel (inverted alpha, red, green or blue) as a grey image.
+    json::Value masks = json::Value::array();
+    for (std::size_t i = 0; i < spec.talk_masks.size(); ++i) {
+      const FileRef& ref = spec.talk_masks[i];
+      const std::string& channel = spec.talk_mask_channels[i];
+      std::string bytes;
+      if (options_.ffmpeg.empty()) {
+        bytes = ReadFileRef(ref);
+        if (i == 0)
+          job->warnings.push_back(
+              "node " + task.node_id +
+              ": speaker masks are sent as they are (bright = speaker); "
+              "start the router with --comfy-ffmpeg to use their " +
+              channel + " channel");
+      } else {
+        const std::string filter =
+            channel == "inverted_alpha"
+                ? "format=rgba,alphaextract,negate"
+                : "format=gbrp,extractplanes=" + channel.substr(0, 1);
+        const fs::path png = WorkFile("png");
+        std::string error;
+        if (!RunFfmpeg({"-i", FilePath(ref), "-vf", filter, "-frames:v", "1",
+                        png},
+                       &error))
+          throw std::runtime_error("cannot read the mask " + ref.name + ": " +
+                                   error);
+        bytes = ReadAll(png);
+        fs::remove(png);
+      }
+      masks.push_back(json::Value("data:" + SniffImageType(bytes) +
+                                  ";base64," + Base64Encode(bytes)));
+    }
+    body["gufo"]["talk"]["speaker_masks"] = std::move(masks);
+  }
   if (spec.audio_reference && spec.audio_reference_from_video) {
     // The anchor clip's soundtrack (GetVideoComponents audio) as FLAC.
     if (options_.ffmpeg.empty())

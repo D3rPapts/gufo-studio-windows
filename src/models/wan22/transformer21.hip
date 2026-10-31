@@ -1462,6 +1462,10 @@ bool Transformer21::Forward(const Transformer21Input& input,
     LaunchAttention(m.query.get(), m.key.get(), m.packed.get(),
                     m.attention.get(), tokens, tokens, kHeads, s);
     (void)hipEventRecord(m.timing[2 * layer + 1], s);
+    if (input.hook != nullptr &&
+        !input.hook->AfterSelfAttention(layer, m.query.get(), m.key.get(),
+                                        tokens, s, error))
+      return false;
     if (!m.Unpack(b.o, scratch, error) ||
         !m.Gemm(scratch, b.o_bias, m.attention.get(), linear, tokens, kWidth,
                 kWidth, error))
@@ -1500,6 +1504,9 @@ bool Transformer21::Forward(const Transformer21Input& input,
       return false;
     ResidualKernel<<<Blocks(count), 256, 0, s>>>(linear, nullptr, nullptr,
                                                  count, m.hidden.f32());
+    if (input.hook != nullptr &&
+        !input.hook->AfterCrossAttention(layer, m.hidden.f32(), s, error))
+      return false;
 
     // 3. Feed-forward (GELU tanh).
     LayerNormKernel<<<rows, kRowThreads, 0, s>>>(

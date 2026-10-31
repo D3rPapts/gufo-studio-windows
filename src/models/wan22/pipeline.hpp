@@ -98,6 +98,14 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
 bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
               int fps, std::string* error);
 
+/// WriteMp4 with a second input muxed as the audio track (`audio`: a WAV or
+/// any file FFmpeg reads; AAC 192 kb/s, cut to the video with -shortest).
+/// An empty `audio` writes the video alone.
+bool WriteMp4WithAudio(const std::filesystem::path& path,
+                       const DecodedVideo& video, int fps,
+                       const std::filesystem::path& audio,
+                       std::string* error);
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_PIPELINE_HPP_
