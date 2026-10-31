@@ -127,6 +127,11 @@ struct GenerationRequest {
   // video file.
   std::string camera_json;
   std::filesystem::path guide_video_path;
+  // Wan 2.1 InfiniteTalk runner only: "gufo.talk" JSON and the speaker
+  // masks (RGB8 at their own size, one per audio guide when there are two);
+  // the audio guides are the speakers (frame = speaker index).
+  std::string talk_json;
+  std::vector<GenerationKeyframe> speaker_masks;
   // Live preview of the denoised latents (MiniMax H3 and Wan 2.2).
   models::PreviewHook preview;
 };

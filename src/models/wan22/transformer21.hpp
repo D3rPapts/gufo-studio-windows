@@ -4,6 +4,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -25,6 +26,24 @@ public:
                      std::string* error) = 0;
   virtual bool AfterBlock(int layer, float* hidden, hipStream_t stream,
                           std::string* error) = 0;
+  /// Optional (InfiniteTalk speaker routing): right after a block's
+  /// self-attention, its RMS-normalized, rotated queries and keys, BF16
+  /// head-major [40][tokens][128]. Read-only; valid until the hook returns.
+  virtual bool AfterSelfAttention(int layer, const std::uint16_t* query,
+                                  const std::uint16_t* key, int tokens,
+                                  hipStream_t stream, std::string* error) {
+    (void)layer, (void)query, (void)key, (void)tokens, (void)stream,
+        (void)error;
+    return true;
+  }
+  /// Optional (InfiniteTalk audio cross-attention): after the text/image
+  /// cross-attention residual and before the feed-forward; may add to the
+  /// FP32 residual stream [tokens, 5120].
+  virtual bool AfterCrossAttention(int layer, float* hidden,
+                                   hipStream_t stream, std::string* error) {
+    (void)layer, (void)hidden, (void)stream, (void)error;
+    return true;
+  }
 };
 
 /// One call of the Wan 2.1 I2V 14B transformer: the model input

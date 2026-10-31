@@ -46,6 +46,7 @@ enum class VideoModelFamily : std::uint8_t {
   kMinimaxH3,
   kWan22,
   kWan21Uni3C,
+  kWan21Talk,
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
@@ -53,6 +54,22 @@ inline constexpr std::string_view kWan22Preset = "wan22";
 // Wan 2.1 I2V 14B + lightx2v + Uni3C camera control (+ MoGe-2 camera paths).
 inline constexpr std::string_view kWan21ModelId = "wan2.1-uni3c";
 inline constexpr std::string_view kWan21Preset = "wan21";
+
+// Wan 2.1 I2V 14B + lightx2v + InfiniteTalk (audio-driven talking video,
+// one or two speakers), 25 fps; see video_talk.hpp.
+inline constexpr std::string_view kWan21TalkModelId = "wan2.1-infinitetalk-14b";
+inline constexpr std::string_view kWan21TalkPreset = "wan21-talk";
+
+/// An InfiniteTalk bundle: `gufo-talk.json` in the root names its parts.
+[[nodiscard]] bool IsWan21TalkDirectory(const std::filesystem::path& root);
+/// Size as Wan 2.1 camera jobs, 1..1500 frames (60 s at 25 fps), 1..20
+/// steps.
+[[nodiscard]] bool ValidateWan21TalkParameters(
+    const minimax_h3::GenerationParameters& parameters,
+    std::string* error = nullptr);
+/// 25 fps: round(seconds * 25) frames for 0.04..60 seconds.
+[[nodiscard]] std::optional<int> ResolveWan21TalkDurationFrames(
+    std::string_view seconds, std::string* error = nullptr);
 
 /// A Wan 2.1 camera bundle: `gufo-camera.json` in the root names its parts
 /// (see video_wan21.hpp).
@@ -139,6 +156,11 @@ struct VideoJobRequest {
   // or poses), and an uploaded guide video (MP4 bytes) instead.
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
+  // Wan 2.1 InfiniteTalk: the speakers' audio in `audio_guides` (frame =
+  // speaker index), the "gufo.talk" options as JSON, and one mask image per
+  // speaker when there are two (decoded RGB8 at its own size).
+  std::string talk_json;
+  std::vector<minimax_h3::GenerationKeyframe> speaker_masks;
   // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
   // every second step by default, every step of a MiniMax H3 schedule with
   // at most 16 steps (Turbo) ("gufo": {"preview": {...}}).

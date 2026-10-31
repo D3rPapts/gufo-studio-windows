@@ -540,6 +540,13 @@ bool RunFfmpeg(const std::vector<std::wstring>& arguments,
 
 bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
               int fps, std::string* error) {
+  return WriteMp4WithAudio(path, video, fps, {}, error);
+}
+
+bool WriteMp4WithAudio(const std::filesystem::path& path,
+                       const DecodedVideo& video, int fps,
+                       const std::filesystem::path& audio,
+                       std::string* error) {
   const std::size_t frame_bytes =
       static_cast<std::size_t>(video.width) * video.height * 3;
   if (video.frames < 1 || video.rgb8.size() != frame_bytes * video.frames ||
@@ -556,30 +563,25 @@ bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
   const std::string size =
       std::to_string(video.width) + "x" + std::to_string(video.height);
 #if defined(_WIN32)
-  const std::vector<std::wstring> arguments = {L"-y",
-                                               L"-loglevel",
-                                               L"error",
-                                               L"-f",
-                                               L"rawvideo",
-                                               L"-pixel_format",
-                                               L"rgb24",
-                                               L"-video_size",
-                                               Widen(size),
-                                               L"-framerate",
-                                               std::to_wstring(fps),
-                                               L"-i",
-                                               L"-",
-                                               L"-c:v",
-                                               L"libx264",
-                                               L"-preset",
-                                               L"fast",
-                                               L"-crf",
-                                               L"18",
-                                               L"-pix_fmt",
-                                               L"yuv420p",
-                                               L"-movflags",
-                                               L"+faststart",
-                                               partial.wstring()};
+  std::vector<std::wstring> arguments = {
+      L"-y",          L"-loglevel",    L"error", L"-f",
+      L"rawvideo",    L"-pixel_format", L"rgb24", L"-video_size",
+      Widen(size),    L"-framerate",   std::to_wstring(fps),
+      L"-i",          L"-"};
+  if (!audio.empty()) {
+    // Second input: the audio track, AAC, cut to the video.
+    for (const std::wstring& argument :
+         {std::wstring(L"-i"), audio.wstring(), std::wstring(L"-map"),
+          std::wstring(L"0:v"), std::wstring(L"-map"), std::wstring(L"1:a"),
+          std::wstring(L"-c:a"), std::wstring(L"aac"), std::wstring(L"-b:a"),
+          std::wstring(L"192k"), std::wstring(L"-shortest")})
+      arguments.push_back(argument);
+  }
+  for (const wchar_t* argument :
+       {L"-c:v", L"libx264", L"-preset", L"fast", L"-crf", L"18", L"-pix_fmt",
+        L"yuv420p", L"-movflags", L"+faststart"})
+    arguments.push_back(argument);
+  arguments.push_back(partial.wstring());
   if (!RunFfmpeg(arguments, video.rgb8, log, error))
     return false;
 #else
@@ -589,7 +591,11 @@ bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
       (override != nullptr && *override != '\0' ? override : "ffmpeg") +
       "' -y -loglevel error -f rawvideo -pixel_format rgb24 -video_size " +
       size + " -framerate " + std::to_string(fps) +
-      " -i - -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags "
+      " -i - " +
+      (audio.empty() ? std::string()
+                     : "-i '" + audio.string() +
+                           "' -map 0:v -map 1:a -c:a aac -b:a 192k -shortest ") +
+      "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags "
       "+faststart '" +
       partial.string() + "' 2> '" + log.string() + "'";
   FILE* pipe = popen(command.c_str(), "w");

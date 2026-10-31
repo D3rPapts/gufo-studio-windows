@@ -1505,16 +1505,20 @@ int RunServe(std::span<const char* const> args) {
     }
 
     // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B, a camera
-    // bundle (gufo-camera.json) Wan 2.1 I2V + Uni3C; anything else is
+    // bundle (gufo-camera.json) Wan 2.1 I2V + Uni3C, a talk bundle
+    // (gufo-talk.json) Wan 2.1 I2V + InfiniteTalk; anything else is
     // validated as MiniMax H3.
-    const bool wan21 = server::IsWan21CameraDirectory(video_model);
-    const bool wan22 = !wan21 && server::IsWan22ModelDirectory(video_model);
+    const bool talk = server::IsWan21TalkDirectory(video_model);
+    const bool wan21 = !talk && server::IsWan21CameraDirectory(video_model);
+    const bool wan22 =
+        !talk && !wan21 && server::IsWan22ModelDirectory(video_model);
     if (validate_only)
       return 0;
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
-            .family = wan21   ? server::VideoModelFamily::kWan21Uni3C
+            .family = talk    ? server::VideoModelFamily::kWan21Talk
+                      : wan21 ? server::VideoModelFamily::kWan21Uni3C
                       : wan22 ? server::VideoModelFamily::kWan22
                               : server::VideoModelFamily::kMinimaxH3,
             .model_id = {},
@@ -1538,7 +1542,8 @@ int RunServe(std::span<const char* const> args) {
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling "
-                << (wan21   ? "Wan 2.1 camera"
+                << (talk    ? "Wan 2.1 InfiniteTalk"
+                    : wan21 ? "Wan 2.1 camera"
                     : wan22 ? "Wan 2.2"
                             : "MiniMax H3")
                 << " video service: " << video_jobs->initialization_error()
