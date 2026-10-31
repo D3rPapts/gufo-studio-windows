@@ -22,6 +22,10 @@
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+//   vace   KSampler <- WanVaceToVideo (control_video from LoadVideo /
+//          VHS_LoadVideo, control_masks through ImageToMask / InvertMask or
+//          LoadImageMask, reference_image from LoadImage), TrimVideoLatent
+//          after it -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 // A new family adds its node classes to the tables in comfy_graph.cpp, a
 // task type here and an executor in comfy_adapter.cpp.
 //
@@ -60,6 +64,7 @@ struct ModelIds {
   /// Post-processing only (RIFE / upscale of a loaded video): a video server
   /// with --rife-model. When `available` is set and lacks it, `h3` serves.
   std::string process{"gufo-rife"};
+  std::string vace{"wan2.1-vace-14b"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -165,7 +170,7 @@ json::Value MusicRequestBody(const MusicTask& task);
 
 /// kProcess: no generation, a loaded video is only interpolated / upscaled
 /// (LoadVideo -> GetVideoComponents -> RIFE VFI / ImageUpscaleWithModel).
-enum class VideoFamily { kH3, kWan, kCamera, kProcess };
+enum class VideoFamily { kH3, kWan, kCamera, kProcess, kVace };
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
 struct VideoUpscale {
@@ -229,6 +234,19 @@ struct VideoTask {
   std::optional<FileRef> render_video;
   /// kProcess: the LoadVideo file, sent as source_video.
   std::optional<FileRef> source_video;
+  /// VACE family (gufo.vace, the files added by the executor): control
+  /// video, mask (a video or a still for every frame) with its channel,
+  /// reference images, strength, sampler / shift, and whether the bundle's
+  /// step-distill LoRA applies (false: the graph has no LoRA).
+  std::optional<FileRef> control_video;
+  std::optional<FileRef> vace_mask;
+  std::string vace_mask_channel;  // "red", "green", "blue"
+  bool vace_invert_mask{false};
+  std::vector<FileRef> reference_images;
+  std::optional<double> vace_strength;
+  std::string vace_sampler;  // "lcm" or "euler"; empty = bundle default
+  std::optional<double> vace_shift;
+  bool vace_lora{true};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

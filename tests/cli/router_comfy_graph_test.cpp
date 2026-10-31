@@ -3,6 +3,7 @@
 // them in /history (long prompt texts shortened); the H3 and Wan graphs are
 // built from the node signatures ComfyUI's /object_info reports.
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -180,6 +181,33 @@ constexpr const char* kRifeOnly = R"({
  "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": "film/video/orig/a1_s01_x01/f"}},
  "5": {"class_type": "CreateVideo", "inputs": {"images": ["3", 0], "fps": 96.0, "codec": "h264"}},
  "6": {"class_type": "SaveVideo", "inputs": {"video": ["5", 0], "filename_prefix": "film/video/seg_a1_s01_x01", "format": "mp4"}}
+})";
+
+// Wan 2.1 VACE 14B (ComfyUI's WanVaceToVideo template with the lightx2v T2V
+// LoRA): control video and an inverted mask video, a reference image,
+// TrimVideoLatent between the sampler and the decode.
+constexpr const char* kVace = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.1_vace_14B_fp16.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors", "strength_model": 1.0}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "5": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["2", 0], "shift": 8.0}},
+ "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "the woman walks through the office, cinematic"}},
+ "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "blurry, static"}},
+ "20": {"class_type": "LoadVideo", "inputs": {"file": "pose_shot03.mp4"}},
+ "21": {"class_type": "GetVideoComponents", "inputs": {"video": ["20", 0]}},
+ "26": {"class_type": "LoadVideo", "inputs": {"file": "mask_shot03.mp4"}},
+ "22": {"class_type": "GetVideoComponents", "inputs": {"video": ["26", 0]}},
+ "27": {"class_type": "ImageToMask", "inputs": {"channel": "red", "image": ["22", 0]}},
+ "23": {"class_type": "InvertMask", "inputs": {"mask": ["27", 0]}},
+ "24": {"class_type": "LoadImage", "inputs": {"image": "figur_anna.png"}},
+ "25": {"class_type": "LoadImageMask", "inputs": {"image": "maske_tisch.png", "channel": "red"}},
+ "30": {"class_type": "WanVaceToVideo", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": 81, "batch_size": 1, "strength": 0.8, "control_video": ["21", 0], "control_masks": ["23", 0], "reference_image": ["24", 0]}},
+ "31": {"class_type": "KSampler", "inputs": {"model": ["5", 0], "positive": ["30", 0], "negative": ["30", 1], "latent_image": ["30", 2], "seed": 7, "steps": 4, "cfg": 1.0, "sampler_name": "lcm", "scheduler": "simple", "denoise": 1.0}},
+ "32": {"class_type": "TrimVideoLatent", "inputs": {"samples": ["31", 0], "trim_amount": ["30", 3]}},
+ "33": {"class_type": "VAEDecode", "inputs": {"samples": ["32", 0], "vae": ["4", 0]}},
+ "34": {"class_type": "CreateVideo", "inputs": {"images": ["33", 0], "fps": 16}},
+ "35": {"class_type": "SaveVideo", "inputs": {"video": ["34", 0], "filename_prefix": "film/vace/shot03", "format": "mp4", "codec": "h264"}}
 })";
 
 comfy::Plan PlanOf(const char* text) {
@@ -978,6 +1006,108 @@ void TestUni3C() {
   assert(smooth.interpolate == 2 && smooth.fps == 32);
 }
 
+void TestVace() {
+  // Wan 2.1 VACE 14B the ComfyUI-core way: control video, mask video
+  // (ImageToMask, inverted) and a reference image into WanVaceToVideo,
+  // TrimVideoLatent between the sampler and the decode.
+  const comfy::Plan plan = PlanOf(kVace);
+  assert(plan.tasks.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kVace);
+  assert(video.model == "wan2.1-vace-14b");
+  assert(video.prompt == "the woman walks through the office, cinematic");
+  assert(video.negative_prompt == "blurry, static");
+  assert(video.width == 832 && video.height == 480 && video.frames == 81);
+  assert(video.fps == 16 && video.steps == 4 && video.seed == 7);
+  assert(!video.guidance);
+  assert((video.control_video ==
+          comfy::FileRef{"pose_shot03.mp4", "input"}));
+  assert((video.vace_mask == comfy::FileRef{"mask_shot03.mp4", "input"}));
+  assert(video.vace_mask_channel == "red" && video.vace_invert_mask);
+  assert(video.reference_images.size() == 1);
+  assert((video.reference_images[0] ==
+          comfy::FileRef{"figur_anna.png", "input"}));
+  assert(video.vace_strength && *video.vace_strength == 0.8);
+  assert(video.vace_sampler == "lcm");
+  assert(video.vace_shift && *video.vace_shift == 8.0);
+  assert(video.vace_lora);
+  assert(plan.warnings.empty());
+  assert(plan.tasks[0].outputs.size() == 1);
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "wan2.1-vace-14b");
+  assert(body.member_str("size") == "832x480");
+  assert(body.find("seconds")->as_double() == 5);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("frames")->as_double() == 81);
+  assert(gufo->find("steps")->as_double() == 4);
+  assert(gufo->find("seed")->as_double() == 7);
+  assert(gufo->member_str("negative_prompt") == "blurry, static");
+  assert(gufo->find("guidance") == nullptr);
+  const json::Value* vace = gufo->find("vace");
+  assert(vace != nullptr);
+  assert(vace->find("strength")->as_double() == 0.8);
+  assert(vace->member_str("mask_channel") == "red");
+  assert(vace->find("invert_mask")->as_bool());
+  assert(vace->member_str("sampler") == "lcm");
+  assert(vace->find("shift")->as_double() == 8);
+  assert(vace->find("lora") == nullptr);
+  // The media are added by the executor, not the body.
+  assert(vace->find("control_video") == nullptr);
+
+  // Without LoRA, cfg 6 and uni_pc: guidance sent, no LoRA, euler warned.
+  std::string full = Replace(kVace, "\"model\": [\"2\", 0], \"shift\"",
+                             "\"model\": [\"1\", 0], \"shift\"");
+  full = Replace(full, "\"cfg\": 1.0, \"sampler_name\": \"lcm\"",
+                 "\"cfg\": 6.0, \"sampler_name\": \"uni_pc\"");
+  full = Replace(full, "\"steps\": 4", "\"steps\": 20");
+  const comfy::Plan full_plan = PlanOf(full.c_str());
+  const auto& slow = std::get<comfy::VideoTask>(full_plan.tasks[0].spec);
+  assert(slow.guidance && *slow.guidance == 6.0 && slow.steps == 20);
+  assert(!slow.vace_lora && slow.vace_sampler == "euler");
+  assert(full_plan.warnings.size() == 1 &&
+         full_plan.warnings[0].find("uni_pc") != std::string::npos);
+  const json::Value slow_body = comfy::VideoRequestBody(slow);
+  assert(slow_body.find("gufo")->find("guidance")->as_double() == 6);
+  assert(!slow_body.find("gufo")->find("vace")->find("lora")->as_bool());
+
+  // A still mask (LoadImageMask) is used for every frame (warning), no
+  // reference, no control video: plain inpainting of a region.
+  std::string still = Replace(
+      kVace, "\"control_masks\": [\"23\", 0]", "\"control_masks\": [\"25\", 0]");
+  still = Replace(still, ", \"reference_image\": [\"24\", 0]", "");
+  still = Replace(still, "\"control_video\": [\"21\", 0], ", "");
+  const comfy::Plan still_plan = PlanOf(still.c_str());
+  const auto& region = std::get<comfy::VideoTask>(still_plan.tasks[0].spec);
+  assert(!region.control_video && region.reference_images.empty());
+  assert((region.vace_mask == comfy::FileRef{"maske_tisch.png", "input"}));
+  assert(region.vace_mask_channel == "red" && !region.vace_invert_mask);
+  assert(still_plan.warnings.size() == 1 &&
+         still_plan.warnings[0].find("every frame") != std::string::npos);
+
+  // Errors: a preprocessor in front of the control video, an alpha mask, a
+  // foreign LoRA, a wrong length, too large, denoise < 1.
+  assert(ErrorOf(Replace(kVace, "\"control_video\": [\"21\", 0]",
+                         "\"control_video\": [\"24\", 0]"))
+             .message.find("LoadVideo") != std::string::npos);
+  assert(ErrorOf(Replace(kVace, "\"channel\": \"red\", \"image\": [\"22\", 0]",
+                         "\"channel\": \"alpha\", \"image\": [\"22\", 0]"))
+             .message.find("alpha") != std::string::npos);
+  assert(ErrorOf(Replace(kVace, "lightx2v_T2V_14B_cfg_step_distill",
+                         "anime_style"))
+             .message.find("LoRA") != std::string::npos);
+  assert(ErrorOf(Replace(kVace, "\"length\": 81", "\"length\": 80"))
+             .message.find("4k+1") != std::string::npos);
+  assert(ErrorOf(Replace(kVace, "\"width\": 832", "\"width\": 1600"))
+             .message.find("1280x720") != std::string::npos);
+  assert(ErrorOf(Replace(kVace, "\"denoise\": 1.0", "\"denoise\": 0.7"))
+             .message.find("denoise") != std::string::npos);
+  // VACE classes are known to the adapter.
+  const auto& classes = comfy::SupportedClassTypes();
+  for (const char* name : {"WanVaceToVideo", "TrimVideoLatent", "ImageToMask",
+                           "InvertMask"})
+    assert(std::find(classes.begin(), classes.end(), name) != classes.end());
+}
+
 void TestWanFunCamera() {
   // ComfyUI's Wan Fun Camera form: WanCameraEmbedding -> WanCameraImageToVideo.
   std::string text = Replace(
@@ -1308,6 +1438,7 @@ int main() {
   TestAceStep();
   TestUni3C();
   TestWanFunCamera();
+  TestVace();
   TestDelivery();
   TestWavJoin();
   TestHelpers();
