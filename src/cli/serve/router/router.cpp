@@ -90,6 +90,9 @@ constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
 constexpr int kSpawnAttempts = 3;
 constexpr std::chrono::seconds kShutdownDrain{10};
+/// Remote routers: model list refresh period and the bound of one probe.
+constexpr std::chrono::seconds kRemoteProbeEvery{5};
+constexpr std::chrono::milliseconds kRemoteProbeTimeout{2000};
 
 HttpResponse Err(int status, std::string_view reason, std::string_view message,
                  std::string_view type, std::string_view code) {
@@ -206,6 +209,7 @@ json::Value AutoloadFailureJson(const AutoloadFailure& failure) {
 /// the path belongs to the model-routing table instead.
 std::optional<HttpResponse> RouteFront(const router::Registry& registry,
                                        const AutoloadFailures& failures,
+                                       const router::RemoteHub* remotes,
                                        const HttpRequest& req) {
   if (req.method == "GET" && (req.path == "/health" || req.path == "/healthz" ||
                               req.path == "/v1/health")) {
@@ -228,12 +232,32 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
     json::Value data = json::Value::array();
     // llama.cpp's router shape (status.value / status.args), so clients
     // written for it list and pick models unchanged.
-    for (const auto& [preset, status] : registry.Statuses()) {
+    for (const auto& [preset, local_status] : registry.Statuses()) {
+      // A remote model shows its router's last listed state (cached by the
+      // remote thread, never asked live) and no args.
+      std::string_view status = local_status;
+      std::string remote_status;
       json::Value model = json::Value::object();
       model["id"] = preset->id;
       model["object"] = "model";
       model["owned_by"] = "gufo";
       model["modality"] = preset->modality;
+      if (preset->remote.has_value()) {
+        const router::RemoteEndpoint& url = preset->remote->url;
+        std::string error;
+        json::Value remote = json::Value::object();
+        remote["url"] = "http://" + router::EndpointKey(url);
+        const bool reachable =
+            remotes == nullptr || remotes->Reachable(url, &error);
+        remote["reachable"] = reachable;
+        if (!reachable)
+          remote["error"] = error;
+        model["remote"] = std::move(remote);
+        if (remotes != nullptr)
+          remote_status = remotes->ModelStatus(url, preset->id);
+        status = remote_status.empty() ? std::string_view("unloaded")
+                                       : std::string_view(remote_status);
+      }
       model["loaded"] = status == "loaded";
       json::Value args = json::Value::array();
       for (const std::string& arg : preset->argv)
@@ -714,6 +738,9 @@ public:
   std::unique_ptr<router::jobs::JobQueue> jobs;
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
+  /// Reachability and model states of the remote routers; null without
+  /// [remote/<id>] sections.
+  std::unique_ptr<router::RemoteHub> remotes;
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -775,7 +802,8 @@ public:
         (req.path == "/models/load" || req.path == "/models/unload")) {
       return ModelsControlLocked(req, lock);
     }
-    if (const auto front = RouteFront(registry, autoload_failed, req)) {
+    if (const auto front =
+            RouteFront(registry, autoload_failed, remotes.get(), req)) {
       return *front;
     }
     if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
@@ -1029,6 +1057,12 @@ public:
   HttpResponse RelayRemote(const std::string& model_id,
                            const router::RemoteSpec& spec,
                            const HttpRequest& req) {
+    std::string known_error;
+    if (remotes != nullptr && !remotes->Reachable(spec.url, &known_error)) {
+      // The last probe or relay failed: answer at once instead of letting
+      // every client wait out the connect timeout.
+      return router::RemoteUnavailable(model_id, known_error);
+    }
     HttpResponse response =
         router::ProxyToWorker(router::RemoteTarget(spec), req);
     if (response.status != 502 || response.streaming_body) {
@@ -1038,6 +1072,12 @@ public:
     constexpr std::string_view kPrefix = "upstream_unavailable detail=";
     if (std::string_view(detail).starts_with(kPrefix)) {
       detail.erase(0, kPrefix.size());
+    }
+    if (remotes != nullptr && (detail.starts_with("connect") ||
+                               detail.starts_with("resolve"))) {
+      // Only a failed connect says the router is gone; a lost answer may
+      // be one bad request.
+      remotes->MarkUnreachable(spec.url, detail);
     }
     Logger::Warn("router", "event=remote_unavailable model=" + model_id +
                                " url=" + spec.url.host + ":" +
@@ -1278,6 +1318,41 @@ public:
     }
   }
 
+  /// Remote thread: asks every remote router for its model list every few
+  /// seconds (no lock held while asking) and logs ids the remote does not
+  /// serve. Runs until the router stops.
+  void RemoteMain() {
+    while (!stop_requested.load()) {
+      for (const auto& target : remotes->Targets()) {
+        if (stop_requested.load())
+          return;
+        router::RemoteProbe probe = router::ProbeRemoteModels(
+            target.url, target.api_key, kRemoteProbeTimeout);
+        const std::string key = router::EndpointKey(target.url);
+        std::string reachable_before;
+        const bool was_reachable =
+            remotes->Reachable(target.url, &reachable_before);
+        if (probe.reachable != was_reachable) {
+          Logger::Info("router", "event=remote_" +
+                                     std::string(probe.reachable
+                                                     ? "reachable"
+                                                     : "unreachable") +
+                                     " url=" + key +
+                                     (probe.error.empty()
+                                          ? std::string()
+                                          : " detail=\"" + probe.error + "\""));
+        }
+        for (const auto& id : remotes->Record(target.url, std::move(probe))) {
+          Logger::Warn("router", "event=remote_model_missing model=" + id +
+                                     " url=" + key);
+        }
+      }
+      const auto next = std::chrono::steady_clock::now() + kRemoteProbeEvery;
+      while (!stop_requested.load() && std::chrono::steady_clock::now() < next)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
   /// for queued loads, and kill wedged loads past their deadline.
   void SuperviseOnce() {
@@ -1345,6 +1420,29 @@ public:
         failed[id] = AutoloadFailureJson(failure);
     }
     body["autoload_failed"] = std::move(failed);
+    if (remotes != nullptr) {
+      // Remote routers (cached probe) and, per remote model, whether a
+      // relay or job of it is open here.
+      json::Value remote = json::Value::object();
+      remote["routers"] = remotes->Status();
+      json::Value models = json::Value::object();
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& [preset, status] : registry.Statuses()) {
+          (void)status;
+          if (!preset->remote.has_value())
+            continue;
+          json::Value model = json::Value::object();
+          model["url"] = "http://" + router::EndpointKey(preset->remote->url);
+          model["busy"] = registry.Busy(preset->id);
+          model["gpu_slot"] = preset->remote->gpu_slot;
+          models[preset->id] = std::move(model);
+        }
+      }
+      remote["models"] = std::move(models);
+      remote["inflight"] = static_cast<long long>(remote_inflight.load());
+      body["remote"] = std::move(remote);
+    }
     return HttpResponse{.status = 200,
                         .reason = "OK",
                         .body = body.dump(),
@@ -2083,6 +2181,8 @@ int RunRouter(std::span<const char* const> args) {
   }
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
+  if (auto hub = std::make_unique<router::RemoteHub>(models); !hub->empty())
+    state->remotes = std::move(hub);
   state->pages_dir = pages_dir;
   {
     router::ResidencyOptions residency_options;
@@ -2224,6 +2324,9 @@ int RunRouter(std::span<const char* const> args) {
       std::this_thread::sleep_for(kSupervisionTick);
     }
   });
+  std::thread remote_thread;
+  if (state->remotes != nullptr)
+    remote_thread = std::thread([&state] { state->RemoteMain(); });
   // --autoload runs behind the listening front so a failed load (e.g. "bad
   // allocation" under memory pressure) never ends the router and other
   // models and pages stay reachable meanwhile.
@@ -2287,6 +2390,8 @@ int RunRouter(std::span<const char* const> args) {
   supervision.join();
   if (autoloader.joinable())
     autoloader.join();
+  if (remote_thread.joinable())
+    remote_thread.join();
   state->StopSpawner();
   return 0;
 }
