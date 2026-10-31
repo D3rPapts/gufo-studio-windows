@@ -1017,6 +1017,23 @@ def check_autoload_retry(binary, tmp):
         assert status == 200 and body[:4] == b"RIFF", (status, body[:200])
         status, body = get("/status/")
         assert status == 200 and b"status" in body, status
+        # Without a start page "/" stays a plain 404 ...
+        status, body = get("/")
+        assert status == 404, (status, body[:200])
+        # ... with one, "/" redirects there.
+        start = os.path.join(work, "pages", "start")
+        os.makedirs(start)
+        with open(os.path.join(start, "index.html"), "w") as handle:
+            handle.write("<p>start</p>")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        assert response.status == 302, response.status
+        assert response.getheader("Location") == "/start/", response.getheaders()
+        status, body = get("/start/")
+        assert status == 200 and b"start" in body, status
         # The retry after 3 s loads it; the failure mark goes away.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and status_of("flaky")["value"] != "loaded":

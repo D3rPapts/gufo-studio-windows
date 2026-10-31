@@ -102,11 +102,22 @@ HttpResponse LlamaErr(int status, std::string_view reason,
 
 /// Static file under --pages-dir: GET /<page>/ serves <dir>/<page>/index.html,
 /// GET /<page>/<file> the file itself, and /<page> redirects to /<page>/.
+/// GET / redirects to /start/ when <dir>/start/index.html exists.
 /// Same-origin pages need no CORS or private-network preflight from browsers.
 std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                                       const HttpRequest& req) {
-  if (dir.empty() || req.method != "GET" || req.path.size() < 2 ||
-      req.path.starts_with("/v1/"))
+  if (dir.empty() || req.method != "GET")
+    return std::nullopt;
+  if (req.path == "/" || req.path.starts_with("/?")) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(dir / "start" / "index.html", ec))
+      return std::nullopt;
+    return HttpResponse{.status = 302,
+                        .reason = "Found",
+                        .headers = {{"Location", "/start/"},
+                                    {"Cache-Control", "no-cache"}}};
+  }
+  if (req.path.size() < 2 || req.path.starts_with("/v1/"))
     return std::nullopt;
   std::string_view rel = std::string_view(req.path).substr(1);
   if (const auto query = rel.find('?'); query != std::string_view::npos)
@@ -1834,7 +1845,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &models_dir);
   parser.AddOption("", "--pages-dir", "DIR",
                    "Serve static pages: GET /<name>/ returns "
-                   "DIR/<name>/index.html",
+                   "DIR/<name>/index.html; GET / redirects to /start/ "
+                   "when DIR/start/index.html exists",
                    "Router", &pages_dir);
   parser.AddOption("", "--comfy-dir", "DIR",
                    "Serve a ComfyUI-compatible API (/prompt, /history, "
