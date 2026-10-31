@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/video_vace.hpp"
 #include "src/cli/serve/video_wan21.hpp"
 #include "src/cli/serve/preview.hpp"
 #include "src/cli/serve/video_wan22.hpp"
@@ -89,6 +90,41 @@ bool ValidateWan21Parameters(const minimax_h3::GenerationParameters& p,
     return fail("frames must be 4k + 1 between 5 and 81");
   if (p.evaluations < 1 || p.evaluations > 20)
     return fail("steps must be 1..20");
+  return true;
+}
+
+bool IsWan21VaceDirectory(const std::filesystem::path& root) {
+  std::ifstream input(root / "gufo-vace.json", std::ios::binary);
+  if (!input)
+    return false;
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  try {
+    return json::parse(text).member_str("_class_name") == "GufoWan21Vace";
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ValidateWan21VaceParameters(const minimax_h3::GenerationParameters& p,
+                                 std::string* error) {
+  const auto fail = [error](const char* message) {
+    if (error != nullptr)
+      *error = message;
+    return false;
+  };
+  if (p.preset != kWan21VacePreset)
+    return fail("Wan 2.1 VACE jobs use the 'wan21-vace' preset");
+  const int w = p.output_width, h = p.output_height;
+  if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 16 != 0 ||
+      h % 16 != 0 || w * h > 1280 * 720)
+    return fail(
+        "size must be WxH with multiples of 16, 256..1280 per side and at "
+        "most 1280x720 pixels");
+  if (p.frames < 5 || p.frames > 81 || (p.frames - 1) % 4 != 0)
+    return fail("frames must be 4k + 1 between 5 and 81");
+  if (p.evaluations < 1 || p.evaluations > 50)
+    return fail("steps must be 1..50");
   return true;
 }
 
@@ -447,16 +483,22 @@ struct VideoJobService::Impl {
     if (!options.now) {
       options.now = UnixNow;
     }
-    const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C;
+    const bool vace = options.family == VideoModelFamily::kWan21Vace;
+    const bool wan21 =
+        options.family == VideoModelFamily::kWan21Uni3C || vace;
     const bool wan = options.family == VideoModelFamily::kWan22 || wan21;
     if (wan && options.model_id.empty()) {
-      options.model_id = std::string(wan21 ? kWan21ModelId : kWan22ModelId);
+      options.model_id = std::string(vace    ? kWan21VaceModelId
+                                     : wan21 ? kWan21ModelId
+                                             : kWan22ModelId);
     }
     if (!wan) {
       options.model_id = "minimax-h3";
     }
     if (!options.runner) {
-      if (wan21) {
+      if (vace) {
+        options.runner = RunWan21VaceJob;
+      } else if (wan21) {
         options.runner = RunWan21Job;
       } else if (wan) {
         options.runner = RunWan22Job;
@@ -478,7 +520,14 @@ struct VideoJobService::Impl {
         return;
       }
 #endif
-      if (options.validate_model_inventory && wan21 &&
+      if (options.validate_model_inventory && vace &&
+          !IsWan21VaceDirectory(options.model_root)) {
+        initialization_error =
+            "not a Wan 2.1 VACE bundle (gufo-vace.json): " +
+            options.model_root.string();
+        return;
+      }
+      if (options.validate_model_inventory && wan21 && !vace &&
           !IsWan21CameraDirectory(options.model_root)) {
         initialization_error =
             "not a Wan 2.1 camera bundle (gufo-camera.json): " +
@@ -624,7 +673,8 @@ struct VideoJobService::Impl {
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
         const bool wan = options.family != VideoModelFamily::kMinimaxH3;
-        const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C;
+        const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C ||
+                           options.family == VideoModelFamily::kWan21Vace;
         int recovered_width = 0, recovered_height = 0;
         const bool valid_output =
             wan ? job->snapshot.output_format == "mp4" &&
@@ -821,7 +871,19 @@ struct VideoJobService::Impl {
           .guidance = static_cast<float>(job->request.guidance),
           .camera_json = job->request.camera_json,
           .guide_video_path = {},
+          .vace_json = job->request.vace_json,
+          .mask_path = {},
       };
+      if (!job->request.mask_file.empty()) {
+        // VACE mask (MP4 or still image), decoded from the job directory.
+        generation.mask_path =
+            job->directory / ("mask" + job->request.mask_extension);
+        std::ofstream mask(generation.mask_path, std::ios::binary);
+        mask.write(
+            reinterpret_cast<const char*>(job->request.mask_file.data()),
+            static_cast<std::streamsize>(job->request.mask_file.size()));
+        std::vector<std::uint8_t>().swap(job->request.mask_file);
+      }
       if (!job->request.guide_video.empty()) {
         // The uploaded guide is decoded by FFmpeg from the job directory.
         generation.guide_video_path = job->directory / "guide.mp4";
@@ -874,13 +936,14 @@ struct VideoJobService::Impl {
       if (options.family == VideoModelFamily::kWan22)
         preview.dense_up_to = 0;
       preview.pixel_frames = job->request.parameters.frames;
-      preview.fps =
-          options.family == VideoModelFamily::kWan21Uni3C ? 16 : 24;
+      const bool wan21_family =
+          options.family == VideoModelFamily::kWan21Uni3C ||
+          options.family == VideoModelFamily::kWan21Vace;
+      preview.fps = wan21_family ? 16 : 24;
       generation.preview = PreviewHub::Global().Begin(
           job->snapshot.id,
           options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
-          : options.family == VideoModelFamily::kWan21Uni3C
-              ? LatentFormat::kWan21
+          : wan21_family                             ? LatentFormat::kWan21
               : LatentFormat::kMinimaxH3,
           preview);
       const auto preview_before = PreviewHub::Global().stats();
@@ -1189,6 +1252,36 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
       return {.result = VideoJobResult::kInvalid,
               .job = std::nullopt,
               .error = "invalid Wan 2.1 camera video job request"};
+    }
+  } else if (impl_->options.family == VideoModelFamily::kWan21Vace) {
+    int width = 0, height = 0;
+    const auto frames = ResolveWan21DurationFrames(request.seconds);
+    bool references_valid = request.keyframes.size() <= 4;
+    for (const auto& reference : request.keyframes)
+      references_valid =
+          references_valid && reference.width > 0 && reference.height > 0 &&
+          reference.rgb.size() == static_cast<std::size_t>(reference.width) *
+                                      static_cast<std::size_t>(
+                                          reference.height) *
+                                      3U;
+    if (request.model != impl_->options.model_id ||
+        request.prompt.find('\0') != std::string::npos ||
+        request.negative_prompt.find('\0') != std::string::npos ||
+        request.output_format != "mp4" ||
+        !ParseVideoSize(request.size, &width, &height) ||
+        width != request.parameters.output_width ||
+        height != request.parameters.output_height || !frames ||
+        *frames != request.parameters.frames ||
+        !ValidateWan21VaceParameters(request.parameters, nullptr) ||
+        !references_valid || !request.lora.empty() ||
+        !request.first_frame.empty() || !request.camera_json.empty() ||
+        !std::isfinite(request.guidance) || request.guidance < 1.0 ||
+        request.guidance > 20.0 ||
+        (!request.mask_file.empty() && request.mask_extension != ".mp4" &&
+         request.mask_extension != ".ppm")) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "invalid Wan 2.1 VACE video job request"};
     }
   } else if (impl_->options.family == VideoModelFamily::kWan22) {
     int width = 0, height = 0;

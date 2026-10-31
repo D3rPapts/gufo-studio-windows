@@ -127,6 +127,13 @@ struct GenerationRequest {
   // video file.
   std::string camera_json;
   std::filesystem::path guide_video_path;
+  // Wan 2.1 VACE runner only: "gufo.vace" options as JSON (strength,
+  // mask_channel, sampler, shift), the mask file (MP4 video or a binary PPM
+  // still for every frame); the control video is `guide_video_path`, the
+  // reference images are `keyframes`, the negative prompt and guidance as
+  // above.
+  std::string vace_json;
+  std::filesystem::path mask_path;
   // Live preview of the denoised latents (MiniMax H3 and Wan 2.2).
   models::PreviewHook preview;
 };

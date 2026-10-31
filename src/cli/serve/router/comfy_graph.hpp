@@ -21,6 +21,10 @@
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+//   vace   KSampler <- WanVaceToVideo (control_video from LoadVideo /
+//          VHS_LoadVideo, control_masks through ImageToMask / InvertMask or
+//          LoadImageMask, reference_image from LoadImage), TrimVideoLatent
+//          after it -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 // A new family adds its node classes to the tables in comfy_graph.cpp, a
 // task type here and an executor in comfy_adapter.cpp.
 //
@@ -56,6 +60,7 @@ struct ModelIds {
   std::string tts_clone{"qwen3-tts-clone"};
   std::string music{"ace-step-1.5-xl-turbo"};
   std::string camera{"wan2.1-uni3c"};
+  std::string vace{"wan2.1-vace-14b"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -159,7 +164,7 @@ struct MusicTask {
 /// The /v1/audio/music body for `task` (synchronous, WAV).
 json::Value MusicRequestBody(const MusicTask& task);
 
-enum class VideoFamily { kH3, kWan, kCamera };
+enum class VideoFamily { kH3, kWan, kCamera, kVace };
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
 struct VideoUpscale {
@@ -212,6 +217,19 @@ struct VideoTask {
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;
   std::optional<FileRef> render_video;
+  /// VACE family (gufo.vace, the files added by the executor): control
+  /// video, mask (a video or a still for every frame) with its channel,
+  /// reference images, strength, sampler / shift, and whether the bundle's
+  /// step-distill LoRA applies (false: the graph has no LoRA).
+  std::optional<FileRef> control_video;
+  std::optional<FileRef> vace_mask;
+  std::string vace_mask_channel;  // "red", "green", "blue"
+  bool vace_invert_mask{false};
+  std::vector<FileRef> reference_images;
+  std::optional<double> vace_strength;
+  std::string vace_sampler;  // "lcm" or "euler"; empty = bundle default
+  std::optional<double> vace_shift;
+  bool vace_lora{true};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

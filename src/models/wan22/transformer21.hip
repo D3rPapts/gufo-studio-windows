@@ -569,8 +569,15 @@ struct Transformer21::Impl {
     int text_rows{0};
     DeviceBuffer text_key, text_packed;  // [layers] x ...
     DeviceBuffer image_key, image_packed;
+    DeviceBuffer text_states;  // BF16 [text_rows, W] for hooks
+    std::uint64_t serial{0};
   };
   ContextCache contexts[kContextSlots];
+  // Text-to-video checkpoint: 16 input channels, no image context.
+  bool text_only{false};
+  int in_channels{Transformer21::kInChannels};
+  std::uint64_t context_serial{0};
+  bool LoadPatch(std::string* error);
 
   // Activations.
   int reserved_tokens{0};
@@ -904,6 +911,23 @@ bool Transformer21::Impl::Unpack(const Fp8Linear& linear,
                     error);
 }
 
+// Patch embedding [5120, C, 1, 2, 2] -> BF16 [5120, 144] (c * 4 + kh * 2 +
+// kw); a text-to-video checkpoint's 16 channels are zero-padded to 36.
+bool Transformer21::Impl::LoadPatch(std::string* error) {
+  constexpr std::size_t W = kWidth;
+  if (!text_only)
+    return LoadDense(patch_weight, "patch_embedding", W, kPatchIn, true,
+                     error);
+  const std::size_t columns = static_cast<std::size_t>(in_channels) * 4;
+  std::vector<float> host, padded(W * kPatchIn, 0.0F);
+  if (!ReadHost("patch_embedding.weight", W * columns, &host, error))
+    return false;
+  for (std::size_t r = 0; r < W; ++r)
+    std::copy_n(host.begin() + r * columns, columns,
+                padded.begin() + r * kPatchIn);
+  return UploadBf16(patch_weight, padded, error);
+}
+
 bool Transformer21::Impl::Reserve(int tokens, std::string* error) {
   if (tokens <= reserved_tokens)
     return true;
@@ -970,6 +994,12 @@ double Transformer21::last_blocks_ms() const {
 hipStream_t Transformer21::stream() const {
   return impl_->stream;
 }
+int Transformer21::in_channels() const {
+  return impl_->in_channels;
+}
+bool Transformer21::text_only() const {
+  return impl_->text_only;
+}
 
 std::unique_ptr<Transformer21> Transformer21::Load(
     const std::filesystem::path& dit_file,
@@ -982,10 +1012,14 @@ std::unique_ptr<Transformer21> Transformer21::Load(
       (!lora_file.empty() &&
        !m.Index(lora_file, 1, "diffusion_model.", error)))
     return nullptr;
-  if (m.Find("blocks.0.cross_attn.k_img.weight") == nullptr ||
-      m.Find("blocks.39.ffn.2.scale_weight") == nullptr ||
-      m.Find("blocks.40.ffn.0.weight") != nullptr) {
-    SetError(error, "not a Wan 2.1 I2V 14B FP8 (scaled) checkpoint");
+  m.text_only = m.Find("blocks.0.cross_attn.k_img.weight") == nullptr;
+  const TensorLocation* patch = m.Find("patch_embedding.weight");
+  if (patch != nullptr && patch->shape.size() == 5)
+    m.in_channels = static_cast<int>(patch->shape[1]);
+  if (m.Find("blocks.39.ffn.2.scale_weight") == nullptr ||
+      m.Find("blocks.40.ffn.0.weight") != nullptr ||
+      m.in_channels != (m.text_only ? 16 : kInChannels)) {
+    SetError(error, "not a Wan 2.1 I2V or T2V 14B FP8 (scaled) checkpoint");
     return nullptr;
   }
   if (!Check(hipStreamCreateWithFlags(&m.stream, hipStreamNonBlocking),
@@ -1013,8 +1047,7 @@ std::unique_ptr<Transformer21> Transformer21::Load(
   constexpr std::size_t W = kWidth;
   constexpr std::size_t F = kFeedForward;
   // Patch embedding [5120, 36, 1, 2, 2] -> [5120, 144] (c * 4 + kh * 2 + kw).
-  if (!m.LoadDense(m.patch_weight, "patch_embedding", W, kPatchIn, true,
-                   error) ||
+  if (!m.LoadPatch(error) ||
       !m.LoadVector(m.patch_bias, "patch_embedding.bias", W, true, error) ||
       !m.LoadDense(m.time1, "time_embedding.0", W, kFrequencies, false,
                    error) ||
@@ -1030,7 +1063,13 @@ std::unique_ptr<Transformer21> Transformer21::Load(
       !m.LoadVector(m.text1_bias, "text_embedding.0.bias", W, true, error) ||
       !m.LoadDense(m.text2, "text_embedding.2", W, W, true, error) ||
       !m.LoadVector(m.text2_bias, "text_embedding.2.bias", W, true, error) ||
-      !m.LoadVector(m.img_norm1_weight, "img_emb.proj.0.weight", kImageWidth,
+      !m.LoadVector(m.out_modulation, "head.modulation", 2 * W, false,
+                    error) ||
+      !m.LoadDense(m.proj_out, "head.head", kPatchOut, W, true, error) ||
+      !m.LoadVector(m.proj_out_bias, "head.head.bias", kPatchOut, true, error))
+    return nullptr;
+  if (!m.text_only &&
+      (!m.LoadVector(m.img_norm1_weight, "img_emb.proj.0.weight", kImageWidth,
                     false, error) ||
       !m.LoadVector(m.img_norm1_bias, "img_emb.proj.0.bias", kImageWidth,
                     false, error) ||
@@ -1043,11 +1082,7 @@ std::unique_ptr<Transformer21> Transformer21::Load(
       !m.LoadVector(m.img_norm2_weight, "img_emb.proj.4.weight", W, false,
                     error) ||
       !m.LoadVector(m.img_norm2_bias, "img_emb.proj.4.bias", W, false,
-                    error) ||
-      !m.LoadVector(m.out_modulation, "head.modulation", 2 * W, false,
-                    error) ||
-      !m.LoadDense(m.proj_out, "head.head", kPatchOut, W, true, error) ||
-      !m.LoadVector(m.proj_out_bias, "head.head.bias", kPatchOut, true, error))
+                    error)))
     return nullptr;
   m.blocks = std::vector<Block>(kLayers);
   for (int index = 0; index < kLayers; ++index) {
@@ -1079,14 +1114,8 @@ std::unique_ptr<Transformer21> Transformer21::Load(
         !m.LoadVector(b.cross_v_bias, c + "v.bias", W, true, error) ||
         !m.LoadFp8(b.cross_o, c + "o", w, w, error) ||
         !m.LoadVector(b.cross_o_bias, c + "o.bias", W, true, error) ||
-        !m.LoadFp8(b.cross_k_img, c + "k_img", w, w, error) ||
-        !m.LoadVector(b.cross_k_img_bias, c + "k_img.bias", W, true, error) ||
-        !m.LoadFp8(b.cross_v_img, c + "v_img", w, w, error) ||
-        !m.LoadVector(b.cross_v_img_bias, c + "v_img.bias", W, true, error) ||
         !m.LoadVector(b.cross_norm_q, c + "norm_q.weight", W, false, error) ||
         !m.LoadVector(b.cross_norm_k, c + "norm_k.weight", W, false, error) ||
-        !m.LoadVector(b.cross_norm_k_img, c + "norm_k_img.weight", W, false,
-                      error) ||
         !m.LoadVector(b.norm2_weight, p + "norm3.weight", W, false, error) ||
         !m.LoadVector(b.norm2_bias, p + "norm3.bias", W, false, error) ||
         !m.LoadFp8(b.up, p + "ffn.0", kFeedForward, w, error) ||
@@ -1094,6 +1123,14 @@ std::unique_ptr<Transformer21> Transformer21::Load(
         !m.LoadFp8(b.down, p + "ffn.2", w, kFeedForward, error) ||
         !m.LoadVector(b.down_bias, p + "ffn.2.bias", W, true, error) ||
         !m.LoadVector(b.modulation, p + "modulation", 6 * W, false, error))
+      return nullptr;
+    if (!m.text_only &&
+        (!m.LoadFp8(b.cross_k_img, c + "k_img", w, w, error) ||
+         !m.LoadVector(b.cross_k_img_bias, c + "k_img.bias", W, true, error) ||
+         !m.LoadFp8(b.cross_v_img, c + "v_img", w, w, error) ||
+         !m.LoadVector(b.cross_v_img_bias, c + "v_img.bias", W, true, error) ||
+         !m.LoadVector(b.cross_norm_k_img, c + "norm_k_img.weight", W, false,
+                       error)))
       return nullptr;
   }
   if (!m.scratch.Allocate(2 * F * W * 2, error) ||
@@ -1120,7 +1157,9 @@ bool Transformer21::PrepareContext(int slot, std::span<const float> text,
   if (slot < 0 || slot >= kContextSlots || text_rows <= 0 ||
       text_rows > 4096 ||
       text.size() != static_cast<std::size_t>(text_rows) * kTextWidth ||
-      image.size() != static_cast<std::size_t>(kImageRows) * kImageWidth) {
+      image.size() != (m.text_only ? std::size_t{0}
+                                   : static_cast<std::size_t>(kImageRows) *
+                                         kImageWidth)) {
     SetError(error, "Wan 2.1 transformer: invalid context");
     return false;
   }
@@ -1144,9 +1183,10 @@ bool Transformer21::PrepareContext(int slot, std::span<const float> text,
       !Check(hipMemcpyAsync(text_in.raw(), half.data(), half.size() * 2,
                             hipMemcpyHostToDevice, s),
              "context upload", error) ||
-      !Check(hipMemcpyAsync(image_in.raw(), image.data(), image.size() * 4,
-                            hipMemcpyHostToDevice, s),
-             "context upload", error))
+      (!m.text_only &&
+       !Check(hipMemcpyAsync(image_in.raw(), image.data(), image.size() * 4,
+                             hipMemcpyHostToDevice, s),
+              "context upload", error)))
     return false;
   // Text: linear, GELU (tanh), linear.
   if (!m.Gemm(m.text1.get(), m.text1_bias, text_in.get(), text_hidden.get(),
@@ -1158,23 +1198,26 @@ bool Transformer21::PrepareContext(int slot, std::span<const float> text,
               text_states.get(), text_rows, kWidth, kWidth, error))
     return false;
   // Image: layer norm, linear, GELU (erf), linear, layer norm (eps 1e-5).
-  LayerNormAnyF32Kernel<<<kImageRows, kRowThreads, 0, s>>>(
-      image_in.f32(), kImageWidth, m.img_norm1_weight.f32(),
-      m.img_norm1_bias.f32(), 1e-5F, image_normed.get());
-  if (!m.Gemm(m.img1.get(), m.img1_bias, image_normed.get(),
-              image_hidden.get(), kImageRows, kImageWidth, kImageWidth, error))
-    return false;
-  GeluKernel<true><<<Blocks(I * kImageWidth), 256, 0, s>>>(image_hidden.get(),
-                                                           I * kImageWidth);
-  if (!m.Gemm(m.img2.get(), m.img2_bias, image_hidden.get(), linear.get(),
-              kImageRows, kWidth, kImageWidth, error))
-    return false;
-  LayerNormAnyKernel<<<kImageRows, kRowThreads, 0, s>>>(
-      linear.get(), kWidth, m.img_norm2_weight.f32(), m.img_norm2_bias.f32(),
-      1e-5F, image_states.get());
+  if (!m.text_only) {
+    LayerNormAnyF32Kernel<<<kImageRows, kRowThreads, 0, s>>>(
+        image_in.f32(), kImageWidth, m.img_norm1_weight.f32(),
+        m.img_norm1_bias.f32(), 1e-5F, image_normed.get());
+    if (!m.Gemm(m.img1.get(), m.img1_bias, image_normed.get(),
+                image_hidden.get(), kImageRows, kImageWidth, kImageWidth,
+                error))
+      return false;
+    GeluKernel<true><<<Blocks(I * kImageWidth), 256, 0, s>>>(
+        image_hidden.get(), I * kImageWidth);
+    if (!m.Gemm(m.img2.get(), m.img2_bias, image_hidden.get(), linear.get(),
+                kImageRows, kWidth, kImageWidth, error))
+      return false;
+    LayerNormAnyKernel<<<kImageRows, kRowThreads, 0, s>>>(
+        linear.get(), kWidth, m.img_norm2_weight.f32(),
+        m.img_norm2_bias.f32(), 1e-5F, image_states.get());
+  }
   if ((context_text != nullptr &&
        !m.Download(text_states.get(), true, L * W, context_text, error)) ||
-      (context_image != nullptr &&
+      (context_image != nullptr && !m.text_only &&
        !m.Download(image_states.get(), true, I * W, context_image, error)))
     return false;
 
@@ -1183,8 +1226,9 @@ bool Transformer21::PrepareContext(int slot, std::span<const float> text,
     cache.text_rows = 0;
     if (!cache.text_key.Allocate(kLayers * L * W * 2, error) ||
         !cache.text_packed.Allocate(kLayers * LP * W * 2, error) ||
-        !cache.image_key.Allocate(kLayers * I * W * 2, error) ||
-        !cache.image_packed.Allocate(kLayers * IP * W * 2, error))
+        (!m.text_only &&
+         (!cache.image_key.Allocate(kLayers * I * W * 2, error) ||
+          !cache.image_packed.Allocate(kLayers * IP * W * 2, error))))
       return false;
   }
   std::uint16_t* scratch = m.scratch.get();
@@ -1215,16 +1259,20 @@ bool Transformer21::PrepareContext(int slot, std::span<const float> text,
                      b.cross_v_bias, text_states.get(), text_rows,
                      cache.text_key.get() + layer * L * W,
                      cache.text_packed.get() + layer * LP * W) ||
-        !keys_values(b.cross_k_img, b.cross_k_img_bias, b.cross_norm_k_img,
-                     b.cross_v_img, b.cross_v_img_bias, image_states.get(),
-                     kImageRows, cache.image_key.get() + layer * I * W,
-                     cache.image_packed.get() + layer * IP * W))
+        (!m.text_only &&
+         !keys_values(b.cross_k_img, b.cross_k_img_bias, b.cross_norm_k_img,
+                      b.cross_v_img, b.cross_v_img_bias, image_states.get(),
+                      kImageRows, cache.image_key.get() + layer * I * W,
+                      cache.image_packed.get() + layer * IP * W)))
       return false;
   }
   if (!Check(hipGetLastError(), "context", error) ||
       !Check(hipStreamSynchronize(s), "context", error))
     return false;
   cache.text_rows = text_rows;
+  // The embedded text stays for hooks with their own cross-attention (VACE).
+  cache.text_states = std::move(text_states);
+  cache.serial = ++m.context_serial;
   return true;
 }
 
@@ -1247,7 +1295,7 @@ bool Transformer21::Forward(const Transformer21Input& input,
   const Impl::ContextCache& context = m.contexts[input.context_slot];
   const int ph = input.height / 2, pw = input.width / 2;
   const int tokens = input.frames * ph * pw;
-  const std::size_t latent_count = static_cast<std::size_t>(kInChannels) *
+  const std::size_t latent_count = static_cast<std::size_t>(m.in_channels) *
                                    input.frames * input.height * input.width;
   if (input.latent.size() != latent_count) {
     SetError(error, "Wan 2.1 transformer: input size does not match its shape");
@@ -1285,6 +1333,15 @@ bool Transformer21::Forward(const Transformer21Input& input,
   if (!Check(hipMemcpyAsync(m.latent.f32(), input.latent.data(),
                             latent_count * 4, hipMemcpyHostToDevice, s),
              "input upload", error) ||
+      // Text-to-video: channels 16..35 are zero (zero patch columns too).
+      (m.in_channels < kInChannels &&
+       !Check(hipMemsetAsync(m.latent.f32() + latent_count, 0,
+                             (static_cast<std::size_t>(kInChannels) *
+                                  input.frames * input.height * input.width -
+                              latent_count) *
+                                 4,
+                             s),
+              "input upload", error)) ||
       (new_rope &&
        !Check(hipMemcpyAsync(m.rope.f32(), rope.data(), rope.size() * 4,
                              hipMemcpyHostToDevice, s),
@@ -1337,6 +1394,33 @@ bool Transformer21::Forward(const Transformer21Input& input,
       !input.hook->Begin(m.latent.f32(), input.frames, input.height,
                          input.width, m.temb.f32(), s, error))
     return false;
+  if (input.hook != nullptr) {
+    Transformer21BlockState state;
+    state.frames = input.frames;
+    state.height = input.height;
+    state.width = input.width;
+    state.tokens = tokens;
+    state.hidden = m.hidden.f32();
+    state.temb = m.temb.f32();
+    state.modulation = m.proj.f32();
+    state.rope = m.rope.f32();
+    state.text = context.text_states.get();
+    state.text_rows = context.text_rows;
+    state.context_slot = input.context_slot;
+    state.context_serial = context.serial;
+    state.weights = m.scratch.get();
+    state.normed = m.normed.get();
+    state.linear = m.acc.get();
+    state.query = m.query.get();
+    state.key = m.key.get();
+    state.value = m.value.get();
+    state.packed = m.packed.get();
+    state.attention = m.attention.get();
+    state.ffn = m.ffn.get();
+    state.ffn_rows = std::min(tokens, kFeedForwardChunk);
+    if (!input.hook->BeginBlocks(state, s, error))
+      return false;
+  }
 
   const float* proj = m.proj.f32();
   const auto modulated = [&](const Block& b, int shift, int scale) {
@@ -1403,11 +1487,13 @@ bool Transformer21::Forward(const Transformer21Input& input,
                     context.text_packed.get() + layer * LP * W,
                     m.attention.get(), tokens, static_cast<std::uint32_t>(L),
                     kHeads, s);
-    LaunchAttention(m.query.get(), context.image_key.get() + layer * I * W,
-                    context.image_packed.get() + layer * IP * W,
-                    m.attention_image.get(), tokens, kImageRows, kHeads, s);
-    AddKernel<<<Blocks(count), 256, 0, s>>>(m.attention.get(),
-                                            m.attention_image.get(), count);
+    if (!m.text_only) {
+      LaunchAttention(m.query.get(), context.image_key.get() + layer * I * W,
+                      context.image_packed.get() + layer * IP * W,
+                      m.attention_image.get(), tokens, kImageRows, kHeads, s);
+      AddKernel<<<Blocks(count), 256, 0, s>>>(m.attention.get(),
+                                              m.attention_image.get(), count);
+    }
     if (!m.Unpack(b.cross_o, scratch, error) ||
         !m.Gemm(scratch, b.cross_o_bias, m.attention.get(), linear, tokens,
                 kWidth, kWidth, error))

@@ -256,7 +256,9 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
 bool IsKeyframeField(std::string_view name) {
   return name == "input_reference" || name == "first_frame" ||
          name == "last_frame" || name == "audio_reference" ||
-         name == "render_video" || name.starts_with("keyframe_");
+         name == "render_video" || name.starts_with("keyframe_") ||
+         name == "control_video" || name == "mask" ||
+         name.starts_with("reference_image");
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -1111,6 +1113,405 @@ HttpResponse CreateWan21Video(const json::Value& body,
   return response;
 }
 
+// Wan 2.1 VACE 14B ("wan2.1-vace-14b"): {"model", "prompt", "size" (default
+// "832x480", multiples of 16, at most 1280x720 pixels), "seconds" (0.25..5 at
+// 16 fps, default 5), "gufo": {"seed", "steps" (default 4), "frames",
+// "negative_prompt", "guidance" (1..20, default 1 = no CFG), "interpolate",
+// "upscale", "preview", "vace": {"control_video" (MP4 data URL or base64),
+// "mask" (MP4, or a PNG/JPEG/WebP still for every frame; white = generate),
+// "mask_channel" ("red" | "green" | "blue" | "luma"), "invert_mask",
+// "reference_images" (up to 4 images: data URL, base64 or HTTPS),
+// "strength" (0..1000, default 1), "sampler" ("lcm" | "euler"), "shift"
+// (1..20), "lora" (false: without the bundle's step-distill LoRA, e.g. for
+// cfg 5 and 20+ steps)}}}. A multipart upload may carry "control_video",
+// "mask" and "reference_image" / "reference_image_<n>" files instead.
+// Without a control video the model sees grey (reference-to-video /
+// text-to-video).
+HttpResponse CreateWan21VaceVideo(
+    const json::Value& body, const std::map<std::string, std::string>& files,
+    VideoJobService& service) {
+  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo"})) {
+    return Error(400, "Bad Request",
+                 "request contains an unsupported video field (VACE inputs "
+                 "go into 'gufo.vace')",
+                 "unsupported_field");
+  }
+  for (const auto& [name, data] : files) {
+    (void)data;
+    if (name != "control_video" && name != "mask" &&
+        !name.starts_with("reference_image")) {
+      return Error(400, "Bad Request",
+                   "unsupported upload '" + name +
+                       "' (control_video, mask, reference_image_<n>)",
+                   "unsupported_field");
+    }
+  }
+  const json::Value* model_value = body.find("model");
+  const json::Value* prompt_value = body.find("prompt");
+  const json::Value* size_value = body.find("size");
+  if (model_value == nullptr || !model_value->is_string() ||
+      prompt_value == nullptr || !prompt_value->is_string() ||
+      (size_value != nullptr && !size_value->is_string())) {
+    return Error(400, "Bad Request",
+                 "'model', 'prompt', and optional 'size' must be strings",
+                 "invalid_parameter_type");
+  }
+  const std::string model = model_value->str();
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  const std::string prompt = prompt_value->str();
+  if (prompt.find('\0') != std::string::npos) {
+    return Error(400, "Bad Request", "'prompt' must not contain NUL",
+                 "invalid_prompt");
+  }
+  const std::string size = body.member_str("size", "832x480");
+  const json::Value* seconds_value = body.find("seconds");
+  std::string seconds = "5";
+  if (seconds_value != nullptr && seconds_value->is_string()) {
+    seconds = seconds_value->str();
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
+  }
+  std::string duration_error;
+  const auto duration_frames =
+      ResolveWan21DurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  minimax_h3::GenerationParameters parameters;
+  parameters.preset = std::string(kWan21VacePreset);
+  parameters.frames = *duration_frames;
+  parameters.evaluations = 4;
+  parameters.mux = true;
+  parameters.decode_audio = false;
+  if (!ParseVideoSize(size, &parameters.output_width,
+                      &parameters.output_height)) {
+    return Error(400, "Bad Request", "'size' must be WIDTHxHEIGHT",
+                 "invalid_size");
+  }
+  parameters.internal_width = parameters.output_width;
+  parameters.internal_height = parameters.output_height;
+  std::uint64_t seed = 42;
+  std::string negative_prompt;
+  double guidance = 1.0;
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
+  PreviewOptions preview = VideoJobRequest{}.preview;
+  json::Value vace_options = json::Value::object();
+  std::vector<std::uint8_t> control_video, mask_file;
+  std::string mask_extension;
+  std::vector<minimax_h3::GenerationKeyframe> references;
+  core::ImageReadBudget image_budget;
+  image_budget.remaining_bytes = 4 * core::kMaxEncodedImageBytes;
+
+  // A video or still: an uploaded file, a data URL or raw base64.
+  const auto media = [&](const json::Value* value, const char* name,
+                         std::vector<std::uint8_t>* out,
+                         std::string* message) {
+    if (const auto upload = files.find(name); upload != files.end()) {
+      if (value != nullptr) {
+        *message = std::string("'gufo.vace.") + name +
+                   "' and an uploaded '" + name + "' exclude each other";
+        return false;
+      }
+      out->assign(upload->second.begin(), upload->second.end());
+      return true;
+    }
+    if (value == nullptr)
+      return true;
+    if (!value->is_string()) {
+      *message = std::string("'gufo.vace.") + name +
+                 "' must be a data URL or base64 string";
+      return false;
+    }
+    std::string_view text = value->str();
+    if (text.starts_with("data:")) {
+      const auto comma = text.find(',');
+      if (comma == std::string_view::npos ||
+          text.substr(0, comma).find(";base64") == std::string_view::npos) {
+        *message = std::string("'gufo.vace.") + name +
+                   "' data URL must be base64";
+        return false;
+      }
+      text.remove_prefix(comma + 1);
+    }
+    auto decoded = DecodeBase64(text);
+    if (!decoded.has_value() || decoded->size() < 64) {
+      *message = std::string("'gufo.vace.") + name + "' is not valid base64";
+      return false;
+    }
+    *out = std::move(*decoded);
+    return true;
+  };
+  const json::Value* vace = nullptr;
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension,
+                        {"seed", "steps", "frames", "negative_prompt",
+                         "guidance", "interpolate", "upscale", "preview",
+                         "vace"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' may contain only 'seed', 'steps', 'frames', "
+                   "'negative_prompt', 'guidance', 'interpolate', 'upscale', "
+                   "'preview' and 'vace'",
+                   "invalid_strix_options");
+    }
+    if (const auto failed = ParseVideoPreview(*extension, &preview)) {
+      return *failed;
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
+    }
+    if (extension->contains("negative_prompt")) {
+      const json::Value* value = extension->find("negative_prompt");
+      if (!value->is_string() || value->str().find('\0') != std::string::npos) {
+        return Error(400, "Bad Request",
+                     "'gufo.negative_prompt' must be a string",
+                     "invalid_negative_prompt");
+      }
+      negative_prompt = value->str();
+    }
+    if (extension->contains("guidance")) {
+      const json::Value* value = extension->find("guidance");
+      guidance = value->is_number() ? value->as_double(-1.0) : -1.0;
+      if (!std::isfinite(guidance) || guidance < 1.0 || guidance > 20.0) {
+        return Error(400, "Bad Request",
+                     "'gufo.guidance' must be a number in 1..20 (1 = no "
+                     "classifier-free guidance)",
+                     "invalid_guidance");
+      }
+    }
+    if (extension->contains("seed")) {
+      const auto parsed = JsonUnsigned(extension->find("seed"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.seed' must be a non-negative exact integer",
+                     "invalid_seed");
+      }
+      seed = *parsed;
+    }
+    if (extension->contains("steps")) {
+      const auto parsed = JsonFrame(extension->find("steps"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request", "'gufo.steps' must be 1..50",
+                     "invalid_steps");
+      }
+      parameters.evaluations = *parsed;
+    }
+    if (extension->contains("frames")) {
+      const auto parsed = JsonFrame(extension->find("frames"));
+      if (!parsed.has_value() || *parsed != *duration_frames) {
+        return Error(400, "Bad Request",
+                     "'gufo.frames' must match the 'seconds' duration",
+                     "invalid_frames");
+      }
+    }
+    vace = extension->find("vace");
+  }
+  if (vace != nullptr &&
+      (!vace->is_object() ||
+       !HasOnlyMembers(*vace, {"control_video", "mask", "mask_channel",
+                               "invert_mask", "reference_images", "strength",
+                               "sampler", "shift", "lora"}))) {
+    return Error(400, "Bad Request",
+                 "'gufo.vace' may contain only 'control_video', 'mask', "
+                 "'mask_channel', 'invert_mask', 'reference_images', "
+                 "'strength', 'sampler', 'shift' and 'lora'",
+                 "invalid_vace");
+  }
+  const auto member = [&](const char* name) -> const json::Value* {
+    return vace == nullptr ? nullptr : vace->find(name);
+  };
+  std::string media_error;
+  if (!media(member("control_video"), "control_video", &control_video,
+             &media_error) ||
+      !media(member("mask"), "mask", &mask_file, &media_error)) {
+    return Error(400, "Bad Request", media_error, "invalid_vace");
+  }
+  if (!mask_file.empty()) {
+    const auto starts = [&](std::string_view magic) {
+      if (mask_file.size() < magic.size())
+        return false;
+      for (std::size_t i = 0; i < magic.size(); ++i)
+        if (static_cast<std::uint8_t>(magic[i]) != mask_file[i])
+          return false;
+      return true;
+    };
+    const bool still =
+        starts("\x89PNG") || starts("\xFF\xD8\xFF") ||
+        (starts("RIFF") && mask_file.size() > 12 && mask_file[8] == 'W' &&
+         mask_file[9] == 'E' && mask_file[10] == 'B' && mask_file[11] == 'P');
+    if (still) {
+      // Decoded here (validated), handed on as a binary PPM.
+      try {
+        const core::Image image = core::DecodeImage(mask_file);
+        const std::string header = "P6\n" + std::to_string(image.width) + " " +
+                                   std::to_string(image.height) + "\n255\n";
+        mask_file.assign(header.begin(), header.end());
+        mask_file.insert(mask_file.end(), image.pixels.begin(),
+                         image.pixels.end());
+        mask_extension = ".ppm";
+      } catch (const std::exception& exception) {
+        return Error(400, "Bad Request",
+                     std::string("'gufo.vace.mask' ") + exception.what(),
+                     "invalid_vace");
+      }
+    } else {
+      mask_extension = ".mp4";
+    }
+  }
+  if (const json::Value* channel = member("mask_channel")) {
+    if (!channel->is_string() ||
+        (channel->str() != "red" && channel->str() != "green" &&
+         channel->str() != "blue" && channel->str() != "luma")) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.mask_channel' must be red, green, blue or luma",
+                   "invalid_vace");
+    }
+    vace_options["mask_channel"] = channel->str();
+  }
+  if (const json::Value* invert = member("invert_mask")) {
+    if (!invert->is_bool()) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.invert_mask' must be a boolean",
+                   "invalid_vace");
+    }
+    vace_options["invert_mask"] = invert->as_bool();
+  }
+  if (const json::Value* lora = member("lora")) {
+    if (!lora->is_bool()) {
+      return Error(400, "Bad Request", "'gufo.vace.lora' must be a boolean",
+                   "invalid_vace");
+    }
+    vace_options["lora"] = lora->as_bool();
+  }
+  if (const json::Value* strength = member("strength")) {
+    const double value = strength->is_number() ? strength->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 0.0 || value > 1000.0) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.strength' must be a number in 0..1000",
+                   "invalid_vace");
+    }
+    vace_options["strength"] = value;
+  }
+  if (const json::Value* sampler = member("sampler")) {
+    if (!sampler->is_string() ||
+        (sampler->str() != "lcm" && sampler->str() != "euler")) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.sampler' must be lcm or euler", "invalid_vace");
+    }
+    vace_options["sampler"] = sampler->str();
+  }
+  if (const json::Value* shift = member("shift")) {
+    const double value = shift->is_number() ? shift->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 1.0 || value > 20.0) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.shift' must be a number in 1..20",
+                   "invalid_vace");
+    }
+    vace_options["shift"] = value;
+  }
+  // Reference images: JSON entries first, then uploads in name order.
+  if (const json::Value* list = member("reference_images")) {
+    if (!list->is_array() || list->size() > 4) {
+      return Error(400, "Bad Request",
+                   "'gufo.vace.reference_images' must be an array of at most "
+                   "4 images",
+                   "invalid_vace");
+    }
+    for (const json::Value& item : list->items()) {
+      std::string image_error;
+      auto image = ReadKeyframe(&item, nullptr,
+                                minimax_h3::KeyframeAnchor::kFirst,
+                                image_budget, &image_error);
+      if (!image.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.vace.reference_images' " + image_error,
+                     "invalid_vace");
+      }
+      image->vision = false;
+      references.push_back(std::move(*image));
+    }
+  }
+  for (const auto& [name, data] : files) {
+    if (!name.starts_with("reference_image"))
+      continue;
+    std::string image_error;
+    auto image = ReadKeyframe(nullptr, &data,
+                              minimax_h3::KeyframeAnchor::kFirst,
+                              image_budget, &image_error);
+    if (!image.has_value()) {
+      return Error(400, "Bad Request", "'" + name + "' " + image_error,
+                   "invalid_vace");
+    }
+    image->vision = false;
+    references.push_back(std::move(*image));
+  }
+  if (references.size() > 4) {
+    return Error(400, "Bad Request", "at most 4 VACE reference images",
+                 "invalid_vace");
+  }
+  std::string parameter_error;
+  if (!ValidateWan21VaceParameters(parameters, &parameter_error)) {
+    return Error(400, "Bad Request", parameter_error, "invalid_parameters");
+  }
+  VideoJobRequest job_request;
+  job_request.model = model;
+  job_request.prompt = prompt;
+  job_request.size = size;
+  job_request.seconds = seconds;
+  job_request.output_format = "mp4";
+  job_request.parameters = std::move(parameters);
+  job_request.seed = seed;
+  job_request.keyframes = std::move(references);
+  job_request.negative_prompt = std::move(negative_prompt);
+  job_request.guidance = guidance;
+  job_request.interpolate = interpolate.multiplier;
+  job_request.interpolate_fps_num = interpolate.fps_num;
+  job_request.interpolate_fps_den = interpolate.fps_den;
+  job_request.upscale = std::move(upscale);
+  job_request.guide_video = std::move(control_video);
+  job_request.vace_json = vace_options.dump();
+  job_request.mask_file = std::move(mask_file);
+  job_request.mask_extension = std::move(mask_extension);
+  job_request.preview = preview;
+  const VideoJobCreateResult created = service.Create(job_request);
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   std::map<std::string, std::string> files;
@@ -1144,11 +1545,26 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
   }
+  if (service.family() != VideoModelFamily::kWan21Vace) {
+    // VACE uploads exist only for wan2.1-vace-14b.
+    for (const auto& [name, data] : files) {
+      (void)data;
+      if (name == "control_video" || name == "mask" ||
+          name.starts_with("reference_image")) {
+        return Error(400, "Bad Request",
+                     "request contains an unsupported video field",
+                     "unsupported_field");
+      }
+    }
+  }
   if (service.family() == VideoModelFamily::kWan22) {
     return CreateWan22Video(body, files, service);
   }
   if (service.family() == VideoModelFamily::kWan21Uni3C) {
     return CreateWan21Video(body, files, service);
+  }
+  if (service.family() == VideoModelFamily::kWan21Vace) {
+    return CreateWan21VaceVideo(body, files, service);
   }
   if (IsUnsupportedConditioning(body)) {
     return Error(400, "Bad Request",

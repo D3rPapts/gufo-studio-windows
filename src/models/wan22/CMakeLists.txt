@@ -1,12 +1,13 @@
 # Wan 2.2 TI2V-5B: umT5-XXL tokenizer, text encoder, transformer (DiT), UniPC
 # scheduler, VAE decoder and the text-to-video pipeline.
-add_library(gufo_wan22 STATIC EXCLUDE_FROM_ALL tokenizer.cpp scheduler.cpp)
+add_library(gufo_wan22 STATIC EXCLUDE_FROM_ALL tokenizer.cpp scheduler.cpp
+  vace_context.cpp)
 target_include_directories(gufo_wan22 PUBLIC ${PROJECT_SOURCE_DIR})
 
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_wan22 PRIVATE text_encoder.hip transformer.hip
     attention.hip gemm.cpp vae.hip pipeline.cpp clip_vision.hip
-    transformer21.hip uni3c.hip pipeline21.cpp
+    transformer21.hip uni3c.hip pipeline21.cpp vace.hip pipeline_vace.cpp
     moge.hip camera_path.cpp point_render.hip)
   target_compile_options(gufo_wan22 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
@@ -32,4 +33,11 @@ if (BUILD_TESTING)
   add_test(NAME wan22_tokenizer_test COMMAND wan22_tokenizer_test)
   set_tests_properties(wan22_tokenizer_test PROPERTIES
     LABELS "cpu;models;wan22;external-model" SKIP_RETURN_CODE 77)
+
+  add_executable(wan22_vace_context_test
+    ${PROJECT_SOURCE_DIR}/tests/models/wan22/vace_context_test.cpp)
+  target_link_libraries(wan22_vace_context_test PRIVATE gufo_wan22)
+  add_test(NAME wan22_vace_context_test COMMAND wan22_vace_context_test)
+  set_tests_properties(wan22_vace_context_test PROPERTIES
+    LABELS "cpu;models;wan22")
 endif()

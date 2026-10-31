@@ -759,6 +759,81 @@ void TestWan22Options(const std::filesystem::path& root) {
   }
 }
 
+// Wan 2.1 VACE: gufo.vace options reach the runner as vace_json, the control
+// video as the guide file, a still mask as a binary PPM, reference images as
+// keyframes; negative prompt, guidance and steps pass through. Bad options
+// and VACE uploads on other families are refused.
+void TestWan21Vace(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobServiceOptions options = Options(root, &runner);
+  options.family = VideoModelFamily::kWan21Vace;
+  options.model_root = "/private/models/wan21-vace";
+  VideoJobService service(std::move(options));
+  Check(service.ready(), service.initialization_error());
+  Check(service.model_id() == "wan2.1-vace-14b", "VACE model id");
+  // A 1x1 RGBA PNG and 72 zero bytes standing in for an MP4.
+  const std::string png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+      "hKmMIQAAAABJRU5ErkJggg==";
+  const std::string mp4(96, 'A');
+  const std::string prefix =
+      R"({"model":"wan2.1-vace-14b","prompt":"walk","size":"832x480","seconds":"1","gufo":{"negative_prompt":"blurry","guidance":5,"steps":20,"vace":{)";
+  const std::string body =
+      prefix + R"("control_video":"data:video/mp4;base64,)" + mp4 +
+      R"(","mask":"data:image/png;base64,)" + png +
+      R"(","mask_channel":"green","invert_mask":true,"reference_images":[")" +
+      png +
+      R"("],"strength":0.5,"sampler":"euler","shift":8,"lora":false}}})";
+  const HttpResponse created = Send(service, "POST", "/v1/videos", body);
+  Check(created.status == 202, "VACE request is accepted: " + created.body);
+  runner.WaitForCalls(1);
+  WaitCompleted(service, CreatedId(created));
+  const h3::GenerationRequest generation = runner.latest();
+  Check(generation.parameters.preset == "wan21-vace" &&
+            generation.parameters.frames == 17 &&
+            generation.parameters.evaluations == 20 &&
+            generation.parameters.output_width == 832 &&
+            generation.negative_prompt == "blurry" &&
+            generation.guidance == 5.0F,
+        "VACE size, frames, steps, negative prompt and guidance reach the "
+        "runner");
+  Check(!generation.guide_video_path.empty() &&
+            generation.mask_path.extension() == ".ppm" &&
+            generation.keyframes.size() == 1 &&
+            generation.keyframes[0].width == 1 &&
+            !generation.keyframes[0].vision,
+        "VACE control video, still mask and reference image reach the runner");
+  {
+    std::ifstream mask(generation.mask_path, std::ios::binary);
+    std::string header(11, '\0');
+    mask.read(header.data(), 11);
+    Check(header == "P6\n1 1\n255\n", "VACE still mask is a binary PPM");
+  }
+  const gufo::json::Value vace = gufo::json::parse(generation.vace_json);
+  Check(vace.member_double("strength") == 0.5 &&
+            vace.member_str("mask_channel") == "green" &&
+            vace.find("invert_mask")->as_bool() &&
+            vace.member_str("sampler") == "euler" &&
+            vace.member_double("shift") == 8 &&
+            !vace.find("lora")->as_bool(),
+        "VACE options reach the runner: " + generation.vace_json);
+
+  for (const std::string bad :
+       {prefix + R"("strength":-1}}})", prefix + R"("sampler":"uni_pc"}}})",
+        prefix + R"("mask_channel":"alpha"}}})",
+        prefix + R"("control_video":"!!"}}})", prefix + R"("unknown":1}}})",
+        prefix + R"("reference_images":["a","b","c","d","e"]}}})",
+        std::string(
+            R"({"model":"wan2.1-vace-14b","prompt":"x","size":"1920x1080","seconds":"1"})"),
+        std::string(
+            R"({"model":"wan2.1-vace-14b","prompt":"x","seconds":"1","first_frame":"x"})"),
+        std::string(
+            R"({"model":"wan2.1-vace-14b","prompt":"x","seconds":"1","gufo":{"guidance":0.5}})")}) {
+    Check(Send(service, "POST", "/v1/videos", bad).status == 400,
+          "invalid VACE request is rejected: " + bad);
+  }
+}
+
 // Wan 2.1 Uni3C camera moves: "gufo.preview" is accepted, the runner gets a
 // hook that keeps the dense default (every step but the last of the 4-step
 // LCM schedule), and a 16-channel latent becomes a preview loop under the
@@ -957,6 +1032,7 @@ int main() {
   TestQueueSaturation(base / "queue");
   TestWan22Options(base / "wan22");
   TestWan21Preview(base / "wan21");
+  TestWan21Vace(base / "wan21-vace");
   TestDelivery(base / "delivery");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";

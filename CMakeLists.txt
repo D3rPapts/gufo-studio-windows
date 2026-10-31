@@ -460,6 +460,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
   src/cli/serve/video_wan21.cpp
+  src/cli/serve/video_vace.cpp
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
   src/cli/serve/music_api.cpp
@@ -1021,6 +1022,7 @@ if (BUILD_TESTING)
     tests/cli/video_jobs_test.cpp
     src/cli/serve/video_jobs.cpp
     src/cli/serve/video_wan21.cpp
+    src/cli/serve/video_vace.cpp
     src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_jobs_test PRIVATE gufo_preview gufo_logging gufo_core gufo_cache)
@@ -1036,6 +1038,7 @@ if (BUILD_TESTING)
     src/cli/serve/video_api.cpp
     src/cli/serve/video_jobs.cpp
     src/cli/serve/video_wan21.cpp
+    src/cli/serve/video_vace.cpp
     src/cli/serve/video_wan22.cpp
   )
   target_link_libraries(video_api_test PRIVATE gufo_preview gufo_logging gufo_core gufo_cache)

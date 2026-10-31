@@ -364,6 +364,12 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->audio_reference);
       if (video->render_video)
         files->push_back(*video->render_video);
+      if (video->control_video)
+        files->push_back(*video->control_video);
+      if (video->vace_mask)
+        files->push_back(*video->vace_mask);
+      files->insert(files->end(), video->reference_images.begin(),
+                    video->reference_images.end());
     }
   }
 }
@@ -1613,6 +1619,29 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     camera["render_video"] = "data:video/mp4;base64," +
                              Base64Encode(ReadFileRef(*spec.render_video));
     body["gufo"]["camera"] = std::move(camera);
+  }
+  if (spec.family == VideoFamily::kVace) {
+    // VACE media into gufo.vace: videos as MP4 data URLs, images as they are
+    // (gufo fits every input to the video size itself).
+    json::Value& vace = body["gufo"]["vace"];
+    if (spec.control_video)
+      vace["control_video"] = "data:video/mp4;base64," +
+                              Base64Encode(ReadFileRef(*spec.control_video));
+    if (spec.vace_mask) {
+      const std::string bytes = ReadFileRef(*spec.vace_mask);
+      vace["mask"] = (ImageDimensions(bytes) ? "data:" + SniffImageType(bytes)
+                                             : std::string("data:video/mp4")) +
+                     ";base64," + Base64Encode(bytes);
+    }
+    if (!spec.reference_images.empty()) {
+      json::Value references = json::Value::array();
+      for (const FileRef& ref : spec.reference_images) {
+        const std::string bytes = ReadFileRef(ref);
+        references.push_back("data:" + SniffImageType(bytes) + ";base64," +
+                             Base64Encode(bytes));
+      }
+      vace["reference_images"] = std::move(references);
+    }
   }
   if (spec.audio_reference) {
     const std::string audio = ReadFileRef(*spec.audio_reference);

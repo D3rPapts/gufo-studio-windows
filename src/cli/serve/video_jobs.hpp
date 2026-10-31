@@ -46,6 +46,7 @@ enum class VideoModelFamily : std::uint8_t {
   kMinimaxH3,
   kWan22,
   kWan21Uni3C,
+  kWan21Vace,
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
@@ -63,6 +64,19 @@ inline constexpr std::string_view kWan21Preset = "wan21";
 /// 16 fps: 4k + 1 frames for 0.25..5 seconds (at most 81).
 [[nodiscard]] std::optional<int> ResolveWan21DurationFrames(
     std::string_view seconds, std::string* error = nullptr);
+
+// Wan 2.1 VACE 14B (T2V 14B + VACE module, video editing with a control
+// video, masks and reference images), 16 fps like the camera family.
+inline constexpr std::string_view kWan21VaceModelId = "wan2.1-vace-14b";
+inline constexpr std::string_view kWan21VacePreset = "wan21-vace";
+/// A VACE bundle: `gufo-vace.json` in the root names its parts (see
+/// video_vace.hpp).
+[[nodiscard]] bool IsWan21VaceDirectory(const std::filesystem::path& root);
+/// Multiples of 16, 256..1280 per side, at most 1280 * 720 pixels; frames
+/// 4k + 1 in 5..81; 1..50 steps.
+[[nodiscard]] bool ValidateWan21VaceParameters(
+    const minimax_h3::GenerationParameters& parameters,
+    std::string* error = nullptr);
 
 // True when `root/model_index.json` describes a Wan 2.2 TI2V-5B pipeline.
 [[nodiscard]] bool IsWan22ModelDirectory(const std::filesystem::path& root);
@@ -139,6 +153,13 @@ struct VideoJobRequest {
   // or poses), and an uploaded guide video (MP4 bytes) instead.
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
+  // Wan 2.1 VACE: "gufo.vace" options as JSON; the control video is
+  // `guide_video`, the reference images `keyframes` (RGB8, vision false);
+  // the mask as file bytes with its extension (".mp4" video, or ".ppm": a
+  // binary P6 still, decoded by the API, used for every frame).
+  std::string vace_json;
+  std::vector<std::uint8_t> mask_file;
+  std::string mask_extension;
   // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
   // every second step by default, every step of a MiniMax H3 schedule with
   // at most 16 steps (Turbo) ("gufo": {"preview": {...}}).

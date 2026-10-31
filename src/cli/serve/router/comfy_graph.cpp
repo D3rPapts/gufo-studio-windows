@@ -78,6 +78,10 @@ constexpr std::string_view kPlumbing[] = {
     "ImageUpscaleWithModel",
     "ImageScale",
     "ImageScaleBy",
+    "WanVaceToVideo",
+    "TrimVideoLatent",
+    "ImageToMask",
+    "InvertMask",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -404,7 +408,8 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
     } else if (cls == "ConditioningZeroOut") {
       cond.zeroed = true;
       link = graph.RequireLink(link->node, "conditioning");
-    } else if (cls == "WanImageToVideo" || cls == "WanCameraImageToVideo") {
+    } else if (cls == "WanImageToVideo" || cls == "WanCameraImageToVideo" ||
+               cls == "WanVaceToVideo") {
       // Outputs (positive, negative, latent): follow the matching input.
       link = graph.RequireLink(link->node,
                                link->slot == 1 ? "negative" : "positive");
@@ -1220,6 +1225,187 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
   return task;
 }
 
+/// A video an IMAGE input receives: GetVideoComponents <- LoadVideo, or
+/// VHS_LoadVideo (gufo decodes and fits the file itself).
+FileRef VideoFile(const Graph& graph, const std::string& id,
+                  const std::string& key, const Link& link,
+                  std::vector<std::string>* warnings) {
+  const std::string source = graph.Class(link.node);
+  if (source == "VHS_LoadVideo") {
+    // gufo reads the file's frames in order from the start.
+    for (const char* option :
+         {"force_rate", "skip_first_frames", "select_every_nth"}) {
+      const double fallback = std::string_view(option) == "select_every_nth"
+                                  ? 1.0
+                                  : 0.0;
+      if (graph.Num(link.node, option, fallback) != fallback)
+        warnings->push_back("node " + link.node + ": " + option +
+                            " is not applied (gufo reads every frame from "
+                            "the start; prepare the video at 16 fps)");
+    }
+    return ParseFileRef(graph.Str(link.node, "video"), "input");
+  }
+  if (source == "GetVideoComponents") {
+    const Link file = graph.RequireLink(link.node, "video");
+    if (graph.Class(file.node) != "LoadVideo")
+      throw NodeFailure(link.node, "unsupported_link",
+                        "the video must come from LoadVideo");
+    return ParseFileRef(graph.Str(file.node, "file"), "input");
+  }
+  throw NodeFailure(id, "unsupported_link",
+                    "input '" + key +
+                        "' must come from LoadVideo (GetVideoComponents) or "
+                        "VHS_LoadVideo, not " +
+                        source +
+                        " (run preprocessors in ComfyUI and load their "
+                        "result as a video)");
+}
+
+/// Wan 2.1 VACE 14B (wan2.1-vace-14b, 16 fps): KSampler <- WanVaceToVideo,
+/// TrimVideoLatent behind the sampler (gufo always trims the reference
+/// frames).
+VideoTask BuildVace(const Graph& graph, const std::string& sampler,
+                    const ModelIds& models, const Link& latent,
+                    std::vector<std::string>* warnings) {
+  const std::string vace = latent.node;
+  VideoTask task;
+  task.family = VideoFamily::kVace;
+  task.model = models.vace;
+  task.fps = 16;
+  task.width = static_cast<int>(graph.Num(vace, "width", 832));
+  task.height = static_cast<int>(graph.Num(vace, "height", 480));
+  if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 256 ||
+      task.height < 256 || task.width > 1280 || task.height > 1280 ||
+      task.width * task.height > 1280 * 720)
+    throw NodeFailure(vace, "unsupported_value",
+                      "gufo wan2.1-vace-14b needs width/height in multiples "
+                      "of 16, 256..1280 and at most 1280x720 pixels, not " +
+                          std::to_string(task.width) + "x" +
+                          std::to_string(task.height));
+  task.frames = static_cast<int>(graph.Num(vace, "length", 81));
+  if (task.frames < 5 || task.frames > 81 || (task.frames - 1) % 4 != 0)
+    throw NodeFailure(vace, "unsupported_value",
+                      "gufo wan2.1-vace-14b length must be 4k+1 frames, "
+                      "5..81 (16 fps)");
+  if (graph.Num(vace, "batch_size", 1) != 1)
+    throw NodeFailure(vace, "unsupported_value",
+                      "gufo wan2.1-vace-14b renders batch_size 1");
+  const double strength = graph.Num(vace, "strength", 1.0);
+  if (strength < 0 || strength > 1000)
+    throw NodeFailure(vace, "unsupported_value",
+                      "strength must be 0..1000");
+  if (strength != 1.0)
+    task.vace_strength = strength;
+  if (auto control = graph.LinkOf(vace, "control_video"))
+    task.control_video =
+        VideoFile(graph, vace, "control_video", *control, warnings);
+  if (auto mask = graph.LinkOf(vace, "control_masks")) {
+    Link link = *mask;
+    for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
+         ++guard) {
+      task.vace_invert_mask = !task.vace_invert_mask;
+      link = graph.RequireLink(link.node, "mask");
+    }
+    const std::string source = graph.Class(link.node);
+    std::string channel;
+    if (source == "ImageToMask") {
+      channel = graph.Str(link.node, "channel", "red");
+      task.vace_mask =
+          VideoFile(graph, link.node, "image",
+                    graph.RequireLink(link.node, "image"), warnings);
+    } else if (source == "LoadImageMask") {
+      channel = graph.Str(link.node, "channel", "alpha");
+      task.vace_mask = ParseFileRef(graph.Str(link.node, "image"), "input");
+      warnings->push_back("node " + vace +
+                          ": gufo applies the still mask to every frame "
+                          "(ComfyUI masks only the first frame and pads "
+                          "the rest with 1)");
+    } else {
+      throw NodeFailure(vace, "unsupported_link",
+                        "control_masks must come from ImageToMask (on a "
+                        "loaded video), LoadImageMask or InvertMask, not " +
+                            source);
+    }
+    if (channel != "red" && channel != "green" && channel != "blue")
+      throw NodeFailure(link.node, "unsupported_value",
+                        "gufo reads VACE masks from the red, green or blue "
+                        "channel, not " +
+                            channel);
+    task.vace_mask_channel = channel;
+  }
+  if (auto reference = graph.LinkOf(vace, "reference_image"))
+    task.reference_images.push_back(
+        ImageFile(graph, vace, "reference_image", *reference));
+  // Prompts and sampling.
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "CLIPTextEncode")
+    throw NodeFailure(sampler, "unsupported_link",
+                      "Wan positive conditioning must come from "
+                      "CLIPTextEncode");
+  task.prompt = graph.Str(positive.encoder, "text");
+  task.negative_prompt =
+      ClipText(graph, FollowConditioning(graph, sampler, "negative"));
+  task.steps = static_cast<int>(graph.Num(sampler, "steps"));
+  if (task.steps < 1 || task.steps > 50)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.1-vace-14b takes 1..50 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  const double cfg = graph.Num(sampler, "cfg", 1.0);
+  if (cfg < 1.0 || cfg > 20.0)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.1-vace-14b takes cfg 1..20");
+  if (cfg != 1.0)
+    task.guidance = cfg;
+  const std::string sampler_name = graph.Str(sampler, "sampler_name", "lcm");
+  task.vace_sampler = sampler_name == "lcm" ? "lcm" : "euler";
+  if (sampler_name != "lcm" && sampler_name != "euler")
+    warnings->push_back("node " + sampler + ": sampler " + sampler_name +
+                        " runs as euler on gufo wan2.1-vace-14b");
+  const std::string scheduler = graph.Str(sampler, "scheduler", "simple");
+  if (scheduler != "simple" && scheduler != "normal")
+    warnings->push_back("node " + sampler + ": scheduler " + scheduler +
+                        " runs as gufo's shifted linear (simple) schedule");
+  if (graph.Num(sampler, "denoise", 1.0) != 1.0)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.1-vace-14b samples with denoise 1");
+  const ModelChain chain = FollowModel(graph, sampler);
+  if (!chain.uni3c.empty())
+    throw NodeFailure(chain.uni3c, "unsupported_link",
+                      "Uni3C does not combine with VACE in gufo");
+  task.vace_lora = !chain.loras.empty();
+  for (const auto& [name, lora_strength] : chain.loras) {
+    const std::string lower = Lower(name);
+    if (lower.find("lightx2v") == std::string::npos &&
+        lower.find("distill") == std::string::npos &&
+        lower.find("causvid") == std::string::npos)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "gufo wan2.1-vace-14b has its step-distill LoRA "
+                        "(lightx2v) built in and takes no other LoRA, not " +
+                            name);
+    if (lower.find("lightx2v") == std::string::npos || lora_strength != 1.0)
+      warnings->push_back("node " + sampler + ": LoRA " + name +
+                          " runs as gufo's built-in lightx2v T2V LoRA at "
+                          "strength 1");
+  }
+  // ModelSamplingSD3 shift on the model path -> gufo.vace.shift.
+  Link link = graph.RequireLink(sampler, "model");
+  for (int guard = 0; guard < 64; ++guard) {
+    const std::string cls = graph.Class(link.node);
+    if (cls == "ModelSamplingSD3") {
+      task.vace_shift = graph.Num(link.node, "shift", 8.0);
+      if (*task.vace_shift < 1.0 || *task.vace_shift > 20.0)
+        throw NodeFailure(link.node, "unsupported_value",
+                          "gufo wan2.1-vace-14b takes shift 1..20");
+      break;
+    }
+    if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple")
+      break;
+    link = graph.RequireLink(link.node, "model");
+  }
+  return task;
+}
+
 OutputKind KindOf(std::string_view class_type) {
   if (class_type == "SaveAudio" || class_type == "PreviewAudio")
     return OutputKind::kAudio;
@@ -1296,7 +1482,10 @@ Delivery DeliveryOf(const Graph& graph, const std::string& id,
                         "ImageUpscaleWithModel on a video");
     return delivery;
   }
-  const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+  const int base = video->family == VideoFamily::kCamera ||
+                           video->family == VideoFamily::kVace
+                       ? 16
+                       : 24;
   if (!rife.empty()) {
     if (rife.size() > 1)
       throw NodeFailure(rife.back(), "unsupported_link",
@@ -1514,6 +1703,32 @@ json::Value VideoRequestBody(const VideoTask& task) {
       camera["ease"] = task.camera->ease;
       gufo["camera"] = std::move(camera);
     }
+  } else if (task.family == VideoFamily::kVace) {
+    // 16 fps like the camera family. The executor adds control_video, mask
+    // and reference_images to gufo.vace.
+    body["size"] =
+        std::to_string(task.width) + "x" + std::to_string(task.height);
+    body["seconds"] = (task.frames - 1) / 16.0;
+    gufo["frames"] = task.frames;
+    if (task.guidance)
+      gufo["guidance"] = *task.guidance;
+    if (!task.negative_prompt.empty())
+      gufo["negative_prompt"] = task.negative_prompt;
+    json::Value vace = json::Value::object();
+    if (task.vace_strength)
+      vace["strength"] = *task.vace_strength;
+    if (task.vace_mask) {
+      vace["mask_channel"] = task.vace_mask_channel;
+      if (task.vace_invert_mask)
+        vace["invert_mask"] = true;
+    }
+    if (!task.vace_sampler.empty())
+      vace["sampler"] = task.vace_sampler;
+    if (task.vace_shift)
+      vace["shift"] = *task.vace_shift;
+    if (!task.vace_lora)
+      vace["lora"] = false;
+    gufo["vace"] = std::move(vace);
   } else {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
@@ -1809,6 +2024,9 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
                    latent_class == "WanCameraImageToVideo")
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
+          else if (latent_class == "WanVaceToVideo")
+            task.spec = BuildVace(graph, generator, models, latent,
+                                  &plan->warnings);
           else if (latent_class == "EmptyAceStep1.5LatentAudio")
             task.spec = BuildMusic(graph, generator, models, latent,
                                    &plan->warnings);
@@ -1849,7 +2067,10 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
           video->fps_num = delivery.fps_num;
           video->fps_den = delivery.fps_den;
           video->upscale = delivery.upscale;
-          const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+          const int base = video->family == VideoFamily::kCamera ||
+                           video->family == VideoFamily::kVace
+                       ? 16
+                       : 24;
           video->fps = delivery.fps_num > 0
                            ? static_cast<int>(std::lround(
                                  static_cast<double>(delivery.fps_num) /

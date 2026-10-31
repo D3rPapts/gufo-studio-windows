@@ -1505,16 +1505,20 @@ int RunServe(std::span<const char* const> args) {
     }
 
     // A Diffusers WanPipeline directory selects Wan 2.2 TI2V-5B, a camera
-    // bundle (gufo-camera.json) Wan 2.1 I2V + Uni3C; anything else is
-    // validated as MiniMax H3.
-    const bool wan21 = server::IsWan21CameraDirectory(video_model);
-    const bool wan22 = !wan21 && server::IsWan22ModelDirectory(video_model);
+    // bundle (gufo-camera.json) Wan 2.1 I2V + Uni3C, a VACE bundle
+    // (gufo-vace.json) Wan 2.1 VACE 14B; anything else is validated as
+    // MiniMax H3.
+    const bool vace = server::IsWan21VaceDirectory(video_model);
+    const bool wan21 = !vace && server::IsWan21CameraDirectory(video_model);
+    const bool wan22 =
+        !vace && !wan21 && server::IsWan22ModelDirectory(video_model);
     if (validate_only)
       return 0;
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
-            .family = wan21   ? server::VideoModelFamily::kWan21Uni3C
+            .family = vace    ? server::VideoModelFamily::kWan21Vace
+                      : wan21 ? server::VideoModelFamily::kWan21Uni3C
                       : wan22 ? server::VideoModelFamily::kWan22
                               : server::VideoModelFamily::kMinimaxH3,
             .model_id = {},
@@ -1533,12 +1537,13 @@ int RunServe(std::span<const char* const> args) {
             .interpolator = std::move(video_interpolator),
             .upscaler = std::move(video_upscaler),
             .upscale_models = std::move(video_upscale_names),
-            .recycle_rows = wan22 ? 0 : video_recycle_rows,
+            .recycle_rows = wan22 || vace ? 0 : video_recycle_rows,
             .recycle = RecycleVideoWorker,
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling "
-                << (wan21   ? "Wan 2.1 camera"
+                << (vace    ? "Wan 2.1 VACE"
+                    : wan21 ? "Wan 2.1 camera"
                     : wan22 ? "Wan 2.2"
                             : "MiniMax H3")
                 << " video service: " << video_jobs->initialization_error()
