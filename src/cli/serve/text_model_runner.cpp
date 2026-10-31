@@ -16,6 +16,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "src/core/ttft_trace.hpp"
 
 namespace gufo::server {
 
@@ -1537,9 +1538,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner prefill budget must be at least one token");
   }
 
+  const bool trace = ttft::TraceEnabled();
+  const auto trace_start = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
+  const auto trace_offset = impl_->prefill_offset;
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
   // Direct callers join any capture before mutating its borrowed state.
   impl_->CapturePromptSnapshot();
+  const auto trace_join = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   const auto snapshot_position = impl_->snapshot_tokens.size();
   while (!impl_->boundaries.empty() &&
          impl_->boundaries.front() <= impl_->prefill_offset) {
@@ -1628,7 +1633,9 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     state.SetCancellationCheck({});
   // Fallback captures and admission must finish before pinning starts. The
   // chunk's GPU work can overlap preparation; cached decode never calls it.
+  const auto trace_reserve = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   impl_->lease.PreparePrefill(std::min(remaining, max_input_tokens));
+  const auto trace_prepare = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   // The following step starts at this frontier and stops at the next one, so
   // a runner may read its inputs during this step.
   auto lookahead_end = impl_->prompt.size();
@@ -1652,6 +1659,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
                     max_input_tokens, snapshot_position, &captured, capture)
               : impl_->runner->Prefill(state, model_prompt,
                                        impl_->prefill_offset, max_input_tokens);
+  const auto trace_run = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   if (step.interrupted) {
     if (!capabilities.prefill_rollback || step.consumed_tokens ||
         step.decode_ready || !impl_->cancelled || !impl_->cancelled() ||
@@ -1709,6 +1717,20 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
                                    shared_with_peers
                                        ? SnapshotPurpose::kBranchPoint
                                        : SnapshotPurpose::kHistory);
+  if (trace) {
+    const auto end = ttft::Clock::now();
+    std::fprintf(stderr,
+                 "ttft-trace runner offset=%zu consumed=%zu in_pass=%d "
+                 "join_ms=%.1f reserve_ms=%.1f prepare_ms=%.1f run_ms=%.1f "
+                 "after_ms=%.1f total_ms=%.1f\n",
+                 trace_offset, step.consumed_tokens, in_pass ? 1 : 0,
+                 ttft::MsBetween(trace_start, trace_join),
+                 ttft::MsBetween(trace_join, trace_reserve),
+                 ttft::MsBetween(trace_reserve, trace_prepare),
+                 ttft::MsBetween(trace_prepare, trace_run),
+                 ttft::MsBetween(trace_run, end),
+                 ttft::MsBetween(trace_start, end));
+  }
   return step;
 }
 

@@ -1,5 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/core/ttft_trace.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -133,6 +134,8 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
 }
 
 void QwenGpuExecutor::Reset() noexcept {
+  const bool trace = ttft::TraceEnabled();
+  const auto trace_start = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   try {
     if (continuation_hooks_)
       continuation_hooks_->BeforeReset();
@@ -148,15 +151,26 @@ void QwenGpuExecutor::Reset() noexcept {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  const auto trace_hooks = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   try {
     arena_.Reset();
+    if (trace)
+      (void)hipStreamSynchronize(arena_.stream);
     if (continuation_hooks_)
       continuation_hooks_->AfterReset();
     reset_failure_ = nullptr;
   } catch (...) {
     reset_failure_ = std::current_exception();
   }
+  const auto trace_arena = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   graph_executor_.Reset();
+  if (trace)
+    std::fprintf(stderr,
+                 "ttft-trace target-reset before_hooks_ms=%.1f arena_ms=%.1f "
+                 "graph_ms=%.1f\n",
+                 ttft::MsBetween(trace_start, trace_hooks),
+                 ttft::MsBetween(trace_hooks, trace_arena),
+                 ttft::MsBetween(trace_arena, ttft::Clock::now()));
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(

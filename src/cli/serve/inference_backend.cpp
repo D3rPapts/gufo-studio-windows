@@ -1,4 +1,5 @@
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/core/ttft_trace.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1305,9 +1306,15 @@ public:
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
     auto& qwen = RequireQwenState(state);
+    const bool trace = ttft::TraceEnabled();
+    const auto trace_start =
+        trace ? ttft::Clock::now() : ttft::Clock::time_point{};
     // Keep the entry recurrence pinned so cancellation can stop between
     // layers without discarding already completed prompt work.
     auto activity = qwen.BeginPrefill();
+    if (trace)
+      std::fprintf(stderr, "ttft-trace begin-prefill offset=%zu ms=%.1f\n",
+                   offset, ttft::MsBetween(trace_start, ttft::Clock::now()));
     try {
       if (offset != qwen.position()) {
         throw std::logic_error(

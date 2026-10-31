@@ -10,10 +10,12 @@
 #include <utility>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/ttft_trace.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/kernels/copy_27b.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::hip {
@@ -1134,16 +1136,38 @@ void QwenGpuArena::Reset() {
   // Attention only reads positions through the current token. Prefill/decode
   // writes those rows before use; clearing reserved future KV adds O(capacity)
   // work to every short conversation and snapshot restore.
-  if (d_ssm_conv_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(d_ssm_conv_state, 0, total_conv * sizeof(float),
-                             stream));
-  }
-  if (d_ssm_deltanet_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(
-        d_ssm_deltanet_state, 0,
-        total_deltanet *
-            QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
-        stream));
+  const bool trace = ttft::TraceEnabled();
+  if (trace)
+    (void)hipStreamSynchronize(stream);
+  const auto trace_start = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
+  const std::size_t conv_bytes = total_conv * sizeof(float);
+  const std::size_t deltanet_bytes =
+      total_deltanet *
+      QwenRecurrentStateElementBytes(policy_.recurrent_state_storage);
+  const auto zero = [&](void* buffer, std::size_t bytes) {
+#ifdef _WIN32
+    if (qwen27::Zero27On()) {
+      LaunchDeviceZero27(buffer, bytes, stream);
+      return;
+    }
+#endif
+    HIP_CHECK(hipMemsetAsync(buffer, 0, bytes, stream));
+  };
+  if (d_ssm_conv_state != nullptr)
+    zero(d_ssm_conv_state, conv_bytes);
+  if (d_ssm_deltanet_state != nullptr)
+    zero(d_ssm_deltanet_state, deltanet_bytes);
+  if (trace) {
+    (void)hipStreamSynchronize(stream);
+    std::fprintf(stderr,
+                 "ttft-trace arena-reset bytes=%zu kernel=%d ms=%.1f\n",
+                 conv_bytes + deltanet_bytes,
+#ifdef _WIN32
+                 qwen27::Zero27On() ? 1 : 0,
+#else
+                 0,
+#endif
+                 ttft::MsBetween(trace_start, ttft::Clock::now()));
   }
   DisableSsmReplayCapture();
   saved_context_ = 0;

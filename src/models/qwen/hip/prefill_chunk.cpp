@@ -5,6 +5,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/ttft_trace.hpp"
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -71,6 +72,29 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   if (batch_size > arena_.GetMaxBatch()) {
     throw std::length_error("prompt chunk exceeds the GPU batch length");
   }
+  // GUFO_TTFT_TRACE: host time to enqueue the layer stack (including the
+  // cancellation backpressure waits) and the remaining wait for the GPU.
+  struct ChunkTrace {
+    bool on;
+    std::uint32_t start_pos;
+    std::size_t batch;
+    ttft::Clock::time_point begin{};
+    ttft::Clock::time_point layers{};
+    ~ChunkTrace() {
+      if (!on)
+        return;
+      const auto end = ttft::Clock::now();
+      if (layers == ttft::Clock::time_point{})
+        layers = end;
+      std::fprintf(stderr,
+                   "ttft-trace chunk start=%u tokens=%zu enqueue_ms=%.1f "
+                   "tail_ms=%.1f total_ms=%.1f\n",
+                   start_pos, batch, ttft::MsBetween(begin, layers),
+                   ttft::MsBetween(layers, end), ttft::MsBetween(begin, end));
+    }
+  } chunk_trace{ttft::TraceEnabled(), start_pos, batch_size,
+                ttft::TraceEnabled() ? ttft::Clock::now()
+                                     : ttft::Clock::time_point{}};
   models::qwen::ContinuationWrite write(
       continuation_hooks_, start_pos,
       start_pos + static_cast<std::uint32_t>(batch_size));
@@ -658,6 +682,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
   }
 
+  if (chunk_trace.on)
+    chunk_trace.layers = ttft::Clock::now();
   if (capture_prompt_hidden_) {
     if (target_layer_count == 0) {
       const std::size_t old_size = h_prompt_hidden_.Size();

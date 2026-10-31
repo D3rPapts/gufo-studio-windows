@@ -12,7 +12,12 @@
 #include <string_view>
 #include <type_traits>
 
+#include <hip/hip_runtime.h>
+
+#include <cstdio>
+
 #include "src/core/sampling.hpp"
+#include "src/core/ttft_trace.hpp"
 
 namespace gufo::speculative {
 namespace {
@@ -1508,8 +1513,17 @@ tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
   target_executor_->SetPromptHiddenCapture(
       capture, capture ? draft_backend_->TargetHiddenLayerIds()
                        : std::span<const std::uint32_t>{});
+  const bool trace = ttft::TraceEnabled();
+  if (trace)
+    (void)hipDeviceSynchronize();
+  const auto trace_start =
+      trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   const auto next =
       target_executor_->ForwardPromptSuffix(tokens, position, compute_logits);
+  if (trace)
+    (void)hipDeviceSynchronize();
+  const auto trace_target =
+      trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   if (capture) {
     const auto hidden = target_executor_->GetPromptHiddenStates();
     if (hidden.empty() || hidden.size() % tokens.size() != 0 ||
@@ -1522,6 +1536,14 @@ tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
       throw std::runtime_error("draft failed to append target prompt features");
     }
   }
+  if (trace) {
+    (void)hipDeviceSynchronize();
+    std::fprintf(stderr,
+                 "ttft-trace extend position=%u tokens=%zu target_ms=%.1f "
+                 "draft_ms=%.1f\n",
+                 position, tokens.size(), ttft::MsBetween(trace_start, trace_target),
+                 ttft::MsBetween(trace_target, ttft::Clock::now()));
+  }
   return next;
 }
 
@@ -1530,8 +1552,28 @@ tokenization::TokenId SpeculativeVerifier::Prime(
   if (prompt_tokens.empty()) {
     throw std::invalid_argument("speculative prompt must not be empty");
   }
+  // GUFO_TTFT_TRACE: synchronize between the parts to attribute GPU time.
+  const bool trace = ttft::TraceEnabled();
+  const auto mark = [&] {
+    if (!trace)
+      return ttft::Clock::time_point{};
+    (void)hipDeviceSynchronize();
+    return ttft::Clock::now();
+  };
+  const auto trace_entry =
+      trace ? ttft::Clock::now() : ttft::Clock::time_point{};
+  const auto trace_start = mark();
   Reset();
+  const auto trace_draft_reset = mark();
   target_executor_->Reset();
+  const auto trace_reset = mark();
+  if (trace)
+    std::fprintf(stderr,
+                 "ttft-trace prime-reset presync_ms=%.1f draft_reset_ms=%.1f "
+                 "target_reset_ms=%.1f\n",
+                 ttft::MsBetween(trace_entry, trace_start),
+                 ttft::MsBetween(trace_start, trace_draft_reset),
+                 ttft::MsBetween(trace_draft_reset, trace_reset));
 
   const bool capture_hidden =
       draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
@@ -1541,6 +1583,7 @@ tokenization::TokenId SpeculativeVerifier::Prime(
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
   const tokenization::TokenId first_token =
       target_executor_->ForwardPromptSuffix(prompt_tokens, 0, compute_logits);
+  const auto trace_target = mark();
   if (capture_hidden) {
     const auto prompt_hidden = target_executor_->GetPromptHiddenStates();
     if (prompt_hidden.empty() ||
@@ -1557,6 +1600,15 @@ tokenization::TokenId SpeculativeVerifier::Prime(
     if (!draft_backend_->PrimeTargetContext(context)) {
       throw std::runtime_error("draft backend failed to prime target context");
     }
+  }
+  if (trace) {
+    const auto end = mark();
+    std::fprintf(stderr,
+                 "ttft-trace prime tokens=%zu reset_ms=%.1f target_ms=%.1f "
+                 "draft_ms=%.1f\n",
+                 prompt_tokens.size(), ttft::MsBetween(trace_start, trace_reset),
+                 ttft::MsBetween(trace_reset, trace_target),
+                 ttft::MsBetween(trace_target, end));
   }
   return first_token;
 }

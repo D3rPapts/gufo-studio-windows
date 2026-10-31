@@ -60,6 +60,10 @@ enum class Phase : std::uint8_t {
   static const bool on = SwitchOn("GUFO_QWEN27_COPY27");
   return on;
 }
+[[nodiscard]] inline bool Zero27On() {
+  static const bool on = SwitchOn("GUFO_QWEN27_ZERO27");
+  return on;
+}
 [[nodiscard]] inline bool Attn27On() {
   static const bool on = SwitchOn("GUFO_QWEN27_ATTN27");
   return on;
