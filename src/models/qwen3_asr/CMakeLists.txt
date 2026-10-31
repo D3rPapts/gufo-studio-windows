@@ -7,6 +7,7 @@ add_library(gufo_qwen3_asr STATIC
   hip/transcription_runtime.cpp
   loader.cpp
   prompt.cpp
+  subtitles.cpp
   tensor.cpp
   tokenizer.cpp
 )
@@ -60,6 +61,13 @@ function(gufo_qwen3_asr_register_tests)
   set_tests_properties(qwen3_asr_prompt_test PROPERTIES
     LABELS "cpu;models;qwen3-asr;tokenizer;prompt;quality;external-model"
     SKIP_RETURN_CODE 77)
+
+  add_executable(qwen3_asr_subtitles_test
+    ${PROJECT_SOURCE_DIR}/src/models/qwen3_asr/tests/subtitles_test.cpp)
+  target_link_libraries(qwen3_asr_subtitles_test PRIVATE gufo_qwen3_asr)
+  add_test(NAME qwen3_asr_subtitles_test COMMAND qwen3_asr_subtitles_test)
+  set_tests_properties(qwen3_asr_subtitles_test PROPERTIES
+    LABELS "cpu;models;qwen3-asr;subtitles;quality")
 
   add_executable(qwen3_asr_audio_api_test
     ${PROJECT_SOURCE_DIR}/src/models/qwen3_asr/tests/audio_api_test.cpp

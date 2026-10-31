@@ -752,10 +752,17 @@ Qwen3-ASR serving uses its own model process:
 
 `POST /v1/audio/transcriptions` accepts OpenAI-compatible multipart fields
 `file`, `model`, `language`, `prompt`, `response_format`, `temperature`, and
-`max_tokens`, and `stream`. The native route is deterministic (`temperature=0`)
-and supports `json`, `text`, and `verbose_json`. `stream=true` with JSON emits
-OpenAI transcript delta/done events. Long uploads are split within model
-capacity; `max_tokens` applies per chunk. Timestamp requests are rejected.
+`max_tokens`, `stream`, and `timestamp_granularities[]`. The native route is
+deterministic (`temperature=0`) and supports `json`, `text`, `srt`, `vtt`, and
+`verbose_json`. `stream=true` with JSON emits OpenAI transcript delta/done
+events. Long uploads are split within model capacity; `max_tokens` applies per
+chunk. Qwen3-ASR produces no timestamps, so `srt`, `vtt`, and `verbose_json`
+first cut the audio at measured pauses and transcribe each speech segment on
+its own; cue and segment times are those measured boundaries
+(`X-Gufo-ASR-Timestamps: vad-segments`), see
+[subtitles](models/qwen3-asr/README.md#subtitles). Only
+`timestamp_granularities[]=segment` with `verbose_json` is accepted; word
+timestamps are rejected.
 
 `GET /v1/realtime?intent=transcription` upgrades to OpenAI's manual-commit
 transcription WebSocket interface. [ASR streaming examples](models/qwen3-asr/README.md#streaming)
