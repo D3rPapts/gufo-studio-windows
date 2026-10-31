@@ -726,6 +726,13 @@ if (BUILD_TESTING)
       TIMEOUT 30)
   endif()
 
+  # Portable (Winsock or POSIX through net.hpp, threads only).
+  add_executable(router_proxy_remote_test tests/cli/router_proxy_remote_test.cpp)
+  target_link_libraries(router_proxy_remote_test PRIVATE gufo_http)
+  add_test(NAME router_proxy_remote_test COMMAND router_proxy_remote_test)
+  set_tests_properties(router_proxy_remote_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
   add_executable(router_jobs_test tests/cli/router_jobs_test.cpp)
   target_link_libraries(router_jobs_test PRIVATE gufo_http)
   add_test(NAME router_jobs_test COMMAND router_jobs_test)

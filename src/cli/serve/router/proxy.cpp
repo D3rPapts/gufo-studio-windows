@@ -3,6 +3,7 @@
 #include "src/core/platform/net.hpp"
 
 #ifndef _WIN32
+#include <sys/select.h>
 #include <sys/time.h>
 #endif
 
@@ -103,6 +104,84 @@ HttpResponse UpstreamUnavailable(std::string_view detail) {
   return response;
 }
 
+/// TCP keepalive: probes after 30 s of silence, every 5 s, 4 misses end
+/// the connection (a dead remote link fails in about a minute instead of
+/// never). Best effort; options the platform lacks are skipped.
+void EnableKeepalive(net::Socket socket) {
+  const int on = 1;
+  (void)::setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE,
+                     reinterpret_cast<const char*>(&on), sizeof(on));
+#if defined(TCP_KEEPIDLE)
+  const int idle = 30;
+  (void)::setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE,
+                     reinterpret_cast<const char*>(&idle), sizeof(idle));
+#endif
+#if defined(TCP_KEEPINTVL)
+  const int interval = 5;
+  (void)::setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL,
+                     reinterpret_cast<const char*>(&interval),
+                     sizeof(interval));
+#endif
+#if defined(TCP_KEEPCNT)
+  const int count = 4;
+  (void)::setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT,
+                     reinterpret_cast<const char*>(&count), sizeof(count));
+#endif
+}
+
+/// connect() bounded by `timeout`: non-blocking connect, wait until the
+/// socket is writable (or failed), then back to blocking mode. Returns 0 or
+/// the socket error; ETIMEDOUT/WSAETIMEDOUT when the bound passed.
+int ConnectWithTimeout(net::Socket socket, const sockaddr* address,
+                       net::SocklenT length, Milliseconds timeout) {
+  if (!net::SetNonBlocking(socket)) {
+    return net::LastSocketError();
+  }
+  if (::connect(socket, address, length) != 0) {
+    const int started = net::LastSocketError();
+#ifdef _WIN32
+    if (started != WSAEWOULDBLOCK) {
+      return started;
+    }
+#else
+    if (started != EINPROGRESS && started != EINTR) {
+      return started;
+    }
+#endif
+    fd_set writable;
+    fd_set failed;
+    FD_ZERO(&writable);
+    FD_ZERO(&failed);
+    FD_SET(socket, &writable);
+    FD_SET(socket, &failed);
+    timeval wait{static_cast<long>(timeout.count() / 1000),
+                 static_cast<long>((timeout.count() % 1000) * 1000)};
+    // Winsock reports a refused non-blocking connect in the except set.
+    const int ready = ::select(static_cast<int>(socket) + 1, nullptr,
+                               &writable, &failed, &wait);
+    if (ready == 0) {
+#ifdef _WIN32
+      return WSAETIMEDOUT;
+#else
+      return ETIMEDOUT;
+#endif
+    }
+    if (ready < 0) {
+      return net::LastSocketError();
+    }
+    int socket_error = 0;
+    net::SocklenT size = sizeof(socket_error);
+    if (::getsockopt(socket, SOL_SOCKET, SO_ERROR,
+                     reinterpret_cast<char*>(&socket_error), &size) != 0) {
+      return net::LastSocketError();
+    }
+    if (socket_error != 0) {
+      return socket_error;
+    }
+  }
+  return net::SetBlocking(socket) ? 0 : net::LastSocketError();
+}
+
 int ConnectTo(const UpstreamTarget& target, std::string* error) {
   addrinfo hints{};
   hints.ai_family = AF_INET;
@@ -116,23 +195,44 @@ int ConnectTo(const UpstreamTarget& target, std::string* error) {
     return -1;
   }
   int fd = -1;
+  int connect_error = 0;
   for (addrinfo* info = results; info != nullptr; info = info->ai_next) {
     const net::Socket socket = net::CreateStreamSocket(info->ai_family);
     if (socket == net::kInvalidSocket) {
       continue;
     }
-    if (::connect(socket, info->ai_addr,
-                  static_cast<net::SocklenT>(info->ai_addrlen)) == 0) {
+    if (target.keepalive) {
+      EnableKeepalive(socket);
+    }
+    if (target.connect_timeout.count() > 0) {
+      connect_error = ConnectWithTimeout(
+          socket, info->ai_addr, static_cast<net::SocklenT>(info->ai_addrlen),
+          target.connect_timeout);
+      if (connect_error == 0) {
+        fd = static_cast<int>(socket);
+        break;
+      }
+    } else if (::connect(socket, info->ai_addr,
+                         static_cast<net::SocklenT>(info->ai_addrlen)) == 0) {
       fd = static_cast<int>(socket);
       break;
+    } else {
+      connect_error = net::LastSocketError();
     }
     net::CloseSocket(socket);
   }
-  const int connect_error = net::LastSocketError();
   ::freeaddrinfo(results);
   if (fd < 0) {
-    *error = "connect failed (socket error " + std::to_string(connect_error) +
-             ")";
+#ifdef _WIN32
+    const bool timed_out = connect_error == WSAETIMEDOUT;
+#else
+    const bool timed_out = connect_error == ETIMEDOUT;
+#endif
+    *error = timed_out && target.connect_timeout.count() > 0
+                 ? "connect timed out after " +
+                       std::to_string(target.connect_timeout.count()) + " ms"
+                 : "connect failed (socket error " +
+                       std::to_string(connect_error) + ")";
   }
   return fd;
 }
@@ -163,12 +263,21 @@ std::string BuildUpstreamRequest(const UpstreamTarget& target,
   }
   out += " HTTP/1.1\r\n";
   for (const auto& [name, value] : request.headers) {
-    if (!IsDroppedRequestHeader(name)) {
+    const bool replaced = std::any_of(
+        target.extra_headers.begin(), target.extra_headers.end(),
+        [&name](const auto& extra) { return IEquals(extra.first, name); });
+    if (!IsDroppedRequestHeader(name) && !replaced) {
       out += name;
       out += ": ";
       out += value;
       out += "\r\n";
     }
+  }
+  for (const auto& [name, value] : target.extra_headers) {
+    out += name;
+    out += ": ";
+    out += value;
+    out += "\r\n";
   }
   out += "Host: " + target.host + ":" + std::to_string(target.port) + "\r\n";
   out += "Connection: close\r\n";
@@ -224,18 +333,22 @@ struct UpstreamHead {
 };
 
 /// Read status line + headers. Returns false on EOF before headers, a client
-/// that went away while waiting, or a malformed head. There is no deadline:
-/// the worker's own request limits end a stuck request, and its exit closes
-/// the connection.
+/// that went away while waiting, a passed `head_timeout` or a malformed head.
+/// Without `head_timeout` there is no deadline: the worker's own request
+/// limits end a stuck request, and its exit closes the connection.
 bool ReadHead(int fd, const gufo::server::HttpRequest& front,
-              UpstreamHead* head, std::string* error) {
+              Milliseconds head_timeout, UpstreamHead* head,
+              std::string* error) {
+  const auto deadline = std::chrono::steady_clock::now() + head_timeout;
   std::string data;
   std::size_t header_end = std::string::npos;
   char buffer[4096];
   while (header_end == std::string::npos) {
     bool timed_out = false;
-    const auto count =
-        Receive(fd, kHeadPollInterval, buffer, sizeof(buffer), &timed_out);
+    const Milliseconds slice =
+        head_timeout.count() > 0 ? std::min(kHeadPollInterval, head_timeout)
+                                 : kHeadPollInterval;
+    const auto count = Receive(fd, slice, buffer, sizeof(buffer), &timed_out);
     if (count == 0) {
       *error = "connection closed before headers";
       return false;
@@ -243,6 +356,12 @@ bool ReadHead(int fd, const gufo::server::HttpRequest& front,
     if (count < 0 && timed_out) {
       if (front.is_cancelled && front.is_cancelled()) {
         *error = "client disconnected while waiting for the worker";
+        return false;
+      }
+      if (head_timeout.count() > 0 &&
+          std::chrono::steady_clock::now() >= deadline) {
+        *error = "no response head within " +
+                 std::to_string(head_timeout.count()) + " ms";
         return false;
       }
       continue;
@@ -490,7 +609,7 @@ gufo::server::HttpResponse ProxyToWorker(
     return UpstreamUnavailable("failed to forward request");
   }
   UpstreamHead head;
-  if (!ReadHead(fd, request, &head, &error)) {
+  if (!ReadHead(fd, request, target.head_timeout, &head, &error)) {
     return UpstreamUnavailable(error);
   }
 
