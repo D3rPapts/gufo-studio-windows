@@ -31,6 +31,7 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
+#include "src/models/rife/video_io.hpp"
 
 namespace gufo::server {
 
@@ -387,7 +388,7 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "prompt") {
     return scaled(3, 9);
   }
-  if (phase == "keyframes") {
+  if (phase == "keyframes" || phase == "guide_clips") {
     return scaled(9, 10);
   }
   if (phase == "denoiser") {
@@ -406,6 +407,76 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
     return scaled(98, 99);
   }
   return 1;
+}
+
+// Decodes uploaded MiniMax H3 guide clips (MP4) with FFmpeg from the job
+// directory into RGB8 frame sets. At most `max_frames` frames are kept: the
+// reference anchors only the first 17k + 5 frames, and a clip longer than the
+// video cannot fit anyway. The upload bytes are released on the way.
+bool DecodeH3GuideVideos(const std::filesystem::path& directory,
+                         std::vector<VideoGuideUpload>* uploads,
+                         int max_frames,
+                         std::vector<minimax_h3::GenerationVideoGuide>* guides,
+                         std::string* error) {
+  for (std::size_t index = 0; index < uploads->size(); ++index) {
+    VideoGuideUpload& upload = (*uploads)[index];
+    const std::filesystem::path path =
+        directory / ("guide_clip_" + std::to_string(index) + ".mp4");
+    {
+      std::ofstream file(path, std::ios::binary);
+      file.write(reinterpret_cast<const char*>(upload.mp4.data()),
+                 static_cast<std::streamsize>(upload.mp4.size()));
+      if (!file) {
+        *error = "cannot store MiniMax H3 guide clip " + std::to_string(index);
+        return false;
+      }
+    }
+    std::vector<std::uint8_t>().swap(upload.mp4);
+    models::rife::VideoInfo info;
+    if (!models::rife::ProbeVideo(path, &info, error)) {
+      return false;
+    }
+    if (info.width < 16 || info.height < 16 || info.width > 4096 ||
+        info.height > 4096) {
+      *error = "MiniMax H3 guide clip " + std::to_string(index) +
+               " has an unsupported size";
+      return false;
+    }
+    models::rife::FrameReader reader;
+    if (!reader.Open(path, info.width, info.height, error)) {
+      return false;
+    }
+    minimax_h3::GenerationVideoGuide guide;
+    guide.frame = upload.frame;
+    guide.width = info.width;
+    guide.height = info.height;
+    const std::size_t frame_bytes = static_cast<std::size_t>(info.width) *
+                                    static_cast<std::size_t>(info.height) * 3U;
+    std::vector<std::uint8_t> frame(frame_bytes);
+    while (guide.frames < max_frames) {
+      bool end = false;
+      if (!reader.Read(frame.data(), &end, error)) {
+        if (!end) {
+          reader.Close();
+          return false;
+        }
+        error->clear();
+        break;
+      }
+      guide.rgb.insert(guide.rgb.end(), frame.begin(), frame.end());
+      ++guide.frames;
+    }
+    reader.Close();
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    if (guide.frames == 0) {
+      *error = "MiniMax H3 guide clip " + std::to_string(index) +
+               " has no frames";
+      return false;
+    }
+    guides->push_back(std::move(guide));
+  }
+  return true;
 }
 
 }  // namespace
@@ -889,8 +960,14 @@ struct VideoJobService::Impl {
       std::string error;
       bool success = false;
       try {
-        success = options.runner(generation, &job->cancellation, Progress,
-                                 &progress, &telemetry, &error);
+        // MiniMax H3 guide clips are decoded here (FFmpeg) so the model
+        // library stays free of media decoding; a broken clip fails the job.
+        if (DecodeH3GuideVideos(job->directory, &job->request.h3_guide_videos,
+                                job->request.parameters.frames,
+                                &generation.video_guides, &error)) {
+          success = options.runner(generation, &job->cancellation, Progress,
+                                   &progress, &telemetry, &error);
+        }
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -1178,7 +1255,8 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
         height != request.parameters.output_height || !frames ||
         *frames != request.parameters.frames ||
         !ValidateWan21Parameters(request.parameters, nullptr) ||
-        !request.keyframes.empty() || !request.lora.empty() ||
+        !request.keyframes.empty() || !request.h3_guide_videos.empty() ||
+        !request.lora.empty() ||
         request.first_frame.empty() ||
         request.first_frame.size() !=
             static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
@@ -1202,7 +1280,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
         *frames != request.parameters.frames ||
         !ValidateWan22Parameters(request.parameters, nullptr) ||
         !request.keyframes.empty() || !request.audio_guides.empty() ||
-        !request.lora.empty() ||
+        !request.h3_guide_videos.empty() || !request.lora.empty() ||
         request.first_frame.size() !=
             static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
                 static_cast<std::size_t>(
@@ -1221,6 +1299,8 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
               request.output_format != "ppm") ||
              !minimax_h3::ValidateGenerationParameters(request.parameters,
                                                        nullptr) ||
+             request.keyframes.size() + request.h3_guide_videos.size() >
+                 minimax_h3::kH3MaximumKeyframes ||
              !MatchesOutputContract(request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,

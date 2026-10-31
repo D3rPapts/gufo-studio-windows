@@ -251,6 +251,45 @@ bool BuildKeyframeConditioning(const ModelInventory& inventory,
   return true;
 }
 
+bool BuildGuideClipConditioning(const ModelInventory& inventory,
+                                std::span<const KeyframeMoments> moments,
+                                std::uint64_t encode_seed,
+                                std::uint64_t noise_seed,
+                                std::vector<float>* latent,
+                                std::string* error) {
+  if (latent == nullptr || moments.empty()) {
+    SetError(error, "invalid MiniMax H3 guide clip moments");
+    return false;
+  }
+  const int latent_height = moments.front().latent_height;
+  const int latent_width = moments.front().latent_width;
+  const std::size_t plane = static_cast<std::size_t>(latent_height) *
+                            static_cast<std::size_t>(latent_width);
+  const std::size_t time = moments.size();
+  latent->assign(plane * time * static_cast<std::size_t>(kLatentChannels),
+                 0.0F);
+  std::vector<float> frame;
+  for (std::size_t t = 0; t < time; ++t) {
+    if (moments[t].latent_height != latent_height ||
+        moments[t].latent_width != latent_width ||
+        !BuildKeyframeConditioning(inventory, moments[t], encode_seed + t,
+                                   noise_seed + t, &frame, error)) {
+      if (error != nullptr && error->empty()) {
+        *error = "MiniMax H3 guide clip latent frames differ in size";
+      }
+      return false;
+    }
+    for (std::size_t channel = 0;
+         channel < static_cast<std::size_t>(kLatentChannels); ++channel) {
+      std::copy_n(frame.begin() + static_cast<std::ptrdiff_t>(channel * plane),
+                  plane,
+                  latent->begin() + static_cast<std::ptrdiff_t>(
+                                        (channel * time + t) * plane));
+    }
+  }
+  return true;
+}
+
 #if !defined(ENGINE_ENABLE_HIP)
 bool EncodeKeyframeMoments(const ModelInventory&,
                            std::span<const KeyframeImage>,
@@ -258,6 +297,15 @@ bool EncodeKeyframeMoments(const ModelInventory&,
                            std::vector<KeyframeMoments>*,
                            VideoVaeEncoderTelemetry*, std::string* error) {
   SetError(error, "MiniMax H3 keyframe encoding requires ENGINE_ENABLE_HIP");
+  return false;
+}
+
+bool EncodeGuideClipMoments(const ModelInventory&, int, int,
+                            std::span<const std::uint8_t>, int,
+                            const CancellationToken*,
+                            std::vector<KeyframeMoments>*,
+                            VideoVaeEncoderTelemetry*, std::string* error) {
+  SetError(error, "MiniMax H3 guide clip encoding requires ENGINE_ENABLE_HIP");
   return false;
 }
 #endif

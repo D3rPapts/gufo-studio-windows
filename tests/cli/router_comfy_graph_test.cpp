@@ -74,6 +74,27 @@ constexpr const char* kH3 = R"({
  "41": {"class_type": "SaveAudio", "inputs": {"audio": ["33", 0], "filename_prefix": "film/clips/a1_s01_shot01"}}
 })";
 
+// FilmStudio V100 h3_fortsetzung_anker.json (continuation from the last
+// frames and the sound of the previous part), with BasicGuider +
+// SamplerCustomAdvanced already rewritten to the KSampler "12" the adapter
+// turns them into.
+constexpr const char* kH3Anchor = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "strength_model": 1.0, "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+ "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+ "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "prompt": "STYLE\nSHOT 1: The scene continues seamlessly from the anchored opening clip ...", "width": 896, "height": 512, "length": 124}},
+ "12": {"class_type": "KSampler", "inputs": {"model": ["2", 0], "positive": ["7", 0], "latent_image": ["6", 1], "seed": 43, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep", "scheduler": "simple", "denoise": 1.0}},
+ "13": {"class_type": "VAEDecode", "inputs": {"samples": ["12", 0], "vae": ["4", 0]}},
+ "14": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["12", 0], "vae": ["5", 0]}},
+ "15": {"class_type": "SaveImage", "inputs": {"images": ["13", 0], "filename_prefix": "film/video/roh/a1_s02_x05_h3/t1/f"}},
+ "17": {"class_type": "SaveAudio", "inputs": {"audio": ["14", 0], "filename_prefix": "film/video/roh/a1_s02_x05_h3/t1/ton"}},
+ "22": {"class_type": "LoadVideo", "inputs": {"file": "life3_film_a1_s02_x05_h3_anker1.mp4"}},
+ "23": {"class_type": "GetVideoComponents", "inputs": {"video": ["22", 0]}},
+ "7": {"class_type": "MiniMaxH3AddGuide", "inputs": {"positive": ["6", 0], "latent": ["6", 1], "frame_idx": 0, "vae": ["4", 0], "audio_vae": ["5", 0], "image": ["23", 0], "audio": ["23", 1]}}
+})";
+
 constexpr const char* kWan = R"({
  "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default"}},
  "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
@@ -292,6 +313,63 @@ void TestH3Guides() {
              .find("gufo")
              ->find("audio_reference_frame")
              ->as_double() == 0);
+}
+
+void TestH3AnchorClip() {
+  const comfy::Plan plan = PlanOf(kH3Anchor);
+  assert(plan.tasks.size() == 1);
+  const auto& h3 = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(h3.family == comfy::VideoFamily::kH3);
+  assert(h3.width == 896 && h3.height == 512 && h3.frames == 124);
+  assert(h3.seed == 43 && h3.steps == 8 && h3.lora == "turbo");
+  // The frame batch is a guide clip, its soundtrack the audio guide; no
+  // first frame, no single guide images.
+  const comfy::FileRef clip{"life3_film_a1_s02_x05_h3_anker1.mp4", "input"};
+  assert((h3.guide_video == clip));
+  assert(h3.guide_video_frame == 0);
+  assert((h3.audio_reference == clip));
+  assert(h3.audio_reference_from_video);
+  assert(h3.audio_reference_frame == 0);
+  assert(!h3.first_frame && !h3.last_frame && h3.keyframes.empty());
+  const json::Value body = comfy::VideoRequestBody(h3);
+  assert(body.member_str("size") == "896x512");
+  assert(body.find("gufo")->find("frames")->as_double() == 124);
+  assert(body.find("gufo")->find("audio_reference_frame")->as_double() == 0);
+  // The executor adds the clip and the extracted sound itself.
+  assert(body.find("gufo")->find("guide_video") == nullptr);
+  assert(body.find("audio_reference") == nullptr);
+
+  const auto replaced = [](std::string text, const std::string& from,
+                           const std::string& to) {
+    const std::size_t at = text.find(from);
+    assert(at != std::string::npos);
+    text.replace(at, from.size(), to);
+    return text;
+  };
+  // A guide clip at a later frame keeps its frame_idx.
+  const std::string later =
+      replaced(kH3Anchor, "\"frame_idx\": 0", "\"frame_idx\": 17");
+  const comfy::Plan shifted = PlanOf(later.c_str());
+  const auto& moved = std::get<comfy::VideoTask>(shifted.tasks[0].spec);
+  assert(moved.guide_video_frame == 17 && moved.audio_reference_frame == 17);
+
+  // Without the audio link only the picture is anchored.
+  const std::string silent =
+      replaced(kH3Anchor, ", \"audio\": [\"23\", 1]", "");
+  const comfy::Plan quiet = PlanOf(silent.c_str());
+  const auto& mute = std::get<comfy::VideoTask>(quiet.tasks[0].spec);
+  assert(mute.guide_video && !mute.audio_reference);
+
+  // The images come from output 0, the audio from output 1.
+  const std::string swapped = replaced(kH3Anchor, "\"image\": [\"23\", 0]",
+                                       "\"image\": [\"23\", 1]");
+  assert(ErrorOf(swapped).message.find("output 0 of GetVideoComponents") !=
+         std::string::npos);
+  // GetVideoComponents must read a LoadVideo.
+  const std::string loose =
+      replaced(kH3Anchor, "\"LoadVideo\", \"inputs\": {\"file\"",
+               "\"LoadImage\", \"inputs\": {\"image\"");
+  assert(ErrorOf(loose).message.find("LoadVideo") != std::string::npos);
 }
 
 void TestWan() {
@@ -1094,6 +1172,7 @@ int main() {
   TestVoiceClone();
   TestH3();
   TestH3Guides();
+  TestH3AnchorClip();
   TestWan();
   TestUnsupportedNodes();
   TestImageToImage();

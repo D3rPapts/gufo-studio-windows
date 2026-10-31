@@ -95,6 +95,22 @@ struct GenerationAudioGuide {
   AudioWaveform waveform;
 };
 
+/// A guide clip (MiniMaxH3AddGuide with a multi-frame image batch, e.g. the
+/// last frames of the previous part fed through LoadVideo and
+/// GetVideoComponents): decoded RGB8 frames at their own size, frame-major.
+/// As in the reference, generation keeps the first 17k + 5 frames (below 5
+/// frames only the first one, as a single guide image), centre-crops each to
+/// the canvas and encodes them as one causal clip; the clip must end inside
+/// the video. Its soundtrack is a separate GenerationAudioGuide.
+struct GenerationVideoGuide {
+  // Pixel frame of the clip's first frame; negative counts from the end.
+  int frame{0};
+  int width{0};
+  int height{0};
+  int frames{0};
+  std::vector<std::uint8_t> rgb;
+};
+
 struct GenerationRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -109,6 +125,8 @@ struct GenerationRequest {
   std::vector<GenerationKeyframe> keyframes;
   // Audio guides (at most kH3MaximumAudioGuides).
   std::vector<GenerationAudioGuide> audio_guides;
+  // Guide clips; each counts as one of the kH3MaximumKeyframes image guides.
+  std::vector<GenerationVideoGuide> video_guides;
   // Optional transformer LoRA (original/ComfyUI layout), merged at load.
   std::filesystem::path lora_path;
   float lora_strength{1.0F};
@@ -139,6 +157,9 @@ struct GenerationTelemetry {
   double audio_guide_ms{0.0};
   std::size_t audio_guides{0};
   std::size_t audio_guide_frames{0};
+  double guide_clip_ms{0.0};
+  std::size_t guide_clips{0};
+  std::size_t guide_clip_latent_frames{0};
   double vision_ms{0.0};
   std::size_t vision_tokens{0};
   double denoiser_ms{0.0};

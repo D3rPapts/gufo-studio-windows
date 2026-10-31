@@ -102,6 +102,14 @@ struct VideoUpscale {
   [[nodiscard]] bool enabled() const { return width > 0 || height > 0; }
 };
 
+// A MiniMax H3 guide clip as uploaded (MiniMaxH3AddGuide with a frame batch,
+// e.g. LoadVideo -> GetVideoComponents): MP4 bytes anchored at pixel frame
+// `frame` (negative counts from the end). The worker decodes it with FFmpeg.
+struct VideoGuideUpload {
+  int frame{0};
+  std::vector<std::uint8_t> mp4;
+};
+
 struct VideoJobRequest {
   std::string model{"minimax-h3"};
   std::string prompt;
@@ -114,6 +122,8 @@ struct VideoJobRequest {
   std::vector<minimax_h3::GenerationKeyframe> keyframes;
   // Audio guides (decoded 32 kHz stereo), e.g. the voice at frame 0.
   std::vector<minimax_h3::GenerationAudioGuide> audio_guides;
+  // Guide clips (MP4); each counts as one of the eight image guides.
+  std::vector<VideoGuideUpload> h3_guide_videos;
   // Name of a LoRA registered with the service; empty for none.
   std::string lora;
   std::optional<double> lora_strength;

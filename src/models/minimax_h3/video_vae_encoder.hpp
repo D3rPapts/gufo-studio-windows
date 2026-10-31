@@ -51,6 +51,18 @@ struct KeyframeMoments {
                                          VideoVaeEncoderTelemetry* telemetry,
                                          std::string* error = nullptr);
 
+/// Encodes a guide clip (MiniMaxH3AddGuide with a multi-frame image batch):
+/// `frames` = 17k + 5 RGB8 canvases of width x height, frame-major, through
+/// the causal 3D encoder like the reference's encode_temporal (17-frame
+/// chunks, the last padded by repeating its final frame, the last 3 latent
+/// frames of the concatenation dropped). Writes 5k + 2 latent frames of
+/// moments, oldest first. Loads the encoder with all temporal taps.
+[[nodiscard]] bool EncodeGuideClipMoments(
+    const ModelInventory& inventory, int width, int height,
+    std::span<const std::uint8_t> rgb_frames, int frames,
+    const CancellationToken* cancellation, std::vector<KeyframeMoments>* output,
+    VideoVaeEncoderTelemetry* telemetry, std::string* error = nullptr);
+
 /// Turns posterior moments into the conditioning latent of the reference:
 /// sample the posterior under `encode_seed`, round to float16, normalize with
 /// the VAE statistics, then hold the anchor at t = 0.999
@@ -62,6 +74,15 @@ struct KeyframeMoments {
                                              std::uint64_t noise_seed,
                                              std::vector<float>* latent,
                                              std::string* error = nullptr);
+
+/// The conditioning latent of a guide clip: BuildKeyframeConditioning per
+/// latent frame (posterior seed `encode_seed + t`, anchor noise seed
+/// `noise_seed + t`), interleaved channel-major as
+/// [24][latent frames][latent_height][latent_width].
+[[nodiscard]] bool BuildGuideClipConditioning(
+    const ModelInventory& inventory, std::span<const KeyframeMoments> moments,
+    std::uint64_t encode_seed, std::uint64_t noise_seed,
+    std::vector<float>* latent, std::string* error = nullptr);
 
 /// Places an RGB8 image on a width x height canvas: scale to cover, Lanczos-3
 /// resample, center crop (the reference's follower-keyframe arithmetic).

@@ -1856,6 +1856,25 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     SetError(error, "invalid MiniMax H3 denoiser creation arguments");
     return nullptr;
   }
+  if (!conditioning.keyframe_latent_frames.empty() &&
+      conditioning.keyframe_latent_frames.size() !=
+          conditioning.keyframe_frames.size()) {
+    SetError(error, "invalid MiniMax H3 denoiser guide clip arguments");
+    return nullptr;
+  }
+  std::vector<ImageGuidePlacement> image_placements;
+  for (std::size_t index = 0; index < conditioning.keyframe_frames.size();
+       ++index) {
+    const int latent_frames = conditioning.keyframe_latent_frames.empty()
+                                  ? 1
+                                  : conditioning.keyframe_latent_frames[index];
+    // 5k + 2 latent frames come from 17k + 5 pixel frames.
+    const int pixel_frames =
+        latent_frames <= 1 ? 1 : ((latent_frames - 2) / 5) * 17 + 5;
+    image_placements.push_back({.frame = conditioning.keyframe_frames[index],
+                                .latent_frames = latent_frames,
+                                .pixel_frames = pixel_frames});
+  }
   std::vector<AudioGuidePlacement> audio_placements;
   for (const AudioGuideLatent& guide : conditioning.audio_guides) {
     if (guide.latent_frames < 1 ||
@@ -1868,8 +1887,8 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
         {.frame = guide.frame, .latent_frames = guide.latent_frames});
   }
   auto layout =
-      BuildGuideLayout(options.text_rows, options.geometry,
-                       conditioning.keyframe_frames, audio_placements, error);
+      BuildImageGuideLayout(options.text_rows, options.geometry,
+                            image_placements, audio_placements, error);
   auto schedule = BuildServingSchedule(options.evaluations, error);
   if (!layout || !schedule) {
     return nullptr;
@@ -1904,22 +1923,32 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
       kH3VideoLatentChannels *
       static_cast<std::size_t>(options.geometry.latent_height) *
       static_cast<std::size_t>(options.geometry.latent_width);
-  impl->condition_rows_host.resize(conditioning.keyframe_latents.size() *
-                                   keyframe_elements);
-  for (std::size_t index = 0; index < conditioning.keyframe_latents.size();
-       ++index) {
-    const std::vector<float>& latent = conditioning.keyframe_latents[index];
-    if (latent.size() != keyframe_elements ||
-        !PatchifyVideo(
-            latent, kH3VideoLatentChannels, 1, options.geometry.latent_height,
-            options.geometry.latent_width,
-            std::span(impl->condition_rows_host)
-                .subspan(index * keyframe_elements, keyframe_elements),
-            error)) {
-      if (error != nullptr && error->empty()) {
-        *error = "MiniMax H3 keyframe latent differs from the canvas";
+  // Guide clips span several latent frames: [24][latent frames][h][w],
+  // patchified frame by frame like the target video.
+  impl->condition_rows_host.resize(impl->layout.condition_rows *
+                                   kH3VideoPatchWidth);
+  {
+    std::size_t offset = 0;
+    for (std::size_t index = 0; index < conditioning.keyframe_latents.size();
+         ++index) {
+      const std::vector<float>& latent = conditioning.keyframe_latents[index];
+      const int latent_frames = image_placements[index].latent_frames;
+      const std::size_t elements =
+          keyframe_elements * static_cast<std::size_t>(latent_frames);
+      if (latent.size() != elements ||
+          offset + elements > impl->condition_rows_host.size() ||
+          !PatchifyVideo(latent, kH3VideoLatentChannels, latent_frames,
+                         options.geometry.latent_height,
+                         options.geometry.latent_width,
+                         std::span(impl->condition_rows_host)
+                             .subspan(offset, elements),
+                         error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 keyframe latent differs from the canvas";
+        }
+        return nullptr;
       }
-      return nullptr;
+      offset += elements;
     }
   }
   // Audio guide rows in the target audio packing (stereo track major).
