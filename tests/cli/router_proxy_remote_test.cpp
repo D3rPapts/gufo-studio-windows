@@ -1,6 +1,7 @@
-// Proxy options for remote routers (UpstreamTarget connect_timeout,
-// head_timeout, extra_headers, keepalive). Portable: Winsock and POSIX
-// through src/core/platform/net.hpp, threads instead of fork.
+// Remote routers: proxy options (UpstreamTarget connect_timeout,
+// head_timeout, extra_headers, keepalive), the --remote-allow check, GPU
+// slots and the busy-check parser. Portable: Winsock and POSIX through
+// src/core/platform/net.hpp, threads instead of fork.
 
 #include <atomic>
 #include <cassert>
@@ -16,7 +17,10 @@
 #include <vector>
 
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/router/jobs.hpp"
+#include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
+#include "src/cli/serve/router/remote.hpp"
 #include "src/core/platform/net.hpp"
 
 namespace {
@@ -288,6 +292,92 @@ void TestHeadTimeoutDoesNotCutTheBody() {
   assert(Drain(response) == "data: xdata: xdata: x");
 }
 
+void TestRemoteAllowList() {
+  using gufo::router::CheckRemoteAllowed;
+  using gufo::router::RemoteSpec;
+  std::vector<gufo::router::jobs::AllowEntry> allow;
+  std::string error;
+  RemoteSpec spec;
+  assert(gufo::router::ParseRemoteUrl("http://192.168.100.56:8081", false,
+                                      &spec.url, &error));
+  assert(!CheckRemoteAllowed(spec, allow, &error));
+  assert(error.find("--remote-allow") != std::string::npos);
+  for (const char* list : {"192.168.100.56", "192.168.100.56:8081",
+                           "192.168.100.0/24", "10.0.0.1,192.168.100.56:8081",
+                           "*"}) {
+    assert(gufo::router::jobs::ParseAllowList(list, &allow, &error));
+    assert(CheckRemoteAllowed(spec, allow, &error));
+  }
+  for (const char* list : {"192.168.100.57", "192.168.100.56:8085",
+                           "192.168.101.0/24", "studio.local"}) {
+    assert(gufo::router::jobs::ParseAllowList(list, &allow, &error));
+    assert(!CheckRemoteAllowed(spec, allow, &error));
+  }
+  // The busy-check url needs its own allow entry.
+  assert(gufo::router::jobs::ParseAllowList("192.168.100.56:8081", &allow,
+                                            &error));
+  gufo::router::RemoteEndpoint check;
+  assert(gufo::router::ParseRemoteUrl("http://192.168.100.56:8085/queue",
+                                      true, &check, &error));
+  spec.busy_check = check;
+  assert(!CheckRemoteAllowed(spec, allow, &error));
+  assert(error.find("busy-check-url") != std::string::npos);
+}
+
+void TestGpuSlotsSerialAndTimeout() {
+  gufo::router::GpuSlots slots;
+  auto first = slots.Acquire("s", "a", std::chrono::milliseconds(100), {});
+  assert(first != nullptr);
+  // Another slot name is independent.
+  auto other = slots.Acquire("t", "x", std::chrono::milliseconds(100), {});
+  assert(other != nullptr);
+  const auto began = Clock::now();
+  assert(slots.Acquire("s", "b", std::chrono::milliseconds(300), {}) ==
+         nullptr);
+  assert(Clock::now() - began >= std::chrono::milliseconds(280));
+  // A cancelled waiter gives up without the timeout.
+  const auto cancelled_at = Clock::now();
+  assert(slots.Acquire("s", "c", std::chrono::seconds(10),
+                       [] { return true; }) == nullptr);
+  assert(Clock::now() - cancelled_at < std::chrono::seconds(1));
+  // Waiters get the slot in arrival order once it is released.
+  std::vector<int> order;
+  std::mutex order_mutex;
+  std::vector<std::thread> waiters;
+  for (int i = 0; i < 3; ++i) {
+    waiters.emplace_back([&slots, &order, &order_mutex, i] {
+      auto hold = slots.Acquire("s", "w", std::chrono::seconds(10), {});
+      assert(hold != nullptr);
+      {
+        const std::lock_guard<std::mutex> lock(order_mutex);
+        order.push_back(i);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  const auto status = slots.Status();
+  assert(status.find("s")->find("waiting")->as_size() == 3);
+  assert(status.find("s")->find("holder")->str() == "a");
+  first->Release();
+  first->Release();  // idempotent
+  for (auto& waiter : waiters) {
+    waiter.join();
+  }
+  assert((order == std::vector<int>{0, 1, 2}));
+  assert(!slots.Status().find("s")->find("held")->as_bool(true));
+}
+
+void TestBusyCheckParse() {
+  using gufo::router::BusyCheckSaysBusy;
+  assert(!BusyCheckSaysBusy("{\"queue_running\": [], \"queue_pending\": []}"));
+  assert(BusyCheckSaysBusy("{\"queue_running\": [[1, \"x\"]], "
+                           "\"queue_pending\": []}"));
+  assert(BusyCheckSaysBusy("{\"queue_running\": [], \"queue_pending\": [1]}"));
+  assert(!BusyCheckSaysBusy("not json"));
+  assert(!BusyCheckSaysBusy("{\"status\": \"ok\"}"));
+}
+
 }  // namespace
 
 int main() {
@@ -298,6 +388,9 @@ int main() {
   TestConnectTimeoutIsBounded();
   TestHeadTimeout();
   TestHeadTimeoutDoesNotCutTheBody();
+  TestRemoteAllowList();
+  TestGpuSlotsSerialAndTimeout();
+  TestBusyCheckParse();
   std::cout << "All router remote proxy tests passed.\n";
   return 0;
 }
