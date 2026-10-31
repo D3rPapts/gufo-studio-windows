@@ -44,6 +44,7 @@ enum class LatentFormat : std::uint8_t {
   kFlux2Patched,  // MOSS-Image: 32 channels patched 2x2 to 128, 16x
   kWan22,         // 48 channels, 16x, 4x temporal
   kMinimaxH3,     // 24 channels, 16x
+  kWan21,         // 16 channels, 8x, 4x temporal (Wan 2.1 VAE, Uni3C)
 };
 
 struct PreviewRgb {

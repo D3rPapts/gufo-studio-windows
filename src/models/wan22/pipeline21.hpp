@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/preview_hook.hpp"
 #include "src/models/wan22/camera_path.hpp"
 #include "src/models/wan22/vae.hpp"
 
@@ -57,6 +58,9 @@ struct I2V21Telemetry {
   double depth_ms{0}, render_ms{0};
   double scene_depth{0}, fx{0}, metric_scale{0};
   std::vector<double> step_ms;
+  /// Live previews handed out and the time spent forming them.
+  double preview_ms{0};
+  int previews{0};
   std::size_t peak_device_bytes{0};
 };
 
@@ -71,6 +75,10 @@ struct I2V21Callbacks {
   /// The rendered guide video, RGB8 [frames, height, width, 3].
   std::function<void(const std::vector<std::uint8_t>& frames, int count)>
       rendered_guide;
+  /// Live preview: the LCM estimate x0 = x - sigma * v of a step, normalized
+  /// Wan 2.1 latents [16][frames][h][w] (channel-major). Read-only: the
+  /// sampled video is the same with or without it.
+  PreviewHook preview;
 };
 
 /// MoGe-2 + camera path + point render only: the Uni3C guide for

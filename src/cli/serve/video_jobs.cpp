@@ -868,15 +868,20 @@ struct VideoJobService::Impl {
         continue;
       }
       // Live preview under the job id while someone watches it.
+      // Wan 2.1 Uni3C keeps the dense default: its distilled 4-step LCM
+      // schedule would otherwise show a single preview (step 2).
       PreviewOptions preview = job->request.preview;
-      if (options.family != VideoModelFamily::kMinimaxH3)
+      if (options.family == VideoModelFamily::kWan22)
         preview.dense_up_to = 0;
       preview.pixel_frames = job->request.parameters.frames;
-      preview.fps = 24;
+      preview.fps =
+          options.family == VideoModelFamily::kWan21Uni3C ? 16 : 24;
       generation.preview = PreviewHub::Global().Begin(
           job->snapshot.id,
           options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
-                                                     : LatentFormat::kMinimaxH3,
+          : options.family == VideoModelFamily::kWan21Uni3C
+              ? LatentFormat::kWan21
+              : LatentFormat::kMinimaxH3,
           preview);
       const auto preview_before = PreviewHub::Global().stats();
       ProgressContext progress{this, job};

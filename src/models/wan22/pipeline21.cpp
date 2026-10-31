@@ -268,6 +268,23 @@ bool GenerateI2V21(const I2V21Request& request, const I2V21Callbacks& callbacks,
       // LCM: x0 = x - sigma * v; re-noise to the next sigma.
       const float sigma = static_cast<float>(sigmas[step]);
       const float next = static_cast<float>(sigmas[step + 1]);
+      if (callbacks.preview.Wants(step + 1, request.steps)) {
+        // The same x0 the update below forms, in its own buffer.
+        const auto preview_start = Clock::now();
+        std::vector<float> x0(latents.size());
+        for (std::size_t i = 0; i < latents.size(); ++i)
+          x0[i] = latents[i] - sigma * velocity[i];
+        callbacks.preview.publish({.step = step + 1,
+                                   .steps = request.steps,
+                                   .frames = lf,
+                                   .height = lh,
+                                   .width = lw,
+                                   .channels = 16,
+                                   .channel_major = true,
+                                   .data = x0});
+        tel.preview_ms += Ms(preview_start);
+        ++tel.previews;
+      }
       std::vector<float> fresh;
       if (next > 0.0F) {
         fresh = GaussianNoise(latents.size(), request.seed + 1 + step);

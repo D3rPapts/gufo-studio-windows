@@ -227,6 +227,7 @@ bool RunWan21Job(const minimax_h3::GenerationRequest& request,
   callbacks.keep_going = [cancellation] {
     return cancellation == nullptr || !cancellation->IsCancelled();
   };
+  callbacks.preview = request.preview;
   wan22::DecodedVideo video;
   wan22::I2V21Telemetry stages;
   if (!wan22::GenerateI2V21(job, callbacks, nullptr, &video, &stages, error))
@@ -249,6 +250,8 @@ bool RunWan21Job(const minimax_h3::GenerationRequest& request,
     for (double ms : stages.step_ms)
       denoise += ms;
     telemetry->denoiser_ms = stages.dit_load_ms + stages.context_ms + denoise;
+    telemetry->denoiser.preview_ms = stages.preview_ms;
+    telemetry->denoiser.previews = stages.previews;
     telemetry->video_vae_ms = stages.decode_ms;
     telemetry->media_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - media_start)

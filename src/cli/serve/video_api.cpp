@@ -964,6 +964,7 @@ HttpResponse CreateWan21Video(const json::Value& body,
   std::uint64_t seed = 42;
   VideoInterpolation interpolate;
   VideoUpscale upscale;
+  PreviewOptions preview = VideoJobRequest{}.preview;
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
   if (const auto upload = files.find("render_video"); upload != files.end()) {
@@ -973,11 +974,14 @@ HttpResponse CreateWan21Video(const json::Value& body,
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension,
                         {"seed", "steps", "frames", "interpolate", "upscale",
-                         "camera"})) {
+                         "camera", "preview"})) {
       return Error(400, "Bad Request",
                    "'gufo' may contain only 'seed', 'steps', 'frames', "
-                   "'interpolate', 'upscale' and 'camera'",
+                   "'interpolate', 'upscale', 'camera' and 'preview'",
                    "invalid_strix_options");
+    }
+    if (const auto failed = ParseVideoPreview(*extension, &preview)) {
+      return *failed;
     }
     if (extension->contains("interpolate")) {
       const auto parsed = JsonInterpolate(extension->find("interpolate"));
@@ -1087,6 +1091,7 @@ HttpResponse CreateWan21Video(const json::Value& body,
       .upscale = std::move(upscale),
       .camera_json = std::move(camera_json),
       .guide_video = std::move(guide_video),
+      .preview = preview,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
