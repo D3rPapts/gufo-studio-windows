@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -772,13 +773,73 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
 struct Model::Impl {
   Weights weights;
   Tokenizer tokenizer;
+  // The runtime's adapter terms point into these patches.
+  std::map<std::string, LoraAdapter, std::less<>> loras;
   Runtime runtime;
   std::mutex mutex;
   std::atomic<bool> lost{false};
   std::function<void(const std::string&)> log;
+  // Under `mutex`: the set whose weights the runtime has built; reset while
+  // a switch is unfinished so the next request completes it.
+  std::optional<std::vector<Lora>> installed{std::in_place};
+  // Published by a completed switch.
+  std::vector<Lora> active;
+  mutable std::mutex active_mutex;
   explicit Impl(const std::filesystem::path& root)
       : weights(root), tokenizer(root), runtime(weights) {}
+  double SelectLoras(const std::vector<Lora>& requested,
+                     const CancellationCheck& cancelled);
 };
+
+// Called under `mutex`. Switched weights rebuild from the mapped originals,
+// so returning to an earlier set reproduces its weights exactly. Every
+// target whose terms change is built here, so the merge cost is in
+// `lora_ms` and not in denoising. Weights left unbuilt by a failed switch
+// rebuild with the current terms on next use.
+double Model::Impl::SelectLoras(const std::vector<Lora>& requested,
+                                const CancellationCheck& cancelled) {
+  std::vector<Lora> selected;
+  for (const auto& lora : requested)
+    if (lora.scale != 0)
+      selected.push_back(lora);
+  if (installed == selected)
+    return 0;
+  const auto start = Clock::now();
+  std::map<std::string, std::vector<LoraTerm>, std::less<>> terms;
+  for (const auto& lora : selected) {
+    const auto it = loras.find(lora.name);
+    if (it == loras.end())
+      throw std::invalid_argument("unknown LoRA adapter " + lora.name);
+    for (const auto& patch : it->second.patches())
+      terms[patch.target].push_back({&patch, lora.scale});
+  }
+  {
+    std::lock_guard active_lock(active_mutex);
+    active.clear();
+  }
+  installed.reset();
+  try {
+    const auto rebuild = runtime.SetLoras(std::move(terms));
+    // Stream the dropped transformer weights in bounded batches first; the
+    // loop then only finds them resident (or uploads any left over).
+    if (!rebuild.empty()) {
+      Cancel(cancelled);
+      runtime.UploadMissing("transformer.");
+    }
+    for (const auto& name : rebuild) {
+      Cancel(cancelled);
+      runtime.Weight(name);
+    }
+    runtime.Synchronize();
+  } catch (...) {
+    (void)hipStreamSynchronize(runtime.stream());
+    throw;
+  }
+  installed = selected;
+  std::lock_guard active_lock(active_mutex);
+  active = std::move(selected);
+  return Milliseconds(start);
+}
 
 Model::Model(const std::filesystem::path& root)
     : impl_(std::make_unique<Impl>(root)) {}
@@ -792,6 +853,27 @@ std::vector<std::uint32_t> Model::Tokenize(std::string_view text) const {
   return impl_->tokenizer.Encode(text);
 }
 
+LoraInfo Model::AddLora(const std::string& name,
+                        const std::filesystem::path& path) {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->loras.contains(name))
+    throw std::invalid_argument("duplicate LoRA adapter " + name);
+  const auto& weights = impl_->weights;
+  LoraAdapter adapter(path, [&](std::string_view tensor) {
+    return weights.Contains(tensor) ? weights.Get(tensor).shape
+                                    : std::vector<int>{};
+  });
+  LoraInfo info{adapter.format(), adapter.patches().size(), adapter.min_rank(),
+                adapter.max_rank()};
+  impl_->loras.emplace(name, std::move(adapter));
+  return info;
+}
+
+std::vector<Lora> Model::ActiveLoras() const {
+  std::lock_guard lock(impl_->active_mutex);
+  return impl_->active;
+}
+
 Result Model::Generate(const Request& request,
                        const CancellationCheck& cancelled,
                        const Observer& observer) {
@@ -801,6 +883,8 @@ Result Model::Generate(const Request& request,
   if (DeviceLost())
     throw std::runtime_error("Qwen-Image GPU context lost; restart the server");
   Cancel(cancelled);
+  const auto total_start = Clock::now();
+  const double lora_ms = impl_->SelectLoras(request.loras, cancelled);
   const auto start = Clock::now();
   auto& rt = impl_->runtime;
   Result result;
@@ -833,6 +917,7 @@ Result Model::Generate(const Request& request,
                                "; use fewer or smaller reference images");
     }
   };
+  result.metrics.lora_ms = lora_ms;
   try {
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
@@ -990,7 +1075,7 @@ Result Model::Generate(const Request& request,
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
     result.metrics.vae_ms = Milliseconds(vae_start);
-    result.metrics.total_ms = Milliseconds(start);
+    result.metrics.total_ms = Milliseconds(total_start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();
     return result;
   } catch (const std::exception& error) {

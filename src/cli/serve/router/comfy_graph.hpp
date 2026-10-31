@@ -95,6 +95,9 @@ struct ImageTask {
   FileRef canvas;
   std::vector<FileRef> references;
   int batch{1};
+  /// LoraLoader(ModelOnly) chain -> top-level "loras" [{name, scale}], in
+  /// application order; names via LoraName, empty = field not sent.
+  std::vector<std::pair<std::string, double>> loras;
 };
 
 struct SpeechTask {
@@ -260,6 +263,15 @@ std::string BuildMultipart(const std::vector<MultipartPart>& parts,
 /// The "gufo" extension object for an image request (negative prompt,
 /// guidance, strength); empty when there is nothing to send.
 json::Value ImageExtension(const ImageTask& task);
+
+/// The "loras" array for an image request ([{"name", "scale"}]); null when
+/// the graph has no LoRA node, so the worker's --lora-default set applies.
+json::Value ImageLoras(const ImageTask& task);
+
+/// The gufo adapter name for a ComfyUI lora_name: the file name without
+/// folders and without ".safetensors" / ".sft" ("style/Anime.safetensors" ->
+/// "Anime"). Register the file under that name with `--lora NAME=PATH`.
+std::string LoraName(std::string_view lora_name);
 
 /// 16-bit PCM WAV pieces for joining dialogue lines.
 struct Wav {

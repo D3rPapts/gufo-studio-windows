@@ -281,6 +281,19 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument("strength below 1 requires an input image");
   if (request.init_image)
     CheckImage(*request.init_image);
+  if (request.loras.size() > 16)
+    throw std::invalid_argument("image requests apply at most 16 LoRAs");
+  for (std::size_t i = 0; i < request.loras.size(); ++i) {
+    const auto& lora = request.loras[i];
+    if (lora.name.empty())
+      throw std::invalid_argument("LoRA name must not be empty");
+    for (std::size_t j = 0; j < i; ++j)
+      if (request.loras[j].name == lora.name)
+        throw std::invalid_argument("duplicate LoRA " + lora.name);
+    if (!std::isfinite(lora.scale) || std::abs(lora.scale) > 10)
+      throw std::invalid_argument(
+          "LoRA scale must be finite and at most 10 in magnitude");
+  }
 }
 
 namespace {

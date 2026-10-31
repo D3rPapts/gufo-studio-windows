@@ -1306,6 +1306,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   if (spec.strength)
     init_image = ReadFileRef(spec.init_image);
   const json::Value extension = ImageExtension(spec);
+  const json::Value loras = ImageLoras(spec);
   // Live preview under this id; the worker renders it only while the relay
   // below polls it for a connected /ws client.
   const std::string preview_id = PreviewId(job->id, task.node_id);
@@ -1332,6 +1333,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       body["response_format"] = "b64_json";
       if (!fields.empty())
         body["gufo"] = fields;
+      if (!loras.is_null())
+        body["loras"] = loras;
       return Call(job, "POST", "/v1/images/generations", body.dump(),
                   "application/json");
     }
@@ -1345,6 +1348,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
         {"response_format", "", "", "b64_json"}};
     if (!fields.empty())
       parts.push_back({"gufo", "", "application/json", fields.dump()});
+    if (!loras.is_null())
+      parts.push_back({"loras", "", "application/json", loras.dump()});
     if (!init_image.empty()) {
       const std::string type = SniffImageType(init_image);
       // The start image is the single "image" part, or "init_image" next
@@ -1391,6 +1396,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
                "event=image prompt_id=" + job->id + " size=" + size +
                    " steps=" + std::to_string(spec.steps) +
                    " references=" + std::to_string(spec.references.size()) +
+                   (loras.is_null() ? "" : " loras=" + loras.dump()) +
                    " status=" + std::to_string(result.status));
   if (result.status != 200)
     throw std::runtime_error("gufo image request failed (HTTP " +
