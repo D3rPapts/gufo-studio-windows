@@ -364,6 +364,11 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->audio_reference);
       if (video->render_video)
         files->push_back(*video->render_video);
+    } else if (const auto* foley = std::get_if<FoleyTask>(&task.spec)) {
+      if (foley->video)
+        files->push_back(*foley->video);
+      if (foley->image)
+        files->push_back(*foley->image);
     }
   }
 }
@@ -1249,6 +1254,8 @@ json::Value Adapter::RunTask(const std::shared_ptr<Job>& job,
     return RunDialogue(job, task, *dialogue);
   if (const auto* music = std::get_if<MusicTask>(&task.spec))
     return RunMusic(job, task, *music);
+  if (const auto* foley = std::get_if<FoleyTask>(&task.spec))
+    return RunFoley(job, task, *foley);
   return RunVideo(job, task, std::get<VideoTask>(task.spec));
 }
 
@@ -1559,6 +1566,82 @@ json::Value Adapter::RunMusic(const std::shared_ptr<Job>& job,
                              std::to_string(result.status) +
                              "): " + ErrorMessage(result));
   return SaveSpeech(task, {result.body});
+}
+
+json::Value Adapter::RunFoley(const std::shared_ptr<Job>& job,
+                              const Task& task, const FoleyTask& spec) {
+  json::Value body = FoleyRequestBody(spec);
+  if (spec.video) {
+    const std::string bytes = ReadFileRef(*spec.video);
+    std::string type = ContentTypeFor(spec.video->name);
+    if (!type.starts_with("video/"))
+      type = "video/mp4";
+    body["video"] = "data:" + type + ";base64," + Base64Encode(bytes);
+  } else if (spec.image) {
+    const std::string bytes = ReadFileRef(*spec.image);
+    body["image"] =
+        "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
+  }
+  const FetchResult result = Call(job, "POST", "/v1/audio/foley", body.dump(),
+                                  "application/json");
+  Logger::Info("comfy", "event=foley prompt_id=" + job->id +
+                            " model=" + spec.model +
+                            " status=" + std::to_string(result.status) +
+                            " bytes=" + std::to_string(result.body.size()));
+  if (result.status != 200 || !result.body.starts_with("RIFF"))
+    throw std::runtime_error("gufo foley request failed (HTTP " +
+                             std::to_string(result.status) +
+                             "): " + ErrorMessage(result));
+  json::Value ui = json::Value::object();
+  for (const OutputTarget& target : task.outputs) {
+    if (target.kind != OutputKind::kVideo) {
+      Task single = task;
+      single.outputs = {target};
+      json::Value saved = SaveSpeech(single, {result.body});
+      ui[target.node_id] = saved[target.node_id];
+      continue;
+    }
+    // VHS_VideoCombine / SaveVideo with the sampler's audio: the loaded
+    // video with the generated track (H.264 + AAC, cut to the shorter).
+    if (options_.ffmpeg.empty() || !spec.video)
+      throw std::runtime_error(
+          "a video output of MMAudioSampler needs the loaded video and "
+          "--comfy-ffmpeg");
+    const fs::path wav = WorkFile("wav");
+    const fs::path mp4 = WorkFile("mp4");
+    WriteAll(wav, result.body);
+    std::string error;
+    const bool muxed = RunFfmpeg(
+        {"-i", FilePath(*spec.video), "-i", wav, "-map", "0:v:0", "-map",
+         "1:a:0", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", mp4},
+        &error);
+    std::error_code ec;
+    fs::remove(wav, ec);
+    if (!muxed) {
+      fs::remove(mp4, ec);
+      throw std::runtime_error("cannot add the sound to the video: " + error);
+    }
+    const std::string bytes = ReadAll(mp4);
+    fs::remove(mp4, ec);
+    json::Value saved = SaveBytes(target, "mp4", bytes);
+    if (target.class_type == "VHS_VideoCombine") {
+      json::Value entry = saved["images"].items().front();
+      entry["format"] = "video/h264-mp4";
+      if (spec.force_rate > 0)
+        entry["frame_rate"] = spec.force_rate;
+      json::Value gifs = json::Value::array();
+      gifs.push_back(std::move(entry));
+      json::Value node = json::Value::object();
+      node["gifs"] = std::move(gifs);
+      ui[target.node_id] = std::move(node);
+    } else {
+      saved["animated"] = json::Value::array();
+      saved["animated"].push_back(true);
+      ui[target.node_id] = std::move(saved);
+    }
+  }
+  return ui;
 }
 
 json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,

@@ -92,7 +92,8 @@ constexpr std::string_view kJobPaths[] = {
     "/v1/videos",             "/v1/audio/speech",
     "/v1/audio/music",        "/v1/audio/transcriptions",
     "/v1/chat/completions",   "/v1/completions",
-    "/v1/responses",          "/v1/messages"};
+    "/v1/responses",          "/v1/messages",
+    "/v1/audio/foley"};
 
 long long NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(

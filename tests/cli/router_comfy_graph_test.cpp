@@ -1087,6 +1087,106 @@ void TestPreviewFrames() {
   assert(comfy::PreviewId(std::string(200, 'x'), "1").size() == 128);
 }
 
+// MMAudio as kijai/ComfyUI-MMAudio wires it (node signatures from its
+// nodes.py): VHS_LoadVideo frames into MMAudioSampler, the sound to
+// SaveAudio and, with the frames, to VHS_VideoCombine.
+constexpr const char* kMmaudio = R"({
+ "1": {"class_type": "MMAudioModelLoader", "inputs": {"mmaudio_model": "mmaudio_large_44k_v2_fp16.safetensors", "base_precision": "fp16"}},
+ "2": {"class_type": "MMAudioFeatureUtilsLoader", "inputs": {"vae_model": "mmaudio_vae_44k_fp16.safetensors", "synchformer_model": "mmaudio_synchformer_fp16.safetensors", "clip_model": "apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors", "mode": "44k", "precision": "fp16"}},
+ "3": {"class_type": "VHS_LoadVideo", "inputs": {"video": "shot07.mp4", "force_rate": 25, "custom_width": 0, "custom_height": 0, "frame_load_cap": 0, "skip_first_frames": 0, "select_every_nth": 1}},
+ "4": {"class_type": "MMAudioSampler", "inputs": {"mmaudio_model": ["1", 0], "feature_utils": ["2", 0], "duration": 8, "steps": 25, "cfg": 4.5, "seed": 42, "prompt": "footsteps on gravel, a door slams", "negative_prompt": "music", "mask_away_clip": false, "force_offload": true, "images": ["3", 0]}},
+ "5": {"class_type": "SaveAudio", "inputs": {"audio": ["4", 0], "filename_prefix": "film/ton/shot07"}},
+ "6": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["3", 0], "audio": ["4", 0], "frame_rate": 25, "loop_count": 0, "filename_prefix": "film/ton/shot07_mux", "format": "video/h264-mp4", "pingpong": false, "save_output": true}}
+})";
+
+void TestFoley() {
+  const comfy::Plan plan = PlanOf(kMmaudio);
+  assert(plan.tasks.size() == 1);
+  const auto& task = plan.tasks[0];
+  assert(task.node_id == "4" && task.class_type == "MMAudioSampler");
+  const auto& foley = std::get<comfy::FoleyTask>(task.spec);
+  assert(foley.model == "mmaudio-44k");
+  assert(foley.prompt == "footsteps on gravel, a door slams");
+  assert(foley.negative_prompt == "music");
+  assert(foley.duration == 8 && foley.steps == 25 && foley.cfg == 4.5);
+  assert(foley.seed == 42 && !foley.mask_away_clip);
+  assert((foley.video == comfy::FileRef{"shot07.mp4", "input"}));
+  assert(!foley.image && foley.force_rate == 25);
+  assert(task.outputs.size() == 2);
+  for (const auto& output : task.outputs) {
+    if (output.node_id == "5")
+      assert(output.kind == comfy::OutputKind::kAudio &&
+             output.prefix == "film/ton/shot07");
+    else
+      assert(output.kind == comfy::OutputKind::kVideo &&
+             output.prefix == "film/ton/shot07_mux");
+  }
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::FoleyRequestBody(foley);
+  assert(body.member_str("model") == "mmaudio-44k");
+  assert(body.member_str("prompt") == foley.prompt);
+  assert(body.member_str("negative_prompt") == "music");
+  assert(body.find("duration")->as_double() == 8);
+  assert(body.find("steps")->as_double() == 25);
+  assert(body.find("cfg_strength")->as_double() == 4.5);
+  assert(body.find("seed")->as_double() == 42);
+  assert(body.member_str("frame_mode") == "consecutive");
+  assert(body.find("force_rate")->as_double() == 25);
+  assert(body.find("video") == nullptr);  // the executor adds the file
+  assert(body.member_str("response_format") == "wav");
+
+  // Text to audio: no images, SaveAudio only.
+  std::string text = Replace(kMmaudio, ", \"images\": [\"3\", 0]", "");
+  text = Replace(text,
+                 ",\n \"6\": {\"class_type\": \"VHS_VideoCombine\", \"inputs\": "
+                 "{\"images\": [\"3\", 0], \"audio\": [\"4\", 0], "
+                 "\"frame_rate\": 25, \"loop_count\": 0, \"filename_prefix\": "
+                 "\"film/ton/shot07_mux\", \"format\": \"video/h264-mp4\", "
+                 "\"pingpong\": false, \"save_output\": true}}",
+                 "");
+  const comfy::Plan text_plan = PlanOf(text.c_str());
+  const auto& text_foley = std::get<comfy::FoleyTask>(text_plan.tasks[0].spec);
+  assert(!text_foley.video && !text_foley.image);
+  assert(comfy::FoleyRequestBody(text_foley).find("frame_mode") == nullptr);
+  // A video output without frames to put the sound on fails.
+  assert(ErrorOf(Replace(kMmaudio, ", \"images\": [\"3\", 0]", ""))
+             .message.find("needs the sampler's images") != std::string::npos);
+  // 16k models and the 16k feature mode are not served.
+  assert(ErrorOf(Replace(kMmaudio, "mmaudio_large_44k_v2_fp16",
+                         "mmaudio_small_16k_fp16"))
+             .node_errors.find("1") != nullptr);
+  assert(ErrorOf(Replace(kMmaudio, "\"mode\": \"44k\"", "\"mode\": \"16k\""))
+             .node_errors.find("2") != nullptr);
+  // Another 44k checkpoint runs on mmaudio-44k with a warning.
+  assert(PlanOf(Replace(kMmaudio, "mmaudio_large_44k_v2_fp16",
+                        "mmaudio_medium_44k_fp16")
+                    .c_str())
+             .warnings.size() == 1);
+  // A SaveImage cannot take the sound.
+  assert(ErrorOf(Replace(kMmaudio, "\"SaveAudio\", \"inputs\": {\"audio\"",
+                         "\"SaveImage\", \"inputs\": {\"images\""))
+             .message.find("cannot store") != std::string::npos);
+  // One LoadImage frame: MMAudio's image mode (with a warning).
+  const std::string still =
+      Replace(Replace(kMmaudio,
+                      "\"VHS_LoadVideo\", \"inputs\": {\"video\": "
+                      "\"shot07.mp4\", \"force_rate\": 25, \"custom_width\": "
+                      "0, \"custom_height\": 0, \"frame_load_cap\": 0, "
+                      "\"skip_first_frames\": 0, \"select_every_nth\": 1}",
+                      "\"LoadImage\", \"inputs\": {\"image\": \"kf.png\"}"),
+              ",\n \"6\": {\"class_type\": \"VHS_VideoCombine\", \"inputs\": "
+              "{\"images\": [\"3\", 0], \"audio\": [\"4\", 0], "
+              "\"frame_rate\": 25, \"loop_count\": 0, \"filename_prefix\": "
+              "\"film/ton/shot07_mux\", \"format\": \"video/h264-mp4\", "
+              "\"pingpong\": false, \"save_output\": true}}",
+              "");
+  const comfy::Plan still_plan = PlanOf(still.c_str());
+  const auto& still_foley =
+      std::get<comfy::FoleyTask>(still_plan.tasks[0].spec);
+  assert((still_foley.image == comfy::FileRef{"kf.png", "input"}));
+  assert(still_plan.warnings.size() == 1);
+}
+
 int main() {
   TestQwenTextToImage();
   TestQwenReferencesAndCanvas();
@@ -1109,6 +1209,7 @@ int main() {
   TestWavJoin();
   TestHelpers();
   TestPreviewFrames();
+  TestFoley();
   std::cout << "router_comfy_graph_test: all passed\n";
   return 0;
 }

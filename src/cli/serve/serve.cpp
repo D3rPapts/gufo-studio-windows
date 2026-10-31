@@ -48,6 +48,7 @@
 #include <hip/hip_runtime_api.h>
 #endif
 #include "src/cli/serve/music_api.hpp"
+#include "src/cli/serve/foley_api.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -998,7 +999,9 @@ void PrintServeHelp(std::string_view program_name,
       << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
          "(/v1/chat/completions with input_audio)\n"
       << "  music     Serve ACE-Step 1.5 XL turbo text-to-music "
-         "(/v1/audio/music)\n\n"
+         "(/v1/audio/music)\n"
+      << "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
+         "(/v1/audio/foley)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -1093,7 +1096,7 @@ int RunServe(std::span<const char* const> args) {
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
         arg == "image" || arg == "embedding" || arg == "omni" ||
-        arg == "music") {
+        arg == "music" || arg == "foley") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1101,7 +1104,8 @@ int RunServe(std::span<const char* const> args) {
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
-          topic != "embedding" && topic != "omni" && topic != "music") {
+          topic != "embedding" && topic != "omni" && topic != "music" &&
+          topic != "foley") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1191,8 +1195,47 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::EmbeddingService> embeddings;
   std::shared_ptr<server::OmniService> omni;
   std::shared_ptr<server::MusicService> music;
+  std::shared_ptr<server::FoleyService> foley;
 
-  if (subcommand == "music") {
+  if (subcommand == "foley") {
+    std::filesystem::path model;
+    std::string name = "mmaudio-44k";
+    ArgParser parser("gufo serve foley",
+                     "Serve MMAudio large_44k_v2 video/text-to-audio.");
+    parser.AddOption("-m", "--model", "DIR",
+                     "MMAudio directory (mmaudio_large_44k_v2_*, "
+                     "mmaudio_vae_44k_*, mmaudio_synchformer_*, "
+                     "apple_DFN5B-CLIP-ViT-H-14-384_* .safetensors, "
+                     "bigvgan_v2_44khz_128band_512x.safetensors, tokenizer/)",
+                     "Model", &model);
+    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
+                     "Model", &name);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", "foley");
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (model.empty()) {
+      std::cerr << "Error: --model <DIR> is required for foley server\n";
+      return 2;
+    }
+    if (validate_only)
+      return 0;
+    ModelLoadLog load_log("mmaudio", model);
+    foley = std::make_shared<server::FoleyService>(model, name);
+    if (!foley->ready()) {
+      std::cerr << "Error loading MMAudio: " << foley->initialization_error()
+                << '\n';
+      return 1;
+    }
+    load_log.Complete("model=" + name);
+  } else if (subcommand == "music") {
     std::filesystem::path model;
     std::string name = "ace-step-1.5-xl-turbo";
     ArgParser parser("gufo serve music",
@@ -2145,6 +2188,9 @@ int RunServe(std::span<const char* const> args) {
   if (music != nullptr) {
     server.set_music(music);
   }
+  if (foley != nullptr) {
+    server.set_foley(foley);
+  }
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
@@ -2175,7 +2221,8 @@ namespace {
 std::string ValidateServeArgvByParsing(std::string_view modality,
                                        const std::vector<std::string>& argv) {
   static constexpr std::string_view kModalities[] = {
-      "llm", "image", "video", "tts", "asr", "embedding", "omni", "music"};
+      "llm",       "image", "video", "tts",  "asr",
+      "embedding", "omni",  "music", "foley"};
   if (std::ranges::find(kModalities, modality) == std::end(kModalities)) {
     return "unknown modality '" + std::string(modality) + "'";
   }

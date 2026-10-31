@@ -26,6 +26,7 @@ class ImageService;
 class EmbeddingService;
 class OmniService;
 class MusicService;
+class FoleyService;
 class WebSocket;
 
 struct HttpRequest {
@@ -142,6 +143,11 @@ public:
   void set_music(std::shared_ptr<MusicService> music) {
     music_ = std::move(music);
   }
+  /// Serves MMAudio video / text to audio (/v1/audio/foley); call before
+  /// start().
+  void set_foley(std::shared_ptr<FoleyService> foley) {
+    foley_ = std::move(foley);
+  }
 
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
@@ -179,6 +185,7 @@ private:
   std::shared_ptr<EmbeddingService> embeddings_;
   std::shared_ptr<OmniService> omni_;
   std::shared_ptr<MusicService> music_;
+  std::shared_ptr<FoleyService> foley_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

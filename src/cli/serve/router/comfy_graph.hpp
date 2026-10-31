@@ -21,6 +21,10 @@
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+//   foley  MMAudioSampler (kijai/ComfyUI-MMAudio) <- MMAudioModelLoader +
+//          MMAudioFeatureUtilsLoader, images from VHS_LoadVideo /
+//          LoadVideo (or LoadImage) -> /v1/audio/foley (mmaudio-44k); to
+//          SaveAudio / PreviewAudio, or muxed into VHS_VideoCombine / SaveVideo
 // A new family adds its node classes to the tables in comfy_graph.cpp, a
 // task type here and an executor in comfy_adapter.cpp.
 //
@@ -56,6 +60,7 @@ struct ModelIds {
   std::string tts_clone{"qwen3-tts-clone"};
   std::string music{"ace-step-1.5-xl-turbo"};
   std::string camera{"wan2.1-uni3c"};
+  std::string foley{"mmaudio-44k"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -159,6 +164,32 @@ struct MusicTask {
 /// The /v1/audio/music body for `task` (synchronous, WAV).
 json::Value MusicRequestBody(const MusicTask& task);
 
+/// MMAudio video / text to audio (/v1/audio/foley), from MMAudioSampler.
+struct FoleyTask {
+  std::string model;
+  std::string prompt;
+  std::string negative_prompt;
+  double duration{8.0};
+  int steps{25};
+  double cfg{4.5};
+  std::uint64_t seed{0};
+  bool mask_away_clip{false};
+  /// The frames of the sampler's `images` input: a video file (VHS_LoadVideo
+  /// or LoadVideo) sent as gufo frame_mode "consecutive", or one image
+  /// (LoadImage, MMAudio's image mode). Neither = text to audio.
+  std::optional<FileRef> video;
+  std::optional<FileRef> image;
+  /// VHS_LoadVideo options, applied by the worker like VHS does.
+  double force_rate{0};
+  int skip_first_frames{0};
+  int select_every_nth{1};
+  int frame_load_cap{0};
+};
+
+/// The /v1/audio/foley body for `task` without the media (the executor adds
+/// video / image as data URLs).
+json::Value FoleyRequestBody(const FoleyTask& task);
+
 enum class VideoFamily { kH3, kWan, kCamera };
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
@@ -221,7 +252,9 @@ json::Value VideoRequestBody(const VideoTask& task);
 struct Task {
   std::string node_id;  // the sampler / TTS node producing the media
   std::string class_type;
-  std::variant<ImageTask, SpeechTask, VideoTask, DialogueTask, MusicTask> spec;
+  std::variant<ImageTask, SpeechTask, VideoTask, DialogueTask, MusicTask,
+               FoleyTask>
+      spec;
   std::vector<OutputTarget> outputs;
 };
 

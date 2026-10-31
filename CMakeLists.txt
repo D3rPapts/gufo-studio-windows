@@ -463,6 +463,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
   src/cli/serve/music_api.cpp
+  src/cli/serve/foley_api.cpp
   src/cli/serve/video_upscale.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
@@ -491,6 +492,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_http PUBLIC gufo_rife)
   # ACE-Step 1.5 behind `gufo serve music` (src/models/ace_step).
   target_link_libraries(gufo_http PUBLIC gufo_ace_step)
+  # MMAudio video / text to audio behind `gufo serve foley` (src/models/mmaudio).
+  target_link_libraries(gufo_http PUBLIC gufo_mmaudio)
   # Real-ESRGAN upscaling of finished videos ("gufo":{"upscale":...}).
   target_link_libraries(gufo_http PUBLIC gufo_realesrgan)
 endif()
@@ -1621,4 +1624,6 @@ add_subdirectory(src/models/rife)
 
 # ACE-Step 1.5 XL turbo (music): text encoder, DiT, VAE and gufo-ace-check.
 add_subdirectory(src/models/ace_step)
+# MMAudio large_44k_v2 (foley): CLIP, Synchformer, network, VAE, BigVGAN.
+add_subdirectory(src/models/mmaudio)
 add_subdirectory(src/models/realesrgan)

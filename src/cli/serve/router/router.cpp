@@ -391,7 +391,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       "/v1/images/edits",          "/v1/audio/speech",
       "/v1/audio/music",           "/v1/embeddings",
       "/embeddings",               "/embedding",
-      "/completion",               "/apply-template"};
+      "/completion",               "/apply-template",
+      // MMAudio (gufo serve foley); synchronous through the router.
+      "/v1/audio/foley"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
