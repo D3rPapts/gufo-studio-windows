@@ -82,8 +82,10 @@ No inpainting checkpoint is needed. After every denoising step the latent
 cells the mask keeps are reset to the start image, noised with the same
 initial noise to the step's sigma; the masked cells denoise freely and see
 the kept area as context. At the last step (sigma 0) the kept cells are the
-start image's latent, so after the VAE they decode to the start image (up to
-the VAE's own round trip and a seam of a few pixels next to the mask). A cell
+start image's latent, so after the VAE they decode to the start image up to
+the VAE's own round trip (measured at 512²: 41.5 dB against the original). The
+decoder carries small changes about 32 pixels past the mask (beyond that at
+most 5 of 255 against the round trip, 58 dB; within 16 pixels up to 27). A cell
 is 16 x 16 output pixels; it is edited when any mask pixel in it is, so the
 edit area rounds outward to that grid.
 
