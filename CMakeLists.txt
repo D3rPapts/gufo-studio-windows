@@ -866,6 +866,12 @@ if (BUILD_TESTING)
   set_tests_properties(router_comfy_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 180)
 
+  add_test(NAME router_passthrough_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_passthrough_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_passthrough_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
+
   # Real-model smoke check: gpu-only labels, so the hosted check-pr name
   # filter skips it and gpu-fast excludes it while gpu-full executes it.
   # Missing model dirs make the script print SKIPPED and exit 0.
