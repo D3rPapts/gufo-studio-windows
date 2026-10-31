@@ -89,6 +89,10 @@ constexpr std::string_view kPlumbing[] = {
     "AudioEncoderEncode",
     "ImageBatch",
     "ImageFromBatch",
+    // MMAudio (kijai/ComfyUI-MMAudio): the loaders only name files.
+    "MMAudioModelLoader",
+    "MMAudioFeatureUtilsLoader",
+    "MMAudioVoCoderLoader",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -100,6 +104,7 @@ constexpr std::string_view kGenerators[] = {
     "FB_Qwen3TTSVoiceClone",
     "FB_Qwen3TTSCustomVoice",
     "FB_Qwen3TTSDialogueInference",
+    "MMAudioSampler",
 };
 
 constexpr std::string_view kOutputs[] = {
@@ -126,6 +131,11 @@ bool IsTts(std::string_view class_type) {
 bool IsSampler(std::string_view class_type) {
   return class_type == "KSampler" || class_type == "KSamplerAdvanced";
 }
+
+bool IsFoley(std::string_view class_type) {
+  return class_type == "MMAudioSampler";
+}
+
 std::string Lower(std::string_view text) {
   std::string out(text);
   for (char& c : out)
@@ -1792,6 +1802,82 @@ VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
   return task;
 }
 
+/// kijai/ComfyUI-MMAudio: MMAudioSampler with MMAudioModelLoader,
+/// MMAudioFeatureUtilsLoader and optional images (VHS_LoadVideo, LoadVideo
+/// via GetVideoComponents, or LoadImage).
+FoleyTask BuildFoley(const Graph& graph, const std::string& id,
+                     const ModelIds& models,
+                     std::vector<std::string>* warnings) {
+  FoleyTask task;
+  task.model = models.foley;
+  const Link model = graph.RequireLink(id, "mmaudio_model");
+  if (graph.Class(model.node) != "MMAudioModelLoader")
+    throw NodeFailure(id, "unsupported_link",
+                      "mmaudio_model must come from MMAudioModelLoader");
+  const std::string file = Lower(graph.Str(model.node, "mmaudio_model", ""));
+  if (file.find("16k") != std::string::npos)
+    throw NodeFailure(model.node, "unsupported_value",
+                      "gufo serves MMAudio 44k (large_44k_v2), not 16k");
+  if (!file.empty() && file.find("large_44k_v2") == std::string::npos)
+    warnings->push_back("node " + model.node + ": " + file +
+                        " is served by " + task.model +
+                        " (large_44k_v2)");
+  const Link features = graph.RequireLink(id, "feature_utils");
+  if (graph.Class(features.node) != "MMAudioFeatureUtilsLoader")
+    throw NodeFailure(id, "unsupported_link",
+                      "feature_utils must come from MMAudioFeatureUtilsLoader");
+  if (graph.Str(features.node, "mode", "44k") != "44k")
+    throw NodeFailure(features.node, "unsupported_value",
+                      "gufo serves MMAudio in 44k mode only");
+  task.duration = graph.Num(id, "duration", 8.0);
+  if (!(task.duration >= 1.0 && task.duration <= 120.0))
+    throw NodeFailure(id, "unsupported_value",
+                      "gufo MMAudio renders 1..120 seconds");
+  task.steps = static_cast<int>(graph.Num(id, "steps", 25));
+  if (task.steps < 1 || task.steps > 200)
+    throw NodeFailure(id, "unsupported_value", "steps must be 1..200");
+  task.cfg = graph.Num(id, "cfg", 4.5);
+  task.seed = Seed(graph.Num(id, "seed", 0));
+  task.prompt = graph.Str(id, "prompt", "");
+  task.negative_prompt = graph.Str(id, "negative_prompt", "");
+  task.mask_away_clip = graph.Bool(id, "mask_away_clip", false);
+  if (auto images = graph.LinkOf(id, "images")) {
+    const std::string cls = graph.Class(images->node);
+    if (cls == "VHS_LoadVideo") {
+      task.video = ParseFileRef(graph.Str(images->node, "video"), "input");
+      task.force_rate = graph.Num(images->node, "force_rate", 0);
+      task.skip_first_frames =
+          static_cast<int>(graph.Num(images->node, "skip_first_frames", 0));
+      task.select_every_nth =
+          static_cast<int>(graph.Num(images->node, "select_every_nth", 1));
+      task.frame_load_cap =
+          static_cast<int>(graph.Num(images->node, "frame_load_cap", 0));
+      if (graph.Num(images->node, "custom_width", 0) != 0 ||
+          graph.Num(images->node, "custom_height", 0) != 0)
+        warnings->push_back("node " + images->node +
+                            ": custom_width / custom_height are ignored "
+                            "(MMAudio resizes the frames itself)");
+    } else if (cls == "GetVideoComponents") {
+      const Link file = graph.RequireLink(images->node, "video");
+      if (graph.Class(file.node) != "LoadVideo")
+        throw NodeFailure(images->node, "unsupported_link",
+                          "the video must come from LoadVideo");
+      task.video = ParseFileRef(graph.Str(file.node, "file"), "input");
+    } else if (cls == "LoadImage" || cls == "LoadImageOutput") {
+      task.image = ImageFile(graph, id, "images", *images);
+      warnings->push_back("node " + id +
+                          ": one image runs as MMAudio's image mode (CLIP "
+                          "only); ComfyUI-MMAudio needs a video here");
+    } else {
+      throw NodeFailure(id, "unsupported_link",
+                        "images must come from VHS_LoadVideo, LoadVideo "
+                        "(GetVideoComponents) or LoadImage, not " +
+                            cls);
+    }
+  }
+  return task;
+}
+
 OutputKind KindOf(std::string_view class_type) {
   if (class_type == "SaveAudio" || class_type == "PreviewAudio")
     return OutputKind::kAudio;
@@ -2194,6 +2280,32 @@ json::Value MusicRequestBody(const MusicTask& task) {
   return body;
 }
 
+json::Value FoleyRequestBody(const FoleyTask& task) {
+  json::Value body = json::Value::object();
+  body["model"] = task.model;
+  body["prompt"] = task.prompt;
+  body["negative_prompt"] = task.negative_prompt;
+  body["duration"] = task.duration;
+  body["steps"] = task.steps;
+  body["cfg_strength"] = task.cfg;
+  body["seed"] = task.seed;
+  body["mask_away_clip"] = task.mask_away_clip;
+  if (task.video) {
+    // ComfyUI-MMAudio feeds the IMAGE batch's first frames, not 8 / 25 fps.
+    body["frame_mode"] = "consecutive";
+    if (task.force_rate > 0)
+      body["force_rate"] = task.force_rate;
+    if (task.skip_first_frames > 0)
+      body["skip_first_frames"] = task.skip_first_frames;
+    if (task.select_every_nth > 1)
+      body["select_every_nth"] = task.select_every_nth;
+    if (task.frame_load_cap > 0)
+      body["frame_load_cap"] = task.frame_load_cap;
+  }
+  body["response_format"] = "wav";
+  return body;
+}
+
 json::Value ImageExtension(const ImageTask& task) {
   json::Value gufo = json::Value::object();
   if (!task.negative_prompt.empty())
@@ -2437,7 +2549,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
       bool tts = false;
       for (const std::string& node_id : upstream) {
         const std::string up = graph.Class(node_id);
-        if (IsSampler(up) || IsTts(up)) {
+        if (IsSampler(up) || IsTts(up) || IsFoley(up)) {
           generators.push_back(node_id);
           tts = tts || IsTts(up);
         }
@@ -2506,6 +2618,10 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           task.spec = std::move(video);
         } else if (tts &&
                    task.class_type == "FB_Qwen3TTSDialogueInference") {
+        if (IsFoley(task.class_type)) {
+          task.spec = BuildFoley(graph, generator, models, &plan->warnings);
+        } else if (tts &&
+                   task.class_type == "FB_Qwen3TTSDialogueInference") {
           task.spec = BuildDialogue(graph, generator, models, &plan->warnings);
         } else if (tts) {
           task.spec = BuildSpeech(graph, generator, models, &plan->warnings);
@@ -2541,6 +2657,17 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                           std::holds_alternative<DialogueTask>(task.spec) ||
                           std::holds_alternative<MusicTask>(task.spec);
       const bool image = std::holds_alternative<ImageTask>(task.spec);
+      if (const auto* foley = std::get_if<FoleyTask>(&task.spec)) {
+        // Audio files, or the loaded video with the new sound track.
+        if (target.kind == OutputKind::kImage)
+          throw NodeFailure(id, "unsupported_link",
+                            cls + " cannot store the output of " +
+                                task.class_type);
+        if (target.kind == OutputKind::kVideo && !foley->video)
+          throw NodeFailure(id, "unsupported_link",
+                            "a video output of MMAudioSampler needs the "
+                            "sampler's images from a loaded video");
+      }
       if ((speech && target.kind != OutputKind::kAudio) ||
           (image && target.kind != OutputKind::kImage))
         throw NodeFailure(

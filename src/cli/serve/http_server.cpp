@@ -34,6 +34,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/music_api.hpp"
+#include "src/cli/serve/foley_api.hpp"
 #include "src/cli/serve/omni_api.hpp"
 #include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -2194,6 +2195,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (embeddings_ != nullptr && embeddings_->ready()) ||
                        (omni_ != nullptr && omni_->ready()) ||
                        (music_ != nullptr && music_->ready()) ||
+                       (foley_ != nullptr && foley_->ready()) ||
                        images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
@@ -2209,6 +2211,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = omni_->model_id();
     } else if (music_ != nullptr && music_->ready()) {
       body["model"] = music_->model_id();
+    } else if (foley_ != nullptr && foley_->ready()) {
+      body["model"] = foley_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
@@ -2237,7 +2241,24 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       models["data"].push_back(std::move(model));
       listed.body = models.dump();
     }
+    if (foley_ != nullptr && foley_->ready()) {
+      json::Value models = json::parse(listed.body);
+      json::Value model = json::Value::object();
+      model["id"] = foley_->model_id();
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-mmaudio";
+      model["capability"] = "foley";
+      models["data"].push_back(std::move(model));
+      listed.body = models.dump();
+    }
     return listed;
+  }
+  if (foley_ != nullptr && IsFoleyApiPath(req.path)) {
+    if (!foley_->ready())
+      return Err(503, "Service Unavailable", "MMAudio foley is not ready",
+                 "server_error", "foley_service_unavailable");
+    return foley_->Handle(req);
   }
   if (music_ != nullptr && IsMusicApiPath(req.path)) {
     if (!music_->ready())

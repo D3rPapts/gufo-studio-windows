@@ -112,6 +112,8 @@ private:
   json::Value RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                        const VideoTask& spec);  json::Value RunMusic(const std::shared_ptr<Job>& job, const Task& task,
                        const MusicTask& spec);
+  json::Value RunFoley(const std::shared_ptr<Job>& job, const Task& task,
+                       const FoleyTask& spec);
 
   std::filesystem::path FilePath(const FileRef& ref) const;
   std::string ReadFileRef(const FileRef& ref) const;
