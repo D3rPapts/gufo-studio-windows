@@ -985,12 +985,10 @@ public:
         std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
         remote_inflight);
     lock.unlock();
-    HttpResponse response = router::ProxyToWorker(router::RemoteTarget(spec), req);
-    if (response.status == 502 && !response.streaming_body) {
+    HttpResponse response = RelayRemote(model_id, spec, req);
+    if (response.status == 503 && !response.streaming_body) {
       hold->Release();
-      Logger::Warn("router", "event=remote_unavailable model=" + model_id +
-                                 " detail=\"" + response.log_details + "\"");
-      return router::RemoteUnavailable(model_id, response.log_details);
+      return response;
     }
     std::shared_ptr<JobBodySniffer> sniffer;
     if (response.status >= 200 && response.status < 300 &&
@@ -1025,9 +1023,33 @@ public:
     return streamed;
   }
 
+  /// One relay to a remote router (state mutex free). A connect failure or
+  /// a remote that closed before answering becomes 503 remote_unavailable;
+  /// every remote answer, errors included, passes through unchanged.
+  HttpResponse RelayRemote(const std::string& model_id,
+                           const router::RemoteSpec& spec,
+                           const HttpRequest& req) {
+    HttpResponse response =
+        router::ProxyToWorker(router::RemoteTarget(spec), req);
+    if (response.status != 502 || response.streaming_body) {
+      return response;
+    }
+    std::string detail = response.log_details;
+    constexpr std::string_view kPrefix = "upstream_unavailable detail=";
+    if (std::string_view(detail).starts_with(kPrefix)) {
+      detail.erase(0, kPrefix.size());
+    }
+    Logger::Warn("router", "event=remote_unavailable model=" + model_id +
+                               " url=" + spec.url.host + ":" +
+                               std::to_string(spec.url.port) + " detail=\"" +
+                               detail + "\"");
+    return router::RemoteUnavailable(model_id, detail);
+  }
+
   /// Live previews (/v1/previews/{id}[/events]) of a running image or video
   /// job: the model comes from `?model=` or, for a video job, its owner.
   /// Only a loaded worker is asked; a preview never starts or keeps one.
+  /// A remote model's preview goes to its router.
   HttpResponse PreviewLocked(const HttpRequest& req,
                              std::unique_lock<std::mutex>& lock) {
     std::string model_id = req.query_param("model");
@@ -1037,6 +1059,15 @@ public:
       if (id.ends_with("/events"))
         id.remove_suffix(std::string_view("/events").size());
       model_id = registry.JobOwner(id);
+    }
+    if (const router::PresetModel* preset =
+            model_id.empty() ? nullptr : registry.Find(model_id);
+        preset != nullptr && preset->remote.has_value()) {
+      // The remote router finds the job itself: path and query go unchanged
+      // and the SSE stream relays as it arrives.
+      const router::RemoteSpec spec = *preset->remote;
+      lock.unlock();
+      return RelayRemote(model_id, spec, req);
     }
     const auto worker = model_id.empty() || !LoadedLocked(model_id)
                             ? nullptr
