@@ -263,11 +263,11 @@ MaskChannel ParseMaskChannel(std::string_view name) {
       "mask channel must be auto, alpha, red, green or blue");
 }
 
-std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
-                               int width, int height) {
+namespace {
+
+// Edit value (0 keep .. 255 edit) of every mask pixel for `channel`.
+std::vector<std::uint8_t> EditValues(const Image& mask, MaskChannel channel) {
   CheckImage(mask);
-  if (width < 16 || height < 16 || width % 16 || height % 16)
-    throw std::invalid_argument("masked image size must be multiples of 16");
   // kAuto without a translucent pixel reads luminance (white = edit).
   bool luminance = false;
   if (channel == MaskChannel::kAuto) {
@@ -279,21 +279,65 @@ std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
         break;
       }
   }
-  const auto edit = [&](std::size_t pixel) -> int {
-    const auto* p = mask.rgba.data() + 4 * pixel;
+  std::vector<std::uint8_t> values(mask.rgba.size() / 4);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    const auto* p = mask.rgba.data() + 4 * i;
+    int v = p[0];
     if (luminance)  // ITU-R BT.601, as Pillow's convert("L")
-      return (p[0] * 299 + p[1] * 587 + p[2] * 114 + 500) / 1000;
-    switch (channel) {
-      case MaskChannel::kAlpha:
-        return 255 - p[3];
-      case MaskChannel::kGreen:
-        return p[1];
-      case MaskChannel::kBlue:
-        return p[2];
-      default:
-        return p[0];
-    }
-  };
+      v = (p[0] * 299 + p[1] * 587 + p[2] * 114 + 500) / 1000;
+    else if (channel == MaskChannel::kAlpha)
+      v = 255 - p[3];
+    else if (channel == MaskChannel::kGreen)
+      v = p[1];
+    else if (channel == MaskChannel::kBlue)
+      v = p[2];
+    values[i] = static_cast<std::uint8_t>(v);
+  }
+  return values;
+}
+
+// w = max(w, max over the 3 x 3 neighbors - step), `radius` times: the
+// max-plus dilation by a Chebyshev cone of slope 1 / (radius + 1).
+void Spread(std::vector<float>& w, int rows, int cols, int radius) {
+  const float step = 1.0F / static_cast<float>(radius + 1);
+  std::vector<float> row_max(w.size());
+  for (int k = 0; k < radius; ++k) {
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c) {
+        const std::size_t i = static_cast<std::size_t>(r) * cols + c;
+        float m = w[i];
+        if (c > 0)
+          m = std::max(m, w[i - 1]);
+        if (c + 1 < cols)
+          m = std::max(m, w[i + 1]);
+        row_max[i] = m;
+      }
+    bool changed = false;
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c) {
+        const std::size_t i = static_cast<std::size_t>(r) * cols + c;
+        float m = row_max[i];
+        if (r > 0)
+          m = std::max(m, row_max[i - cols]);
+        if (r + 1 < rows)
+          m = std::max(m, row_max[i + cols]);
+        if (m - step > w[i]) {
+          w[i] = m - step;
+          changed = true;
+        }
+      }
+    if (!changed)
+      break;
+  }
+}
+
+}  // namespace
+
+std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
+                               int width, int height) {
+  if (width < 16 || height < 16 || width % 16 || height % 16)
+    throw std::invalid_argument("masked image size must be multiples of 16");
+  const auto edit = EditValues(mask, channel);
   const int rows = height / 16, cols = width / 16;
   std::vector<float> weights(static_cast<std::size_t>(rows) * cols);
   // Cell [c * 16, c * 16 + 16) covers mask pixels [c * 16 * size / output,
@@ -313,8 +357,8 @@ std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
       int most = 0;
       for (int y = y0; y < std::min(y1, mask.height) && most < 255; ++y)
         for (int x = x0; x < std::min(x1, mask.width); ++x)
-          most = std::max(
-              most, edit(static_cast<std::size_t>(y) * mask.width + x));
+          most = std::max<int>(
+              most, edit[static_cast<std::size_t>(y) * mask.width + x]);
       weights[static_cast<std::size_t>(r) * cols + c] =
           static_cast<float>(most) / 255.0F;
     }
@@ -322,6 +366,58 @@ std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
   return weights;
 }
 
+std::vector<float> SpreadMask(std::span<const float> weights, int rows,
+                              int cols, int radius) {
+  if (rows <= 0 || cols <= 0 ||
+      weights.size() != static_cast<std::size_t>(rows) * cols || radius < 0)
+    throw std::invalid_argument("invalid mask spread");
+  std::vector<float> result(weights.begin(), weights.end());
+  Spread(result, rows, cols, radius);
+  return result;
+}
+
+std::vector<float> CompositeWeights(const Image& mask, MaskChannel channel,
+                                    int width, int height, int feather) {
+  if (width <= 0 || height <= 0 || feather < 0)
+    throw std::invalid_argument("invalid mask composite");
+  const auto edit = EditValues(mask, channel);
+  std::vector<float> weights(static_cast<std::size_t>(width) * height);
+  for (int y = 0; y < height; ++y) {
+    // Nearest mask pixel to the output pixel's center.
+    const int my = static_cast<int>(
+        (2 * static_cast<std::int64_t>(y) + 1) * mask.height / (2 * height));
+    for (int x = 0; x < width; ++x) {
+      const int mx = static_cast<int>(
+          (2 * static_cast<std::int64_t>(x) + 1) * mask.width / (2 * width));
+      weights[static_cast<std::size_t>(y) * width + x] =
+          static_cast<float>(
+              edit[static_cast<std::size_t>(my) * mask.width + mx]) /
+          255.0F;
+    }
+  }
+  Spread(weights, height, width, feather);
+  return weights;
+}
+
+void CompositeMasked(Image& result, const Image& original,
+                     std::span<const float> weights) {
+  CheckImage(result);
+  CheckImage(original);
+  if (result.width != original.width || result.height != original.height ||
+      weights.size() != static_cast<std::size_t>(result.width) * result.height)
+    throw std::invalid_argument("mask composite shape mismatch");
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    const float w = weights[i];
+    if (w >= 1)
+      continue;
+    for (int c = 0; c < 4; ++c) {
+      auto& out = result.rgba[4 * i + c];
+      out = w <= 0 ? original.rgba[4 * i + c]
+                   : static_cast<std::uint8_t>(std::lround(
+                         w * out + (1 - w) * original.rgba[4 * i + c]));
+    }
+  }
+}
 void BlendMasked(std::span<float> latent, std::span<const float> kept,
                  std::span<const float> weights, int cols) {
   if (cols <= 0 || latent.size() != kept.size() ||
@@ -366,12 +462,21 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument("strength below 1 requires an input image");
   if (request.init_image)
     CheckImage(*request.init_image);
+  if (request.mask_feather < 0 || request.mask_feather > 64)
+    throw std::invalid_argument("mask feather must be 0 to 64 pixels");
+  if (request.mask_blur < 0 || request.mask_blur > 4)
+    throw std::invalid_argument("mask blur must be 0 to 4 cells");
+  if (!(request.mask_release >= 0 && request.mask_release <= 0.9))
+    throw std::invalid_argument("mask release must be between 0 and 0.9");
   if (request.mask) {
     if (!request.init_image)
       throw std::invalid_argument("a mask requires an input image to edit");
     CheckImage(*request.mask);
-  } else if (request.mask_channel != MaskChannel::kAuto) {
-    throw std::invalid_argument("a mask channel requires a mask");
+  } else if (request.mask_channel != MaskChannel::kAuto ||
+             !request.mask_composite ||
+             request.mask_feather != kDefaultMaskFeather ||
+             request.mask_blur != 0 || request.mask_release != 0) {
+    throw std::invalid_argument("mask options require a mask");
   }
   if (request.loras.size() > 16)
     throw std::invalid_argument("image requests apply at most 16 LoRAs");

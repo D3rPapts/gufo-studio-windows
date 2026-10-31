@@ -102,7 +102,7 @@ struct ImageTask {
   std::optional<double> strength;
   FileRef init_image;
   /// SetLatentNoiseMask / VAEEncodeForInpaint: masked editing of
-  /// init_image; sent as the multipart "mask" with gufo.mask_channel.
+  /// `init_image`; sent as the multipart "mask" with gufo.mask_channel.
   FileRef mask;
   std::string mask_channel;  // "alpha", "red", "green" or "blue"
   SizeSource size_source{SizeSource::kSquare};

@@ -132,9 +132,10 @@ struct Parsed {
   std::optional<image::Image> mask;
 };
 
-constexpr std::array<std::string_view, 7> kExtensionFields{
-    "negative_prompt", "guidance",   "strength",    "init_image",
-    "preview",         "mask",       "mask_channel"};
+constexpr std::array<std::string_view, 11> kExtensionFields{
+    "negative_prompt", "guidance",       "strength",     "init_image",
+    "preview",         "mask",           "mask_channel", "mask_composite",
+    "mask_feather",    "mask_blur",      "mask_release"};
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -243,7 +244,9 @@ Parsed Multipart(const HttpRequest& request) {
         if (!extension.is_object() || extension.contains(key))
           throw std::invalid_argument("duplicate field " + name);
         extension[key] = key == "guidance" || key == "strength" ||
-                                 key == "preview"
+                                 key == "preview" || key == "mask_composite" ||
+                                 key == "mask_feather" || key == "mask_blur" ||
+                                 key == "mask_release"
                              ? ParseJson(data)
                              : json::Value(std::string(data));
       } else if (name == "gufo") {
@@ -525,6 +528,16 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       }
       generation.mask_channel =
           image::ParseMaskChannel(String(*extension, "mask_channel", "auto"));
+      if (const auto* composite = extension->find("mask_composite")) {
+        if (!composite->is_bool())
+          throw std::invalid_argument("gufo.mask_composite must be a boolean");
+        generation.mask_composite = composite->as_bool();
+      }
+      generation.mask_feather = static_cast<int>(Number(
+          *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
+      generation.mask_blur =
+          static_cast<int>(Number(*extension, "mask_blur", 0, 0, 4));
+      generation.mask_release = Real(*extension, "mask_release", 0, 0, 0.9);
     }
     if (extension && extension->contains("strength") && !parsed.init_image) {
       // A single uploaded "image" is the start image, not a reference.
@@ -632,6 +645,11 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " strength=" << generation.strength
               << " init_image=" << (generation.init_image ? 1 : 0)
               << " mask=" << (generation.mask ? 1 : 0);
+      if (generation.mask)
+        details << " mask_composite=" << (generation.mask_composite ? 1 : 0)
+                << " mask_feather=" << generation.mask_feather
+                << " mask_blur=" << generation.mask_blur
+                << " mask_release=" << generation.mask_release;
       if (!service.loras().files.empty())
         details << " loras=" << LoraList(generation.loras)
                 << " lora_ms=" << result.metrics.lora_ms;

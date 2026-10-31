@@ -400,11 +400,57 @@ int main(int argc, char** argv) {
     }
     assert(rejected);
   }
+  // Spread: linear falloff of 1 / (radius + 1) per cell, Chebyshev distance.
+  const std::vector<float> center{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  assert(SpreadMask(center, 5, 5, 0) == center);
+  const auto spread = SpreadMask(center, 5, 5, 2);
+  const auto near = [](float a, float b) { return std::abs(a - b) < 1e-6F; };
+  assert(spread[12] == 1 && near(spread[0], 1.0F / 3.0F) &&
+         near(spread[6], 2.0F / 3.0F) && spread[8] == spread[6]);
+  const auto wide = SpreadMask(center, 5, 5, 4);  // never beyond the grid
+  assert(near(wide[0], 0.6F) && near(wide[1], 0.6F) && near(wide[7], 0.8F));
+  // Composite: mask pixel nearest to each output pixel, feathered in pixels.
+  auto strip = solid(4, 1, {0, 0, 0, 255});
+  set(strip, 0, 0, {0, 0, 0, 0});
+  const auto exact = CompositeWeights(strip, MaskChannel::kAuto, 8, 1, 0);
+  assert((exact == std::vector<float>{1, 1, 0, 0, 0, 0, 0, 0}));
+  const auto soft = CompositeWeights(strip, MaskChannel::kAuto, 8, 1, 3);
+  assert(soft[1] == 1 && soft[2] == 0.75F && soft[3] == 0.5F &&
+         soft[4] == 0.25F && soft[5] == 0 && soft[7] == 0);
+  Image generated = solid(8, 1, {200, 100, 0, 255});
+  const Image original = solid(8, 1, {0, 100, 200, 255});
+  CompositeMasked(generated, original, soft);
+  assert(generated.rgba[0] == 200 && generated.rgba[4 * 2] == 150 &&
+         generated.rgba[4 * 2 + 2] == 50 && generated.rgba[4 * 3] == 100 &&
+         generated.rgba[4 * 7 + 2] == 200);
+  assert(std::equal(generated.rgba.begin() + 20, generated.rgba.end(),
+                    original.rgba.begin() + 20));
+  {
+    bool rejected = false;
+    try {
+      CompositeMasked(generated, solid(4, 1, {0, 0, 0, 255}), soft);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
   ValidateRequest(Request{.init_image = image, .mask = openai});
+  ValidateRequest(Request{.init_image = image,
+                          .mask = openai,
+                          .mask_composite = false,
+                          .mask_feather = 0,
+                          .mask_blur = 4,
+                          .mask_release = 0.9});
   ValidateRequest(Request{.init_image = image, .strength = 0.4, .mask = openai});
   for (const auto& invalid :
        {Request{.mask = openai},
-        Request{.init_image = image, .mask_channel = MaskChannel::kRed}}) {
+        Request{.init_image = image, .mask_channel = MaskChannel::kRed},
+        Request{.init_image = image, .mask_composite = false},
+        Request{.init_image = image, .mask_blur = 1},
+        Request{.init_image = image, .mask = openai, .mask_feather = 65},
+        Request{.init_image = image, .mask = openai, .mask_blur = 5},
+        Request{.init_image = image, .mask = openai, .mask_release = 0.95}}) {
     bool rejected = false;
     try {
       ValidateRequest(invalid);
@@ -453,12 +499,26 @@ int main(int argc, char** argv) {
   assert(seen.mask && seen.init_image && seen.images.empty() &&
          seen.strength == 0.6 && seen.mask_channel == MaskChannel::kAlpha &&
          seen.width == 256);
+  assert(seen.mask_composite && seen.mask_feather == kDefaultMaskFeather &&
+         seen.mask_blur == 0 && seen.mask_release == 0);
+  http.body = multipart({{"prompt", "a red cube"},
+                         {"gufo.mask_composite", "false"},
+                         {"gufo.mask_feather", "4"},
+                         {"gufo.mask_blur", "1"},
+                         {"gufo.mask_release", "0.25"}},
+                        true, true);
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(!seen.mask_composite && seen.mask_feather == 4 &&
+         seen.mask_blur == 1 && seen.mask_release == 0.25);
   for (const auto& body :
        {multipart({{"prompt", "a"}}, false, true),
         multipart({{"prompt", "a"}}, true, true, 2),
         multipart({{"prompt", "a"}, {"gufo.mask_channel", "hue"}}, true, true),
         multipart({{"prompt", "a"}, {"gufo.mask_channel", "red"}}, true,
-                  false)}) {
+                  false),
+        multipart({{"prompt", "a"}, {"gufo.mask_composite", "1"}}, true, true),
+        multipart({{"prompt", "a"}, {"gufo.mask_feather", "2.5"}}, true, true),
+        multipart({{"prompt", "a"}, {"gufo.mask_blur", "1"}}, true, false)}) {
     http.body = body;
     assert(gufo::server::HandleImageApiRequest(http, extended).status == 400);
   }

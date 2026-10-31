@@ -55,6 +55,22 @@ std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
 /// row r of `latent` becomes m * latent + (1 - m) * kept with m = weights[r].
 void BlendMasked(std::span<float> latent, std::span<const float> kept,
                  std::span<const float> weights, int cols);
+/// Widens cell weights by `radius` cells with a linear falloff:
+/// w = max(w, max over neighbors (w_n - d / (radius + 1))), d the Chebyshev
+/// cell distance. Edited cells never lose weight; radius 0 returns `weights`.
+std::vector<float> SpreadMask(std::span<const float> weights, int rows,
+                              int cols, int radius);
+/// Per output pixel weight of the generated image for the final composite:
+/// the mask's edit value at that pixel (nearest mask pixel), widened by
+/// `feather` pixels with a linear falloff (as SpreadMask, in pixels). 0
+/// outside keeps the start image's pixel exactly.
+std::vector<float> CompositeWeights(const Image& mask, MaskChannel channel,
+                                    int width, int height, int feather);
+/// result = w * result + (1 - w) * original per RGBA byte, rounded.
+void CompositeMasked(Image& result, const Image& original,
+                     std::span<const float> weights);
+/// Default soft edge of the final composite, in output pixels.
+inline constexpr int kDefaultMaskFeather = 16;
 
 /// A registered adapter selected by name; strength multiplies its alpha/rank.
 struct Lora {
@@ -92,6 +108,15 @@ struct Request {
   /// full strength (also on Turbo) and with strength below 1.
   std::optional<Image> mask;
   MaskChannel mask_channel{MaskChannel::kAuto};
+  /// Copy the start image's pixels back outside the mask after decoding,
+  /// with a `mask_feather` pixel soft edge (CompositeWeights), so the kept
+  /// area is the start image exactly instead of its VAE round trip.
+  bool mask_composite{true};
+  int mask_feather{kDefaultMaskFeather};
+  /// Widen the latent mask by this many cells with a falloff (SpreadMask).
+  int mask_blur{0};
+  /// Fraction of the final steps that no longer reset kept cells.
+  double mask_release{0};
   /// Live preview of the denoised estimate; never changes the image.
   models::PreviewHook preview;
   // Applied in order; scale 0 entries are ignored.

@@ -1012,10 +1012,11 @@ Result Model::Generate(const Request& request,
     Matrix start_noise, mask_weights;
     if (masked) {
       start_noise = latent;
-      mask_weights =
-          rt.Upload(MaskWeights(*request.mask, request.mask_channel,
-                                request.width, request.height),
-                    height * width, 1);
+      mask_weights = rt.Upload(
+          SpreadMask(MaskWeights(*request.mask, request.mask_channel,
+                                 request.width, request.height),
+                     height, width, request.mask_blur),
+          height * width, 1);
       rt.Observe(observer, "mask", mask_weights);
     }
     const auto denoise_start = Clock::now();
@@ -1055,7 +1056,10 @@ Result Model::Generate(const Request& request,
                    velocity);
       }
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
-      if (masked)
+      // The last mask_release share of the steps lets kept cells settle
+      // with the edit (the composite restores their pixels).
+      if (masked && step < steps - static_cast<int>(std::lround(
+                                        request.mask_release * steps)))
         // Kept cells follow the start image's trajectory and end on its
         // latent at sigma 0; the edited cells see them as context.
         latent = rt.MaskBlend(
@@ -1091,6 +1095,11 @@ Result Model::Generate(const Request& request,
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
+    if (masked && request.mask_composite)
+      CompositeMasked(result.image, *init_image,
+                      CompositeWeights(*request.mask, request.mask_channel,
+                                       request.width, request.height,
+                                       request.mask_feather));
     result.metrics.vae_ms = Milliseconds(vae_start);
     result.metrics.total_ms = Milliseconds(total_start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();
