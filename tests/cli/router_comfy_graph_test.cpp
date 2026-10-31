@@ -357,6 +357,65 @@ void TestImageToImage() {
   assert(error.message.find("VAEEncode") != std::string::npos);
 }
 
+void TestMaskedEdit() {
+  // SetLatentNoiseMask over VAEEncode with LoadImage's MASK output (1 - alpha).
+  std::string text = Replace(
+      kQwenCanvas, R"("latent_image": ["c2", 0])", R"("latent_image": ["m2", 0])");
+  text = Replace(text, R"( "6": {"class_type": "KSampler")",
+                 R"( "m1": {"class_type": "LoadImage", "inputs": {"image": "maske.png"}},
+ "m2": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["c2", 0], "mask": ["m1", 1]}},
+ "6": {"class_type": "KSampler")");
+  comfy::Plan plan = PlanOf(text.c_str());
+  auto image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert((image.init_image == comfy::FileRef{"leinwand.png", "input"}));
+  assert((image.mask == comfy::FileRef{"maske.png", "input"}));
+  assert(image.mask_channel == "alpha" && !image.strength);
+  assert(image.size_source == comfy::SizeSource::kCanvas);
+  assert(image.references.size() == 3);
+  assert(comfy::ImageExtension(image).member_str("mask_channel") == "alpha");
+  // With denoise below 1 both apply.
+  plan = PlanOf(Replace(text, "\"denoise\": 1.0", "\"denoise\": 0.7").c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.strength && *image.strength == 0.7 && !image.mask.name.empty());
+  // LoadImageMask keeps its channel.
+  const std::string channel = Replace(
+      text, R"("m1": {"class_type": "LoadImage", "inputs": {"image": "maske.png"}})",
+      R"("m1": {"class_type": "LoadImageMask", "inputs": {"image": "maske.png [output]", "channel": "red"}})");
+  plan = PlanOf(Replace(channel, R"("mask": ["m1", 1])", R"("mask": ["m1", 0])")
+                    .c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert((image.mask == comfy::FileRef{"maske.png", "output"}));
+  assert(image.mask_channel == "red");
+  assert(ErrorOf(Replace(channel, "\"red\"", "\"hue\"")).message.find(
+             "channel") != std::string::npos);
+  // The IMAGE output of LoadImage is not a mask.
+  assert(ErrorOf(Replace(text, R"("mask": ["m1", 1])", R"("mask": ["m1", 0])"))
+             .message.find("MASK output") != std::string::npos);
+  // SetLatentNoiseMask needs an encoded image.
+  assert(ErrorOf(Replace(text, R"("samples": ["c2", 0])",
+                         R"("samples": ["5", 2])"))
+             .message.find("VAEEncode") != std::string::npos);
+  // VAEEncodeForInpaint maps to the same masked edit, with a warning.
+  std::string inpaint = Replace(
+      kQwenCanvas,
+      R"("c2": {"class_type": "VAEEncode", "inputs": {"pixels": ["c1", 0], "vae": ["2", 0]}})",
+      R"("c2": {"class_type": "VAEEncodeForInpaint", "inputs": {"pixels": ["c1", 0], "vae": ["2", 0], "mask": ["c1", 1], "grow_mask_by": 6}})");
+  plan = PlanOf(inpaint.c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert((image.init_image == comfy::FileRef{"leinwand.png", "input"}));
+  assert((image.mask == comfy::FileRef{"leinwand.png", "input"}));
+  assert(image.mask_channel == "alpha");
+  bool warned = false;
+  for (const auto& warning : plan.warnings)
+    warned |= warning.find("VAEEncodeForInpaint") != std::string::npos;
+  assert(warned);
+  // Without a mask nothing changes: no mask field is sent.
+  plan = PlanOf(kQwenCanvas);
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.mask.name.empty() && image.init_image.name.empty());
+  assert(comfy::ImageExtension(image).find("mask_channel") == nullptr);
+}
+
 void TestQwenLoras() {
   // LoraLoader -> LoraLoaderModelOnly (strength 0) -> LoraLoaderModelOnly ->
   // KSampler: "loras" in the order ComfyUI applies them, loader side first.
@@ -1038,6 +1097,7 @@ int main() {
   TestWan();
   TestUnsupportedNodes();
   TestImageToImage();
+  TestMaskedEdit();
   TestQwenLoras();
   TestQwenTurbo();
   TestRife();

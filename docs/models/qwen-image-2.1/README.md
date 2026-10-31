@@ -63,9 +63,60 @@ therefore differ from older Gufo releases; generation seeds are unchanged.
 
 The official repository recommends 2048²; Gufo follows the pinned Diffusers
 1024² default. Set `size` explicitly for larger output. Output is PNG/base64;
-URL output, separate masks, streaming and `input_fidelity` are unsupported.
+URL output, streaming and `input_fidelity` are unsupported.
 OpenAI SDK clients use the local `/v1` base URL; `seed` and `steps` are Gufo
 extensions supplied through `extra_body`.
+
+### Masked editing (inpainting)
+
+A `mask` upload limits the edit to an area of the first image, as in the
+OpenAI API: transparent mask pixels are regenerated, opaque ones are kept.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/images/edits \
+  -F model=Qwen-Image-2.1 -F image=@shot.png -F mask=@mask.png \
+  -F 'prompt=A red umbrella in her hand' -F seed=42 > response.json
+```
+
+No inpainting checkpoint is needed. After every denoising step the latent
+cells the mask keeps are reset to the start image, noised with the same
+initial noise to the step's sigma; the masked cells denoise freely and see
+the kept area as context. A cell is 16 x 16 output pixels; it is edited when
+any mask pixel in it is, so the edit area rounds outward to that grid, and by
+default the latent mask is widened by one more cell at half weight
+(`gufo.mask_blur`), which measured a smoother seam.
+
+After decoding, the start image's pixels are copied back outside the mask with
+a linear soft edge of `gufo.mask_feather` pixels (default 16). Everything
+farther from the mask than the feather is the start image byte for byte; the
+VAE round trip alone would change it (41.5 dB at 512²) and the decoder carries
+small changes about 32 pixels past the edited cells. 16 pixels covers the
+half-weight cell and the strongest decoder spill without a visible step; 4
+pixels can cut spilled edges hard, 32 pixels shows more of the decoder's
+changes around the mask. `gufo.mask_composite=false` returns the decoded image
+as is (ComfyUI's SetLatentNoiseMask output).
+
+| Setting | Behavior |
+| --- | --- |
+| `mask` | PNG/JPEG of any size, scaled to the output size. Counts toward the 20 MiB upload limit. |
+| `gufo.mask_channel` | `auto` (default): alpha when any pixel is translucent (transparent = edit), otherwise luminance (white = edit). `alpha`: 1 - alpha only (an opaque mask keeps everything). `red`, `green`, `blue`: that channel, white = edit. Partial values blend partially. |
+| Start image | The first `image` upload, which also stays a reference so the edit model sees the whole picture; or `init_image` (multipart) / `gufo.init_image` (JSON, base64) for a start image that is not a reference. `size` `auto` keeps its canvas (rounded to 32). |
+| `gufo.mask_feather` | 0–64 output pixels of soft edge for the composite, default 16; 0 copies the start image back right up to the mask. |
+| `gufo.mask_composite` | Default `true`. `false` skips the composite. |
+| `gufo.mask_blur` | 0–4 cells (16 px each) of latent mask widening with a linear falloff, default 1. |
+| `gufo.strength` | Optional. Below 1 the masked area starts from the noised start image instead of pure noise (keeps its layout). With exactly one `image`, that image is then only the start image, not a reference. |
+
+JSON requests to `/v1/images/generations` take `gufo.mask` as base64 or a data
+URL next to `gufo.init_image`. Turbo supports masks at its fixed schedule
+(full strength only). Requests without a mask are unchanged.
+
+The router's ComfyUI adapter maps `SetLatentNoiseMask` (samples from
+`VAEEncode`) and `VAEEncodeForInpaint` to the same request. The mask must come
+from the MASK output of `LoadImage`/`LoadImageOutput` (1 - alpha) or from
+`LoadImageMask` (its channel). `VAEEncodeForInpaint` keeps the original pixels
+under the mask instead of gray and ignores `grow_mask_by` (with a warning);
+at `denoise` 1 that makes no difference. The ComfyUI mask editor upload
+(`/upload/mask`) is not supported; upload the mask as an image.
 
 For llama-swap, add this model and send the same requests to the proxy:
 

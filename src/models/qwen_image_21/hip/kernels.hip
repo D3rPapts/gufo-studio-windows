@@ -268,6 +268,18 @@ __global__ void Elementwise(const B* x, const B* other, B* y, std::size_t n,
   y[i] = Bf16(value);
 }
 
+// Masked editing: per-row weight between the denoised latent and the start
+// image noised to the same sigma (FP32 blend, one BF16 rounding).
+__global__ void MaskBlendRows(const B* x, const B* kept, const B* weights,
+                              B* y, std::size_t n, int cols) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const float w = float(weights[i / cols]);
+  y[i] = Bf16(w * float(x[i]) + (1.0F - w) * float(kept[i]));
+}
+
 __global__ void PrepareModulation(const B* x, B* y, int count, bool gates) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < count) {
@@ -1619,6 +1631,18 @@ Matrix Runtime::NoiseMix(const Matrix& noise, const Matrix& image,
   auto out = New(noise.rows, noise.cols);
   Elementwise<<<Blocks(out.size()), 256, 0, stream_>>>(
       Ptr(noise), Ptr(image), Ptr(out), out.size(), 8, sigma);
+  Check(hipGetLastError());
+  return out;
+}
+
+Matrix Runtime::MaskBlend(const Matrix& x, const Matrix& kept,
+                          const Matrix& weights) {
+  if (x.rows != kept.rows || x.cols != kept.cols || weights.rows != x.rows ||
+      weights.cols != 1 || x.packed || kept.packed)
+    throw std::logic_error("Qwen-Image mask blend shape mismatch");
+  auto out = New(x.rows, x.cols);
+  MaskBlendRows<<<Blocks(out.size()), 256, 0, stream_>>>(
+      Ptr(x), Ptr(kept), Ptr(weights), Ptr(out), out.size(), x.cols);
   Check(hipGetLastError());
   return out;
 }

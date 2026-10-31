@@ -101,6 +101,10 @@ struct ImageTask {
   /// denoise < 1: image to image from `init_image` with gufo.strength.
   std::optional<double> strength;
   FileRef init_image;
+  /// SetLatentNoiseMask / VAEEncodeForInpaint: masked editing of
+  /// `init_image`; sent as the multipart "mask" with gufo.mask_channel.
+  FileRef mask;
+  std::string mask_channel;  // "alpha", "red", "green" or "blue"
   SizeSource size_source{SizeSource::kSquare};
   int width{0};
   int height{0};

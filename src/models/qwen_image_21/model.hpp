@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/models/preview_hook.hpp"
@@ -34,6 +35,44 @@ std::uint64_t InitialNoiseSeed(std::uint64_t seed,
 
 /// ComfyUI KSampler treats denoise above this as a full schedule.
 inline constexpr double kFullStrength = 0.9999;
+
+/// Which mask channel marks the area to regenerate.
+/// kAuto: alpha when any pixel is translucent (OpenAI `mask`: transparent =
+/// edit; ComfyUI LoadImage MASK), otherwise luminance (white = edit).
+/// kAlpha: 1 - alpha (a fully opaque mask keeps everything).
+/// kRed/kGreen/kBlue: that channel, white = edit (ComfyUI LoadImageMask).
+enum class MaskChannel { kAuto, kAlpha, kRed, kGreen, kBlue };
+/// "auto", "alpha", "red", "green" or "blue"; throws std::invalid_argument.
+MaskChannel ParseMaskChannel(std::string_view name);
+/// One latent cell per 16 x 16 output pixels, row-major
+/// (height / 16) x (width / 16): the largest edit weight (0 keep .. 1 edit)
+/// of the mask pixels the cell covers, after scaling the mask to
+/// width x height (nearest area, no filter overshoot). Rounding outward keeps
+/// every edited pixel editable; cells the mask does not touch stay exactly 0.
+std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
+                               int width, int height);
+/// FP32 reference of the per-step blend (the GPU rounds the result to BF16):
+/// row r of `latent` becomes m * latent + (1 - m) * kept with m = weights[r].
+void BlendMasked(std::span<float> latent, std::span<const float> kept,
+                 std::span<const float> weights, int cols);
+/// Widens cell weights by `radius` cells with a linear falloff:
+/// w = max(w, max over neighbors (w_n - d / (radius + 1))), d the Chebyshev
+/// cell distance. Edited cells never lose weight; radius 0 returns `weights`.
+std::vector<float> SpreadMask(std::span<const float> weights, int rows,
+                              int cols, int radius);
+/// Per output pixel weight of the generated image for the final composite:
+/// the mask's edit value at that pixel (nearest mask pixel), widened by
+/// `feather` pixels with a linear falloff (as SpreadMask, in pixels). 0
+/// outside keeps the start image's pixel exactly.
+std::vector<float> CompositeWeights(const Image& mask, MaskChannel channel,
+                                    int width, int height, int feather);
+/// result = w * result + (1 - w) * original per RGBA byte, rounded.
+void CompositeMasked(Image& result, const Image& original,
+                     std::span<const float> weights);
+/// Default soft edge of the final composite, in output pixels.
+inline constexpr int kDefaultMaskFeather = 16;
+/// Default widening of the latent mask, in 16-pixel cells.
+inline constexpr int kDefaultMaskBlur = 1;
 
 /// A registered adapter selected by name; strength multiplies its alpha/rank.
 struct Lora {
@@ -64,6 +103,22 @@ struct Request {
   /// strength.
   std::optional<Image> init_image;
   double strength{1};
+  /// Masked editing (inpainting) of `init_image`, which it requires; any
+  /// size, see MaskWeights for its channels. After every step the cells the
+  /// mask keeps return to the start image noised to the next sigma, so they
+  /// end as the start image's latent; edited cells denoise freely. Works at
+  /// full strength (also on Turbo) and with strength below 1.
+  std::optional<Image> mask;
+  MaskChannel mask_channel{MaskChannel::kAuto};
+  /// Copy the start image's pixels back outside the mask after decoding,
+  /// with a `mask_feather` pixel soft edge (CompositeWeights), so the kept
+  /// area is the start image exactly instead of its VAE round trip.
+  bool mask_composite{true};
+  int mask_feather{kDefaultMaskFeather};
+  /// Widen the latent mask by this many cells with a falloff (SpreadMask).
+  /// One cell (half weight 16 px past the mask) measured a smoother seam
+  /// under the default composite; the feather covers it.
+  int mask_blur{kDefaultMaskBlur};
   /// Live preview of the denoised estimate; never changes the image.
   models::PreviewHook preview;
   // Applied in order; scale 0 entries are ignored.

@@ -318,6 +318,235 @@ int main(int argc, char** argv) {
   assert(seen.strength == 0.5 && seen.init_image && seen.images.empty() &&
          seen.guidance == 3 && seen.negative_prompt == "blurry" &&
          seen.width == 256);
+
+  // Masked editing: mask channels, cell weights, blend and request parsing.
+  assert(ParseMaskChannel("auto") == MaskChannel::kAuto);
+  assert(ParseMaskChannel("alpha") == MaskChannel::kAlpha);
+  assert(ParseMaskChannel("blue") == MaskChannel::kBlue);
+  for (const auto* bad : {"", "Alpha", "luma", "red "}) {
+    bool rejected = false;
+    try {
+      (void)ParseMaskChannel(bad);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  const auto solid = [](int w, int h, std::array<std::uint8_t, 4> rgba) {
+    Image result{w, h, {}};
+    for (int i = 0; i < w * h; ++i)
+      result.rgba.insert(result.rgba.end(), rgba.begin(), rgba.end());
+    return result;
+  };
+  const auto set = [](Image& target, int x, int y,
+                      std::array<std::uint8_t, 4> rgba) {
+    std::copy(rgba.begin(), rgba.end(),
+              target.rgba.begin() + (std::size_t(y) * target.width + x) * 4);
+  };
+  // OpenAI mask: one transparent pixel edits exactly its 16 x 16 cell.
+  auto openai = solid(64, 64, {0, 0, 0, 255});
+  set(openai, 40, 8, {0, 0, 0, 0});
+  assert((MaskWeights(openai, MaskChannel::kAuto, 64, 64) ==
+          std::vector<float>{0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+  // Half the size: 32 mask pixels per cell, still exactly one cell.
+  assert((MaskWeights(openai, MaskChannel::kAlpha, 32, 32) ==
+          std::vector<float>{0, 1, 0, 0}));
+  // Twice the size: a cell covers 8 x 8 mask pixels.
+  const auto doubled = MaskWeights(openai, MaskChannel::kAlpha, 128, 128);
+  assert(doubled.size() == 64);
+  for (int r = 0; r < 8; ++r)
+    for (int c = 0; c < 8; ++c)
+      assert(doubled[r * 8 + c] == ((r == 1 && (c == 5)) ? 1.0F : 0.0F));
+  // Partial alpha is a partial weight; the cell takes its largest weight.
+  set(openai, 41, 9, {0, 0, 0, 128});
+  set(openai, 3, 60, {0, 0, 0, 128});
+  const auto partial = MaskWeights(openai, MaskChannel::kAuto, 64, 64);
+  assert(partial[2] == 1 && partial[12] == 127.0F / 255.0F);
+  // Opaque masks: auto reads luminance (white edits), alpha keeps everything.
+  auto painted = solid(32, 48, {0, 0, 0, 255});
+  set(painted, 31, 47, {255, 255, 255, 255});
+  set(painted, 0, 0, {255, 0, 0, 255});
+  const auto luma = MaskWeights(painted, MaskChannel::kAuto, 32, 48);
+  assert(luma.size() == 6 && luma[5] == 1 && luma[1] == 0);
+  assert(luma[0] == 76.0F / 255.0F);  // (255 * 299 + 500) / 1000
+  assert(MaskWeights(painted, MaskChannel::kRed, 32, 48)[0] == 1);
+  assert(MaskWeights(painted, MaskChannel::kGreen, 32, 48)[0] == 0);
+  for (const float w : MaskWeights(painted, MaskChannel::kAlpha, 32, 48))
+    assert(w == 0);
+  // A 1 x 1 mask covers every cell.
+  for (const float w :
+       MaskWeights(solid(1, 1, {0, 0, 0, 0}), MaskChannel::kAuto, 96, 32))
+    assert(w == 1);
+  for (const auto [w, h] : {std::pair{8, 16}, {24, 32}, {32, 40}, {0, 32}}) {
+    bool rejected = false;
+    try {
+      (void)MaskWeights(openai, MaskChannel::kAuto, w, h);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  // Blend: weight 1 keeps the sample, 0 the start image, exactly.
+  std::vector<float> sample{1.5F, -2, 3, 4, 0.25F, -8};
+  const std::vector<float> kept{9, 9, 7, 7, -1, 2};
+  BlendMasked(sample, kept, std::vector<float>{1, 0, 0.5F}, 2);
+  assert((sample == std::vector<float>{1.5F, -2, 7, 7, -0.375F, -3}));
+  {
+    bool rejected = false;
+    try {
+      BlendMasked(sample, kept, std::vector<float>{1, 0}, 2);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  // Spread: linear falloff of 1 / (radius + 1) per cell, Chebyshev distance.
+  const std::vector<float> center{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  assert(SpreadMask(center, 5, 5, 0) == center);
+  const auto spread = SpreadMask(center, 5, 5, 2);
+  const auto near = [](float a, float b) { return std::abs(a - b) < 1e-6F; };
+  assert(spread[12] == 1 && near(spread[0], 1.0F / 3.0F) &&
+         near(spread[6], 2.0F / 3.0F) && spread[8] == spread[6]);
+  const auto wide = SpreadMask(center, 5, 5, 4);  // never beyond the grid
+  assert(near(wide[0], 0.6F) && near(wide[1], 0.6F) && near(wide[7], 0.8F));
+  // Composite: mask pixel nearest to each output pixel, feathered in pixels.
+  auto strip = solid(4, 1, {0, 0, 0, 255});
+  set(strip, 0, 0, {0, 0, 0, 0});
+  const auto exact = CompositeWeights(strip, MaskChannel::kAuto, 8, 1, 0);
+  assert((exact == std::vector<float>{1, 1, 0, 0, 0, 0, 0, 0}));
+  const auto soft = CompositeWeights(strip, MaskChannel::kAuto, 8, 1, 3);
+  assert(soft[1] == 1 && soft[2] == 0.75F && soft[3] == 0.5F &&
+         soft[4] == 0.25F && soft[5] == 0 && soft[7] == 0);
+  Image generated = solid(8, 1, {200, 100, 0, 255});
+  const Image original = solid(8, 1, {0, 100, 200, 255});
+  CompositeMasked(generated, original, soft);
+  assert(generated.rgba[0] == 200 && generated.rgba[4 * 2] == 150 &&
+         generated.rgba[4 * 2 + 2] == 50 && generated.rgba[4 * 3] == 100 &&
+         generated.rgba[4 * 7 + 2] == 200);
+  assert(std::equal(generated.rgba.begin() + 20, generated.rgba.end(),
+                    original.rgba.begin() + 20));
+  {
+    bool rejected = false;
+    try {
+      CompositeMasked(generated, solid(4, 1, {0, 0, 0, 255}), soft);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  ValidateRequest(Request{.init_image = image, .mask = openai});
+  ValidateRequest(Request{.init_image = image,
+                          .mask = openai,
+                          .mask_composite = false,
+                          .mask_feather = 0,
+                          .mask_blur = 0});
+  ValidateRequest(Request{.init_image = image, .strength = 0.4, .mask = openai});
+  for (const auto& invalid :
+       {Request{.mask = openai},
+        Request{.init_image = image, .mask_channel = MaskChannel::kRed},
+        Request{.init_image = image, .mask_composite = false},
+        Request{.init_image = image, .mask_blur = 0},
+        Request{.init_image = image, .mask = openai, .mask_feather = 65},
+        Request{.init_image = image, .mask = openai, .mask_blur = 5}}) {
+    bool rejected = false;
+    try {
+      ValidateRequest(invalid);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  // Multipart OpenAI edit: "image" + "mask"; the image stays a reference and
+  // is the start image; size keeps its canvas.
+  const auto mask_png = EncodePng(openai);
+  const auto multipart = [&](const std::vector<std::pair<std::string,
+                                                         std::string>>& fields,
+                             bool with_image, bool with_mask, int masks = 1) {
+    std::string body;
+    const auto file = [&](const char* name, const std::vector<std::uint8_t>& b) {
+      body += std::string("--boundary\r\nContent-Disposition: form-data; "
+                          "name=\"") +
+              name + "\"; filename=\"x.png\"\r\nContent-Type: image/png\r\n\r\n";
+      body.append(reinterpret_cast<const char*>(b.data()), b.size());
+      body += "\r\n";
+    };
+    if (with_image)
+      file("image", png);
+    for (int i = 0; with_mask && i < masks; ++i)
+      file("mask", mask_png);
+    for (const auto& [name, value] : fields)
+      body += "--boundary\r\nContent-Disposition: form-data; name=\"" + name +
+              "\"\r\n\r\n" + value + "\r\n";
+    return body + "--boundary--\r\n";
+  };
+  http.path = "/v1/images/edits";
+  http.headers = {{"Content-Type", "multipart/form-data; boundary=boundary"}};
+  http.body = multipart({{"prompt", "a red cube"}}, true, true);
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(seen.mask && seen.mask->rgba == openai.rgba && seen.init_image &&
+         seen.init_image->rgba == image.rgba && seen.images.size() == 1 &&
+         seen.strength == 1 && seen.mask_channel == MaskChannel::kAuto &&
+         seen.width == 32 && seen.height == 32);
+  http.body = multipart({{"prompt", "a red cube"},
+                         {"size", "256x256"},
+                         {"gufo.strength", "0.6"},
+                         {"gufo.mask_channel", "alpha"}},
+                        true, true);
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(seen.mask && seen.init_image && seen.images.empty() &&
+         seen.strength == 0.6 && seen.mask_channel == MaskChannel::kAlpha &&
+         seen.width == 256);
+  assert(seen.mask_composite && seen.mask_feather == kDefaultMaskFeather &&
+         seen.mask_blur == kDefaultMaskBlur);
+  http.body = multipart({{"prompt", "a red cube"},
+                         {"gufo.mask_composite", "false"},
+                         {"gufo.mask_feather", "4"},
+                         {"gufo.mask_blur", "0"}},
+                        true, true);
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(!seen.mask_composite && seen.mask_feather == 4 &&
+         seen.mask_blur == 0);
+  for (const auto& body :
+       {multipart({{"prompt", "a"}}, false, true),
+        multipart({{"prompt", "a"}}, true, true, 2),
+        multipart({{"prompt", "a"}, {"gufo.mask_channel", "hue"}}, true, true),
+        multipart({{"prompt", "a"}, {"gufo.mask_channel", "red"}}, true,
+                  false),
+        multipart({{"prompt", "a"}, {"gufo.mask_composite", "1"}}, true, true),
+        multipart({{"prompt", "a"}, {"gufo.mask_feather", "2.5"}}, true, true),
+        multipart({{"prompt", "a"}, {"gufo.mask_blur", "2"}}, true, false),
+        multipart({{"prompt", "a"}, {"gufo.mask_release", "0.2"}}, true, true)}) {
+    http.body = body;
+    assert(gufo::server::HandleImageApiRequest(http, extended).status == 400);
+  }
+  // JSON: gufo.init_image + gufo.mask (base64), no references.
+  std::string mask_encoded;
+  for (std::size_t i = 0; i < mask_png.size(); i += 3) {
+    const std::uint32_t v =
+        mask_png[i] << 16 |
+        (i + 1 < mask_png.size() ? mask_png[i + 1] << 8 : 0) |
+        (i + 2 < mask_png.size() ? mask_png[i + 2] : 0);
+    const std::size_t digits = std::min<std::size_t>(mask_png.size() - i, 3) + 1;
+    for (std::size_t k = 0; k < 4; ++k)
+      mask_encoded += k < digits ? kDigits[(v >> (18 - 6 * k)) & 63] : '=';
+  }
+  http.path = "/v1/images/generations";
+  http.headers = {{"Content-Type", "application/json"}};
+  http.body = R"({"prompt":"a red cube","size":"64x64","gufo":{"init_image":")" +
+              encoded + R"(","mask":")" + mask_encoded +
+              R"(","mask_channel":"auto"}})";
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(seen.mask && seen.mask->rgba == openai.rgba && seen.init_image &&
+         seen.images.empty() && seen.width == 64 && seen.strength == 1);
+  http.body = R"({"prompt":"a","gufo":{"mask":")" + mask_encoded + R"("}})";
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 400);
+  // Requests without a mask are unchanged.
+  http.body = R"({"prompt":"a red cube","size":"256x256","seed":1})";
+  assert(gufo::server::HandleImageApiRequest(http, extended).status == 200);
+  assert(!seen.mask && !seen.init_image &&
+         seen.mask_channel == MaskChannel::kAuto);
+
   int turbo_calls = 0;
   std::vector<Request> turbo_requests;
   gufo::server::ImageService turbo_service(

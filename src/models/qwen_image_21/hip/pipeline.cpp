@@ -981,9 +981,10 @@ Result Model::Generate(const Request& request,
     }
     const bool img2img =
         request.init_image && request.strength <= kFullStrength;
+    const bool masked = request.init_image && request.mask;
     std::optional<Image> init_image;
     Matrix init_latent;
-    if (img2img) {
+    if (img2img || masked) {
       init_image =
           ResizeImage(*request.init_image, request.width, request.height);
       init_latent = EncodeVae(rt, impl_->weights, *init_image, cancelled,
@@ -1007,6 +1008,17 @@ Result Model::Generate(const Request& request,
       value = normal(rng);
     auto latent = rt.Upload(noise, height * width, 64);
     rt.Observe(observer, "noise", latent);
+    // Masked editing re-noises the start image with the same draws.
+    Matrix start_noise, mask_weights;
+    if (masked) {
+      start_noise = latent;
+      mask_weights = rt.Upload(
+          SpreadMask(MaskWeights(*request.mask, request.mask_channel,
+                                 request.width, request.height),
+                     height, width, request.mask_blur),
+          height * width, 1);
+      rt.Observe(observer, "mask", mask_weights);
+    }
     const auto denoise_start = Clock::now();
     // Turbo uses its checkpoint schedule; partial-strength img2img keeps
     // the base model's KSampler-style truncated schedule.
@@ -1044,6 +1056,12 @@ Result Model::Generate(const Request& request,
                    velocity);
       }
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
+      if (masked)
+        // Kept cells follow the start image's trajectory and end on its
+        // latent at sigma 0; the edited cells see them as context.
+        latent = rt.MaskBlend(
+            latent, rt.NoiseMix(start_noise, init_latent, sigmas[step + 1]),
+            mask_weights);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
       if (request.preview.Wants(step + 1, steps)) {
@@ -1074,6 +1092,11 @@ Result Model::Generate(const Request& request,
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
+    if (masked && request.mask_composite)
+      CompositeMasked(result.image, *init_image,
+                      CompositeWeights(*request.mask, request.mask_channel,
+                                       request.width, request.height,
+                                       request.mask_feather));
     result.metrics.vae_ms = Milliseconds(vae_start);
     result.metrics.total_ms = Milliseconds(total_start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();

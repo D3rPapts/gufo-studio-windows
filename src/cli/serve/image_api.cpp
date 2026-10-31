@@ -129,10 +129,13 @@ struct Parsed {
   json::Value fields = json::Value::object();
   std::vector<image::Image> images;
   std::optional<image::Image> init_image;
+  std::optional<image::Image> mask;
 };
 
-constexpr std::array<std::string_view, 5> kExtensionFields{
-    "negative_prompt", "guidance", "strength", "init_image", "preview"};
+constexpr std::array<std::string_view, 10> kExtensionFields{
+    "negative_prompt", "guidance",     "strength",       "init_image",
+    "preview",         "mask",         "mask_channel",   "mask_composite",
+    "mask_feather",    "mask_blur"};
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -206,27 +209,27 @@ Parsed Multipart(const HttpRequest& request) {
     body.remove_prefix(end + delimiter.size());
     if (++fields > 32)
       throw std::invalid_argument("too many multipart fields");
-    if (name == "image" || name == "image[]" || name == "init_image") {
-      const bool init = name == "init_image";
-      if (init && parsed.init_image)
-        throw std::invalid_argument("duplicate field init_image");
-      if ((!init && parsed.images.size() == 10) ||
+    if (name == "image" || name == "image[]" || name == "init_image" ||
+        name == "mask") {
+      const bool init = name == "init_image", mask = name == "mask";
+      if ((init && parsed.init_image) || (mask && parsed.mask))
+        throw std::invalid_argument("duplicate field " + name);
+      if ((!init && !mask && parsed.images.size() == 10) ||
           data.size() > core::kMaxEncodedImageBytes - image_bytes)
         throw std::invalid_argument("image inputs exceed 10 images or 20 MiB");
       image_bytes += data.size();
       auto decoded_image = image::DecodeImage(std::span(
           reinterpret_cast<const std::uint8_t*>(data.data()), data.size()));
+      // OpenAI mask: transparent pixels mark the area to edit.
       const auto& decoded =
-          init ? parsed.init_image.emplace(std::move(decoded_image))
-               : parsed.images.emplace_back(std::move(decoded_image));
+          init   ? parsed.init_image.emplace(std::move(decoded_image))
+          : mask ? parsed.mask.emplace(std::move(decoded_image))
+                 : parsed.images.emplace_back(std::move(decoded_image));
       image_pixels += static_cast<std::size_t>(decoded.width) * decoded.height;
       if (image_pixels > core::kMaxImagePixels)
         throw std::invalid_argument(
             "reference images exceed 32 megapixels combined");
     } else {
-      if (name == "mask")
-        throw std::invalid_argument(
-            "mask uploads are unsupported; provide annotated reference images");
       if (parsed.fields.contains(name))
         throw std::invalid_argument("duplicate field " + name);
       if (data.size() > (64U << 10U))
@@ -241,7 +244,8 @@ Parsed Multipart(const HttpRequest& request) {
         if (!extension.is_object() || extension.contains(key))
           throw std::invalid_argument("duplicate field " + name);
         extension[key] = key == "guidance" || key == "strength" ||
-                                 key == "preview"
+                                 key == "preview" || key == "mask_composite" ||
+                                 key == "mask_feather" || key == "mask_blur"
                              ? ParseJson(data)
                              : json::Value(std::string(data));
       } else if (name == "gufo") {
@@ -512,6 +516,26 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
             text.starts_with("data:") ? text : "data:image/png;base64," + text);
         parsed.init_image = image::DecodeImage(bytes);
       }
+      if (const auto* mask = extension->find("mask")) {
+        if (parsed.mask || !mask->is_string() ||
+            mask->str().starts_with("http"))
+          throw std::invalid_argument(
+              "gufo.mask must be base64 or a data URL, given once");
+        const auto& text = mask->str();
+        parsed.mask = image::DecodeImage(core::ReadImageUrl(
+            text.starts_with("data:") ? text : "data:image/png;base64," + text));
+      }
+      generation.mask_channel =
+          image::ParseMaskChannel(String(*extension, "mask_channel", "auto"));
+      if (const auto* composite = extension->find("mask_composite")) {
+        if (!composite->is_bool())
+          throw std::invalid_argument("gufo.mask_composite must be a boolean");
+        generation.mask_composite = composite->as_bool();
+      }
+      generation.mask_feather = static_cast<int>(Number(
+          *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
+      generation.mask_blur = static_cast<int>(
+          Number(*extension, "mask_blur", image::kDefaultMaskBlur, 0, 4));
     }
     if (extension && extension->contains("strength") && !parsed.init_image) {
       // A single uploaded "image" is the start image, not a reference.
@@ -521,7 +545,15 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       parsed.init_image = std::move(generation.images.front());
       generation.images.clear();
     }
+    if (parsed.mask && !parsed.init_image) {
+      // Like OpenAI, the mask edits the first image, which stays a reference
+      // (the edit model sees the whole original).
+      if (generation.images.empty())
+        throw std::invalid_argument("a mask needs an image to edit");
+      parsed.init_image = generation.images.front();
+    }
     generation.init_image = std::move(parsed.init_image);
+    generation.mask = std::move(parsed.mask);
     const auto size = String(fields, "size", "auto");
     if (size == "auto") {
       if (generation.init_image) {
@@ -609,7 +641,12 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " steps=" << generation.steps
               << " guidance=" << generation.guidance
               << " strength=" << generation.strength
-              << " init_image=" << (generation.init_image ? 1 : 0);
+              << " init_image=" << (generation.init_image ? 1 : 0)
+              << " mask=" << (generation.mask ? 1 : 0);
+      if (generation.mask)
+        details << " mask_composite=" << (generation.mask_composite ? 1 : 0)
+                << " mask_feather=" << generation.mask_feather
+                << " mask_blur=" << generation.mask_blur;
       if (!service.loras().files.empty())
         details << " loras=" << LoraList(generation.loras)
                 << " lora_ms=" << result.metrics.lora_ms;
