@@ -2616,9 +2616,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           video.source_video =
               ParseFileRef(graph.Str(generator, "file"), "input");
           task.spec = std::move(video);
-        } else if (tts &&
-                   task.class_type == "FB_Qwen3TTSDialogueInference") {
-        if (IsFoley(task.class_type)) {
+        } else if (IsFoley(task.class_type)) {
           task.spec = BuildFoley(graph, generator, models, &plan->warnings);
         } else if (tts &&
                    task.class_type == "FB_Qwen3TTSDialogueInference") {
