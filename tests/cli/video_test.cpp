@@ -1,9 +1,14 @@
 #include "src/cli/video/video.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace {
 
@@ -115,17 +120,57 @@ void TestSelectedFramesAndFailures() {
              std::vector<int>({0, 11, 21}),
          "selected frames normalize");
 
-  const std::array<const char*, 5> unsupported = {
-      "--model", "/models/h3", "--first-frame", "input.png", "A fox"};
-  Expect(!gufo::cli::ParseVideoOptions(unsupported, &error).has_value(),
-         "first-frame input rejected");
-  Expect(error.find("Unknown option") != std::string::npos,
-         "unsupported input is an unknown option");
+  // --first-frame/--last-frame are FL2VA keyframe inputs; an unreadable image
+  // is reported as such instead of being an unknown option.
+  const std::array<const char*, 5> missing = {
+      "--model", "/models/h3", "--first-frame",
+      "gufo-video-cli-test-missing.png", "A fox"};
+  error.clear();
+  Expect(!gufo::cli::ParseVideoOptions(missing, &error).has_value(),
+         "missing first-frame image rejected");
+  Expect(error.find("cannot read keyframe") != std::string::npos,
+         "missing first-frame image names the keyframe");
 
   const std::array<const char*, 4> no_audio = {"--model", "/models/h3",
                                                "--no-audio", "A fox"};
   Expect(!gufo::cli::ParseVideoOptions(no_audio, &error).has_value(),
          "audio cannot be disabled while muxing");
+}
+
+void TestKeyframes() {
+  // 2x1 RGB PNG: red, blue.
+  constexpr std::array<unsigned char, 70> kPng = {
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+      0x08, 0x02, 0x00, 0x00, 0x00, 0x7b, 0x40, 0xe8, 0xdd, 0x00, 0x00, 0x00,
+      0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0x00, 0x04,
+      0xff, 0x01, 0x07, 0x00, 0x01, 0xff, 0xe2, 0x23, 0x9e, 0x59, 0x00, 0x00,
+      0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+  const std::filesystem::path png =
+      std::filesystem::temp_directory_path() / "gufo-video-cli-test-key.png";
+  {
+    std::ofstream output(png, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(kPng.data()), kPng.size());
+    Expect(static_cast<bool>(output), "keyframe fixture written");
+  }
+  const std::string path = png.string();
+  const std::array<const char*, 9> args = {
+      "--model",      "/models/h3",   "--output", "out.mp4", "--first-frame",
+      path.c_str(),   "--last-frame", path.c_str(), "A fox"};
+  std::string error;
+  const auto options = gufo::cli::ParseVideoOptions(args, &error);
+  std::error_code ignored;
+  std::filesystem::remove(png, ignored);
+  Expect(options.has_value(), "first and last keyframes parse");
+  const auto& keyframes = options->request.keyframes;
+  Expect(keyframes.size() == 2, "two keyframes");
+  Expect(keyframes[0].anchor == gufo::minimax_h3::KeyframeAnchor::kFirst &&
+             keyframes[1].anchor == gufo::minimax_h3::KeyframeAnchor::kLast,
+         "keyframe anchors");
+  Expect(keyframes[0].width == 2 && keyframes[0].height == 1 &&
+             keyframes[0].rgb ==
+                 std::vector<std::uint8_t>({255, 0, 0, 0, 0, 255}),
+         "keyframe pixels decoded");
 }
 
 void TestSharedOptionParsing() {
@@ -165,6 +210,7 @@ int main() {
   TestPresets();
   TestDevelopmentAndOverrides();
   TestSelectedFramesAndFailures();
+  TestKeyframes();
   TestSharedOptionParsing();
   std::cout << "All MiniMax H3 video CLI tests passed.\n";
   return 0;
