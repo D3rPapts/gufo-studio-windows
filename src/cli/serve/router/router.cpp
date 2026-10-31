@@ -657,6 +657,8 @@ public:
   AutoloadFailures autoload_failed;
   /// Next time SweepFinishedJobsLocked asks the workers about open jobs.
   std::chrono::steady_clock::time_point next_job_sweep{};
+  /// Sweeps in a row a job's worker left its status unanswered.
+  std::map<std::string, int> job_silent_sweeps;
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
@@ -1124,8 +1126,13 @@ public:
   /// qwen-image-2.1-turbo and moss-image off for 20 minutes). Every
   /// kJobSweep the router asks the owning worker itself and releases jobs
   /// that are finished or unknown there; finished jobs keep their owner, so
-  /// a late status or content read still routes to it.
+  /// a late status or content read still routes to it. A worker that
+  /// leaves a job's status unanswered for kJobSilentSweeps sweeps in a row
+  /// (3 minutes; a computing worker still answers status reads at once) is
+  /// hung: it is stopped like an unresponsive worker and its jobs released
+  /// (a reloaded worker reports them from its persisted job state).
   static constexpr auto kJobSweep = std::chrono::seconds(10);
+  static constexpr int kJobSilentSweeps = 18;
   void SweepFinishedJobsLocked(std::unique_lock<std::mutex>& lock) {
     const auto now = std::chrono::steady_clock::now();
     if (now < next_job_sweep)
@@ -1145,6 +1152,7 @@ public:
     if (probes.empty())
       return;
     std::vector<const Probe*> finished;
+    std::vector<const Probe*> silent;
     lock.unlock();
     for (const Probe& probe : probes) {
       HttpRequest poll;
@@ -1168,6 +1176,11 @@ public:
       try {
         const auto result =
             CollectResponse(router::ProxyToWorker(target, poll));
+        if (result.status == 502) {
+          // No answer before the deadline, or the connection failed.
+          silent.push_back(&probe);
+          continue;
+        }
         if (result.status == 404) {
           finished.push_back(&probe);
           continue;
@@ -1184,6 +1197,9 @@ public:
       }
     }
     lock.lock();
+    for (const Probe& probe : probes)
+      if (std::find(silent.begin(), silent.end(), &probe) == silent.end())
+        job_silent_sweeps.erase(probe.job);
     for (const Probe* probe : finished) {
       if (registry.JobOwner(probe->job) != probe->model)
         continue;
@@ -1191,6 +1207,27 @@ public:
       Logger::Info("router", "event=job_released job=" + probe->job +
                                  " model=" + probe->model +
                                  " reason=finished_unclaimed");
+    }
+    std::set<std::string> hung;
+    for (const Probe* probe : silent)
+      if (++job_silent_sweeps[probe->job] >= kJobSilentSweeps &&
+          registry.JobOwner(probe->job) == probe->model)
+        hung.insert(probe->model);
+    for (const std::string& model : hung) {
+      if (FindWorkerLocked(model) == nullptr)
+        continue;
+      Logger::Warn("router", "event=worker_unresponsive model=" + model +
+                                 " reason=job_status action=restart");
+      for (const auto& [job, owner] : registry.OpenJobs())
+        if (owner == model) {
+          job_silent_sweeps.erase(job);
+          registry.CompleteVideoJob(job);
+          Logger::Info("router", "event=job_released job=" + job +
+                                     " model=" + model +
+                                     " reason=worker_unresponsive");
+        }
+      // Each stop releases the lock; the next tick re-reads everything.
+      StopLocked(model);
     }
   }
 
