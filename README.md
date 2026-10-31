@@ -1,15 +1,29 @@
-# gufo_windows: Gufo on Windows 11 for AMD Strix Halo
+# gufo-studio-windows: Gufo as a creative AI studio on Windows 11 for AMD Strix Halo
 
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [gufo_windows 1.1.1](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.1)**
+> **Download [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1)**
 > (zip, branch `release/1.1.1-ttft`): text, images, speech, music and video from one
 > OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
 > it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
 > first request. The release notes list what was tested.
-> Previous: [1.1.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo_windows/releases/tag/v1.0.0).
+> Previous: [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> This repository was called `gufo_windows` until 31 October 2026; old links still work.
+
+### Focus
+
+gufo-studio-windows is built for one setup first: two GMKtec EVO-X2 (AMD Strix Halo,
+64 GB) on Windows 11 that share the load for video and creative work. The
+goal is one tool that covers everything a film pipeline needs: text, images,
+speech, music and video. New features land here when that setup needs them,
+and the measurements in the release notes come from it. Sharing the load
+between the two machines is the next big step; it is not in 1.1.1 yet.
+Other Strix Halo machines (64 and 128 GB) should work too, and we help in
+the issues, but only this setup is tested here.
+
+_(AI-assisted text, written with Claude Code.)_
 
 ### New in 1.1.1
 
@@ -49,37 +63,42 @@ onto current upstream Gufo, so Gufo builds and runs natively on Windows 11:
 no WSL, no Linux. It serves an OpenAI-compatible API, so clients written for
 llama.cpp's server or the OpenAI API work against it.
 
-The step-by-step guide below covers Qwen3.8-27B. Since then many more models
-run here on the same machine, each from its own branch. They are listed in
-[What runs here now](#what-runs-here-now-october-2026). Everything on this
-page was run on one machine (below); Linux users should use
-[upstream Gufo](https://github.com/gufo-org/gufo).
+The easiest way to use it is the release zip above. The step-by-step guide
+further down builds `main` from source and covers Qwen3.8-27B only; the
+release branches (`release/1.1`, `release/1.1.1-ttft`) carry everything in
+the tables below. Everything on this page was run on one machine (below);
+Linux users should use [upstream Gufo](https://github.com/gufo-org/gufo).
 
 The port, the fixes and the measurements were done by Claude (Anthropic,
 Claude Opus 5.5) in Claude Code, at the request of the repository owner. MIT
 licensed, like upstream.
 
-## What runs here now (October 2026)
+## What runs here now (1.1.1, October 2026)
 
 All of this runs on the 64 GB EVO-X2 below, under Windows 11, behind one
-OpenAI-compatible router on one port (one model loaded at a time). Speeds are
-single requests on this machine.
+OpenAI-compatible router on one port. Models load on the first request;
+with the memory guard several stay loaded while they fit. Numbers are single
+requests on this machine, measured on the version in the last column.
 
-| Model | What it does | Speed here | Branch |
+| Area | Model | Measured here | Version |
 | --- | --- | --- | --- |
-| Qwen3.8-27B (UD-Q4_K_XL, DFlash2) | text, images in | 28-31 tok/s, prefill ~515 tok/s (table below) | `win-merge-2026-10-24`, `verify-gemm-27b` |
-| **Qwen3.8-Flash-Next on 64 GB** (UD-Q4_K_XL, 104 GB) | text, images in | 14-15 tok/s, prefill ~285 tok/s | `moe-ssd-stream` |
-| **Qwen3.8-Flash-Next UD-Q3_K_XL** (90 GB) | text | ~16 tok/s, prefill ~290 tok/s | `moe-ssd-stream` |
-| Qwen3.6-35B-A3B (Q4_K_M) | text | 70 / 62 / 53 tok/s at 0 / 8K / 32K context | `win-35b-decode-mmvq` |
-| Hemmingway-1.5 (Qwen3.8-27B fine-tune for fiction) | creative writing | ~25 tok/s | runs on the 27B build |
-| Qwen3-Omni-30B-A3B-Captioner | describes audio (speech, voices, sounds) | 47-59 tok/s | `win-main` |
-| Qwen-Image-2.1 | text to image, **editing with up to 10 reference images** (`/v1/images/edits`) | 512² / 20 steps 10.5 s; one-reference edit 31 s | `perf/forceinline` |
-| MOSS-Image | text to image, **element placement** (JSON layout prompt with boxes) | 512² / 20 steps 18.8 s | `perf/forceinline` |
-| **MiniMax H3** | text or image to video with stereo sound: first/last frame, turbo LoRA (8 steps), picture understanding | 5 s (512², turbo, first frame) in 131 s | `feat/media-next` |
-| **Wan 2.2 TI2V-5B** | text or image to video (no sound), negative prompt, guidance | 480² / 1 s / 20 steps 46 s; 1280×704 / 5 s / 50 steps ~30 min | `feat/media-next` |
-| Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, Base) | speech, designed voices, voice cloning | ~2x realtime | upstream + `feat/h3-windows-media` build |
-| **RIFE 4.7** (rife49) | frame interpolation x2-x8 after H3 or Wan jobs (`"gufo":{"interpolate":4}`), audio kept | x4 of 5 s 512² video in 1.9 s; 1280×704 in 4.8 s | `feat/rife` |
-| Router with web pages | one port for all of the above; chat, image (with reference images and a box editor for placement), voice and video pages | – | `win-router` |
+| Text | Qwen3.8-27B (UD-Q4_K_XL, DFlash2) | 28-31 tok/s decode, prefill ~515 tok/s (1.0); first token of a film JSON request 0.96 s, loads in ~14 s (1.1.1) | 1.0 / 1.1.1 |
+| Text, 64 GB with SSD streaming | Qwen3.8-Flash-Next UD-Q4_K_XL (104 GB) | 12.8 tok/s (story), 13.5 tok/s (cached English), prefill ~282 tok/s | 1.1.0 |
+| Text, 64 GB with SSD streaming | Qwen3.8-Flash-Next UD-Q3_K_XL (90 GB) | 15.6 tok/s, one request | 1.1.0 |
+| Text | Qwen3.6-35B-A3B (Q4_K_M) | 51 tok/s on a 40-shot JSON list, 65 tok/s prose; with DFlash2 63 tok/s on the JSON list (+25 %), but 46 tok/s on prose | 1.0 `gufo-a3b.exe` |
+| Creative writing | Hemmingway-1.5 (27B fine-tune) | ~25 tok/s | 1.0 |
+| Audio description | Qwen3-Omni-30B-A3B-Captioner | 53.6 tok/s | 1.1.0 |
+| Image | Qwen-Image 2.1 | 512² / 40 steps 20.2 s; 1024² / 40 steps 109-112 s; edit with up to 10 reference images | 1.1.1 |
+| Image, fast | Qwen-Image 2.1 Turbo (8 steps) | 512² 4.3 s; 1024² 22.7-24.0 s; 1920x1088 63 s | 1.1.1 |
+| Image style | LoRA adapters for Qwen-Image 2.1 | switching 2.9-4.2 s, no extra time per step | 1.1.1 |
+| Image layout | MOSS-Image (JSON layout prompt with boxes) | 512² / 30 steps 27.1 s; 1024² / 50 steps 172 s | #907 build |
+| Video with sound | MiniMax H3 (Turbo LoRA, first/last frame) | 1 s 512² in 60-66 s | 1.1.0 |
+| Video | Wan 2.2 TI2V-5B | 1 s 480² / 20 steps in 41-46 s | 1.1.0 |
+| Camera moves | Wan 2.1 I2V 14B + Uni3C | 3 s 832x480 orbit, 4 steps, in 197 s | 1.1.0 |
+| Video delivery | RIFE 4.7, Real-ESRGAN | RIFE 5.9 ms per new frame (24 to 60 fps); 832x512 to 1920x1200 in 34-62 ms per frame | 1.1.0 |
+| Speech | Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, cloning, `speed`) | ~2x realtime | 1.0 |
+| Music | ACE-Step 1.5 XL turbo | 10 s of music in 10.7 s | 1.1.0 |
+| Pages | `/chat/` `/bild/` `/stimme/` `/video/` `/musik/` `/speicher/` | served by the router | 1.1.1 |
 
 What made the bigger models fit on 64 GB:
 - **SSD expert streaming for Flash-Next** (`--expert-cache-bytes`): routed
@@ -98,43 +117,43 @@ Found on the way: **the Windows build did not inline GPU helper functions.**
 clang-cl turns the RelWithDebInfo flag `/Ob1` into `-finline-hint-functions`
 for the device compile too, so every `__device__` helper without `inline`
 stayed a real call inside the kernels. Building HIP sources with `/Ob2`
-(`perf/forceinline`) makes Qwen-Image 30 % faster and MOSS-Image 8 % faster,
-with bit-identical output; the 27B and Flash-Next kernels were already
-inlined and are unchanged.
+makes Qwen-Image 30 % faster and MOSS-Image 8 % faster, with bit-identical
+output (upstream [#872](https://github.com/gufo-org/gufo/pull/872), merged).
 
-Since 1.1 (branch `release/1.1`): a ComfyUI-compatible API in the router
-(next to the OpenAI-style one), memory-aware loading of several models at
-once in the router, ACE-Step 1.5 music, Wan 2.1 + Uni3C camera moves,
-Real-ESRGAN upscaling and live previews.
+Also found: on Windows `hipMemsetAsync` cleared the 27B's 159 MB recurrent
+state at only ~0.5 GB/s, twice before every prompt. A small zeroing kernel
+does it in 1-4 ms; that is the 0.7 s faster first token in 1.1.1.
 
 Not working here: Fish Audio Drama-3 TTS (its weights alone take 39.6 GB of
 GPU memory; not yet tried on the 128 GB machine), DeepSeek V4 Flash (too
-large).
+large for 64 GB; not tried yet).
 
 ### Want something from this?
 
-**Open an [issue](https://github.com/D3rPapts/gufo_windows/issues) in this
+**Open an [issue](https://github.com/D3rPapts/gufo-studio-windows/issues) in this
 repository** and say what you'd like to use: a model, a fix, a feature from
 one of the branches. We'll help. That can mean rebasing it onto your fork or
 branch, building it for you, or testing on our hardware (a 64 GB and a 128 GB
 Strix Halo, both under Windows 11).
 
-Already offered elsewhere:
-- Upstream: [#773](https://github.com/gufo-org/gufo/pull/773),
+Given back to upstream Gufo:
+- Merged: [#773](https://github.com/gufo-org/gufo/pull/773),
   [#794](https://github.com/gufo-org/gufo/pull/794),
   [#795](https://github.com/gufo-org/gufo/pull/795),
-  [#796](https://github.com/gufo-org/gufo/pull/796) merged;
-  [#810](https://github.com/gufo-org/gufo/pull/810) (model-bench on Windows)
-  merged too; [#822](https://github.com/gufo-org/gufo/pull/822) (27B verify GEMMs),
+  [#796](https://github.com/gufo-org/gufo/pull/796),
+  [#810](https://github.com/gufo-org/gufo/pull/810) (model-bench on Windows),
   [#830](https://github.com/gufo-org/gufo/pull/830) (Qwen-Image loading),
-  [#856](https://github.com/gufo-org/gufo/pull/856) (H3 on Windows) open.
-- [endyjasmi/gufo#35](https://github.com/endyjasmi/gufo/pull/35): SSD
-  expert streaming and UD-Q3_K_XL for the Windows port (declined: that port
-  matches upstream's numbers, so these stay here).
-- [slimsami/strycast#7](https://github.com/slimsami/strycast/pull/7): MMQ
-  decode for the 35B experts, merged.
-- [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1): faster
-  Qwen3.6-35B-A3B decode.
+  [#856](https://github.com/gufo-org/gufo/pull/856) (H3 on Windows),
+  [#872](https://github.com/gufo-org/gufo/pull/872) (`/Ob2` for HIP sources).
+- Open: [#885](https://github.com/gufo-org/gufo/pull/885) (Qwen-Image true CFG
+  and multi-reference edits), [#904](https://github.com/gufo-org/gufo/pull/904)
+  (Windows table for the 27B verification GEMMs),
+  [#907](https://github.com/gufo-org/gufo/pull/907) (MOSS-Image).
+- Elsewhere: [slimsami/strycast#7](https://github.com/slimsami/strycast/pull/7)
+  (MMQ decode for the 35B experts, merged);
+  [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1) (faster
+  Qwen3.6-35B-A3B decode, open); [endyjasmi/gufo#35](https://github.com/endyjasmi/gufo/pull/35)
+  (SSD expert streaming for that Windows port; declined, so it stays here).
 
 ## What was tested
 
@@ -152,7 +171,7 @@ without thinking:
 | --- | --- | --- | --- |
 | llama.cpp Vulkan + MTP | 28.2 tok/s | 256 tok/s | 487 s |
 | best llama.cpp setting found (Vulkan + DFlash2) | 28.3 tok/s | 257 tok/s | 431 s |
-| **gufo_windows** | **28.2-31.2 tok/s** | **512-517 tok/s** | **332-349 s** |
+| **gufo-studio-windows** (1.0) | **28.2-31.2 tok/s** | **512-517 tok/s** | **332-349 s** |
 
 - Prefill about 2x llama.cpp; 20-30% less total time on this workload.
 - Up to 152K context on 32 GB GPU memory: a 147,913-token prompt was
@@ -213,8 +232,8 @@ C:\vcpkg\vcpkg.exe install icu curl openssl libpng libjpeg-turbo --triplet x64-w
 ### 3. Get the code and build
 
 ```powershell
-git clone https://github.com/D3rPapts/gufo_windows
-cd gufo_windows
+git clone https://github.com/D3rPapts/gufo-studio-windows
+cd gufo-studio-windows
 powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1   # lists anything missing and how to fix it
 powershell -ExecutionPolicy Bypass -File tools\windows\build.ps1   # -> build\release\gufo.exe
 ```
@@ -321,7 +340,7 @@ for the numbers.
 - **Short answers without thinking decode slower than llama.cpp:** about
   19 tok/s against 20-23 tok/s. gufo's lead comes from prefill (about 2x)
   and from long thinking runs.
-- **One request at a time.** A long request makes every other request wait
+- **One request at a time per model.** A long request makes every other request wait
   in the queue (once 10 minutes during a 23-minute request).
 - **Without `--repeat-penalty 1.05`, Qwen3.8-27B sometimes loops** into
   endless lists. llama.cpp does the same with this model.
@@ -334,13 +353,13 @@ for the numbers.
 - **After installing CMake or Ninja with winget, open a new terminal**, or
   `check.ps1` and `build.ps1` report them missing.
 - Plans and open questions are tracked in the
-  [issues](https://github.com/D3rPapts/gufo_windows/issues).
+  [issues](https://github.com/D3rPapts/gufo-studio-windows/issues).
 
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
   [What runs here now](#what-runs-here-now-october-2026) were tested on their
-  branches. DeepSeek V4 Flash and Qwen3-ASR were never run here.
+  branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
 - Concurrent requests; the EVO-X2's high-performance mode and Windows power mode "Best performance".
