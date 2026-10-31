@@ -56,6 +56,9 @@ struct ModelIds {
   std::string tts_clone{"qwen3-tts-clone"};
   std::string music{"ace-step-1.5-xl-turbo"};
   std::string camera{"wan2.1-uni3c"};
+  /// Post-processing only (RIFE / upscale of a loaded video): a video server
+  /// with --rife-model. When `available` is set and lacks it, `h3` serves.
+  std::string process{"gufo-rife"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -159,7 +162,9 @@ struct MusicTask {
 /// The /v1/audio/music body for `task` (synchronous, WAV).
 json::Value MusicRequestBody(const MusicTask& task);
 
-enum class VideoFamily { kH3, kWan, kCamera };
+/// kProcess: no generation, a loaded video is only interpolated / upscaled
+/// (LoadVideo -> GetVideoComponents -> RIFE VFI / ImageUpscaleWithModel).
+enum class VideoFamily { kH3, kWan, kCamera, kProcess };
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
 struct VideoUpscale {
@@ -212,6 +217,8 @@ struct VideoTask {
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;
   std::optional<FileRef> render_video;
+  /// kProcess: the LoadVideo file, sent as source_video.
+  std::optional<FileRef> source_video;
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

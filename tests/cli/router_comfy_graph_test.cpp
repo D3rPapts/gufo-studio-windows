@@ -128,6 +128,39 @@ constexpr const char* kUni3C = R"({
  "33": {"class_type": "SaveVideo", "inputs": {"video": ["32", 0], "filename_prefix": "film/kamera/shot07", "format": "mp4", "codec": "h264"}}
 })";
 
+// FilmStudio v100 H3 speaking shot as its pipeline sends it: ComfyUI's
+// split sampler (SamplerCustomAdvanced) instead of a KSampler.
+constexpr const char* kH3Custom = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "strength_model": 1.0, "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+ "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+ "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "prompt": "SHOT 1: The scene opens exactly on <Picture 1>. Lars speaks.", "width": 896, "height": 512, "length": 124, "first_frame": ["20", 0]}},
+ "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}},
+ "9": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+ "10": {"class_type": "BasicScheduler", "inputs": {"model": ["2", 0], "scheduler": "simple", "steps": 8, "denoise": 1.0}},
+ "11": {"class_type": "BasicGuider", "inputs": {"model": ["2", 0], "conditioning": ["7", 0]}},
+ "12": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["11", 0], "sampler": ["9", 0], "sigmas": ["10", 0], "latent_image": ["6", 1]}},
+ "13": {"class_type": "VAEDecode", "inputs": {"samples": ["12", 0], "vae": ["4", 0]}},
+ "14": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["12", 0], "vae": ["5", 0]}},
+ "15": {"class_type": "SaveImage", "inputs": {"images": ["13", 0], "filename_prefix": "film/video/roh/a1_s01_x01_h3/t0/f"}},
+ "17": {"class_type": "SaveAudio", "inputs": {"audio": ["14", 0], "filename_prefix": "film/video/roh/a1_s01_x01_h3/t0/ton"}},
+ "20": {"class_type": "LoadImage", "inputs": {"image": "a1_s01_shot01_kf0_896x512.png"}},
+ "21": {"class_type": "LoadAudio", "inputs": {"audio": "life3_film_a1_s01_x01_h3.wav"}},
+ "7": {"class_type": "MiniMaxH3AddGuide", "inputs": {"positive": ["6", 0], "latent": ["6", 1], "frame_idx": 0, "audio_vae": ["5", 0], "audio": ["21", 0]}}
+})";
+
+// FilmStudio v100: RIFE x4 of a finished shot (no generator in the graph).
+constexpr const char* kRifeOnly = R"({
+ "1": {"class_type": "LoadVideo", "inputs": {"file": "life3_film_a1_s01_x01_roh.mp4"}},
+ "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+ "3": {"class_type": "RIFE VFI", "inputs": {"frames": ["2", 0], "ckpt_name": "rife49.pth", "clear_cache_after_n_frames": 10, "multiplier": 4, "fast_mode": false, "ensemble": true, "scale_factor": 1.0, "dtype": "float16", "torch_compile": false, "batch_size": 1}},
+ "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": "film/video/orig/a1_s01_x01/f"}},
+ "5": {"class_type": "CreateVideo", "inputs": {"images": ["3", 0], "fps": 96.0, "codec": "h264"}},
+ "6": {"class_type": "SaveVideo", "inputs": {"video": ["5", 0], "filename_prefix": "film/video/seg_a1_s01_x01", "format": "mp4"}}
+})";
+
 comfy::Plan PlanOf(const char* text) {
   comfy::Plan plan;
   comfy::PlanError error;
@@ -292,6 +325,54 @@ void TestH3Guides() {
              .find("gufo")
              ->find("audio_reference_frame")
              ->as_double() == 0);
+}
+
+void TestH3CustomSampler() {
+  // SamplerCustomAdvanced <- RandomNoise / KSamplerSelect / BasicScheduler /
+  // BasicGuider folds into the KSampler path: same task as a KSampler graph.
+  const comfy::Plan plan = PlanOf(kH3Custom);
+  assert(plan.tasks.size() == 1);
+  const auto& task = plan.tasks[0];
+  assert(task.node_id == "12" && task.class_type == "KSampler");
+  assert(task.outputs.size() == 2);
+  const auto& video = std::get<comfy::VideoTask>(task.spec);
+  assert(video.family == comfy::VideoFamily::kH3);
+  assert(video.width == 896 && video.height == 512 && video.frames == 124);
+  assert(video.steps == 8 && video.seed == 42);
+  assert(video.lora == "turbo" && !video.lora_strength);
+  assert((video.first_frame ==
+          comfy::FileRef{"a1_s01_shot01_kf0_896x512.png", "input"}));
+  assert((video.audio_reference ==
+          comfy::FileRef{"life3_film_a1_s01_x01_h3.wav", "input"}));
+  assert(video.audio_reference_frame == 0);
+  assert(plan.warnings.empty());
+  // The second output (denoised_output) is the same latent for gufo.
+  std::string denoised = kH3Custom;
+  denoised.replace(denoised.find("\"samples\": [\"12\", 0], \"vae\": [\"4\", 0]"),
+                   37, "\"samples\": [\"12\", 1], \"vae\": [\"4\", 0]");
+  assert(PlanOf(denoised.c_str()).tasks.size() == 1);
+  // CFGGuider carries positive, negative and cfg.
+  std::string cfg = kH3Custom;
+  cfg.replace(cfg.find("\"BasicGuider\", \"inputs\": {\"model\": [\"2\", 0], "
+                       "\"conditioning\": [\"7\", 0]}"),
+              70,
+              "\"CFGGuider\", \"inputs\": {\"model\": [\"2\", 0], "
+              "\"positive\": [\"7\", 0], \"negative\": [\"6\", 0], "
+              "\"cfg\": 1.0}");
+  assert(std::get<comfy::VideoTask>(PlanOf(cfg.c_str()).tasks[0].spec).seed ==
+         42);
+  // Other noise sources are not gufo's sampler.
+  std::string disabled = kH3Custom;
+  disabled.replace(disabled.find("\"RandomNoise\", \"inputs\": {\"noise_seed\": 42}"),
+                   43, "\"DisableNoise\", \"inputs\": {}");
+  const comfy::PlanError error = ErrorOf(disabled);
+  assert(error.message.find("RandomNoise") != std::string::npos);
+  assert(error.node_errors.find("12") != nullptr);
+  // A scheduler on another model than the guider is a warning.
+  std::string other = kH3Custom;
+  other.replace(other.find("\"BasicScheduler\", \"inputs\": {\"model\": [\"2\", 0]"),
+                46, "\"BasicScheduler\", \"inputs\": {\"model\": [\"1\", 0]");
+  assert(PlanOf(other.c_str()).warnings.size() == 1);
 }
 
 void TestWan() {
@@ -599,6 +680,47 @@ void TestRife() {
               "\"images\": [\"9\", 0]}}, \"9\": {\"class_type\": \"RIFE VFI\", "
               "\"inputs\": {\"frames\": [\"7\", 0], \"multiplier\": 2"));
   assert(still.message.find("H3 or Wan") != std::string::npos);
+}
+
+void TestRifeOnly() {
+  // LoadVideo -> RIFE VFI -> SaveImage + SaveVideo: one post-processing job
+  // (gufo source_video + gufo.interpolate), both outputs from it.
+  const comfy::Plan plan = PlanOf(kRifeOnly);
+  assert(plan.tasks.size() == 1);
+  const auto& task = plan.tasks[0];
+  assert(task.node_id == "1" && task.class_type == "LoadVideo");
+  assert(task.outputs.size() == 2);
+  const auto& video = std::get<comfy::VideoTask>(task.spec);
+  assert(video.family == comfy::VideoFamily::kProcess);
+  assert(video.model == "gufo-rife");
+  assert((video.source_video ==
+          comfy::FileRef{"life3_film_a1_s01_x01_roh.mp4", "input"}));
+  assert(video.interpolate == 4 && video.fps_num == 0 && video.fps == 96);
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "gufo-rife");
+  assert(!body.contains("prompt") && !body.contains("size"));
+  assert(body.find("gufo")->find("interpolate")->as_double() == 4);
+  assert(!body.find("gufo")->contains("seed"));
+  // Without a gufo-rife model on the router the H3 server (--rife-model)
+  // takes it.
+  comfy::ModelIds ids;
+  ids.available = {"minimax-h3", "qwen-image-2.1"};
+  comfy::Plan fallback;
+  comfy::PlanError error;
+  assert(comfy::BuildPlan(json::parse(kRifeOnly), ids, &fallback, &error));
+  assert(std::get<comfy::VideoTask>(fallback.tasks[0].spec).model ==
+         "minimax-h3");
+  // x8 for stills: 192 fps.
+  const comfy::Plan stills = PlanOf(
+      Replace(Replace(kRifeOnly, "\"multiplier\": 4", "\"multiplier\": 8"),
+              "\"fps\": 96.0", "\"fps\": 192.0")
+          .c_str());
+  assert(std::get<comfy::VideoTask>(stills.tasks[0].spec).interpolate == 8);
+  // A LoadVideo straight into SaveVideo has nothing for gufo to do.
+  assert(ErrorOf(Replace(kRifeOnly, "\"images\": [\"3\", 0], \"fps\"",
+                         "\"images\": [\"2\", 0], \"fps\""))
+             .message.find("no generating node") != std::string::npos);
 }
 
 constexpr const char* kDialogue = R"({
@@ -1094,6 +1216,7 @@ int main() {
   TestVoiceClone();
   TestH3();
   TestH3Guides();
+  TestH3CustomSampler();
   TestWan();
   TestUnsupportedNodes();
   TestImageToImage();
@@ -1101,6 +1224,7 @@ int main() {
   TestQwenLoras();
   TestQwenTurbo();
   TestRife();
+  TestRifeOnly();
   TestDialogue();
   TestAceStep();
   TestUni3C();

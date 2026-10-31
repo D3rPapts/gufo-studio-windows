@@ -364,6 +364,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->audio_reference);
       if (video->render_video)
         files->push_back(*video->render_video);
+      if (video->source_video)
+        files->push_back(*video->source_video);
     }
   }
 }
@@ -1614,6 +1616,9 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                              Base64Encode(ReadFileRef(*spec.render_video));
     body["gufo"]["camera"] = std::move(camera);
   }
+  if (spec.source_video)
+    body["source_video"] = "data:video/mp4;base64," +
+                           Base64Encode(ReadFileRef(*spec.source_video));
   if (spec.audio_reference) {
     const std::string audio = ReadFileRef(*spec.audio_reference);
     body["audio_reference"] =

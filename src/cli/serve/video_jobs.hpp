@@ -139,6 +139,10 @@ struct VideoJobRequest {
   // or poses), and an uploaded guide video (MP4 bytes) instead.
   std::string camera_json;
   std::vector<std::uint8_t> guide_video;
+  // Post-processing only (MP4 bytes, e.g. ComfyUI LoadVideo -> RIFE VFI): no
+  // generation, the upload is interpolated and/or upscaled. Needs
+  // `interpolate` or `upscale`; the model, prompt and size are not used.
+  std::vector<std::uint8_t> source_video;
   // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
   // every second step by default, every step of a MiniMax H3 schedule with
   // at most 16 steps (Turbo) ("gufo": {"preview": {...}}).

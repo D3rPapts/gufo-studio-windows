@@ -889,8 +889,20 @@ struct VideoJobService::Impl {
       std::string error;
       bool success = false;
       try {
-        success = options.runner(generation, &job->cancellation, Progress,
-                                 &progress, &telemetry, &error);
+        if (!job->request.source_video.empty()) {
+          // Post-processing only: the upload stands in for the generated MP4.
+          std::ofstream source(generation.output_path, std::ios::binary);
+          source.write(
+              reinterpret_cast<const char*>(job->request.source_video.data()),
+              static_cast<std::streamsize>(job->request.source_video.size()));
+          success = static_cast<bool>(source.flush());
+          if (!success)
+            error = "cannot store the uploaded source video";
+          std::vector<std::uint8_t>().swap(job->request.source_video);
+        } else {
+          success = options.runner(generation, &job->cancellation, Progress,
+                                   &progress, &telemetry, &error);
+        }
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -1167,7 +1179,17 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .job = std::nullopt,
             .error = initialization_error()};
   }
-  if (impl_->options.family == VideoModelFamily::kWan21Uni3C) {
+  if (!request.source_video.empty()) {
+    // Post-processing only: the generator's request shape does not apply.
+    if (request.output_format != "mp4" ||
+        (request.interpolate <= 1 && request.interpolate_fps_num <= 0 &&
+         !request.upscale.enabled())) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "'source_video' needs MP4 output and 'interpolate' or "
+                       "'upscale'"};
+    }
+  } else if (impl_->options.family == VideoModelFamily::kWan21Uni3C) {
     int width = 0, height = 0;
     const auto frames = ResolveWan21DurationFrames(request.seconds);
     if (request.model != impl_->options.model_id ||

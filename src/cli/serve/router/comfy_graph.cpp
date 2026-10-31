@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -115,7 +116,6 @@ bool IsTts(std::string_view class_type) {
 bool IsSampler(std::string_view class_type) {
   return class_type == "KSampler" || class_type == "KSamplerAdvanced";
 }
-
 std::string Lower(std::string_view text) {
   std::string out(text);
   for (char& c : out)
@@ -434,6 +434,132 @@ std::string ClipText(const Graph& graph, const Conditioning& cond) {
 
 std::string SeedKey(const std::string& cls) {
   return cls == "KSamplerAdvanced" ? "noise_seed" : "seed";
+}
+
+/// The node behind `key` of `id`, which must be one of `classes`.
+Link PartOf(const Graph& graph, const std::string& id, const std::string& key,
+            std::initializer_list<std::string_view> classes) {
+  const Link link = graph.RequireLink(id, key);
+  const std::string cls = graph.Class(link.node);
+  if (std::find(classes.begin(), classes.end(), cls) != classes.end())
+    return link;
+  std::string names;
+  for (const std::string_view name : classes)
+    names += (names.empty() ? "" : " or ") + std::string(name);
+  throw NodeFailure(id, "unsupported_link",
+                    "input '" + key + "' must come from " + names + ", not " +
+                        cls);
+}
+
+/// A copy of input `key` of `id` (link or literal); throws when absent.
+json::Value InputOf(const Graph& graph, const std::string& id,
+                    const std::string& key) {
+  const json::Value* raw = graph.Raw(id, key);
+  if (raw == nullptr)
+    throw NodeFailure(id, "required_input_missing",
+                      "required input '" + key + "' is missing");
+  return *raw;
+}
+
+/// ComfyUI's split sampler: SamplerCustomAdvanced <- RandomNoise (seed),
+/// BasicGuider / CFGGuider (model, conditioning, cfg), KSamplerSelect
+/// (sampler) and BasicScheduler (steps, scheduler, denoise). Returns `prompt`
+/// with each one folded into a KSampler under the same node id, its parts
+/// removed and links to its second output (denoised_output) moved to the
+/// first; a null value when the prompt has no SamplerCustomAdvanced.
+json::Value LowerCustomSamplers(const json::Value& prompt,
+                                std::vector<std::string>* warnings) {
+  const Graph graph(prompt);
+  std::map<std::string, json::Value> lowered;
+  std::set<std::string> parts;
+  for (const auto& [id, node] : prompt.members()) {
+    if (node.member_str("class_type") != "SamplerCustomAdvanced")
+      continue;
+    const Link noise = PartOf(graph, id, "noise", {"RandomNoise"});
+    const Link guider = PartOf(graph, id, "guider", {"BasicGuider", "CFGGuider"});
+    const Link sampler = PartOf(graph, id, "sampler", {"KSamplerSelect"});
+    const Link sigmas = PartOf(graph, id, "sigmas", {"BasicScheduler"});
+    const bool cfg_guider = graph.Class(guider.node) == "CFGGuider";
+    json::Value inputs = json::Value::object();
+    inputs["model"] = InputOf(graph, guider.node, "model");
+    if (cfg_guider) {
+      inputs["positive"] = InputOf(graph, guider.node, "positive");
+      inputs["negative"] = InputOf(graph, guider.node, "negative");
+      inputs["cfg"] = InputOf(graph, guider.node, "cfg");
+    } else {
+      inputs["positive"] = InputOf(graph, guider.node, "conditioning");
+      inputs["cfg"] = 1.0;
+    }
+    inputs["latent_image"] = InputOf(graph, id, "latent_image");
+    inputs["seed"] = InputOf(graph, noise.node, "noise_seed");
+    inputs["sampler_name"] = InputOf(graph, sampler.node, "sampler_name");
+    inputs["steps"] = InputOf(graph, sigmas.node, "steps");
+    inputs["scheduler"] = InputOf(graph, sigmas.node, "scheduler");
+    if (const json::Value* denoise = graph.Raw(sigmas.node, "denoise"))
+      inputs["denoise"] = *denoise;
+    // BasicScheduler reads the model only for its sigma shift; gufo takes
+    // the shift from the guider's model chain, so the two should agree.
+    if (auto scheduler_model = graph.LinkOf(sigmas.node, "model")) {
+      if (const auto guider_model = graph.LinkOf(guider.node, "model");
+          !guider_model || guider_model->node != scheduler_model->node ||
+          guider_model->slot != scheduler_model->slot)
+        warnings->push_back("node " + sigmas.node +
+                            ": BasicScheduler and the guider use different "
+                            "models; gufo follows the guider's");
+    }
+    json::Value folded = json::Value::object();
+    folded["class_type"] = "KSampler";
+    folded["inputs"] = std::move(inputs);
+    lowered.emplace(id, std::move(folded));
+    for (const Link* part : {&noise, &guider, &sampler, &sigmas})
+      parts.insert(part->node);
+  }
+  if (lowered.empty())
+    return json::Value();
+  // A part that also feeds another node stays, so the class check reports it.
+  for (const auto& [id, node] : prompt.members()) {
+    if (parts.contains(id) || lowered.contains(id))
+      continue;
+    const json::Value* inputs = node.find("inputs");
+    if (inputs == nullptr)
+      continue;
+    for (const auto& [key, value] : inputs->members()) {
+      (void)key;
+      if (auto link = Graph::AsLink(value))
+        parts.erase(link->node);
+    }
+  }
+  json::Value out = json::Value::object();
+  for (const auto& [id, node] : prompt.members()) {
+    if (parts.contains(id))
+      continue;
+    if (auto found = lowered.find(id); found != lowered.end()) {
+      out.append_member(id, found->second);
+      continue;
+    }
+    json::Value copy = json::Value::object();
+    for (const auto& [field, value] : node.members()) {
+      if (field != "inputs" || !value.is_object()) {
+        copy.append_member(field, value);
+        continue;
+      }
+      json::Value inputs = json::Value::object();
+      for (const auto& [key, input] : value.members()) {
+        auto link = Graph::AsLink(input);
+        if (link && link->slot == 1 && lowered.contains(link->node)) {
+          json::Value moved = json::Value::array();
+          moved.push_back(input.items()[0]);
+          moved.push_back(0);
+          inputs.append_member(key, std::move(moved));
+        } else {
+          inputs.append_member(key, input);
+        }
+      }
+      copy.append_member(field, std::move(inputs));
+    }
+    out.append_member(id, std::move(copy));
+  }
+  return out;
 }
 
 }  // namespace
@@ -1476,12 +1602,17 @@ bool IsOutputClass(std::string_view class_type) {
 json::Value VideoRequestBody(const VideoTask& task) {
   json::Value body = json::Value::object();
   body["model"] = task.model;
-  body["prompt"] = task.prompt;
   json::Value gufo = json::Value::object();
-  gufo["seed"] = task.seed;
-  if (task.steps > 0)
-    gufo["steps"] = task.steps;
-  if (task.family == VideoFamily::kH3) {
+  if (task.family != VideoFamily::kProcess) {
+    body["prompt"] = task.prompt;
+    gufo["seed"] = task.seed;
+    if (task.steps > 0)
+      gufo["steps"] = task.steps;
+  }
+  if (task.family == VideoFamily::kProcess) {
+    // Only gufo.interpolate / gufo.upscale below; the executor adds
+    // source_video.
+  } else if (task.family == VideoFamily::kH3) {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
     // gufo aligns ceil(seconds * 24) up to 17k + 5 and wants gufo.frames to
@@ -1703,14 +1834,64 @@ std::optional<std::string> JoinWavs(const std::vector<std::string>& parts,
   return BuildWav(joined);
 }
 
-bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
+namespace {
+
+/// The LoadVideo node whose frames reach output `id` through
+/// GetVideoComponents and a RIFE VFI or ImageUpscaleWithModel, with no
+/// generator involved; nullopt when the output is not such a chain.
+std::optional<std::string> ProcessSource(const Graph& graph,
+                                         const std::string& id,
+                                         const std::set<std::string>& upstream) {
+  std::vector<std::string> loaders;
+  bool processed = false;
+  for (const std::string& node_id : upstream) {
+    const std::string cls = graph.Class(node_id);
+    if (cls == "LoadVideo")
+      loaders.push_back(node_id);
+    else if (cls == "RIFE VFI" || cls == "ImageUpscaleWithModel")
+      processed = true;
+  }
+  if (loaders.empty() || !processed)
+    return std::nullopt;
+  if (loaders.size() > 1)
+    throw NodeFailure(id, "unsupported_link",
+                      "output depends on more than one LoadVideo");
+  for (const std::string& node_id : upstream) {
+    if (graph.Class(node_id) != "GetVideoComponents")
+      continue;
+    if (graph.RequireLink(node_id, "video").node != loaders.front())
+      throw NodeFailure(node_id, "unsupported_link",
+                        "the video must come from LoadVideo");
+  }
+  return loaders.front();
+}
+
+}  // namespace
+
+bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                PlanError* error) {
   *plan = Plan{};
-  if (!prompt.is_object() || prompt.empty()) {
+  if (!original.is_object() || original.empty()) {
     error->type = "invalid_prompt";
     error->message = "prompt must be a non-empty object of nodes";
     return false;
   }
+  // 0. SamplerCustomAdvanced graphs become KSampler graphs.
+  json::Value lowered;
+  try {
+    lowered = LowerCustomSamplers(original, &plan->warnings);
+  } catch (const NodeFailure& failure) {
+    const std::string cls = Graph(original).Class(failure.node_id);
+    error->type = "prompt_outputs_failed_validation";
+    error->message = "node " + failure.node_id + " (" + cls + "): " +
+                     failure.what();
+    error->details = error->message;
+    error->node_errors[failure.node_id] =
+        NodeError(cls, failure.error_type, failure.what());
+    plan->warnings.clear();
+    return false;
+  }
+  const json::Value& prompt = lowered.is_null() ? original : lowered;
   Graph graph(prompt);
   // 1. Every node must be a class the adapter knows.
   std::vector<std::string> unsupported;
@@ -1773,10 +1954,17 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
           tts = tts || IsTts(up);
         }
       }
+      // Without a generator: a loaded video that is only interpolated /
+      // upscaled (FilmStudio: LoadVideo -> RIFE VFI -> SaveVideo per shot).
+      std::optional<std::string> process;
       if (generators.empty())
+        process = ProcessSource(graph, id, upstream);
+      if (generators.empty() && !process)
         throw NodeFailure(id, "unsupported_link",
                           "output has no generating node (KSampler or "
                           "Qwen3-TTS) upstream");
+      if (process)
+        generators.push_back(*process);
       if (generators.size() > 1)
         throw NodeFailure(id, "unsupported_link",
                           "output depends on more than one generating node; "
@@ -1794,7 +1982,21 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
         Task task;
         task.node_id = generator;
         task.class_type = graph.Class(generator);
-        if (tts && task.class_type == "FB_Qwen3TTSDialogueInference") {
+        if (process) {
+          VideoTask video;
+          video.family = VideoFamily::kProcess;
+          video.model =
+              models.available.empty() ||
+                      std::find(models.available.begin(),
+                                models.available.end(),
+                                models.process) != models.available.end()
+                  ? models.process
+                  : models.h3;
+          video.source_video =
+              ParseFileRef(graph.Str(generator, "file"), "input");
+          task.spec = std::move(video);
+        } else if (tts &&
+                   task.class_type == "FB_Qwen3TTSDialogueInference") {
           task.spec = BuildDialogue(graph, generator, models, &plan->warnings);
         } else if (tts) {
           task.spec = BuildSpeech(graph, generator, models, &plan->warnings);

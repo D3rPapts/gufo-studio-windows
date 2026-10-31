@@ -256,7 +256,8 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
 bool IsKeyframeField(std::string_view name) {
   return name == "input_reference" || name == "first_frame" ||
          name == "last_frame" || name == "audio_reference" ||
-         name == "render_video" || name.starts_with("keyframe_");
+         name == "render_video" || name == "source_video" ||
+         name.starts_with("keyframe_");
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -1111,6 +1112,101 @@ HttpResponse CreateWan21Video(const json::Value& body,
   return response;
 }
 
+// Post-processing of an existing MP4 on any video server: {"model",
+// "source_video" (MP4 data URL or base64, or a multipart "source_video"
+// file), "gufo": {"interpolate", "upscale"}}. Nothing is generated; the
+// video is interpolated with RIFE and/or upscaled, audio kept.
+HttpResponse CreateProcessVideo(const json::Value& body,
+                                const std::map<std::string, std::string>& files,
+                                VideoJobService& service) {
+  if (!HasOnlyMembers(body, {"model", "source_video", "gufo"})) {
+    return Error(400, "Bad Request",
+                 "a 'source_video' request takes only 'model', "
+                 "'source_video' and 'gufo'",
+                 "unsupported_field");
+  }
+  std::vector<std::uint8_t> source;
+  if (const auto upload = files.find("source_video"); upload != files.end()) {
+    source.assign(upload->second.begin(), upload->second.end());
+  } else if (const json::Value* video = body.find("source_video");
+             video != nullptr && video->is_string()) {
+    std::string_view text = video->str();
+    if (text.starts_with("data:")) {
+      const auto comma = text.find(',');
+      if (comma == std::string_view::npos ||
+          text.substr(0, comma).find(";base64") == std::string_view::npos) {
+        return Error(400, "Bad Request",
+                     "'source_video' data URL must be base64",
+                     "invalid_source_video");
+      }
+      text.remove_prefix(comma + 1);
+    }
+    auto decoded = DecodeBase64(text);
+    if (decoded.has_value())
+      source = std::move(*decoded);
+  }
+  if (source.size() < 64) {
+    return Error(400, "Bad Request",
+                 "'source_video' must be an MP4 file, data URL or base64",
+                 "invalid_source_video");
+  }
+  VideoInterpolation interpolate;
+  VideoUpscale upscale;
+  if (const json::Value* extension = body.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension, {"interpolate", "upscale"})) {
+      return Error(400, "Bad Request",
+                   "'gufo' of a 'source_video' request may contain only "
+                   "'interpolate' and 'upscale'",
+                   "invalid_strix_options");
+    }
+    if (extension->contains("interpolate")) {
+      const auto parsed = JsonInterpolate(extension->find("interpolate"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.interpolate' must be 1..8 or {\"fps\": 1..240}",
+                     "invalid_interpolate");
+      }
+      interpolate = *parsed;
+    }
+    if (extension->contains("upscale")) {
+      const auto parsed = JsonUpscale(extension->find("upscale"));
+      if (!parsed.has_value()) {
+        return Error(400, "Bad Request",
+                     "'gufo.upscale' must be \"WxH\" or {\"width\", "
+                     "\"height\", \"fit\", \"model\"}",
+                     "invalid_upscale");
+      }
+      upscale = *parsed;
+    }
+  }
+  const VideoJobCreateResult created = service.Create({
+      .model = body.member_str("model", service.model_id()),
+      .output_format = "mp4",
+      .interpolate = interpolate.multiplier,
+      .interpolate_fps_num = interpolate.fps_num,
+      .interpolate_fps_den = interpolate.fps_den,
+      .upscale = std::move(upscale),
+      .source_video = std::move(source),
+  });
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
   std::map<std::string, std::string> files;
@@ -1143,6 +1239,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (!body.is_object()) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
+  }
+  if (body.contains("source_video") || files.contains("source_video")) {
+    return CreateProcessVideo(body, files, service);
   }
   if (service.family() == VideoModelFamily::kWan22) {
     return CreateWan22Video(body, files, service);
