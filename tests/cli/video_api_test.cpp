@@ -589,7 +589,7 @@ void TestDurations(const std::filesystem::path& root) {
   Check(runner.latest().parameters.frames == 345,
         "multipart resolves the maximum aligned duration");
 
-  for (const auto seconds : {"0", "4", "14.376", "15", "16"}) {
+  for (const auto seconds : {"0", "0.5", "14.376", "15", "16"}) {
     const auto response =
         Send(service, "POST", "/v1/videos",
              "{\"model\":\"minimax-h3\",\"prompt\":\"x\",\"seconds\":\"" +

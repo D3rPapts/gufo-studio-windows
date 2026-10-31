@@ -846,10 +846,10 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
   task.frames = SnapH3Frames(length);
   if (task.frames < 22)
     task.frames = 22;
-  if (task.frames > 22 && (task.frames < 124 || task.frames > 345))
+  if (task.frames > 345)
     throw NodeFailure(video, "unsupported_value",
-                      "gufo MiniMax H3 renders 22 frames or 124..345 frames "
-                      "(5..14.4 s at 24 fps), not " +
+                      "gufo MiniMax H3 renders 22..345 frames (17k + 5, up to "
+                      "14.4 s at 24 fps), not " +
                           std::to_string(task.frames));
   task.steps = static_cast<int>(graph.Num(sampler, "steps"));
   task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
@@ -2154,12 +2154,11 @@ json::Value VideoRequestBody(const VideoTask& task) {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
     // gufo aligns ceil(seconds * 24) up to 17k + 5 and wants gufo.frames to
-    // match: seconds 1 = 22 frames, otherwise 5..14.375 s. (frames - 8) / 24
+    // match: seconds 1 = 22 frames, otherwise up to 14.375 s. (frames - 8) / 24
     // lands inside the 17-frame step below `frames` without rounding trouble.
     double seconds = 1.0;
     if (task.frames > 22)
-      seconds =
-          std::max(5.0, std::round((task.frames - 8) / 24.0 * 1000.0) / 1000.0);
+      seconds = std::round((task.frames - 8) / 24.0 * 1000.0) / 1000.0;
     body["seconds"] = seconds;
     gufo["frames"] = task.frames;
     if (!task.lora.empty())

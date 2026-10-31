@@ -106,7 +106,12 @@ void TestDurations() {
                                                      {"12", 294},
                                                      {"13", 328},
                                                      {"14", 345},
-                                                     {"14.375", 345}}) {
+                                                     {"14.375", 345},
+                                                     // Short FilmStudio shots: any 17k + 5.
+                                                     {"1.5", 39},
+                                                     {"2", 56},
+                                                     {"4.125", 107},
+                                                     {"4.99", 124}}) {
     Check(h3::ResolveDurationFrames(seconds) == frames,
           "duration uses the official 24-fps VAE grid");
     auto parameters = h3::ResolveGenerationPreset("exact-1344x768");
@@ -115,7 +120,7 @@ void TestDurations() {
     Check(h3::ValidateGenerationParameters(*parameters, &error), error);
   }
   for (const auto seconds :
-       {"", "0", "2", "4.99", "14.376", "15", "16", "nan", "inf", "5x"}) {
+       {"", "0", "0.5", "14.376", "15", "16", "nan", "inf", "5x"}) {
     Check(!h3::ResolveDurationFrames(seconds),
           "invalid or over-limit aligned duration is rejected");
   }

@@ -30,7 +30,9 @@ std::optional<int> ResolveDurationFrames(std::string_view seconds,
       std::isfinite(duration)) {
     if (duration == 1.0)
       return 22;
-    if (duration >= 5.0 && duration <= 15.0) {
+    // Shorter shots too (ComfyUI renders any 17k + 5 frames, e.g. 107 for the
+    // FilmStudio's 4-second shots); the sampler takes 5..345 frames.
+    if (duration > 1.0 && duration <= 15.0) {
       const int frames = AlignFrameCount(
           static_cast<int>(std::ceil(duration * kH3FramesPerSecond)));
       if (frames <= kH3MaximumFrames)
@@ -39,7 +41,7 @@ std::optional<int> ResolveDurationFrames(std::string_view seconds,
   }
   if (error != nullptr)
     *error =
-        "MiniMax H3 seconds must be 1 (diagnostic) or 5..15 with "
+        "MiniMax H3 seconds must be 1 (diagnostic) or above 1 up to 15 with "
         "24-fps VAE alignment fitting within 345 frames (14.375 seconds)";
   return std::nullopt;
 }
