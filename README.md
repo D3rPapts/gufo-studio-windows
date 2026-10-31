@@ -358,7 +358,7 @@ for the numbers.
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
-  [What runs here now](#what-runs-here-now-october-2026) were tested on their
+  [What runs here now](#what-runs-here-now-111-october-2026) were tested on their
   branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
