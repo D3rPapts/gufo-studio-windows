@@ -36,6 +36,9 @@ constexpr std::string_view kPlumbing[] = {
     "VAEDecode",
     "VAEDecodeTiled",
     "VAEEncode",
+    "VAEEncodeForInpaint",
+    "SetLatentNoiseMask",
+    "LoadImageMask",
     "LTXVSeparateAVLatent",
     "LTXVAudioVAEDecode",
     "VAEDecodeAudio",
@@ -297,6 +300,30 @@ FileRef ImageFile(const Graph& graph, const std::string& id,
   throw NodeFailure(
       id, "unsupported_link",
       "input '" + key + "' must come from LoadImage, not " + source);
+}
+
+/// Mask a node input receives: LoadImage / LoadImageOutput MASK (1 - alpha)
+/// or LoadImageMask (its channel), sent as the file plus gufo.mask_channel.
+void MaskFile(const Graph& graph, const std::string& id, const Link& link,
+              ImageTask* task) {
+  const std::string source = graph.Class(link.node);
+  if ((source == "LoadImage" || source == "LoadImageOutput") &&
+      link.slot == 1) {
+    task->mask = ImageFile(graph, id, "mask", link);
+    task->mask_channel = "alpha";
+  } else if (source == "LoadImageMask") {
+    task->mask = ParseFileRef(graph.Str(link.node, "image"), "input");
+    task->mask_channel = graph.Str(link.node, "channel", "alpha");
+    if (task->mask_channel != "alpha" && task->mask_channel != "red" &&
+        task->mask_channel != "green" && task->mask_channel != "blue")
+      throw NodeFailure(link.node, "value_not_in_list",
+                        "channel must be alpha, red, green or blue");
+  } else {
+    throw NodeFailure(id, "unsupported_link",
+                      "input 'mask' must come from the MASK output of "
+                      "LoadImage or from LoadImageMask, not " +
+                          source);
+  }
 }
 
 FileRef AudioFile(const Graph& graph, const std::string& id,
@@ -571,7 +598,35 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
     else
       task.negative_prompt = ClipText(graph, negative);
   }
-  const std::string latent_class = graph.Class(latent.node);
+  // Masked editing: SetLatentNoiseMask over VAEEncode, or VAEEncodeForInpaint.
+  // gufo keeps the unmasked latent cells on the start image every step.
+  Link source = latent;
+  if (graph.Class(latent.node) == "SetLatentNoiseMask") {
+    MaskFile(graph, latent.node, graph.RequireLink(latent.node, "mask"),
+             &task);
+    source = graph.RequireLink(latent.node, "samples");
+    if (graph.Class(source.node) != "VAEEncode")
+      throw NodeFailure(latent.node, "unsupported_link",
+                        "SetLatentNoiseMask samples must come from VAEEncode "
+                        "of a LoadImage");
+  }
+  const std::string latent_class = graph.Class(source.node);
+  if (latent_class == "VAEEncodeForInpaint") {
+    MaskFile(graph, source.node, graph.RequireLink(source.node, "mask"),
+             &task);
+    task.size_source = SizeSource::kCanvas;
+    task.canvas = ImageFile(graph, source.node, "pixels",
+                            graph.RequireLink(source.node, "pixels"));
+    task.init_image = task.canvas;
+    // ComfyUI blanks the masked pixels to gray for inpainting checkpoints and
+    // grows the mask; gufo starts from the original pixels (the same at
+    // denoise 1) and rounds the mask out to 16-pixel cells.
+    warnings->push_back("node " + source.node +
+                        ": VAEEncodeForInpaint runs as SetLatentNoiseMask "
+                        "(original pixels under the mask, mask rounded out "
+                        "to 16-pixel cells; grow_mask_by ignored)");
+    return task;
+  }
   if (latent_class == "TextEncodeQwenImage21") {
     task.size_source = task.references.empty() ? SizeSource::kSquare
                                                : SizeSource::kFirstReference;
@@ -579,9 +634,9 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
       task.resolution = 1024;
   } else if (latent_class == "VAEEncode") {
     task.size_source = SizeSource::kCanvas;
-    task.canvas = ImageFile(graph, latent.node, "pixels",
-                            graph.RequireLink(latent.node, "pixels"));
-    if (task.strength)
+    task.canvas = ImageFile(graph, source.node, "pixels",
+                            graph.RequireLink(source.node, "pixels"));
+    if (task.strength || !task.mask.name.empty())
       task.init_image = task.canvas;
   } else if (latent_class == "EmptyLatentImage" ||
              latent_class == "EmptySD3LatentImage") {
@@ -1528,6 +1583,8 @@ json::Value ImageExtension(const ImageTask& task) {
     gufo["guidance"] = *task.guidance;
   if (task.strength)
     gufo["strength"] = *task.strength;
+  if (!task.mask.name.empty())
+    gufo["mask_channel"] = task.mask_channel;
   return gufo;
 }
 

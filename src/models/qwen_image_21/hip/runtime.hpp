@@ -164,6 +164,9 @@ public:
   Matrix Euler(const Matrix& x, const Matrix& velocity, float dt);
   Matrix Guidance(const Matrix& positive, const Matrix& negative, float scale);
   Matrix NoiseMix(const Matrix& noise, const Matrix& image, float sigma);
+  /// Masked editing: row r becomes w * x + (1 - w) * kept in FP32, w = row r
+  /// of the one-column weights; w 1 returns x and w 0 returns kept exactly.
+  Matrix MaskBlend(const Matrix& x, const Matrix& kept, const Matrix& weights);
   Matrix LatentScale(const Matrix& x, std::span<const float> mean,
                      std::span<const float> stddev, bool encode);
   Matrix VisionPosition(const Matrix& x, int height, int width);

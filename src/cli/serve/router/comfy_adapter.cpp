@@ -1302,9 +1302,11 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     }
   }
   const std::string size = std::to_string(width) + "x" + std::to_string(height);
-  std::string init_image;
-  if (spec.strength)
+  std::string init_image, mask;
+  if (spec.strength || !spec.mask.name.empty())
     init_image = ReadFileRef(spec.init_image);
+  if (!spec.mask.name.empty())
+    mask = ReadFileRef(spec.mask);
   const json::Value extension = ImageExtension(spec);
   const json::Value loras = ImageLoras(spec);
   // Live preview under this id; the worker renders it only while the relay
@@ -1353,11 +1355,17 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     if (!init_image.empty()) {
       const std::string type = SniffImageType(init_image);
       // The start image is the single "image" part, or "init_image" next
-      // to "image[]" references.
+      // to "image[]" references or a mask (which would otherwise also make
+      // a single "image" a reference).
       parts.push_back(
-          {references.empty() ? "image" : "init_image",
+          {references.empty() && mask.empty() ? "image" : "init_image",
            std::string("init") + (type == "image/jpeg" ? ".jpg" : ".png"), type,
            init_image});
+    }
+    if (!mask.empty()) {
+      const std::string type = SniffImageType(mask);
+      parts.push_back({"mask", type == "image/jpeg" ? "mask.jpg" : "mask.png",
+                       type, mask});
     }
     for (std::size_t i = 0; i < references.size(); ++i) {
       const std::string type = SniffImageType(references[i]);
@@ -1383,6 +1391,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   relay.request_stop();
   relay.join();
   if (result.status == 400 && !extension.empty() && !spec.strength &&
+      spec.mask.name.empty() &&
       ErrorMessage(result).find("gufo") != std::string::npos) {
     // An image worker without the gufo fields (negative prompt, guidance):
     // render without them and say so, as before.

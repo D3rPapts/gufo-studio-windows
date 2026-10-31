@@ -248,6 +248,91 @@ Image ResizeImage(const Image& image, int width, int height) {
   return output;
 }
 
+MaskChannel ParseMaskChannel(std::string_view name) {
+  if (name == "auto")
+    return MaskChannel::kAuto;
+  if (name == "alpha")
+    return MaskChannel::kAlpha;
+  if (name == "red")
+    return MaskChannel::kRed;
+  if (name == "green")
+    return MaskChannel::kGreen;
+  if (name == "blue")
+    return MaskChannel::kBlue;
+  throw std::invalid_argument(
+      "mask channel must be auto, alpha, red, green or blue");
+}
+
+std::vector<float> MaskWeights(const Image& mask, MaskChannel channel,
+                               int width, int height) {
+  CheckImage(mask);
+  if (width < 16 || height < 16 || width % 16 || height % 16)
+    throw std::invalid_argument("masked image size must be multiples of 16");
+  // kAuto without a translucent pixel reads luminance (white = edit).
+  bool luminance = false;
+  if (channel == MaskChannel::kAuto) {
+    luminance = true;
+    for (std::size_t i = 3; i < mask.rgba.size(); i += 4)
+      if (mask.rgba[i] != 255) {
+        channel = MaskChannel::kAlpha;
+        luminance = false;
+        break;
+      }
+  }
+  const auto edit = [&](std::size_t pixel) -> int {
+    const auto* p = mask.rgba.data() + 4 * pixel;
+    if (luminance)  // ITU-R BT.601, as Pillow's convert("L")
+      return (p[0] * 299 + p[1] * 587 + p[2] * 114 + 500) / 1000;
+    switch (channel) {
+      case MaskChannel::kAlpha:
+        return 255 - p[3];
+      case MaskChannel::kGreen:
+        return p[1];
+      case MaskChannel::kBlue:
+        return p[2];
+      default:
+        return p[0];
+    }
+  };
+  const int rows = height / 16, cols = width / 16;
+  std::vector<float> weights(static_cast<std::size_t>(rows) * cols);
+  // Cell [c * 16, c * 16 + 16) covers mask pixels [c * 16 * size / output,
+  // (c + 1) * 16 * size / output), at least one.
+  const auto span = [](int cell, int size, int output) {
+    const auto begin = static_cast<int>(
+        static_cast<std::int64_t>(cell) * 16 * size / output);
+    const auto end = static_cast<int>(
+        (static_cast<std::int64_t>(cell + 1) * 16 * size + output - 1) /
+        output);
+    return std::pair{std::min(begin, size - 1), std::max(begin + 1, end)};
+  };
+  for (int r = 0; r < rows; ++r) {
+    const auto [y0, y1] = span(r, mask.height, height);
+    for (int c = 0; c < cols; ++c) {
+      const auto [x0, x1] = span(c, mask.width, width);
+      int most = 0;
+      for (int y = y0; y < std::min(y1, mask.height) && most < 255; ++y)
+        for (int x = x0; x < std::min(x1, mask.width); ++x)
+          most = std::max(
+              most, edit(static_cast<std::size_t>(y) * mask.width + x));
+      weights[static_cast<std::size_t>(r) * cols + c] =
+          static_cast<float>(most) / 255.0F;
+    }
+  }
+  return weights;
+}
+
+void BlendMasked(std::span<float> latent, std::span<const float> kept,
+                 std::span<const float> weights, int cols) {
+  if (cols <= 0 || latent.size() != kept.size() ||
+      latent.size() != weights.size() * static_cast<std::size_t>(cols))
+    throw std::invalid_argument("masked blend shape mismatch");
+  for (std::size_t i = 0; i < latent.size(); ++i) {
+    const float m = weights[i / cols];
+    latent[i] = m * latent[i] + (1.0F - m) * kept[i];
+  }
+}
+
 void ValidateRequest(const Request& request) {
   if (request.prompt.size() > (64U << 10U))
     throw std::invalid_argument("image prompt exceeds 64 KiB");
@@ -281,6 +366,13 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument("strength below 1 requires an input image");
   if (request.init_image)
     CheckImage(*request.init_image);
+  if (request.mask) {
+    if (!request.init_image)
+      throw std::invalid_argument("a mask requires an input image to edit");
+    CheckImage(*request.mask);
+  } else if (request.mask_channel != MaskChannel::kAuto) {
+    throw std::invalid_argument("a mask channel requires a mask");
+  }
   if (request.loras.size() > 16)
     throw std::invalid_argument("image requests apply at most 16 LoRAs");
   for (std::size_t i = 0; i < request.loras.size(); ++i) {
