@@ -439,6 +439,7 @@ target_link_libraries(gufo_preview PUBLIC gufo_core JPEG::JPEG PkgConfig::WEBP
 add_library(gufo_http STATIC
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/jobs.cpp
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
@@ -724,6 +725,12 @@ if (BUILD_TESTING)
       TIMEOUT 30)
   endif()
 
+  add_executable(router_jobs_test tests/cli/router_jobs_test.cpp)
+  target_link_libraries(router_jobs_test PRIVATE gufo_http)
+  add_test(NAME router_jobs_test COMMAND router_jobs_test)
+  set_tests_properties(router_jobs_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 60)
+
   add_executable(router_comfy_graph_test tests/cli/router_comfy_graph_test.cpp
     src/cli/serve/router/comfy_graph.cpp)
   target_include_directories(router_comfy_graph_test PRIVATE ${PROJECT_SOURCE_DIR})
@@ -864,6 +871,12 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_comfy_test.py
       $<TARGET_FILE:gufo>)
   set_tests_properties(router_comfy_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
+
+  add_test(NAME router_jobs_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_jobs_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_jobs_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 180)
 
   # Real-model smoke check: gpu-only labels, so the hosted check-pr name

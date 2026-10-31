@@ -39,7 +39,7 @@ set(gufo_pr_targets
   qwen_image_21_test qwen_image_21_weights_test qwen_image_21_lora_test
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test
   router_preset_test router_registry_test router_proxy_test router_workers_test
-  router_ws_relay_test)
+  router_ws_relay_test router_jobs_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 if(NOT WIN32)
   list(APPEND gufo_pr_tests platform_library_relocated_test)

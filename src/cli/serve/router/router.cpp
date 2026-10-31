@@ -27,6 +27,7 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
@@ -257,6 +258,24 @@ router::comfy::FetchResult CollectResponse(HttpResponse response) {
     result.body = std::move(response.body);
   }
   return result;
+}
+
+/// Positive whole seconds separated by commas ("30,60,120").
+bool ParseSecondsList(std::string_view text,
+                      std::vector<std::chrono::seconds>* out) {
+  out->clear();
+  for (std::size_t start = 0; start <= text.size();) {
+    const auto end = std::min(text.find(',', start), text.size());
+    const std::string_view part = text.substr(start, end - start);
+    long long value = 0;
+    const auto [ptr, ec] =
+        std::from_chars(part.data(), part.data() + part.size(), value);
+    if (ec != std::errc{} || ptr != part.data() + part.size() || value < 1)
+      return false;
+    out->emplace_back(value);
+    start = end + 1;
+  }
+  return true;
 }
 
 std::optional<int> ParseEnvPort(const char* value) {
@@ -583,6 +602,8 @@ public:
   AutoloadFailures autoload_failed;
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
+  /// Background jobs with webhooks (--jobs-dir); null when disabled.
+  std::unique_ptr<router::jobs::JobQueue> jobs;
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -629,6 +650,10 @@ public:
     if (req.method == "GET" && (req.path == "/router/status" ||
                                 req.path.starts_with("/router/status?")))
       return RouterStatus();
+    if (jobs != nullptr) {
+      if (auto answer = jobs->Handle(req))
+        return std::move(*answer);
+    }
     if (comfy != nullptr) {
       if (auto answer = comfy->Handle(req))
         return std::move(*answer);
@@ -1556,6 +1581,12 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path pages_dir;
   std::filesystem::path comfy_dir;
   std::filesystem::path comfy_ffmpeg;
+  std::filesystem::path jobs_dir;
+  std::size_t jobs_parallel = 1;
+  std::string jobs_webhook_allow;
+  std::string jobs_webhook_secret;
+  std::string jobs_webhook_retry = "5,30,120,600";
+  std::size_t jobs_webhook_timeout_seconds = 10;
   std::size_t models_max = 2;
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
@@ -1598,6 +1629,31 @@ int RunRouter(std::span<const char* const> args) {
                    "ffmpeg for the ComfyUI API: FLAC audio, PNG frames from "
                    "videos, non-WAV voice references",
                    "Router", &comfy_ffmpeg);
+  parser.AddOption("", "--jobs-dir", "DIR",
+                   "Serve the job API (/v1/jobs): wrapped image, video, "
+                   "audio and chat requests run in the background; DIR holds "
+                   "jobs.json and the results",
+                   "Jobs", &jobs_dir);
+  parser.AddOption("", "--jobs-parallel", "N",
+                   "Jobs running at the same time (default: 1)", "Jobs",
+                   &jobs_parallel);
+  parser.AddOption("", "--jobs-webhook-allow", "LIST",
+                   "Webhook targets jobs may name, comma separated: host "
+                   "names, IPv4 addresses or a.b.c.d/n ranges, each with an "
+                   "optional :port, or * (any but link-local/multicast). "
+                   "Default: none, webhooks off",
+                   "Jobs", &jobs_webhook_allow);
+  parser.AddOption("", "--jobs-webhook-secret", "SECRET",
+                   "Sign webhooks like Standard Webhooks (HMAC-SHA256; "
+                   "whsec_<base64> or raw text)",
+                   "Jobs", &jobs_webhook_secret);
+  parser.AddOption("", "--jobs-webhook-retry-seconds", "LIST",
+                   "Waits before retrying a failed webhook, comma separated "
+                   "(default: 5,30,120,600)",
+                   "Jobs", &jobs_webhook_retry);
+  parser.AddOption("", "--jobs-webhook-timeout-seconds", "SEC",
+                   "Time one webhook attempt may take (default: 10)", "Jobs",
+                   &jobs_webhook_timeout_seconds);
   parser.AddOption("", "--models-max", "N",
                    "Maximum concurrently loaded workers (default: 2; "
                    "0 = unlimited)",
@@ -1719,22 +1775,24 @@ int RunRouter(std::span<const char* const> args) {
   registry_options.idle_timeout = std::chrono::seconds(sleep_idle_seconds);
   registry_options.load_timeout = std::chrono::seconds(load_timeout_seconds);
   std::vector<std::chrono::seconds> autoload_retry_delays;
-  for (std::size_t start = 0; start <= autoload_retry.size();) {
-    const auto end = std::min(autoload_retry.find(',', start),
-                              autoload_retry.size());
-    const std::string_view part =
-        std::string_view(autoload_retry).substr(start, end - start);
-    long long value = 0;
-    const auto [ptr, ec] =
-        std::from_chars(part.data(), part.data() + part.size(), value);
-    if (ec != std::errc{} || ptr != part.data() + part.size() || value < 1) {
-      std::cerr << "Error: --autoload-retry-seconds wants positive whole "
-                   "seconds separated by commas, not '"
-                << autoload_retry << "'\n";
-      return 2;
-    }
-    autoload_retry_delays.emplace_back(value);
-    start = end + 1;
+  if (!ParseSecondsList(autoload_retry, &autoload_retry_delays)) {
+    std::cerr << "Error: --autoload-retry-seconds wants positive whole "
+                 "seconds separated by commas, not '"
+              << autoload_retry << "'\n";
+    return 2;
+  }
+  std::vector<std::chrono::seconds> webhook_retry_delays;
+  if (!ParseSecondsList(jobs_webhook_retry, &webhook_retry_delays)) {
+    std::cerr << "Error: --jobs-webhook-retry-seconds wants positive whole "
+                 "seconds separated by commas, not '"
+              << jobs_webhook_retry << "'\n";
+    return 2;
+  }
+  std::vector<router::jobs::AllowEntry> webhook_allow;
+  if (std::string allow_error; !router::jobs::ParseAllowList(
+          jobs_webhook_allow, &webhook_allow, &allow_error)) {
+    std::cerr << "Error: --jobs-webhook-allow: " << allow_error << "\n";
+    return 2;
   }
   auto state = std::make_shared<RouterState>(models, registry_options);
   state->exe_path = router::ExecutablePath();
@@ -1769,6 +1827,28 @@ int RunRouter(std::span<const char* const> args) {
                        " reserve_host_gb=" + std::to_string(reserve_host_gb));
     }
   }
+  // The ComfyUI adapter and the job API call the router's own API.
+  RouterState* const raw = state.get();
+  router::comfy::Fetch self_fetch;
+  if (api_key.empty()) {
+    // Jobs go through the front like any client, so they show up in the
+    // request log and count as busy for idle checks.
+    const std::string self_host =
+        host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+            ? "127.0.0.1"
+            : host;
+    self_fetch = [self_host, port](const HttpRequest& request) {
+      router::UpstreamTarget target;
+      target.host = self_host;
+      target.port = port;
+      return CollectResponse(router::ProxyToWorker(target, request));
+    };
+  } else {
+    // The loopback relay drops Authorization; dispatch in process instead.
+    self_fetch = [raw](const HttpRequest& request) {
+      return CollectResponse(raw->Dispatch(request));
+    };
+  }
   if (!comfy_dir.empty()) {
     router::comfy::AdapterOptions comfy_options;
     comfy_options.root = comfy_dir;
@@ -1777,32 +1857,34 @@ int RunRouter(std::span<const char* const> args) {
     // validation instead of running on another model.
     for (const auto& model : models)
       comfy_options.models.available.push_back(model.id);
-    RouterState* const raw = state.get();
-    if (api_key.empty()) {
-      // Jobs go through the front like any client, so they show up in the
-      // request log and count as busy for idle checks.
-      const std::string self_host =
-          host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
-              ? "127.0.0.1"
-              : host;
-      comfy_options.fetch = [self_host, port](const HttpRequest& request) {
-        router::UpstreamTarget target;
-        target.host = self_host;
-        target.port = port;
-        return CollectResponse(router::ProxyToWorker(target, request));
-      };
-    } else {
-      // The loopback relay drops Authorization; dispatch in process instead.
-      comfy_options.fetch = [raw](const HttpRequest& request) {
-        return CollectResponse(raw->Dispatch(request));
-      };
-    }
+    comfy_options.fetch = self_fetch;
     comfy_options.unload = [raw] { raw->UnloadIdle(); };
     try {
       state->comfy =
           std::make_unique<router::comfy::Adapter>(std::move(comfy_options));
     } catch (const std::exception& error) {
       std::cerr << "Error: --comfy-dir: " << error.what() << '\n';
+      return 2;
+    }
+  }
+  if (!jobs_dir.empty()) {
+    router::jobs::Options jobs_options;
+    jobs_options.root = jobs_dir;
+    jobs_options.fetch = self_fetch;
+    for (const auto& model : models)
+      jobs_options.models.push_back(model.id);
+    jobs_options.parallel = jobs_parallel;
+    jobs_options.webhook_allow = std::move(webhook_allow);
+    jobs_options.webhook_secret = jobs_webhook_secret;
+    jobs_options.webhook_retry.assign(webhook_retry_delays.begin(),
+                                      webhook_retry_delays.end());
+    jobs_options.webhook_timeout = std::chrono::seconds(
+        std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
+    try {
+      state->jobs =
+          std::make_unique<router::jobs::JobQueue>(std::move(jobs_options));
+    } catch (const std::exception& error) {
+      std::cerr << "Error: --jobs-dir: " << error.what() << '\n';
       return 2;
     }
   }
@@ -1833,6 +1915,15 @@ int RunRouter(std::span<const char* const> args) {
                                (comfy_ffmpeg.empty() ? std::string("none")
                                                      : comfy_ffmpeg.string()));
   }
+  if (state->jobs != nullptr) {
+    state->jobs->Start();
+    Logger::Info("router", "event=jobs_api dir=" + jobs_dir.string() +
+                               " parallel=" + std::to_string(jobs_parallel) +
+                               " webhooks=" +
+                               (jobs_webhook_allow.empty()
+                                    ? std::string("off")
+                                    : jobs_webhook_allow));
+  }
   std::thread supervision([&state] {
     while (!state->stop_requested.load()) {
       state->SuperviseOnce();
@@ -1860,6 +1951,8 @@ int RunRouter(std::span<const char* const> args) {
   state->stop_requested.store(true);
   if (state->comfy != nullptr)
     state->comfy->Stop();
+  if (state->jobs != nullptr)
+    state->jobs->Stop();
   const auto drain_deadline = std::chrono::steady_clock::now() + kShutdownDrain;
   while (std::chrono::steady_clock::now() < drain_deadline) {
     bool any_busy = false;
