@@ -1425,6 +1425,18 @@ public:
       if (auto loop = RefuseRelayedAgain(req, model_id)) {
         return std::move(*loop);
       }
+      // The other machine serves its own clients with this model; a client
+      // here tidying up before its next job must not unload it there. That
+      // router's memory guard frees it when it needs the room.
+      if (unload) {
+        return LlamaErr(409, "Conflict",
+                        "model '" + model_id +
+                            "' is served by the remote router " +
+                            preset->remote->url.host + ":" +
+                            std::to_string(preset->remote->url.port) +
+                            ", which decides about unloading it",
+                        "remote_model");
+      }
       const router::RemoteSpec spec = *preset->remote;
       Logger::Info("router", std::string("event=models_") +
                                  (unload ? "unload" : "load") +

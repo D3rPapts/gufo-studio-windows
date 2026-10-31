@@ -576,10 +576,14 @@ def check_load_unload(router, remote):
     remote.load_delay = 0.0
     assert answers["load"] == (200, {"success": True}), answers
     assert remote.entries("/models/load")[-1]["auth"] == "Bearer " + KEY
+    # Unloading is the remote router's call (its own clients use the model):
+    # refused here, not relayed.
+    unloads = len(remote.entries("/models/unload"))
     code, answer = router.json("POST", "/models/unload", {"model": "img2"})
-    assert code == 200 and answer == {"success": True}, answer
+    assert code == 409 and answer["error"]["type"] == "remote_model", (code, answer)
+    assert len(remote.entries("/models/unload")) == unloads
     with remote.lock:
-        assert remote.states["img2"] == "unloaded"
+        assert remote.states["img2"] != "unloaded"
 
 
 def check_outage(router):
