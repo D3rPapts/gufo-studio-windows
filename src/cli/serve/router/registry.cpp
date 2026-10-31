@@ -283,7 +283,10 @@ void Registry::CompleteVideoJob(std::string_view job_id) {
     return;
   }
   Entry* entry = Lookup(it->second);
-  if (finished_owners_.emplace(it->first, it->second).second) {
+  // insert_or_assign: async music ids are numbered per worker (music_1 ...),
+  // so a finished id can come back for another model or a restarted worker;
+  // the newest finished owner answers.
+  if (finished_owners_.insert_or_assign(it->first, it->second).second) {
     finished_order_.push_back(it->first);
     constexpr std::size_t kFinishedJobs = 1024;
     if (finished_order_.size() > kFinishedJobs) {

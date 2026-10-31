@@ -319,10 +319,17 @@ bool IsJsonModelPost(const HttpRequest& req) {
   if (req.method != "POST") {
     return false;
   }
+  // The worker POST routes that take a JSON `model` field, including the
+  // llama-server (/completion, /apply-template) and embedding
+  // (/embeddings, /embedding) aliases.
   static const std::vector<std::string> kPaths = {
-      "/v1/chat/completions", "/v1/completions",        "/v1/responses",
-      "/v1/messages",         "/v1/images/generations", "/v1/images/edits",
-      "/v1/audio/speech",     "/v1/audio/music"};
+      "/v1/chat/completions",      "/v1/completions",
+      "/v1/responses",             "/v1/messages",
+      "/v1/messages/count_tokens", "/v1/images/generations",
+      "/v1/images/edits",          "/v1/audio/speech",
+      "/v1/audio/music",           "/v1/embeddings",
+      "/embeddings",               "/embedding",
+      "/completion",               "/apply-template"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
@@ -353,6 +360,34 @@ struct Resolution {
 bool IsIntrospectionPath(const std::string& path) {
   return path == "/v1/slots" || path == "/slots" || path == "/v1/metrics" ||
          path == "/metrics";
+}
+
+/// Worker GET routes that describe one model (voices, llama-server props,
+/// image LoRAs). Their model comes from the `model` query parameter like
+/// the introspection paths, but they load the model like any request.
+bool IsModelQueryGet(const HttpRequest& req) {
+  return req.method == "GET" &&
+         (req.path == "/v1/audio/voices" || req.path == "/props" ||
+          req.path == "/sdapi/v1/loras");
+}
+
+/// Job id from `/v1/audio/music/<id>` or `/v1/audio/music/<id>/content`,
+/// the async music reads music_api.cpp serves; empty for anything else.
+std::string MusicJobId(const std::string& path) {
+  constexpr std::string_view prefix = "/v1/audio/music/";
+  std::string_view remainder(path);
+  if (!remainder.starts_with(prefix)) {
+    return "";
+  }
+  remainder.remove_prefix(prefix.size());
+  constexpr std::string_view suffix = "/content";
+  if (remainder.ends_with(suffix)) {
+    remainder.remove_suffix(suffix.size());
+  }
+  if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
+    return "";
+  }
+  return std::string(remainder);
 }
 
 /// The WebSocket-routed paths from the spec resolution table; their model
@@ -402,9 +437,15 @@ Resolution ResolveModel(const HttpRequest& req) {
     resolution.missing = resolution.model_id.empty();
     return resolution;
   }
-  if (req.method == "GET" && IsIntrospectionPath(req.path)) {
+  if (req.method == "GET" &&
+      (IsIntrospectionPath(req.path) || IsModelQueryGet(req))) {
     resolution.model_id = req.query_param("model");
     resolution.missing = resolution.model_id.empty();
+    return resolution;
+  }
+  if (req.method == "GET" && !MusicJobId(req.path).empty()) {
+    // Optional: without ?model= the job's recorded owner answers.
+    resolution.model_id = req.query_param("model");
     return resolution;
   }
   return resolution;
@@ -487,6 +528,10 @@ bool IsVideoCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/videos";
 }
 
+bool IsMusicCreate(const HttpRequest& req) {
+  return req.method == "POST" && req.path == "/v1/audio/music";
+}
+
 /// Job id of the status resource `/v1/videos/<id>`; empty for `/content` or
 /// any deeper path.
 std::string VideoStatusJobId(const std::string& path) {
@@ -502,26 +547,27 @@ std::string VideoStatusJobId(const std::string& path) {
   return std::string(id);
 }
 
-/// Sniffs a relayed worker body so the router can keep its video-job
-/// bookkeeping aligned with the worker's authoritative response. Bytes
-/// accumulate up to the cap; an oversized or malformed body still relays
-/// untouched and is simply not recorded.
-class VideoBodySniffer {
+/// Sniffs a relayed worker body so the router can keep its video- and
+/// async-music-job bookkeeping aligned with the worker's authoritative
+/// response. Bytes accumulate up to the cap; an oversized or malformed body
+/// still relays untouched and is simply not recorded. kContent (a music
+/// result download) only needs the 2xx and buffers nothing.
+class JobBodySniffer {
 public:
-  enum class Kind { kTrack, kStatus, kDelete };
+  enum class Kind { kTrack, kStatus, kDelete, kContent };
 
-  VideoBodySniffer(std::mutex& mutex, router::Registry& registry, Kind kind,
-                   std::string model_id, std::string job_id)
+  JobBodySniffer(std::mutex& mutex, router::Registry& registry, Kind kind,
+                 std::string model_id, std::string job_id)
       : mutex_(mutex),
         registry_(registry),
         kind_(kind),
         model_id_(std::move(model_id)),
         job_id_(std::move(job_id)) {}
-  VideoBodySniffer(const VideoBodySniffer&) = delete;
-  VideoBodySniffer& operator=(const VideoBodySniffer&) = delete;
+  JobBodySniffer(const JobBodySniffer&) = delete;
+  JobBodySniffer& operator=(const JobBodySniffer&) = delete;
 
   std::string_view Observe(std::string_view chunk) {
-    if (!discarded_) {
+    if (!discarded_ && kind_ != Kind::kContent) {
       if (buffer_.size() + chunk.size() > kBodySniffBytes) {
         discarded_ = true;
         buffer_.clear();
@@ -538,9 +584,9 @@ public:
     if (discarded_) {
       return;
     }
-    if (kind_ == Kind::kDelete) {
+    if (kind_ == Kind::kDelete || kind_ == Kind::kContent) {
       const std::lock_guard<std::mutex> lock(mutex_);
-      registry_.CompleteVideoJob(job_id_);
+      CompleteOwnedLocked();
       return;
     }
     json::Value parsed;
@@ -563,11 +609,20 @@ public:
     }
     const std::string value = status->str();
     if (value == "completed" || value == "failed" || value == "cancelled") {
-      registry_.CompleteVideoJob(job_id_);
+      CompleteOwnedLocked();
     }
   }
 
 private:
+  /// Releases the job only for the model that answered: music ids are
+  /// numbered per worker, so a `?model=` read of another worker's
+  /// `music_1` must not close the recorded owner's job.
+  void CompleteOwnedLocked() {
+    if (registry_.JobOwner(job_id_) == model_id_) {
+      registry_.CompleteVideoJob(job_id_);
+    }
+  }
+
   static constexpr std::size_t kBodySniffBytes = 1 << 20;
 
   std::mutex& mutex_;
@@ -676,6 +731,11 @@ public:
       return Err(405, "Method Not Allowed", "method is not allowed",
                  "invalid_request_error", "method_not_allowed");
     }
+    if (req.path.starts_with("/v1/audio/music/") && req.method != "GET") {
+      // Music job reads are GET-only, as in music_api.cpp.
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "invalid_request_error", "method_not_allowed");
+    }
     if (req.path.starts_with("/v1/previews/"))
       return PreviewLocked(req, lock);
     const Resolution resolution = ResolveModel(req);
@@ -697,6 +757,18 @@ public:
       // Status/content reads for a recorded job route to its owner model and
       // reload that worker if it died (persisted job state answers again).
       resolved.model_id = registry.JobOwner(job_id);
+    }
+    const std::string music_job = req.method == "GET"
+                                      ? MusicJobId(req.path)
+                                      : std::string();
+    if (resolved.model_id.empty() && !music_job.empty()) {
+      // Async music reads (status, /content) go to the worker that answered
+      // the POST, like video jobs.
+      resolved.model_id = registry.JobOwner(music_job);
+      if (resolved.model_id.empty()) {
+        return Err(404, "Not Found", "unknown music job " + music_job,
+                   "invalid_request_error", "not_found");
+      }
     }
     if (resolved.model_id.empty()) {
       // Nothing resolved the path to a model. Video paths mirror the front's
@@ -737,6 +809,15 @@ public:
         !LoadedLocked(model_id)) {
       return Err(409, "Conflict", "model '" + model_id + "' is not loaded",
                  "invalid_request_error", "model_not_loaded");
+    }
+    if (!music_job.empty() && !LoadedLocked(model_id)) {
+      // Music jobs live only in the worker's memory: a stopped worker took
+      // them along, so a read never starts one. Drop the open job so the
+      // model no longer counts as busy.
+      if (registry.JobOwner(music_job) == model_id)
+        registry.CompleteVideoJob(music_job);
+      return Err(404, "Not Found", "unknown music job " + music_job,
+                 "invalid_request_error", "not_found");
     }
     // Shutdown order per spec: the drain refuses NEW loads but keeps proxying
     // already-loaded models until the final worker stop.
@@ -780,10 +861,10 @@ public:
     // runs with the lock free; the busy count keeps the worker resident.
     lock.unlock();
     HttpResponse response = router::ProxyToWorker(target, req);
-    std::shared_ptr<VideoBodySniffer> sniffer;
+    std::shared_ptr<JobBodySniffer> sniffer;
     if (response.status >= 200 && response.status < 300 &&
         response.streaming_body) {
-      sniffer = MakeVideoSniffer(req, model_id);
+      sniffer = MakeJobSniffer(req, model_id);
     }
     {
       const std::lock_guard<std::mutex> relock(mutex);
@@ -1331,15 +1412,27 @@ private:
     StopLocked(id);
   }
 
-  /// Video-job bookkeeping for proxied 2xx responses: the create response
-  /// records the worker-assigned id against the owning model; a terminal
-  /// status read or a DELETE releases it. Returns nullptr for non-video
-  /// requests.
-  std::shared_ptr<VideoBodySniffer> MakeVideoSniffer(
-      const HttpRequest& req, const std::string& model_id) {
-    if (IsVideoCreate(req)) {
-      return std::make_shared<VideoBodySniffer>(
-          mutex, registry, VideoBodySniffer::Kind::kTrack, model_id, "");
+  /// Job bookkeeping for proxied 2xx responses: the create response of a
+  /// video or async music job records the worker-assigned id against the
+  /// owning model; a terminal status read, a video DELETE or a music result
+  /// download releases it. Returns nullptr for every other request.
+  std::shared_ptr<JobBodySniffer> MakeJobSniffer(const HttpRequest& req,
+                                                 const std::string& model_id) {
+    if (IsVideoCreate(req) || IsMusicCreate(req)) {
+      // A synchronous music answer is a WAV body: it never parses and
+      // records nothing.
+      return std::make_shared<JobBodySniffer>(
+          mutex, registry, JobBodySniffer::Kind::kTrack, model_id, "");
+    }
+    if (req.method == "GET") {
+      if (const std::string music_id = MusicJobId(req.path);
+          !music_id.empty()) {
+        return std::make_shared<JobBodySniffer>(
+            mutex, registry,
+            req.path.ends_with("/content") ? JobBodySniffer::Kind::kContent
+                                           : JobBodySniffer::Kind::kStatus,
+            model_id, music_id);
+      }
     }
     if (req.method != "GET" && req.method != "DELETE") {
       return nullptr;
@@ -1348,10 +1441,10 @@ private:
     if (job_id.empty()) {
       return nullptr;
     }
-    return std::make_shared<VideoBodySniffer>(
+    return std::make_shared<JobBodySniffer>(
         mutex, registry,
-        req.method == "DELETE" ? VideoBodySniffer::Kind::kDelete
-                               : VideoBodySniffer::Kind::kStatus,
+        req.method == "DELETE" ? JobBodySniffer::Kind::kDelete
+                               : JobBodySniffer::Kind::kStatus,
         model_id, job_id);
   }
 

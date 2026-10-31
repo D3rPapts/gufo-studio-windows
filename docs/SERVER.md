@@ -546,10 +546,12 @@ model = /models/qwen3-asr
 
 | Endpoint | Model source |
 | --- | --- |
-| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/audio/speech`, `/v1/videos` | JSON `model` field |
+| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template` | JSON `model` field |
 | `/v1/audio/transcriptions` (multipart) | `model` form field |
 | `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter |
+| `GET /v1/audio/voices`, `GET /props`, `GET /sdapi/v1/loras` | `model` query parameter (loads the model) |
 | `/v1/videos/<id>` status/content | router job table |
+| `GET /v1/audio/music/<id>` status/content (`"async": true`) | `model` query parameter, else router job table |
 
 A missing model field or query parameter returns 400
 `invalid_request_error` naming the missing field; an unknown model id
@@ -573,6 +575,13 @@ model: while a tracked job is non-terminal its worker is exempt from
 eviction and idle unload, and a status or content read for a recorded job
 reloads that worker if it died, answering from the persisted `--root`
 job state.
+Async music job ids (`POST /v1/audio/music` with `"async": true`) are
+recorded the same way and keep their worker busy until a status read
+reports `completed` or `failed` or the WAV is downloaded. Music jobs live
+only in the worker's memory, so a read for a job whose worker is no longer
+loaded returns 404 `not_found` instead of starting the model. With
+`--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
+/embeddings` goes to the embedding model named in its body.
 
 ### Lifecycle
 

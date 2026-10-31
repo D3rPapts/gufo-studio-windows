@@ -331,6 +331,23 @@ void TestJobOwnerRoundTrip() {
   assert(registry.EvictionCandidate() == "v");
 }
 
+void TestReusedJobIdKeepsNewestOwner() {
+  // Async music ids are numbered per worker: music_1 of a second model (or
+  // of a restarted worker) must route to its newest owner once finished.
+  FakeClock clock;
+  RegistryOptions options;
+  Registry registry(Models({{"tts", "a"}, {"tts", "b"}}), options, clock);
+  registry.TrackVideoJob("music_1", "a");
+  registry.CompleteVideoJob("music_1");
+  assert(registry.JobOwner("music_1") == "a");
+  registry.TrackVideoJob("music_1", "b");
+  assert(registry.JobOwner("music_1") == "b");
+  assert(registry.Busy("b") && !registry.Busy("a"));
+  registry.CompleteVideoJob("music_1");
+  assert(registry.JobOwner("music_1") == "b");
+  assert(!registry.Busy("b"));
+}
+
 int main() {
   TestSpawnAwaitQueue();
   TestLoadTimeout();
@@ -339,6 +356,7 @@ int main() {
   TestLruAcrossModalities();
   TestMultiModalityResidency();
   TestJobOwnerRoundTrip();
+  TestReusedJobIdKeepsNewestOwner();
   std::cout << "All router registry tests passed.\n";
   return 0;
 }

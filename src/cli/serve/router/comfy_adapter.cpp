@@ -458,6 +458,12 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
       return ObjectInfo("");
     if (path.starts_with("/object_info/"))
       return ObjectInfo(path.substr(13));
+    // ComfyUI's /embeddings is a GET list of textual-inversion names. A
+    // POST to the bare /embeddings is the llama-server embeddings API and
+    // routes to an embedding model by its JSON `model` instead.
+    if (path == "/embeddings" && method != "GET" &&
+        request.path == "/embeddings")
+      return std::nullopt;
     if (path == "/embeddings" || path == "/extensions")
       return JsonResponse(200, json::Value::array());
     if (path == "/features")
