@@ -128,6 +128,30 @@ constexpr const char* kUni3C = R"({
  "33": {"class_type": "SaveVideo", "inputs": {"video": ["32", 0], "filename_prefix": "film/kamera/shot07", "format": "mp4", "codec": "h264"}}
 })";
 
+// InfiniteTalk as ComfyUI's template wires it (WanInfiniteTalkToVideo with
+// a DynamicCombo "mode"; its sub-inputs are named "mode.<input>").
+constexpr const char* kTalk = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength_model": 1.0}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp16.safetensors", "type": "wan", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "5": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+ "6": {"class_type": "ModelPatchLoader", "inputs": {"name": "wan2.1_infiniteTalk_single_fp16.safetensors"}},
+ "7": {"class_type": "AudioEncoderLoader", "inputs": {"audio_encoder_name": "wav2vec2-chinese-base_fp16.safetensors"}},
+ "8": {"class_type": "LoadAudio", "inputs": {"audio": "anna_satz1.wav"}},
+ "9": {"class_type": "AudioEncoderEncode", "inputs": {"audio_encoder": ["7", 0], "audio": ["8", 0]}},
+ "10": {"class_type": "LoadImage", "inputs": {"image": "anna_portrait.png"}},
+ "11": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["5", 0], "image": ["10", 0], "crop": "none"}},
+ "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "a woman talks calmly to the camera"}},
+ "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": ""}},
+ "16": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["20", 0], "shift": 5}},
+ "20": {"class_type": "WanInfiniteTalkToVideo", "inputs": {"mode": "single_speaker", "model": ["2", 0], "model_patch": ["6", 0], "positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": 81, "clip_vision_output": ["11", 0], "start_image": ["10", 0], "audio_encoder_output_1": ["9", 0], "motion_frame_count": 9, "audio_scale": 1.0}},
+ "30": {"class_type": "KSampler", "inputs": {"model": ["16", 0], "positive": ["20", 1], "negative": ["20", 2], "latent_image": ["20", 3], "seed": 7, "steps": 4, "cfg": 1.0, "sampler_name": "lcm", "scheduler": "simple", "denoise": 1.0}},
+ "31": {"class_type": "VAEDecode", "inputs": {"samples": ["30", 0], "vae": ["4", 0]}},
+ "32": {"class_type": "CreateVideo", "inputs": {"images": ["31", 0], "audio": ["8", 0], "fps": 25}},
+ "33": {"class_type": "SaveVideo", "inputs": {"video": ["32", 0], "filename_prefix": "film/dialog/anna_s01", "format": "mp4", "codec": "h264"}}
+})";
+
 comfy::Plan PlanOf(const char* text) {
   comfy::Plan plan;
   comfy::PlanError error;
@@ -778,6 +802,132 @@ void TestUni3C() {
   assert(smooth.interpolate == 2 && smooth.fps == 32);
 }
 
+void TestInfiniteTalk() {
+  const comfy::Plan plan = PlanOf(kTalk);
+  assert(plan.tasks.size() == 1);
+  assert(plan.tasks[0].node_id == "30");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kTalk);
+  assert(video.model == "wan2.1-infinitetalk-14b");
+  assert(video.prompt == "a woman talks calmly to the camera");
+  assert(video.width == 832 && video.height == 480 && video.frames == 81);
+  assert(video.fps == 25 && video.steps == 4 && video.seed == 7);
+  assert((video.first_frame == comfy::FileRef{"anna_portrait.png", "input"}));
+  assert(video.talk_audio.size() == 1);
+  assert((video.talk_audio[0] == comfy::FileRef{"anna_satz1.wav", "input"}));
+  assert(video.talk_masks.empty());
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "wan2.1-infinitetalk-14b");
+  assert(body.member_str("size") == "832x480");
+  assert(std::abs(body.find("seconds")->as_double() - 3.24) < 1e-9);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("frames") == nullptr);
+  assert(gufo->find("steps")->as_double() == 4);
+  const json::Value* talk = gufo->find("talk");
+  assert(talk->find("audio_scale")->as_double() == 1.0);
+  assert(talk->find("motion_frames")->as_double() == 9);
+  assert(talk->member_str("audio_mode") == "add");
+
+  // Two speakers: mask_1 from LoadImageMask (alpha), mask_2 from LoadImage's
+  // MASK output.
+  std::string two = Replace(
+      kTalk, "\"mode\": \"single_speaker\",",
+      "\"mode\": \"two_speakers\", \"mode.audio_encoder_output_2\": "
+      "[\"41\", 0], \"mode.mask_1\": [\"42\", 0], \"mode.mask_2\": "
+      "[\"43\", 1],");
+  two = Replace(
+      two, " \"10\": {",
+      " \"40\": {\"class_type\": \"LoadAudio\", \"inputs\": {\"audio\": "
+      "\"ben_satz1.wav\"}},\n \"41\": {\"class_type\": "
+      "\"AudioEncoderEncode\", \"inputs\": {\"audio_encoder\": [\"7\", 0], "
+      "\"audio\": [\"40\", 0]}},\n \"42\": {\"class_type\": "
+      "\"LoadImageMask\", \"inputs\": {\"image\": \"maske_anna.png\", "
+      "\"channel\": \"alpha\"}},\n \"43\": {\"class_type\": \"LoadImage\", "
+      "\"inputs\": {\"image\": \"maske_ben.png\"}},\n \"10\": {");
+  const comfy::Plan two_plan = PlanOf(two.c_str());
+  const auto& pair = std::get<comfy::VideoTask>(two_plan.tasks[0].spec);
+  assert(pair.talk_audio.size() == 2);
+  assert((pair.talk_audio[1] == comfy::FileRef{"ben_satz1.wav", "input"}));
+  assert(pair.talk_masks.size() == 2);
+  assert((pair.talk_masks[0] == comfy::FileRef{"maske_anna.png", "input"}));
+  assert((pair.talk_masks[1] == comfy::FileRef{"maske_ben.png", "input"}));
+  assert(pair.talk_mask_channels[0] == "inverted_alpha");
+  assert(pair.talk_mask_channels[1] == "inverted_alpha");
+  // Two speakers without masks, or from an unsupported node, fail.
+  assert(ErrorOf(Replace(two, ", \"mode.mask_2\": [\"43\", 1]", ""))
+             .message.find("mask_1 and mask_2") != std::string::npos);
+  assert(ErrorOf(Replace(two, "\"mode.mask_2\": [\"43\", 1]",
+                         "\"mode.mask_2\": [\"43\", 0]"))
+             .message.find("LoadImageMask") != std::string::npos);
+
+  // A second window continuing from the first (previous_frames) runs as one
+  // job: 81 + (81 - 9) frames.
+  std::string chained = Replace(
+      kTalk, " \"33\": {",
+      " \"50\": {\"class_type\": \"WanInfiniteTalkToVideo\", \"inputs\": "
+      "{\"mode\": \"single_speaker\", \"model\": [\"2\", 0], "
+      "\"model_patch\": [\"6\", 0], \"positive\": [\"12\", 0], "
+      "\"negative\": [\"13\", 0], \"vae\": [\"4\", 0], \"width\": 832, "
+      "\"height\": 480, \"length\": 81, \"clip_vision_output\": [\"11\", 0], "
+      "\"start_image\": [\"10\", 0], \"audio_encoder_output_1\": [\"9\", 0], "
+      "\"motion_frame_count\": 9, \"audio_scale\": 1.0, \"previous_frames\": "
+      "[\"31\", 0]}},\n \"51\": {\"class_type\": \"KSampler\", \"inputs\": "
+      "{\"model\": [\"50\", 0], \"positive\": [\"50\", 1], \"negative\": "
+      "[\"50\", 2], \"latent_image\": [\"50\", 3], \"seed\": 7, \"steps\": 4, "
+      "\"cfg\": 1.0, \"sampler_name\": \"lcm\", \"scheduler\": \"simple\", "
+      "\"denoise\": 1.0}},\n \"52\": {\"class_type\": \"VAEDecode\", "
+      "\"inputs\": {\"samples\": [\"51\", 0], \"vae\": [\"4\", 0]}},\n "
+      "\"53\": {\"class_type\": \"ImageFromBatch\", \"inputs\": {\"image\": "
+      "[\"52\", 0], \"batch_index\": [\"50\", 4], \"length\": 4096}},\n "
+      "\"54\": {\"class_type\": \"ImageBatch\", \"inputs\": {\"image1\": "
+      "[\"31\", 0], \"image2\": [\"53\", 0]}},\n \"33\": {");
+  chained = Replace(chained, "\"images\": [\"31\", 0], \"audio\"",
+                    "\"images\": [\"54\", 0], \"audio\"");
+  const comfy::Plan chain_plan = PlanOf(chained.c_str());
+  assert(chain_plan.tasks.size() == 1);
+  assert(chain_plan.tasks[0].node_id == "51");
+  const auto& longer = std::get<comfy::VideoTask>(chain_plan.tasks[0].spec);
+  assert(longer.frames == 153);
+  assert(chain_plan.warnings.size() == 1 &&
+         chain_plan.warnings[0].find("one gufo job") != std::string::npos);
+  // Windows with different audio cannot be one job.
+  std::string other = Replace(
+      chained, "\"previous_frames\": [\"31\", 0]}}",
+      "\"previous_frames\": [\"31\", 0]}},\n \"55\": {\"class_type\": "
+      "\"LoadAudio\", \"inputs\": {\"audio\": \"other.wav\"}},\n \"56\": "
+      "{\"class_type\": \"AudioEncoderEncode\", \"inputs\": "
+      "{\"audio_encoder\": [\"7\", 0], \"audio\": [\"55\", 0]}}");
+  other = Replace(other,
+                  "\"audio_encoder_output_1\": [\"9\", 0], "
+                  "\"motion_frame_count\": 9, \"audio_scale\": 1.0, "
+                  "\"previous_frames\"",
+                  "\"audio_encoder_output_1\": [\"56\", 0], "
+                  "\"motion_frame_count\": 9, \"audio_scale\": 1.0, "
+                  "\"previous_frames\"");
+  assert(ErrorOf(other).message.find("same audio") != std::string::npos);
+
+  // Errors: no start image, too large, foreign LoRA, audio not from the
+  // encoder.
+  assert(ErrorOf(Replace(kTalk, ", \"start_image\": [\"10\", 0]", ""))
+             .message.find("start_image") != std::string::npos);
+  assert(ErrorOf(Replace(kTalk, "\"height\": 480", "\"height\": 832"))
+             .message.find("832x832") != std::string::npos);
+  assert(ErrorOf(Replace(kTalk, "lightx2v_I2V_14B_480p_cfg_step_distill",
+                         "anime_style"))
+             .message.find("LoRA") != std::string::npos);
+  assert(ErrorOf(Replace(kTalk, "\"audio_encoder_output_1\": [\"9\", 0]",
+                         "\"audio_encoder_output_1\": [\"8\", 0]"))
+             .message.find("AudioEncoderEncode") != std::string::npos);
+  // motion_frame_count snaps to 4k+1 with a warning.
+  const comfy::Plan snapped = PlanOf(
+      Replace(kTalk, "\"motion_frame_count\": 9", "\"motion_frame_count\": 10")
+          .c_str());
+  assert(std::get<comfy::VideoTask>(snapped.tasks[0].spec).motion_frames ==
+         9);
+  assert(snapped.warnings.size() == 1);
+}
+
 void TestWanFunCamera() {
   // ComfyUI's Wan Fun Camera form: WanCameraEmbedding -> WanCameraImageToVideo.
   std::string text = Replace(
@@ -1105,6 +1255,7 @@ int main() {
   TestAceStep();
   TestUni3C();
   TestWanFunCamera();
+  TestInfiniteTalk();
   TestDelivery();
   TestWavJoin();
   TestHelpers();

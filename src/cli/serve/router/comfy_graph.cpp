@@ -78,6 +78,12 @@ constexpr std::string_view kPlumbing[] = {
     "ImageUpscaleWithModel",
     "ImageScale",
     "ImageScaleBy",
+    // InfiniteTalk (talk family).
+    "WanInfiniteTalkToVideo",
+    "AudioEncoderLoader",
+    "AudioEncoderEncode",
+    "ImageBatch",
+    "ImageFromBatch",
 };
 
 constexpr std::string_view kGenerators[] = {
@@ -342,6 +348,7 @@ struct ModelChain {
   std::vector<std::pair<std::string, double>> loras;  // sampler side first
   std::vector<std::string> lora_nodes;                 // node ids, same order
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
+  std::string talk;   // WanInfiniteTalkToVideo node id, "" if none
 };
 
 ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
@@ -359,6 +366,9 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
                           "the model input passes through two "
                           "WanUni3CControlnetApply nodes");
       chain.uni3c = link.node;
+    } else if (cls == "WanInfiniteTalkToVideo") {
+      if (chain.talk.empty())
+        chain.talk = link.node;
     } else if (cls == "UNETLoader") {
       chain.loader = graph.Str(link.node, "unet_name", "");
       chain.loader_node = link.node;
@@ -408,6 +418,10 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
       // Outputs (positive, negative, latent): follow the matching input.
       link = graph.RequireLink(link->node,
                                link->slot == 1 ? "negative" : "positive");
+    } else if (cls == "WanInfiniteTalkToVideo") {
+      // Outputs (model, positive, negative, latent, trim_image).
+      link = graph.RequireLink(link->node,
+                               link->slot == 2 ? "negative" : "positive");
     } else if (cls == "TextEncodeQwenImage21" || cls == "CLIPTextEncode" ||
                cls == "MiniMaxH3ImageToVideo" ||
                cls == "TextEncodeAceStepAudio1.5") {
@@ -1220,6 +1234,211 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
   return task;
 }
 
+/// A DynamicCombo sub-input: ComfyUI names it "<combo>.<input>" in the API
+/// prompt; older exports use the bare name.
+std::optional<Link> ComboLink(const Graph& graph, const std::string& id,
+                              const std::string& combo,
+                              const std::string& key) {
+  if (auto link = graph.LinkOf(id, combo + "." + key))
+    return link;
+  return graph.LinkOf(id, key);
+}
+
+/// The LoadAudio file behind an AudioEncoderEncode output.
+FileRef TalkAudio(const Graph& graph, const std::string& id,
+                  const std::string& key, const Link& link) {
+  if (graph.Class(link.node) != "AudioEncoderEncode")
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key + "' must come from AudioEncoderEncode, "
+                      "not " + graph.Class(link.node));
+  const Link loader = graph.RequireLink(link.node, "audio_encoder");
+  if (graph.Class(loader.node) != "AudioEncoderLoader")
+    throw NodeFailure(link.node, "unsupported_link",
+                      "audio_encoder must come from AudioEncoderLoader "
+                      "(gufo runs chinese-wav2vec2-base)");
+  return AudioFile(graph, link.node, "audio",
+                   graph.RequireLink(link.node, "audio"));
+}
+
+/// A speaker mask: LoadImageMask (its channel) or LoadImage's MASK output
+/// (1 - alpha).
+std::pair<FileRef, std::string> TalkMask(const Graph& graph,
+                                         const std::string& id,
+                                         const std::string& key,
+                                         const Link& link) {
+  const std::string source = graph.Class(link.node);
+  if ((source == "LoadImage" || source == "LoadImageOutput") &&
+      link.slot == 1)
+    return {ImageFile(graph, id, key, link), "inverted_alpha"};
+  if (source == "LoadImageMask") {
+    const std::string channel = graph.Str(link.node, "channel", "alpha");
+    if (channel != "alpha" && channel != "red" && channel != "green" &&
+        channel != "blue")
+      throw NodeFailure(link.node, "value_not_in_list",
+                        "channel must be alpha, red, green or blue");
+    // ComfyUI's LoadImageMask inverts the alpha channel (1 - alpha), as
+    // LoadImage's MASK does.
+    return {ParseFileRef(graph.Str(link.node, "image"), "input"),
+            channel == "alpha" ? "inverted_alpha" : channel};
+  }
+  throw NodeFailure(id, "unsupported_link",
+                    "input '" + key +
+                        "' must come from LoadImageMask or the MASK output of "
+                        "LoadImage, not " +
+                        source);
+}
+
+/// Wan 2.1 I2V + InfiniteTalk (wan2.1-infinitetalk-14b, 25 fps). A chain of
+/// WanInfiniteTalkToVideo windows (previous_frames from the decoded frames
+/// of the window before) is one gufo job: gufo windows the video itself
+/// (81 frames, continued from the last motion frames).
+VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
+                    const ModelIds& models, const Link& latent,
+                    std::vector<std::string>* warnings) {
+  const std::string node = latent.node;
+  VideoTask task;
+  task.family = VideoFamily::kTalk;
+  task.model = models.talk;
+  task.fps = 25;
+  task.width = static_cast<int>(graph.Num(node, "width", 832));
+  task.height = static_cast<int>(graph.Num(node, "height", 480));
+  if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 256 ||
+      task.height < 256 || task.width * task.height > 832 * 480)
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo wan2.1-infinitetalk-14b needs width/height in "
+                      "multiples of 16 (at least 256) and at most 832x480 "
+                      "pixels, not " +
+                          std::to_string(task.width) + "x" +
+                          std::to_string(task.height));
+  const auto start = graph.LinkOf(node, "start_image");
+  if (!start)
+    throw NodeFailure(node, "required_input_missing",
+                      "gufo wan2.1-infinitetalk-14b needs a start_image");
+  task.first_frame = ImageFile(graph, node, "start_image", *start);
+  const Link patch = graph.RequireLink(node, "model_patch");
+  if (graph.Class(patch.node) != "ModelPatchLoader")
+    throw NodeFailure(node, "unsupported_link",
+                      "model_patch must come from ModelPatchLoader (an "
+                      "InfiniteTalk patch)");
+  // Speakers.
+  task.talk_audio.push_back(TalkAudio(
+      graph, node, "audio_encoder_output_1",
+      graph.RequireLink(node, "audio_encoder_output_1")));
+  const std::string mode = graph.Str(node, "mode", "single_speaker");
+  if (mode == "two_speakers") {
+    const auto second =
+        ComboLink(graph, node, "mode", "audio_encoder_output_2");
+    const auto mask1 = ComboLink(graph, node, "mode", "mask_1");
+    const auto mask2 = ComboLink(graph, node, "mode", "mask_2");
+    if (second) {
+      if (!mask1 || !mask2)
+        throw NodeFailure(node, "required_input_missing",
+                          "two speakers need mask_1 and mask_2");
+      task.talk_audio.push_back(
+          TalkAudio(graph, node, "audio_encoder_output_2", *second));
+      for (const auto& [key, link] :
+           {std::pair<const char*, Link>{"mask_1", *mask1}, {"mask_2", *mask2}}) {
+        auto [file, channel] = TalkMask(graph, node, key, link);
+        task.talk_masks.push_back(std::move(file));
+        task.talk_mask_channels.push_back(std::move(channel));
+      }
+    } else if (mask1 || mask2) {
+      throw NodeFailure(node, "required_input_missing",
+                        "masks without audio_encoder_output_2");
+    }
+  } else if (mode != "single_speaker") {
+    throw NodeFailure(node, "value_not_in_list",
+                      "mode must be single_speaker or two_speakers");
+  }
+  task.audio_scale = graph.Num(node, "audio_scale", 1.0);
+  if (task.audio_scale < -10 || task.audio_scale > 10)
+    throw NodeFailure(node, "unsupported_value", "audio_scale must be -10..10");
+  const int motion = static_cast<int>(graph.Num(node, "motion_frame_count", 9));
+  task.motion_frames = std::clamp(1 + 4 * ((motion - 1 + 2) / 4), 1, 33);
+  if (task.motion_frames != motion)
+    warnings->push_back("node " + node + ": motion_frame_count " +
+                        std::to_string(motion) + " -> gufo uses " +
+                        std::to_string(task.motion_frames) + " (4k+1)");
+  // The window chain: this node and every WanInfiniteTalkToVideo behind its
+  // previous_frames, oldest first by depth.
+  std::vector<std::string> chain{node};
+  if (auto previous = graph.LinkOf(node, "previous_frames")) {
+    std::set<std::string> upstream = graph.Ancestors(previous->node);
+    upstream.insert(previous->node);
+    for (const std::string& id : upstream)
+      if (graph.Class(id) == "WanInfiniteTalkToVideo")
+        chain.push_back(id);
+  }
+  std::sort(chain.begin(), chain.end(),
+            [&](const std::string& a, const std::string& b) {
+              return graph.Ancestors(a).size() < graph.Ancestors(b).size();
+            });
+  int frames = 0;
+  for (std::size_t i = 0; i < chain.size(); ++i) {
+    const std::string& id = chain[i];
+    const int length = static_cast<int>(graph.Num(id, "length", 81));
+    if (length < 1 || length > 1500)
+      throw NodeFailure(id, "unsupported_value",
+                        "length must be 1..1500 frames (25 fps)");
+    const int overlap =
+        i == 0 ? 0 : static_cast<int>(graph.Num(id, "motion_frame_count", 9));
+    frames += length - overlap;
+    if (id != node) {
+      const auto audio = graph.LinkOf(id, "audio_encoder_output_1");
+      if (!audio || !(TalkAudio(graph, id, "audio_encoder_output_1", *audio) ==
+                      task.talk_audio.front()))
+        throw NodeFailure(id, "unsupported_link",
+                          "chained InfiniteTalk windows must share the same "
+                          "audio (gufo runs them as one job)");
+    }
+  }
+  task.frames = frames;
+  if (task.frames < 1 || task.frames > 1500)
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo wan2.1-infinitetalk-14b renders 1..1500 frames "
+                      "(60 s at 25 fps)");
+  if (chain.size() > 1)
+    warnings->push_back("node " + node + ": " + std::to_string(chain.size()) +
+                        " chained InfiniteTalk windows run as one gufo job "
+                        "of " + std::to_string(task.frames) + " frames");
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "CLIPTextEncode")
+    throw NodeFailure(sampler, "unsupported_link",
+                      "InfiniteTalk positive conditioning must come from "
+                      "CLIPTextEncode");
+  task.prompt = graph.Str(positive.encoder, "text");
+  if (!ClipText(graph, FollowConditioning(graph, sampler, "negative")).empty())
+    warnings->push_back("node " + sampler +
+                        ": the negative prompt is not applied (gufo "
+                        "wan2.1-infinitetalk-14b runs the distilled model)");
+  task.steps = static_cast<int>(graph.Num(sampler, "steps"));
+  if (task.steps < 1 || task.steps > 20)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.1-infinitetalk-14b takes 1..20 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  if (graph.Num(sampler, "cfg", 1.0) != 1.0)
+    warnings->push_back("node " + sampler +
+                        ": cfg is not applied (gufo wan2.1-infinitetalk-14b "
+                        "runs the distilled model)");
+  const ModelChain model = FollowModel(graph, sampler);
+  if (model.talk != node)
+    throw NodeFailure(sampler, "unsupported_link",
+                      "the sampler's model must come from the same "
+                      "WanInfiniteTalkToVideo as its latent");
+  for (const auto& [name, strength] : model.loras) {
+    (void)strength;
+    const std::string lower = Lower(name);
+    if (lower.find("lightx2v") == std::string::npos &&
+        lower.find("distill") == std::string::npos)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "gufo wan2.1-infinitetalk-14b has its step-distill "
+                        "LoRA built in and takes no other LoRA, not " +
+                            name);
+  }
+  return task;
+}
+
 OutputKind KindOf(std::string_view class_type) {
   if (class_type == "SaveAudio" || class_type == "PreviewAudio")
     return OutputKind::kAudio;
@@ -1296,7 +1515,7 @@ Delivery DeliveryOf(const Graph& graph, const std::string& id,
                         "ImageUpscaleWithModel on a video");
     return delivery;
   }
-  const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+  const int base = VideoFamilyFps(video->family);
   if (!rife.empty()) {
     if (rife.size() > 1)
       throw NodeFailure(rife.back(), "unsupported_link",
@@ -1473,6 +1692,12 @@ bool IsOutputClass(std::string_view class_type) {
   return Contains(kOutputs, class_type);
 }
 
+int VideoFamilyFps(VideoFamily family) {
+  return family == VideoFamily::kCamera ? 16
+         : family == VideoFamily::kTalk ? 25
+                                        : 24;
+}
+
 json::Value VideoRequestBody(const VideoTask& task) {
   json::Value body = json::Value::object();
   body["model"] = task.model;
@@ -1514,6 +1739,16 @@ json::Value VideoRequestBody(const VideoTask& task) {
       camera["ease"] = task.camera->ease;
       gufo["camera"] = std::move(camera);
     }
+  } else if (task.family == VideoFamily::kTalk) {
+    // 25 fps: gufo maps seconds back to round(25 s) frames.
+    body["size"] =
+        std::to_string(task.width) + "x" + std::to_string(task.height);
+    body["seconds"] = task.frames / 25.0;
+    json::Value talk = json::Value::object();
+    talk["audio_scale"] = task.audio_scale;
+    talk["motion_frames"] = task.motion_frames;
+    talk["audio_mode"] = "add";
+    gufo["talk"] = std::move(talk);
   } else {
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
@@ -1777,10 +2012,31 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
         throw NodeFailure(id, "unsupported_link",
                           "output has no generating node (KSampler or "
                           "Qwen3-TTS) upstream");
-      if (generators.size() > 1)
-        throw NodeFailure(id, "unsupported_link",
-                          "output depends on more than one generating node; "
-                          "chained generators are not supported");
+      if (generators.size() > 1) {
+        // Chained InfiniteTalk windows: the last sampler (the one all others
+        // feed) stands for the whole chain.
+        const auto is_talk = [&](const std::string& g) {
+          const auto latent = graph.LinkOf(g, "latent_image");
+          return IsSampler(graph.Class(g)) && latent &&
+                 graph.Class(latent->node) == "WanInfiniteTalkToVideo";
+        };
+        std::string last;
+        if (std::all_of(generators.begin(), generators.end(), is_talk)) {
+          for (const std::string& g : generators) {
+            const std::set<std::string> before = graph.Ancestors(g);
+            if (std::all_of(generators.begin(), generators.end(),
+                            [&](const std::string& other) {
+                              return other == g || before.contains(other);
+                            }))
+              last = g;
+          }
+        }
+        if (last.empty())
+          throw NodeFailure(id, "unsupported_link",
+                            "output depends on more than one generating "
+                            "node; chained generators are not supported");
+        generators = {last};
+      }
       const std::string& generator = generators.front();
       OutputTarget target;
       target.node_id = id;
@@ -1809,6 +2065,9 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
                    latent_class == "WanCameraImageToVideo")
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
+          else if (latent_class == "WanInfiniteTalkToVideo")
+            task.spec = BuildTalk(graph, generator, models, latent,
+                                  &plan->warnings);
           else if (latent_class == "EmptyAceStep1.5LatentAudio")
             task.spec = BuildMusic(graph, generator, models, latent,
                                    &plan->warnings);
@@ -1849,7 +2108,7 @@ bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
           video->fps_num = delivery.fps_num;
           video->fps_den = delivery.fps_den;
           video->upscale = delivery.upscale;
-          const int base = video->family == VideoFamily::kCamera ? 16 : 24;
+          const int base = VideoFamilyFps(video->family);
           video->fps = delivery.fps_num > 0
                            ? static_cast<int>(std::lround(
                                  static_cast<double>(delivery.fps_num) /

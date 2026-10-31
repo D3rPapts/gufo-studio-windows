@@ -21,6 +21,10 @@
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+//   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
+//          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
+//          windows via previous_frames become one job)
+//          -> /v1/videos (wan2.1-infinitetalk-14b, gufo.talk, 25 fps)
 // A new family adds its node classes to the tables in comfy_graph.cpp, a
 // task type here and an executor in comfy_adapter.cpp.
 //
@@ -56,6 +60,8 @@ struct ModelIds {
   std::string tts_clone{"qwen3-tts-clone"};
   std::string music{"ace-step-1.5-xl-turbo"};
   std::string camera{"wan2.1-uni3c"};
+  std::string talk{"wan2.1-infinitetalk-14b"};
+  std::string animate{"wan2.2-animate-14b"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
   /// (no silent fallback to `image`). Empty = not checked.
@@ -159,7 +165,10 @@ struct MusicTask {
 /// The /v1/audio/music body for `task` (synchronous, WAV).
 json::Value MusicRequestBody(const MusicTask& task);
 
-enum class VideoFamily { kH3, kWan, kCamera };
+enum class VideoFamily { kH3, kWan, kCamera, kTalk, kAnimate };
+
+/// Frames per second a family generates (16 camera, 25 talk, 24 else).
+int VideoFamilyFps(VideoFamily family);
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
 struct VideoUpscale {
@@ -212,6 +221,15 @@ struct VideoTask {
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;
   std::optional<FileRef> render_video;
+  /// Talk family (InfiniteTalk): the speakers' audio (one or two LoadAudio
+  /// files), with two speakers their masks and the mask channel ("red",
+  /// "green", "blue", or "inverted_alpha": ComfyUI's alpha masks), sent
+  /// as gufo.talk {audio, speaker_masks} by the executor.
+  std::vector<FileRef> talk_audio;
+  std::vector<FileRef> talk_masks;
+  std::vector<std::string> talk_mask_channels;
+  double audio_scale{1.0};
+  int motion_frames{9};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds
