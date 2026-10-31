@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -15,9 +17,12 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
+#include "src/models/qwen3_asr/audio.hpp"
+#include "src/models/qwen3_asr/subtitles.hpp"
 
 namespace gufo::server {
 namespace {
@@ -226,6 +231,194 @@ std::string ServerTiming(
   return value.str();
 }
 
+double MillisecondsSince(std::chrono::steady_clock::time_point begin) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - begin)
+      .count();
+}
+
+std::uint64_t SamplesToMilliseconds(std::size_t samples) {
+  // 16 kHz: exactly 16 samples per millisecond, rounded to nearest.
+  return (static_cast<std::uint64_t>(samples) * 1000U +
+          models::qwen3_asr::kAudioSampleRate / 2U) /
+         models::qwen3_asr::kAudioSampleRate;
+}
+
+/// Subtitles and verbose_json: Qwen3-ASR has no timestamps, so speech is cut
+/// at measured pauses (SegmentSpeech) and every segment is transcribed on its
+/// own. Segment times are those sample boundaries, never estimates.
+HttpResponse TranscribeSegments(const HttpRequest& request,
+                                AsrService& service, const std::string& wav,
+                                const std::string& context,
+                                const std::optional<std::string>& language,
+                                std::size_t maximum_tokens,
+                                const std::string& format) {
+  namespace asr = models::qwen3_asr;
+  const auto decode_begin = std::chrono::steady_clock::now();
+  asr::AudioBuffer decoded;
+  std::string error;
+  if (!asr::DecodeWav(std::as_bytes(std::span(wav.data(), wav.size())),
+                      &decoded, &error)) {
+    return Error(400, "Bad Request", std::move(error), "invalid_audio");
+  }
+  const std::vector<float> waveform = asr::ResampleMono16k(decoded);
+  if (!std::ranges::all_of(waveform,
+                           [](float sample) { return std::isfinite(sample); })) {
+    return Error(400, "Bad Request", "audio samples must be finite",
+                 "invalid_audio");
+  }
+  const double decode_ms = MillisecondsSince(decode_begin);
+  const auto vad_begin = std::chrono::steady_clock::now();
+  const std::vector<asr::AudioChunk> segments = asr::SegmentSpeech(waveform);
+  const double vad_ms = MillisecondsSince(vad_begin);
+
+  struct Transcribed {
+    asr::AudioChunk chunk;
+    std::string text;
+    std::vector<std::uint32_t> tokens;
+  };
+  std::vector<Transcribed> transcribed;
+  asr::TranscriptionTimings timings;
+  timings.decode_audio_ms = decode_ms;
+  std::size_t audio_tokens = 0;
+  std::size_t generated_tokens = 0;
+  std::vector<std::string> languages;
+  for (const asr::AudioChunk& segment : segments) {
+    std::vector<float> pcm(
+        waveform.begin() + static_cast<std::ptrdiff_t>(segment.offset),
+        waveform.begin() +
+            static_cast<std::ptrdiff_t>(segment.offset + segment.samples));
+    // The runtime pads split tails to half a second; do the same here. The
+    // cue keeps the measured boundary, not the padded length.
+    if (pcm.size() < asr::kAudioSampleRate / 2U) {
+      pcm.resize(asr::kAudioSampleRate / 2U, 0.0F);
+    }
+    asr::TranscriptionResult result;
+    if (!service.Transcribe(
+            asr::TranscriptionRequest{
+                .wav = {},
+                .context = context,
+                .language = language,
+                .max_new_tokens = maximum_tokens,
+                .pcm16k = pcm,
+                .on_text = {},
+            },
+            request.is_cancelled, &result, &error)) {
+      if (request.is_cancelled && request.is_cancelled()) {
+        return Error(499, "Client Closed Request", "transcription cancelled",
+                     "cancelled");
+      }
+      return Error(500, "Internal Server Error", std::move(error),
+                   "transcription_failed");
+    }
+    timings.feature_extraction_ms += result.timings.feature_extraction_ms;
+    timings.audio_encoder_ms += result.timings.audio_encoder_ms;
+    timings.text_decoder_ms += result.timings.text_decoder_ms;
+    audio_tokens += result.audio_tokens;
+    generated_tokens += result.generated_ids.size();
+    std::string_view names = result.language;
+    while (!names.empty()) {
+      const std::size_t comma = names.find(',');
+      const std::string name(Trim(names.substr(0, comma)));
+      if (!name.empty() &&
+          std::ranges::find(languages, name) == languages.end()) {
+        languages.push_back(name);
+      }
+      names = comma == std::string_view::npos ? std::string_view{}
+                                              : names.substr(comma + 1U);
+    }
+    std::string text = asr::NormalizeSubtitleText(
+        core::Utf8Decoder{}.Push(result.text, true));
+    if (!text.empty()) {
+      transcribed.push_back(
+          {segment, std::move(text), std::move(result.generated_ids)});
+    }
+  }
+
+  HttpResponse response;
+  response.status = 200;
+  response.reason = "OK";
+  if (format == "srt" || format == "vtt") {
+    std::vector<asr::SubtitleCue> cues;
+    cues.reserve(transcribed.size());
+    for (const Transcribed& item : transcribed) {
+      cues.push_back({
+          .start_ms = SamplesToMilliseconds(item.chunk.offset),
+          .end_ms =
+              SamplesToMilliseconds(item.chunk.offset + item.chunk.samples),
+          .text = item.text,
+      });
+    }
+    if (format == "srt") {
+      response.body = asr::FormatSrt(cues);
+      response.headers.emplace_back("Content-Type",
+                                    "application/x-subrip; charset=utf-8");
+    } else {
+      response.body = asr::FormatWebVtt(cues);
+      response.headers.emplace_back("Content-Type", "text/vtt; charset=utf-8");
+    }
+  } else {
+    std::string text;
+    json::Value list = json::Value::array();
+    for (std::size_t i = 0; i < transcribed.size(); ++i) {
+      const Transcribed& item = transcribed[i];
+      if (!text.empty())
+        text += ' ';
+      text += item.text;
+      json::Value segment = json::Value::object();
+      segment["id"] = static_cast<long long>(i);
+      // Whisper's seek counts 10-ms mel frames.
+      segment["seek"] =
+          static_cast<long long>(item.chunk.offset / asr::kAudioHopLength);
+      segment["start"] =
+          static_cast<double>(SamplesToMilliseconds(item.chunk.offset)) /
+          1000.0;
+      segment["end"] = static_cast<double>(SamplesToMilliseconds(
+                           item.chunk.offset + item.chunk.samples)) /
+                       1000.0;
+      segment["text"] = item.text;
+      json::Value tokens = json::Value::array();
+      for (const std::uint32_t token : item.tokens)
+        tokens.push_back(static_cast<long long>(token));
+      segment["tokens"] = std::move(tokens);
+      segment["temperature"] = 0.0;
+      list.push_back(std::move(segment));
+    }
+    std::string language_list;
+    for (const std::string& name : languages) {
+      if (!language_list.empty())
+        language_list += ',';
+      language_list += name;
+    }
+    json::Value body = json::Value::object();
+    body["task"] = "transcribe";
+    body["language"] = Lower(language_list);
+    body["duration"] =
+        static_cast<double>(SamplesToMilliseconds(waveform.size())) / 1000.0;
+    body["text"] = std::move(text);
+    body["segments"] = std::move(list);
+    response.body = body.dump();
+  }
+  response.headers.emplace_back("X-Gufo-Schema",
+                                std::string(kAudioAsrApiSchema));
+  response.headers.emplace_back("X-Gufo-ASR-Backend", service.backend_name());
+  response.headers.emplace_back("X-Gufo-ASR-Timestamps", "vad-segments");
+  response.headers.emplace_back(
+      "Server-Timing",
+      ServerTiming(timings) + ", vad;dur=" + std::to_string(vad_ms));
+  response.log_details =
+      "model=" + service.model_id() + " format=" + format +
+      " segments=" + std::to_string(segments.size()) +
+      " cues=" + std::to_string(transcribed.size()) +
+      " audio_tokens=" + std::to_string(audio_tokens) +
+      " generated_tokens=" + std::to_string(generated_tokens) +
+      " audio_ms=" + std::to_string(SamplesToMilliseconds(waveform.size())) +
+      " vad_ms=" + std::to_string(vad_ms) +
+      " encoder_ms=" + std::to_string(timings.audio_encoder_ms) +
+      " decoder_ms=" + std::to_string(timings.text_decoder_ms);
+  return response;
+}
+
 HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   std::string boundary;
   if (!ExtractBoundary(request.header("content-type"), &boundary)) {
@@ -270,9 +463,10 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   const MultipartPart* response_format = Find(parts, "response_format");
   const std::string format =
       response_format == nullptr ? "json" : response_format->body;
-  if (format != "json" && format != "text" && format != "verbose_json") {
+  if (format != "json" && format != "text" && format != "verbose_json" &&
+      format != "srt" && format != "vtt") {
     return Error(400, "Bad Request",
-                 "response_format must be json, text, or verbose_json",
+                 "response_format must be json, text, srt, verbose_json, or vtt",
                  "invalid_response_format");
   }
   if (const MultipartPart* temperature = Find(parts, "temperature");
@@ -289,10 +483,21 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                    "invalid_temperature");
     }
   }
-  if (Find(parts, "timestamp_granularities[]") != nullptr) {
-    return Error(400, "Bad Request",
-                 "timestamp granularities are not supported",
-                 "unsupported_option");
+  if (const MultipartPart* granularity =
+          Find(parts, "timestamp_granularities[]");
+      granularity != nullptr) {
+    // Segment times are measured pause boundaries; Qwen3-ASR has no word
+    // alignment, so word timestamps are refused instead of estimated.
+    if (granularity->body != "segment") {
+      return Error(400, "Bad Request",
+                   "only segment timestamps are supported (no word alignment)",
+                   "unsupported_option");
+    }
+    if (format != "verbose_json") {
+      return Error(400, "Bad Request",
+                   "timestamp_granularities requires verbose_json",
+                   "invalid_response_format");
+    }
   }
   bool stream = false;
   if (const auto* value = Find(parts, "stream")) {
@@ -390,6 +595,15 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
         };
     return response;
   }
+  if (format == "srt" || format == "vtt" || format == "verbose_json") {
+    return TranscribeSegments(
+        request, service, file->body,
+        prompt == nullptr ? std::string{} : prompt->body,
+        language == nullptr || language->body.empty()
+            ? std::nullopt
+            : std::optional<std::string>(language->body),
+        maximum_tokens, format);
+  }
   models::qwen3_asr::TranscriptionResult result;
   std::string error;
   if (!service.Transcribe(
@@ -419,13 +633,6 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   } else {
     json::Value body = json::Value::object();
     body["text"] = core::Utf8Decoder{}.Push(result.text, true);
-    if (format == "verbose_json") {
-      body["task"] = "transcribe";
-      body["language"] = Lower(result.language);
-      body["duration"] =
-          static_cast<double>(result.audio_samples) / result.sample_rate;
-      body["segments"] = json::Value::array();
-    }
     response.body = body.dump();
   }
   response.headers.emplace_back("X-Gufo-Schema",

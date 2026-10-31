@@ -1,11 +1,14 @@
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/audio_asr_api.hpp"
@@ -48,6 +51,13 @@ public:
     result->generated_ids = {1, 2, 3};
     result->timings.audio_encoder_ms = 10.0;
     result->timings.text_decoder_ms = 20.0;
+    if (!request.pcm16k.empty()) {
+      pcm_samples.push_back(request.pcm16k.size());
+      if (!segment_texts.empty()) {
+        result->text = segment_texts[(pcm_samples.size() - 1U) %
+                                     segment_texts.size()];
+      }
+    }
     if (request.on_text && !request.on_text("A native")) {
       if (error != nullptr)
         *error = "cancelled";
@@ -61,6 +71,8 @@ public:
   std::string context;
   std::optional<std::string> language;
   std::size_t maximum_tokens{0};
+  std::vector<std::size_t> pcm_samples;
+  std::vector<std::string> segment_texts;
 };
 
 AsrService MakeService(FakeRunner* runner) {
@@ -79,7 +91,9 @@ AsrService MakeService(FakeRunner* runner) {
 
 std::string Multipart(std::string response_format = "json",
                       bool include_unknown = false,
-                      std::string_view stream = {}) {
+                      std::string_view stream = {},
+                      std::string_view file = "RIFFfake",
+                      std::string_view granularity = {}) {
   constexpr std::string_view boundary = "gufo-test-boundary";
   std::string body;
   const auto append = [&](std::string_view name, std::string_view value,
@@ -98,7 +112,7 @@ std::string Multipart(std::string response_format = "json",
     body.append(value.data(), value.size());
     body += "\r\n";
   };
-  append("file", "RIFFfake", "sample.wav");
+  append("file", file, "sample.wav");
   append("model", "qwen3-asr");
   append("language", "en");
   append("prompt", "Names: Gufo.");
@@ -107,6 +121,8 @@ std::string Multipart(std::string response_format = "json",
   append("temperature", "0");
   if (!stream.empty())
     append("stream", stream);
+  if (!granularity.empty())
+    append("timestamp_granularities[]", granularity);
   if (include_unknown) {
     append("typo", "true");
   }
@@ -168,18 +184,16 @@ void TestFormatsAndValidation() {
   Check(text.status == 200 && text.body == "A native transcript." &&
             HasHeader(text, "Content-Type", "text/plain; charset=utf-8"),
         "text response format is supported");
-  const HttpResponse verbose = Send(service, Multipart("verbose_json"));
-  Check(verbose.status == 200 &&
-            verbose.body.find("\"duration\":2") != std::string::npos &&
-            verbose.body.find("\"language\":\"english\"") != std::string::npos,
-        "verbose_json exposes duration and language");
-  Check(Send(service, Multipart("srt")).status == 400,
+  Check(Send(service, Multipart("srt")).status == 400 &&
+            Send(service, Multipart("verbose_json")).status == 400,
+        "segmented formats reject audio that is not a WAV");
+  Check(Send(service, Multipart("xml")).status == 400,
         "unsupported response formats fail closed");
   Check(Send(service, Multipart("json", true)).status == 400,
         "unknown multipart fields fail closed");
   Check(Send(service, Multipart(), "application/json").status == 400,
         "non-multipart requests fail closed");
-  Check(runner.calls == 2, "invalid requests never invoke inference");
+  Check(runner.calls == 1, "invalid requests never invoke inference");
 }
 
 void TestStreamingAndChunks() {
@@ -240,12 +254,145 @@ void TestStreamingAndChunks() {
   }
 }
 
+/// 16-bit mono 16-kHz WAV: 0.5 s silence, 1 s tone, 2 s silence, 1.5 s tone,
+/// 1 s silence. Speech therefore lies in [0.5, 1.5) and [3.5, 5.0) seconds.
+std::string TwoUtteranceWav() {
+  constexpr std::uint32_t rate = qwen3_asr::kAudioSampleRate;
+  std::vector<std::int16_t> samples;
+  const auto add = [&](double seconds, bool tone) {
+    const auto count = static_cast<std::size_t>(seconds * rate);
+    for (std::size_t i = 0; i < count; ++i) {
+      const double t = static_cast<double>(samples.size()) / rate;
+      samples.push_back(
+          tone ? static_cast<std::int16_t>(
+                     9000.0 * std::sin(2.0 * 3.14159265358979 * 220.0 * t))
+               : std::int16_t{0});
+    }
+  };
+  add(0.5, false);
+  add(1.0, true);
+  add(2.0, false);
+  add(1.5, true);
+  add(1.0, false);
+  std::string wav;
+  const auto u32 = [&](std::uint32_t value) {
+    for (int i = 0; i < 4; ++i)
+      wav.push_back(static_cast<char>((value >> (8 * i)) & 0xFFU));
+  };
+  const auto u16 = [&](std::uint16_t value) {
+    wav.push_back(static_cast<char>(value & 0xFFU));
+    wav.push_back(static_cast<char>(value >> 8U));
+  };
+  const auto data_bytes = static_cast<std::uint32_t>(samples.size() * 2U);
+  wav += "RIFF";
+  u32(36U + data_bytes);
+  wav += "WAVEfmt ";
+  u32(16);
+  u16(1);
+  u16(1);
+  u32(rate);
+  u32(rate * 2U);
+  u16(2);
+  u16(16);
+  wav += "data";
+  u32(data_bytes);
+  for (const std::int16_t sample : samples)
+    u16(static_cast<std::uint16_t>(sample));
+  return wav;
+}
+
+void TestSubtitleFormats() {
+  const std::string wav = TwoUtteranceWav();
+  FakeRunner runner;
+  runner.segment_texts = {"Hallo <Welt> & Freunde.", "  \n  ",
+                          "Zweiter Satz --> Ende."};
+  AsrService service = MakeService(&runner);
+
+  // Default merging would join two cues 2 s apart only if the gap were at
+  // most 1 s; here they stay separate.
+  const HttpResponse srt = Send(service, Multipart("srt", false, {}, wav));
+  Check(srt.status == 200, "srt succeeds for a WAV upload");
+  Check(runner.pcm_samples.size() == 2 && runner.calls == 2 &&
+            runner.wav_bytes == 0U,
+        "each measured speech segment is transcribed separately as PCM");
+  Check(runner.pcm_samples[0] == 19200U && runner.pcm_samples[1] == 27200U,
+        "segments are the speech plus 100 ms padding on each side");
+  Check(srt.body == "1\n00:00:00,400 --> 00:00:01,600\n"
+                    "Hallo <Welt> & Freunde.\n\n",
+        "srt cue times are the measured boundaries; empty text is dropped");
+  Check(HasHeader(srt, "Content-Type", "application/x-subrip; charset=utf-8") &&
+            HasHeader(srt, "X-Gufo-ASR-Timestamps", "vad-segments"),
+        "srt declares its media type and timing source");
+  Check(srt.log_details.find("segments=2") != std::string::npos &&
+            srt.log_details.find("cues=1") != std::string::npos &&
+            srt.log_details.find("Hallo") == std::string::npos,
+        "srt diagnostics count segments without logging the transcript");
+
+  runner.pcm_samples.clear();
+  runner.segment_texts = {"Hallo <Welt> & Freunde.", "Zweiter Satz --> Ende."};
+  const HttpResponse vtt = Send(service, Multipart("vtt", false, {}, wav));
+  Check(vtt.status == 200 &&
+            vtt.body == "WEBVTT\n\n"
+                        "1\n00:00:00.400 --> 00:00:01.600\n"
+                        "Hallo &lt;Welt&gt; &amp; Freunde.\n\n"
+                        "2\n00:00:03.400 --> 00:00:05.100\n"
+                        "Zweiter Satz --&gt; Ende.\n\n",
+        "vtt uses a header, full-stop times and escaped text");
+  Check(HasHeader(vtt, "Content-Type", "text/vtt; charset=utf-8"),
+        "vtt declares text/vtt");
+
+  runner.pcm_samples.clear();
+  const HttpResponse verbose =
+      Send(service, Multipart("verbose_json", false, {}, wav, "segment"));
+  Check(verbose.status == 200 &&
+            verbose.body.find("\"duration\":6") != std::string::npos &&
+            verbose.body.find("\"language\":\"english\"") !=
+                std::string::npos &&
+            verbose.body.find("\"text\":\"Hallo <Welt> & Freunde. Zweiter "
+                              "Satz --> Ende.\"") != std::string::npos,
+        "verbose_json joins segment texts and reports duration and language");
+  Check(verbose.body.find("\"id\":0") != std::string::npos &&
+            verbose.body.find("\"start\":0.4") != std::string::npos &&
+            verbose.body.find("\"end\":1.6") != std::string::npos &&
+            verbose.body.find("\"start\":3.4") != std::string::npos &&
+            verbose.body.find("\"end\":5.1") != std::string::npos &&
+            verbose.body.find("\"seek\":340") != std::string::npos &&
+            verbose.body.find("\"tokens\":[1,2,3]") != std::string::npos,
+        "verbose_json segments carry measured start and end seconds");
+
+  const int calls = runner.calls;
+  Check(Send(service, Multipart("verbose_json", false, {}, wav, "word"))
+                .status == 400,
+        "word timestamps are refused rather than estimated");
+  Check(Send(service, Multipart("json", false, {}, wav, "segment")).status ==
+            400,
+        "timestamp granularities require verbose_json");
+  Check(Send(service, Multipart("srt", false, "true", wav)).status == 400,
+        "subtitles cannot be streamed");
+  Check(runner.calls == calls, "rejected subtitle requests never run");
+
+  std::string silent = wav.substr(0, 44);
+  silent.append(16000U * 2U, '\0');
+  // Fix the RIFF and data sizes for one second of silence.
+  const auto patch = [&](std::size_t at, std::uint32_t value) {
+    for (int i = 0; i < 4; ++i)
+      silent[at + static_cast<std::size_t>(i)] =
+          static_cast<char>((value >> (8 * i)) & 0xFFU);
+  };
+  patch(4, 36U + 32000U);
+  patch(40, 32000U);
+  const HttpResponse empty = Send(service, Multipart("srt", false, {}, silent));
+  Check(empty.status == 200 && empty.body.empty() && runner.calls == calls,
+        "silence yields an empty SRT without running the model");
+}
+
 }  // namespace
 
 int main() {
   TestJsonRequest();
   TestFormatsAndValidation();
   TestStreamingAndChunks();
+  TestSubtitleFormats();
   std::cout << "PASS qwen3_asr_audio_api_test\n";
   return 0;
 }
