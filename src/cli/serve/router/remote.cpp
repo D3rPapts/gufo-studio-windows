@@ -1,7 +1,11 @@
 #include "src/cli/serve/router/remote.hpp"
 
+#include <chrono>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "src/core/json.hpp"
 
 namespace gufo::router {
 
@@ -43,6 +47,39 @@ bool CheckRemoteAllowed(const RemoteSpec& spec,
     return false;
   }
   return true;
+}
+
+UpstreamTarget RemoteTarget(const RemoteSpec& spec) {
+  UpstreamTarget target;
+  target.host = spec.url.host;
+  target.port = spec.url.port;
+  target.connect_timeout = std::chrono::seconds(spec.connect_timeout_seconds);
+  target.head_timeout = std::chrono::seconds(spec.head_timeout_seconds);
+  target.keepalive = true;
+  if (!spec.api_key.empty()) {
+    target.extra_headers.emplace_back("Authorization",
+                                      "Bearer " + spec.api_key);
+  }
+  return target;
+}
+
+server::HttpResponse RemoteUnavailable(const std::string& model_id,
+                                       const std::string& detail) {
+  json::Value error = json::Value::object();
+  error["message"] = "remote model '" + model_id +
+                     "' is unreachable: " + detail;
+  error["type"] = "server_error";
+  error["code"] = "remote_unavailable";
+  json::Value body = json::Value::object();
+  body["error"] = std::move(error);
+  server::HttpResponse response;
+  response.status = 503;
+  response.reason = "Service Unavailable";
+  response.body = body.dump();
+  response.headers = {{"Content-Type", "application/json"},
+                      {"Retry-After", "30"}};
+  response.log_details = "remote_unavailable model=" + model_id;
+  return response;
 }
 
 }  // namespace gufo::router

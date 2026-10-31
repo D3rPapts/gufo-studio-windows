@@ -544,6 +544,34 @@ private:
   bool armed_{false};
 };
 
+/// Everything one remote relay holds until its response is done: the busy
+/// count (job reads route back, /models/unload sees it) and the in-flight
+/// count the shutdown drain waits for. Release is idempotent and takes the
+/// state mutex itself (through HeldBusy).
+class RemoteHold {
+public:
+  RemoteHold(std::shared_ptr<HeldBusy> busy, std::atomic<int>& inflight)
+      : busy_(std::move(busy)), inflight_(inflight) {
+    ++inflight_;
+  }
+  RemoteHold(const RemoteHold&) = delete;
+  RemoteHold& operator=(const RemoteHold&) = delete;
+  ~RemoteHold() { Release(); }
+
+  void Release() {
+    if (released_.exchange(true)) {
+      return;
+    }
+    busy_->Release();
+    --inflight_;
+  }
+
+private:
+  std::shared_ptr<HeldBusy> busy_;
+  std::atomic<int>& inflight_;
+  std::atomic<bool> released_{false};
+};
+
 bool IsVideoCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/videos";
 }
@@ -620,6 +648,7 @@ public:
       const auto* id = parsed.find("id");
       if (id != nullptr && id->is_string() && !id->str().empty()) {
         registry_.TrackVideoJob(id->str(), model_id_);
+        tracked_ = id->str();
       }
       return;
     }
@@ -632,6 +661,9 @@ public:
       CompleteOwnedLocked();
     }
   }
+
+  /// The job id a create response recorded (after Commit); "" otherwise.
+  const std::string& tracked() const { return tracked_; }
 
 private:
   /// Releases the job only for the model that answered: music ids are
@@ -651,6 +683,7 @@ private:
   std::string model_id_;
   std::string job_id_;
   std::string buffer_;
+  std::string tracked_;
   bool discarded_{false};
 };
 
@@ -679,6 +712,8 @@ public:
   std::unique_ptr<router::comfy::Adapter> comfy;
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
   std::unique_ptr<router::jobs::JobQueue> jobs;
+  /// Relays to remote routers still running (the shutdown drain waits).
+  std::atomic<int> remote_inflight{0};
 
   /// Worker::Spawn must run on the long-lived spawner thread: PR_SET_PDEATHSIG
   /// binds the worker to the thread that forked it, and request-handling
@@ -815,9 +850,8 @@ public:
       return ModelNotFoundError();
     }
     if (preset->remote.has_value()) {
-      return Err(501, "Not Implemented",
-                 "remote model '" + model_id + "' is not routed yet",
-                 "server_error", "remote_not_implemented");
+      // Another router owns the model: no admission, load or memory here.
+      return DispatchRemoteLocked(req, model_id, *preset->remote, lock);
     }
     const bool ws_relay =
         IsWebSocketPath(req) && server::IsWebSocketUpgrade(req);
@@ -925,6 +959,72 @@ public:
     return response;
   }
 
+  /// Relays a request for a `[remote/<id>]` model to its router. The model
+  /// stays "unloaded" in the registry (never admitted, measured, evicted or
+  /// idle-unloaded); only the busy count and the job owners track it, so
+  /// the drain waits for it and job reads route back. The relay runs with
+  /// the state mutex released. A connect failure is a 503
+  /// remote_unavailable: nothing local is restarted.
+  HttpResponse DispatchRemoteLocked(const HttpRequest& req,
+                                    const std::string& model_id,
+                                    const router::RemoteSpec& spec,
+                                    std::unique_lock<std::mutex>& lock) {
+    if (spec.max_request_bytes > 0 &&
+        req.body.size() > spec.max_request_bytes) {
+      return Err(413, "Payload Too Large",
+                 "request body exceeds " +
+                     std::to_string(spec.max_request_bytes) +
+                     " bytes for remote model '" + model_id + "'",
+                 "invalid_request_error", "request_too_large");
+    }
+    if (stop_requested.load()) {
+      return Err(502, "Bad Gateway", "router is shutting down", "server_error",
+                 "upstream_unavailable");
+    }
+    auto hold = std::make_shared<RemoteHold>(
+        std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
+        remote_inflight);
+    lock.unlock();
+    HttpResponse response = router::ProxyToWorker(router::RemoteTarget(spec), req);
+    if (response.status == 502 && !response.streaming_body) {
+      hold->Release();
+      Logger::Warn("router", "event=remote_unavailable model=" + model_id +
+                                 " detail=\"" + response.log_details + "\"");
+      return router::RemoteUnavailable(model_id, response.log_details);
+    }
+    std::shared_ptr<JobBodySniffer> sniffer;
+    if (response.status >= 200 && response.status < 300 &&
+        response.streaming_body) {
+      sniffer = MakeJobSniffer(req, model_id);
+    }
+    if (!response.streaming_body) {
+      hold->Release();
+      return response;
+    }
+    // The hold lives until the streamed body completes or cancels.
+    HttpResponse streamed = std::move(response);
+    streamed.streaming_body = [inner = std::move(streamed.streaming_body),
+                               hold, sniffer](
+                                  const HttpResponse::BodyWriter& writer) {
+      const HttpResponse::BodyWriter sink =
+          sniffer == nullptr ? writer
+                             : [&writer, sniffer](std::string_view chunk) {
+                                 return writer(sniffer->Observe(chunk));
+                               };
+      try {
+        inner(sink);
+      } catch (...) {
+        hold->Release();
+        throw;
+      }
+      if (sniffer != nullptr) {
+        sniffer->Commit();
+      }
+      hold->Release();
+    };
+    return streamed;
+  }
+
   /// Live previews (/v1/previews/{id}[/events]) of a running image or video
   /// job: the model comes from `?model=` or, for a video job, its owner.
   /// Only a loaded worker is asked; a preview never starts or keeps one.
@@ -1001,6 +1101,11 @@ public:
                                "invalid_request_error")
                     : LlamaErr(404, "Not Found", "model is not found",
                                "not_found_error");
+    }
+    if (preset->remote.has_value()) {
+      return LlamaErr(501, "Not Implemented",
+                      "remote models are loaded by their own router",
+                      "not_supported_error");
     }
     bool resident = false;
     bool busy = false;
@@ -1955,8 +2060,15 @@ int RunRouter(std::span<const char* const> args) {
       memory_file.replace_extension(".memory.json");
     }
     residency_options.memory_file = memory_file;
+    // Remote models use the remote machine's memory: no estimates, no
+    // learned peaks, no memory.json entries.
+    std::vector<router::PresetModel> local_models;
+    for (const auto& model : models) {
+      if (!model.remote.has_value())
+        local_models.push_back(model);
+    }
     state->residency = std::make_unique<router::Residency>(
-        residency_options, router::MakeSystemMemoryProbe(), models);
+        residency_options, router::MakeSystemMemoryProbe(), local_models);
     std::string memory_error;
     if (!state->residency->Init(&memory_error)) {
       std::cerr << "Error: " << memory_error << "\n";
@@ -2079,8 +2191,10 @@ int RunRouter(std::span<const char* const> args) {
   std::thread autoloader;
   if (autoload) {
     std::vector<std::string> ids;
-    for (const auto& model : models)
-      ids.push_back(model.id);
+    for (const auto& model : models) {
+      if (!model.remote.has_value())
+        ids.push_back(model.id);
+    }
     autoloader = std::thread(
         [&state, ids = std::move(ids), memory_guard,
          delays = std::move(autoload_retry_delays)]() mutable {
@@ -2105,6 +2219,8 @@ int RunRouter(std::span<const char* const> args) {
         (void)worker;
         any_busy = any_busy || state->registry.Busy(id);
       }
+      // Remote relays in flight; remote jobs run on, so they do not wait.
+      any_busy = any_busy || state->remote_inflight.load() > 0;
     }
     if (!any_busy) {
       break;

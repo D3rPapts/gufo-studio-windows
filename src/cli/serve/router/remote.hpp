@@ -7,8 +7,10 @@
 #include <string>
 #include <vector>
 
+#include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/preset.hpp"
+#include "src/cli/serve/router/proxy.hpp"
 
 namespace gufo::router {
 
@@ -23,6 +25,15 @@ namespace gufo::router {
 [[nodiscard]] bool CheckRemoteAllowed(const RemoteSpec& spec,
                                       const std::vector<jobs::AllowEntry>& allow,
                                       std::string* error);
+
+/// Relay target for a remote model: its router's address, the preset
+/// timeouts, keepalive and the remote router's key as Authorization.
+[[nodiscard]] UpstreamTarget RemoteTarget(const RemoteSpec& spec);
+
+/// 503 remote_unavailable with Retry-After: 30, for a remote router that
+/// cannot be reached (never a reason to stop anything locally).
+[[nodiscard]] server::HttpResponse RemoteUnavailable(
+    const std::string& model_id, const std::string& detail);
 
 }  // namespace gufo::router
 
