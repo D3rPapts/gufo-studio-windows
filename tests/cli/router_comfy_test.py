@@ -844,6 +844,36 @@ def check_websocket(router):
     assert "execution_success" in seen, seen
 
 
+def check_filmstudio(router):
+    """/filmstudio/progress and /filmstudio/preview answer like the film
+    studio's filmstudio_progress ComfyUI plugin: the running prompt for any
+    client, and polling them counts as watching, so previews get rendered."""
+    status, body = router.json("GET", "/filmstudio/progress")
+    assert status == 200 and body["prompt_id"] is None and "time" in body, body
+    assert router.request("POST", "/filmstudio/progress")[0] == 405
+    prompt_id = router.submit(qwen_graph(prompt="SLOW studio", prefix="film/stil/studio"),
+                              client_id="studio-without-socket")
+    seen, image = None, None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        status, body = router.json("GET", "/filmstudio/progress")
+        assert status == 200, body
+        if body["prompt_id"] == prompt_id and body["preview"] is not None:
+            seen = body
+            status, image = router.request("GET", "/filmstudio/preview")
+            assert status == 200, status
+            break
+        time.sleep(0.1)
+    assert seen, "no progress with a preview for %s" % prompt_id
+    assert seen["node"] == "6" and seen["class_type"], seen
+    assert seen["max"] == 20 and 0 <= seen["value"] <= 20, seen
+    assert seen["nodes_total"] >= 1 and 0 <= seen["nodes_done"] < seen["nodes_total"], seen
+    assert image == FAKE_JPEG, image[:16]
+    router.wait(prompt_id)
+    status, body = router.json("GET", "/filmstudio/progress")
+    assert status == 200 and body["prompt_id"] is None, body
+
+
 def check_previews(router):
     """Live previews reach /ws clients as ComfyUI binary frames, only while
     one is connected, and /v1/previews routes through the router."""
@@ -1074,6 +1104,7 @@ def main():
         check_errors(router)
         check_websocket(router)
         check_previews(router)
+        check_filmstudio(router)
         remaining = check_queue_history_free(router)
     except BaseException:
         print(router.tail())

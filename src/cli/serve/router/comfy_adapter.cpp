@@ -485,6 +485,16 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
       return JsonResponse(200, json::Value::object());
     if (path == "/ws")
       return Socket(request);
+    if (path == "/filmstudio/progress") {
+      if (auto bad = only("GET"))
+        return bad;
+      return FilmstudioProgress();
+    }
+    if (path == "/filmstudio/preview") {
+      if (auto bad = only("GET"))
+        return bad;
+      return FilmstudioPreview();
+    }
   } catch (const std::exception& error) {
     Logger::Warn("comfy", std::string("event=request_failed path=") +
                               request.path + " error=" + error.what());
@@ -876,14 +886,25 @@ void Adapter::Emit(const std::string& client, std::string_view type,
                    json::Value data) {
   json::Value message = json::Value::object();
   message["type"] = std::string(type);
+  const bool progress = type == "progress";
+  const int value = progress ? static_cast<int>(data.member_double("value", 0)) : 0;
+  const int max = progress ? static_cast<int>(data.member_double("max", 0)) : 0;
+  const std::string prompt_id = progress ? data.member_str("prompt_id") : "";
   message["data"] = std::move(data);
   const std::lock_guard<std::mutex> lock(mutex_);
+  if (progress && prompt_id == live_.prompt_id) {
+    live_.value = value;
+    live_.max = max;
+    live_.has_progress = true;
+  }
   events_.push_back(Event{next_event_++, client, message.dump()});
   while (events_.size() > 4096)
     events_.pop_front();
 }
 
 bool Adapter::WatchedLocked(const std::string& client) const {
+  if (std::chrono::steady_clock::now() < http_watch_until_)
+    return true;
   if (client.empty())
     return !sockets_.empty();
   const auto it = sockets_.find(client);
@@ -896,6 +917,7 @@ void Adapter::EmitPreview(const std::string& client,
   const std::lock_guard<std::mutex> lock(mutex_);
   previews_[client] =
       Preview{next_preview_++, prompt_id, node_id, std::move(jpeg)};
+  last_preview_ = previews_[client];
 }
 
 void Adapter::RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
@@ -953,6 +975,50 @@ void Adapter::RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
       // A malformed preview is skipped; the next poll tries again.
     }
   }
+}
+
+HttpResponse Adapter::FilmstudioProgress() {
+  const double now = std::chrono::duration<double>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  http_watch_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  json::Value body = json::Value::object();
+  if (live_.prompt_id.empty()) {
+    body["prompt_id"] = nullptr;
+    body["time"] = now;
+    return JsonResponse(200, body);
+  }
+  body["prompt_id"] = live_.prompt_id;
+  body["time"] = now;
+  body["node"] = live_.node;
+  body["class_type"] = live_.class_type;
+  if (live_.has_progress) {
+    body["value"] = live_.value;
+    body["max"] = live_.max;
+  } else {
+    body["value"] = 0;
+    body["max"] = 1;
+  }
+  body["nodes_done"] = live_.nodes_done;
+  body["nodes_total"] = live_.nodes_total;
+  if (!last_preview_.jpeg.empty() && last_preview_.prompt_id == live_.prompt_id)
+    body["preview"] = static_cast<double>(last_preview_.seq);
+  else
+    body["preview"] = nullptr;
+  return JsonResponse(200, body);
+}
+
+HttpResponse Adapter::FilmstudioPreview() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  http_watch_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  if (last_preview_.jpeg.empty())
+    return HttpResponse{.status = 204, .reason = "No Content"};
+  return HttpResponse{.status = 200,
+                      .reason = "OK",
+                      .body = last_preview_.jpeg,
+                      .headers = {{"Content-Type", "image/jpeg"},
+                                  {"Cache-Control", "no-store"}}};
 }
 
 void Adapter::EmitStatusLocked() {
@@ -1155,6 +1221,17 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
     executing["display_node"] = task.node_id;
     executing["prompt_id"] = job->id;
     Emit(job->client_id, "executing", std::move(executing));
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      live_.prompt_id = job->id;
+      live_.node = task.node_id;
+      live_.class_type = task.class_type;
+      live_.value = 0;
+      live_.max = 0;
+      live_.has_progress = false;
+      live_.nodes_done = static_cast<int>(executed.size());
+      live_.nodes_total = static_cast<int>(job->plan.tasks.size());
+    }
     try {
       if (job->cancel.load())
         throw Interrupted();
@@ -1217,6 +1294,10 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
   done["node"] = nullptr;
   done["prompt_id"] = job->id;
   Emit(job->client_id, "executing", std::move(done));
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    live_ = Live{};
+  }
   json::Value status = json::Value::object();
   status["status_str"] = ok ? "success" : "error";
   status["completed"] = ok;
