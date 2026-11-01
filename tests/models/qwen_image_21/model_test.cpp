@@ -9,6 +9,7 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/core/json.hpp"
+#include "src/models/qwen_image_21/hip/memory.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 #include "src/models/qwen_image_21/weights.hpp"
 
@@ -24,8 +25,8 @@ int main(int argc, char** argv) {
     const std::vector<std::pair<std::string, std::vector<std::uint32_t>>> cases{
         {"A red cube on a white table.",
          {32, 2518, 23739, 389, 264, 4158, 1965, 13}},
-        {"  cafe\xcc\x81  déjà vu", {220, 51950, 220, 45839, 32514}},
-        {"नमस्ते 世界 안녕하세요",
+        {"  cafe\xcc\x81  dÃ©jÃ  vu", {220, 51950, 220, 45839, 32514}},
+        {"à¤¨à¤®à¤¸à¥à¤¤à¥‡ ä¸–ç•Œ ì•ˆë…•í•˜ì„¸ìš”",
          {60096, 87244, 78368, 30484, 97, 34370, 220, 99489, 95170, 144370,
           91145}},
         {"if x == 123:\n    print(\"hello\")\n\n",
@@ -754,6 +755,23 @@ int main(int argc, char** argv) {
       rejected = true;
     }
     assert(rejected);
+  }
+  // Large requests keep the text encoder only with a known, sufficient
+  // headroom beside it; otherwise (or when forced) it is released as before.
+  {
+    using hip::KeepsTextEncoder;
+    using hip::kKeepTextEncoderMarginBytes;
+    constexpr std::uint64_t GiB = 1ULL << 30;
+    // Measured keyframe job (9 references): need 23.7 GB, 45 GB free with
+    // the encoder resident.
+    static_assert(KeepsTextEncoder(23695ULL << 20, 45 * GiB, false));
+    static_assert(!KeepsTextEncoder(23695ULL << 20, 45 * GiB, true));
+    static_assert(KeepsTextEncoder(
+        10 * GiB, 10 * GiB + kKeepTextEncoderMarginBytes, false));
+    static_assert(!KeepsTextEncoder(
+        10 * GiB, 10 * GiB + kKeepTextEncoderMarginBytes - 1, false));
+    static_assert(!KeepsTextEncoder(30 * GiB, 20 * GiB, false));
+    static_assert(!KeepsTextEncoder(GiB, UINT64_MAX, false));
   }
   std::cout << "Qwen-Image image and schedule contracts passed\n";
 }

@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -935,18 +936,41 @@ Result Model::Generate(const Request& request,
                               negative_observer);
     }
     // Every DiT condition row keeps 32 layers of K and V (512 KiB per row).
-    // With several references these caches outgrow the memory beside all
-    // weights, so the text encoder (16 GB) leaves until the next request.
+    // With several references these caches can outgrow the memory beside all
+    // weights; then the text encoder (16 GB) leaves until the next request.
+    // When the request fits beside it, the encoder stays and the next request
+    // skips reloading it (memory placement only; results are unchanged).
     const int condition_rows = ConditionRows(prompt);
     result.metrics.condition_rows = condition_rows;
     report("encoded");
     const bool large = condition_rows > kReleaseEncoderRows;
     if (large) {
-      rt.Evict("text_encoder.model.language_model.");
-      rt.Evict("text_encoder.model.visual.");
-      result.metrics.released_text_encoder = true;
       // Freed temporaries stay cached up to this bound (8 GB otherwise).
       rt.SetCacheLimit(kLargeRequestCacheBytes);
+      const auto need = LargeRequestBytes(
+          rt, prompt, negative ? &*negative : nullptr, height * width);
+      const char* force = std::getenv("GUFO_QWEN_IMAGE_RELEASE_TEXT_ENCODER");
+      const bool force_release = force && *force && std::string(force) != "0";
+      bool keep = false;
+      if (!force_release) {
+        // Return cached encoder temporaries before measuring.
+        rt.Trim();
+        const auto memory = hip::QueryDeviceMemory();
+        const auto available = memory.Available(kHostReserveBytes);
+        keep = hip::KeepsTextEncoder(need, available, false);
+        Log("event=memory_check text_encoder=" +
+            std::string(keep ? "kept" : "release") +
+            " need_mib=" + std::to_string(need >> 20) +
+            " available_mib=" + std::to_string(available >> 20) + " " +
+            memory.Describe());
+      }
+      if (!keep) {
+        rt.Evict("text_encoder.model.language_model.");
+        rt.Evict("text_encoder.model.visual.");
+        result.metrics.released_text_encoder = true;
+      }
+    }
+    if (large && result.metrics.released_text_encoder) {
       // Refuse before the caches fill instead of failing inside a kernel:
       // an exhausted shared segment ends in a launch failure or a driver
       // reset, not in an allocation error.
