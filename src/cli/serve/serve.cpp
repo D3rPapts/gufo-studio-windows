@@ -49,6 +49,7 @@
 #endif
 #include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/foley_api.hpp"
+#include "src/cli/serve/upscale_api.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -1001,7 +1002,9 @@ void PrintServeHelp(std::string_view program_name,
       << "  music     Serve ACE-Step 1.5 XL turbo text-to-music "
          "(/v1/audio/music)\n"
       << "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
-         "(/v1/audio/foley)\n\n"
+         "(/v1/audio/foley)\n"
+      << "  upscale   Serve Real-ESRGAN image upscaling on the NPU, GPU or "
+         "CPU (/v1/images/upscale)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -1096,7 +1099,7 @@ int RunServe(std::span<const char* const> args) {
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
         arg == "image" || arg == "embedding" || arg == "omni" ||
-        arg == "music" || arg == "foley") {
+        arg == "music" || arg == "foley" || arg == "upscale") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1105,7 +1108,7 @@ int RunServe(std::span<const char* const> args) {
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
           topic != "embedding" && topic != "omni" && topic != "music" &&
-          topic != "foley") {
+          topic != "foley" && topic != "upscale") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1196,8 +1199,116 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::OmniService> omni;
   std::shared_ptr<server::MusicService> music;
   std::shared_ptr<server::FoleyService> foley;
+  std::shared_ptr<server::UpscaleService> upscale;
 
-  if (subcommand == "foley") {
+  if (subcommand == "upscale") {
+    server::UpscaleServeOptions options;
+    ArgParser parser(
+        "gufo serve upscale",
+        "Serve Real-ESRGAN image upscaling (POST /v1/images/upscale) on the "
+        "AMD NPU (ONNX Runtime + VitisAI from Windows ML), the GPU (HIP) or "
+        "the CPU (ONNX Runtime).");
+    parser.AddOption("", "--device", "npu|gpu|cpu",
+                     "Where the network runs (default: npu)", "Model",
+                     &options.device);
+    parser.AddCustomOption(
+        "-m", "--model", "[NAME=]FILE",
+        "npu/cpu: Real-ESRGAN body ONNX with a fixed input size (e.g. "
+        "realesr-animevideov3=body896q_h288_h3.onnx); gpu: converted "
+        "safetensors. Repeatable; one name may have one file per frame "
+        "width; the first name is the default. Without NAME: "
+        "--served-model-name, else the file stem",
+        "Model",
+        [&options](std::string_view, std::string_view value,
+                   std::string* error) {
+          const std::size_t equals = value.find('=');
+          std::filesystem::path path(std::string(
+              equals == std::string_view::npos ? value
+                                               : value.substr(equals + 1)));
+          std::string name = equals == std::string_view::npos
+                                 ? std::string()
+                                 : std::string(value.substr(0, equals));
+          if ((equals != std::string_view::npos && name.empty()) ||
+              path.empty()) {
+            *error = "--model expects [NAME=]FILE";
+            return false;
+          }
+          options.models.push_back({std::move(name), std::move(path)});
+          return true;
+        });
+    std::string upscale_served_name;
+    parser.AddOption("", "--served-model-name", "NAME",
+                     "Public model ID of --model files given without NAME= "
+                     "(the router passes the section id)",
+                     "Model", &upscale_served_name);
+    parser.AddOption("", "--onnxruntime", "DLL",
+                     "onnxruntime.dll 1.23+ (default: Windows ML)", "Model",
+                     &options.onnxruntime);
+    parser.AddOption("", "--npu-ep", "DLL",
+                     "onnxruntime_vitisai_ep.dll (default: from the Windows "
+                     "ML execution provider catalog)",
+                     "Model", &options.npu_ep);
+    parser.AddOption("", "--npu-cache", "DIR",
+                     "VitisAI compile cache (default: <model dir>/npu-cache)",
+                     "Model", &options.npu_cache);
+    parser.AddOption("", "--npu-config", "JSON",
+                     "VitisAI config_file (e.g. vaiml_config.json)", "Model",
+                     &options.npu_config);
+    parser.AddOption("", "--threads", "N",
+                     "CPU provider threads (default: ONNX Runtime's)", "Model",
+                     &options.threads);
+    parser.AddFlag("", "--fp32", "gpu: FP32 validation path", "Model",
+                   &options.fp32);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      parser.PrintHelp();
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (options.device != "npu" && options.device != "gpu" &&
+        options.device != "cpu") {
+      std::cerr << "Error: --device must be npu, gpu or cpu\n";
+      return 2;
+    }
+    if (options.models.empty()) {
+      std::cerr << "Error: --model [NAME=]FILE is required for upscale "
+                   "server\n";
+      return 2;
+    }
+    for (server::UpscaleModelArg& m : options.models)
+      if (m.name.empty())
+        m.name = upscale_served_name.empty() ? m.path.stem().string()
+                                             : upscale_served_name;
+    for (const server::UpscaleModelArg& m : options.models) {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(m.path, ec)) {
+        std::cerr << "Error: --model file not found: " << m.path.string()
+                  << '\n';
+        return 2;
+      }
+    }
+    if (validate_only)
+      return 0;
+    ModelLoadLog load_log("upscale", options.models.front().path);
+    std::string error;
+    std::unique_ptr<server::UpscaleEngine> engine =
+        server::CreateUpscaleEngine(options, &error);
+    if (engine == nullptr) {
+      std::cerr << "Error loading the upscaler (" << options.device
+                << "): " << error << '\n';
+      return 1;
+    }
+    const std::string runtime = engine->runtime;
+    upscale = std::make_shared<server::UpscaleService>(std::move(engine));
+    load_log.Complete("model=" + upscale->model_id() + " device=" +
+                          options.device + " runtime=\"" + runtime + "\"",
+                      options.device == "gpu");
+  } else if (subcommand == "foley") {
     std::filesystem::path model;
     std::string name = "mmaudio-44k";
     ArgParser parser("gufo serve foley",
@@ -2200,6 +2311,9 @@ int RunServe(std::span<const char* const> args) {
   if (foley != nullptr) {
     server.set_foley(foley);
   }
+  if (upscale != nullptr) {
+    server.set_upscale(upscale);
+  }
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
@@ -2231,7 +2345,7 @@ std::string ValidateServeArgvByParsing(std::string_view modality,
                                        const std::vector<std::string>& argv) {
   static constexpr std::string_view kModalities[] = {
       "llm",       "image", "video", "tts",  "asr",
-      "embedding", "omni",  "music", "foley"};
+      "embedding", "omni",  "music", "foley", "upscale"};
   if (std::ranges::find(kModalities, modality) == std::end(kModalities)) {
     return "unknown modality '" + std::string(modality) + "'";
   }
