@@ -1231,6 +1231,17 @@ if (BUILD_TESTING)
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE)
 
+  add_executable(ming_tts_serve_test
+    tests/models/ming_tts/serve_test.cpp
+    src/cli/serve/audio_tts_api.cpp
+    src/cli/serve/tts_service.cpp)
+  target_link_libraries(ming_tts_serve_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts)
+  add_test(NAME ming_tts_serve_test COMMAND ming_tts_serve_test)
+  set_tests_properties(ming_tts_serve_test PROPERTIES
+    LABELS "cpu;models;ming-tts;server;api;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE)
+
   add_executable(fish_drama3_config_test
     tests/models/fish_drama3/config_test.cpp)
   target_link_libraries(fish_drama3_config_test PRIVATE gufo_fish_drama3)

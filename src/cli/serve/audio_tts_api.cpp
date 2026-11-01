@@ -14,6 +14,7 @@
 
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
+#include "src/models/ming_tts/prompt.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::server {
@@ -359,6 +360,13 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     return Error(400, "Bad Request",
                  "'emotion' is supported only by Ming-3.0-tts",
                  "unsupported_field");
+  }
+  if (!body.member_str("emotion").empty() &&
+      !models::ming_tts::EmotionLabel(body.member_str("emotion")).has_value()) {
+    return Error(400, "Bad Request",
+                 "'emotion' must be happy, sad, angry, fear, disgust, surprise "
+                 "or neutral",
+                 "invalid_emotion");
   }
   std::size_t max_new_tokens = 0;
   if (!ReadUnsigned(body, "max_new_tokens", 3000, kMaximumNewTokens,
