@@ -117,6 +117,17 @@ set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
 
 # CPU-only builds exist for host checks; production targets gfx1151 only.
 option(ENGINE_ENABLE_HIP "Build the gfx1151 HIP backend" ON)
+# `gufo serve upscale --device npu|cpu`: ONNX Runtime is loaded at run time
+# (Windows ML on Windows); only its MIT C API header is vendored, so there is
+# no link dependency. Off elsewhere until a Linux NPU path is tested.
+if (WIN32)
+  set(GUFO_ENABLE_ONNXRUNTIME_DEFAULT ON)
+else()
+  set(GUFO_ENABLE_ONNXRUNTIME_DEFAULT OFF)
+endif()
+option(GUFO_ENABLE_ONNXRUNTIME
+  "Load ONNX Runtime at run time for the NPU / CPU upscaler"
+  ${GUFO_ENABLE_ONNXRUNTIME_DEFAULT})
 set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
 if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
   message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
@@ -473,6 +484,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_rife.cpp
   src/cli/serve/music_api.cpp
   src/cli/serve/foley_api.cpp
+  src/cli/serve/upscale_api.cpp
   src/cli/serve/video_upscale.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
@@ -493,6 +505,8 @@ else()
   target_sources(gufo_http PRIVATE src/cli/serve/router/workers.cpp
                                    src/cli/serve/router/memory_posix.cpp)
 endif()
+# Real-ESRGAN on the NPU / CPU (ONNX Runtime) behind `gufo serve upscale`.
+target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
 target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
