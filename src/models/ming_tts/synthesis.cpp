@@ -1,0 +1,282 @@
+#include "src/models/ming_tts/synthesis.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <random>
+
+#include "src/models/ming_tts/cpu/model.hpp"
+#include "src/models/ming_tts/prompt.hpp"
+#include "src/models/ming_tts/speaker.hpp"
+#include "src/models/ming_tts/tokenizer.hpp"
+
+namespace gufo::models::ming_tts {
+namespace {
+
+// The reference runtime decodes with a 512-position static KV cache.
+constexpr std::int64_t kMaxCacheLength = 512;
+
+void SetError(std::string* error, const std::string& message) {
+  if (error != nullptr) {
+    *error = message;
+  }
+}
+
+std::uint64_t HashSamples(std::span<const float> samples, std::uint32_t rate) {
+  std::uint64_t hash = 1469598103934665603ULL ^ rate;
+  for (const float value : samples) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    hash = (hash ^ bits) * 1099511628211ULL;
+  }
+  return hash ^ samples.size();
+}
+
+}  // namespace
+
+struct Engine::Impl {
+  std::unique_ptr<cpu::Model> model;
+  std::unique_ptr<CamPlusPlus> speaker;
+  Tokenizer tokenizer;
+  std::mutex speaker_mutex;
+  std::map<std::uint64_t, std::vector<float>> speaker_cache;
+};
+
+std::unique_ptr<Engine> Engine::Create(const std::string& model_dir,
+                                       std::string* error) {
+  auto engine = std::unique_ptr<Engine>(new Engine());
+  engine->impl_ = std::make_unique<Impl>();
+  Impl& impl = *engine->impl_;
+  impl.model = cpu::Model::Load(model_dir, error);
+  if (impl.model == nullptr) {
+    return nullptr;
+  }
+  impl.speaker = CamPlusPlus::Load(
+      std::filesystem::path(model_dir) / "campplus.onnx", error);
+  if (impl.speaker == nullptr) {
+    return nullptr;
+  }
+  if (!Tokenizer::Load(model_dir, &impl.tokenizer, error)) {
+    return nullptr;
+  }
+  // prompt_contract.validate_tokenizer: the trained special-token ids.
+  for (const auto& [token, id] :
+       std::initializer_list<std::pair<const char*, std::uint32_t>>{
+           {"<|im_start|>", kImStartId},
+           {"<|im_end|>", kImEndId},
+           {"<|vision_start|>", kVisionStartId},
+           {"<|vision_pad|>", kVisionPadId},
+           {"<audioPatch>", kAudioPatchId},
+           {"<audio>", kAudioStartId}}) {
+    std::vector<std::uint32_t> ids;
+    if (!impl.tokenizer.Encode(token, &ids, error) || ids.size() != 1 ||
+        ids[0] != id) {
+      SetError(error, std::string("Ming-3.0-tts tokenizer does not match the "
+                                  "trained layout for ") + token);
+      return nullptr;
+    }
+  }
+  return engine;
+}
+
+Engine::~Engine() = default;
+
+std::uint32_t Engine::sample_rate() const noexcept {
+  return static_cast<std::uint32_t>(impl_->model->config().sample_rate);
+}
+
+bool Engine::Generate(const SynthesisRequest& request,
+                      const std::function<bool()>& is_cancelled,
+                      SynthesisResult* result, std::string* error) {
+  Impl& impl = *impl_;
+  cpu::Model& model = *impl.model;
+  const ModelConfig& config = model.config();
+  const std::int64_t hidden = config.llm.hidden_size;
+  const std::int64_t latent_dim = config.latent_dim;
+  SynthesisResult local;
+  SynthesisResult& out = result != nullptr ? *result : local;
+  out = {};
+  out.sample_rate = static_cast<std::uint32_t>(config.sample_rate);
+
+  // --- task -> instruction
+  std::optional<std::string> instruction;
+  if (!request.instruction.empty()) {
+    instruction = request.instruction;  // FREEFORM
+  } else if (!request.emotion.empty()) {
+    const auto label = EmotionLabel(request.emotion);
+    if (!label.has_value()) {
+      SetError(error, "unknown Ming emotion '" + request.emotion +
+                          "' (happy, sad, angry, fear, disgust, surprise, neutral)");
+      return false;
+    }
+    StructuredControls controls;
+    controls.emotion = *label;
+    instruction = BuildStructuredInstruction(controls);
+  }
+
+  // --- speaker embedding
+  std::vector<float> speaker;
+  try {
+    if (!request.speaker_embedding.empty()) {
+      if (request.speaker_embedding.size() != 192) {
+        SetError(error, "speaker_embedding must have 192 values");
+        return false;
+      }
+      speaker = request.speaker_embedding;
+    } else if (!request.reference_audio.empty()) {
+      if (request.reference_sample_rate == 0) {
+        SetError(error, "reference audio needs a sample rate");
+        return false;
+      }
+      const std::uint64_t key =
+          HashSamples(request.reference_audio, request.reference_sample_rate);
+      std::lock_guard<std::mutex> lock(impl.speaker_mutex);
+      const auto found = impl.speaker_cache.find(key);
+      if (found != impl.speaker_cache.end()) {
+        speaker = found->second;
+      } else {
+        speaker = impl.speaker->EmbedWaveform(request.reference_audio,
+                                               request.reference_sample_rate);
+        impl.speaker_cache.emplace(key, speaker);
+      }
+    }
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("speaker embedding failed: ") + exception.what());
+    return false;
+  }
+  out.speaker_embedding = speaker;
+  const std::size_t num_speakers = speaker.empty() ? 0 : 1;
+  std::vector<float> projected(static_cast<std::size_t>(hidden));
+  if (num_speakers != 0) {
+    model.ProjectSpeaker(speaker, projected.data());
+  }
+
+  // --- text
+  std::vector<std::string> fragments;
+  if (request.raw_text) {
+    fragments.push_back(request.text);
+  } else {
+    fragments = SplitTextFragments(request.text, request.max_fragment_length);
+  }
+  if (fragments.empty()) {
+    SetError(error, "text produced no synthesizable fragments");
+    return false;
+  }
+  out.fragments = fragments;
+  const std::string prompt = BuildTtsPrompt(request.language);
+
+  std::mt19937_64 rng(request.seed);
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+  cpu::FlowOptions flow;
+  flow.cfg = request.cfg;
+  flow.sigma = request.sigma;
+  flow.temperature = request.temperature;
+
+  for (std::size_t index = 0; index < fragments.size(); ++index) {
+    InputLayout layout;
+    if (!BuildInputIds(impl.tokenizer, prompt, fragments[index], num_speakers,
+                       instruction, &layout, error)) {
+      return false;
+    }
+    const auto rows = static_cast<std::int64_t>(layout.ids.size());
+    if (rows >= kMaxCacheLength - 4) {
+      SetError(error, "prompt too long for the 512-position decode window");
+      return false;
+    }
+    std::vector<std::int64_t> ids(layout.ids.begin(), layout.ids.end());
+    std::vector<float> embeddings(static_cast<std::size_t>(rows * hidden));
+    model.Embed(ids, embeddings.data());
+    for (const std::size_t position : layout.speaker_positions) {
+      std::copy(projected.begin(), projected.end(),
+                embeddings.begin() + static_cast<std::ptrdiff_t>(position) * hidden);
+    }
+    model.ResetCache();
+    std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
+    model.BackboneForward(embeddings.data(), rows, normed.data());
+    std::vector<float> z(normed.end() - hidden, normed.end());
+
+    const std::int64_t budget =
+        std::min<std::int64_t>(request.max_decode_steps, kMaxCacheLength - rows);
+    std::vector<float> history(static_cast<std::size_t>(latent_dim), 0.0F);
+    std::vector<float> noise(static_cast<std::size_t>(latent_dim));
+    std::vector<float> sde(static_cast<std::size_t>(flow.steps * latent_dim));
+    std::vector<float> latent(static_cast<std::size_t>(latent_dim));
+    std::vector<float> latents;
+    std::vector<float> next(static_cast<std::size_t>(hidden));
+    std::int64_t step = 0;
+    for (; step < budget; ++step) {
+      if (is_cancelled && is_cancelled()) {
+        SetError(error, "cancelled");
+        return false;
+      }
+      if (request.noise_source) {
+        request.noise_source(index, step, noise.data());
+      } else {
+        for (float& value : noise) {
+          value = normal(rng);
+        }
+      }
+      if (flow.temperature > 0.0F) {
+        for (float& value : sde) {
+          value = normal(rng);
+        }
+      }
+      model.SampleLatent(z.data(), history.data(), noise.data(), sde.data(),
+                         flow, latent.data());
+      latents.insert(latents.end(), latent.begin(), latent.end());
+      if (model.StopProbability(z.data()) > 0.5F && step > 3) {
+        ++step;
+        break;
+      }
+      model.Aggregate(latent.data(), next.data());
+      model.BackboneForward(next.data(), 1, z.data());
+      history = latent;
+    }
+    const std::int64_t frames = static_cast<std::int64_t>(latents.size()) / latent_dim;
+    out.fragment_steps.push_back(frames);
+    std::vector<float> audio = model.DecodeLatents(latents.data(), frames);
+    if (request.trim_silence) {
+      audio = TrimTrailingSilence(audio, config.sample_rate);
+    }
+    if (request.on_audio && !request.on_audio(audio)) {
+      SetError(error, "cancelled");
+      return false;
+    }
+    out.samples.insert(out.samples.end(), audio.begin(), audio.end());
+    out.latents = std::move(latents);
+  }
+  return true;
+}
+
+std::vector<float> TrimTrailingSilence(std::span<const float> speech,
+                                       std::int64_t sample_rate) {
+  const auto frame = static_cast<std::int64_t>(static_cast<double>(sample_rate) * 0.1);
+  const auto tail = static_cast<std::int64_t>(static_cast<double>(sample_rate) * 0.3);
+  const auto length = static_cast<std::int64_t>(speech.size());
+  if (length == 0) {
+    return {};
+  }
+  if (frame <= 0 || length < frame) {
+    return {speech.begin(), speech.begin() + std::min(length, tail)};
+  }
+  const std::int64_t frames = (length - frame) / frame + 1;
+  std::int64_t index = frames - 1;
+  for (; index >= 0; --index) {
+    double sum = 0.0;
+    for (std::int64_t i = 0; i < frame; ++i) {
+      sum += std::fabs(speech[static_cast<std::size_t>(index * frame + i)]);
+    }
+    if (static_cast<float>(sum / static_cast<double>(frame)) > 1e-3F) {
+      break;
+    }
+  }
+  const std::int64_t usable = frames * frame;
+  const std::int64_t keep =
+      index < 0 ? std::min(usable, tail) : std::min(usable, index * frame + frame + tail);
+  return {speech.begin(), speech.begin() + keep};
+}
+
+}  // namespace gufo::models::ming_tts

@@ -9,7 +9,12 @@ add_library(gufo_ming_tts STATIC
   config.cpp
   prompt.cpp
   safetensors.cpp
+  speaker.cpp
+  synthesis.cpp
   tokenizer.cpp
+  cpu/fft.cpp
+  cpu/model.cpp
+  cpu/ops.cpp
 )
 
 target_include_directories(gufo_ming_tts PUBLIC ${PROJECT_SOURCE_DIR})
@@ -22,4 +27,15 @@ target_link_libraries(gufo_ming_tts PUBLIC
 
 if (OpenMP_CXX_FOUND)
   target_link_libraries(gufo_ming_tts PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# The CPU GEMV kernels use AVX2/FMA (every gfx1151 host CPU has them).
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  if (CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    set_source_files_properties(cpu/ops.cpp PROPERTIES COMPILE_OPTIONS "/clang:-mavx2;/clang:-mfma;/clang:-mf16c")
+  else()
+    set_source_files_properties(cpu/ops.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  endif()
+elseif (MSVC)
+  set_source_files_properties(cpu/ops.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 endif()
