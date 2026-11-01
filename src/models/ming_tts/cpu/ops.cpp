@@ -110,6 +110,63 @@ void Tile(const Linear& layer, const float* x, std::int64_t r0, std::int64_t rn,
   }
 }
 
+#if defined(GUFO_MING_AVX2)
+// R rows (3..6) x 2 output columns: every widened weight vector feeds R FMAs,
+// which keeps the small-batch DiT/aggregator GEMMs off the conversion limit.
+template <int R>
+void TallTile(const Linear& layer, const float* x, std::int64_t r0,
+              std::int64_t j0, float* y) {
+  const std::int64_t in = layer.in_features;
+  const std::int64_t out = layer.out_features;
+  const std::uint16_t* w0 = layer.weight + j0 * in;
+  const std::uint16_t* w1 = w0 + in;
+  __m256 acc0[R];
+  __m256 acc1[R];
+  for (int r = 0; r < R; ++r) {
+    acc0[r] = _mm256_setzero_ps();
+    acc1[r] = _mm256_setzero_ps();
+  }
+  for (std::int64_t k = 0; k < in; k += 8) {
+    const __m256 b0 = LoadBf16x8(w0 + k);
+    const __m256 b1 = LoadBf16x8(w1 + k);
+    for (int r = 0; r < R; ++r) {
+      const __m256 v = _mm256_loadu_ps(x + (r0 + r) * in + k);
+      acc0[r] = _mm256_fmadd_ps(v, b0, acc0[r]);
+      acc1[r] = _mm256_fmadd_ps(v, b1, acc1[r]);
+    }
+  }
+  const float bias0 = layer.bias.empty() ? 0.0F : layer.bias[static_cast<std::size_t>(j0)];
+  const float bias1 = layer.bias.empty() ? 0.0F : layer.bias[static_cast<std::size_t>(j0 + 1)];
+  for (int r = 0; r < R; ++r) {
+    y[(r0 + r) * out + j0] = HorizontalSum(acc0[r]) + bias0;
+    y[(r0 + r) * out + j0 + 1] = HorizontalSum(acc1[r]) + bias1;
+  }
+}
+
+bool TryTallTile(const Linear& layer, const float* x, std::int64_t r0,
+                 std::int64_t rn, std::int64_t j0, float* y) {
+  if (layer.in_features % 8 != 0) {
+    return false;
+  }
+  switch (rn) {
+    case 3:
+      TallTile<3>(layer, x, r0, j0, y);
+      return true;
+    case 4:
+      TallTile<4>(layer, x, r0, j0, y);
+      return true;
+    case 5:
+      TallTile<5>(layer, x, r0, j0, y);
+      return true;
+    case 6:
+      TallTile<6>(layer, x, r0, j0, y);
+      return true;
+    default:
+      return false;
+  }
+}
+#endif
+
 }  // namespace
 
 void LinearForward(const Linear& layer, const float* x, std::int64_t rows,
@@ -125,6 +182,13 @@ void LinearForward(const Linear& layer, const float* x, std::int64_t rows,
     for (std::int64_t block = 0; block < column_blocks; ++block) {
       const std::int64_t j0 = block * 4;
       const std::int64_t jn = std::min<std::int64_t>(4, out - j0);
+#if defined(GUFO_MING_AVX2)
+      if (jn == 4 && panel_rows >= 3 && panel_rows <= 6 &&
+          TryTallTile(layer, x, panel, panel_rows, j0, y)) {
+        (void)TryTallTile(layer, x, panel, panel_rows, j0 + 2, y);
+        continue;
+      }
+#endif
       for (std::int64_t r = 0; r < panel_rows; r += 2) {
         const std::int64_t rn = std::min<std::int64_t>(2, panel_rows - r);
         Tile(layer, x, panel + r, rn, j0, jn, y);

@@ -205,7 +205,8 @@ int main() {
   }
 
   const bool need_model = Want(stages, "backbone") || Want(stages, "dit") ||
-                          Want(stages, "ar") || Want(stages, "vae");
+                          Want(stages, "ar") || Want(stages, "vae") ||
+                          Want(stages, "bench");
   if (need_model) {
     const auto start = std::chrono::steady_clock::now();
     auto model = ming::cpu::Model::Load(model_dir.string(), &error);
@@ -317,6 +318,41 @@ int main() {
                           latent.data());
       Compare("DiT sampled latent step 0", latent.data(), latents.data(),
               static_cast<std::size_t>(latent_dim));
+    }
+
+    // --------------------------------------------------------- bench ----
+    if (!stages.empty() && Want(stages, "bench")) {
+      std::vector<float> out(static_cast<std::size_t>(2 * latent_dim));
+      const std::vector<float> history(static_cast<std::size_t>(latent_dim), 0.0F);
+      std::vector<float> agg_out(static_cast<std::size_t>(hidden));
+      std::vector<float> z(static_cast<std::size_t>(hidden));
+      constexpr int kRepeats = 20;
+      auto t = std::chrono::steady_clock::now();
+      for (int i = 0; i < kRepeats; ++i) {
+        model->FlowVelocity(noises.data(), 0.5F, cond.data(), history.data(), out.data());
+      }
+      const double dit_ms = Seconds(t) * 1000.0 / kRepeats;
+      t = std::chrono::steady_clock::now();
+      for (int i = 0; i < kRepeats; ++i) {
+        model->Aggregate(latents.data(), agg_out.data());
+      }
+      const double agg_ms = Seconds(t) * 1000.0 / kRepeats;
+      model->ResetCache();
+      std::vector<float> embeds(static_cast<std::size_t>(rows * hidden));
+      model->Embed(input_ids, embeds.data());
+      std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
+      t = std::chrono::steady_clock::now();
+      model->BackboneForward(embeds.data(), rows, normed.data());
+      const double prefill_ms = Seconds(t) * 1000.0;
+      t = std::chrono::steady_clock::now();
+      for (int i = 0; i < kRepeats; ++i) {
+        model->BackboneForward(agg.data(), 1, z.data());
+      }
+      const double decode_ms = Seconds(t) * 1000.0 / kRepeats;
+      std::printf("     bench: DiT eval %.2f ms (x10 per step), aggregator %.2f ms, "
+                  "backbone token %.2f ms, prefill %lld rows %.1f ms -> step %.1f ms\n",
+                  dit_ms, agg_ms, decode_ms, static_cast<long long>(rows), prefill_ms,
+                  10 * dit_ms + agg_ms + decode_ms);
     }
 
     // ----------------------------------------------------------- vae ----
