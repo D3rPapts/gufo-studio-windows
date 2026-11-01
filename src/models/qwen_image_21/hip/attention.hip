@@ -1,6 +1,10 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 #include "src/models/qwen_image_21/hip/bf16.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 
@@ -272,8 +276,10 @@ FusedAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
     }
 }
 
+// 256 threads: without the bound the register budget is 192 and the
+// register-resident queries spill.
 template<bool Masked>
-__global__ void FusedAttention(const std::uint16_t* queries,
+__global__ __launch_bounds__(256) void FusedAttention(const std::uint16_t* queries,
                                const std::uint16_t* keys,
                                const std::uint16_t* values,
                                hip_bfloat16* output, int heads, int rows,
@@ -294,9 +300,318 @@ __global__ __launch_bounds__(256) void FusedAttentionSegmented(
                                    rows, segments.end[2], query_start,
                                    query_count, limits, segments);
 }
+
+// ---------------------------------------------------------------------------
+// Flash attention with BF16 probabilities (opt-in, not bit-identical).
+// Like PyTorch SDPA / ComfyUI: the softmax numerator P is rounded to BF16 and
+// P*V runs on the WMMA units with FP32 accumulation; the row sums use the
+// unrounded FP32 P. Each wave owns 16 queries (Q in registers) and all 128
+// output channels (O^T in WMMA accumulators); the block's 8 waves share one
+// transposed 64-key value tile in LDS (double buffered: one barrier per
+// tile). S^T = K Q^T places each query in one lane pair, so a softmax
+// reduction is one cross-half exchange and P^T becomes a WMMA operand
+// without LDS.
+
+constexpr int kFlashKeys = 64;
+constexpr int kFlashPitch = kFlashKeys + 8;  // 144-byte rows, 16-byte aligned
+
+template<bool Value, int N>
+__device__ const std::uint16_t* BlockRowsN(const HeadSegments& h, int row) {
+  if ((row < h.end[0] && row + N > h.end[0]) ||
+      (row >= h.end[0] && row < h.end[1] && row + N > h.end[1]))
+    return nullptr;
+  return SegmentRow<Value>(h, row);
+}
+
+// Lane l <-> lane l ^ 16.
+__device__ __forceinline__ unsigned SwapHalves(unsigned x) {
+  return __builtin_amdgcn_permlanex16(x, x, 0x76543210U, 0xfedcba98U, false,
+                                      false);
+}
+__device__ __forceinline__ float SwapHalves(float x) {
+  return __uint_as_float(SwapHalves(__float_as_uint(x)));
+}
+
+// Round to nearest even (finite, non-negative inputs).
+__device__ __forceinline__ unsigned RoundBf16(float x) {
+  const unsigned u = __float_as_uint(x);
+  return (u + 0x7fffU + ((u >> 16) & 1U)) >> 16;
+}
+
+template<bool Masked, bool Segmented>
+__device__ __forceinline__ void
+FlashAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
+                   const std::uint16_t* values, hip_bfloat16* output,
+                   int heads, int rows, int count, int query_start,
+                   int query_count, const int* limits,
+                   const KeySegments& segments) {
+  __shared__ __attribute__((aligned(16)))
+  std::uint16_t vt[2][128 * kFlashPitch];
+  __shared__ int last_key;
+  const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const int half = lane / 16;
+  const int col = blockIdx.x * 128, head = blockIdx.y;
+  const int query_end = query_start + query_count;
+  queries += static_cast<std::size_t>(head) * rows * 128;
+  [[maybe_unused]] HeadSegments segs{};
+  if constexpr (Segmented) {
+    segs = ForHead(segments, head);
+  } else {
+    keys += static_cast<std::size_t>(head) * count * 128;
+    values += static_cast<std::size_t>(head) * count * 128;
+  }
+  // Value staging: item r covers key rows first + 2 * lane + {0, 1} and
+  // channels (wave + 8 * r) * 8 + [0, 8).
+  uint4 staged[2][2];
+  const auto fetch = [&](int first) {
+    [[maybe_unused]] const std::uint16_t* block = nullptr;
+    if constexpr (Segmented)
+      block = BlockRowsN<true, kFlashKeys>(segs, first);
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int row = first + 2 * lane + e;
+        uint4 x{0, 0, 0, 0};
+        if (row < count) {
+          const std::uint16_t* ptr;
+          if constexpr (Segmented)
+            ptr = block ? block + static_cast<std::size_t>(row - first) * 128
+                        : SegmentRow<true>(segs, row);
+          else
+            ptr = values + static_cast<std::size_t>(row) * 128;
+          x = *reinterpret_cast<const uint4*>(ptr + (wave + 8 * r) * 8);
+        }
+        staged[r][e] = x;
+      }
+  };
+  // Transposed store vt[channel][key]: consecutive lanes write consecutive
+  // dwords, free of bank conflicts.
+  const auto store = [&](std::uint16_t* tile) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const unsigned a[4] = {staged[r][0].x, staged[r][0].y, staged[r][0].z,
+                             staged[r][0].w};
+      const unsigned b[4] = {staged[r][1].x, staged[r][1].y, staged[r][1].z,
+                             staged[r][1].w};
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const unsigned lo = c % 2 ? a[c / 2] >> 16 : a[c / 2] & 0xffffU;
+        const unsigned hi = c % 2 ? b[c / 2] >> 16 : b[c / 2] & 0xffffU;
+        const int channel = (wave + 8 * r) * 8 + c;
+        *reinterpret_cast<unsigned*>(tile + channel * kFlashPitch + 2 * lane) =
+            lo | (hi << 16);
+      }
+    }
+  };
+  if constexpr (Masked) {
+    if (tid < 32) {
+      int visible = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int q = query_start + col + tid + i * 32;
+        if (q < query_end)
+          visible = max(visible, limits[q]);
+      }
+#pragma unroll
+      for (int offset = 16; offset; offset /= 2)
+        visible = max(visible, __shfl_xor(visible, offset, 32));
+      if (tid == 0)
+        last_key = visible;
+    }
+  }
+  const int query = query_start + col + wave * 16 + lane % 16;
+  int limit = count;
+  if constexpr (Masked) {
+    if (query < query_end)
+      limit = min(limits[query], count);
+  }
+  Fragment q[8];
+#pragma unroll
+  for (int d = 0; d < 8; ++d) {
+    q[d] = Fragment{};
+    if (query < query_end)
+      q[d] = Load(queries + static_cast<std::size_t>(query) * 128 + d * 16);
+  }
+  if constexpr (Masked)
+    __syncthreads();
+  const int visible = Masked ? last_key : count;
+  constexpr float kScale = 0.08838834764831845F * 1.4426950408889634F;
+  float maximum = -INFINITY, total = 0;
+  Accumulator o[8]{};
+  fetch(0);
+  for (int base = 0, t = 0; base < visible; base += kFlashKeys, ++t) {
+    std::uint16_t* tile = vt[t & 1];
+    // vt[t & 1] was last read in tile t - 2, before the previous barrier.
+    store(tile);
+    Accumulator s[4]{};
+    [[maybe_unused]] const std::uint16_t* key_row[4]{};
+    if constexpr (Segmented) {
+      const auto* block = BlockRowsN<false, kFlashKeys>(segs, base);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kr = base + 16 * j + lane % 16;
+        key_row[j] = block ? block + static_cast<std::size_t>(kr - base) * 128
+                           : SegmentRow<false>(segs, kr);
+      }
+    }
+#pragma unroll
+    for (int d = 0; d < 8; ++d)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kr = base + 16 * j + lane % 16;
+        Fragment k{};
+        if (kr < count) {
+          if constexpr (Segmented)
+            k = Load(key_row[j] + d * 16);
+          else
+            k = Load(keys + static_cast<std::size_t>(kr) * 128 + d * 16);
+        }
+        s[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(k, q[d], s[j]);
+      }
+    // s[j][i]: key base + 16 j + 2 i + half, query lane % 16.
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int key = base + 16 * j + 2 * i + half;
+        const float x = key < limit ? s[j][i] * kScale : -INFINITY;
+        s[j][i] = x;
+        tile_max = fmaxf(tile_max, x);
+      }
+    tile_max = fmaxf(tile_max, SwapHalves(tile_max));
+    // Key 0 is always visible, so the maximum is finite from tile 0 on.
+    const float next = fmaxf(maximum, tile_max);
+    const float correction = exp2f(maximum - next);
+    maximum = next;
+    float sum = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float p = exp2f(s[j][i] - next);
+        s[j][i] = p;
+        sum += p;
+      }
+    sum += SwapHalves(sum);
+    total = total * correction + sum;
+#pragma unroll
+    for (int c = 0; c < 8; ++c)
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        o[c][i] *= correction;
+    __syncthreads();
+    // The next value tile loads during P*V (not during Q*K, the register
+    // peak).
+    fetch(base + kFlashKeys);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      // P^T operand: element e is key 16 j + e of query lane % 16; this lane
+      // holds the keys of parity `half`, its partner the others.
+      union {
+        Fragment f;
+        unsigned u[8];
+      } pf;
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        const unsigned own =
+            RoundBf16(s[j][2 * m]) | (RoundBf16(s[j][2 * m + 1]) << 16);
+        const unsigned other = SwapHalves(own);
+        const unsigned even = half ? other : own;
+        const unsigned odd = half ? own : other;
+        pf.u[2 * m] = (even & 0xffffU) | (odd << 16);
+        pf.u[2 * m + 1] = (even >> 16) | (odd & 0xffff0000U);
+      }
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const Fragment v =
+            Load(tile + (16 * c + lane % 16) * kFlashPitch + 16 * j);
+        o[c] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(v, pf.f, o[c]);
+      }
+    }
+  }
+  if (query < query_end) {
+    const float scale = 1.0F / total;
+#pragma unroll
+    for (int c = 0; c < 8; ++c)
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        output[(static_cast<std::size_t>(query) * heads + head) * 128 +
+               16 * c + 2 * i + half] = Bf16(o[c][i] * scale);
+  }
+}
+
+template<bool Masked>
+__global__ __launch_bounds__(256) void FlashAttention(
+    const std::uint16_t* queries, const std::uint16_t* keys,
+    const std::uint16_t* values, hip_bfloat16* output, int heads, int rows,
+    int count, int query_start, int query_count, const int* limits) {
+  FlashAttentionBody<Masked, false>(queries, keys, values, output, heads, rows,
+                                    count, query_start, query_count, limits,
+                                    {});
+}
+
+template<bool Masked>
+__global__ __launch_bounds__(256) void FlashAttentionSegmented(
+    const std::uint16_t* queries, KeySegments segments, hip_bfloat16* output,
+    int heads, int rows, int query_start, int query_count, const int* limits) {
+  FlashAttentionBody<Masked, true>(queries, nullptr, nullptr, output, heads,
+                                   rows, segments.end[2], query_start,
+                                   query_count, limits, segments);
+}
+
+bool FlashFromEnvironment() {
+  const char* value = std::getenv("GUFO_QWEN_IMAGE_FLASH_ATTENTION");
+  return value && *value && std::strcmp(value, "0") != 0;
+}
+
+std::atomic<int> flash_override{-1};
 }  // namespace
 
-void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
+bool FlashAttentionEnabled() {
+  static const bool from_environment = FlashFromEnvironment();
+  const int forced = flash_override.load(std::memory_order_relaxed);
+  return forced < 0 ? from_environment : forced != 0;
+}
+
+void SetFlashAttention(int enabled) {
+  flash_override.store(enabled < 0 ? -1 : (enabled ? 1 : 0),
+                       std::memory_order_relaxed);
+}
+
+void FlashAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
+                       const std::uint16_t* values, std::uint16_t* output,
+                       int heads, int rows, int count, int query_start,
+                       hipStream_t stream, int query_count, const int* limits) {
+  const dim3 grid((query_count + 127) / 128, heads);
+  if (limits)
+    FlashAttention<true><<<grid, 256, 0, stream>>>(
+        queries, keys, values, reinterpret_cast<hip_bfloat16*>(output), heads,
+        rows, count, query_start, query_count, limits);
+  else
+    FlashAttention<false><<<grid, 256, 0, stream>>>(
+        queries, keys, values, reinterpret_cast<hip_bfloat16*>(output), heads,
+        rows, count, query_start, query_count, nullptr);
+}
+
+void FlashAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits) {
+  const dim3 grid((query_count + 127) / 128, heads);
+  if (limits)
+    FlashAttentionSegmented<true><<<grid, 256, 0, stream>>>(
+        queries, segments, reinterpret_cast<hip_bfloat16*>(output), heads,
+        rows, query_start, query_count, limits);
+  else
+    FlashAttentionSegmented<false><<<grid, 256, 0, stream>>>(
+        queries, segments, reinterpret_cast<hip_bfloat16*>(output), heads,
+        rows, query_start, query_count, nullptr);
+}
+
+void ExactAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
                        const std::uint16_t* values, std::uint16_t* output,
                        int heads, int rows, int count, int query_start,
                        hipStream_t stream, int query_count, const int* limits) {
@@ -311,7 +626,7 @@ void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
         rows, count, query_start, query_count, nullptr);
 }
 
-void FusedAttention128Segmented(const std::uint16_t* queries,
+void ExactAttention128Segmented(const std::uint16_t* queries,
                                 const KeySegments& segments,
                                 std::uint16_t* output, int heads, int rows,
                                 int query_start, int query_count,
@@ -325,6 +640,31 @@ void FusedAttention128Segmented(const std::uint16_t* queries,
     FusedAttentionSegmented<false><<<grid, 256, 0, stream>>>(
         queries, segments, reinterpret_cast<hip_bfloat16*>(output), heads,
         rows, query_start, query_count, nullptr);
+}
+
+void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
+                       const std::uint16_t* values, std::uint16_t* output,
+                       int heads, int rows, int count, int query_start,
+                       hipStream_t stream, int query_count, const int* limits) {
+  if (FlashAttentionEnabled())
+    FlashAttention128(queries, keys, values, output, heads, rows, count,
+                      query_start, stream, query_count, limits);
+  else
+    ExactAttention128(queries, keys, values, output, heads, rows, count,
+                      query_start, stream, query_count, limits);
+}
+
+void FusedAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits) {
+  if (FlashAttentionEnabled())
+    FlashAttention128Segmented(queries, segments, output, heads, rows,
+                               query_start, query_count, stream, limits);
+  else
+    ExactAttention128Segmented(queries, segments, output, heads, rows,
+                               query_start, query_count, stream, limits);
 }
 
 }  // namespace gufo::models::qwen_image_21::hip

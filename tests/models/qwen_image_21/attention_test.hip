@@ -1,6 +1,8 @@
 // Qwen-Image attention kernels against the frozen former kernel
 // (attention_reference.hip): the exact kernels must match it byte for byte on
-// random inputs, layouts, masks and segment splits. `--bench` also times a
+// random inputs, layouts, masks and segment splits; the flash kernel (BF16
+// probabilities) must stay within a relative tolerance of it and reproduce
+// itself exactly across segment splits. `--bench` also times a
 // keyframe-sized step (4032 queries, 42168 segmented keys, 32 heads).
 // Written with AI assistance (Claude Code).
 #include <hip/hip_runtime.h>
@@ -87,6 +89,7 @@ struct Case {
 };
 
 int mismatches_reported = 0;
+double worst_max = 0, worst_rms = 0;
 
 void ExpectSame(const std::vector<std::uint16_t>& expected,
                 const std::vector<std::uint16_t>& actual,
@@ -105,6 +108,49 @@ void ExpectSame(const std::vector<std::uint16_t>& expected,
             << " (" << Float(expected[first]) << " vs " << Float(actual[first])
             << ")\n";
   ++mismatches_reported;
+}
+
+/// Flash (BF16 probabilities) against the exact kernel: error relative to
+/// the largest reference value of the output, and RMS error relative to the
+/// RMS reference value.
+void ExpectClose(const std::vector<std::uint16_t>& expected,
+                 const std::vector<std::uint16_t>& actual,
+                 const std::string& what) {
+  double max_ref = 0, max_err = 0, sum_ref = 0, sum_err = 0;
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] == kSentinel || actual[i] == kSentinel) {
+      if (expected[i] != actual[i]) {
+        std::cerr << "MISMATCH " << what << ": written range differs at " << i
+                  << "\n";
+        ++mismatches_reported;
+        return;
+      }
+      continue;
+    }
+    const double e = Float(expected[i]), a = Float(actual[i]);
+    if (!std::isfinite(a)) {
+      std::cerr << "MISMATCH " << what << ": non-finite value at " << i
+                << "\n";
+      ++mismatches_reported;
+      return;
+    }
+    max_ref = std::max(max_ref, std::abs(e));
+    max_err = std::max(max_err, std::abs(a - e));
+    sum_ref += e * e;
+    sum_err += (a - e) * (a - e);
+    ++n;
+  }
+  const double relative_max = max_err / std::max(max_ref, 1e-30);
+  const double relative_rms = std::sqrt(sum_err / std::max(sum_ref, 1e-30));
+  worst_max = std::max(worst_max, relative_max);
+  worst_rms = std::max(worst_rms, relative_rms);
+  if (relative_max > 1.5e-2 || relative_rms > 5e-3) {
+    std::cerr << "MISMATCH " << what << ": relative max error " << relative_max
+              << ", relative RMS error " << relative_rms << " over " << n
+              << " values\n";
+    ++mismatches_reported;
+  }
 }
 
 /// Splits head-major [heads][keys][128] into three padded segments.
@@ -176,6 +222,20 @@ void Exact(std::mt19937& rng, const Case& c) {
                            c.keys, c.start, nullptr, c.count, mask);
   image::Check(hipGetLastError());
   ExpectSame(expected, o.Get(), "contiguous " + name);
+  o.Put(blank);
+  image::FlashAttention128(q.data, k.data, v.data, o.data, c.heads, c.rows,
+                           c.keys, c.start, nullptr, c.count, mask);
+  image::Check(hipGetLastError());
+  const auto flash = o.Get();
+  ExpectClose(expected, flash, "flash contiguous " + name);
+  // The switch selects the flash kernel.
+  image::SetFlashAttention(1);
+  o.Put(blank);
+  image::FusedAttention128(q.data, k.data, v.data, o.data, c.heads, c.rows,
+                           c.keys, c.start, nullptr, c.count, mask);
+  image::Check(hipGetLastError());
+  image::SetFlashAttention(0);
+  ExpectSame(flash, o.Get(), "flash dispatch " + name);
   for (const auto& sizes :
        {std::array{c.keys / 3, c.keys / 2 - c.keys / 3, c.keys - c.keys / 2},
         std::array{c.keys - 40, 9, 31}, std::array{c.keys - 17, 17, 0},
@@ -192,10 +252,17 @@ void Exact(std::mt19937& rng, const Case& c) {
     image::FusedAttention128Segmented(q.data, segments.keys, o.data, c.heads,
                                       c.rows, c.start, c.count, nullptr, mask);
     image::Check(hipGetLastError());
-    ExpectSame(segmented_expected, o.Get(),
-               "segmented " + name + " split=" + std::to_string(sizes[0]) +
-                   "/" + std::to_string(sizes[1]) + "/" +
-                   std::to_string(sizes[2]));
+    const std::string split = " split=" + std::to_string(sizes[0]) + "/" +
+                              std::to_string(sizes[1]) + "/" +
+                              std::to_string(sizes[2]);
+    ExpectSame(segmented_expected, o.Get(), "segmented " + name + split);
+    // Same keys in segments: the flash kernel reproduces its own contiguous
+    // result exactly.
+    o.Put(blank);
+    image::FlashAttention128Segmented(q.data, segments.keys, o.data, c.heads,
+                                      c.rows, c.start, c.count, nullptr, mask);
+    image::Check(hipGetLastError());
+    ExpectSame(flash, o.Get(), "flash segmented " + name + split);
   }
 }
 
@@ -241,6 +308,11 @@ void Bench() {
                                       rows, 0, rows, nullptr, nullptr);
   });
   ExpectSame(expected, exact, "bench exact");
+  const auto flash = time("flash", [&] {
+    image::FlashAttention128Segmented(q.data, segments.keys, o.data, heads,
+                                      rows, 0, rows, nullptr, nullptr);
+  });
+  ExpectClose(expected, flash, "bench flash");
   (void)hipEventDestroy(begin);
   (void)hipEventDestroy(end);
 }
@@ -250,6 +322,7 @@ int main(int argc, char** argv) {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
     return 77;
+  image::SetFlashAttention(0);
   std::mt19937 rng(20261101);
   for (const auto& c : {Case{2, 384, 512, 128, 128, 1.0F, false},
                         Case{2, 384, 512, 128, 128, 1.0F, true},
@@ -263,10 +336,12 @@ int main(int argc, char** argv) {
     Exact(rng, c);
   if (argc > 1 && std::strcmp(argv[1], "--bench") == 0)
     Bench();
+  std::cout << "flash kernel: worst relative max error " << worst_max
+            << ", worst relative RMS error " << worst_rms << "\n";
   if (mismatches_reported) {
     std::cerr << mismatches_reported << " attention comparisons failed\n";
     return 1;
   }
-  std::cout << "Qwen-Image attention kernels match the former kernel "
-               "byte for byte\n";
+  std::cout << "Qwen-Image exact attention matches the former kernel byte "
+               "for byte; flash attention within tolerance\n";
 }

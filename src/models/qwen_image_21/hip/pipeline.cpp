@@ -919,6 +919,10 @@ Result Model::Generate(const Request& request,
     }
   };
   result.metrics.lora_ms = lora_ms;
+  // GUFO_QWEN_IMAGE_FLASH_ATTENTION=1 selects the faster, not bit-identical
+  // attention kernel (BF16 probabilities).
+  Log(std::string("event=attention kernel=") +
+      (hip::FlashAttentionEnabled() ? "flash" : "exact"));
   try {
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
