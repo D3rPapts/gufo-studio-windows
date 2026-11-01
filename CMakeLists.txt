@@ -391,6 +391,7 @@ target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
 add_subdirectory(src/models/fish_drama3)
+add_subdirectory(src/models/ming_tts)
 add_subdirectory(src/models/moss_image)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
