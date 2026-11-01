@@ -54,6 +54,10 @@ struct KeySegments {
   int end[3]{};
   int stride[3]{};
 };
+/// 128-dim attention. Dispatches to the exact kernel (FP32 probabilities and
+/// value product, bit-stable) or, when FlashAttentionEnabled(), to the flash
+/// kernel (BF16 probabilities, value product on WMMA; faster, not
+/// bit-identical).
 void FusedAttention128Segmented(const std::uint16_t* queries,
                                 const KeySegments& segments,
                                 std::uint16_t* output, int heads, int rows,
@@ -64,6 +68,31 @@ void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
                        int heads, int rows, int count, int query_start,
                        hipStream_t stream, int query_count = 128,
                        const int* limits = nullptr);
+void ExactAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits);
+void ExactAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
+                       const std::uint16_t* values, std::uint16_t* output,
+                       int heads, int rows, int count, int query_start,
+                       hipStream_t stream, int query_count,
+                       const int* limits);
+void FlashAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits);
+void FlashAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
+                       const std::uint16_t* values, std::uint16_t* output,
+                       int heads, int rows, int count, int query_start,
+                       hipStream_t stream, int query_count,
+                       const int* limits);
+/// Flash kernel selection: GUFO_QWEN_IMAGE_FLASH_ATTENTION=1 (read once),
+/// unless SetFlashAttention(0/1) overrides it; SetFlashAttention(-1) returns
+/// to the environment. Default off.
+bool FlashAttentionEnabled();
+void SetFlashAttention(int enabled);
 // weight[rows x cols] += scale * up[rows x rank] * down[rank x cols]; FP32,
 // row-major.
 void LoraLowRank(hipblasHandle_t blas, float* weight, const float* up,

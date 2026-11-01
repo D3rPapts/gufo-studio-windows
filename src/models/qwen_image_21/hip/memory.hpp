@@ -31,5 +31,18 @@ struct DeviceMemory {
 
 DeviceMemory QueryDeviceMemory();
 
+/// Extra headroom a large request must leave when the text encoder stays.
+inline constexpr std::uint64_t kKeepTextEncoderMarginBytes = 4ULL << 30;
+
+/// Whether a large request keeps the resident text encoder for the next
+/// request: `need` (what the request still allocates) plus the margin fits in
+/// `available` (measured with the encoder resident). Unknown availability
+/// (UINT64_MAX) or `force_release` keep the former always-release behaviour.
+constexpr bool KeepsTextEncoder(std::uint64_t need, std::uint64_t available,
+                                bool force_release) {
+  return !force_release && available != UINT64_MAX && need <= available &&
+         available - need >= kKeepTextEncoderMarginBytes;
+}
+
 }  // namespace gufo::models::qwen_image_21::hip
 #endif
