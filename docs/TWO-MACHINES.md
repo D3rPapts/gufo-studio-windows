@@ -13,7 +13,7 @@ _Written with AI assistance (Claude Code) from our configuration and test logs. 
 
 Each machine runs one `gufo router`. The router owns the API surface and starts one `gufo serve` worker
 process per model when a request needs it. A `[remote/<id>]` preset section makes a model on the other
-machine look local (see [SERVER.md](SERVER.md#remote-models)).
+machine look local (see [SERVER.md on release/1.3](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.3/docs/SERVER.md#remote-models)).
 
 | Machine | Memory | Role |
 |---|---|---|
