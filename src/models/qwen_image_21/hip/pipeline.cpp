@@ -961,10 +961,16 @@ Result Model::Generate(const Request& request,
         rt.Trim();
         const auto memory = hip::QueryDeviceMemory();
         const auto available = memory.Available(kHostReserveBytes);
-        keep = hip::KeepsTextEncoder(need, available, false);
+        // Weights still to load count twice: on Windows a loader can hold
+        // their file mapping in host RAM while they upload (the first large
+        // job after a load usually releases; later ones keep the encoder).
+        const std::uint64_t loading =
+            rt.MissingBytes("transformer.") + rt.MissingBytes("vae.");
+        keep = hip::KeepsTextEncoder(need + loading, available, false);
         Log("event=memory_check text_encoder=" +
             std::string(keep ? "kept" : "release") +
             " need_mib=" + std::to_string(need >> 20) +
+            " loading_mib=" + std::to_string(loading >> 20) +
             " available_mib=" + std::to_string(available >> 20) + " " +
             memory.Describe());
       }
