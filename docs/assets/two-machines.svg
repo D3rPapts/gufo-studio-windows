@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 640" width="1080" height="640" role="img" aria-label="Two EVO-X2 machines, each with a gufo router and worker processes, linked by a direct cable; clients on top">
+        <style>svg { --bg: #ffffff; --paper: #ffffff; --ink: #1b2221; --muted: #5d6866; --rule: #cdd3d0; --accent: #0f7a6c; --accent-soft: #dcefeb; --warm: #b4541d; --warm-soft: #f6e4d8; --remote: #4a5bb5; --remote-soft: #e3e6f6; --exp: #8a6d12; --exp-soft: #f5edd2; } @media (prefers-color-scheme: dark) { svg { --bg: #0d1117; --paper: #161b22; --ink: #e4ebe9; --muted: #98a6a3; --rule: #33403d; --accent: #4cc2b0; --accent-soft: #173a35; --warm: #e98a52; --warm-soft: #3d2618; --remote: #8e9cf0; --remote-soft: #232a4d; --exp: #d9b64c; --exp-soft: #3a3115; } } text { font-family: 'IBM Plex Mono', ui-monospace, Consolas, monospace; }</style><rect width="1080" height="640" fill="var(--bg)"/><defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+          </marker>
+          <marker id="arR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--remote)"/>
+          </marker>
+        </defs>
+
+        <!-- clients -->
+        <g font-size="12">
+          <rect x="20" y="14" width="1040" height="64" rx="4" fill="none" stroke="var(--rule)" stroke-dasharray="4 4"/>
+          <text x="34" y="34" fill="var(--muted)" font-size="11" letter-spacing=".08em">CLIENTS (LAN)</text>
+          <rect x="34" y="42" width="190" height="26" rx="3" fill="var(--paper)" stroke="var(--ink)"/>
+          <text x="129" y="59" text-anchor="middle" fill="var(--ink)">Take One (film studio)</text>
+          <rect x="238" y="42" width="190" height="26" rx="3" fill="var(--paper)" stroke="var(--ink)"/>
+          <text x="333" y="59" text-anchor="middle" fill="var(--ink)">ComfyUI workflows</text>
+          <rect x="442" y="42" width="190" height="26" rx="3" fill="var(--paper)" stroke="var(--ink)"/>
+          <text x="537" y="59" text-anchor="middle" fill="var(--ink)">OpenAI-style apps</text>
+          <rect x="646" y="42" width="190" height="26" rx="3" fill="var(--paper)" stroke="var(--ink)"/>
+          <text x="741" y="59" text-anchor="middle" fill="var(--ink)">Browser pages</text>
+          <rect x="850" y="42" width="196" height="26" rx="3" fill="var(--paper)" stroke="var(--ink)"/>
+          <text x="948" y="59" text-anchor="middle" fill="var(--ink)">Agents / scripts</text>
+        </g>
+        <line x1="270" y1="80" x2="270" y2="128" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ar)"/>
+        <line x1="810" y1="80" x2="810" y2="128" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ar)"/>
+        <text x="282" y="110" fill="var(--muted)" font-size="11">HTTP :8081</text>
+        <text x="822" y="110" fill="var(--muted)" font-size="11">HTTP :8081</text>
+
+        <!-- machine A -->
+        <rect x="20" y="132" width="500" height="490" rx="6" fill="none" stroke="var(--ink)" stroke-width="1.5"/>
+        <text x="36" y="156" fill="var(--ink)" font-size="14" font-weight="600">EVO-X2 · 64 GB</text>
+        <text x="36" y="173" fill="var(--muted)" font-size="11">Ryzen AI Max+ 395 · Radeon 8060S (gfx1151) · Windows 11 · ROCm 10.0</text>
+        <text x="36" y="188" fill="var(--muted)" font-size="11">Windows sees 32 GB, the GPU the rest</text>
+
+        <rect x="36" y="200" width="468" height="130" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="50" y="222" fill="var(--accent)" font-size="13" font-weight="600">gufo router :8081</text>
+        <g font-size="11" fill="var(--ink)">
+          <text x="50" y="242">OpenAI API · ComfyUI API (/prompt /queue /ws)</text>
+          <text x="50" y="258">job API + webhooks · live previews · pages</text>
+          <text x="50" y="274">memory guard (commit limit) · idle unload 30 min</text>
+          <text x="50" y="290">one GPU job at a time per gpu-slot</text>
+          <text x="50" y="306">remote models · loop guard (508)</text>
+          <text x="50" y="322" fill="var(--muted)">preset: one section per model</text>
+        </g>
+
+        <g font-size="11">
+          <rect x="36" y="346" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="48" y="366" fill="var(--warm)" font-weight="600">serve llm · Qwen3.8-27B</text>
+          <text x="48" y="382" fill="var(--ink)">DFlash2 drafts · 155k context</text>
+          <text x="48" y="396" fill="var(--muted)">checker for the film</text>
+
+          <rect x="278" y="346" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="290" y="366" fill="var(--warm)" font-weight="600">serve llm · MoE models</text>
+          <text x="290" y="382" fill="var(--ink)">Qwen3.6-35B-A3B · Flash-Next</text>
+          <text x="290" y="396" fill="var(--muted)">experts streamed from SSD</text>
+
+          <rect x="36" y="414" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="48" y="434" fill="var(--warm)" font-weight="600">serve image</text>
+          <text x="48" y="450" fill="var(--ink)">Qwen-Image 2.1 / Turbo</text>
+          <text x="48" y="464" fill="var(--ink)">MOSS-Image · masks · LoRA</text>
+
+          <rect x="278" y="414" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="290" y="434" fill="var(--warm)" font-weight="600">serve asr / tts / music</text>
+          <text x="290" y="450" fill="var(--ink)">Qwen3-ASR (+subtitles)</text>
+          <text x="290" y="464" fill="var(--ink)">Qwen3-TTS · ACE-Step 1.5</text>
+
+          <rect x="36" y="482" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="48" y="502" fill="var(--warm)" font-weight="600">serve video</text>
+          <text x="48" y="518" fill="var(--ink)">MiniMax H3 · Wan 2.2 TI2V</text>
+          <text x="48" y="532" fill="var(--ink)">Wan 2.1 Uni3C camera · RIFE</text>
+
+          <rect x="278" y="482" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="290" y="502" fill="var(--warm)" font-weight="600">omni · captioner</text>
+          <text x="290" y="518" fill="var(--ink)">Qwen3-Omni-30B-A3B</text>
+          <text x="290" y="532" fill="var(--ink)">audio in, text out</text>
+        </g>
+        <text x="36" y="566" fill="var(--muted)" font-size="11">Workers start on demand, stay while used,</text>
+        <text x="36" y="581" fill="var(--muted)" font-size="11">and leave when idle or when memory is needed.</text>
+        <text x="36" y="604" fill="var(--muted)" font-size="11">Role: always-on checker, chat, small jobs.</text>
+
+        <!-- machine B -->
+        <rect x="560" y="132" width="500" height="490" rx="6" fill="none" stroke="var(--ink)" stroke-width="1.5"/>
+        <text x="576" y="156" fill="var(--ink)" font-size="14" font-weight="600">EVO-X2 · 128 GB</text>
+        <text x="576" y="173" fill="var(--muted)" font-size="11">same chip · Windows 11 · ROCm 10.0</text>
+        <text x="576" y="188" fill="var(--muted)" font-size="11">Windows sees 64 GB, the GPU the rest</text>
+
+        <rect x="576" y="200" width="468" height="130" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="590" y="222" fill="var(--accent)" font-size="13" font-weight="600">gufo router :8081</text>
+        <g font-size="11" fill="var(--ink)">
+          <text x="590" y="242">same router build and API</text>
+          <text x="590" y="258">ComfyUI queue: many prompts in, one at a time out</text>
+          <text x="590" y="274">"front": true puts a retry first in line</text>
+          <text x="590" y="290">27B listed as [remote/…] → checks on the 64 GB box</text>
+          <text x="590" y="306">Hemmingway-1.5 local · DFlash2</text>
+          <text x="590" y="322" fill="var(--muted)">preset: local sections + remote sections</text>
+        </g>
+
+        <g font-size="11">
+          <rect x="576" y="346" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="588" y="366" fill="var(--warm)" font-weight="600">serve video · H3</text>
+          <text x="588" y="382" fill="var(--ink)">start/end frame · voice</text>
+          <text x="588" y="396" fill="var(--ink)">anchor clips · ~50 GB GPU</text>
+
+          <rect x="818" y="346" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="830" y="366" fill="var(--warm)" font-weight="600">serve image · keyframes</text>
+          <text x="830" y="382" fill="var(--ink)">Qwen-Image 2.1 + references</text>
+          <text x="830" y="396" fill="var(--muted)">stays loaded between jobs</text>
+
+          <rect x="576" y="414" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="588" y="434" fill="var(--warm)" font-weight="600">serve llm · Hemmingway</text>
+          <text x="588" y="450" fill="var(--ink)">creative writing (27B tune)</text>
+          <text x="588" y="464" fill="var(--muted)">non-commercial licence</text>
+
+          <rect x="818" y="414" width="226" height="56" rx="3" fill="var(--warm-soft)" stroke="var(--warm)"/>
+          <text x="830" y="434" fill="var(--warm)" font-weight="600">post-processing</text>
+          <text x="830" y="450" fill="var(--ink)">RIFE frame interpolation</text>
+          <text x="830" y="464" fill="var(--ink)">upscale · from source_video</text>
+
+          <rect x="576" y="482" width="468" height="56" rx="3" fill="var(--exp-soft)" stroke="var(--exp)" stroke-dasharray="5 3"/>
+          <text x="588" y="502" fill="var(--exp)" font-weight="600">experimental (built, CPU-tested, no GPU run yet)</text>
+          <text x="588" y="518" fill="var(--ink)">VACE editing · InfiniteTalk talking video · MMAudio foley</text>
+          <text x="588" y="532" fill="var(--muted)">Wan 2.1 14B family · MMAudio weights non-commercial</text>
+        </g>
+        <text x="576" y="566" fill="var(--muted)" font-size="11">Role: heavy rendering. Batches are grouped by</text>
+        <text x="576" y="581" fill="var(--muted)" font-size="11">model family so H3 and Qwen-Image swap rarely.</text>
+        <text x="576" y="604" fill="var(--muted)" font-size="11">ComfyUI on this box is paused, gufo took over.</text>
+
+        <!-- cable -->
+        <line x1="504" y1="265" x2="576" y2="265" stroke="var(--remote)" stroke-width="2.5" marker-end="url(#arR)" marker-start="url(#arR)"/>
+        <rect x="508" y="232" width="64" height="20" rx="3" fill="var(--remote-soft)" stroke="var(--remote)"/>
+        <text x="540" y="246" text-anchor="middle" fill="var(--remote)" font-size="10">relay</text>
+        <text x="540" y="290" text-anchor="middle" fill="var(--remote)" font-size="10">direct</text>
+        <text x="540" y="303" text-anchor="middle" fill="var(--remote)" font-size="10">cable</text>
+      </svg>

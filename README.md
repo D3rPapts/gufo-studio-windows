@@ -4,26 +4,62 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0)**
-> (zip, branch `release/1.2`): text, images, speech, music and video from one
+> **Download [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0)**
+> (zip, branch `release/1.3`): text, images, speech, music and video from one
 > OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
 > it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
 > first request. The release notes list what was tested.
-> Previous: [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> Previous: [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
 > This repository was called `gufo_windows` until 31 October 2026; old links still work.
 
 ### Focus
 
 gufo-studio-windows is built for one setup first: two GMKtec EVO-X2 (AMD Strix Halo,
-64 GB) on Windows 11 that share the load for video and creative work. The
-goal is one tool that covers everything a film pipeline needs: text, images,
-speech, music and video. New features land here when that setup needs them,
-and the measurements in the release notes come from it. Sharing the load
-between the two machines is the next big step; it is not in 1.1.1 yet.
-Other Strix Halo machines (64 and 128 GB) should work too, and we help in
-the issues, but only this setup is tested here.
+one with 64 GB and one with 128 GB) on Windows 11 that share the load for video and
+creative work, connected by a direct cable. The goal is one tool that covers everything
+a film pipeline needs: text, images, speech, music and video. New features land here
+when that setup needs them, and the measurements in the release notes come from it.
+Since 1.3 the two machines share the work: a model on one machine can be used through
+the router of the other ([docs/TWO-MACHINES.md](docs/TWO-MACHINES.md), with diagrams).
+Other Strix Halo machines should work too, and we help in the issues, but only this
+setup is tested here.
 
 _(AI-assisted text, written with Claude Code.)_
+
+### New in 1.3
+
+- **Two machines, one setup:** `[remote/<id>]` preset sections let the router use a
+  model served by another gufo router (requests, previews, load/unload, job polls),
+  limited to the addresses in `--remote-allow`; models that share a `gpu-slot` run one
+  GPU job at a time; a loop guard answers `508`. See [docs/TWO-MACHINES.md](docs/TWO-MACHINES.md).
+- **Qwen-Image 2.1 faster than before and than ComfyUI on our film keyframes:** the text
+  encoder stays loaded between images, a faster attention kernel with identical pixels,
+  and opt-in flash attention (`GUFO_QWEN_IMAGE_FLASH_ATTENTION=1`, not bit-identical,
+  judged equivalent side by side). Keyframe 1344x768 with 9 reference images, 25 steps:
+  652-692 s (1.2.1) → 601-611 s → 391-396 s with flash attention; ComfyUI took about 414 s
+  for the same graph on this machine.
+- **Film-studio graphs over the ComfyUI API:** `SamplerCustomAdvanced`, RIFE-only
+  post-processing of an existing video, MiniMax H3 anchor clips from the previous shot
+  and any 17k+5 frame count.
+- **Upscaling on the NPU** (experimental): `gufo serve upscale --device npu|gpu|cpu`,
+  `POST /v1/images/upscale`, ONNX Runtime and AMD's NPU provider from Windows ML (not
+  bundled). 135 ms per 896x512 frame to 1920x1080, identical to the reference pipeline.
+- **Name service:** `--names-file` serves `GET /v1/names` (random names by origin and
+  gender, reproducible with `seed`) and `/v1/names/origins`.
+- **Pages:** background jobs per browser (images, voice, music are picked up after you
+  come back), "My jobs on this device" on the start page.
+- **Experimental, not yet run on the GPU:** VACE, InfiniteTalk, MMAudio (non-commercial
+  weights) and an H3 stage disk cache.
+- The memory guard also checks the Windows commit limit; upstream fixes #914 and #875.
+
+### New in 1.2
+
+- Subtitles from Qwen3-ASR (`srt`, `vtt`, `verbose_json` with segments).
+- Masked editing (inpainting) for Qwen-Image 2.1, also via ComfyUI `SetLatentNoiseMask`.
+- Background jobs with signed webhooks in the router (`--jobs-dir`, `POST /v1/jobs`).
+- 1.2.1: live preview for Wan 2.1 camera moves, router releases finished jobs nobody
+  reads and restarts hung workers, start page `/start/`, `/transkript/` page, German/English
+  pages and a navigation bar.
 
 ### New in 1.1.1
 
@@ -65,17 +101,18 @@ llama.cpp's server or the OpenAI API work against it.
 
 The easiest way to use it is the release zip above. The step-by-step guide
 further down builds `main` from source and covers Qwen3.8-27B only; the
-release branches (`release/1.1`, `release/1.1.1-ttft`) carry everything in
-the tables below. Everything on this page was run on one machine (below);
+release branches (`release/1.1`, `release/1.1.1-ttft`, `release/1.2`, `release/1.3`)
+carry everything in the tables below. Everything on this page was run on the two
+machines below;
 Linux users should use [upstream Gufo](https://github.com/gufo-org/gufo).
 
 The port, the fixes and the measurements were done by Claude (Anthropic,
 Claude Opus 5.5) in Claude Code, at the request of the repository owner. MIT
 licensed, like upstream.
 
-## What runs here now (1.1.1, October 2026)
+## What runs here now (1.3.0, November 2026)
 
-All of this runs on the 64 GB EVO-X2 below, under Windows 11, behind one
+All of this runs on the two EVO-X2 below (64 GB, and 128 GB where noted), under Windows 11, behind one
 OpenAI-compatible router on one port. Models load on the first request;
 with the memory guard several stay loaded while they fit. Numbers are single
 requests on this machine, measured on the version in the last column.
@@ -86,19 +123,23 @@ requests on this machine, measured on the version in the last column.
 | Text, 64 GB with SSD streaming | Qwen3.8-Flash-Next UD-Q4_K_XL (104 GB) | 12.8 tok/s (story), 13.5 tok/s (cached English), prefill ~282 tok/s | 1.1.0 |
 | Text, 64 GB with SSD streaming | Qwen3.8-Flash-Next UD-Q3_K_XL (90 GB) | 15.6 tok/s, one request | 1.1.0 |
 | Text | Qwen3.6-35B-A3B (Q4_K_M) | 51 tok/s on a 40-shot JSON list, 65 tok/s prose; with DFlash2 63 tok/s on the JSON list (+25 %), but 46 tok/s on prose | 1.0 `gufo-a3b.exe` |
-| Creative writing | Hemmingway-1.5 (27B fine-tune) | ~25 tok/s | 1.0 |
+| Creative writing | Hemmingway-1.5 (27B fine-tune) | ~25 tok/s (1.0); 26-27 tok/s with DFlash2 on a ~70K-token prompt, 128 GB machine (~9 tok/s without) | 1.0 / 1.3 code (test build) |
 | Audio description | Qwen3-Omni-30B-A3B-Captioner | 53.6 tok/s | 1.1.0 |
 | Image | Qwen-Image 2.1 | 512² / 40 steps 20.2 s; 1024² / 40 steps 109-112 s; edit with up to 10 reference images | 1.1.1 |
+| Image, film keyframe | Qwen-Image 2.1, 1344x768, 9 reference images, 25 steps, CFG 2.5 | 601-611 s; 391-396 s with flash attention (128 GB machine) | 1.3 code (test build) |
 | Image, fast | Qwen-Image 2.1 Turbo (8 steps) | 512² 4.3 s; 1024² 22.7-24.0 s; 1920x1088 63 s | 1.1.1 |
 | Image style | LoRA adapters for Qwen-Image 2.1 | switching 2.9-4.2 s, no extra time per step | 1.1.1 |
 | Image layout | MOSS-Image (JSON layout prompt with boxes) | 512² / 30 steps 27.1 s; 1024² / 50 steps 172 s | #907 build |
 | Video with sound | MiniMax H3 (Turbo LoRA, first/last frame) | 1 s 512² in 60-66 s | 1.1.0 |
+| Video, film shots | MiniMax H3 via ComfyUI graphs, 512² | start image + voice, 124 frames 241 s; start + end frame, 107 frames 206 s; continuation from an anchor clip 331 s (128 GB machine) | 1.3 code (test build) |
 | Video | Wan 2.2 TI2V-5B | 1 s 480² / 20 steps in 41-46 s | 1.1.0 |
 | Camera moves | Wan 2.1 I2V 14B + Uni3C | 3 s 832x480 orbit, 4 steps, in 197 s | 1.1.0 |
 | Video delivery | RIFE 4.7, Real-ESRGAN | RIFE 5.9 ms per new frame (24 to 60 fps); 832x512 to 1920x1200 in 34-62 ms per frame | 1.1.0 |
 | Speech | Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, cloning, `speed`) | ~2x realtime | 1.0 |
+| Speech recognition | Qwen3-ASR 1.7B with SRT/VTT subtitles | 12-25 s German WAV in 1.1-1.5 s | 1.2.0 |
+| Upscaling on the NPU | realesr-animevideov3 (int8), 896x512 → 1920x1080 | 135 ms per frame, identical to the reference pipeline | 1.3 code (test build) |
 | Music | ACE-Step 1.5 XL turbo | 10 s of music in 10.7 s | 1.1.0 |
-| Pages | `/chat/` `/bild/` `/stimme/` `/video/` `/musik/` `/speicher/` | served by the router | 1.1.1 |
+| Pages | `/start/` `/chat/` `/bild/` `/stimme/` `/video/` `/musik/` `/transkript/` `/speicher/` | served by the router, German and English | 1.3.0 |
 
 What made the bigger models fit on 64 GB:
 - **SSD expert streaming for Flash-Next** (`--expert-cache-bytes`): routed
@@ -149,6 +190,8 @@ Given back to upstream Gufo:
   and multi-reference edits), [#904](https://github.com/gufo-org/gufo/pull/904)
   (Windows table for the 27B verification GEMMs),
   [#907](https://github.com/gufo-org/gufo/pull/907) (MOSS-Image).
+- Asked: [#926](https://github.com/gufo-org/gufo/issues/926) (interest check:
+  sharing models across several Strix Halo machines at the router level).
 - Elsewhere: [slimsami/strycast#7](https://github.com/slimsami/strycast/pull/7)
   (MMQ decode for the 35B experts, merged);
   [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1) (faster
@@ -157,8 +200,9 @@ Given back to upstream Gufo:
 
 ## What was tested
 
-Machine: **GMKtec EVO-X2** (Ryzen AI MAX+ 395, 64 GB: 32 GB dedicated GPU
-memory, 32 GB left to Windows), run in its **normal performance mode, not the
+Machines: **GMKtec EVO-X2** (Ryzen AI MAX+ 395, 64 GB: 32 GB dedicated GPU
+memory, 32 GB left to Windows) and a second EVO-X2 with **128 GB** (64 GB left to
+Windows) for the rows marked "128 GB", connected by a direct Ethernet cable. Both run in its **normal performance mode, not the
 high-performance mode**, Windows power plan "Balanced". Windows 11 Pro
 (build 26200), AMD driver 32.0.32015.7029, TheRock ROCm 10.0.0. llama.cpp
 and gufo ran under the same settings; the faster modes were not tried.
@@ -358,7 +402,7 @@ for the numbers.
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
-  [What runs here now](#what-runs-here-now-111-october-2026) were tested on their
+  [What runs here now](#what-runs-here-now-130-november-2026) were tested on their
   branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
