@@ -1222,6 +1222,15 @@ if (BUILD_TESTING)
   set_tests_properties(qwen3_tts_audio_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;audio;quality;resampling")
 
+  add_executable(ming_tts_oracle_test
+    tests/models/ming_tts/oracle_test.cpp)
+  target_link_libraries(ming_tts_oracle_test PRIVATE gufo_ming_tts)
+  add_test(NAME ming_tts_oracle_test COMMAND ming_tts_oracle_test)
+  set_tests_properties(ming_tts_oracle_test PROPERTIES
+    LABELS "cpu;models;ming-tts;quality;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE)
+
   add_executable(fish_drama3_config_test
     tests/models/fish_drama3/config_test.cpp)
   target_link_libraries(fish_drama3_config_test PRIVATE gufo_fish_drama3)
