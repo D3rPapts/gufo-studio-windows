@@ -16,6 +16,9 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -27,6 +30,7 @@
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/stage_cache.hpp"
 #include "src/models/minimax_h3/stage_profile.hip.hpp"
 
 namespace gufo::minimax_h3 {
@@ -689,6 +693,11 @@ struct DenoiserSession::Impl {
   DeviceBuffer previous_audio_velocity_f32;
 
   DenoiserTelemetry base_telemetry;
+  std::optional<StageCacheOptions> stage_cache;
+  std::string adaln_cache_key;
+  std::vector<std::vector<std::uint16_t>> adaln_cached;
+  std::vector<std::vector<std::uint16_t>> adaln_recorded;
+  bool adaln_cache_hit{false};
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
@@ -974,6 +983,124 @@ struct DenoiserSession::Impl {
     return true;
   }
 
+  // Diffusion time of every timestep row (the only per-job input of the
+  // AdaLN modulations).
+  std::vector<float> TimeValues() const {
+    std::vector<float> times(time_rows.time_rows, 0.0F);
+    for (int step = 0; step < schedule.evaluations(); ++step) {
+      const std::size_t index = static_cast<std::size_t>(step);
+      times[time_rows.video_rows[index]] = 1.0F - schedule.video[index];
+      times[time_rows.audio_rows[index]] = 1.0F - schedule.audio[index];
+    }
+    if (time_rows.condition_row != TimeRowSchedule::kNoConditionRow) {
+      times[time_rows.condition_row] = kH3ConditionTime;
+    }
+    if (time_rows.audio_condition_row != TimeRowSchedule::kNoConditionRow) {
+      times[time_rows.audio_condition_row] = kH3AudioConditionTime;
+    }
+    return times;
+  }
+
+  // AdaLN cache (GUFO_H3_CACHE_DIR). Each block's and the final layer's
+  // modulation is a function of the timestep rows, the time embedder and
+  // AdaLN weights and the BF16 GEMM backend only. The prompt, the canvas,
+  // the guides and the LoRA (ComputeModulation loads adaln_proj without
+  // it) do not enter. A hit replays the bytes an earlier miss read back
+  // from the device and skips reading the ~24 GiB of AdaLN weights.
+  std::string AdaLnCacheKey() const {
+    StageCacheKey key("gufo.minimax-h3.adaln.v1");
+    key.AddText("backend", ComputeBackendIdentity());
+    key.AddInteger("pinned_solution", static_cast<std::uint32_t>(
+                                          kGfx1151RocblasBf16Solution));
+    key.AddInteger("blocks", kDitBlocks);
+    key.AddInteger("block_width", kBlockModulationWidth);
+    key.AddInteger("final_width", kFinalModulationWidth);
+    key.AddInteger("time_input_width", kTimeInputWidth);
+    key.AddInteger("time_output_width", kTimeOutputWidth);
+    key.AddInteger("time_rows", time_rows.time_rows);
+    const std::vector<float> times = TimeValues();
+    key.AddValues("times", std::span<const float>(times));
+    key.AddInventoryPhase(*inventory, Phase::kAdaLnPrecompute);
+    return key.Hex();
+  }
+
+  void PrepareAdaLnCache() {
+    stage_cache = StageCacheFromEnvironment();
+    if (!stage_cache.has_value()) {
+      return;
+    }
+    adaln_cache_key = AdaLnCacheKey();
+    const std::size_t block_elements =
+        static_cast<std::size_t>(time_rows.time_rows) * kBlockModulationWidth;
+    const std::size_t final_elements =
+        static_cast<std::size_t>(time_rows.time_rows) * kFinalModulationWidth;
+    std::string cache_error;
+    auto loaded =
+        LoadStageArrays(*stage_cache, "adaln", adaln_cache_key, &cache_error);
+    if (!cache_error.empty()) {
+      Trace(cache_error.c_str());
+    }
+    if (loaded.has_value() && loaded->size() == kDitBlocks + 1U &&
+        std::all_of(loaded->begin(), loaded->begin() + kDitBlocks,
+                    [block_elements](const auto& values) {
+                      return values.size() == block_elements;
+                    }) &&
+        loaded->back().size() == final_elements) {
+      adaln_cached = std::move(*loaded);
+      adaln_cache_hit = true;
+      base_telemetry.adaln_cache_hit = true;
+      Trace("AdaLN cache hit");
+      return;
+    }
+    const std::uint64_t entry_bytes =
+        (static_cast<std::uint64_t>(block_elements) * kDitBlocks +
+         final_elements) *
+        sizeof(std::uint16_t);
+    if (entry_bytes <= stage_cache->max_bytes / 2U) {
+      adaln_recorded.resize(kDitBlocks + 1U);
+    }
+  }
+
+  // Publishes a complete miss (called after BuildBlocks succeeded) and
+  // releases the host copies either way.
+  void StoreAdaLnCache() {
+    if (stage_cache.has_value() && !adaln_cache_hit &&
+        !adaln_recorded.empty() &&
+        std::ranges::all_of(adaln_recorded, [](const auto& values) {
+          return !values.empty() && AllFiniteBf16(values);
+        })) {
+      std::string cache_error;
+      if (!StoreStageArrays(*stage_cache, "adaln", adaln_cache_key,
+                            adaln_recorded, &cache_error)) {
+        Trace(cache_error.c_str());
+      } else {
+        Trace("AdaLN cache stored");
+      }
+    }
+    std::vector<std::vector<std::uint16_t>>().swap(adaln_recorded);
+    std::vector<std::vector<std::uint16_t>>().swap(adaln_cached);
+  }
+
+  // Modulation of `slot` (a block index, or kDitBlocks for the final
+  // layer): from the cache on a hit, otherwise computed and recorded.
+  bool Modulation(std::size_t slot, std::string_view prefix,
+                  std::size_t output_width, const DeviceBuffer& time_embedding,
+                  bool select_plan, const CancellationToken* cancellation,
+                  std::vector<std::uint16_t>* host_output, std::string* error) {
+    if (adaln_cache_hit) {
+      *host_output = adaln_cached[slot];
+      return true;
+    }
+    if (!ComputeModulation(prefix, output_width, time_embedding, select_plan,
+                           cancellation, host_output, error)) {
+      return false;
+    }
+    if (!adaln_recorded.empty()) {
+      adaln_recorded[slot] = *host_output;
+    }
+    return true;
+  }
+
   bool BuildTimeEmbedding(DeviceBuffer* output,
                           const CancellationToken* cancellation,
                           std::string* error) {
@@ -993,18 +1120,7 @@ struct DenoiserSession::Impl {
         output_weight == nullptr || output_bias == nullptr) {
       return false;
     }
-    std::vector<float> times(time_rows.time_rows, 0.0F);
-    for (int step = 0; step < schedule.evaluations(); ++step) {
-      const std::size_t index = static_cast<std::size_t>(step);
-      times[time_rows.video_rows[index]] = 1.0F - schedule.video[index];
-      times[time_rows.audio_rows[index]] = 1.0F - schedule.audio[index];
-    }
-    if (time_rows.condition_row != TimeRowSchedule::kNoConditionRow) {
-      times[time_rows.condition_row] = kH3ConditionTime;
-    }
-    if (time_rows.audio_condition_row != TimeRowSchedule::kNoConditionRow) {
-      times[time_rows.audio_condition_row] = kH3AudioConditionTime;
-    }
+    const std::vector<float> times = TimeValues();
     std::vector<float> features(time_rows.time_rows * kTimeInputWidth);
     for (std::size_t row = 0; row < time_rows.time_rows; ++row) {
       for (std::size_t index = 0; index < kTimeInputWidth / 2U; ++index) {
@@ -1136,9 +1252,11 @@ struct DenoiserSession::Impl {
   }
 
   bool BuildBlocks(const CancellationToken* cancellation, std::string* error) {
+    PrepareAdaLnCache();
     DeviceBuffer time_embedding;
     Trace("time embedding");
-    if (!BuildTimeEmbedding(&time_embedding, cancellation, error)) {
+    if (!adaln_cache_hit &&
+        !BuildTimeEmbedding(&time_embedding, cancellation, error)) {
       return false;
     }
     Trace("rope");
@@ -1183,8 +1301,8 @@ struct DenoiserSession::Impl {
         const std::string prefix =
             "blocks." + std::to_string(block) + ".adaln_proj";
         const auto modulation_begin = Clock::now();
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               block == 2, cancellation, &modulation, error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        block == 2, cancellation, &modulation, error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
@@ -1326,9 +1444,9 @@ struct DenoiserSession::Impl {
         const std::string prefix =
             "blocks." + std::to_string(block) + ".adaln_proj";
         const auto modulation_begin = Clock::now();
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               block == 0, cancellation,
-                               &ranked_modulations[block], error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        block == 0, cancellation, &ranked_modulations[block],
+                        error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
@@ -1337,9 +1455,9 @@ struct DenoiserSession::Impl {
       Trace("block modulations computed");
       block0_modulation_host = ranked_modulations[0];
       const auto final_begin = Clock::now();
-      if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
-                             time_embedding, true, cancellation,
-                             &final_modulation_host, error)) {
+      if (!Modulation(kDitBlocks, "final_layer.adaln_proj",
+                      kFinalModulationWidth, time_embedding, true,
+                      cancellation, &final_modulation_host, error)) {
         return false;
       }
       base_telemetry.adaln_precompute_ms +=
@@ -1393,8 +1511,8 @@ struct DenoiserSession::Impl {
         const auto modulation_begin = Clock::now();
         const bool select_plan =
             active_blocks == static_cast<int>(kDitBlocks) && block == 0;
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               select_plan, cancellation, &modulation, error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        select_plan, cancellation, &modulation, error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
@@ -1429,9 +1547,9 @@ struct DenoiserSession::Impl {
       blocks.push_back(std::move(session));
     }
     const auto final_begin = Clock::now();
-    if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
-                           time_embedding, true, cancellation,
-                           &final_modulation_host, error)) {
+    if (!Modulation(kDitBlocks, "final_layer.adaln_proj",
+                    kFinalModulationWidth, time_embedding, true, cancellation,
+                    &final_modulation_host, error)) {
       return false;
     }
     base_telemetry.adaln_precompute_ms +=
@@ -2017,6 +2135,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
     return nullptr;
   }
+  impl->StoreAdaLnCache();
   Trace("load heads");
   if (!impl->LoadHeads(cancellation, error)) {
     Trace(error != nullptr ? error->c_str() : "denoiser stage failed");

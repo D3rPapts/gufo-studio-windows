@@ -165,6 +165,8 @@ struct GenerationTelemetry {
   double inventory_ms{0.0};
   double tokenizer_ms{0.0};
   double prompt_ms{0.0};
+  // The prompt embedding came from the stage cache (GUFO_H3_CACHE_DIR).
+  bool prompt_cache_hit{false};
   double keyframe_ms{0.0};
   double audio_guide_ms{0.0};
   std::size_t audio_guides{0};

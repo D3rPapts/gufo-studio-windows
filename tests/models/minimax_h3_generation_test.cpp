@@ -253,6 +253,20 @@ void TestPresetsAndReports() {
       "telemetry identifies the active attention kernel");
   Check(telemetry_json.find("\"first_preview_ms\": 8.000") != std::string::npos,
         "telemetry records preview latency");
+  Check(telemetry_json.find("\"prompt_cache_hit\": false") !=
+                std::string::npos &&
+            telemetry_json.find("\"denoiser_adaln_cache_hit\": false") !=
+                std::string::npos,
+        "telemetry reports stage cache misses");
+  telemetry.prompt_cache_hit = true;
+  telemetry.denoiser.adaln_cache_hit = true;
+  const std::string cached_json = h3::GenerationTelemetryJson(telemetry);
+  Check(h3::json::Parse(cached_json).IsObject() &&
+            cached_json.find("\"prompt_cache_hit\": true") !=
+                std::string::npos &&
+            cached_json.find("\"denoiser_adaln_cache_hit\": true") !=
+                std::string::npos,
+        "telemetry reports stage cache hits");
 }
 
 void TestAtomicFrames() {

@@ -76,6 +76,8 @@ struct DenoiserTelemetry {
   double setup_ms{0.0};
   double text_refiner_ms{0.0};
   double adaln_precompute_ms{0.0};
+  // The AdaLN modulations came from the stage cache (GUFO_H3_CACHE_DIR).
+  bool adaln_cache_hit{false};
   double core_load_ms{0.0};
   std::vector<double> forward_ms;
   double sampler_ms{0.0};

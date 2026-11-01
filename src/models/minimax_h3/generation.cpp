@@ -17,6 +17,7 @@
 #include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
+#include "src/models/minimax_h3/stage_cache.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
 
 namespace gufo::minimax_h3 {
@@ -647,6 +648,40 @@ bool WriteDiagnosticLatents(const std::filesystem::path& directory,
                             cancellation, error);
 }
 
+#if defined(ENGINE_ENABLE_HIP)
+namespace {
+
+std::string PromptCacheKey(const ModelInventory& inventory,
+                           std::span<const std::uint32_t> tokens,
+                           std::span<const PromptVisionBlock> blocks,
+                           std::span<const KeyframeImage> images,
+                           const std::filesystem::path& projector,
+                           bool isolated) {
+  StageCacheKey key("gufo.minimax-h3.prompt.v1");
+  key.AddText("backend", ComputeBackendIdentity());
+  key.AddInteger("isolated", isolated ? 1U : 0U);
+  key.AddInteger("width", kH3TextConditionWidth);
+  key.AddValues("tokens", tokens);
+  for (const PromptVisionBlock& block : blocks) {
+    key.AddInteger("block_begin", block.begin);
+    key.AddInteger("grid_height", block.grid_height);
+    key.AddInteger("grid_width", block.grid_width);
+  }
+  for (const KeyframeImage& image : images) {
+    key.AddInteger("image_width", static_cast<std::uint64_t>(image.width));
+    key.AddInteger("image_height", static_cast<std::uint64_t>(image.height));
+    key.AddValues("image_rgb", image.rgb);
+  }
+  if (!images.empty()) {
+    key.AddFileIdentity("projector", projector);
+  }
+  key.AddInventoryPhase(inventory, Phase::kPromptEncoder);
+  return key.Hex();
+}
+
+}  // namespace
+#endif
+
 bool GenerateTextVideo(const GenerationRequest& request,
                        const CancellationToken* cancellation,
                        GenerationProgress progress, void* progress_opaque,
@@ -906,7 +941,38 @@ bool GenerateTextVideo(const GenerationRequest& request,
   Report(progress, progress_opaque, "prompt", 0, 1);
   begin = Clock::now();
   PromptEmbedding embedding;
-  if (isolate_prompt) {
+  // Prompt cache (GUFO_H3_CACHE_DIR): the layer-50 rows depend only on the
+  // token ids, the image blocks' grids and pixels, the encoder and vision
+  // weights, the encoding path and the GPU backend. A hit replays the
+  // bytes an earlier miss produced and skips the 62 GiB encoder pass.
+  const std::optional<StageCacheOptions> stage_cache =
+      StageCacheFromEnvironment();
+  std::string prompt_cache_key;
+  if (stage_cache.has_value()) {
+    prompt_cache_key = PromptCacheKey(
+        *inventory, tokens, vision_blocks,
+        use_vision ? std::span<const KeyframeImage>(vision_images)
+                   : std::span<const KeyframeImage>(),
+        use_vision ? request.vision_projector : std::filesystem::path(),
+        isolate_prompt);
+    std::string cache_error;
+    auto cached = LoadStageArrays(*stage_cache, "prompt", prompt_cache_key,
+                                  &cache_error);
+    if (!cache_error.empty()) {
+      TraceStage(cache_error.c_str());
+    }
+    if (cached.has_value() && cached->size() == 1 &&
+        cached->front().size() == tokens.size() * kH3TextConditionWidth) {
+      embedding.tokens = tokens.size();
+      embedding.width = kH3TextConditionWidth;
+      embedding.values = std::move(cached->front());
+      local.prompt_cache_hit = true;
+      TraceStage("prompt cache hit");
+    }
+  }
+  if (local.prompt_cache_hit) {
+    // Replayed from the stage cache above.
+  } else if (isolate_prompt) {
     const PromptIsolationInput isolated{
         .model_root = request.model_root,
         .manifest = request.source_manifest,
@@ -926,6 +992,17 @@ bool GenerateTextVideo(const GenerationRequest& request,
     if (!EncodePromptLayer50(*inventory, tokens, prompt_options, cancellation,
                              &embedding, &local.prompt_encoder, error)) {
       return false;
+    }
+  }
+  if (stage_cache.has_value() && !local.prompt_cache_hit &&
+      embedding.tokens == tokens.size() &&
+      embedding.width == kH3TextConditionWidth &&
+      AllFiniteBf16(embedding.values)) {
+    std::string cache_error;
+    const std::vector<std::vector<std::uint16_t>> arrays = {embedding.values};
+    if (!StoreStageArrays(*stage_cache, "prompt", prompt_cache_key, arrays,
+                          &cache_error)) {
+      TraceStage(cache_error.c_str());
     }
   }
   vision_blocks.clear();
@@ -1265,6 +1342,8 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << telemetry.inventory.payload_bytes_read << ",\n"
          << "  \"tokenizer_ms\": " << telemetry.tokenizer_ms << ",\n"
          << "  \"prompt_ms\": " << telemetry.prompt_ms << ",\n"
+         << "  \"prompt_cache_hit\": "
+         << (telemetry.prompt_cache_hit ? "true" : "false") << ",\n"
          << "  \"keyframes\": " << telemetry.keyframes << ",\n"
          << "  \"keyframe_ms\": " << telemetry.keyframe_ms << ",\n"
          << "  \"audio_guides\": " << telemetry.audio_guides << ",\n"
@@ -1317,6 +1396,8 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << telemetry.denoiser.text_refiner_ms << ",\n"
          << "  \"denoiser_adaln_precompute_ms\": "
          << telemetry.denoiser.adaln_precompute_ms << ",\n"
+         << "  \"denoiser_adaln_cache_hit\": "
+         << (telemetry.denoiser.adaln_cache_hit ? "true" : "false") << ",\n"
          << "  \"denoiser_core_load_ms\": " << telemetry.denoiser.core_load_ms
          << ",\n"
          << "  \"denoiser_sampler_ms\": " << telemetry.denoiser.sampler_ms
