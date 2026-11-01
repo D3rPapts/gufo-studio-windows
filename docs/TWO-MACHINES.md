@@ -57,7 +57,7 @@ renders the next image, the 64 GB box already checks the previous one, so neithe
 ```mermaid
 sequenceDiagram
   autonumber
-  participant P as FilmStudio pipeline
+  participant P as Take One film pipeline
   participant B as Router · 128 GB box
   participant A as Router · 64 GB box
   P->>B: POST /prompt × N (keyframes of a scene)
