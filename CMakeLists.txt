@@ -447,6 +447,7 @@ add_library(gufo_http STATIC
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
   src/cli/serve/router/jobs.cpp
+  src/cli/serve/router/names.cpp
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
@@ -739,6 +740,9 @@ if (BUILD_TESTING)
   endif()
 
   # Portable (Winsock or POSIX through net.hpp, threads only).
+  add_executable(router_names_test tests/cli/router_names_test.cpp)
+  target_link_libraries(router_names_test PRIVATE gufo_http)
+  add_test(NAME router_names_test COMMAND router_names_test)
   add_executable(router_proxy_remote_test tests/cli/router_proxy_remote_test.cpp)
   target_link_libraries(router_proxy_remote_test PRIVATE gufo_http)
   add_test(NAME router_proxy_remote_test COMMAND router_proxy_remote_test)

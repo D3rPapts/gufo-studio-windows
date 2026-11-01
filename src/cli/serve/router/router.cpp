@@ -28,6 +28,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/jobs.hpp"
+#include "src/cli/serve/router/names.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
@@ -791,6 +792,8 @@ public:
   std::unique_ptr<router::comfy::Adapter> comfy;
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
   std::unique_ptr<router::jobs::JobQueue> jobs;
+  /// Random person names from a word list (--names-file); null when disabled.
+  std::unique_ptr<router::names::NameService> names;
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
   /// Reachability and model states of the remote routers; null without
@@ -852,6 +855,10 @@ public:
       return RouterStatus();
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
+        return std::move(*answer);
+    }
+    if (names != nullptr) {
+      if (auto answer = names->Handle(req))
         return std::move(*answer);
     }
     if (comfy != nullptr) {
@@ -2420,6 +2427,7 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path comfy_dir;
   std::filesystem::path comfy_ffmpeg;
   std::filesystem::path jobs_dir;
+  std::filesystem::path names_file;
   std::size_t jobs_parallel = 1;
   std::string jobs_webhook_allow;
   std::string remote_allow;
@@ -2476,6 +2484,11 @@ int RunRouter(std::span<const char* const> args) {
                    "audio and chat requests run in the background; DIR holds "
                    "jobs.json and the results",
                    "Jobs", &jobs_dir);
+  parser.AddOption("", "--names-file", "FILE",
+                   "Serve GET /v1/names (random person names by origin and "
+                   "gender) and /v1/names/origins from FILE: UTF-8 lines "
+                   "kind<TAB>name<TAB>origin<TAB>gender (kind nach|vor)",
+                   "Router", &names_file);
   parser.AddOption("", "--jobs-parallel", "N",
                    "Jobs running at the same time (default: 1)", "Jobs",
                    &jobs_parallel);
@@ -2775,6 +2788,18 @@ int RunRouter(std::span<const char* const> args) {
           std::make_unique<router::jobs::JobQueue>(std::move(jobs_options));
     } catch (const std::exception& error) {
       std::cerr << "Error: --jobs-dir: " << error.what() << '\n';
+      return 2;
+    }
+  }
+
+  if (!names_file.empty()) {
+    try {
+      state->names = std::make_unique<router::names::NameService>(names_file);
+      Logger::Info("router", "event=names_api file=" + names_file.string() +
+                                 " names=" + std::to_string(state->names->Size()) +
+                                 " origins=" + std::to_string(state->names->Origins().size()));
+    } catch (const std::exception& error) {
+      std::cerr << "Error: --names-file: " << error.what() << '\n';
       return 2;
     }
   }
