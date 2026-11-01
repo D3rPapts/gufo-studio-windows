@@ -77,7 +77,10 @@ __device__ const std::uint16_t* BlockRows(const HeadSegments& h, int row) {
 // Online softmax with BF16 QK matrix instructions and an FP32 value product.
 // No probability narrowing and no global score/probability allocation.
 // Each block owns 128 queries by all 128 output channels, consuming 32 keys at
-// a time. Split value staging into two halves to bound LDS usage.
+// a time. Each wave owns 16 queries; their Q fragments stay in registers for
+// the whole key sequence. A tile's 32 value rows are staged at once, so a tile
+// needs three barriers. Arithmetic and its order equal the former version
+// (tests/models/qwen_image_21/attention_reference.hip): bit-identical output.
 // Segmented reads keys and values from `segments` (cached condition rows
 // and the new rows) instead of one contiguous head-major copy.
 template<bool Masked, bool Segmented>
@@ -87,7 +90,7 @@ FusedAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
                    int heads, int rows, int count, int query_start,
                    int query_count, const int* limits,
                    const KeySegments& segments) {
-  __shared__ float p[32][129], v[16][129], stats[128][3];
+  __shared__ float p[32][129], v[32][129], stats[128][3];
   __shared__ int last_key;
   const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
   const int col = blockIdx.x * 128, head = blockIdx.y;
@@ -106,6 +109,30 @@ FusedAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
     return first + i / 128 < count
                ? SegmentRow<true>(segs, first + i / 128)[i % 128]
                : 0;
+  };
+  // Value rows [first, first + 32) into registers, element tid + z * 256.
+  const auto fetch = [&](int first, unsigned short (&out)[16]) {
+    if constexpr (Segmented) {
+      if (const auto* rows = BlockRows<true>(segs, first)) {
+#pragma unroll
+        for (int z = 0; z < 16; ++z) {
+          const int i = tid + z * 256;
+          out[z] = first + i / 128 < count ? rows[i] : 0;
+        }
+      } else {
+#pragma unroll
+        for (int z = 0; z < 16; ++z)
+          out[z] = stage(first, z);
+      }
+    } else {
+#pragma unroll
+      for (int z = 0; z < 16; ++z) {
+        const int i = tid + z * 256;
+        out[z] = first + i / 128 < count
+                     ? values[std::size_t(first + i / 128) * 128 + i % 128]
+                     : 0;
+      }
+    }
   };
   if (tid < 128) {
     stats[tid][0] = -INFINITY;
@@ -127,72 +154,61 @@ FusedAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
         last_key = visible;
     }
   }
+  // This wave's 16 query rows, loaded once.
+  const int qr = query_start + col + wave * 16 + lane % 16;
+  Fragment query[8];
+#pragma unroll
+  for (int d = 0; d < 8; ++d) {
+    query[d] = Fragment{};
+    if (qr < query_end)
+      query[d] = Load(queries + static_cast<std::size_t>(qr) * 128 + d * 16);
+  }
   __syncthreads();
   float accum[8][8]{};
   const int visible = Masked ? last_key : count;
   // Keep the next tile in registers while QK, softmax and FP32 PV execute.
   unsigned short prefetch_v[16];
-  if constexpr (Segmented) {
-    if (const auto* rows = BlockRows<true>(segs, 0)) {
-#pragma unroll
-      for (int z = 0; z < 16; ++z) {
-        const int i = tid + z * 256;
-        prefetch_v[z] = i / 128 < count ? rows[i] : 0;
-      }
-    } else {
-#pragma unroll
-      for (int z = 0; z < 16; ++z)
-        prefetch_v[z] = stage(0, z);
-    }
-  } else {
-#pragma unroll
-    for (int z = 0; z < 16; ++z) {
-      const int i = tid + z * 256;
-      prefetch_v[z] =
-          i / 128 < count
-              ? values[static_cast<std::size_t>(i / 128) * 128 + i % 128]
-              : 0;
-    }
-  }
+  fetch(0, prefetch_v);
   for (int base = 0; base < visible; base += 32) {
-    for (int qoff = 0; qoff < 128; qoff += 64) {
-      Accumulator dot{};
-      const int qr = query_start + col + qoff + (wave / 2) * 16 + lane % 16;
-      const int kr = base + (wave % 2) * 16 + lane % 16;
-      [[maybe_unused]] const std::uint16_t* key_row = nullptr;
-      if constexpr (Segmented) {
-        const auto* block = BlockRows<false>(segs, base);
-        key_row = block ? block + static_cast<std::size_t>(kr - base) * 128
-                        : SegmentRow<false>(segs, kr);
-      }
-// Keep two fragment pairs live; full unrolling raises register pressure.
-#pragma unroll 2
-      for (int d = 0; d < 128; d += 16) {
-        Fragment q{};
-        if (qr < query_end)
-          q = Load(queries + static_cast<std::size_t>(qr) * 128 + d);
+    Accumulator dot[2]{};
+    [[maybe_unused]] const std::uint16_t* key_row[2]{};
+    const int kr[2] = {base + lane % 16, base + 16 + lane % 16};
+    if constexpr (Segmented) {
+      const auto* block = BlockRows<false>(segs, base);
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+        key_row[t] = block ? block + static_cast<std::size_t>(kr[t] - base) * 128
+                           : SegmentRow<false>(segs, kr[t]);
+    }
+#pragma unroll
+    for (int d = 0; d < 8; ++d)
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
         Fragment k{};
-        if (kr < count) {
+        if (kr[t] < count) {
           if constexpr (Segmented)
-            k = Load(key_row + d);
+            k = Load(key_row[t] + d * 16);
           else
-            k = Load(keys + static_cast<std::size_t>(kr) * 128 + d);
+            k = Load(keys + static_cast<std::size_t>(kr[t]) * 128 + d * 16);
         }
-        dot = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q, k, dot);
+        dot[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(query[d], k,
+                                                             dot[t]);
       }
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        const int q = qoff + (wave / 2) * 16 + 2 * i + lane / 16;
-        const int k = (wave % 2) * 16 + lane % 16;
+        const int q = wave * 16 + 2 * i + lane / 16;
+        const int k = t * 16 + lane % 16;
         int limit = count;
         if constexpr (Masked) {
           const int position = query_start + col + q;
           if (position < query_end)
             limit = limits[position];
         }
-        p[k][q] = base + k < limit ? dot[i] * 0.08838834764831845F : -INFINITY;
+        p[k][q] =
+            base + k < limit ? dot[t][i] * 0.08838834764831845F : -INFINITY;
       }
-    }
     __syncthreads();
     for (int qoff = 0; qoff < 128; qoff += 64) {
       const int q = qoff + tid / 4, l = tid % 4;
@@ -220,61 +236,28 @@ FusedAttentionBody(const std::uint16_t* queries, const std::uint16_t* keys,
         stats[q][2] = correction;
       }
     }
-    unsigned short current_v[16];
+    // The previous tile's value reads ended at its last barrier.
 #pragma unroll
-    for (int z = 0; z < 16; z++)
-      current_v[z] = prefetch_v[z];
-    if constexpr (Segmented) {
-      if (const auto* rows = BlockRows<true>(segs, base + 32)) {
-#pragma unroll
-        for (int z = 0; z < 16; ++z) {
-          const int i = tid + z * 256;
-          prefetch_v[z] = base + 32 + i / 128 < count ? rows[i] : 0;
-        }
-      } else {
-#pragma unroll
-        for (int z = 0; z < 16; ++z)
-          prefetch_v[z] = stage(base + 32, z);
-      }
-    } else {
-#pragma unroll
-      for (int z = 0; z < 16; ++z) {
-        const int i = tid + z * 256;
-        prefetch_v[z] =
-            base + 32 + i / 128 < count
-                ? values[std::size_t(base + 32 + i / 128) * 128 + i % 128]
-                : 0;
-      }
+    for (int z = 0; z < 16; z++) {
+      const int i = tid + z * 256;
+      v[i / 128][i % 128] = __uint_as_float(unsigned(prefetch_v[z]) << 16);
     }
+    fetch(base + 32, prefetch_v);
     __syncthreads();
 #pragma unroll
     for (int y = 0; y < 8; y++)
 #pragma unroll
       for (int x = 0; x < 8; x++)
         accum[y][x] *= stats[tid / 16 + y * 16][2];
-    // Unroll so that each current_v index is a constant. With a runtime
-    // index, clang 23 selects each value with a chain of compares.
-#pragma unroll
-    for (int half = 0; half < 2; half++) {
-#pragma unroll
-      for (int z = 0; z < 8; z++) {
-        const int i = tid + z * 256;
-        v[i / 128][i % 128] =
-            __uint_as_float(unsigned(current_v[half * 8 + z]) << 16);
-      }
-      __syncthreads();
 #pragma unroll 2
-      for (int k = 0; k < 16; k++)
+    for (int k = 0; k < 32; k++)
 #pragma unroll
-        for (int y = 0; y < 8; y++) {
-          float probability = p[half * 16 + k][tid / 16 + y * 16];
+      for (int y = 0; y < 8; y++) {
+        float probability = p[k][tid / 16 + y * 16];
 #pragma unroll
-          for (int x = 0; x < 8; x++)
-            accum[y][x] =
-                fmaf(v[k][tid % 16 + x * 16], probability, accum[y][x]);
-        }
-      __syncthreads();
-    }
+        for (int x = 0; x < 8; x++)
+          accum[y][x] = fmaf(v[k][tid % 16 + x * 16], probability, accum[y][x]);
+      }
     __syncthreads();
   }
 #pragma unroll

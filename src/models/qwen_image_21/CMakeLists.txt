@@ -56,6 +56,21 @@ function(gufo_qwen_image_21_register_tests)
     add_test(NAME qwen_image_21_kernel_test COMMAND qwen_image_21_kernel_test)
     set_tests_properties(qwen_image_21_kernel_test PROPERTIES
       LABELS "gpu;qwen-image" SKIP_RETURN_CODE 77)
+    # Production attention kernels against the frozen former kernel; the
+    # reference keeps the library's arithmetic flags.
+    add_executable(qwen_image_21_attention_test
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/attention_test.hip
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/attention_reference.hip)
+    target_link_libraries(qwen_image_21_attention_test PRIVATE gufo_qwen_image_21)
+    target_compile_options(qwen_image_21_attention_test PRIVATE
+      $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
+    set_source_files_properties(
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/attention_reference.hip
+      PROPERTIES COMPILE_OPTIONS
+      "-gline-tables-only;-Xarch_device;-mllvm=-amdgpu-sched-strategy=iterative-ilp")
+    add_test(NAME qwen_image_21_attention_test COMMAND qwen_image_21_attention_test)
+    set_tests_properties(qwen_image_21_attention_test PROPERTIES
+      LABELS "gpu;qwen-image" SKIP_RETURN_CODE 77)
     add_executable(qwen_image_21_probe
       ${PROJECT_SOURCE_DIR}/tools/models/qwen_image_21/probe.cpp)
     target_link_libraries(qwen_image_21_probe PRIVATE gufo_qwen_image_21)
