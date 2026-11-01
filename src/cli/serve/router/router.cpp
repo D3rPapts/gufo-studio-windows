@@ -85,7 +85,13 @@ constexpr std::string_view kPresetGrammar =
     "      queue-timeout-seconds = 900  longest wait, then 503 remote_busy\n"
     "      busy-check-url = http://<IPv4>:<port>/queue  optional ComfyUI\n"
     "                                   queue; wait while it runs anything\n"
-    "      max-request-bytes = N        413 above N bytes\n\n";
+    "      max-request-bytes = N        413 above N bytes\n"
+    "    A local section and a [remote/<model-id>] of the same id make the\n"
+    "    model switchable: POST /router/placement {\"model\": id,\n"
+    "    \"placement\": \"local\"|\"remote\"} (or {\"all\": ...}) moves it at\n"
+    "    runtime; running requests finish where they started. In the remote\n"
+    "    section, modality may be left out and\n"
+    "      placement = local            start placement (local|remote)\n\n";
 
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
@@ -256,7 +262,17 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
       model["object"] = "model";
       model["owned_by"] = "gufo";
       model["modality"] = preset->modality;
-      if (preset->remote.has_value()) {
+      if (preset->switchable) {
+        // Moved at runtime with POST /router/placement; the `remote` block
+        // below appears only while requests go there, so another router's
+        // probe sees "relayed here" exactly then (loop guard).
+        model["switchable"] = true;
+        model["placement"] =
+            router::PlacementName(registry.PlacementOf(preset->id));
+        model["remote_url"] =
+            "http://" + router::EndpointKey(preset->remote->url);
+      }
+      if (registry.RoutesRemote(preset->id)) {
         const router::RemoteEndpoint& url = preset->remote->url;
         std::string error;
         json::Value remote = json::Value::object();
@@ -525,14 +541,20 @@ Resolution ResolveModel(const HttpRequest& req) {
 /// request thread with the lock free.
 class HeldBusy : public std::enable_shared_from_this<HeldBusy> {
 public:
-  HeldBusy(std::mutex& mutex, router::Registry& registry, std::string model_id)
-      : mutex_(mutex), registry_(registry), model_id_(std::move(model_id)) {}
+  /// `remote`: a relay to the remote router, counted apart from local work
+  /// so it never keeps the local worker of a switchable model loaded.
+  HeldBusy(std::mutex& mutex, router::Registry& registry, std::string model_id,
+           bool remote = false)
+      : mutex_(mutex),
+        registry_(registry),
+        model_id_(std::move(model_id)),
+        remote_(remote) {}
   HeldBusy(const HeldBusy&) = delete;
   HeldBusy& operator=(const HeldBusy&) = delete;
   ~HeldBusy() { Release(); }
 
   std::shared_ptr<HeldBusy> Arm() {
-    registry_.RequestStarted(model_id_);
+    registry_.RequestStarted(model_id_, remote_);
     armed_ = true;
     return shared_from_this();
   }
@@ -543,13 +565,14 @@ public:
     }
     std::lock_guard<std::mutex> lock(mutex_);
     armed_ = false;
-    registry_.RequestFinished(model_id_);
+    registry_.RequestFinished(model_id_, remote_);
   }
 
 private:
   std::mutex& mutex_;
   router::Registry& registry_;
   std::string model_id_;
+  bool remote_{false};
   bool armed_{false};
 };
 
@@ -681,12 +704,13 @@ public:
   enum class Kind { kTrack, kStatus, kDelete, kContent };
 
   JobBodySniffer(std::mutex& mutex, router::Registry& registry, Kind kind,
-                 std::string model_id, std::string job_id)
+                 std::string model_id, std::string job_id, bool remote)
       : mutex_(mutex),
         registry_(registry),
         kind_(kind),
         model_id_(std::move(model_id)),
-        job_id_(std::move(job_id)) {}
+        job_id_(std::move(job_id)),
+        remote_(remote) {}
   JobBodySniffer(const JobBodySniffer&) = delete;
   JobBodySniffer& operator=(const JobBodySniffer&) = delete;
 
@@ -723,7 +747,7 @@ public:
     if (kind_ == Kind::kTrack) {
       const auto* id = parsed.find("id");
       if (id != nullptr && id->is_string() && !id->str().empty()) {
-        registry_.TrackVideoJob(id->str(), model_id_);
+        registry_.TrackVideoJob(id->str(), model_id_, remote_);
         tracked_ = id->str();
       }
       return;
@@ -762,6 +786,7 @@ private:
   std::string job_id_;
   std::string buffer_;
   std::string tracked_;
+  bool remote_{false};
   bool discarded_{false};
 };
 
@@ -855,6 +880,8 @@ public:
     if (req.method == "GET" && (req.path == "/router/status" ||
                                 req.path.starts_with("/router/status?")))
       return RouterStatus();
+    if (req.path == "/router/placement")
+      return PlacementControl(req);
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);
@@ -949,7 +976,7 @@ public:
     if (preset == nullptr) {
       return ModelNotFoundError();
     }
-    if (preset->remote.has_value()) {
+    if (RoutesRemoteLocked(*preset, req, music_job)) {
       // Another router owns the model: no admission, load or memory here.
       return DispatchRemoteLocked(req, model_id, *preset->remote, lock);
     }
@@ -1085,6 +1112,152 @@ public:
     return router::RemoteLoop(model_id, forwarded_by);
   }
 
+  /// Whether this request for `preset` goes to the remote router (state
+  /// mutex held). A job read (video status, content or DELETE; async music)
+  /// follows its job to where it was created, so switching a model never
+  /// strands a running job; everything else follows the current placement.
+  bool RoutesRemoteLocked(const router::PresetModel& preset,
+                          const HttpRequest& req,
+                          const std::string& music_job) {
+    if (!preset.remote.has_value()) {
+      return false;
+    }
+    std::string job = music_job;
+    if (job.empty() && server::IsVideoApiPath(req.path) &&
+        (req.method == "GET" || req.method == "DELETE")) {
+      job = VideoJobId(req.path);
+    }
+    if (!job.empty() && registry.JobOwner(job) == preset.id) {
+      return registry.JobRemote(job);
+    }
+    return registry.RoutesRemote(preset.id);
+  }
+
+  /// GET|POST /router/placement. POST {"model": id, "placement":
+  /// "local"|"remote"} or {"all": "local"|"remote"} moves switchable models
+  /// (a local section with a `[remote/<id>]` twin) between the local worker
+  /// and the remote router without a restart. New requests follow at once;
+  /// requests, sockets and jobs already running finish where they started
+  /// (never cut off), and a local worker left without local work is
+  /// unloaded by the supervision tick. Answers the placements of all
+  /// switchable models and the ids that changed. Protected like
+  /// /models/load: the router's --api-key, when set. Not persisted: a
+  /// restart starts from the preset's `placement` again.
+  HttpResponse PlacementControl(const HttpRequest& req) {
+    if (req.method != "GET" && req.method != "POST") {
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "invalid_request_error", "method_not_allowed");
+    }
+    std::vector<std::string> changed;
+    std::unique_lock<std::mutex> lock(mutex);
+    if (req.method == "POST") {
+      json::Value body;
+      try {
+        body = json::parse(req.body);
+      } catch (const std::exception&) {
+        return Err(400, "Bad Request", "request body must be JSON",
+                   "invalid_request_error", "invalid_json");
+      }
+      const std::string model = body.member_str("model");
+      const std::string all = body.member_str("all");
+      const std::string target =
+          model.empty() ? all : body.member_str("placement");
+      if (!body.is_object() || model.empty() == all.empty()) {
+        return Err(400, "Bad Request",
+                   "send {\"model\": id, \"placement\": \"local\"|\"remote\"} "
+                   "or {\"all\": \"local\"|\"remote\"}",
+                   "invalid_request_error", "invalid_placement");
+      }
+      if (target != "local" && target != "remote") {
+        return Err(400, "Bad Request",
+                   "placement takes \"local\" or \"remote\", not \"" + target +
+                       "\"",
+                   "invalid_request_error", "invalid_placement");
+      }
+      const router::Placement placement = target == "remote"
+                                              ? router::Placement::kRemote
+                                              : router::Placement::kLocal;
+      std::vector<std::string> ids;
+      if (!model.empty()) {
+        const router::PresetModel* preset = registry.Find(model);
+        if (preset == nullptr) {
+          return ModelNotFoundError();
+        }
+        if (!preset->switchable) {
+          return Err(409, "Conflict",
+                     "model '" + model +
+                         "' is not switchable: it needs a local section and "
+                         "a [remote/" +
+                         model + "] section in the preset",
+                     "invalid_request_error", "not_switchable");
+        }
+        ids.push_back(model);
+      } else {
+        for (const auto& [preset, status] : registry.Statuses()) {
+          (void)status;
+          if (preset->switchable)
+            ids.push_back(preset->id);
+        }
+        if (ids.empty()) {
+          return Err(409, "Conflict",
+                     "no switchable models: give a local section a "
+                     "[remote/<id>] twin in the preset",
+                     "invalid_request_error", "not_switchable");
+        }
+      }
+      for (const std::string& id : ids) {
+        const router::Placement before = registry.PlacementOf(id);
+        if (before == placement || !registry.SetPlacement(id, placement)) {
+          continue;
+        }
+        changed.push_back(id);
+        Logger::Info("router", "event=placement model=" + id + " from=" +
+                                   router::PlacementName(before) + " to=" +
+                                   router::PlacementName(placement));
+        if (residency != nullptr) {
+          residency->Event(
+              id + " placed " +
+              (placement == router::Placement::kRemote
+                   ? "on the remote router (the local worker unloads when "
+                     "its work is done)"
+                   : "here again"));
+        }
+      }
+    }
+    json::Value models = json::Value::object();
+    for (const auto& [preset, status] : registry.Statuses()) {
+      if (!preset->switchable)
+        continue;
+      json::Value entry = json::Value::object();
+      entry["placement"] =
+          router::PlacementName(registry.PlacementOf(preset->id));
+      entry["local_status"] =
+          stopping.count(preset->id) > 0 ? "unloading" : std::string(status);
+      entry["local_busy"] = registry.Busy(preset->id);
+      entry["remote_busy"] = registry.RemoteBusy(preset->id);
+      entry["remote_url"] =
+          "http://" + router::EndpointKey(preset->remote->url);
+      std::string error;
+      const bool reachable =
+          remotes == nullptr || remotes->Reachable(preset->remote->url, &error);
+      entry["remote_reachable"] = reachable;
+      if (!reachable)
+        entry["remote_error"] = error;
+      models[preset->id] = std::move(entry);
+    }
+    json::Value moved = json::Value::array();
+    for (const std::string& id : changed)
+      moved.push_back(id);
+    json::Value answer = json::Value::object();
+    answer["models"] = std::move(models);
+    answer["changed"] = std::move(moved);
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = answer.dump(),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-cache"}}};
+  }
+
   HttpResponse DispatchRemoteLocked(const HttpRequest& req,
                                     const std::string& model_id,
                                     const router::RemoteSpec& spec,
@@ -1113,7 +1286,8 @@ public:
                  "upstream_unavailable");
     }
     auto hold = std::make_shared<RemoteHold>(
-        std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
+        std::make_shared<HeldBusy>(mutex, registry, model_id, /*remote=*/true)
+            ->Arm(),
         remote_inflight);
     lock.unlock();
     if (StartsRemoteGpuWork(req)) {
@@ -1130,7 +1304,7 @@ public:
     std::shared_ptr<JobBodySniffer> sniffer;
     if (response.status >= 200 && response.status < 300 &&
         response.streaming_body) {
-      sniffer = MakeJobSniffer(req, model_id);
+      sniffer = MakeJobSniffer(req, model_id, /*remote=*/true);
     }
     if (!response.streaming_body) {
       hold->Release();
@@ -1346,16 +1520,19 @@ public:
   HttpResponse PreviewLocked(const HttpRequest& req,
                              std::unique_lock<std::mutex>& lock) {
     std::string model_id = req.query_param("model");
-    if (model_id.empty()) {
-      std::string_view id(req.path);
-      id.remove_prefix(std::string_view("/v1/previews/").size());
-      if (id.ends_with("/events"))
-        id.remove_suffix(std::string_view("/events").size());
+    std::string_view id(req.path);
+    id.remove_prefix(std::string_view("/v1/previews/").size());
+    if (id.ends_with("/events"))
+      id.remove_suffix(std::string_view("/events").size());
+    if (model_id.empty())
       model_id = registry.JobOwner(id);
-    }
+    // A recorded job's preview goes where the job runs; anything else
+    // follows the model's current placement.
+    const bool own_job = !model_id.empty() && registry.JobOwner(id) == model_id;
     if (const router::PresetModel* preset =
             model_id.empty() ? nullptr : registry.Find(model_id);
-        preset != nullptr && preset->remote.has_value()) {
+        preset != nullptr && preset->remote.has_value() &&
+        (own_job ? registry.JobRemote(id) : registry.RoutesRemote(model_id))) {
       // The remote router finds the job itself: path and query go unchanged
       // and the SSE stream relays as it arrives.
       if (auto loop = RefuseRelayedAgain(req, model_id)) {
@@ -1432,7 +1609,7 @@ public:
                     : LlamaErr(404, "Not Found", "model is not found",
                                "not_found_error");
     }
-    if (preset->remote.has_value()) {
+    if (registry.RoutesRemote(model_id)) {
       if (auto loop = RefuseRelayedAgain(req, model_id)) {
         return std::move(*loop);
       }
@@ -1455,7 +1632,9 @@ public:
                                  spec.url.host + ":" +
                                  std::to_string(spec.url.port));
       auto hold = std::make_shared<RemoteHold>(
-          std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm(),
+          std::make_shared<HeldBusy>(mutex, registry, model_id,
+                                     /*remote=*/true)
+              ->Arm(),
           remote_inflight);
       lock.unlock();
       if (!unload) {
@@ -1558,7 +1737,8 @@ public:
           break;
         }
         const router::PresetModel* preset = registry.Find(id);
-        if (preset == nullptr)
+        // A switchable model placed on the remote router loads there.
+        if (preset == nullptr || registry.RoutesRemote(id))
           break;
         Logger::Info("router", "event=autoload_start model=" + id +
                                    " attempt=" + std::to_string(attempt + 1));
@@ -1712,6 +1892,33 @@ public:
     }
   }
 
+  /// A switchable model placed on the remote router keeps its local worker
+  /// only while local work (requests, sockets, jobs) is open. Once nothing
+  /// local ran for kPlacementGrace (a request that just got the loaded
+  /// worker has armed its busy count by then) the worker is unloaded. A
+  /// loading worker finishes its load first. State mutex held; each stop
+  /// releases it.
+  static constexpr auto kPlacementGrace = std::chrono::seconds(2);
+  void UnloadPlacedRemoteLocked() {
+    std::vector<std::string> due;
+    const auto now = registry.NowForStatus();
+    for (const auto& entry : registry.Residents()) {
+      if (!entry.loading && !entry.busy && registry.RoutesRemote(entry.id) &&
+          now - entry.last_active >= kPlacementGrace)
+        due.push_back(entry.id);
+    }
+    for (const std::string& id : due) {
+      // An earlier stop released the lock: re-check everything.
+      if (registry.Busy(id) || !registry.RoutesRemote(id) ||
+          !LoadedLocked(id) || FindWorkerLocked(id) == nullptr)
+        continue;
+      Logger::Info("router", "event=placement_unload model=" + id);
+      if (residency != nullptr)
+        residency->Event("unloaded " + id + " (placed on the remote router)");
+      StopLocked(id);
+    }
+  }
+
   /// An open video or async music job keeps its model busy until a client
   /// reads its terminal status, its result or deletes it. A job nobody comes
   /// back for (page closed while it ran) would keep the model resident and
@@ -1862,6 +2069,7 @@ public:
         StopLocked(candidate);
       }
     }
+    UnloadPlacedRemoteLocked();
     SuperviseMemoryLocked(lock);
     for (const auto& id : registry.DueLoadTimeouts()) {
       Logger::Warn("router", "event=load_timeout_expired model=" + id);
@@ -1901,13 +2109,20 @@ public:
       {
         const std::lock_guard<std::mutex> lock(mutex);
         for (const auto& [preset, status] : registry.Statuses()) {
-          (void)status;
           if (!preset->remote.has_value())
             continue;
           json::Value model = json::Value::object();
           model["url"] = "http://" + router::EndpointKey(preset->remote->url);
-          model["busy"] = registry.Busy(preset->id);
+          // Relays and jobs through the remote router that are still open.
+          model["busy"] = registry.RemoteBusy(preset->id);
           model["gpu_slot"] = preset->remote->gpu_slot;
+          model["placement"] =
+              router::PlacementName(registry.PlacementOf(preset->id));
+          if (preset->switchable) {
+            model["switchable"] = true;
+            model["local_status"] = std::string(status);
+            model["local_busy"] = registry.Busy(preset->id);
+          }
           models[preset->id] = std::move(model);
         }
       }
@@ -2171,12 +2386,14 @@ private:
   /// owning model; a terminal status read, a video DELETE or a music result
   /// download releases it. Returns nullptr for every other request.
   std::shared_ptr<JobBodySniffer> MakeJobSniffer(const HttpRequest& req,
-                                                 const std::string& model_id) {
+                                                 const std::string& model_id,
+                                                 bool remote = false) {
     if (IsVideoCreate(req) || IsMusicCreate(req)) {
       // A synchronous music answer is a WAV body: it never parses and
       // records nothing.
       return std::make_shared<JobBodySniffer>(
-          mutex, registry, JobBodySniffer::Kind::kTrack, model_id, "");
+          mutex, registry, JobBodySniffer::Kind::kTrack, model_id, "",
+          remote);
     }
     if (req.method == "GET") {
       if (const std::string music_id = MusicJobId(req.path);
@@ -2185,7 +2402,7 @@ private:
             mutex, registry,
             req.path.ends_with("/content") ? JobBodySniffer::Kind::kContent
                                            : JobBodySniffer::Kind::kStatus,
-            model_id, music_id);
+            model_id, music_id, remote);
       }
     }
     if (req.method != "GET" && req.method != "DELETE") {
@@ -2199,7 +2416,7 @@ private:
         mutex, registry,
         req.method == "DELETE" ? JobBodySniffer::Kind::kDelete
                                : JobBodySniffer::Kind::kStatus,
-        model_id, job_id);
+        model_id, job_id, remote);
   }
 
   /// Arms a fresh spawn with a freshly reserved port. Returns the fatal 502
@@ -2712,7 +2929,7 @@ int RunRouter(std::span<const char* const> args) {
     // learned peaks, no memory.json entries.
     std::vector<router::PresetModel> local_models;
     for (const auto& model : models) {
-      if (!model.remote.has_value())
+      if (!model.remote.has_value() || model.switchable)
         local_models.push_back(model);
     }
     state->residency = std::make_unique<router::Residency>(
@@ -2857,7 +3074,8 @@ int RunRouter(std::span<const char* const> args) {
   if (autoload) {
     std::vector<std::string> ids;
     for (const auto& model : models) {
-      if (!model.remote.has_value())
+      if (!model.remote.has_value() ||
+          (model.switchable && model.placement == router::Placement::kLocal))
         ids.push_back(model.id);
     }
     autoloader = std::thread(

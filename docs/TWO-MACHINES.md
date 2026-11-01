@@ -89,6 +89,11 @@ package; each model keeps its own licence.
 - **Load sharing:** `[remote/<id>]` sections plus `--remote-allow` (IPv4 / CIDR); a shared `gpu-slot` runs one
   GPU-starting request at a time; a loop-guard header answers `508` when two routers name each other; models stay
   on one machine as long as possible.
+- **Moving work at runtime:** a model with a local section and a `[remote/<id>]` twin can switch between the two
+  boxes without a restart: `POST /router/placement {"model": "<id>", "placement": "remote"}` (or `{"all": "remote"}`
+  to hand everything to the other box for an hour, and `{"all": "local"}` to take it back). Running requests finish
+  where they started; the local worker unloads once it has nothing left to do
+  (see [SERVER.md](SERVER.md#switching-a-model-between-local-and-remote)).
 - **Text:** Qwen3.8-27B with DFlash2 speculative decoding; Hemmingway-1.5 (non-commercial licence);
   Qwen3.6-35B-A3B; Qwen3.8-Flash-Next with SSD expert streaming; Qwen3-Omni captioner for audio.
 - **Image:** Qwen-Image 2.1 and Turbo (text-to-image, edit, masks, LoRA; non-commercial licence); MOSS-Image;

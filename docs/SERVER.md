@@ -683,9 +683,64 @@ id must be the same on both routers.
   other router lists as remote: `/v1/models` shows them unloaded with
   `"remote": {"loop": true}` and `/router/status` lists them as `remote`.
 - `GET /router/status` adds a `remote` block: routers (reachable, error,
-  last check, model states), models (url, busy, gpu slot), relays in
-  flight, gpu slots (holder, waiting), jobs holding a slot and the last
-  busy-check answers.
+  last check, model states), models (url, busy, gpu slot, placement),
+  relays in flight, gpu slots (holder, waiting), jobs holding a slot and
+  the last busy-check answers.
+
+#### Switching a model between local and remote
+
+A local section and a `[remote/<id>]` section with the same id make the
+model *switchable*: it can run here or on the other router, and
+`POST /router/placement` moves it while the router keeps running. In the
+remote section `modality` may be left out (it must match the local one
+when given) and `placement` sets the start value:
+
+```ini
+[llm/qwen3.8-27b]
+model = models/qwen3.8-27b.gguf
+
+[remote/qwen3.8-27b]
+url = http://192.168.100.56:8081
+api-key-env = GUFO_REMOTE56_KEY
+gpu-slot = studio56
+placement = local        # local (default) | remote
+```
+
+```sh
+curl -X POST http://127.0.0.1:8081/router/placement \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.8-27b", "placement": "remote"}'
+curl -X POST http://127.0.0.1:8081/router/placement -d '{"all": "local"}'
+curl http://127.0.0.1:8081/router/placement      # current placements
+```
+
+The answer lists every switchable model (`placement`, `local_status`,
+`local_busy`, `remote_busy`, `remote_url`, `remote_reachable`) and the
+ids that `changed`. Errors: 400 `invalid_placement`, 404
+`model_not_found`, 409 `not_switchable`. The endpoint is protected like
+`/models/load`: by the router's `--api-key` when one is set.
+
+- New requests follow the placement at once. Nothing running is cut off:
+  local requests, WebSockets and jobs finish on the local worker, relays
+  finish on the remote router.
+- Moved to `remote`: once no local request, socket or job has been open
+  for 2 s, the supervision tick unloads the local worker (a worker that
+  is still loading finishes its load first). Relays to the other router
+  never count as local work.
+- Moved to `local`: the model loads on the next request as usual
+  (`--autoload` only loads switchable models that start `local`).
+- Video and async music job reads (status, content, DELETE) and job
+  previews follow the job to where it was created, whatever the
+  placement is now.
+- While a model is `remote`, everything above applies: gpu slot, busy
+  check, 503 `remote_unavailable`, 508 `remote_loop` (a relayed request
+  for a model that is `remote` here as well). `/v1/models` shows
+  `"switchable": true`, `"placement"` and `"remote_url"`; the `remote`
+  block (which other routers read as "relayed here") appears only while
+  the placement is `remote`.
+- Switchable models count for the memory guard and `memory.json` like
+  local ones. The placement is not saved: after a restart the preset's
+  `placement` applies again.
 
 ## Endpoint Set
 

@@ -244,12 +244,61 @@ void TestRemoteErrors() {
       "url = http://10.0.0.2:8081\nmodality = image\n"
       "api-key-env = GUFO_PRESET_TEST_UNSET_KEY\n",
       "GUFO_PRESET_TEST_UNSET_KEY");
-  // Remote ids share the id space with local sections.
+  // One remote section per id (a local twin is allowed, see
+  // TestSwitchableTwin).
   TestErrorMentionsSectionAndToken(
       "gufo_router_preset_remote_dup.conf",
-      "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
-      "modality = llm\n",
+      "[remote/a]\nurl = http://10.0.0.2:8081\nmodality = llm\n"
+      "[remote/a]\nurl = http://10.0.0.3:8081\nmodality = llm\n",
       "remote/a", "duplicate");
+  bad("gufo_router_preset_remote_placement_alone.conf",
+      "url = http://10.0.0.2:8081\nmodality = image\nplacement = remote\n",
+      "placement");
+}
+
+void TestSwitchableTwin() {
+  using gufo::router::Placement;
+  // Remote section before and after its local twin; modality optional.
+  const auto file = WriteFixture(
+      "gufo_router_preset_twin.conf",
+      "[remote/b]\nurl = http://10.0.0.2:8081\ngpu-slot = s56\n"
+      "placement = remote\n\n"
+      "[llm/a]\nmodel = m\n\n"
+      "[image/b]\nmodel = b.gguf\n\n"
+      "[remote/a]\nurl = http://10.0.0.2:8081\nmodality = llm\n\n"
+      "[remote/c]\nurl = http://10.0.0.3:8081\nmodality = tts\n");
+  std::vector<PresetModel> models;
+  std::string error;
+  assert(LoadPreset(file, "/models", &models, &error));
+  assert(models.size() == 3);
+  // Section order of the local sections; the remote-only one stays put.
+  assert(models[0].id == "a" && models[0].modality == "llm");
+  assert(models[1].id == "b" && models[1].modality == "image");
+  assert(models[2].id == "c" && models[2].modality == "tts");
+  assert(models[0].switchable && models[0].remote.has_value());
+  assert(models[0].placement == Placement::kLocal);  // default
+  assert(!models[0].argv.empty());
+  assert(models[1].switchable && models[1].placement == Placement::kRemote);
+  assert(models[1].remote->gpu_slot == "s56");
+  assert(models[1].remote->url.port == 8081);
+  assert(!models[2].switchable && models[2].placement == Placement::kRemote);
+  // A twin's modality must match the local section.
+  TestErrorMentionsSectionAndToken(
+      "gufo_router_preset_twin_modality.conf",
+      "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
+      "modality = image\n",
+      "remote/a", "differs");
+  TestErrorMentionsSectionAndToken(
+      "gufo_router_preset_twin_placement.conf",
+      "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
+      "placement = elsewhere\n",
+      "remote/a", "placement");
+  // Two local sections with one id stay a duplicate.
+  TestErrorMentionsSectionAndToken(
+      "gufo_router_preset_twin_dup_local.conf",
+      "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
+      "[image/a]\nmodel = m\n",
+      "image/a", "duplicate");
 }
 
 void TestParseRemoteUrl() {
@@ -294,6 +343,7 @@ int main() {
   TestIsReservedKey();
   TestRemoteSection();
   TestRemoteErrors();
+  TestSwitchableTwin();
   TestParseRemoteUrl();
   std::cout << "All router preset tests passed.\n";
   return 0;

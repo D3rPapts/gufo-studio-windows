@@ -12,6 +12,7 @@ Registry::Registry(std::vector<PresetModel> presets, RegistryOptions options,
   for (auto& preset : presets) {
     Entry entry;
     entry.preset = std::move(preset);
+    entry.placement = entry.preset.placement;
     entries_.push_back(std::move(entry));
   }
 }
@@ -218,18 +219,49 @@ void Registry::MarkUnloaded(std::string_view model_id) {
   Touch(*entry);
 }
 
-void Registry::RequestStarted(std::string_view model_id) {
+Placement Registry::PlacementOf(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry == nullptr ? Placement::kLocal : entry->placement;
+}
+
+bool Registry::RoutesRemote(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry != nullptr && entry->preset.remote.has_value() &&
+         entry->placement == Placement::kRemote;
+}
+
+bool Registry::SetPlacement(std::string_view model_id, Placement placement) {
+  Entry* entry = Lookup(model_id);
+  if (entry == nullptr || !entry->preset.switchable) {
+    return false;
+  }
+  entry->placement = placement;
+  return true;
+}
+
+void Registry::RequestStarted(std::string_view model_id, bool remote) {
   Entry* entry = Lookup(model_id);
   if (entry == nullptr) {
+    return;
+  }
+  if (remote) {
+    // A relay leaves the local idle timer alone.
+    ++entry->open_remote_requests;
     return;
   }
   ++entry->open_requests;
   Touch(*entry);
 }
 
-void Registry::RequestFinished(std::string_view model_id) {
+void Registry::RequestFinished(std::string_view model_id, bool remote) {
   Entry* entry = Lookup(model_id);
   if (entry == nullptr) {
+    return;
+  }
+  if (remote) {
+    if (entry->open_remote_requests > 0) {
+      --entry->open_remote_requests;
+    }
     return;
   }
   if (entry->open_requests > 0) {
@@ -259,20 +291,31 @@ void Registry::WebSocketClosed(std::string_view model_id) {
 }
 
 void Registry::TrackVideoJob(std::string_view job_id,
-                             std::string_view model_id) {
+                             std::string_view model_id, bool remote) {
   Entry* entry = Lookup(model_id);
   if (entry == nullptr) {
     return;
   }
-  const auto previous = job_owners_.find(std::string(job_id));
+  const std::string key(job_id);
+  const auto previous = job_owners_.find(key);
   if (previous != job_owners_.end()) {
-    Entry* old_owner = Lookup(previous->second);
-    if (old_owner != nullptr && old_owner->open_jobs > 0) {
-      --old_owner->open_jobs;
+    if (Entry* old_owner = Lookup(previous->second); old_owner != nullptr) {
+      std::size_t& count = remote_jobs_.count(key) > 0
+                               ? old_owner->open_remote_jobs
+                               : old_owner->open_jobs;
+      if (count > 0) {
+        --count;
+      }
     }
     job_owners_.erase(previous);
   }
-  job_owners_.emplace(std::string(job_id), std::string(model_id));
+  job_owners_.emplace(key, std::string(model_id));
+  if (remote) {
+    remote_jobs_.insert(key);
+    ++entry->open_remote_jobs;
+    return;
+  }
+  remote_jobs_.erase(key);
   ++entry->open_jobs;
   Touch(*entry);
 }
@@ -290,22 +333,39 @@ void Registry::CompleteVideoJob(std::string_view job_id) {
     finished_order_.push_back(it->first);
     constexpr std::size_t kFinishedJobs = 1024;
     if (finished_order_.size() > kFinishedJobs) {
+      if (!job_owners_.contains(finished_order_.front())) {
+        remote_jobs_.erase(finished_order_.front());
+      }
       finished_owners_.erase(finished_order_.front());
       finished_order_.erase(finished_order_.begin());
     }
   }
+  const bool remote = remote_jobs_.count(it->first) > 0;
   job_owners_.erase(it);
   if (entry == nullptr) {
     return;
   }
-  if (entry->open_jobs > 0) {
-    --entry->open_jobs;
+  std::size_t& count = remote ? entry->open_remote_jobs : entry->open_jobs;
+  if (count > 0) {
+    --count;
   }
-  Touch(*entry);
+  if (!remote) {
+    Touch(*entry);
+  }
 }
 
 std::vector<std::pair<std::string, std::string>> Registry::OpenJobs() const {
-  return {job_owners_.begin(), job_owners_.end()};
+  std::vector<std::pair<std::string, std::string>> jobs;
+  for (const auto& [job, owner] : job_owners_) {
+    if (remote_jobs_.count(job) == 0) {
+      jobs.emplace_back(job, owner);
+    }
+  }
+  return jobs;
+}
+
+bool Registry::JobRemote(std::string_view job_id) const {
+  return remote_jobs_.count(std::string(job_id)) > 0;
 }
 
 std::string Registry::JobOwner(std::string_view job_id) const {
@@ -324,6 +384,12 @@ bool Registry::JobOpen(std::string_view job_id) const {
 bool Registry::Busy(std::string_view model_id) const {
   const Entry* entry = Lookup(model_id);
   return entry != nullptr && BusyEntry(*entry);
+}
+
+bool Registry::RemoteBusy(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry != nullptr &&
+         (entry->open_remote_requests > 0 || entry->open_remote_jobs > 0);
 }
 
 std::size_t Registry::ActiveCount() const {

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -61,23 +62,39 @@ public:
   void MarkReady(std::string_view model_id);
   void MarkUnloaded(std::string_view model_id);
 
-  // Activity accounting (all nestable per connection).
-  void RequestStarted(std::string_view model_id);
-  void RequestFinished(std::string_view model_id);
+  // Placement of models with a remote spec. Remote-only models are always
+  // kRemote; a switchable model starts at its preset placement.
+  [[nodiscard]] Placement PlacementOf(std::string_view model_id) const;
+  /// True when requests for the model go to its remote router now.
+  [[nodiscard]] bool RoutesRemote(std::string_view model_id) const;
+  /// Moves a switchable model; false for unknown or non-switchable ids.
+  bool SetPlacement(std::string_view model_id, Placement placement);
+
+  // Activity accounting (all nestable per connection). `remote` counts a
+  // relay to the remote router: it never keeps the local worker busy.
+  void RequestStarted(std::string_view model_id, bool remote = false);
+  void RequestFinished(std::string_view model_id, bool remote = false);
   void WebSocketOpened(std::string_view model_id);
   void WebSocketClosed(std::string_view model_id);
-  void TrackVideoJob(std::string_view job_id, std::string_view model_id);
+  void TrackVideoJob(std::string_view job_id, std::string_view model_id,
+                     bool remote = false);
   void CompleteVideoJob(std::string_view job_id);
-  /// Open (not yet released) jobs as (job id, owner model id).
+  /// Open (not yet released) local jobs as (job id, owner model id).
   [[nodiscard]] std::vector<std::pair<std::string, std::string>> OpenJobs()
       const;
   /// Owner model id; "" when the job is unknown.
   [[nodiscard]] std::string JobOwner(std::string_view job_id) const;
   /// True while the job is tracked and not completed.
   [[nodiscard]] bool JobOpen(std::string_view job_id) const;
+  /// True when the job was created through the remote router (open or
+  /// finished): its reads go there whatever the placement is now.
+  [[nodiscard]] bool JobRemote(std::string_view job_id) const;
 
-  /// True while any request, socket or video job is open for the model.
+  /// True while any local request, socket or video job is open for the
+  /// model (what keeps its worker loaded).
   [[nodiscard]] bool Busy(std::string_view model_id) const;
+  /// True while a relay or job through the remote router is open.
+  [[nodiscard]] bool RemoteBusy(std::string_view model_id) const;
   /// Number of loading or ready models.
   [[nodiscard]] std::size_t ActiveCount() const;
 
@@ -102,6 +119,9 @@ private:
     std::size_t open_requests{0};
     std::size_t open_sockets{0};
     std::size_t open_jobs{0};
+    std::size_t open_remote_requests{0};
+    std::size_t open_remote_jobs{0};
+    Placement placement{Placement::kLocal};
     Clock::time_point last_active{};
     bool deadline_armed{false};
     Clock::time_point deadline{};
@@ -119,6 +139,8 @@ private:
 
   std::vector<Entry> entries_;
   std::map<std::string, std::string> job_owners_;
+  /// Jobs created through the remote router (open and finished ones).
+  std::set<std::string> remote_jobs_;
   // Finished jobs keep their owner so /content and status reads still route
   // there (the worker reloads and answers from its persisted job state);
   // oldest first, bounded.
