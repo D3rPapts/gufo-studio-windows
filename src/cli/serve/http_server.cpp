@@ -35,6 +35,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/foley_api.hpp"
+#include "src/cli/serve/upscale_api.hpp"
 #include "src/cli/serve/omni_api.hpp"
 #include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -2196,6 +2197,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (omni_ != nullptr && omni_->ready()) ||
                        (music_ != nullptr && music_->ready()) ||
                        (foley_ != nullptr && foley_->ready()) ||
+                       (upscale_ != nullptr && upscale_->ready()) ||
                        images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
@@ -2213,6 +2215,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = music_->model_id();
     } else if (foley_ != nullptr && foley_->ready()) {
       body["model"] = foley_->model_id();
+    } else if (upscale_ != nullptr && upscale_->ready()) {
+      body["model"] = upscale_->model_id();
+      body["device"] = upscale_->engine().device;
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
@@ -2252,7 +2257,28 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       models["data"].push_back(std::move(model));
       listed.body = models.dump();
     }
+    if (upscale_ != nullptr && upscale_->ready()) {
+      json::Value models = json::parse(listed.body);
+      for (const std::string& name : upscale_->engine().model_names) {
+        json::Value model = json::Value::object();
+        model["id"] = name;
+        model["object"] = "model";
+        model["created"] = Now();
+        model["owned_by"] = "operator-supplied-realesrgan";
+        model["capability"] = "upscale";
+        model["device"] = upscale_->engine().device;
+        model["runtime"] = upscale_->engine().runtime;
+        models["data"].push_back(std::move(model));
+      }
+      listed.body = models.dump();
+    }
     return listed;
+  }
+  if (upscale_ != nullptr && IsUpscaleApiPath(req.path)) {
+    if (!upscale_->ready())
+      return Err(503, "Service Unavailable", "upscaler is not ready",
+                 "server_error", "upscale_service_unavailable");
+    return upscale_->Handle(req);
   }
   if (foley_ != nullptr && IsFoleyApiPath(req.path)) {
     if (!foley_->ready())

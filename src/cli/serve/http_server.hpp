@@ -27,6 +27,7 @@ class EmbeddingService;
 class OmniService;
 class MusicService;
 class FoleyService;
+class UpscaleService;
 class WebSocket;
 
 struct HttpRequest {
@@ -148,6 +149,11 @@ public:
   void set_foley(std::shared_ptr<FoleyService> foley) {
     foley_ = std::move(foley);
   }
+  /// Serves Real-ESRGAN image upscaling (/v1/images/upscale) on the NPU,
+  /// GPU or CPU; call before start().
+  void set_upscale(std::shared_ptr<UpscaleService> upscale) {
+    upscale_ = std::move(upscale);
+  }
 
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
@@ -186,6 +192,7 @@ private:
   std::shared_ptr<OmniService> omni_;
   std::shared_ptr<MusicService> music_;
   std::shared_ptr<FoleyService> foley_;
+  std::shared_ptr<UpscaleService> upscale_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

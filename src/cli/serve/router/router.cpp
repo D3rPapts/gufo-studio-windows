@@ -394,7 +394,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       "/embeddings",               "/embedding",
       "/completion",               "/apply-template",
       // MMAudio (gufo serve foley); synchronous through the router.
-      "/v1/audio/foley"};
+      "/v1/audio/foley",
+      // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
+      "/v1/images/upscale"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }

@@ -76,6 +76,64 @@ the default model with `pad`. Width and height must be even (at most
 size, then every output frame upscaled) and reports progress phase `upscale`.
 Without `--upscale-model` the request is rejected with 400.
 
+## Images on the NPU, GPU or CPU (`gufo serve upscale`)
+
+```
+gufo serve upscale --device npu --model realesr-animevideov3=body896q_h288_h3.onnx \
+                   [--model realesr-animevideov3=body512q_h280_h3.onnx] \
+                   [--npu-cache DIR] --port 8095
+```
+
+- `--device npu` runs a Real-ESRGAN **body** ONNX (the convolutions before
+  the pixel shuffle, int8 QDQ from AMD Quark, fixed input size) on the AMD
+  NPU through ONNX Runtime and the VitisAI execution provider of Windows ML.
+  gufo loads `onnxruntime.dll` at run time from the Windows ML framework
+  package (`--onnxruntime` overrides) and asks the Windows ML catalog for the
+  provider (`--npu-ep` overrides); it never ships either. The first start
+  compiles the model into `--npu-cache` (default `<model dir>/npu-cache`,
+  cache key = file stem); later starts read the cache.
+- `--device cpu` runs the same file on the ONNX Runtime CPU provider
+  (`--threads N`). The int8 graph is deterministic: on .198 the CPU result
+  of Take One's test frames equals Take One's NPU output pixel for pixel.
+- `--device gpu` uses the HIP upscaler above with the converted safetensors
+  (`--fp32` for the validation path).
+
+The NPU / CPU path reproduces Take One's `npu_upscale_worker.py`: RGB /255,
+two row passes (rows 0..T-1 keep the top half, rows h-T..h-1 the bottom half),
+DepthToSpace(4) plus the nearest-neighbour input, clip, `uint8(v*255+0.5)`,
+then OpenCV `INTER_AREA` (bit-exact port) and a centre crop: 896x512 ->
+rows 16..2031 of the x4 picture -> 1920x1080; 832x512 -> 1950x1200 ->
+columns 15..1934 -> 1920x1200 (`fit: "crop"`). `pad` and `stretch` use the
+same area filter. One model name may have several files, one per frame
+width; the request's frame picks the file.
+
+`POST /v1/images/upscale`
+
+```json
+{"model": "realesr-animevideov3", "image": "data:image/png;base64,...",
+ "size": "1920x1080", "fit": "crop", "response_format": "b64_json"}
+```
+
+returns `{created, model, device, model_file, width, height, fit,
+data: [{b64_json}], cost: {seconds, queue_seconds, body_seconds,
+post_seconds, png_seconds}}` and a `Server-Timing` header;
+`"response_format": "png"` returns the PNG itself. Without `size` (or
+`width`/`height`) the x4 picture is returned. Requests run one at a time;
+more than 8 waiting give 429. As a router section (the router forwards
+`/v1/images/upscale` by the body's `model`, here the section id):
+
+```ini
+[external/realesr-npu]
+command = D:\path\to\gufo.exe
+args = serve upscale --device npu
+model = D:\path\to\body896q_h288_h3.onnx
+served-model-name = realesr-npu
+```
+
+`npu-upscale-probe` (built with `GUFO_ENABLE_ONNXRUNTIME`) runs one image
+and compares it with a reference: `npu-upscale-probe --device cpu --model
+body896q_h288_h3.onnx --input in.png --size 1920x1080 --compare ref.png`.
+
 ## Implementation
 
 `src/models/realesrgan`: every convolution runs through the implicit-GEMM
