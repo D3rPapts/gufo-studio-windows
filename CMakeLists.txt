@@ -356,6 +356,7 @@ add_library(gufo_core STATIC
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sampling.cpp
   src/models/minimax_h3/sha256.cpp
+  src/models/minimax_h3/stage_cache.cpp
   src/models/minimax_h3/tokenizer.cpp
   src/models/minimax_h3/video_vae.cpp
   src/models/minimax_h3/video_vae_encoder.cpp
@@ -1271,6 +1272,14 @@ if (BUILD_TESTING)
     COMMAND minimax_h3_generation_test)
   set_tests_properties(minimax_h3_generation_test PROPERTIES
     LABELS "cpu;models;minimax-h3;generation;cli;quality;cancellation")
+
+  add_executable(minimax_h3_stage_cache_test
+    tests/models/minimax_h3_stage_cache_test.cpp)
+  target_link_libraries(minimax_h3_stage_cache_test PRIVATE gufo_core)
+  add_test(NAME minimax_h3_stage_cache_test
+    COMMAND minimax_h3_stage_cache_test)
+  set_tests_properties(minimax_h3_stage_cache_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;cache;quality")
 
   add_executable(minimax_h3_video_vae_test
     tests/models/minimax_h3_video_vae_test.cpp)
