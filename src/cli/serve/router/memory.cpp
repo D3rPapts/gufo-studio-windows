@@ -644,9 +644,11 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
     return static_cast<std::int64_t>(static_cast<double>(bytes) * by);
   };
   MemoryNeed need;
-  if (!record.has_learned && !record.other_layouts.empty()) {
-    // A peak measured with another layout beats the estimate; take the
-    // largest layout not above this one (else the smallest above it).
+  const bool complete = record.has_learned && record.learned_complete;
+  if (!complete && !record.other_layouts.empty()) {
+    // Until this layout has a complete peak, one measured with another
+    // layout beats the estimate: the largest layout not above this one (else
+    // the smallest above it). A partial peak of this layout only raises it.
     auto prior = record.other_layouts.upper_bound(layout_gb_);
     if (prior != record.other_layouts.begin()) {
       --prior;
@@ -655,15 +657,17 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
     need.gpu = scale(derived.gpu, learned_factor);
     need.host = scale(derived.host, learned_factor);
     need.shared = std::min(scale(derived.shared, learned_factor), need.gpu);
-    return need;
-  }
-  if (record.has_estimate && !(record.has_learned && record.learned_complete)) {
+    if (!record.has_learned) {
+      return need;
+    }
+  } else if (record.has_estimate && !complete) {
     need.gpu = scale(record.estimate.gpu, factor);
     need.host = scale(record.estimate.host, factor);
   }
   if (record.has_learned) {
-    need.shared = std::min(scale(record.learned.shared, learned_factor),
-                           scale(record.learned.gpu, learned_factor));
+    need.shared = std::max(need.shared,
+                           std::min(scale(record.learned.shared, learned_factor),
+                                    scale(record.learned.gpu, learned_factor)));
     need.gpu = std::max(need.gpu, scale(record.learned.gpu, learned_factor));
     need.host = std::max(need.host, scale(record.learned.host, learned_factor));
     if (record.learned_complete) {

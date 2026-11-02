@@ -481,6 +481,14 @@ void TestLayoutChange() {
     // Learning with 48 GiB starts afresh and does not keep the old host peak.
     ProcessMemory usage;
     usage.valid = true;
+    usage.gpu_dedicated = Gb(1);
+    usage.host_working_set = Gb(0.5);
+    CHECK(book.Observe("llm", usage));
+    // A partial peak of the new layout keeps the derived need, not the
+    // (larger) estimate.
+    need = book.Need("llm", 1.15, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(36));
+    CHECK(need.host > Gb(2.05) && need.host < Gb(2.15));
     usage.gpu_dedicated = Gb(36);
     usage.host_working_set = Gb(2.5);
     CHECK(book.Observe("llm", usage));
