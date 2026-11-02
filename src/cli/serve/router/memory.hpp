@@ -161,6 +161,12 @@ WatchdogAction PlanWatchdog(const SystemMemory& system,
 /// persisted as JSON. Thread-safe.
 class MemoryBook {
 public:
+  /// A learned peak of one dedicated-memory layout (BIOS VRAM split).
+  struct Learned {
+    MemoryNeed need;
+    std::string at;
+    bool complete{false};
+  };
   struct Record {
     bool has_estimate{false};
     MemoryNeed estimate;
@@ -171,6 +177,12 @@ public:
     /// The peak comes from a worker that finished loading and served until a
     /// normal stop; from then on it replaces the estimate.
     bool learned_complete{false};
+    /// Dedicated GPU memory (whole GiB) the learned peak was measured with;
+    /// 0 = unknown (files written before the layout was recorded).
+    int learned_layout_gb{0};
+    /// Peaks learned with other dedicated sizes, by GiB (0 = unknown). Kept
+    /// when the BIOS split changes and restored when it changes back.
+    std::map<int, Learned> other_layouts;
   };
 
   /// Empty path: nothing is read or written.
@@ -189,10 +201,16 @@ public:
   void RaiseLearned(std::string_view id, const MemoryNeed& need);
   /// A worker of `id` ran through load and use and was stopped normally.
   void MarkComplete(std::string_view id);
+  /// The adapter's dedicated memory. When it differs from the size a peak was
+  /// learned with, that peak moves to other_layouts and the model learns
+  /// anew; until then Need() derives from the old peak (see there).
+  void SetLayout(std::int64_t gpu_dedicated_total);
 
   /// Learned peak x learned_factor once a complete run was measured;
-  /// before that max(estimate x factor, learned x learned_factor). A model
-  /// with neither is exclusive.
+  /// before that max(estimate x factor, learned x learned_factor). Nothing
+  /// learned with the current layout but with another: that peak x
+  /// learned_factor, where a shared part that now fits into dedicated memory
+  /// no longer counts as host RAM. A model with neither is exclusive.
   [[nodiscard]] MemoryNeed Need(std::string_view id, double factor,
                                 double learned_factor, bool* exclusive) const;
   [[nodiscard]] Record Get(std::string_view id) const;
@@ -203,6 +221,9 @@ private:
   mutable std::mutex mutex_;
   std::map<std::string, Record, std::less<>> records_;
   bool dirty_{false};
+  int layout_gb_{0};
+
+  void AdoptLayoutLocked(Record& record);
 };
 
 [[nodiscard]] double ToGb(std::int64_t bytes);

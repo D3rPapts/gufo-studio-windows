@@ -448,6 +448,67 @@ void TestMemoryBook() {
   std::filesystem::remove(file, ignored);
 }
 
+// A BIOS split change (32 -> 48 GiB dedicated): the peak learned with 32 GiB,
+// whose shared spill now fits into dedicated memory, stops counting that
+// spill as host RAM; the old peak stays in the file and returns with 32 GiB.
+void TestLayoutChange() {
+  const auto file =
+      std::filesystem::temp_directory_path() /
+      ("router_memory_layout_" + std::to_string(std::rand()) + ".json");
+  {
+    // A file from before layouts were recorded (the 27B on 31.10.).
+    std::ofstream(file)
+        << R"({"version":1,"models":{"llm":{"estimate_gpu_gb":35.5,)"
+           R"("estimate_host_gb":6.5,"learned_gpu_gb":36,"learned_host_gb":8.3,)"
+           R"("learned_shared_gb":6.2,"learned_at":"x","learned_complete":true},)"
+           R"("small":{"learned_gpu_gb":4,"learned_host_gb":1,)"
+           R"("learned_shared_gb":0,"learned_at":"y","learned_complete":true}}})";
+  }
+  bool exclusive = false;
+  {
+    MemoryBook book(file);
+    std::string error;
+    CHECK(book.Load(&error));
+    book.SetLayout(Gb(48));
+    MemoryNeed need = book.Need("llm", 1.15, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(36));
+    CHECK(need.host > Gb(2.05) && need.host < Gb(2.15));  // 8.3 - 6.2
+    CHECK(need.shared == 0);
+    // No spill: the peak counts as learned with 48 GiB, unchanged.
+    need = book.Need("small", 1.0, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(4) && need.host == Gb(1));
+    CHECK(book.Get("small").learned_layout_gb == 48);
+    // Learning with 48 GiB starts afresh and does not keep the old host peak.
+    ProcessMemory usage;
+    usage.valid = true;
+    usage.gpu_dedicated = Gb(36);
+    usage.host_working_set = Gb(2.5);
+    CHECK(book.Observe("llm", usage));
+    book.MarkComplete("llm");
+    need = book.Need("llm", 1.0, 1.0, &exclusive);
+    CHECK(need.host == Gb(2.5));
+    CHECK(book.Save(&error));
+  }
+  {
+    MemoryBook book(file);
+    std::string error;
+    CHECK(book.Load(&error));
+    const MemoryBook::Record record = book.Get("llm");
+    CHECK(record.learned_layout_gb == 48);
+    CHECK(record.other_layouts.count(0) == 1);
+    CHECK(record.other_layouts.count(0) == 1 &&
+          record.other_layouts.at(0).need.host > Gb(8.25));
+    // Back to 32 GiB: the 48 GiB peak is kept, the unknown-layout one is
+    // used (largest layout not above 32).
+    book.SetLayout(Gb(32));
+    const MemoryNeed need = book.Need("llm", 1.0, 1.0, &exclusive);
+    CHECK(need.host > Gb(8.25));
+    CHECK(book.Get("llm").other_layouts.count(48) == 1);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(file, ignored);
+}
+
 void TestPresetHintsAndIdleOverride() {
   const auto dir = std::filesystem::temp_directory_path();
   const auto file = dir / "router_memory_test_preset.ini";
@@ -521,6 +582,7 @@ int main() {
   TestCommitWatchdog();
   TestFactors();
   TestMemoryBook();
+  TestLayoutChange();
   TestPresetHintsAndIdleOverride();
   if (failures != 0) {
     std::cerr << failures << " router memory checks failed.\n";
