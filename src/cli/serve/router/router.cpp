@@ -27,6 +27,7 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/names.hpp"
 #include "src/cli/serve/router/preset.hpp"
@@ -821,6 +822,8 @@ public:
   std::unique_ptr<router::jobs::JobQueue> jobs;
   /// Random person names from a word list (--names-file); null when disabled.
   std::unique_ptr<router::names::NameService> names;
+  /// POST /v1/figuren (figure check over the router's own vision chats).
+  std::unique_ptr<router::figuren::FigurenService> figuren;
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
   /// Reachability and model states of the remote routers; null without
@@ -888,6 +891,10 @@ public:
     }
     if (names != nullptr) {
       if (auto answer = names->Handle(req))
+        return std::move(*answer);
+    }
+    if (figuren != nullptr) {
+      if (auto answer = figuren->Handle(req))
         return std::move(*answer);
     }
     if (comfy != nullptr) {
@@ -2970,6 +2977,12 @@ int RunRouter(std::span<const char* const> args) {
     self_fetch = [raw](const HttpRequest& request) {
       return CollectResponse(raw->Dispatch(request));
     };
+  }
+  {
+    router::figuren::Options figuren_options;
+    figuren_options.fetch = self_fetch;
+    state->figuren = std::make_unique<router::figuren::FigurenService>(
+        std::move(figuren_options));
   }
   if (!comfy_dir.empty()) {
     router::comfy::AdapterOptions comfy_options;
