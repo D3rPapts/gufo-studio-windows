@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/ming_tts/backend.hpp"
 #include "src/models/ming_tts/config.hpp"
 #include "src/models/ming_tts/cpu/ops.hpp"
 #include "src/models/ming_tts/safetensors.hpp"
@@ -67,20 +68,42 @@ struct VaeDecoder {  // audio.decoder
   std::vector<float> window;  // head.istft.window (BF16 values)
 };
 
-// Per-step sampler options (FlowLoss.sample / CFM.sample defaults).
-struct FlowOptions {
-  float cfg{2.0F};
-  float sigma{0.25F};
-  float temperature{0.0F};
-  std::int32_t steps{10};
-};
+using FlowOptions = ming_tts::FlowOptions;
 
-class Model {
+class Model final : public Backend {
 public:
+  // Backend
+  [[nodiscard]] const char* name() const noexcept override { return "cpu"; }
+  void ResetBackbone() override { ResetCache(); }
+  void RunBackbone(const float* embeddings, std::int64_t rows,
+                   float* normed) override {
+    BackboneForward(embeddings, rows, normed);
+  }
+  [[nodiscard]] float StopAt(const float* z) override { return StopProbability(z); }
+  void SampleFlow(const float* cond, const float* history, const float* noise,
+                  const float* sde_noise, const FlowOptions& options,
+                  float* latent) override {
+    SampleLatent(cond, history, noise, sde_noise, options, latent);
+  }
+  void AggregateLatent(const float* latent, float* out) override {
+    Aggregate(latent, out);
+  }
+  [[nodiscard]] std::vector<float> DecodeAudio(const float* latents,
+                                               std::int64_t frames) override {
+    return DecodeLatents(latents, frames);
+  }
+
   [[nodiscard]] static std::unique_ptr<Model> Load(const std::string& model_dir,
                                                    std::string* error);
 
   [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
+  // Loaded weights (BF16 matrices borrowed from the mapped checkpoint), used
+  // to upload the GPU runtime.
+  [[nodiscard]] const Qwen2Stack& llm() const noexcept { return llm_; }
+  [[nodiscard]] const FlowHead& flow_head() const noexcept { return flow_; }
+  [[nodiscard]] const Aggregator& aggregator() const noexcept { return aggregator_; }
+  [[nodiscard]] const VaeDecoder& vae_decoder() const noexcept { return vae_; }
+  [[nodiscard]] const Linear& stop_head() const noexcept { return stop_head_; }
 
   // Token embedding rows -> out[ids.size(), hidden].
   void Embed(std::span<const std::int64_t> ids, float* out) const;

@@ -39,3 +39,14 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 elseif (MSVC)
   set_source_files_properties(cpu/ops.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 endif()
+
+if (ENGINE_ENABLE_HIP)
+  target_sources(gufo_ming_tts PRIVATE
+    hip/model.cpp
+    hip/ops.hip)
+  target_compile_definitions(gufo_ming_tts PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(gufo_ming_tts PUBLIC
+    gufo_fish_drama3
+    hip::host
+    roc::rocblas)
+endif()

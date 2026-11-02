@@ -283,7 +283,12 @@ std::string TtsService::model_id() const {
 }
 
 std::string TtsService::backend_name() const {
-  return impl_->is_ming ? "native-cpu" : "native-hip";
+  if (impl_->is_ming) {
+    return impl_->ming_engine != nullptr
+               ? std::string("native-") + impl_->ming_engine->backend_name()
+               : std::string("native-cpu");
+  }
+  return "native-hip";
 }
 
 std::vector<std::string> TtsService::voices() const {

@@ -76,6 +76,8 @@ public:
                               SynthesisResult* result, std::string* error);
 
   [[nodiscard]] std::uint32_t sample_rate() const noexcept;
+  // "hip" or "cpu": where the AR loop and the VAE decoder run.
+  [[nodiscard]] const char* backend_name() const noexcept;
 
   // Prompt latents [patches, 64] for a mono reference waveform (resampled to
   // 44.1 kHz, front padded, VAE encoder, posterior sample with `noise` when it

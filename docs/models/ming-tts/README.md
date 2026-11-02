@@ -10,9 +10,14 @@ decoder with an ISTFT head. The CAM++ speaker encoder is read directly from
 the shipped `campplus.onnx`; Python and ONNX Runtime are not runtime
 requirements.
 
-Current state: a CPU reference runtime (FP32 math on the BF16 weights) that
-matches the Python reference stage by stage; a gfx1151 HIP runtime is not
-implemented yet, so `X-Gufo-TTS-Backend` reports `native-cpu`.
+Runtimes: a CPU reference runtime (FP32 math on the BF16 weights) that matches
+the Python reference stage by stage, and a gfx1151 HIP runtime for the AR loop
+and the VAE decoder (text front end, CAM++ and the VAE encoder stay on the
+CPU). The HIP runtime is used automatically when a GPU is present
+(`GUFO_MING_BACKEND=cpu` forces the CPU, `=hip` makes a missing GPU an error);
+`X-Gufo-TTS-Backend` reports `native-hip` or `native-cpu`. **The HIP runtime is
+compiled but has not been run on a GPU yet** (`tests/models/ming_tts/hip_test.cpp`
+is the pending check).
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md)
 
@@ -61,7 +66,7 @@ decoded.
 
 ## Not yet supported
 
-- GPU (HIP) runtime.
+- Verified GPU numbers (HIP runtime untested so far).
 - Text normalisation for Chinese/English (the reference uses a pynini FST);
   other languages are passed through unchanged exactly like the reference.
 - Temperature > 0 uses gufo's own RNG, so seeded outputs differ from PyTorch.

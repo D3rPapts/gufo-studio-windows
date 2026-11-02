@@ -1231,6 +1231,10 @@ if (BUILD_TESTING)
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE)
 
+  add_executable(ming_tts_bench
+    tests/models/ming_tts/bench_main.cpp)
+  target_link_libraries(ming_tts_bench PRIVATE gufo_ming_tts gufo_qwen3_tts)
+
   add_executable(ming_tts_serve_test
     tests/models/ming_tts/serve_test.cpp
     src/cli/serve/audio_tts_api.cpp
@@ -1431,6 +1435,15 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(ming_tts_hip_test
+      tests/models/ming_tts/hip_test.cpp)
+    target_link_libraries(ming_tts_hip_test PRIVATE gufo_ming_tts)
+    add_test(NAME ming_tts_hip_test COMMAND ming_tts_hip_test)
+    set_tests_properties(ming_tts_hip_test PROPERTIES
+      LABELS "gpu;models;ming-tts;quality;external-model"
+      SKIP_RETURN_CODE 77
+      RUN_SERIAL TRUE)
+
     add_executable(qwen3_tts_synthesis_hip_test
       tests/models/qwen3_tts/synthesis_hip_test.cpp)
     target_link_libraries(qwen3_tts_synthesis_hip_test PRIVATE gufo_qwen3_tts)

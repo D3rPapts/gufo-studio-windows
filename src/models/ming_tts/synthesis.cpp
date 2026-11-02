@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <random>
 
 #include "src/models/ming_tts/cpu/model.hpp"
+#if defined(ENGINE_ENABLE_HIP)
+#include "src/models/ming_tts/hip/model.hpp"
+#endif
 #include "src/models/ming_tts/prompt.hpp"
 #include "src/models/ming_tts/speaker.hpp"
 #include "src/models/ming_tts/tokenizer.hpp"
@@ -39,6 +43,10 @@ std::uint64_t HashSamples(std::span<const float> samples, std::uint32_t rate) {
 
 struct Engine::Impl {
   std::unique_ptr<cpu::Model> model;
+  // GPU runtime when built with HIP and a device is present; the CPU model
+  // keeps the text/speaker/encoder work and is the fallback backend.
+  std::unique_ptr<Backend> gpu;
+  [[nodiscard]] Backend& run() { return gpu ? *gpu : static_cast<Backend&>(*model); }
   std::unique_ptr<CamPlusPlus> speaker;
   Tokenizer tokenizer;
   std::mutex speaker_mutex;
@@ -62,6 +70,25 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir,
   if (!Tokenizer::Load(model_dir, &impl.tokenizer, error)) {
     return nullptr;
   }
+  // GUFO_MING_BACKEND=cpu forces the CPU runtime; =hip makes a missing GPU
+  // runtime an error instead of a fallback.
+  const char* backend_env = std::getenv("GUFO_MING_BACKEND");
+  const std::string backend = backend_env != nullptr ? backend_env : "";
+#if defined(ENGINE_ENABLE_HIP)
+  if (backend != "cpu") {
+    std::string gpu_error;
+    impl.gpu = hip::Model::Create(*impl.model, &gpu_error);
+    if (impl.gpu == nullptr && backend == "hip") {
+      SetError(error, gpu_error);
+      return nullptr;
+    }
+  }
+#else
+  if (backend == "hip") {
+    SetError(error, "this build has no HIP runtime");
+    return nullptr;
+  }
+#endif
   // prompt_contract.validate_tokenizer: the trained special-token ids.
   for (const auto& [token, id] :
        std::initializer_list<std::pair<const char*, std::uint32_t>>{
@@ -84,6 +111,10 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir,
 
 Engine::~Engine() = default;
 
+const char* Engine::backend_name() const noexcept {
+  return impl_->gpu ? impl_->gpu->name() : "cpu";
+}
+
 std::uint32_t Engine::sample_rate() const noexcept {
   return static_cast<std::uint32_t>(impl_->model->config().sample_rate);
 }
@@ -93,6 +124,7 @@ bool Engine::Generate(const SynthesisRequest& request,
                       SynthesisResult* result, std::string* error) {
   Impl& impl = *impl_;
   cpu::Model& model = *impl.model;
+  Backend& run = impl.run();
   const ModelConfig& config = model.config();
   const std::int64_t hidden = config.llm.hidden_size;
   const std::int64_t latent_dim = config.latent_dim;
@@ -215,12 +247,12 @@ bool Engine::Generate(const SynthesisRequest& request,
                 embeddings.begin() + static_cast<std::ptrdiff_t>(position) * hidden);
     }
     for (std::size_t i = 0; i < latent_steps; ++i) {
-      model.Aggregate(prompt_latents.data() + i * static_cast<std::size_t>(latent_dim),
+      run.AggregateLatent(prompt_latents.data() + i * static_cast<std::size_t>(latent_dim),
                       embeddings.data() + (layout.latent_position + static_cast<std::int64_t>(i)) * hidden);
     }
-    model.ResetCache();
+    run.ResetBackbone();
     std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
-    model.BackboneForward(embeddings.data(), rows, normed.data());
+    run.RunBackbone(embeddings.data(), rows, normed.data());
     std::vector<float> z(normed.end() - hidden, normed.end());
 
     const std::int64_t budget =
@@ -252,20 +284,20 @@ bool Engine::Generate(const SynthesisRequest& request,
           value = normal(rng);
         }
       }
-      model.SampleLatent(z.data(), history.data(), noise.data(), sde.data(),
+      run.SampleFlow(z.data(), history.data(), noise.data(), sde.data(),
                          flow, latent.data());
       latents.insert(latents.end(), latent.begin(), latent.end());
-      if (model.StopProbability(z.data()) > 0.5F && step > 3) {
+      if (run.StopAt(z.data()) > 0.5F && step > 3) {
         ++step;
         break;
       }
-      model.Aggregate(latent.data(), next.data());
-      model.BackboneForward(next.data(), 1, z.data());
+      run.AggregateLatent(latent.data(), next.data());
+      run.RunBackbone(next.data(), 1, z.data());
       history = latent;
     }
     const std::int64_t frames = static_cast<std::int64_t>(latents.size()) / latent_dim;
     out.fragment_steps.push_back(frames);
-    std::vector<float> audio = model.DecodeLatents(latents.data(), frames);
+    std::vector<float> audio = run.DecodeAudio(latents.data(), frames);
     if (request.trim_silence) {
       audio = TrimTrailingSilence(audio, config.sample_rate);
     }
