@@ -33,6 +33,15 @@ autoregressive loop (per-step latent cosine stays ≥ 0.9997); the raw waveform
 cosine (0.986) is phase-sensitive and only reported. The reference itself runs
 in BF16 autocast on the GPU, which differs from this FP32 oracle by more.
 
+## Speaker similarity (CAM++ cosine to the reference voice)
+
+Same 9.2 s German reference voice; CAM++ embedding cosine between reference
+and output (higher is closer). gufo CPU runtime, 2026-11-02: EMOTION
+(angry/sad/happy) 0.76–0.82, FREEFORM whisper 0.73, ZERO_SHOT with transcript
+(prompt latents) 0.90. The Python reference on the GPU (BF16, EMOTION, six
+other sentences) scored 0.71–0.76 for the same voice. Different sentences, so
+this shows the port is in the same range, not a controlled A/B.
+
 ## Not measured yet
 
 - Listening comparison of the CPU runtime against the Python BF16 output.
