@@ -381,6 +381,77 @@ int main() {
     }
   }
 
+  // ------------------------------------- prompt latents / ZERO_SHOT ----
+  if (Want(stages, "zs") && std::filesystem::exists(ref_dir / "oracle_zs.safetensors")) {
+    const auto zstart = std::chrono::steady_clock::now();
+    auto zs = ming::SafetensorsFile::Open(ref_dir / "oracle_zs.safetensors", &error);
+    const json::Value zmeta = json::parse(ReadText(ref_dir / "oracle_zs.json"));
+    auto model = ming::cpu::Model::Load(model_dir.string(), &error);
+    if (zs == nullptr || model == nullptr) {
+      std::printf("FAIL zs setup: %s\n", error.c_str());
+      return 1;
+    }
+    const std::int64_t hidden = model->config().llm.hidden_size;
+    const auto rate = static_cast<std::int64_t>(zmeta.find("ref_sample_rate")->as_double());
+    const std::vector<float> ref = oracle->ToF32("ref_wav");
+    const std::vector<float> wav44 = ming::ResampleLikeTorchaudio(ref, rate, 44100);
+    Compare("resample to 44.1 kHz", wav44, zs->ToF32("ref_wav44k"));
+    const std::vector<float> prompt_wav = zs->ToF32("prompt_wav");
+    std::int64_t patches = 0;
+    const std::vector<float> params =
+        model->EncodePosterior(prompt_wav.data(), static_cast<std::int64_t>(prompt_wav.size()), &patches);
+    Compare("VAE encoder posterior params", params, zs->ToF32("enc_params"));
+    const std::vector<float> noise = zs->ToF32("enc_noise");
+    const std::vector<float> latents = model->SamplePosterior(params, noise.data());
+    Compare("prompt latents (posterior sample)", latents, zs->ToF32("prompt_latent"));
+    std::printf("     encoder %lld patches %.2f s\n", static_cast<long long>(patches), Seconds(zstart));
+
+    ming::InputLayout layout;
+    const bool ok = ming::BuildInputIds(tokenizer, ming::BuildTtsPrompt("de"), zmeta.member_str("text"), 1,
+                                        std::nullopt, &layout, &error, zmeta.member_str("prompt_text"),
+                                        static_cast<std::size_t>(patches));
+    Expect("ZERO_SHOT input_ids", ok && layout.ids == Ids(*zmeta.find("input_ids")) &&
+                                      layout.latent_position ==
+                                          static_cast<std::int64_t>(zmeta.find("latent_position")->as_double()),
+           std::to_string(layout.ids.size()) + " ids, latents at " + std::to_string(layout.latent_position));
+    const auto rows = static_cast<std::int64_t>(layout.ids.size());
+    std::vector<std::int64_t> ids(layout.ids.begin(), layout.ids.end());
+    std::vector<float> embeds(static_cast<std::size_t>(rows * hidden));
+    model->Embed(ids, embeds.data());
+    model->ProjectSpeaker(zs->ToF32("spk_emb"),
+                          embeds.data() + static_cast<std::int64_t>(layout.speaker_positions.at(0)) * hidden);
+    const std::vector<float> want_lat = zs->ToF32("prompt_latent");
+    for (std::int64_t i = 0; i < patches; ++i) {
+      model->Aggregate(want_lat.data() + i * 64, embeds.data() + (layout.latent_position + i) * hidden);
+    }
+    Compare("ZERO_SHOT inputs_embeds", embeds, zs->ToF32("inputs_embeds"));
+    model->ResetCache();
+    std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
+    model->BackboneForward(embeds.data(), rows, normed.data());
+    Compare("ZERO_SHOT prefill final normed", normed, zs->ToF32("prefill_hidden_last"));
+    const std::vector<float> cond = zs->ToF32("cond");
+    const std::vector<float> step_noise = zs->ToF32("noise");
+    const std::vector<float> want_steps = zs->ToF32("latents");
+    std::vector<float> history(want_lat.end() - 64, want_lat.end());
+    std::vector<float> got_steps, got_cond(normed.end() - hidden, normed.end());
+    std::vector<float> latent(64), next(static_cast<std::size_t>(hidden)), z(static_cast<std::size_t>(hidden));
+    const auto steps = static_cast<std::int64_t>(want_steps.size() / 64);
+    for (std::int64_t s = 0; s < steps; ++s) {
+      model->SampleLatent(cond.data() + s * hidden, history.data(), step_noise.data() + s * 64, nullptr, {},
+                          latent.data());
+      got_steps.insert(got_steps.end(), latent.begin(), latent.end());
+      history.assign(want_steps.begin() + s * 64, want_steps.begin() + (s + 1) * 64);
+      if (s + 1 < steps) {
+        model->Aggregate(want_steps.data() + s * 64, next.data());
+        model->BackboneForward(next.data(), 1, z.data());
+        got_cond.insert(got_cond.end(), z.begin(), z.end());
+      }
+    }
+    Compare("ZERO_SHOT AR cond (teacher forced)", got_cond, cond);
+    Compare("ZERO_SHOT AR latents (teacher forced)", got_steps, want_steps);
+    std::printf("     zero-shot stage %.1f s\n", Seconds(zstart));
+  }
+
   // ---------------------------------------------------- free running ----
   if (Want(stages, "free")) {
     const auto fstart = std::chrono::steady_clock::now();

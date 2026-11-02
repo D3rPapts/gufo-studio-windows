@@ -22,6 +22,7 @@ build (`windows-cpu-test`):
 | Teacher-forced AR, 33 steps: backbone condition, sampled latents, aggregator, stop probability | 1.0000000 | 2.1e-5 / 3.2e-6 / 7.6e-6 / 5.6e-9 |
 | VAE decoder: fc1, upsample, layer 0, final hidden, ISTFT head, waveform | 1.0000000 | ≤ 1.6e-5 |
 | VAE probe, 300 frames (checks the 64-key sliding window) | 1.0000000 | 5e-11 |
+| ZERO_SHOT oracle (`ming_oracle_zs.py`, transcript + 116 prompt latents): resample 24 → 44.1 kHz, VAE-encoder posterior, sampled latents, 219 prompt ids, inputs (incl. aggregated latents), prefill, 4 teacher-forced steps | 1.0000000 / exact ids | ≤ 7.4e-5 |
 | Trailing-silence trim length | exact (110250) | – |
 | Free-running AR with the oracle's start noise: step count | exact (33) | – |
 | Free-running latents (all steps) | 0.9997 | 0.17 |

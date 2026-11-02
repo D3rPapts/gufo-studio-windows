@@ -6,6 +6,7 @@
 //   GUFO_MING_MODEL   checkpoint directory
 //   GUFO_MING_VOICE   reference WAV for the preset / inline clone
 //   GUFO_MING_OUT     optional directory for the produced WAV/PCM files
+//   GUFO_MING_VOICE_TEXT optional UTF-8 transcript file: adds a ZERO_SHOT request
 //
 // Exits 77 (skip) when the model or voice is not configured.
 // Written with AI assistance (Claude Code).
@@ -156,6 +157,17 @@ int main() {
                     R"("emotion":"sad","input":"Es ist vorbei. Sie kommt nicht mehr zurück.",)"
                     R"("reference_audio":")") +
             gufo::server::EncodeAudioBase64(voice_bytes) + "\"}");
+  if (const char* voice_text = std::getenv("GUFO_MING_VOICE_TEXT"); voice_text != nullptr) {
+    gufo::json::Value body = gufo::json::Value::object();
+    body["model"] = "ming-3.0-tts";
+    body["voice"] = "voice-clone";
+    body["language"] = "de";
+    body["input"] = "Wir sehen uns morgen am Bahnhof, ich bringe die Karten mit.";
+    body["reference_audio"] = gufo::server::EncodeAudioBase64(voice_bytes);
+    // A path to a UTF-8 transcript file (environment strings are not UTF-8 on Windows).
+    body["reference_text"] = ReadFile(voice_text);
+    speak("ming_zeroshot_inline.wav", body.dump());
+  }
   speak("ming_fluestern.wav",
         R"({"model":"ming-3.0-tts","voice":"fabian","instructions":)"
         R"("Whisper very softly and tensely, almost breathless, close to the microphone.",)"

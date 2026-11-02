@@ -212,6 +212,7 @@ struct TtsService::Impl {
             ming.language = request.language;
             ming.emotion = request.emotion;
             ming.instruction = request.instruct;
+            ming.reference_text = request.reference_text;
             const auto& audio = request.reference_audio;
             if (!audio.samples.empty() && audio.channels > 0) {
               const std::size_t frames = audio.samples.size() / audio.channels;

@@ -54,6 +54,13 @@ struct Aggregator {  // linear_proj_audio
   std::vector<float> cls;  // word_embedder row 0
 };
 
+struct VaeEncoder {  // audio.encoder (prompt latents)
+  Qwen2Stack backbone;
+  Qwen2Stack aggregator;  // 4 layers over [4 frames + CLS] groups
+  Linear fc1, fc2, fc3;
+  std::vector<float> cls;
+};
+
 struct VaeDecoder {  // audio.decoder
   Qwen2Stack stack;
   Linear fc1, head_out;
@@ -116,6 +123,16 @@ public:
                                                  std::int64_t frames,
                                                  VaeTrace* trace = nullptr) const;
 
+  // VAE encoder on a 44.1 kHz prompt waveform (front-padded to a multiple of
+  // hop * patch): returns the posterior parameters [patches, 2 * latent_dim]
+  // (mean | scale) like AudioVAE.encoder + fc3.
+  [[nodiscard]] std::vector<float> EncodePosterior(const float* wave,
+                                                   std::int64_t samples,
+                                                   std::int64_t* patches) const;
+  // mean + (softplus(scale) + 1e-4) * noise, noise [patches, latent_dim].
+  [[nodiscard]] std::vector<float> SamplePosterior(
+      const std::vector<float>& params, const float* noise) const;
+
 private:
   void DitForward(const DitStack& stack, float* x, std::int64_t batch,
                   std::int64_t seq) const;
@@ -131,6 +148,7 @@ private:
   FlowHead flow_;
   Aggregator aggregator_;
   VaeDecoder vae_;
+  VaeEncoder encoder_;
 
   // Backbone KV cache: per layer [positions, kv_heads, head_dim].
   mutable std::vector<std::vector<float>> cache_k_;

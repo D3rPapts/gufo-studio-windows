@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -29,6 +30,11 @@ struct SynthesisRequest {
   // Reference voice (mono) for the CAM++ speaker embedding.
   std::vector<float> reference_audio;
   std::uint32_t reference_sample_rate{0};
+  // Transcript of reference_audio: enables prompt latents from the VAE
+  // encoder (the reference ZERO_SHOT layout).
+  std::string reference_text;
+  // Test hook: posterior noise for the prompt latents ([patches, 64]).
+  std::vector<float> prompt_noise;
   // Precomputed 192-dim CAM++ embedding; overrides reference_audio.
   std::vector<float> speaker_embedding;
 
@@ -70,6 +76,14 @@ public:
                               SynthesisResult* result, std::string* error);
 
   [[nodiscard]] std::uint32_t sample_rate() const noexcept;
+
+  // Prompt latents [patches, 64] for a mono reference waveform (resampled to
+  // 44.1 kHz, front padded, VAE encoder, posterior sample with `noise` when it
+  // has the right size, otherwise drawn from `rng`).
+  [[nodiscard]] std::vector<float> EncodePrompt(std::span<const float> audio,
+                                                std::uint32_t sample_rate,
+                                                std::span<const float> noise,
+                                                std::mt19937_64* rng);
 
   struct Impl;
 

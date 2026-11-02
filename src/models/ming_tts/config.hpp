@@ -43,6 +43,8 @@ struct DitConfig {
 struct ModelConfig {
   Qwen2Config llm;
   Qwen2Config vae_decoder;
+  Qwen2Config vae_encoder;            // enc_kwargs.backbone
+  std::int32_t vae_encoder_aggregator_layers{4};
   DitConfig dit;
   DitConfig aggregator;
   std::int32_t latent_dim{64};

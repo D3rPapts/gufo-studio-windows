@@ -148,10 +148,23 @@ bool Engine::Generate(const SynthesisRequest& request,
     return false;
   }
   out.speaker_embedding = speaker;
-  const std::size_t num_speakers = speaker.empty() ? 0 : 1;
-  std::vector<float> projected(static_cast<std::size_t>(hidden));
-  if (num_speakers != 0) {
-    model.ProjectSpeaker(speaker, projected.data());
+
+  std::mt19937_64 rng(request.seed);
+  std::normal_distribution<float> normal(0.0F, 1.0F);
+
+  // --- prompt latents (VAE encoder): only together with a transcript.
+  std::vector<float> prompt_latents;
+  std::optional<std::string> prompt_text;
+  try {
+    if (!request.reference_text.empty() && !request.reference_audio.empty()) {
+      prompt_latents = EncodePrompt(request.reference_audio,
+                                    request.reference_sample_rate,
+                                    request.prompt_noise, &rng);
+      prompt_text = request.reference_text;
+    }
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("prompt encoding failed: ") + exception.what());
+    return false;
   }
 
   // --- text
@@ -167,18 +180,26 @@ bool Engine::Generate(const SynthesisRequest& request,
   }
   out.fragments = fragments;
   const std::string prompt = BuildTtsPrompt(request.language);
-
-  std::mt19937_64 rng(request.seed);
-  std::normal_distribution<float> normal(0.0F, 1.0F);
+  // MingTTS: split FREEFORM (STYLE) requests reuse the first generated
+  // fragment as voice prompt (latents + speaker embedding + its text).
+  const bool reuse_first_fragment =
+      !request.instruction.empty() && fragments.size() > 1;
   cpu::FlowOptions flow;
   flow.cfg = request.cfg;
   flow.sigma = request.sigma;
   flow.temperature = request.temperature;
 
   for (std::size_t index = 0; index < fragments.size(); ++index) {
+    const std::size_t num_speakers = speaker.empty() ? 0 : 1;
+    std::vector<float> projected(static_cast<std::size_t>(hidden));
+    if (num_speakers != 0) {
+      model.ProjectSpeaker(speaker, projected.data());
+    }
+    const std::size_t latent_steps =
+        prompt_text.has_value() ? prompt_latents.size() / static_cast<std::size_t>(latent_dim) : 0;
     InputLayout layout;
     if (!BuildInputIds(impl.tokenizer, prompt, fragments[index], num_speakers,
-                       instruction, &layout, error)) {
+                       instruction, &layout, error, prompt_text, latent_steps)) {
       return false;
     }
     const auto rows = static_cast<std::int64_t>(layout.ids.size());
@@ -193,6 +214,10 @@ bool Engine::Generate(const SynthesisRequest& request,
       std::copy(projected.begin(), projected.end(),
                 embeddings.begin() + static_cast<std::ptrdiff_t>(position) * hidden);
     }
+    for (std::size_t i = 0; i < latent_steps; ++i) {
+      model.Aggregate(prompt_latents.data() + i * static_cast<std::size_t>(latent_dim),
+                      embeddings.data() + (layout.latent_position + static_cast<std::int64_t>(i)) * hidden);
+    }
     model.ResetCache();
     std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
     model.BackboneForward(embeddings.data(), rows, normed.data());
@@ -201,6 +226,9 @@ bool Engine::Generate(const SynthesisRequest& request,
     const std::int64_t budget =
         std::min<std::int64_t>(request.max_decode_steps, kMaxCacheLength - rows);
     std::vector<float> history(static_cast<std::size_t>(latent_dim), 0.0F);
+    if (latent_steps > 0) {  // the last prompt latent seeds the history
+      history.assign(prompt_latents.end() - latent_dim, prompt_latents.end());
+    }
     std::vector<float> noise(static_cast<std::size_t>(latent_dim));
     std::vector<float> sde(static_cast<std::size_t>(flow.steps * latent_dim));
     std::vector<float> latent(static_cast<std::size_t>(latent_dim));
@@ -247,8 +275,51 @@ bool Engine::Generate(const SynthesisRequest& request,
     }
     out.samples.insert(out.samples.end(), audio.begin(), audio.end());
     out.latents = std::move(latents);
+    if (reuse_first_fragment && index == 0) {
+      try {
+        speaker = impl.speaker->EmbedWaveform(audio, config.sample_rate);
+        prompt_latents = EncodePrompt(audio, static_cast<std::uint32_t>(config.sample_rate),
+                                      {}, &rng);
+        prompt_text = fragments[0];
+      } catch (const std::exception& exception) {
+        SetError(error, std::string("fragment prompt failed: ") + exception.what());
+        return false;
+      }
+    }
   }
   return true;
+}
+
+std::vector<float> Engine::EncodePrompt(std::span<const float> audio,
+                                        std::uint32_t sample_rate,
+                                        std::span<const float> noise,
+                                        std::mt19937_64* rng) {
+  const cpu::Model& model = *impl_->model;
+  const ModelConfig& config = model.config();
+  if (sample_rate == 0) {
+    throw std::invalid_argument("reference audio needs a sample rate");
+  }
+  std::vector<float> wave =
+      ResampleLikeTorchaudio(audio, sample_rate, config.sample_rate);
+  // Front padding to hop * patch: the prompt tail seeds the first step.
+  const auto align = static_cast<std::size_t>(config.vae_hop_size) *
+                     static_cast<std::size_t>(config.vae_patch_size);
+  if (const std::size_t rem = wave.size() % align; rem != 0) {
+    wave.insert(wave.begin(), align - rem, 0.0F);
+  }
+  std::int64_t patches = 0;
+  const std::vector<float> params =
+      model.EncodePosterior(wave.data(), static_cast<std::int64_t>(wave.size()), &patches);
+  std::vector<float> eps(static_cast<std::size_t>(patches * config.latent_dim));
+  if (noise.size() == eps.size()) {
+    std::copy(noise.begin(), noise.end(), eps.begin());
+  } else {
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    for (float& value : eps) {
+      value = normal(*rng);
+    }
+  }
+  return model.SamplePosterior(params, eps.data());
 }
 
 std::vector<float> TrimTrailingSilence(std::span<const float> speech,

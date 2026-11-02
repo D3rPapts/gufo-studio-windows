@@ -147,6 +147,14 @@ std::optional<ModelConfig> LoadModelConfigFromPath(const std::string& model_dir,
     SetError(error, "incomplete Ming-3.0-tts audio_tokenizer_config");
     return std::nullopt;
   }
+  const auto* enc = audio->find("enc_kwargs");
+  const auto* enc_backbone = enc != nullptr ? enc->find("backbone") : nullptr;
+  std::int32_t input_dim = 0;
+  if (enc_backbone == nullptr || !ParseQwen2(*enc_backbone, &config.vae_encoder) ||
+      !ReadInt(*enc, "input_dim", &input_dim) || input_dim != config.vae_hop_size) {
+    SetError(error, "incomplete Ming-3.0-tts enc_kwargs");
+    return std::nullopt;
+  }
   if (config.dit.patch_size != 1 || config.dit.history_patch_size != 1 ||
       config.latent_dim <= 0 || config.vae_patch_size <= 0 ||
       config.vae_hop_size <= 0) {

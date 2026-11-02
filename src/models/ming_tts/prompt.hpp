@@ -44,15 +44,21 @@ struct StructuredControls {
 struct InputLayout {
   std::vector<std::uint32_t> ids;
   std::vector<std::size_t> speaker_positions;  // rows replaced by spk_head
+  // First of the prompt-latent rows (after <audio>), or -1 without them.
+  std::int64_t latent_position{-1};
 };
 
-// prompt_contract.build_input_ids for the dense checkpoint without prompt
-// latents. Every piece is tokenized separately, as the reference does.
+// prompt_contract.build_input_ids for the dense checkpoint. Every piece is
+// tokenized separately, as the reference does. With a prompt transcript and
+// prompt_latent_steps > 0 the transcript precedes the text and that many
+// <audioPatch> rows follow <audio>.
 [[nodiscard]] bool BuildInputIds(const Tokenizer& tokenizer,
                                  std::string_view prompt, std::string_view text,
                                  std::size_t num_speakers,
                                  const std::optional<std::string>& instruction,
-                                 InputLayout* layout, std::string* error);
+                                 InputLayout* layout, std::string* error,
+                                 const std::optional<std::string>& prompt_text = {},
+                                 std::size_t prompt_latent_steps = 0);
 
 // MingTTS.prepare_text for languages outside zh/en (no FST normalisation):
 // strip Markdown inline code, trim, cut_text_by_semantic_length(text, 24).

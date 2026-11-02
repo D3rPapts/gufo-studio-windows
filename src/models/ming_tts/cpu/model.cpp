@@ -158,6 +158,15 @@ std::unique_ptr<Model> Model::Load(const std::string& model_dir,
     if (vae.head_out.out_features != c.vae_hop_size * 4 + 2) {
       throw std::runtime_error("unexpected ISTFT head width");
     }
+    VaeEncoder& encoder = model->encoder_;
+    encoder.backbone = LoadQwen2(file, "audio.encoder.encoder.", c.vae_encoder);
+    Qwen2Config aggregator_config = c.vae_encoder;
+    aggregator_config.num_layers = c.vae_encoder_aggregator_layers;
+    encoder.aggregator = LoadQwen2(file, "audio.encoder.aggregator.", aggregator_config);
+    encoder.fc1 = LoadLinear(file, "audio.encoder.fc1", false);
+    encoder.fc2 = LoadLinear(file, "audio.encoder.fc2", true);
+    encoder.fc3 = LoadLinear(file, "audio.encoder.fc3", true);
+    encoder.cls = LoadVector(file, "audio.encoder.cls_embed", c.vae_encoder.hidden_size);
   } catch (const std::exception& exception) {
     set_error(std::string("Ming-3.0-tts weights: ") + exception.what());
     return nullptr;
@@ -510,6 +519,71 @@ std::vector<float> Model::DecodeLatents(const float* latents,
                                   envelope[i + static_cast<std::size_t>(pad)]);
   }
   return audio;
+}
+
+std::vector<float> Model::EncodePosterior(const float* wave,
+                                          std::int64_t samples,
+                                          std::int64_t* patches) const {
+  const std::int64_t hop = config_.vae_hop_size;
+  const std::int64_t patch = config_.vae_patch_size;
+  const std::int64_t h = encoder_.backbone.config.hidden_size;
+  // get_frames: ceil(len / hop) frames of `hop` samples, zero padded.
+  const std::int64_t frames = (samples + hop - 1) / hop;
+  std::vector<float> framed(static_cast<std::size_t>(frames * hop), 0.0F);
+  std::copy(wave, wave + samples, framed.begin());
+  std::vector<float> x1(static_cast<std::size_t>(frames * h));
+  std::vector<float> x2(static_cast<std::size_t>(frames * h));
+  LinearForward(encoder_.fc1, framed.data(), frames, x1.data());
+  LinearForward(encoder_.fc2, x1.data(), frames, x2.data());
+  Qwen2Forward(encoder_.backbone, x2.data(), frames, 0, /*use_cache=*/false,
+               nullptr);
+  RmsNorm(x2.data(), frames, h, encoder_.backbone.final_norm,
+          encoder_.backbone.config.rms_norm_eps);
+  // pad_patch_insert_cls: groups of `patch` frames (zero padded) + CLS.
+  *patches = (frames + patch - 1) / patch;
+  const std::int64_t group = patch + 1;
+  std::vector<float> seq(static_cast<std::size_t>(*patches * group * h), 0.0F);
+  for (std::int64_t p = 0; p < *patches; ++p) {
+    for (std::int64_t f = 0; f < patch; ++f) {
+      const std::int64_t frame = p * patch + f;
+      if (frame < frames) {
+        std::copy(x2.begin() + frame * h, x2.begin() + (frame + 1) * h,
+                  seq.begin() + (p * group + f) * h);
+      }
+    }
+    std::copy(encoder_.cls.begin(), encoder_.cls.end(),
+              seq.begin() + (p * group + patch) * h);
+  }
+  Qwen2Forward(encoder_.aggregator, seq.data(), *patches * group, 0,
+               /*use_cache=*/false, nullptr);
+  std::vector<float> cls_rows(static_cast<std::size_t>(*patches * h));
+  for (std::int64_t p = 0; p < *patches; ++p) {
+    RmsNormTo(seq.data() + (p * group + patch) * h, cls_rows.data() + p * h, 1, h,
+              encoder_.aggregator.final_norm,
+              encoder_.aggregator.config.rms_norm_eps);
+  }
+  std::vector<float> params(
+      static_cast<std::size_t>(*patches * encoder_.fc3.out_features));
+  LinearForward(encoder_.fc3, cls_rows.data(), *patches, params.data());
+  return params;
+}
+
+std::vector<float> Model::SamplePosterior(const std::vector<float>& params,
+                                          const float* noise) const {
+  const std::int64_t d = config_.latent_dim;
+  const auto patches = static_cast<std::int64_t>(params.size()) / (2 * d);
+  std::vector<float> latent(static_cast<std::size_t>(patches * d));
+  for (std::int64_t p = 0; p < patches; ++p) {
+    for (std::int64_t i = 0; i < d; ++i) {
+      const float mean = params[static_cast<std::size_t>(p * 2 * d + i)];
+      const float scale = params[static_cast<std::size_t>(p * 2 * d + d + i)];
+      // softplus with PyTorch's threshold 20
+      const float softplus = scale > 20.0F ? scale : std::log1p(std::exp(scale));
+      latent[static_cast<std::size_t>(p * d + i)] =
+          mean + (softplus + 1e-4F) * noise[p * d + i];
+    }
+  }
+  return latent;
 }
 
 }  // namespace gufo::models::ming_tts::cpu

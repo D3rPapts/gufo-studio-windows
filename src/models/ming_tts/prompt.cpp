@@ -576,9 +576,13 @@ std::string BuildStructuredInstruction(const StructuredControls& c) {
 bool BuildInputIds(const Tokenizer& tokenizer, std::string_view prompt,
                    std::string_view text, std::size_t num_speakers,
                    const std::optional<std::string>& instruction,
-                   InputLayout* layout, std::string* error) {
+                   InputLayout* layout, std::string* error,
+                   const std::optional<std::string>& prompt_text,
+                   std::size_t prompt_latent_steps) {
   layout->ids.clear();
   layout->speaker_positions.clear();
+  layout->latent_position = -1;
+  const bool with_latents = prompt_text.has_value() && prompt_latent_steps > 0;
   auto append = [&](std::string_view piece) {
     std::vector<std::uint32_t> ids;
     if (!tokenizer.Encode(piece, &ids, error)) {
@@ -603,6 +607,9 @@ bool BuildInputIds(const Tokenizer& tokenizer, std::string_view prompt,
     return text.find(m) != std::string_view::npos;
   });
   if (!bgm && !append(kTextInputPrefix)) {
+    return false;
+  }
+  if (with_latents && !append(*prompt_text)) {
     return false;
   }
   if (!append(text) || !append(kUserSuffix) || !append(kAssistantPrefix)) {
@@ -630,6 +637,10 @@ bool BuildInputIds(const Tokenizer& tokenizer, std::string_view prompt,
       *error = "speaker slot count mismatch (text must not contain vision tokens)";
     }
     return false;
+  }
+  if (with_latents) {
+    layout->latent_position = static_cast<std::int64_t>(layout->ids.size());
+    layout->ids.insert(layout->ids.end(), prompt_latent_steps, kAudioPatchId);
   }
   return true;
 }
