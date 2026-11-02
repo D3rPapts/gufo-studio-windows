@@ -19,6 +19,10 @@ struct Linear {
   std::vector<float> bias;  // empty: no bias
 };
 
+// Diagnostics: round the activations of products with more than 8 rows to
+// BF16 first, emulating the rocBLAS BF16 path of the GPU runtime.
+void SetBf16ActivationEmulation(bool enabled);
+
 // y[m, out] = x[m, in] * W^T + b
 void LinearForward(const Linear& layer, const float* x, std::int64_t rows,
                    float* y);

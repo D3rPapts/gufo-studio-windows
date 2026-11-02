@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <map>
 #include <numbers>
 #include <stdexcept>
 #include <string>
@@ -121,11 +123,24 @@ struct Model::Impl {
   std::vector<float> t_values;
   Scratch t_table;
 
+  // Larger products: FP32 tiled kernel (default, matches the CPU path) or
+  // rocBLAS with BF16 activations (GUFO_MING_GEMM=bf16; faster, but the
+  // coarser prefill sends the free-running AR onto another trajectory).
+  bool bf16_gemm{false};
+  // HIP graphs for the per-step flow sampler and aggregator
+  // (GUFO_MING_GRAPHS=0 disables). Captured on the second identical call.
+  bool use_graphs{true};
+  std::map<std::string, hipGraphExec_t> graphs;
+  std::map<std::string, int> graph_seen;
+
   // scratch
   Scratch hidden, normed, q, k, v, attn, proj, gate, up, bf16, misc, head,
       frames, audio;
 
   ~Impl() {
+    for (auto& [key, exec] : graphs) {
+      (void)hipGraphExecDestroy(exec);
+    }
     if (blas != nullptr) {
       (void)rocblas_destroy_handle(blas);
     }
@@ -207,6 +222,10 @@ struct Model::Impl {
           layer.weight, x, y, static_cast<std::size_t>(rows),
           static_cast<std::size_t>(layer.out), static_cast<std::size_t>(layer.in),
           stream);
+    } else if (!bf16_gemm) {
+      LaunchGemmF32Bf16(x, layer.weight, y, static_cast<std::size_t>(rows),
+                        static_cast<std::size_t>(layer.out),
+                        static_cast<std::size_t>(layer.in), stream);
     } else {
       // bf16 scratch holds uint16 values; size in floats rounded up.
       auto* x_bf16 = reinterpret_cast<std::uint16_t*>(
@@ -334,6 +353,46 @@ struct Model::Impl {
 
   void Sync() { Check(hipStreamSynchronize(stream), "synchronize"); }
 
+  // Runs `body` (kernel launches on `stream` only, fixed buffers) eagerly the
+  // first time a key is seen, then captures it once and replays the graph.
+  template <typename Body>
+  void RunGraph(const std::string& key, Body&& body) {
+    if (!use_graphs) {
+      body();
+      return;
+    }
+    if (const auto found = graphs.find(key); found != graphs.end()) {
+      Check(hipGraphLaunch(found->second, stream), "graph launch");
+      return;
+    }
+    if (graph_seen[key]++ == 0) {
+      body();
+      return;
+    }
+    hipGraph_t captured = nullptr;
+    if (hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal) != hipSuccess) {
+      use_graphs = false;
+      body();
+      return;
+    }
+    body();
+    const hipError_t end = hipStreamEndCapture(stream, &captured);
+    hipGraphExec_t exec = nullptr;
+    if (end != hipSuccess || captured == nullptr ||
+        hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0) != hipSuccess) {
+      if (captured != nullptr) {
+        (void)hipGraphDestroy(captured);
+      }
+      // Capture failed: stay eager from now on (the body did not run).
+      use_graphs = false;
+      body();
+      return;
+    }
+    (void)hipGraphDestroy(captured);
+    graphs.emplace(key, exec);
+    Check(hipGraphLaunch(exec, stream), "graph launch");
+  }
+
   void ToDevice(float* device, const float* host, std::size_t count) {
     Check(hipMemcpyAsync(device, host, count * sizeof(float), hipMemcpyHostToDevice,
                          stream),
@@ -381,6 +440,12 @@ struct Model::Impl {
   // t-embedding rows for the sampler timesteps (cached per step count).
   const float* TimeRows(std::int32_t steps, const DitBuffers& b) {
     if (steps != t_steps) {
+      // The table may move: graphs recorded against the old one are stale.
+      for (auto& [key, exec] : graphs) {
+        (void)hipGraphExecDestroy(exec);
+      }
+      graphs.clear();
+      graph_seen.clear();
       const std::size_t d = static_cast<std::size_t>(flow.config.hidden_size);
       t_values = cpu::Model::FlowTimesteps(steps);
       float* table = t_table.Ensure(static_cast<std::size_t>(steps) * d);
@@ -422,6 +487,10 @@ std::unique_ptr<Model> Model::Create(const cpu::Model& cpu_model, std::string* e
   try {
     Impl& m = *impl;
     m.cpu = &cpu_model;
+    const char* gemm = std::getenv("GUFO_MING_GEMM");
+    m.bf16_gemm = gemm != nullptr && std::string(gemm) == "bf16";
+    const char* graphs_env = std::getenv("GUFO_MING_GRAPHS");
+    m.use_graphs = !(graphs_env != nullptr && std::string(graphs_env) == "0");
     Check(hipStreamCreateWithFlags(&m.stream, hipStreamNonBlocking), "stream");
     Check(rocblas_create_handle(&m.blas), "create handle");
     Check(rocblas_set_atomics_mode(m.blas, rocblas_atomics_not_allowed), "atomics");
@@ -470,6 +539,10 @@ std::unique_ptr<Model> Model::Create(const cpu::Model& cpu_model, std::string* e
 }
 
 void Model::ResetBackbone() { impl_->cache_length = 0; }
+
+void Model::SetGraphs(bool enabled) { impl_->use_graphs = enabled; }
+void Model::SetBf16Gemm(bool enabled) { impl_->bf16_gemm = enabled; }
+bool Model::graphs_enabled() const noexcept { return impl_->use_graphs; }
 
 void Model::RunBackbone(const float* embeddings, std::int64_t rows, float* normed) {
   Impl& m = *impl_;
@@ -530,19 +603,27 @@ void Model::SampleFlow(const float* cond, const float* history, const float* noi
   if (stochastic) {
     m.ToDevice(b.sde, sde_noise, static_cast<std::size_t>(options.steps) * lat);
   }
-  m.Linear(m.flow_c, b.cond, 1, b.c_cond);
-  m.Linear(m.flow_x, b.hist, 1, b.x_hist);
-  for (std::int32_t s = 0; s < options.steps; ++s) {
-    const float dt = m.t_values[static_cast<std::size_t>(s) + 1] -
-                     m.t_values[static_cast<std::size_t>(s)];
-    m.Velocity(b, t_rows + static_cast<std::size_t>(s) * d, b.y);
-    LaunchEulerStep(b.y, b.vel, options.cfg, dt, lat, m.stream);
-    if (stochastic) {
-      const float scale = options.sigma * std::sqrt(options.temperature) *
-                          std::sqrt(std::fabs(dt));
-      LaunchAxpy(b.y, b.sde + static_cast<std::size_t>(s) * lat, scale, lat, m.stream);
+  const std::string key = "flow:" + std::to_string(options.steps) + ":" +
+                          std::to_string(options.cfg) + ":" +
+                          (stochastic ? std::to_string(options.sigma) + ":" +
+                                            std::to_string(options.temperature)
+                                      : std::string("0"));
+  m.RunGraph(key, [&] {
+    m.Linear(m.flow_c, b.cond, 1, b.c_cond);
+    m.Linear(m.flow_x, b.hist, 1, b.x_hist);
+    for (std::int32_t s = 0; s < options.steps; ++s) {
+      const float dt = m.t_values[static_cast<std::size_t>(s) + 1] -
+                       m.t_values[static_cast<std::size_t>(s)];
+      m.Velocity(b, t_rows + static_cast<std::size_t>(s) * d, b.y);
+      LaunchEulerStep(b.y, b.vel, options.cfg, dt, lat, m.stream);
+      if (stochastic) {
+        const float scale = options.sigma * std::sqrt(options.temperature) *
+                            std::sqrt(std::fabs(dt));
+        LaunchAxpy(b.y, b.sde + static_cast<std::size_t>(s) * lat, scale, lat,
+                   m.stream);
+      }
     }
-  }
+  });
   m.ToHost(latent, b.y, lat);
 }
 
@@ -553,13 +634,16 @@ void Model::AggregateLatent(const float* latent, float* out) {
   const std::size_t lat = static_cast<std::size_t>(m.cpu->config().latent_dim);
   const std::size_t h = static_cast<std::size_t>(m.cpu->config().llm.hidden_size);
   m.ToDevice(b.y, latent, lat);
-  Check(hipMemcpyAsync(b.seq, m.agg_cls, d * sizeof(float), hipMemcpyDeviceToDevice,
-                       m.stream),
-        "cls");
-  m.Linear(m.agg_x, b.y, 1, b.seq + d);
-  m.DitForward(m.aggregator, b.seq, 1, 2, b.nrm, b.q, b.k, b.v, b.attn, b.proj, b.ff);
-  LaunchRmsNorm(b.seq, m.aggregator.final_norm, b.last, 1, d, 1e-6F, m.stream);
-  m.Linear(m.aggregator.final_linear, b.last, 1, b.cond);
+  m.RunGraph("aggregator", [&] {
+    Check(hipMemcpyAsync(b.seq, m.agg_cls, d * sizeof(float), hipMemcpyDeviceToDevice,
+                         m.stream),
+          "cls");
+    m.Linear(m.agg_x, b.y, 1, b.seq + d);
+    m.DitForward(m.aggregator, b.seq, 1, 2, b.nrm, b.q, b.k, b.v, b.attn, b.proj,
+                 b.ff);
+    LaunchRmsNorm(b.seq, m.aggregator.final_norm, b.last, 1, d, 1e-6F, m.stream);
+    m.Linear(m.aggregator.final_linear, b.last, 1, b.cond);
+  });
   m.ToHost(out, b.cond, h);
 }
 

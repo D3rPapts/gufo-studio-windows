@@ -37,6 +37,12 @@ public:
   [[nodiscard]] std::vector<float> DecodeAudio(const float* latents,
                                                std::int64_t frames) override;
 
+  // Test/tuning switches (defaults: graphs on, FP32 tiled GEMM; environment
+  // GUFO_MING_GRAPHS=0 / GUFO_MING_GEMM=bf16 at creation).
+  void SetGraphs(bool enabled);
+  void SetBf16Gemm(bool enabled);
+  [[nodiscard]] bool graphs_enabled() const noexcept;
+
   // Single DiT velocity evaluation (cond, uncond) [2, latent], for tests.
   void FlowVelocity(const float* x, float t, const float* cond,
                     const float* history, float* cond_uncond);

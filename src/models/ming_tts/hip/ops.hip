@@ -43,6 +43,67 @@ __device__ float BlockMax(float value, float* shared) {
   return total;
 }
 
+constexpr int kTile = 64;
+constexpr int kTileK = 16;
+
+__device__ inline float Bf16ToFloat(std::uint16_t bits) {
+  return __uint_as_float(static_cast<unsigned>(bits) << 16U);
+}
+
+// 256 threads, each computes a 4x4 block of the 64x64 output tile.
+__global__ void GemmF32Bf16Kernel(const float* a, const std::uint16_t* w, float* c,
+                                  std::size_t m, std::size_t n, std::size_t k) {
+  __shared__ float as[kTileK][kTile + 4];
+  __shared__ float ws[kTileK][kTile + 4];
+  const unsigned tx = threadIdx.x % 16;
+  const unsigned ty = threadIdx.x / 16;
+  const std::size_t m0 = static_cast<std::size_t>(blockIdx.y) * kTile;
+  const std::size_t n0 = static_cast<std::size_t>(blockIdx.x) * kTile;
+  float acc[4][4] = {};
+  for (std::size_t k0 = 0; k0 < k; k0 += kTileK) {
+    for (unsigned i = threadIdx.x; i < kTile * kTileK; i += blockDim.x) {
+      const unsigned row = i / kTileK;
+      const unsigned col = i % kTileK;
+      const std::size_t gk = k0 + col;
+      const std::size_t gm = m0 + row;
+      const std::size_t gn = n0 + row;
+      as[col][row] = (gm < m && gk < k) ? a[gm * k + gk] : 0.0F;
+      ws[col][row] = (gn < n && gk < k) ? Bf16ToFloat(w[gn * k + gk]) : 0.0F;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kTileK; ++kk) {
+      float av[4];
+      float wv[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        av[i] = as[kk][ty * 4 + i];
+        wv[i] = ws[kk][tx * 4 + i];
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          acc[i][j] = fmaf(av[i], wv[j], acc[i][j]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int i = 0; i < 4; ++i) {
+    const std::size_t gm = m0 + ty * 4 + i;
+    if (gm >= m) {
+      continue;
+    }
+    for (int j = 0; j < 4; ++j) {
+      const std::size_t gn = n0 + tx * 4 + j;
+      if (gn < n) {
+        c[gm * n + gn] = acc[i][j];
+      }
+    }
+  }
+}
+
 __global__ void AddBiasKernel(float* y, const float* bias, std::size_t rows,
                               std::size_t cols) {
   const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -318,6 +379,15 @@ __global__ void OverlapAddKernel(const float* frames_in, const float* window,
 }
 
 }  // namespace
+
+void LaunchGemmF32Bf16(const float* a, const std::uint16_t* w, float* c,
+                       std::size_t m, std::size_t n, std::size_t k,
+                       hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((n + kTile - 1) / kTile),
+                  static_cast<unsigned>((m + kTile - 1) / kTile));
+  hipLaunchKernelGGL(GemmF32Bf16Kernel, grid, dim3(kThreads), 0, stream, a, w, c, m,
+                     n, k);
+}
 
 void LaunchAddBias(float* y, const float* bias, std::size_t rows,
                    std::size_t cols, hipStream_t stream) {

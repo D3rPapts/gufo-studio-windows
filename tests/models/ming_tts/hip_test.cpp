@@ -93,6 +93,61 @@ std::vector<float> Envelope(const std::vector<float>& wav) {
   return env;
 }
 
+// Free-running AR on a backend with the oracle's start noise; returns the
+// latents. Mirrors Engine::Generate (stop > 0.5 after step 3).
+std::vector<float> FreeRun(ming::Backend& backend, const std::vector<float>& embeds,
+                           std::int64_t rows, std::int64_t hidden, std::int64_t lat,
+                           const std::vector<float>& noises, double* ms_per_step) {
+  backend.ResetBackbone();
+  std::vector<float> normed(static_cast<std::size_t>(rows * hidden));
+  backend.RunBackbone(embeds.data(), rows, normed.data());
+  std::vector<float> z(normed.end() - hidden, normed.end());
+  std::vector<float> history(static_cast<std::size_t>(lat), 0.0F), latent(history.size()),
+      next(static_cast<std::size_t>(hidden)), out;
+  const auto t = std::chrono::steady_clock::now();
+  std::int64_t step = 0;
+  for (; step < 512 - rows; ++step) {
+    const std::size_t at = static_cast<std::size_t>(step * lat);
+    std::vector<float> noise(static_cast<std::size_t>(lat), 0.0F);
+    for (std::size_t i = 0; i < noise.size() && at + i < noises.size(); ++i) {
+      noise[i] = noises[at + i];
+    }
+    backend.SampleFlow(z.data(), history.data(), noise.data(), nullptr, {}, latent.data());
+    out.insert(out.end(), latent.begin(), latent.end());
+    if (backend.StopAt(z.data()) > 0.5F && step > 3) {
+      ++step;
+      break;
+    }
+    backend.AggregateLatent(latent.data(), next.data());
+    backend.RunBackbone(next.data(), 1, z.data());
+    history = latent;
+  }
+  *ms_per_step = Seconds(t) * 1e3 / static_cast<double>(std::max<std::int64_t>(1, step));
+  return out;
+}
+
+// Per-step latent cosine against a reference trajectory.
+void Divergence(const std::string& name, const std::vector<float>& got,
+                const std::vector<float>& want, std::size_t lat) {
+  std::string curve;
+  long first_bad = -1;
+  const std::size_t steps = std::min(got.size(), want.size()) / lat;
+  for (std::size_t s = 0; s < steps; ++s) {
+    const double c = Cos(got.data() + s * lat, want.data() + s * lat, lat);
+    if (first_bad < 0 && c < 0.999) {
+      first_bad = static_cast<long>(s);
+    }
+    if (s % 4 == 0 || s + 1 == steps) {
+      char buffer[32];
+      std::snprintf(buffer, sizeof(buffer), " %zu:%.4f", s, c);
+      curve += buffer;
+    }
+  }
+  std::printf("     %s: %zu vs %zu steps, first step < 0.999: %ld;%s\n", name.c_str(),
+              got.size() / lat, want.size() / lat, first_bad, curve.c_str());
+  std::fflush(stdout);
+}
+
 }  // namespace
 
 int main() {
@@ -203,6 +258,33 @@ int main() {
   const std::vector<float> probe = oracle->ToF32("vae_probe_latents");
   Compare("VAE probe 300 frames", gpu->DecodeAudio(probe.data(), static_cast<std::int64_t>(probe.size() / l)),
           oracle->ToF32("vae_probe_wav"), 0.98);
+  // --- free running directly on the backends: where do trajectories split?
+  {
+    double ms = 0;
+    gpu->SetBf16Gemm(false);
+    gpu->SetGraphs(true);
+    const std::vector<float> fp32_graph = FreeRun(*gpu, embeds, rows, hidden, lat, noises, &ms);
+    std::printf("     GPU free run (FP32 GEMM, graphs %s): %.2f ms/step\n",
+                gpu->graphs_enabled() ? "on" : "off(capture failed)", ms);
+    Divergence("GPU FP32 vs oracle", fp32_graph, latents, l);
+    Expect("GPU FP32 free-run step count",
+           std::llabs(static_cast<long long>(fp32_graph.size() / l) - steps) <= 1,
+           std::to_string(fp32_graph.size() / l) + " vs " + std::to_string(steps));
+    const std::vector<float> again = FreeRun(*gpu, embeds, rows, hidden, lat, noises, &ms);
+    std::printf("     GPU free run again (graphs replayed): %.2f ms/step\n", ms);
+    gpu->SetGraphs(false);
+    const std::vector<float> eager = FreeRun(*gpu, embeds, rows, hidden, lat, noises, &ms);
+    std::printf("     GPU free run eager (no graphs): %.2f ms/step\n", ms);
+    Compare("graph replay == eager (latents)", again, eager, 0.99999);
+    Compare("graph first run == replay (latents)", fp32_graph, again, 0.99999);
+    gpu->SetGraphs(true);
+    gpu->SetBf16Gemm(true);
+    const std::vector<float> bf16 = FreeRun(*gpu, embeds, rows, hidden, lat, noises, &ms);
+    Divergence("GPU BF16-GEMM prefill vs oracle (info)", bf16, latents, l);
+    gpu->SetBf16Gemm(false);
+    const std::vector<float> cpu = FreeRun(*cpu_model, embeds, rows, hidden, lat, noises, &ms);
+    Divergence("CPU vs oracle (info)", cpu, latents, l);
+  }
   gpu.reset();
 
   // --- free-running engine on the GPU (oracle start noise)

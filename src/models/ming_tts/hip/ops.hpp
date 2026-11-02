@@ -14,6 +14,11 @@
 
 namespace gufo::models::ming_tts::hip {
 
+// C[M, N] = A[M, K] (FP32) * W[N, K]^T (BF16), FP32 accumulation; 64x64
+// tiles. Keeps prefill and VAE activations in FP32 (rocBLAS needs BF16 A).
+void LaunchGemmF32Bf16(const float* a, const std::uint16_t* w, float* c,
+                       std::size_t m, std::size_t n, std::size_t k,
+                       hipStream_t stream);
 // y[r, c] += bias[c]
 void LaunchAddBias(float* y, const float* bias, std::size_t rows,
                    std::size_t cols, hipStream_t stream);

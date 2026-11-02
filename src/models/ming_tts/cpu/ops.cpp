@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
@@ -169,8 +170,25 @@ bool TryTallTile(const Linear& layer, const float* x, std::int64_t r0,
 
 }  // namespace
 
+namespace {
+bool g_bf16_activations = false;
+}  // namespace
+
+void SetBf16ActivationEmulation(bool enabled) { g_bf16_activations = enabled; }
+
 void LinearForward(const Linear& layer, const float* x, std::int64_t rows,
                    float* y) {
+  std::vector<float> rounded;
+  if (g_bf16_activations && rows > 8) {
+    rounded.assign(x, x + rows * layer.in_features);
+    for (float& value : rounded) {
+      std::uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      bits = (bits + 0x7FFFU + ((bits >> 16U) & 1U)) & 0xFFFF0000U;  // RNE
+      std::memcpy(&value, &bits, 4);
+    }
+    x = rounded.data();
+  }
   const std::int64_t out = layer.out_features;
   const std::int64_t column_blocks = (out + 3) / 4;
   // Rows are processed in panels so a panel of activations stays in cache

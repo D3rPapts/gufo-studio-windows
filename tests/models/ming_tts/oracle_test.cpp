@@ -452,6 +452,55 @@ int main() {
     std::printf("     zero-shot stage %.1f s\n", Seconds(zstart));
   }
 
+  // ---------- diagnostics: free run with BF16-rounded large-batch inputs ----
+  if (!stages.empty() && Want(stages, "bf16sim")) {
+    for (const bool emulate : {false, true}) {
+      ming::cpu::SetBf16ActivationEmulation(emulate);
+      auto engine = ming::Engine::Create(model_dir.string(), &error);
+      const std::vector<float> noises = oracle->ToF32("noise");
+      const std::vector<float> want = oracle->ToF32("latents");
+      ming::SynthesisRequest request;
+      request.text = meta.member_str("text");
+      request.emotion = emotion;
+      request.speaker_embedding = oracle->ToF32("spk_emb");
+      request.raw_text = true;
+      request.noise_source = [&](std::size_t, std::int64_t step, float* noise) {
+        for (std::size_t i = 0; i < 64; ++i) {
+          const std::size_t at = static_cast<std::size_t>(step) * 64 + i;
+          noise[i] = at < noises.size() ? noises[at] : 0.0F;
+        }
+      };
+      ming::SynthesisResult result;
+      if (engine == nullptr || !engine->Generate(request, {}, &result, &error)) {
+        std::printf("FAIL bf16sim: %s\n", error.c_str());
+        return 1;
+      }
+      std::string curve;
+      long first_bad = -1;
+      const std::size_t n = std::min(result.latents.size(), want.size()) / 64;
+      for (std::size_t s = 0; s < n; ++s) {
+        double d = 0, a = 0, b = 0;
+        for (std::size_t i = 0; i < 64; ++i) {
+          d += static_cast<double>(result.latents[s * 64 + i]) * want[s * 64 + i];
+          a += static_cast<double>(result.latents[s * 64 + i]) * result.latents[s * 64 + i];
+          b += static_cast<double>(want[s * 64 + i]) * want[s * 64 + i];
+        }
+        const double c = d / std::sqrt(a * b);
+        if (first_bad < 0 && c < 0.999) first_bad = static_cast<long>(s);
+        if (s % 4 == 0) {
+          char buffer[32];
+          std::snprintf(buffer, sizeof(buffer), " %zu:%.4f", s, c);
+          curve += buffer;
+        }
+      }
+      std::printf("     bf16sim %s: %lld steps (oracle %zu), first < 0.999 at %ld;%s\n",
+                  emulate ? "BF16 activations (rows>8)" : "FP32", 
+                  static_cast<long long>(result.fragment_steps.at(0)), want.size() / 64,
+                  first_bad, curve.c_str());
+    }
+    ming::cpu::SetBf16ActivationEmulation(false);
+  }
+
   // ---------------------------------------------------- free running ----
   if (Want(stages, "free")) {
     const auto fstart = std::chrono::steady_clock::now();
