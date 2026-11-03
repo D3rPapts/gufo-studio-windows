@@ -24,6 +24,8 @@ constexpr std::string_view kSpeechPath = "/v1/audio/speech";
 constexpr std::string_view kVoicesPath = "/v1/audio/voices";
 constexpr std::size_t kMaximumInputBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 8192;
+// VoxCPM2 encodes the whole reference clip into its 8192-position context.
+constexpr std::size_t kMaximumVoxCpm2ReferenceSeconds = 60;
 
 bool ReadUnsigned(const json::Value& body, std::string_view name,
                   std::size_t default_value, std::size_t maximum,
@@ -208,7 +210,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   }
   if (model->str() != service.model_id() && model->str() != "qwen3-tts" &&
       !(service.is_fish_drama3() && model->str() == "fish-drama-3") &&
-      !(service.is_ming_tts() && model->str() == "ming-3.0-tts")) {
+      !(service.is_ming_tts() && model->str() == "ming-3.0-tts") &&
+      !(service.is_voxcpm2() && model->str() == "voxcpm2")) {
     return Error(400, "Bad Request", "unsupported audio speech model",
                  "invalid_model");
   }
@@ -261,7 +264,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     reference_text = preset->reference_text;
     speaker_embedding_only = preset->speaker_embedding_only;
   } else if (service.variant() == models::qwen3_tts::ModelVariant::kBase &&
-             ((!service.is_fish_drama3() && !service.is_ming_tts()) ||
+             ((!service.is_fish_drama3() && !service.is_ming_tts() &&
+               !service.is_voxcpm2()) ||
               body.find("reference_audio") != nullptr ||
               body.find("reference_text") != nullptr)) {
     const json::Value* encoded_audio = body.find("reference_audio");
@@ -283,9 +287,13 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                    "invalid_voice_clone_mode");
     }
     // Ming-3.0-tts clones from the CAM++ speaker embedding alone.
+    // VoxCPM2 clones from the reference audio alone unless a transcript (or
+    // voice_clone_mode "icl") asks for the reference + continuation layout.
     speaker_embedding_only =
         service.is_ming_tts() ||
-        (clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only");
+        (clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only") ||
+        (service.is_voxcpm2() && clone_mode == nullptr &&
+         (clone_text == nullptr || !clone_text->is_string() || clone_text->str().empty()));
     if (!speaker_embedding_only &&
         (clone_text == nullptr || !clone_text->is_string() ||
          clone_text->str().empty())) {
@@ -356,12 +364,15 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                    "invalid_parameter_type");
     }
   }
-  if (!body.member_str("emotion").empty() && !service.is_ming_tts()) {
+  if (!body.member_str("emotion").empty() && !service.is_ming_tts() &&
+      !service.is_voxcpm2()) {
     return Error(400, "Bad Request",
-                 "'emotion' is supported only by Ming-3.0-tts",
+                 "'emotion' is supported only by Ming-3.0-tts and VoxCPM2",
                  "unsupported_field");
   }
-  if (!body.member_str("emotion").empty() &&
+  // VoxCPM2 takes any free-text style ("froehlich", "whispering ..."); Ming
+  // only knows its seven labels.
+  if (!body.member_str("emotion").empty() && service.is_ming_tts() &&
       !models::ming_tts::EmotionLabel(body.member_str("emotion")).has_value()) {
     return Error(400, "Bad Request",
                  "'emotion' must be happy, sad, angry, fear, disgust, surprise "
@@ -421,8 +432,19 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   // callers from repeating it -- naming an Italian voice without a language
   // would otherwise synthesize it as English. An explicit request language
   // still wins, so one voice can be driven in another language on purpose.
+  if (service.is_voxcpm2() && !reference_audio.samples.empty() &&
+      reference_audio.sample_rate > 0 && reference_audio.channels > 0 &&
+      reference_audio.samples.size() / reference_audio.channels >
+          static_cast<std::size_t>(reference_audio.sample_rate) *
+              kMaximumVoxCpm2ReferenceSeconds) {
+    return Error(400, "Bad Request",
+                 "VoxCPM2 reference audio must not exceed " +
+                     std::to_string(kMaximumVoxCpm2ReferenceSeconds) + " seconds",
+                 "invalid_reference_audio");
+  }
   std::string language = body.member_str("language");
-  if (language.empty() && service.is_ming_tts()) {
+  if (language.empty() && (service.is_ming_tts() || service.is_voxcpm2())) {
+    // VoxCPM2 detects the language from the text and ignores this field.
     // Ming's own default: no "Target language" line unless a preset sets one.
     if (preset != nullptr) {
       language = preset->language;

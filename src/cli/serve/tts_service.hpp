@@ -46,8 +46,8 @@ struct TtsServiceOptions {
   Runner runner;
 };
 
-/// Synchronous, bounded native TTS service (supports Qwen3-TTS, Fish Drama-3
-/// and Ming-3.0-tts).
+/// Synchronous, bounded native TTS service (supports Qwen3-TTS, Fish Drama-3,
+/// Ming-3.0-tts and VoxCPM2).
 class TtsService {
 public:
   explicit TtsService(TtsServiceOptions options);
@@ -69,6 +69,7 @@ public:
   [[nodiscard]] models::qwen3_tts::ModelVariant variant() const noexcept;
   [[nodiscard]] bool is_fish_drama3() const noexcept;
   [[nodiscard]] bool is_ming_tts() const noexcept;
+  [[nodiscard]] bool is_voxcpm2() const noexcept;
   [[nodiscard]] std::uint32_t sample_rate() const noexcept;
 
   [[nodiscard]] bool Synthesize(
