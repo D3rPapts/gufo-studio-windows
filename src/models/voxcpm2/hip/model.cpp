@@ -25,6 +25,9 @@ namespace ming = ming_tts::hip;
 // Up to this many rows a product runs as a BF16 GEMV per row; above it the
 // FP32-activation tiled GEMM takes over (keeps the math FP32 like the CPU).
 constexpr std::int64_t kGemvRows = 8;
+// Up to this many rows the split-K skinny GEMM (32-row passes) is used; the
+// 64x64 tile GEMM only fills a handful of the 40 CUs at DiT sizes (22 rows).
+constexpr std::int64_t kSkinnyMaxRows = 128;
 
 void Check(hipError_t status, const char* what) {
   if (status != hipSuccess) {
@@ -184,6 +187,12 @@ struct Model::Impl {
   DevCache base_cache, residual_cache;
 
   bool use_graphs{true};
+  // Split-K skinny GEMM for 9..128 rows (GUFO_VOXCPM_SKINNY=0: old tile GEMM).
+  bool use_skinny{true};
+  std::size_t max_partial{0};
+  float* partial_main{nullptr};  // skinny partial sums (eager paths)
+  float* partial_flow{nullptr};  // same for the graph-captured sampler
+  bool in_flow{false};
   std::map<std::tuple<std::int32_t, float, bool>, hipGraphExec_t> graphs;
   std::map<std::tuple<std::int32_t, float, bool>, int> graph_seen;
   // Time-embedding rows per timesteps setting: [executed steps, dit_hidden].
@@ -227,6 +236,8 @@ struct Model::Impl {
     out.in = linear.in_features;
     out.weight = Upload(linear.weight, static_cast<std::size_t>(out.out * out.in));
     out.bias = UploadVector(linear.bias);
+    max_partial = std::max(max_partial, SkinnyPartialFloats(static_cast<std::size_t>(out.out),
+                                                            static_cast<std::size_t>(out.in)));
     if (out.in % 8 != 0) {
       throw std::runtime_error("VoxCPM2 HIP runtime needs in_features % 8 == 0");
     }
@@ -272,6 +283,11 @@ struct Model::Impl {
                                                static_cast<std::size_t>(rows),
                                                static_cast<std::size_t>(layer.out),
                                                static_cast<std::size_t>(layer.in), stream);
+    } else if (use_skinny && rows <= kSkinnyMaxRows) {
+      LaunchSkinnyGemm(xin, layer.weight, layer.bias, y, static_cast<std::size_t>(rows),
+                       static_cast<std::size_t>(layer.out), static_cast<std::size_t>(layer.in),
+                       in_flow ? partial_flow : partial_main, stream);
+      return;  // bias added in the reduction
     } else {
       ming::LaunchGemmF32Bf16(xin, layer.weight, y, static_cast<std::size_t>(rows),
                               static_cast<std::size_t>(layer.out),
@@ -494,6 +510,15 @@ std::unique_ptr<Model> Model::Create(const cpu::Model& cpu_model, std::string* e
     m.rope_cos = m.UploadVector(cpu_model.rope_cos());
     m.rope_sin = m.UploadVector(cpu_model.rope_sin());
     m.EnsureFlowBuffers();
+    const char* skinny_env = std::getenv("GUFO_VOXCPM_SKINNY");
+    m.use_skinny = !(skinny_env != nullptr && std::string(skinny_env) == "0");
+    for (float** buffer : {&m.partial_main, &m.partial_flow}) {
+      void* device = nullptr;
+      Check(hipMalloc(&device, std::max<std::size_t>(m.max_partial, 64) * sizeof(float)),
+            "partial alloc");
+      m.allocations.push_back(device);
+      *buffer = static_cast<float*>(device);
+    }
   } catch (const std::exception& exception) {
     if (error != nullptr) {
       *error = std::string("VoxCPM2 HIP runtime: ") + exception.what();
@@ -504,6 +529,18 @@ std::unique_ptr<Model> Model::Create(const cpu::Model& cpu_model, std::string* e
 }
 
 void Model::SetGraphs(bool enabled) { impl_->use_graphs = enabled; }
+void Model::SetSkinnyGemm(bool enabled) {
+  Impl& m = *impl_;
+  if (m.use_skinny != enabled) {
+    for (auto& [key, exec] : m.graphs) {  // recorded with the other kernels
+      (void)hipGraphExecDestroy(exec);
+    }
+    m.graphs.clear();
+    m.graph_seen.clear();
+  }
+  m.use_skinny = enabled;
+}
+bool Model::skinny_gemm() const noexcept { return impl_->use_skinny; }
 bool Model::graphs_enabled() const noexcept { return impl_->use_graphs; }
 
 void Model::Prefill(const std::int64_t* ids, const float* feats, const std::uint8_t* audio_mask,
@@ -559,6 +596,7 @@ void Model::SamplePatch(const float* lm_hidden, const float* residual_hidden,
   m.ToDevice(m.f_prev.data, prev_patch, pd * sizeof(float));
   m.ToDevice(m.f_x.data, noise, pd * sizeof(float));
   auto body = [&] {
+    m.in_flow = true;
     m.Linear(m.lm_to_dit, m.f_lm.data, 1, m.f_mu.data);
     m.Linear(m.res_to_dit, m.f_res.data, 1, m.f_mu.data + dh);
     m.Linear(m.dit_cond, m.f_prev.data, static_cast<std::int64_t>(p), m.f_cond.data);
@@ -567,6 +605,7 @@ void Model::SamplePatch(const float* lm_hidden, const float* residual_hidden,
       LaunchCfgEuler(m.f_x.data, m.f_vel.data, options.cfg, schedule[s].dt, pd,
                      options.cfg_zero_star, m.stream);
     }
+    m.in_flow = false;
   };
   const auto key = std::make_tuple(options.timesteps, options.cfg, options.cfg_zero_star);
   if (!m.use_graphs) {
@@ -654,7 +693,9 @@ void Model::Velocity(const float* x, const float* mu, const float* cond, float t
   m.ToDevice(m.f_prev.data, cond, pd * sizeof(float));
   m.ToDevice(m.f_x.data, x, pd * sizeof(float));
   m.Linear(m.dit_cond, m.f_prev.data, static_cast<std::int64_t>(p), m.f_cond.data);
+  m.in_flow = true;
   m.VelocityDevice(m.f_tmp.data);
+  m.in_flow = false;
   m.ToHost(out, m.f_vel.data, 2 * pd * sizeof(float));
 }
 

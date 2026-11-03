@@ -231,7 +231,326 @@ __global__ void CfgEulerKernel(float* x, const float* vel, float cfg, float dt, 
   }
 }
 
+// ---- skinny split-K GEMM ---------------------------------------------------
+constexpr int kSkCols = 32;                       // output columns per block
+constexpr int kSkSlice = static_cast<int>(kSkinnySlice);
+constexpr int kSkRows = static_cast<int>(kSkinnyRows);
+
+__device__ inline float Bf16Bits(std::uint16_t bits) {
+  return __uint_as_float(static_cast<unsigned>(bits) << 16U);
+}
+
+// Block (256 threads) = 32 columns x one K slice for up to 32 rows. Weights
+// are staged through LDS with coalesced 16-byte loads; thread (col, g)
+// accumulates rows g, g + 8, g + 16, g + 24.
+__global__ void SkinnyGemmKernel(const float* x, const std::uint16_t* w, float* partial,
+                                 int m, int n, int k) {
+  __shared__ float xs[kSkRows][kSkSlice + 1];
+  __shared__ float ws[kSkCols][kSkSlice + 1];
+  const int n0 = blockIdx.x * kSkCols;
+  const int split = blockIdx.y;
+  const int k0 = split * kSkSlice;
+  const int kn = min(kSkSlice, k - k0);
+  for (int i = threadIdx.x; i < kSkRows * kSkSlice; i += blockDim.x) {
+    const int r = i / kSkSlice;
+    const int c = i % kSkSlice;
+    xs[r][c] = (r < m && c < kn) ? x[static_cast<std::size_t>(r) * k + k0 + c] : 0.0F;
+  }
+  // 32 rows x 128 bf16 = 32 x 16 uint4 loads
+  for (int i = threadIdx.x; i < kSkCols * (kSkSlice / 8); i += blockDim.x) {
+    const int r = i / (kSkSlice / 8);
+    const int c8 = (i % (kSkSlice / 8)) * 8;
+    const int j = n0 + r;
+    if (j < n && c8 < kn) {
+      const uint4 raw =
+          *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(j) * k + k0 + c8);
+      const unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        ws[r][c8 + 2 * e] = Bf16Bits(static_cast<std::uint16_t>(words[e] & 0xFFFFU));
+        ws[r][c8 + 2 * e + 1] = Bf16Bits(static_cast<std::uint16_t>(words[e] >> 16U));
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        ws[r][c8 + e] = 0.0F;
+      }
+    }
+  }
+  __syncthreads();
+  const int col = threadIdx.x % kSkCols;
+  const int g = threadIdx.x / kSkCols;  // 0..7
+  float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+  for (int kk = 0; kk < kn; ++kk) {
+    const float wv = ws[col][kk];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      acc[r] = fmaf(wv, xs[g + 8 * r][kk], acc[r]);
+    }
+  }
+  const int j = n0 + col;
+  if (j < n) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int row = g + 8 * r;
+      if (row < m) {
+        partial[(static_cast<std::size_t>(split) * kSkRows + row) * n + j] = acc[r];
+      }
+    }
+  }
+}
+
+__global__ void SkinnyReduceKernel(const float* partial, const float* bias, float* y, int m,
+                                   int n, int splits) {
+  const std::size_t index = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (index >= static_cast<std::size_t>(m) * n) {
+    return;
+  }
+  const int row = static_cast<int>(index / n);
+  const int j = static_cast<int>(index % n);
+  float sum = bias != nullptr ? bias[j] : 0.0F;
+  for (int s = 0; s < splits; ++s) {
+    sum += partial[(static_cast<std::size_t>(s) * kSkRows + row) * n + j];
+  }
+  y[index] = sum;
+}
+
+// ---- AudioVAE kernels --------------------------------------------------------
+constexpr int kTile = 64;
+constexpr int kTileK = 16;
+
+// C[M, N] = A[M, K] B[K, N] (+ bias[m]); 256 threads, 4x4 outputs each.
+__global__ void GemmNNKernel(const float* a, const float* b, const float* bias, float* c,
+                             std::size_t m, std::size_t n, std::size_t k) {
+  __shared__ float as[kTileK][kTile + 4];
+  __shared__ float bs[kTileK][kTile + 4];
+  const unsigned tx = threadIdx.x % 16;
+  const unsigned ty = threadIdx.x / 16;
+  const std::size_t m0 = static_cast<std::size_t>(blockIdx.y) * kTile;
+  const std::size_t n0 = static_cast<std::size_t>(blockIdx.x) * kTile;
+  float acc[4][4] = {};
+  for (std::size_t k0 = 0; k0 < k; k0 += kTileK) {
+    for (unsigned i = threadIdx.x; i < kTile * kTileK; i += blockDim.x) {
+      const unsigned row = i / kTileK;  // A: 64 rows x 16 k
+      const unsigned col = i % kTileK;
+      const std::size_t gm = m0 + row;
+      const std::size_t gk = k0 + col;
+      as[col][row] = (gm < m && gk < k) ? a[gm * k + gk] : 0.0F;
+      const unsigned kr = i / kTile;  // B: 16 k x 64 n
+      const unsigned nc = i % kTile;
+      const std::size_t bk = k0 + kr;
+      const std::size_t bn = n0 + nc;
+      bs[kr][nc] = (bk < k && bn < n) ? b[bk * n + bn] : 0.0F;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kTileK; ++kk) {
+      float av[4];
+      float bv[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        av[i] = as[kk][ty * 4 + i];
+        bv[i] = bs[kk][tx * 4 + i];
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int i = 0; i < 4; ++i) {
+    const std::size_t gm = m0 + ty * 4 + i;
+    if (gm >= m) {
+      continue;
+    }
+    const float add = bias != nullptr ? bias[gm] : 0.0F;
+    for (int j = 0; j < 4; ++j) {
+      const std::size_t gn = n0 + tx * 4 + j;
+      if (gn < n) {
+        c[gm * n + gn] = acc[i][j] + add;
+      }
+    }
+  }
+}
+
+__global__ void SnakeKernel(float* x, const float* alpha, const float* inv, std::size_t channels,
+                            std::size_t length) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < channels * length) {
+    const std::size_t c = i / length;
+    const float s = sinf(alpha[c] * x[i]);
+    x[i] = x[i] + inv[c] * (s * s);
+  }
+}
+
+__global__ void ChannelScaleBiasKernel(float* x, const float* scale, const float* bias,
+                                       std::size_t channels, std::size_t length) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < channels * length) {
+    const std::size_t c = i / length;
+    x[i] = x[i] * scale[c] + bias[c];
+  }
+}
+
+__global__ void DepthwiseConvKernel(const float* x, std::size_t len_in, const float* w,
+                                    const float* b, float* y, std::size_t channels,
+                                    std::size_t kernel, std::size_t dilation,
+                                    std::size_t len_out) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= channels * len_out) {
+    return;
+  }
+  const std::size_t c = i / len_out;
+  const std::size_t t = i % len_out;
+  const float* xr = x + c * len_in + t;
+  const float* wr = w + c * kernel;
+  float sum = 0.0F;
+  for (std::size_t j = 0; j < kernel; ++j) {
+    sum = fmaf(wr[j], xr[j * dilation], sum);
+  }
+  y[i] = b[c] + sum;
+}
+
+__global__ void Im2colKernel(const float* x, std::size_t len_in, float* col,
+                             std::size_t channels, std::size_t kernel, std::size_t stride,
+                             std::size_t dilation, std::size_t len_out) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= channels * kernel * len_out) {
+    return;
+  }
+  const std::size_t t = i % len_out;
+  const std::size_t row = i / len_out;  // ci * kernel + j
+  const std::size_t ci = row / kernel;
+  const std::size_t j = row % kernel;
+  col[i] = x[ci * len_in + t * stride + j * dilation];
+}
+
+__global__ void PadLeftKernel(const float* history, const float* x, float* padded,
+                              std::size_t channels, std::size_t pad, std::size_t length) {
+  const std::size_t total = pad + length;
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= channels * total) {
+    return;
+  }
+  const std::size_t c = i / total;
+  const std::size_t t = i % total;
+  padded[i] = t < pad ? (history != nullptr ? history[c * pad + t] : 0.0F)
+                      : x[c * length + t - pad];
+}
+
+__global__ void KeepTailKernel(const float* padded, float* history, std::size_t channels,
+                               std::size_t pad, std::size_t total) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < channels * pad) {
+    const std::size_t c = i / pad;
+    const std::size_t t = i % pad;
+    history[i] = padded[c * total + total - pad + t];
+  }
+}
+
+__global__ void ConvTransposeCombineKernel(const float* z, const float* bias, float* y,
+                                           std::size_t cout, std::size_t stride,
+                                           std::size_t length) {
+  const std::size_t out_len = length * stride;
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= cout * out_len) {
+    return;
+  }
+  const std::size_t co = i / out_len;
+  const std::size_t pos = i % out_len;
+  const std::size_t e = pos / stride;
+  const std::size_t r = pos % stride;
+  const std::size_t ext = length + 1;
+  y[i] = bias[co] + z[(r * cout + co) * ext + e + 1] + z[((r + stride) * cout + co) * ext + e];
+}
+
+__global__ void TanhKernel(float* x, std::size_t n) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n) {
+    x[i] = tanhf(x[i]);
+  }
+}
+
 }  // namespace
+
+std::size_t SkinnyPartialFloats(std::size_t n, std::size_t k) {
+  return (k + kSkinnySlice - 1) / kSkinnySlice * kSkinnyRows * n;
+}
+
+void LaunchSkinnyGemm(const float* x, const std::uint16_t* w, const float* bias, float* y,
+                      std::size_t m, std::size_t n, std::size_t k, float* partial,
+                      hipStream_t stream) {
+  const auto splits = static_cast<unsigned>((k + kSkinnySlice - 1) / kSkinnySlice);
+  const auto col_blocks = static_cast<unsigned>((n + kSkCols - 1) / kSkCols);
+  for (std::size_t r0 = 0; r0 < m; r0 += kSkinnyRows) {
+    const std::size_t rows = m - r0 < kSkinnyRows ? m - r0 : kSkinnyRows;
+    hipLaunchKernelGGL(SkinnyGemmKernel, dim3(col_blocks, splits), dim3(kThreads), 0, stream,
+                       x + r0 * k, w, partial, static_cast<int>(rows), static_cast<int>(n),
+                       static_cast<int>(k));
+    hipLaunchKernelGGL(SkinnyReduceKernel, dim3(Blocks(rows * n)), dim3(kThreads), 0, stream,
+                       partial, bias, y + r0 * n, static_cast<int>(rows), static_cast<int>(n),
+                       static_cast<int>(splits));
+  }
+}
+
+void LaunchGemmF32NN(const float* a, const float* b, const float* bias, float* c,
+                     std::size_t m, std::size_t n, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((n + kTile - 1) / kTile),
+                  static_cast<unsigned>((m + kTile - 1) / kTile));
+  hipLaunchKernelGGL(GemmNNKernel, grid, dim3(kThreads), 0, stream, a, b, bias, c, m, n, k);
+}
+
+void LaunchSnake(float* x, const float* alpha, const float* inv, std::size_t channels,
+                 std::size_t length, hipStream_t stream) {
+  hipLaunchKernelGGL(SnakeKernel, dim3(Blocks(channels * length)), dim3(kThreads), 0, stream, x,
+                     alpha, inv, channels, length);
+}
+
+void LaunchChannelScaleBias(float* x, const float* scale, const float* bias,
+                            std::size_t channels, std::size_t length, hipStream_t stream) {
+  hipLaunchKernelGGL(ChannelScaleBiasKernel, dim3(Blocks(channels * length)), dim3(kThreads), 0,
+                     stream, x, scale, bias, channels, length);
+}
+
+void LaunchDepthwiseConv(const float* x, std::size_t len_in, const float* w, const float* b,
+                         float* y, std::size_t channels, std::size_t kernel,
+                         std::size_t dilation, std::size_t len_out, hipStream_t stream) {
+  hipLaunchKernelGGL(DepthwiseConvKernel, dim3(Blocks(channels * len_out)), dim3(kThreads), 0,
+                     stream, x, len_in, w, b, y, channels, kernel, dilation, len_out);
+}
+
+void LaunchIm2col(const float* x, std::size_t len_in, float* col, std::size_t channels,
+                  std::size_t kernel, std::size_t stride, std::size_t dilation,
+                  std::size_t len_out, hipStream_t stream) {
+  hipLaunchKernelGGL(Im2colKernel, dim3(Blocks(channels * kernel * len_out)), dim3(kThreads), 0,
+                     stream, x, len_in, col, channels, kernel, stride, dilation, len_out);
+}
+
+void LaunchPadLeft(const float* history, const float* x, float* padded, std::size_t channels,
+                   std::size_t pad, std::size_t length, hipStream_t stream) {
+  hipLaunchKernelGGL(PadLeftKernel, dim3(Blocks(channels * (pad + length))), dim3(kThreads), 0,
+                     stream, history, x, padded, channels, pad, length);
+}
+
+void LaunchKeepTail(const float* padded, float* history, std::size_t channels, std::size_t pad,
+                    std::size_t total, hipStream_t stream) {
+  hipLaunchKernelGGL(KeepTailKernel, dim3(Blocks(channels * pad)), dim3(kThreads), 0, stream,
+                     padded, history, channels, pad, total);
+}
+
+void LaunchConvTransposeCombine(const float* z, const float* bias, float* y, std::size_t cout,
+                                std::size_t stride, std::size_t length, hipStream_t stream) {
+  hipLaunchKernelGGL(ConvTransposeCombineKernel, dim3(Blocks(cout * length * stride)),
+                     dim3(kThreads), 0, stream, z, bias, y, cout, stride, length);
+}
+
+void LaunchTanh(float* x, std::size_t elements, hipStream_t stream) {
+  hipLaunchKernelGGL(TanhKernel, dim3(Blocks(elements)), dim3(kThreads), 0, stream, x, elements);
+}
 
 void LaunchRopeTable(float* x, std::size_t rows, std::size_t period, std::size_t heads,
                      std::size_t head_dim, std::size_t first, const float* cos_table,

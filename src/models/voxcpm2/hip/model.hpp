@@ -43,6 +43,10 @@ public:
   // HIP graphs for the flow sampler (default on; GUFO_VOXCPM_GRAPHS=0 at creation).
   void SetGraphs(bool enabled);
   [[nodiscard]] bool graphs_enabled() const noexcept;
+  // Split-K skinny GEMM for 9..128-row products (default on;
+  // GUFO_VOXCPM_SKINNY=0 at creation selects the 64x64 tile GEMM).
+  void SetSkinnyGemm(bool enabled);
+  [[nodiscard]] bool skinny_gemm() const noexcept;
 
   struct Impl;
 

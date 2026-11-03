@@ -13,8 +13,10 @@
 #include "src/models/voxcpm2/cpu/audio_vae.hpp"
 #include "src/models/voxcpm2/cpu/model.hpp"
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/models/voxcpm2/hip/audio_vae.hpp"
 #include "src/models/voxcpm2/hip/model.hpp"
 #endif
+#include "src/models/voxcpm2/vae_runner.hpp"
 #include "src/models/voxcpm2/tokenizer.hpp"
 
 namespace gufo::models::voxcpm2 {
@@ -35,6 +37,25 @@ std::uint64_t HashSamples(std::span<const float> samples, std::uint32_t rate, bo
   }
   return hash ^ samples.size();
 }
+
+// The CPU AudioVAE behind the runner interface.
+class CpuVaeRunner final : public VaeRunner {
+public:
+  explicit CpuVaeRunner(const cpu::AudioVae& vae) : vae_(vae) {}
+  [[nodiscard]] const char* name() const noexcept override { return "cpu"; }
+  [[nodiscard]] std::vector<float> Encode(const float* wave, std::int64_t samples,
+                                          std::int64_t* frames) override {
+    return vae_.Encode(wave, samples, frames);
+  }
+  void ResetDecoder() override { state_ = {}; }
+  [[nodiscard]] std::vector<float> DecodeChunk(const float* z, std::int64_t frames) override {
+    return vae_.DecodeChunk(&state_, z, frames);
+  }
+
+private:
+  const cpu::AudioVae& vae_;
+  cpu::AudioVae::DecoderState state_;
+};
 
 }  // namespace
 
@@ -73,6 +94,9 @@ struct Engine::Impl {
   std::unique_ptr<cpu::AudioVae> vae;
   std::unique_ptr<Backend> gpu;
   [[nodiscard]] Backend& run() { return gpu ? *gpu : static_cast<Backend&>(*model); }
+  std::unique_ptr<VaeRunner> vae_cpu;
+  std::unique_ptr<VaeRunner> vae_gpu;
+  [[nodiscard]] VaeRunner& vae_run() { return vae_gpu ? *vae_gpu : *vae_cpu; }
   Tokenizer tokenizer;
   std::mutex cache_mutex;
   std::map<std::uint64_t, std::vector<float>> audio_cache;
@@ -93,6 +117,7 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir, std::string
   if (!Tokenizer::Load(model_dir, &impl.tokenizer, error)) {
     return nullptr;
   }
+  impl.vae_cpu = std::make_unique<CpuVaeRunner>(*impl.vae);
   // GUFO_VOXCPM_BACKEND=cpu forces the CPU runtime; =hip makes a missing GPU
   // runtime an error instead of a fallback.
   const char* backend_env = std::getenv("GUFO_VOXCPM_BACKEND");
@@ -104,6 +129,12 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir, std::string
     if (impl.gpu == nullptr && backend == "hip") {
       SetError(error, gpu_error);
       return nullptr;
+    }
+    // GUFO_VOXCPM_VAE=cpu keeps the AudioVAE on the CPU next to a GPU AR loop.
+    const char* vae_env = std::getenv("GUFO_VOXCPM_VAE");
+    if (impl.gpu != nullptr && !(vae_env != nullptr && std::string(vae_env) == "cpu")) {
+      std::string vae_error;
+      impl.vae_gpu = hip::AudioVae::Create(*impl.vae, &vae_error);
     }
   }
 #else
@@ -123,6 +154,37 @@ std::uint32_t Engine::sample_rate() const noexcept {
 
 const char* Engine::backend_name() const noexcept {
   return impl_->gpu ? impl_->gpu->name() : "cpu";
+}
+
+const char* Engine::vae_backend_name() const noexcept {
+  return impl_->vae_gpu ? impl_->vae_gpu->name() : "cpu";
+}
+
+void Engine::SetSkinnyGemm(bool enabled) {
+#if defined(ENGINE_ENABLE_HIP)
+  if (auto* model = dynamic_cast<hip::Model*>(impl_->gpu.get()); model != nullptr) {
+    model->SetSkinnyGemm(enabled);
+  }
+#else
+  (void)enabled;
+#endif
+}
+
+void Engine::ClearAudioCache() {
+  std::lock_guard<std::mutex> lock(impl_->cache_mutex);
+  impl_->audio_cache.clear();
+}
+
+void Engine::SetVaeOnGpu(bool enabled) {
+  if (!enabled) {
+    impl_->vae_gpu.reset();
+  }
+#if defined(ENGINE_ENABLE_HIP)
+  else if (impl_->vae_gpu == nullptr) {
+    std::string error;
+    impl_->vae_gpu = hip::AudioVae::Create(*impl_->vae, &error);
+  }
+#endif
 }
 
 std::vector<float> Engine::EncodeAudio(std::span<const float> audio, std::uint32_t sample_rate,
@@ -154,7 +216,7 @@ std::vector<float> Engine::EncodeAudio(std::span<const float> audio, std::uint32
   }
   std::int64_t frames = 0;
   const std::vector<float> mu =
-      impl_->vae->Encode(wave.data(), static_cast<std::int64_t>(wave.size()), &frames);
+      impl_->vae_run().Encode(wave.data(), static_cast<std::int64_t>(wave.size()), &frames);
   // mu [latent, frames] -> view(latent, patches, patch).permute(1, 2, 0)
   const std::int64_t d = config.feat_dim;
   const std::int64_t p = config.patch_size;
@@ -284,7 +346,7 @@ bool Engine::Generate(const SynthesisRequest& request, const std::function<bool(
   std::vector<float> patch(static_cast<std::size_t>(patch_values));
   std::vector<float> prev(static_cast<std::size_t>(patch_values));
   std::vector<float> generated;
-  cpu::AudioVae::DecoderState decoder;
+  VaeRunner& vae = impl.vae_run();
   auto decode_patches = [&](const float* patches, std::int64_t count) {
     std::vector<float> z(static_cast<std::size_t>(d * count * p));
     for (std::int64_t n = 0; n < count; ++n) {
@@ -295,7 +357,7 @@ bool Engine::Generate(const SynthesisRequest& request, const std::function<bool(
         }
       }
     }
-    return impl.vae->DecodeChunk(&decoder, z.data(), count * p);
+    return vae.DecodeChunk(z.data(), count * p);
   };
 
   std::int32_t attempt = 0;
@@ -304,7 +366,7 @@ bool Engine::Generate(const SynthesisRequest& request, const std::function<bool(
                 residual_hidden.data());
     std::copy(feats.end() - patch_values, feats.end(), prev.begin());
     generated.clear();
-    decoder = {};
+    vae.ResetDecoder();
     if (streaming && context_len > 0) {
       (void)decode_patches(prompt_patches.data() + (prompt_len - context_len) * patch_values,
                            context_len);
@@ -353,7 +415,7 @@ bool Engine::Generate(const SynthesisRequest& request, const std::function<bool(
   out.attempts = std::min(attempt + 1, attempts_allowed);
   out.steps = static_cast<std::int64_t>(generated.size()) / patch_values;
   if (!streaming) {
-    decoder = {};
+    vae.ResetDecoder();
     if (context_len > 0) {
       (void)decode_patches(prompt_patches.data() + (prompt_len - context_len) * patch_values,
                            context_len);

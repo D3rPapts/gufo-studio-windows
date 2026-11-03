@@ -88,6 +88,16 @@ public:
                                                std::int64_t frames,
                                                DecodeTrace* trace = nullptr) const;
 
+  // Layers (FP32, weight norm folded) for the GPU upload.
+  [[nodiscard]] const Conv1d& enc_in() const noexcept { return enc_in_; }
+  [[nodiscard]] const std::vector<EncoderBlock>& enc_blocks() const noexcept { return enc_blocks_; }
+  [[nodiscard]] const Conv1d& enc_mu() const noexcept { return enc_mu_; }
+  [[nodiscard]] const Conv1d& dec_depthwise() const noexcept { return dec_depthwise_; }
+  [[nodiscard]] const Conv1d& dec_pointwise() const noexcept { return dec_pointwise_; }
+  [[nodiscard]] const std::vector<DecoderBlock>& dec_blocks() const noexcept { return dec_blocks_; }
+  [[nodiscard]] const Snake& dec_snake() const noexcept { return dec_snake_; }
+  [[nodiscard]] const Conv1d& dec_out() const noexcept { return dec_out_; }
+
 private:
   AudioVaeConfig config_;
   Conv1d enc_in_;

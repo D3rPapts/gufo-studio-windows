@@ -71,6 +71,15 @@ public:
   [[nodiscard]] std::uint32_t sample_rate() const noexcept;
   // "hip" or "cpu": where the AR loop runs (the AudioVAE runs on the CPU).
   [[nodiscard]] const char* backend_name() const noexcept;
+  // "hip" or "cpu": where the AudioVAE (reference encoder, streaming decoder)
+  // runs. GUFO_VOXCPM_VAE=cpu keeps it on the CPU.
+  [[nodiscard]] const char* vae_backend_name() const noexcept;
+  // Tests/benchmarks: switch the AudioVAE between GPU and CPU.
+  void SetVaeOnGpu(bool enabled);
+  // Tests/benchmarks: split-K skinny GEMM on/off in the HIP runtime (no-op on CPU).
+  void SetSkinnyGemm(bool enabled);
+  // Tests/benchmarks: forget the encoded reference/prompt audio.
+  void ClearAudioCache();
 
   // AudioVAE encoder patches [patches, patch, latent] for a mono waveform
   // (resampled to 16 kHz, padded to whole patches on the right or left).

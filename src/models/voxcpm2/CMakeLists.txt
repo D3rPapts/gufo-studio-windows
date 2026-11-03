@@ -28,6 +28,7 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_voxcpm2 PRIVATE
+    hip/audio_vae.cpp
     hip/model.cpp
     hip/ops.hip)
   target_compile_definitions(gufo_voxcpm2 PRIVATE ENGINE_ENABLE_HIP=1)
