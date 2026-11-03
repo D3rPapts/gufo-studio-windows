@@ -108,8 +108,8 @@ constexpr std::string_view kGenerators[] = {
 };
 
 constexpr std::string_view kOutputs[] = {
-    "SaveImage", "PreviewImage", "SaveAudio", "PreviewAudio", "SaveVideo",
-    "VHS_VideoCombine"};
+    "SaveImage",    "PreviewImage",  "SaveAudio",       "PreviewAudio",
+    "SaveAudioMP3", "SaveAudioOpus", "SaveVideo",       "VHS_VideoCombine"};
 
 // Node families other gufo ports are bringing; named so the error says so.
 // (ACE-Step 1.0; gufo serves ACE-Step 1.5.)
@@ -1879,7 +1879,8 @@ FoleyTask BuildFoley(const Graph& graph, const std::string& id,
 }
 
 OutputKind KindOf(std::string_view class_type) {
-  if (class_type == "SaveAudio" || class_type == "PreviewAudio")
+  if (class_type == "SaveAudio" || class_type == "PreviewAudio" ||
+      class_type == "SaveAudioMP3" || class_type == "SaveAudioOpus")
     return OutputKind::kAudio;
   if (class_type == "SaveVideo" || class_type == "VHS_VideoCombine")
     return OutputKind::kVideo;

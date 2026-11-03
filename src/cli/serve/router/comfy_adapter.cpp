@@ -1599,6 +1599,11 @@ json::Value Adapter::SaveSpeech(const Task& task,
     for (const std::string& wav : wavs) {
       json::Value saved;
       if (options_.ffmpeg.empty()) {
+        if (target.class_type == "SaveAudioMP3" ||
+            target.class_type == "SaveAudioOpus")
+          throw std::runtime_error(
+              target.class_type +
+              " needs ffmpeg; start the router with --comfy-ffmpeg");
         saved = SaveBytes(target, "wav", wav);
       } else {
         const fs::path file = WorkFile("wav");
@@ -2080,13 +2085,26 @@ json::Value Adapter::SaveBytes(const OutputTarget& target,
 
 json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
                                     const fs::path& media) {
+  // SaveAudio/PreviewAudio write FLAC like ComfyUI; SaveAudioMP3 (VBR V0)
+  // and SaveAudioOpus (128 kbit/s) use ComfyUI's default quality.
+  const bool mp3 = target.class_type == "SaveAudioMP3";
+  const bool opus = target.class_type == "SaveAudioOpus";
+  const std::string ext = mp3 ? "mp3" : opus ? "opus" : "flac";
   const Destination destination = DestinationFor(options_.root, target);
   const std::string filename = OutputFilename(
-      destination.base, CounterIn(destination), OutputKind::kAudio, "flac");
+      destination.base, CounterIn(destination), OutputKind::kAudio, ext);
+  std::vector<fs::path> codec;
+  if (mp3)
+    codec = {"-c:a", "libmp3lame", "-q:a", "0"};
+  else if (opus)
+    codec = {"-c:a", "libopus", "-b:a", "128k"};
+  else
+    codec = {"-c:a", "flac"};
+  std::vector<fs::path> args = {"-i", media, "-vn"};
+  args.insert(args.end(), codec.begin(), codec.end());
+  args.push_back(destination.folder / U8Path(filename));
   std::string error;
-  if (!RunFfmpeg({"-i", media, "-vn", "-c:a", "flac",
-                  destination.folder / U8Path(filename)},
-                 &error))
+  if (!RunFfmpeg(args, &error))
     throw std::runtime_error("cannot write the audio track: " + error);
   json::Value list = json::Value::array();
   list.push_back(FileEntry(destination, filename));
