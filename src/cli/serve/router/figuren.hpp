@@ -11,11 +11,20 @@
 //      "referenzen": [{"name": "Lars", "kopf": "<data URL>"}, ...],
 //      "steckbrief": {"Lars": "short profile"},   optional
 //      "schwelle": 0.6,                            optional
+//      "nur_kostuem": false,                       optional
 //      "modell": "qwen3.8-27b"}                    optional
+//     A referenz may also carry "front": "<data URL>" (front reference of the
+//     figure); then its costume is checked as well. With nur_kostuem the head
+//     comparison is skipped (boxes + costume only) and "kopf" is optional.
 //   -> {"figuren": [{"name", "box": [x0,y0,x1,y1], "kopf_box": [...],
 //        "schild", "zuordnung": "schild"|"reihenfolge", "aehnlichkeit": 0..1,
-//        "abweichungen": [...], "nachgeprueft": bool[, "schnell": 0..1]}],
+//        "abweichungen": [...], "nachgeprueft": bool[, "schnell": 0..1]
+//        [, "kostuem_ok": bool, "kostuem_abweichungen": [...],
+//           "kostuem_teile": [{"teil", "soll", "ist", "ok"[, "regel"]}],
+//           "steckbrief_widerspricht_referenz": [...]]}],
 //       "sekunden": n}
+//   (aehnlichkeit, abweichungen, nachgeprueft and schnell are left out with
+//   nur_kostuem; the kostuem fields appear only for figures with a front.)
 //
 // Steps: (1) one vision chat lists every person with person_box, head_box
 // (0..1000 relative) and badge, thinking off; (2) badge assignment (3-letter
@@ -26,6 +35,11 @@
 // Every chat goes through the router's own /v1/chat/completions (the fetch
 // below), so model loading, the memory guard and busy handling apply as for
 // any client.
+// Costume (figuren.py kostueme): per figure with a front reference one chat
+// with thinking (max_tokens 14000) compares the front reference with the
+// head-to-belt crop of the frame (shirt, tie, glasses); shirt and tie items
+// whose wanted and seen colour name different colour families are then
+// marked wrong even when the model passed them.
 
 #include <array>
 #include <cstddef>
@@ -59,6 +73,22 @@ std::optional<Box> ToPixels(const json::Value& box, int width, int height);
 /// by a third of its size (floor division) on every side, clamped to the
 /// image, at least one pixel.
 Box HeadCrop(const Box& head, int width, int height);
+
+/// Torso crop rectangle (figuren.py torso_crop): person box width, from the
+/// head top down to the head bottom plus 3.2 head heights (truncated), at
+/// most the person box bottom but at least 8 px below the head; clamped to
+/// the image, at least one pixel.
+Box TorsoCrop(const Box& box, const Box& kopf_box, int width, int height);
+
+/// Colour family of a colour word (figuren.py FAMILIEN/familie): the first
+/// family in table order with a word contained in the lowercased text.
+std::optional<std::string> ColourFamily(std::string_view text);
+
+/// figuren.py nachpruefen: shirt ("hemd", "shirt") and tie ("krawatte",
+/// "tie") items whose soll and ist name different colour families get
+/// ok = false and regel = "Farbfamilie a != b" unless already wrong. Non-object
+/// entries are dropped.
+json::Value CheckCostumeItems(const json::Value& items);
 
 /// Longer side scaled down to `max_side` (never up), aspect kept.
 std::pair<int, int> FitSize(int width, int height, int max_side);

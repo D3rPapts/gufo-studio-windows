@@ -27,6 +27,7 @@ using RgbaImage = models::qwen_image_21::Image;
 constexpr int kFrameSide = 1344;
 constexpr int kHeadSide = 768;
 constexpr int kMaxTokens = 6000;
+constexpr int kCostumeTokens = 14000;
 constexpr double kDefaultThreshold = 0.6;
 constexpr std::size_t kMaxReferences = 32;
 
@@ -87,6 +88,67 @@ std::optional<double> AsNumber(const json::Value& value) {
     return parsed;
   }
   return std::nullopt;
+}
+
+/// Python truthiness of a JSON value (`i.get("ok", True)` and the like).
+bool Truthy(const json::Value& value) {
+  if (value.is_null())
+    return false;
+  if (value.is_bool())
+    return value.as_bool();
+  if (value.is_number())
+    return value.as_double() != 0;
+  if (value.is_string())
+    return !value.str().empty();
+  return !value.empty();
+}
+
+/// A member's truthiness, `fallback` when it is missing.
+bool MemberTruthy(const json::Value& object, const std::string& key,
+                  bool fallback) {
+  const json::Value* value = object.find(key);
+  return value == nullptr ? fallback : Truthy(*value);
+}
+
+/// Python str() of a member for messages: strings as they are, a missing
+/// member as None, other values as JSON.
+std::string MemberText(const json::Value& object, const std::string& key) {
+  const json::Value* value = object.find(key);
+  if (value == nullptr || value->is_null())
+    return "None";
+  return value->is_string() ? value->str() : value->dump();
+}
+
+/// A list of strings from a model answer: strings kept, other entries as
+/// JSON text, a lone string as a one-element list.
+json::Value StringList(const json::Value* value) {
+  json::Value out = json::Value::array();
+  if (value == nullptr)
+    return out;
+  if (value->is_string()) {
+    out.push_back(value->str());
+  } else if (value->is_array()) {
+    for (const json::Value& entry : value->items())
+      out.push_back(entry.is_string() ? entry.str() : entry.dump());
+  }
+  return out;
+}
+
+/// Lowercase for ASCII and the German capital umlauts (UTF-8).
+std::string LowerText(std::string_view text) {
+  std::string out(text);
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(out[i]);
+    if (c >= 'A' && c <= 'Z') {
+      out[i] = static_cast<char>(c - 'A' + 'a');
+    } else if (c == 0xC3 && i + 1 < out.size()) {
+      const unsigned char next = static_cast<unsigned char>(out[i + 1]);
+      if (next == 0x84 || next == 0x96 || next == 0x9C)  // capital umlauts
+        out[i + 1] = static_cast<char>(next + 0x20);
+      ++i;
+    }
+  }
+  return out;
 }
 
 /// Uppercased (ASCII; German sharp s as SS) letters A-Z only.
@@ -227,6 +289,14 @@ struct Reference {
   std::string name;
   RgbaImage head;
   std::string profile;
+  std::optional<RgbaImage> front;
+};
+
+struct CostumeVerdict {
+  bool ok{true};
+  json::Value differences = json::Value::array();
+  json::Value items = json::Value::array();
+  json::Value contradictions = json::Value::array();
 };
 
 struct Verdict {
@@ -241,7 +311,8 @@ public:
 
   /// One chat through the router's own API; throws UpstreamError on a non-2xx
   /// answer.
-  std::string Ask(json::Value content, bool think) const {
+  std::string Ask(json::Value content, bool think,
+                  int max_tokens = kMaxTokens) const {
     json::Value message = json::Value::object();
     message["role"] = "user";
     message["content"] = std::move(content);
@@ -250,7 +321,7 @@ public:
     json::Value body = json::Value::object();
     body["model"] = model_;
     body["messages"] = std::move(messages);
-    body["max_tokens"] = kMaxTokens;
+    body["max_tokens"] = max_tokens;
     body["temperature"] = 0;
     if (!think) {
       json::Value kwargs = json::Value::object();
@@ -364,6 +435,71 @@ public:
     return verdict;
   }
 
+  /// figuren.py compare_costume: front reference vs the head-to-belt crop,
+  /// thinking on, then the colour-family rule for shirt and tie.
+  CostumeVerdict CompareCostume(const RgbaImage& frame, const Person& person,
+                                const Reference& reference) const {
+    const RgbaImage torso = Crop(
+        frame, TorsoCrop(person.box, person.kopf_box, frame.width,
+                         frame.height));
+    std::string prompt =
+        "Image 1 is the front reference of the film character " +
+        reference.name +
+        ". Image 2 shows the same character (head to belt) in a new film "
+        "frame.";
+    if (!reference.profile.empty())
+      prompt += " The text the reference image was generated from: " +
+                reference.profile;
+    prompt +=
+        " Check only these costume items: shirt, tie, glasses or sunglasses "
+        "(frame and lens tint). For each item write the colour shown in the "
+        "reference image 1 (soll; image 1 decides, the text only helps to "
+        "name it) and the colour you see in image 2 (ist), as plain colour "
+        "words. If the text clearly contradicts image 1 for an item, also add "
+        "it to widersprueche (German, e.g. Brille: Text dunkel, Referenz "
+        "gruen getoent). Decide per item: wrong if the hue or colour family "
+        "differs (grey vs brown/beige, white vs beige/cream/tan/yellow, pale "
+        "blue vs white, green tint vs plain dark/black lenses, glasses "
+        "present vs absent); NOT wrong for a lighter or darker shade of the "
+        "same hue (blue vs navy, dark red vs red) or for warm/cool lighting "
+        "that shifts all colours of the picture alike. Ignore face, hair, "
+        "pose, trousers and background. Answer only with JSON: {\"items\": "
+        "[{\"teil\": \"Hemd\", \"soll\": \"...\", \"ist\": \"...\", "
+        "\"ok\": true}], \"widersprueche\": [], \"kostuem_ok\": "
+        "true/false, \"abweichungen\": [\"short German phrase like Hemd "
+        "hellbraun statt hellgrau\"]}.";
+    json::Value content = json::Value::array();
+    content.push_back(ImagePart(DataUrl(*reference.front, kHeadSide)));
+    content.push_back(ImagePart(DataUrl(torso, kHeadSide)));
+    content.push_back(TextPart(std::move(prompt)));
+    const std::string answer = Ask(std::move(content), true, kCostumeTokens);
+    const auto result = JsonFrom(answer, false);
+    if (!result.has_value())
+      throw AnswerError("no JSON in answer: " + Tail(answer));
+    CostumeVerdict verdict;
+    const json::Value* items = result->find("items");
+    verdict.items = CheckCostumeItems(
+        items != nullptr && items->is_array() ? *items : json::Value::array());
+    if (!verdict.items.empty()) {
+      for (const json::Value& item : verdict.items.items())
+        verdict.ok = verdict.ok && MemberTruthy(item, "ok", true);
+    } else {
+      verdict.ok = MemberTruthy(*result, "kostuem_ok", true);
+    }
+    if (!verdict.ok) {
+      verdict.differences = StringList(result->find("abweichungen"));
+      if (verdict.differences.empty()) {
+        for (const json::Value& item : verdict.items.items())
+          if (!MemberTruthy(item, "ok", true))
+            verdict.differences.push_back(MemberText(item, "teil") + " " +
+                                          MemberText(item, "ist") + " statt " +
+                                          MemberText(item, "soll"));
+      }
+    }
+    verdict.contradictions = StringList(result->find("widersprueche"));
+    return verdict;
+  }
+
 private:
   static std::string Tail(const std::string& text) {
     return text.size() <= 300 ? text : text.substr(text.size() - 300);
@@ -377,6 +513,7 @@ struct Request {
   RgbaImage frame;
   std::vector<Reference> references;
   double threshold{kDefaultThreshold};
+  bool costume_only{false};
   std::string model;
 };
 
@@ -403,19 +540,37 @@ Request ParseRequest(const std::string& text, const std::string& default_model) 
   const json::Value* profiles = body.find("steckbrief");
   if (profiles != nullptr && !profiles->is_null() && !profiles->is_object())
     throw std::invalid_argument("steckbrief must be an object {name: text}");
+  if (const json::Value* only = body.find("nur_kostuem");
+      only != nullptr && !only->is_null()) {
+    if (!only->is_bool())
+      throw std::invalid_argument("nur_kostuem must be true or false");
+    request.costume_only = only->as_bool();
+  }
   std::set<std::string> seen;
   for (const json::Value& entry : refs->items()) {
     const json::Value* name = entry.find("name");
     const json::Value* kopf = entry.find("kopf");
+    const bool has_kopf =
+        kopf != nullptr && kopf->is_string() && !kopf->str().empty();
+    // With nur_kostuem the head reference is not used and may be left out.
+    const bool kopf_optional =
+        request.costume_only && (kopf == nullptr || kopf->is_null());
     if (name == nullptr || !name->is_string() || name->str().empty() ||
-        kopf == nullptr || !kopf->is_string() || kopf->str().empty())
+        (!has_kopf && !kopf_optional))
       throw std::invalid_argument(
           "every referenz needs a name and a kopf image");
     if (!seen.insert(name->str()).second)
       throw std::invalid_argument("duplicate referenz name: " + name->str());
     Reference reference;
     reference.name = name->str();
-    reference.head = ReadImage(kopf->str(), "kopf");
+    if (has_kopf)
+      reference.head = ReadImage(kopf->str(), "kopf");
+    if (const json::Value* front = entry.find("front");
+        front != nullptr && !front->is_null()) {
+      if (!front->is_string() || front->str().empty())
+        throw std::invalid_argument("front must be a data URL or base64 image");
+      reference.front = ReadImage(front->str(), "front");
+    }
     if (profiles != nullptr && profiles->is_object()) {
       if (const json::Value* profile = profiles->find(reference.name);
           profile != nullptr && profile->is_string())
@@ -523,6 +678,76 @@ Box HeadCrop(const Box& head, int width, int height) {
   return Box{x0, y0, x1, y1};
 }
 
+Box TorsoCrop(const Box& box, const Box& kopf_box, int width, int height) {
+  const int head_height = kopf_box[3] - kopf_box[1];
+  const int bottom =
+      std::min(box[3], kopf_box[3] + static_cast<int>(head_height * 3.2));
+  const int x0 = std::clamp(std::max(0, box[0]), 0, std::max(0, width - 1));
+  const int y0 =
+      std::clamp(std::max(0, kopf_box[1]), 0, std::max(0, height - 1));
+  const int x1 =
+      std::clamp(std::min(width, box[2]), x0 + 1, std::max(x0 + 1, width));
+  const int y1 = std::clamp(std::min(height, std::max(bottom, kopf_box[3] + 8)),
+                            y0 + 1, std::max(y0 + 1, height));
+  return Box{x0, y0, x1, y1};
+}
+
+std::optional<std::string> ColourFamily(std::string_view text) {
+  // figuren.py FAMILIEN, in its order (the first family that matches wins).
+  static const std::vector<std::pair<std::string, std::vector<std::string>>>
+      kFamilies = {
+          {"weiss", {"weiss", "wei\xc3\x9f", "white"}},
+          {"creme",
+           {"creme", "cream", "beige", "elfenbein", "ivory", "ocker", "tan"}},
+          {"grau", {"grau", "grey", "gray", "silber"}},
+          {"braun", {"braun", "brown", "hellbraun", "khaki"}},
+          {"blau", {"blau", "blue", "navy", "marine"}},
+          {"gruen", {"gruen", "gr\xc3\xbcn", "green", "oliv"}},
+          {"rot", {"rot", "red", "bordeaux", "weinrot"}},
+          {"gelb", {"gelb", "yellow", "gold"}},
+          {"schwarz", {"schwarz", "black", "dunkel", "dark"}},
+          {"rosa", {"rosa", "pink"}},
+      };
+  const std::string lower = LowerText(text);
+  for (const auto& [family, words] : kFamilies)
+    for (const std::string& word : words)
+      if (lower.find(word) != std::string::npos)
+        return family;
+  return std::nullopt;
+}
+
+json::Value CheckCostumeItems(const json::Value& items) {
+  json::Value out = json::Value::array();
+  for (const json::Value& entry : items.items()) {
+    if (!entry.is_object())
+      continue;
+    json::Value item = entry;
+    const json::Value* teil = item.find("teil");
+    const std::string part = LowerText(
+        teil == nullptr      ? std::string()
+        : teil->is_string() ? teil->str()
+                            : teil->dump());
+    if (StartsWith(part, "hemd") || StartsWith(part, "shirt") ||
+        StartsWith(part, "krawatte") || StartsWith(part, "tie")) {
+      const auto family_of = [&item](const char* key) {
+        const json::Value* value = item.find(key);
+        return value != nullptr && value->is_string()
+                   ? ColourFamily(value->str())
+                   : std::nullopt;
+      };
+      const auto wanted = family_of("soll");
+      const auto seen = family_of("ist");
+      if (wanted && seen && *wanted != *seen &&
+          MemberTruthy(item, "ok", true)) {
+        item["ok"] = false;
+        item["regel"] = "Farbfamilie " + *wanted + " != " + *seen;
+      }
+    }
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
 std::pair<int, int> FitSize(int width, int height, int max_side) {
   const int longer = std::max(width, height);
   if (longer <= max_side || longer <= 0)
@@ -598,14 +823,16 @@ std::optional<HttpResponse> FigurenService::Handle(
       return std::find_if(parsed.references.begin(), parsed.references.end(),
                           [&name](const Reference& r) { return r.name == name; });
     };
-    // (3) quick compare for every figure, thinking off.
+    // (3) quick compare for every figure, thinking off (skipped with
+    // nur_kostuem).
     std::vector<Verdict> quick;
-    for (const Assignment& a : assigned)
-      quick.push_back(session.Compare(parsed.frame,
-                                      people[a.person].kopf_box,
-                                      *reference_of(a.name), false));
+    if (!parsed.costume_only)
+      for (const Assignment& a : assigned)
+        quick.push_back(session.Compare(parsed.frame,
+                                        people[a.person].kopf_box,
+                                        *reference_of(a.name), false));
     // (4) below the threshold: again with thinking; that verdict counts.
-    json::Value figures = json::Value::array();
+    std::vector<json::Value> figures;
     for (std::size_t i = 0; i < assigned.size(); ++i) {
       const Assignment& a = assigned[i];
       const Person& person = people[a.person];
@@ -615,6 +842,10 @@ std::optional<HttpResponse> FigurenService::Handle(
       figure["kopf_box"] = BoxJson(person.kopf_box);
       figure["schild"] = person.schild;
       figure["zuordnung"] = a.by_badge ? "schild" : "reihenfolge";
+      if (parsed.costume_only) {
+        figures.push_back(std::move(figure));
+        continue;
+      }
       Verdict verdict = std::move(quick[i]);
       const bool recheck = verdict.similarity < parsed.threshold;
       if (recheck) {
@@ -627,12 +858,28 @@ std::optional<HttpResponse> FigurenService::Handle(
       figure["nachgeprueft"] = recheck;
       figures.push_back(std::move(figure));
     }
+    // (5) costume for every figure with a front reference, thinking on.
+    json::Value figures_out = json::Value::array();
+    for (std::size_t i = 0; i < assigned.size(); ++i) {
+      const Reference& reference = *reference_of(assigned[i].name);
+      json::Value& figure = figures[i];
+      if (reference.front.has_value()) {
+        CostumeVerdict costume = session.CompareCostume(
+            parsed.frame, people[assigned[i].person], reference);
+        figure["kostuem_ok"] = costume.ok;
+        figure["kostuem_abweichungen"] = std::move(costume.differences);
+        figure["kostuem_teile"] = std::move(costume.items);
+        figure["steckbrief_widerspricht_referenz"] =
+            std::move(costume.contradictions);
+      }
+      figures_out.push_back(std::move(figure));
+    }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       started)
             .count();
     json::Value body = json::Value::object();
-    body["figuren"] = std::move(figures);
+    body["figuren"] = std::move(figures_out);
     body["sekunden"] = std::round(seconds * 10) / 10;
     return JsonResponse(200, "OK", body.dump());
   } catch (const UpstreamError& error) {
