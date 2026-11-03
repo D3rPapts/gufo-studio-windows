@@ -123,10 +123,14 @@ bool Fits(const Room& room, const MemoryNeed& need,
   if (room.host - policy.reserve_host - spill < need.host) {
     return false;
   }
-  // Windows commits GPU and host bytes alike: a load that fits RAM but not
-  // the commit limit fails with bad_alloc (or waits for the page file to
-  // grow) instead.
-  return room.commit - policy.reserve_commit >= CommitNeed(need);
+  // A load that fits RAM but not the commit limit fails with bad_alloc (or
+  // waits for the page file to grow). Only host bytes are committed: the
+  // model's own host/shared buffers (need.host) and what spills from
+  // dedicated into shared. Dedicated GPU memory (BIOS carve-out) is not
+  // charged: 03.11. on 48/16 the 27B (37 GB gpu need) took ~6 GB of commit,
+  // while counting gpu + host kept qwen-image-2.1 (48 GB gpu need) waiting
+  // for 10 minutes at 49 GB free commit.
+  return room.commit - policy.reserve_commit >= need.host + spill;
 }
 
 /// True when even an empty machine could not give `need` (estimate larger
@@ -139,9 +143,13 @@ bool NeverFits(const SystemMemory& system, const MemoryNeed& need,
                               need.gpu) {
     return true;
   }
-  if (system.commit_valid &&
-      system.commit_limit - policy.reserve_commit < CommitNeed(need)) {
-    return true;
+  if (system.commit_valid) {
+    const std::int64_t spill = std::max<std::int64_t>(
+        0, need.gpu - need.shared -
+               (system.gpu_valid ? system.gpu_dedicated_total : 0));
+    if (system.commit_limit - policy.reserve_commit < need.host + spill) {
+      return true;
+    }
   }
   return system.host_valid &&
          system.host_total - policy.reserve_host < need.host;

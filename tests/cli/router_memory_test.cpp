@@ -319,15 +319,26 @@ SystemMemory WithCommit(SystemMemory memory, double commit_free) {
 
 void TestCommitLimit() {
   const MemoryPolicy policy;
-  // RAM and GPU fit, but GPU + host (20 + 4 GB) exceed free commit minus
-  // the 3 GB reserve: wait instead of a bad_alloc.
-  auto plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 25), {}, "m",
-                            Need(20, 4), false, policy);
+  // Only host bytes are committed (own host/shared buffers + what spills
+  // from dedicated); dedicated GPU memory is a BIOS carve-out (03.11.: the
+  // 27B with 37 GB gpu need took ~6 GB commit on 48/16). RAM and GPU fit,
+  // but the 12 GB host need exceeds free commit minus the 3 GB reserve.
+  auto plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 14), {}, "m",
+                            Need(10, 12), false, policy);
   CHECK(plan.action == Action::kWait);
   CHECK(plan.reason.find("commit") != std::string::npos);
-  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 28), {}, "m",
-                       Need(20, 4), false, policy);
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 16), {}, "m",
+                       Need(10, 12), false, policy);
   CHECK(plan.action == Action::kSpawn && !plan.alone);
+  // Dedicated GPU bytes alone never wait for commit (qwen-image-2.1 waited
+  // 10 min at 49 GB free commit for a 48 GB gpu need, 03.11.).
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 8), {}, "m",
+                       Need(28, 2), false, policy);
+  CHECK(plan.action == Action::kSpawn);
+  // What spills from dedicated into shared is host RAM and is committed.
+  plan = PlanAdmission(WithCommit(Machine(28, 0.2, 20), 10), {}, "m",
+                       Need(10, 2), false, policy);
+  CHECK(plan.action == Action::kWait);  // 6 GB spill + 2 GB host > 10 - 3
   // The model's own shared buffers are in its GPU and host need: counted once.
   MemoryNeed with_shared = Need(20, 4);
   with_shared.shared = Gb(3);
@@ -338,18 +349,18 @@ void TestCommitLimit() {
   // An idle resident's private bytes come back when it is evicted.
   ResidentView idle = Resident("idle", 10, 10, 1);
   idle.current.commit = Gb(12);
-  plan = PlanAdmission(WithCommit(Machine(12, 0.2, 18), 20), {idle}, "m",
-                       Need(20, 4), false, policy);
+  plan = PlanAdmission(WithCommit(Machine(12, 0.2, 18), 15), {idle}, "m",
+                       Need(10, 14), false, policy);
   CHECK(plan.action == Action::kEvict && plan.evict.size() == 1 &&
         plan.evict[0] == "idle");
   // A loading resident still owes commit up to its need (10 + 2 GB, holds 5).
   ResidentView loading = Resident("l", 10, 3, 1, false, true);
   loading.current.commit = Gb(5);
   plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 19.5), {loading}, "m",
-                       Need(8, 2), false, policy);
-  CHECK(plan.action == Action::kWait);  // 19.5 - 7 owed - 3 < 10
+                       Need(8, 10), false, policy);
+  CHECK(plan.action == Action::kWait);  // 19.5 - 7 owed - 3 < 10 host
   plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 21), {loading}, "m",
-                       Need(8, 2), false, policy);
+                       Need(8, 10), false, policy);
   CHECK(plan.action == Action::kSpawn);
   // A custom reserve.
   MemoryPolicy loose = policy;
