@@ -170,6 +170,26 @@ void Engine::SetSkinnyGemm(bool enabled) {
 #endif
 }
 
+void Engine::SetWmma(bool enabled) {
+#if defined(ENGINE_ENABLE_HIP)
+  if (auto* model = dynamic_cast<hip::Model*>(impl_->gpu.get()); model != nullptr) {
+    model->SetWmma(enabled);
+  }
+#else
+  (void)enabled;
+#endif
+}
+
+void Engine::SetSkinnyMaxRows(std::int64_t rows) {
+#if defined(ENGINE_ENABLE_HIP)
+  if (auto* model = dynamic_cast<hip::Model*>(impl_->gpu.get()); model != nullptr) {
+    model->SetSkinnyMaxRows(rows);
+  }
+#else
+  (void)rows;
+#endif
+}
+
 void Engine::ClearAudioCache() {
   std::lock_guard<std::mutex> lock(impl_->cache_mutex);
   impl_->audio_cache.clear();

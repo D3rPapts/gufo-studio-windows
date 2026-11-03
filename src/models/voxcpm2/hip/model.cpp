@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -25,9 +27,11 @@ namespace ming = ming_tts::hip;
 // Up to this many rows a product runs as a BF16 GEMV per row; above it the
 // FP32-activation tiled GEMM takes over (keeps the math FP32 like the CPU).
 constexpr std::int64_t kGemvRows = 8;
-// Up to this many rows the split-K skinny GEMM (32-row passes) is used; the
-// 64x64 tile GEMM only fills a handful of the 40 CUs at DiT sizes (22 rows).
-constexpr std::int64_t kSkinnyMaxRows = 128;
+// Default row limit for the split-K skinny GEMM (32-row passes). GPU run 2:
+// DiT (22 rows) 202.7 -> 138.1 ms/step with skinny v1, but prefill (86 rows,
+// 3 passes) 344 -> 650 ms, so larger products keep the 64x64 tile GEMM.
+// GUFO_VOXCPM_SKINNY_MAX_ROWS overrides it (for measuring).
+constexpr std::int64_t kSkinnyMaxRowsDefault = 32;
 
 void Check(hipError_t status, const char* what) {
   if (status != hipSuccess) {
@@ -44,6 +48,7 @@ struct DevLinear {
 
 struct DevLayer {
   DevLinear q, k, v, o, gate, up, down;
+  DevLinear gate_up;  // [gate; up] in one allocation (gate/up point into it)
   const float* input_norm{nullptr};
   const float* post_norm{nullptr};
 };
@@ -189,6 +194,28 @@ struct Model::Impl {
   bool use_graphs{true};
   // Split-K skinny GEMM for 9..128 rows (GUFO_VOXCPM_SKINNY=0: old tile GEMM).
   bool use_skinny{true};
+  std::int64_t skinny_max_rows{kSkinnyMaxRowsDefault};
+  // BF16 WMMA inside the skinny GEMM (GUFO_VOXCPM_WMMA=1; default off until
+  // the oracle checks on the GPU say it holds).
+  bool use_wmma{false};
+  // Per-kernel profile (eager, synchronizing after every op): name -> ms, calls.
+  bool profiling{false};
+  std::map<std::string, std::pair<double, int>> profile;
+  std::chrono::steady_clock::time_point profile_mark;
+  void Tick(const char* name) {
+    if (!profiling) {
+      return;
+    }
+    Check(hipStreamSynchronize(stream), "profile sync");
+    const auto now = std::chrono::steady_clock::now();
+    auto& slot = profile[name];
+    slot.first += std::chrono::duration<double, std::milli>(now - profile_mark).count();
+    slot.second += 1;
+    profile_mark = now;
+  }
+  bool Skinny(std::int64_t rows) const {
+    return use_skinny && rows > kGemvRows && rows <= skinny_max_rows;
+  }
   std::size_t max_partial{0};
   float* partial_main{nullptr};  // skinny partial sums (eager paths)
   float* partial_flow{nullptr};  // same for the graph-captured sampler
@@ -252,8 +279,26 @@ struct Model::Impl {
       d.k = UploadLinear(layer.k);
       d.v = UploadLinear(layer.v);
       d.o = UploadLinear(layer.o);
-      d.gate = UploadLinear(layer.gate);
-      d.up = UploadLinear(layer.up);
+      // gate and up back to back: one [2f, h] matrix for the fused skinny GEMM
+      {
+        const std::size_t f = static_cast<std::size_t>(layer.gate.out_features);
+        const std::size_t hin = static_cast<std::size_t>(layer.gate.in_features);
+        void* fused = nullptr;
+        Check(hipMalloc(&fused, 2 * f * hin * sizeof(std::uint16_t)), "weight alloc");
+        allocations.push_back(fused);
+        auto* base = static_cast<std::uint16_t*>(fused);
+        Check(hipMemcpy(base, layer.gate.weight, f * hin * sizeof(std::uint16_t),
+                        hipMemcpyHostToDevice), "weight upload");
+        Check(hipMemcpy(base + f * hin, layer.up.weight, f * hin * sizeof(std::uint16_t),
+                        hipMemcpyHostToDevice), "weight upload");
+        if (!layer.gate.bias.empty() || !layer.up.bias.empty()) {
+          throw std::runtime_error("VoxCPM2 HIP: MLP biases are not expected");
+        }
+        d.gate = {base, nullptr, static_cast<std::int64_t>(f), static_cast<std::int64_t>(hin)};
+        d.up = {base + f * hin, nullptr, static_cast<std::int64_t>(f), static_cast<std::int64_t>(hin)};
+        d.gate_up = {base, nullptr, static_cast<std::int64_t>(2 * f), static_cast<std::int64_t>(hin)};
+        max_partial = std::max(max_partial, SkinnyPartialFloats(2 * f, hin));
+      }
       d.down = UploadLinear(layer.down);
       d.input_norm = UploadVector(layer.input_norm);
       d.post_norm = UploadVector(layer.post_norm);
@@ -283,10 +328,11 @@ struct Model::Impl {
                                                static_cast<std::size_t>(rows),
                                                static_cast<std::size_t>(layer.out),
                                                static_cast<std::size_t>(layer.in), stream);
-    } else if (use_skinny && rows <= kSkinnyMaxRows) {
+    } else if (Skinny(rows)) {
       LaunchSkinnyGemm(xin, layer.weight, layer.bias, y, static_cast<std::size_t>(rows),
                        static_cast<std::size_t>(layer.out), static_cast<std::size_t>(layer.in),
-                       in_flow ? partial_flow : partial_main, stream);
+                       in_flow ? partial_flow : partial_main, stream, SkinnyEpilogue::kStore,
+                       use_wmma);
       return;  // bias added in the reduction
     } else {
       ming::LaunchGemmF32Bf16(xin, layer.weight, y, static_cast<std::size_t>(rows),
@@ -330,10 +376,15 @@ struct Model::Impl {
     }
     for (std::size_t index = 0; index < stack.layers.size(); ++index) {
       const DevLayer& layer = stack.layers[index];
+      const bool skinny = Skinny(static_cast<std::int64_t>(rows));
+      float* partial = in_flow ? partial_flow : partial_main;
       ming::LaunchRmsNorm(xin, layer.input_norm, nrm, rows, h, eps, stream);
+      Tick("rmsnorm");
       Linear(layer.q, nrm, static_cast<std::int64_t>(rows), qb);
+      Tick("gemm q");
       Linear(layer.k, nrm, static_cast<std::int64_t>(rows), kb);
       Linear(layer.v, nrm, static_cast<std::int64_t>(rows), vb);
+      Tick("gemm k+v");
       if (c.rope) {
         LaunchRopeTable(qb, rows, static_cast<std::size_t>(seqlen),
                         static_cast<std::size_t>(c.num_heads), hd,
@@ -341,6 +392,7 @@ struct Model::Impl {
         LaunchRopeTable(kb, rows, static_cast<std::size_t>(seqlen),
                         static_cast<std::size_t>(c.num_kv_heads), hd,
                         static_cast<std::size_t>(first), rope_cos, rope_sin, stream);
+        Tick("rope");
       }
       if (cache != nullptr) {
         Copy(cache->k[index] + static_cast<std::size_t>(first) * kvw, kb, rows * kvw);
@@ -358,16 +410,41 @@ struct Model::Impl {
                         static_cast<std::size_t>(seqlen) * qw,
                         static_cast<std::size_t>(seqlen) * kvw, causal, 0, stream);
       }
+      Tick("attention (+cache copy)");
+      if (skinny) {  // residual add and SiLU*up fused into the split-K reduction
+        LaunchSkinnyGemm(ab, layer.o.weight, layer.o.bias, xin, rows,
+                         static_cast<std::size_t>(layer.o.out), static_cast<std::size_t>(layer.o.in),
+                         partial, stream, SkinnyEpilogue::kAccumulate, use_wmma);
+        Tick("gemm o (+residual)");
+        ming::LaunchRmsNorm(xin, layer.post_norm, nrm, rows, h, eps, stream);
+        Tick("rmsnorm");
+        LaunchSkinnyGemm(nrm, layer.gate_up.weight, nullptr, gb, rows,
+                         static_cast<std::size_t>(layer.gate_up.out),
+                         static_cast<std::size_t>(layer.gate_up.in), partial, stream,
+                         SkinnyEpilogue::kSiluMulPairs, use_wmma);
+        Tick("gemm gate+up (+silu*up)");
+        LaunchSkinnyGemm(gb, layer.down.weight, layer.down.bias, xin, rows,
+                         static_cast<std::size_t>(layer.down.out),
+                         static_cast<std::size_t>(layer.down.in), partial, stream,
+                         SkinnyEpilogue::kAccumulate, use_wmma);
+        Tick("gemm down (+residual)");
+        continue;
+      }
       Linear(layer.o, ab, static_cast<std::int64_t>(rows), pb);
       ming::LaunchAdd(xin, pb, rows * h, stream);
+      Tick("gemm o + add");
       ming::LaunchRmsNorm(xin, layer.post_norm, nrm, rows, h, eps, stream);
+      Tick("rmsnorm");
       Linear(layer.gate, nrm, static_cast<std::int64_t>(rows), gb);
       Linear(layer.up, nrm, static_cast<std::int64_t>(rows), ub);
       ming::LaunchSiluMul(gb, ub, rows * f, stream);
+      Tick("gemm gate+up + silu*up");
       Linear(layer.down, gb, static_cast<std::int64_t>(rows), pb);
       ming::LaunchAdd(xin, pb, rows * h, stream);
+      Tick("gemm down + add");
     }
     ming::LaunchRmsNorm(xin, stack.final_norm, xin, rows, h, eps, stream);
+    Tick("rmsnorm");
     if (cache != nullptr) {
       cache->length = first + seqlen;
     }
@@ -458,12 +535,14 @@ struct Model::Impl {
     Linear(dit_in, f_x.data, static_cast<std::int64_t>(p), f_xrows.data);
     LaunchAssembleDit(f_mu.data, t_row, f_cond.data, f_xrows.data, f_seq.data, mu_tokens, p, dh,
                       stream);
+    Tick("dit in_proj + assemble");
     StackForward(dit, f_seq.data, 2, static_cast<std::int64_t>(seq_len), false, nullptr,
                  flow_scratch);
     for (std::size_t b = 0; b < 2; ++b) {
       Linear(dit_out, f_seq.data + (b * seq_len + mu_tokens + 1 + p) * dh,
              static_cast<std::int64_t>(p), f_vel.data + b * pd);
     }
+    Tick("dit out_proj");
   }
 };
 
@@ -512,6 +591,11 @@ std::unique_ptr<Model> Model::Create(const cpu::Model& cpu_model, std::string* e
     m.EnsureFlowBuffers();
     const char* skinny_env = std::getenv("GUFO_VOXCPM_SKINNY");
     m.use_skinny = !(skinny_env != nullptr && std::string(skinny_env) == "0");
+    if (const char* rows_env = std::getenv("GUFO_VOXCPM_SKINNY_MAX_ROWS"); rows_env != nullptr) {
+      m.skinny_max_rows = std::max<std::int64_t>(kGemvRows, std::atoll(rows_env));
+    }
+    const char* wmma_env = std::getenv("GUFO_VOXCPM_WMMA");
+    m.use_wmma = wmma_env != nullptr && std::string(wmma_env) == "1";
     for (float** buffer : {&m.partial_main, &m.partial_flow}) {
       void* device = nullptr;
       Check(hipMalloc(&device, std::max<std::size_t>(m.max_partial, 64) * sizeof(float)),
@@ -541,6 +625,56 @@ void Model::SetSkinnyGemm(bool enabled) {
   m.use_skinny = enabled;
 }
 bool Model::skinny_gemm() const noexcept { return impl_->use_skinny; }
+
+void Model::SetSkinnyMaxRows(std::int64_t rows) {
+  impl_->skinny_max_rows = std::max<std::int64_t>(kGemvRows, rows);
+}
+
+void Model::SetWmma(bool enabled) {
+  Impl& m = *impl_;
+  if (m.use_wmma != enabled) {
+    for (auto& [key, exec] : m.graphs) {
+      (void)hipGraphExecDestroy(exec);
+    }
+    m.graphs.clear();
+    m.graph_seen.clear();
+  }
+  m.use_wmma = enabled;
+}
+
+bool Model::wmma() const noexcept { return impl_->use_wmma; }
+
+void Model::SetProfiling(bool enabled) {
+  Impl& m = *impl_;
+  m.profiling = enabled;
+  m.profile.clear();
+  Check(hipStreamSynchronize(m.stream), "profile sync");
+  m.profile_mark = std::chrono::steady_clock::now();
+}
+
+std::string Model::ProfileReport() const {
+  const Impl& m = *impl_;
+  std::vector<std::pair<std::string, std::pair<double, int>>> rows(m.profile.begin(),
+                                                                   m.profile.end());
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+  double total = 0.0;
+  for (const auto& row : rows) {
+    total += row.second.first;
+  }
+  std::string out;
+  char line[200];
+  for (const auto& [name, value] : rows) {
+    std::snprintf(line, sizeof(line), "  %-28s %8.2f ms %5.1f %%  %5d calls  %.3f ms/call\n",
+                  name.c_str(), value.first, total > 0.0 ? 100.0 * value.first / total : 0.0,
+                  value.second, value.first / std::max(1, value.second));
+    out += line;
+  }
+  std::snprintf(line, sizeof(line), "  %-28s %8.2f ms (eager, synchronized after every op)\n",
+                "total", total);
+  out += line;
+  return out;
+}
 bool Model::graphs_enabled() const noexcept { return impl_->use_graphs; }
 
 void Model::Prefill(const std::int64_t* ids, const float* feats, const std::uint8_t* audio_mask,
@@ -600,15 +734,17 @@ void Model::SamplePatch(const float* lm_hidden, const float* residual_hidden,
     m.Linear(m.lm_to_dit, m.f_lm.data, 1, m.f_mu.data);
     m.Linear(m.res_to_dit, m.f_res.data, 1, m.f_mu.data + dh);
     m.Linear(m.dit_cond, m.f_prev.data, static_cast<std::int64_t>(p), m.f_cond.data);
+    m.Tick("dit condition (mu, cond)");
     for (std::size_t s = 0; s < schedule.size(); ++s) {
       m.VelocityDevice(t_rows + s * dh);
       LaunchCfgEuler(m.f_x.data, m.f_vel.data, options.cfg, schedule[s].dt, pd,
                      options.cfg_zero_star, m.stream);
+      m.Tick("cfg euler");
     }
     m.in_flow = false;
   };
   const auto key = std::make_tuple(options.timesteps, options.cfg, options.cfg_zero_star);
-  if (!m.use_graphs) {
+  if (!m.use_graphs || m.profiling) {
     body();
   } else if (const auto found = m.graphs.find(key); found != m.graphs.end()) {
     Check(hipGraphLaunch(found->second, m.stream), "graph launch");

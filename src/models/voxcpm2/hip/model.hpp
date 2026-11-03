@@ -47,6 +47,15 @@ public:
   // GUFO_VOXCPM_SKINNY=0 at creation selects the 64x64 tile GEMM).
   void SetSkinnyGemm(bool enabled);
   [[nodiscard]] bool skinny_gemm() const noexcept;
+  // Largest row count for the skinny GEMM (default 32; GUFO_VOXCPM_SKINNY_MAX_ROWS).
+  void SetSkinnyMaxRows(std::int64_t rows);
+  // BF16 WMMA in the skinny GEMM (activations rounded to BF16, FP32
+  // accumulate); default off, GUFO_VOXCPM_WMMA=1 at creation.
+  void SetWmma(bool enabled);
+  [[nodiscard]] bool wmma() const noexcept;
+  // Per-op timing (forces eager execution and a sync after every op).
+  void SetProfiling(bool enabled);
+  [[nodiscard]] std::string ProfileReport() const;
 
   struct Impl;
 

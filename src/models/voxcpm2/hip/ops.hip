@@ -5,6 +5,8 @@
 
 #include <cmath>
 
+#include <rocwmma/rocwmma.hpp>
+
 namespace gufo::models::voxcpm2::hip {
 namespace {
 
@@ -232,21 +234,112 @@ __global__ void CfgEulerKernel(float* x, const float* vel, float cfg, float dt, 
 }
 
 // ---- skinny split-K GEMM ---------------------------------------------------
-constexpr int kSkCols = 32;                       // output columns per block
+// Block tile: 32 rows x 64 columns x one 128-wide K slice (split-K), staged in
+// 32-deep chunks. v2: each thread owns 2 rows x 4 columns and reads them as
+// float2/float4 from LDS (v1 read 5 LDS values per 4 FMAs and was LDS-bound).
+constexpr int kSkCols = 64;
 constexpr int kSkSlice = static_cast<int>(kSkinnySlice);
 constexpr int kSkRows = static_cast<int>(kSkinnyRows);
+constexpr int kSkChunk = 32;
 
 __device__ inline float Bf16Bits(std::uint16_t bits) {
   return __uint_as_float(static_cast<unsigned>(bits) << 16U);
 }
 
-// Block (256 threads) = 32 columns x one K slice for up to 32 rows. Weights
-// are staged through LDS with coalesced 16-byte loads; thread (col, g)
-// accumulates rows g, g + 8, g + 16, g + 24.
-__global__ void SkinnyGemmKernel(const float* x, const std::uint16_t* w, float* partial,
-                                 int m, int n, int k) {
-  __shared__ float xs[kSkRows][kSkSlice + 1];
-  __shared__ float ws[kSkCols][kSkSlice + 1];
+__global__ __launch_bounds__(256) void SkinnyGemmKernel(const float* x, const std::uint16_t* w,
+                                                        float* partial, int m, int n, int k) {
+  __shared__ __attribute__((aligned(16))) float xs[kSkChunk][kSkRows + 4];
+  __shared__ __attribute__((aligned(16))) float ws[kSkChunk][kSkCols + 4];
+  const int n0 = blockIdx.x * kSkCols;
+  const int split = blockIdx.y;
+  const int k_begin = split * kSkSlice;
+  const int k_end = min(k, k_begin + kSkSlice);
+  const int t = threadIdx.x;
+  const int cg = t % 16;  // columns cg*4 .. cg*4+3
+  const int rg = t / 16;  // rows rg*2, rg*2+1
+  float acc[2][4] = {};
+  for (int kc = k_begin; kc < k_end; kc += kSkChunk) {
+    const int kn = min(kSkChunk, k_end - kc);
+    {  // X chunk: 32 rows x 32 k, one float4 per thread
+      const int row = t / 8;
+      const int k4 = (t % 8) * 4;
+      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      if (row < m && k4 < kn) {
+        v = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(row) * k + kc + k4);
+      }
+      xs[k4 + 0][row] = v.x;
+      xs[k4 + 1][row] = v.y;
+      xs[k4 + 2][row] = v.z;
+      xs[k4 + 3][row] = v.w;
+    }
+    {  // W chunk: 64 columns x 32 k BF16, 8 values (16 bytes) per thread
+      const int col = t / 4;
+      const int k8 = (t % 4) * 8;
+      const int j = n0 + col;
+      unsigned words[4] = {0U, 0U, 0U, 0U};
+      if (j < n && k8 < kn) {
+        const uint4 raw =
+            *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(j) * k + kc + k8);
+        words[0] = raw.x;
+        words[1] = raw.y;
+        words[2] = raw.z;
+        words[3] = raw.w;
+      }
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        ws[k8 + 2 * e][col] = Bf16Bits(static_cast<std::uint16_t>(words[e] & 0xFFFFU));
+        ws[k8 + 2 * e + 1][col] = Bf16Bits(static_cast<std::uint16_t>(words[e] >> 16U));
+      }
+    }
+    __syncthreads();
+#pragma unroll 8
+    for (int kk = 0; kk < kn; ++kk) {
+      const float4 wv = *reinterpret_cast<const float4*>(&ws[kk][cg * 4]);
+      const float2 xv = *reinterpret_cast<const float2*>(&xs[kk][rg * 2]);
+      acc[0][0] = fmaf(xv.x, wv.x, acc[0][0]);
+      acc[0][1] = fmaf(xv.x, wv.y, acc[0][1]);
+      acc[0][2] = fmaf(xv.x, wv.z, acc[0][2]);
+      acc[0][3] = fmaf(xv.x, wv.w, acc[0][3]);
+      acc[1][0] = fmaf(xv.y, wv.x, acc[1][0]);
+      acc[1][1] = fmaf(xv.y, wv.y, acc[1][1]);
+      acc[1][2] = fmaf(xv.y, wv.z, acc[1][2]);
+      acc[1][3] = fmaf(xv.y, wv.w, acc[1][3]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int row = rg * 2 + r;
+    if (row >= m) {
+      continue;
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int j = n0 + cg * 4 + c;
+      if (j < n) {
+        partial[(static_cast<std::size_t>(split) * kSkRows + row) * n + j] = acc[r][c];
+      }
+    }
+  }
+}
+
+// BF16 WMMA variant (activations rounded to BF16 RNE, FP32 accumulation):
+// 4 waves (wave32) per block, each a 16-column strip x both 16-row tiles.
+using WmmaBf16 = rocwmma::bfloat16_t;
+constexpr int kWmPitch = kSkSlice + 8;  // bf16 elements per LDS row
+
+__device__ inline std::uint16_t F32ToBf16Bits(float value) {
+  unsigned bits = __float_as_uint(value);
+  bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+__global__ __launch_bounds__(128) void SkinnyGemmWmmaKernel(const float* x,
+                                                            const std::uint16_t* w,
+                                                            float* partial, int m, int n,
+                                                            int k) {
+  __shared__ __attribute__((aligned(16))) std::uint16_t as[kSkRows * kWmPitch];
+  __shared__ __attribute__((aligned(16))) std::uint16_t bs[kSkCols * kWmPitch];
   const int n0 = blockIdx.x * kSkCols;
   const int split = blockIdx.y;
   const int k0 = split * kSkSlice;
@@ -254,65 +347,75 @@ __global__ void SkinnyGemmKernel(const float* x, const std::uint16_t* w, float* 
   for (int i = threadIdx.x; i < kSkRows * kSkSlice; i += blockDim.x) {
     const int r = i / kSkSlice;
     const int c = i % kSkSlice;
-    xs[r][c] = (r < m && c < kn) ? x[static_cast<std::size_t>(r) * k + k0 + c] : 0.0F;
+    const float v = (r < m && c < kn) ? x[static_cast<std::size_t>(r) * k + k0 + c] : 0.0F;
+    as[r * kWmPitch + c] = F32ToBf16Bits(v);
   }
-  // 32 rows x 128 bf16 = 32 x 16 uint4 loads
   for (int i = threadIdx.x; i < kSkCols * (kSkSlice / 8); i += blockDim.x) {
-    const int r = i / (kSkSlice / 8);
+    const int col = i / (kSkSlice / 8);
     const int c8 = (i % (kSkSlice / 8)) * 8;
-    const int j = n0 + r;
+    const int j = n0 + col;
+    uint4 raw = make_uint4(0U, 0U, 0U, 0U);
     if (j < n && c8 < kn) {
-      const uint4 raw =
-          *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(j) * k + k0 + c8);
-      const unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        ws[r][c8 + 2 * e] = Bf16Bits(static_cast<std::uint16_t>(words[e] & 0xFFFFU));
-        ws[r][c8 + 2 * e + 1] = Bf16Bits(static_cast<std::uint16_t>(words[e] >> 16U));
-      }
-    } else {
-#pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        ws[r][c8 + e] = 0.0F;
-      }
+      raw = *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(j) * k + k0 + c8);
     }
+    *reinterpret_cast<uint4*>(&bs[col * kWmPitch + c8]) = raw;
   }
   __syncthreads();
-  const int col = threadIdx.x % kSkCols;
-  const int g = threadIdx.x / kSkCols;  // 0..7
-  float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-  for (int kk = 0; kk < kn; ++kk) {
-    const float wv = ws[col][kk];
+  using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, WmmaBf16, rocwmma::row_major>;
+  using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, WmmaBf16, rocwmma::col_major>;
+  using FragC = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+  const int wave = threadIdx.x / 32;  // 16-column strip
+  FragC acc[2];
+  rocwmma::fill_fragment(acc[0], 0.0F);
+  rocwmma::fill_fragment(acc[1], 0.0F);
+  const auto* a_ptr = reinterpret_cast<const WmmaBf16*>(as);
+  const auto* b_ptr = reinterpret_cast<const WmmaBf16*>(bs);
+  for (int kk = 0; kk < kSkSlice; kk += 16) {
+    FragB fb;
+    rocwmma::load_matrix_sync(fb, b_ptr + wave * 16 * kWmPitch + kk, kWmPitch);
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      acc[r] = fmaf(wv, xs[g + 8 * r][kk], acc[r]);
+    for (int tile = 0; tile < 2; ++tile) {
+      FragA fa;
+      rocwmma::load_matrix_sync(fa, a_ptr + tile * 16 * kWmPitch + kk, kWmPitch);
+      rocwmma::mma_sync(acc[tile], fa, fb, acc[tile]);
     }
   }
-  const int j = n0 + col;
-  if (j < n) {
+  if (n0 + wave * 16 + 16 <= n) {
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int row = g + 8 * r;
-      if (row < m) {
-        partial[(static_cast<std::size_t>(split) * kSkRows + row) * n + j] = acc[r];
-      }
+    for (int tile = 0; tile < 2; ++tile) {
+      rocwmma::store_matrix_sync(
+          partial + (static_cast<std::size_t>(split) * kSkRows + tile * 16) * n + n0 + wave * 16,
+          acc[tile], static_cast<unsigned>(n), rocwmma::mem_row_major);
     }
   }
 }
 
+// mode 0: y = bias + sum; 1: y += bias + sum (residual); 2: SiLU-gated pair,
+// partial has 2 * n_out columns [gate | up]: y = silu(g) * u.
 __global__ void SkinnyReduceKernel(const float* partial, const float* bias, float* y, int m,
-                                   int n, int splits) {
+                                   int n, int splits, int mode) {
+  const int n_out = mode == 2 ? n / 2 : n;
   const std::size_t index = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (index >= static_cast<std::size_t>(m) * n) {
+  if (index >= static_cast<std::size_t>(m) * n_out) {
     return;
   }
-  const int row = static_cast<int>(index / n);
-  const int j = static_cast<int>(index % n);
+  const int row = static_cast<int>(index / n_out);
+  const int j = static_cast<int>(index % n_out);
   float sum = bias != nullptr ? bias[j] : 0.0F;
   for (int s = 0; s < splits; ++s) {
     sum += partial[(static_cast<std::size_t>(s) * kSkRows + row) * n + j];
   }
-  y[index] = sum;
+  if (mode == 2) {
+    float up = bias != nullptr ? bias[j + n_out] : 0.0F;
+    for (int s = 0; s < splits; ++s) {
+      up += partial[(static_cast<std::size_t>(s) * kSkRows + row) * n + j + n_out];
+    }
+    y[index] = sum / (1.0F + expf(-sum)) * up;
+  } else if (mode == 1) {
+    y[index] += sum;
+  } else {
+    y[index] = sum;
+  }
 }
 
 // ---- AudioVAE kernels --------------------------------------------------------
@@ -483,17 +586,25 @@ std::size_t SkinnyPartialFloats(std::size_t n, std::size_t k) {
 
 void LaunchSkinnyGemm(const float* x, const std::uint16_t* w, const float* bias, float* y,
                       std::size_t m, std::size_t n, std::size_t k, float* partial,
-                      hipStream_t stream) {
+                      hipStream_t stream, SkinnyEpilogue epilogue, bool wmma) {
   const auto splits = static_cast<unsigned>((k + kSkinnySlice - 1) / kSkinnySlice);
   const auto col_blocks = static_cast<unsigned>((n + kSkCols - 1) / kSkCols);
+  const bool use_wmma = wmma && n % kSkCols == 0 && k % kSkinnySlice == 0;
+  const std::size_t n_out = epilogue == SkinnyEpilogue::kSiluMulPairs ? n / 2 : n;
   for (std::size_t r0 = 0; r0 < m; r0 += kSkinnyRows) {
     const std::size_t rows = m - r0 < kSkinnyRows ? m - r0 : kSkinnyRows;
-    hipLaunchKernelGGL(SkinnyGemmKernel, dim3(col_blocks, splits), dim3(kThreads), 0, stream,
-                       x + r0 * k, w, partial, static_cast<int>(rows), static_cast<int>(n),
-                       static_cast<int>(k));
-    hipLaunchKernelGGL(SkinnyReduceKernel, dim3(Blocks(rows * n)), dim3(kThreads), 0, stream,
-                       partial, bias, y + r0 * n, static_cast<int>(rows), static_cast<int>(n),
-                       static_cast<int>(splits));
+    if (use_wmma) {
+      hipLaunchKernelGGL(SkinnyGemmWmmaKernel, dim3(col_blocks, splits), dim3(128), 0, stream,
+                         x + r0 * k, w, partial, static_cast<int>(rows), static_cast<int>(n),
+                         static_cast<int>(k));
+    } else {
+      hipLaunchKernelGGL(SkinnyGemmKernel, dim3(col_blocks, splits), dim3(kThreads), 0, stream,
+                         x + r0 * k, w, partial, static_cast<int>(rows), static_cast<int>(n),
+                         static_cast<int>(k));
+    }
+    hipLaunchKernelGGL(SkinnyReduceKernel, dim3(Blocks(rows * n_out)), dim3(kThreads), 0, stream,
+                       partial, bias, y + r0 * n_out, static_cast<int>(rows), static_cast<int>(n),
+                       static_cast<int>(splits), static_cast<int>(epilogue));
   }
 }
 

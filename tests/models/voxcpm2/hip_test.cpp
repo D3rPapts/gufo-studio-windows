@@ -189,11 +189,22 @@ int main() {
     }
     Check("dit velocity call 0", Cos(out.data(), want.data(), out.size()), 0.999);
   }
-  // flow sampler, prefill and teacher-forced AR for both GEMM paths:
-  // "vorher" = 64x64 tile GEMM (run of 03.11. 01:53), "nachher" = split-K skinny GEMM.
-  for (const bool skinny : {false, true}) {
-    gpu->SetSkinnyGemm(skinny);
-    const std::string tag = skinny ? "[nachher skinny] " : "[vorher tile] ";
+  // GEMM variants for the sampler / prefill / teacher-forced AR:
+  //   tile   = 64x64 tile GEMM (state of GPU run 1, "vorher" of run 2)
+  //   fp32   = skinny v2 (2x4 register tiles, fused gate+up / residual), FP32
+  //   wmma   = skinny v2 with BF16 WMMA (activations rounded to BF16)
+  struct Variant {
+    const char* tag;
+    bool skinny;
+    bool wmma;
+  };
+  const Variant variants[] = {{"[tile] ", false, false}, {"[fp32] ", true, false},
+                              {"[wmma] ", true, true}};
+  for (const Variant& variant : variants) {
+    gpu->SetSkinnyGemm(variant.skinny);
+    gpu->SetWmma(variant.wmma);
+    gpu->SetSkinnyMaxRows(32);
+    const std::string tag = variant.tag;
     {
       std::vector<float> lm(step_lm.begin(), step_lm.begin() + H);
       std::vector<float> res(step_res.begin(), step_res.begin() + H);
@@ -208,14 +219,34 @@ int main() {
                       run, ms);
         Check(name, Cos(patch.data(), step_pred.data(), patch.size()), 0.999);
       }
+      if (variant.skinny) {  // per-op profile of one sampler call (eager, synchronized)
+        gpu->SetProfiling(true);
+        gpu->SamplePatch(lm.data(), res.data(), step_cond.data(), step_noise.data(), flow,
+                         patch.data());
+        std::printf("%sprofile of one flow sampler call (9 DiT evaluations):\n%s", tag.c_str(),
+                    gpu->ProfileReport().c_str());
+        gpu->SetProfiling(false);
+      }
     }
+    std::vector<std::int64_t> limits{32};
+    if (variant.skinny) {
+      limits.push_back(128);  // prefill (86 rows) as 3 skinny passes, to pick the limit
+    }
+    for (const std::int64_t limit : limits) {
+      gpu->SetSkinnyMaxRows(limit);
+      std::vector<float> lm(static_cast<std::size_t>(H)), res(static_cast<std::size_t>(H));
+      const auto t = std::chrono::steady_clock::now();
+      gpu->Prefill(ids.data(), feats.data(), mask.data(), rows, lm.data(), res.data());
+      std::printf("%sprefill %lld rows %.1f ms (skinny up to %lld rows)\n", tag.c_str(),
+                  static_cast<long long>(rows), Seconds(t) * 1000.0, static_cast<long long>(limit));
+      Check(tag + "prefill lm_hidden (limit " + std::to_string(limit) + ")",
+            Cos(lm.data(), step_lm.data(), lm.size()), 0.999);
+      Check(tag + "prefill residual_hidden (limit " + std::to_string(limit) + ")",
+            Cos(res.data(), step_res.data(), res.size()), 0.999);
+    }
+    gpu->SetSkinnyMaxRows(32);
     std::vector<float> lm(static_cast<std::size_t>(H)), res(static_cast<std::size_t>(H));
-    const auto t = std::chrono::steady_clock::now();
     gpu->Prefill(ids.data(), feats.data(), mask.data(), rows, lm.data(), res.data());
-    std::printf("%sprefill %lld rows %.1f ms\n", tag.c_str(), static_cast<long long>(rows),
-                Seconds(t) * 1000.0);
-    Check(tag + "prefill lm_hidden", Cos(lm.data(), step_lm.data(), lm.size()), 0.999);
-    Check(tag + "prefill residual_hidden", Cos(res.data(), step_res.data(), res.size()), 0.999);
     double worst_lm = 1.0, worst_res = 1.0, worst_patch = 1.0;
     double t_sample = 0.0, t_advance = 0.0, t_stop = 0.0;
     for (std::int64_t i = 0; i < steps; ++i) {
@@ -232,21 +263,31 @@ int main() {
       gpu->StopLogits(lm.data(), logits);
       t_stop += Seconds(ts);
       if (i + 1 < steps) {
+        if (variant.skinny && !variant.wmma && i == 1) {
+          gpu->SetProfiling(true);
+          gpu->Advance(step_pred.data() + i * PD, lm.data(), res.data());
+          std::printf("%sprofile of one advance step (local encoder, base LM, residual LM):\n%s",
+                      tag.c_str(), gpu->ProfileReport().c_str());
+          gpu->SetProfiling(false);
+          continue;
+        }
         ts = std::chrono::steady_clock::now();
         gpu->Advance(step_pred.data() + i * PD, lm.data(), res.data());
         t_advance += Seconds(ts);
       }
     }
+    const std::int64_t timed_advances =
+        std::max<std::int64_t>(1, steps - 1 - ((variant.skinny && !variant.wmma) ? 1 : 0));
     std::printf("%sper AR step: sampler %.1f ms, stop %.1f ms, advance %.1f ms\n", tag.c_str(),
                 1000.0 * t_sample / steps, 1000.0 * t_stop / steps,
-                1000.0 * t_advance / std::max<std::int64_t>(1, steps - 1));
+                1000.0 * t_advance / timed_advances);
     Check(tag + "AR lm_hidden (worst step)", worst_lm, 0.999);
     Check(tag + "AR residual_hidden (worst step)", worst_res, 0.999);
     Check(tag + "AR flow patch (worst step)", worst_patch, 0.999);
   }
   (void)step_dit;
 
-  // AudioVAE on the GPU vs. the oracle and the CPU port
+  // AudioVAE on the GPU vs. the oracle (unchanged since run 2; kept as a check)
   {
     auto cpu_vae = vox::cpu::AudioVae::Load(model_env, c.vae, &error);
     auto gpu_vae = cpu_vae != nullptr ? vox::hip::AudioVae::Create(*cpu_vae, &error) : nullptr;
@@ -257,31 +298,14 @@ int main() {
       const auto wave16k = oracle->ToF32("ref_wave16k");
       const auto want_mu = oracle->ToF32("vae_enc_mu");
       std::int64_t frames = 0;
-      for (int run = 0; run < 2; ++run) {
-        const auto t = std::chrono::steady_clock::now();
-        const auto mu = gpu_vae->Encode(wave16k.data(), static_cast<std::int64_t>(wave16k.size()), &frames);
-        char name[160];
-        std::snprintf(name, sizeof(name), "hip vae encode run %d (%.1f ms, %.1f s audio)", run,
-                      Seconds(t) * 1000.0, static_cast<double>(wave16k.size()) / 16000.0);
-        Check(name, mu.size() == want_mu.size() ? Cos(mu.data(), want_mu.data(), mu.size()) : 0.0, 0.9999);
-      }
-      {
-        const auto t = std::chrono::steady_clock::now();
-        std::int64_t cpu_frames = 0;
-        (void)cpu_vae->Encode(wave16k.data(), static_cast<std::int64_t>(wave16k.size()), &cpu_frames);
-        std::printf("cpu vae encode %.1f ms (vorher)\n", Seconds(t) * 1000.0);
-      }
+      auto t = std::chrono::steady_clock::now();
+      const auto mu = gpu_vae->Encode(wave16k.data(), static_cast<std::int64_t>(wave16k.size()), &frames);
+      char name[160];
+      std::snprintf(name, sizeof(name), "hip vae encode (%.1f ms)", Seconds(t) * 1000.0);
+      Check(name, mu.size() == want_mu.size() ? Cos(mu.data(), want_mu.data(), mu.size()) : 0.0, 0.9999);
       const auto latent = oracle->ToF32("latent");
       const auto want_wave = oracle->ToF32("wave");
       const std::int64_t lf = static_cast<std::int64_t>(latent.size()) / D;
-      gpu_vae->ResetDecoder();
-      auto t = std::chrono::steady_clock::now();
-      const auto full = gpu_vae->DecodeChunk(latent.data(), lf);
-      std::printf("hip vae decode %lld frames in one call %.1f ms\n", static_cast<long long>(lf),
-                  Seconds(t) * 1000.0);
-      Check("hip vae decode wave", full.size() == want_wave.size()
-                                       ? Cos(full.data(), want_wave.data(), full.size()) : 0.0, 0.9999);
-      // streaming, one AR patch (4 frames) per call, like the engine
       gpu_vae->ResetDecoder();
       std::vector<float> chunked;
       double t_chunks = 0.0;
@@ -302,24 +326,10 @@ int main() {
                   1000.0 * t_chunks / static_cast<double>((lf + P - 1) / P));
       Check("hip vae streaming == oracle wave", chunked.size() == want_wave.size()
                 ? Cos(chunked.data(), want_wave.data(), chunked.size()) : 0.0, 0.9999);
-      vox::cpu::AudioVae::DecoderState state;
-      t = std::chrono::steady_clock::now();
-      for (std::int64_t f = 0; f < lf; f += P) {
-        const std::int64_t n = std::min(P, lf - f);
-        std::vector<float> z(static_cast<std::size_t>(D * n));
-        for (std::int64_t ch = 0; ch < D; ++ch) {
-          for (std::int64_t j = 0; j < n; ++j) {
-            z[static_cast<std::size_t>(ch * n + j)] = latent[static_cast<std::size_t>(ch * lf + f + j)];
-          }
-        }
-        (void)cpu_vae->DecodeChunk(&state, z.data(), n);
-      }
-      std::printf("cpu vae decode per AR patch %.1f ms (vorher)\n",
-                  1000.0 * Seconds(t) / static_cast<double>((lf + P - 1) / P));
     }
   }
 
-  // engine: oracle-noise free run (correctness) and a natural sentence (RTF), both variants
+  // engine: oracle-noise free run (correctness) and a natural streamed sentence (RTF, own stop)
   {
     cpu.reset();
     gpu.reset();
@@ -328,19 +338,18 @@ int main() {
       std::printf("FAIL engine: %s\n", error.c_str());
       return 1;
     }
+    engine->SetVaeOnGpu(true);
     const auto ref_raw = oracle->ToF32("ref_wave16k_raw");
     const auto want_wave = oracle->ToF32("wave");
     const char* out = std::getenv("GUFO_VOXCPM_OUT");
-    for (const bool after : {false, true}) {
-      engine->SetSkinnyGemm(after);
-      engine->SetVaeOnGpu(after);
-      const std::string tag = after ? "[nachher] " : "[vorher] ";
-      std::printf("%sAR backend %s, VAE %s\n", tag.c_str(), engine->backend_name(),
-                  engine->vae_backend_name());
-      for (int run = 0; run < 2; ++run) {  // run 0: reference encode included, run 1: cached
-        if (run == 0) {
-          engine->ClearAudioCache();
-        }
+    std::int64_t fp32_sentence_steps = -1;
+    std::vector<float> fp32_sentence_patches;
+    for (const Variant& variant : variants) {
+      engine->SetSkinnyGemm(variant.skinny);
+      engine->SetWmma(variant.wmma);
+      engine->SetSkinnyMaxRows(32);
+      const std::string tag = variant.tag;
+      {
         vox::SynthesisRequest request;
         request.text = meta.member_str("text");
         request.reference_audio = ref_raw;
@@ -363,64 +372,81 @@ int main() {
         if (!engine->Generate(request, {}, &result, &error)) {
           std::printf("FAIL %sfree run: %s\n", tag.c_str(), error.c_str());
           ++g_failures;
-          continue;
-        }
-        const double seconds = Seconds(t);
-        const double audio_s = static_cast<double>(result.samples.size()) / result.sample_rate;
-        std::printf("%sfree run %s: %lld steps (oracle %lld), %.2f s audio in %.2f s, RTF %.2f\n",
-                    tag.c_str(), run == 0 ? "with reference encode" : "reference cached",
-                    static_cast<long long>(result.steps), static_cast<long long>(steps), audio_s,
-                    seconds, seconds / audio_s);
-        if (run == 1) {
-          const bool same_steps = std::llabs(result.steps - steps) <= 2;
+        } else {
+          const double seconds = Seconds(t);
+          const double audio_s = static_cast<double>(result.samples.size()) / result.sample_rate;
+          std::printf("%sfree run (oracle noise): %lld steps (oracle %lld), %.2f s audio in %.2f s, RTF %.2f\n",
+                      tag.c_str(), static_cast<long long>(result.steps),
+                      static_cast<long long>(steps), audio_s, seconds, seconds / audio_s);
+          const bool same_steps = result.steps == steps;
           if (!same_steps) {
             ++g_failures;
           }
-          std::printf("%-4s %sfree run step count within +-2\n", same_steps ? "OK" : "FAIL", tag.c_str());
+          std::printf("%-4s %sfree run step count equal\n", same_steps ? "OK" : "FAIL", tag.c_str());
           const std::size_t n = std::min(result.patches.size(), step_pred.size());
           Check(tag + "free run latents (common steps)", Cos(result.patches.data(), step_pred.data(), n), 0.98);
           const std::size_t w = std::min(result.samples.size(), want_wave.size());
-          Check(tag + "free run wave vs oracle (common samples)", Cos(result.samples.data(), want_wave.data(), w), 0.95);
+          Check(tag + "free run wave vs oracle", Cos(result.samples.data(), want_wave.data(), w), 0.95);
+        }
+      }
+      // natural sentence, own stop, streamed (one chunk per AR step); best of 2 runs
+      double best = 1e9;
+      for (int run = 0; run < 2; ++run) {
+        vox::SynthesisRequest request;
+        request.text = "Guten Morgen! Heute scheint die Sonne, und wir fahren ans Meer. "
+                       "Ich freue mich schon sehr darauf.";
+        request.instruction = "fröhlich und begeistert";
+        request.reference_audio = ref_raw;
+        request.reference_sample_rate = 16000;
+        request.seed = 4242;
+        std::size_t chunks = 0;
+        double first_chunk_s = -1.0;
+        const auto t = std::chrono::steady_clock::now();
+        request.on_audio = [&](std::span<const float>) {
+          if (chunks++ == 0) {
+            first_chunk_s = Seconds(t);
+          }
+          return true;
+        };
+        vox::SynthesisResult result;
+        if (!engine->Generate(request, {}, &result, &error)) {
+          std::printf("FAIL %ssentence: %s\n", tag.c_str(), error.c_str());
+          ++g_failures;
+          break;
+        }
+        const double seconds = Seconds(t);
+        const double audio_s = static_cast<double>(result.samples.size()) / result.sample_rate;
+        best = std::min(best, seconds / audio_s);
+        std::printf("%ssentence run %d (streamed, reference cached): %lld steps, %.2f s audio in "
+                    "%.2f s, RTF %.2f, first chunk after %.0f ms, %.1f ms per step\n",
+                    tag.c_str(), run, static_cast<long long>(result.steps), audio_s, seconds,
+                    seconds / audio_s, first_chunk_s * 1000.0,
+                    1000.0 * seconds / std::max<std::int64_t>(1, result.steps));
+        if (run == 0) {
+          if (!variant.skinny || !variant.wmma) {
+            if (variant.skinny) {
+              fp32_sentence_steps = result.steps;
+              fp32_sentence_patches = result.patches;
+            }
+          } else if (fp32_sentence_steps >= 0) {  // WMMA vs FP32, same seed
+            const bool same = result.steps == fp32_sentence_steps;
+            if (!same) {
+              ++g_failures;
+            }
+            std::printf("%-4s [wmma] sentence step count equal to [fp32] (%lld vs %lld)\n",
+                        same ? "OK" : "FAIL", static_cast<long long>(result.steps),
+                        static_cast<long long>(fp32_sentence_steps));
+            const std::size_t n = std::min(result.patches.size(), fp32_sentence_patches.size());
+            std::printf("INFO [wmma] sentence latents vs [fp32] cos=%.7f\n",
+                        Cos(result.patches.data(), fp32_sentence_patches.data(), n));
+          }
           if (out != nullptr) {
-            WriteWav(std::filesystem::path(out) / (after ? "hip_free_nachher.wav" : "hip_free_vorher.wav"),
-                     result.samples, result.sample_rate);
+            std::string file = std::string("hip_satz_") + (variant.wmma ? "wmma" : variant.skinny ? "fp32" : "tile") + ".wav";
+            WriteWav(std::filesystem::path(out) / file, result.samples, result.sample_rate);
           }
         }
       }
-      // natural sentence with its own stop (streaming as served: one chunk per AR step)
-      vox::SynthesisRequest request;
-      request.text = "Guten Morgen! Heute scheint die Sonne, und wir fahren ans Meer. "
-                     "Ich freue mich schon sehr darauf.";
-      request.instruction = "fröhlich und begeistert";
-      request.reference_audio = ref_raw;
-      request.reference_sample_rate = 16000;
-      request.seed = 4242;
-      std::size_t chunks = 0;
-      double first_chunk_s = -1.0;
-      const auto t = std::chrono::steady_clock::now();
-      request.on_audio = [&](std::span<const float>) {
-        if (chunks++ == 0) {
-          first_chunk_s = Seconds(t);
-        }
-        return true;
-      };
-      vox::SynthesisResult result;
-      if (!engine->Generate(request, {}, &result, &error)) {
-        std::printf("FAIL %ssentence: %s\n", tag.c_str(), error.c_str());
-        ++g_failures;
-        continue;
-      }
-      const double seconds = Seconds(t);
-      const double audio_s = static_cast<double>(result.samples.size()) / result.sample_rate;
-      std::printf("%ssentence (streamed, reference cached): %lld steps, %.2f s audio in %.2f s, "
-                  "RTF %.2f, first chunk after %.0f ms, %.1f ms per step\n",
-                  tag.c_str(), static_cast<long long>(result.steps), audio_s, seconds,
-                  seconds / audio_s, first_chunk_s * 1000.0,
-                  1000.0 * seconds / std::max<std::int64_t>(1, result.steps));
-      if (out != nullptr) {
-        WriteWav(std::filesystem::path(out) / (after ? "hip_satz_nachher.wav" : "hip_satz_vorher.wav"),
-                 result.samples, result.sample_rate);
-      }
+      std::printf("%ssentence best RTF %.2f\n", tag.c_str(), best);
     }
   }
   std::printf("%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

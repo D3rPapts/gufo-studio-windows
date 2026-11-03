@@ -71,12 +71,20 @@ inline constexpr std::size_t kSkinnySlice = 128;
 // Floats of partial-sum scratch a skinny product of m rows (chunked by 32)
 // needs: ceil(k / 128) * 32 * n.
 [[nodiscard]] std::size_t SkinnyPartialFloats(std::size_t n, std::size_t k);
-// y[m, n] = x[m, k] (FP32) * W[n, k]^T (BF16) (+ bias[n]); FP32 accumulation,
-// split-K over 128-wide slices (32 columns x one slice per block) and a
-// deterministic reduction. Rows are processed in chunks of 32. k % 8 == 0.
+enum class SkinnyEpilogue : int {
+  kStore = 0,         // y = x W^T + b
+  kAccumulate = 1,    // y += x W^T + b (residual add)
+  kSiluMulPairs = 2,  // W = [gate; up] (2 * n_out rows): y[m, n_out] = silu(g) * u
+};
+// y = x[m, k] (FP32) * W[n, k]^T (BF16) (+ bias[n]); FP32 accumulation,
+// split-K over 128-wide slices (64 columns x one slice per block, 2x4 outputs
+// per thread) and a deterministic reduction with the epilogue. Rows are
+// processed in chunks of 32. k % 8 == 0. wmma: BF16 WMMA (activations
+// rounded to BF16, FP32 accumulate) when n % 64 == 0 and k % 128 == 0.
 void LaunchSkinnyGemm(const float* x, const std::uint16_t* w, const float* bias, float* y,
                       std::size_t m, std::size_t n, std::size_t k, float* partial,
-                      hipStream_t stream);
+                      hipStream_t stream, SkinnyEpilogue epilogue = SkinnyEpilogue::kStore,
+                      bool wmma = false);
 
 // ---- AudioVAE (FP32, channel-major [channels, time]) --------------------
 // C[m, n] = A[m, k] * B[k, n] (+ bias[m]); 64x64 tiles, FP32.

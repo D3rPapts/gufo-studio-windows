@@ -78,6 +78,9 @@ public:
   void SetVaeOnGpu(bool enabled);
   // Tests/benchmarks: split-K skinny GEMM on/off in the HIP runtime (no-op on CPU).
   void SetSkinnyGemm(bool enabled);
+  // Tests/benchmarks: BF16 WMMA in the skinny GEMM; skinny row limit.
+  void SetWmma(bool enabled);
+  void SetSkinnyMaxRows(std::int64_t rows);
   // Tests/benchmarks: forget the encoded reference/prompt audio.
   void ClearAudioCache();
 
