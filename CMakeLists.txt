@@ -392,6 +392,7 @@ add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
 add_subdirectory(src/models/fish_drama3)
 add_subdirectory(src/models/ming_tts)
+add_subdirectory(src/models/voxcpm2)
 add_subdirectory(src/models/moss_image)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
@@ -509,7 +510,7 @@ else()
 endif()
 # Real-ESRGAN on the NPU / CPU (ONNX Runtime) behind `gufo serve upscale`.
 target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
-target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
+target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2 gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
   target_link_libraries(gufo_http PUBLIC gufo_wan22)
@@ -553,7 +554,7 @@ target_compile_definitions(gufo PRIVATE
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
 endif()
-target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_qwen3_asr gufo_embedding_gemma2)
+target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2 gufo_qwen3_asr gufo_embedding_gemma2)
 
 if (NOT WIN32)
   add_custom_target(gufo-server ALL
@@ -1210,7 +1211,7 @@ if (BUILD_TESTING)
     tests/models/qwen3_tts/audio_api_test.cpp
     src/cli/serve/audio_tts_api.cpp
     src/cli/serve/tts_service.cpp)
-  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts)
+  target_link_libraries(qwen3_tts_audio_api_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2)
   add_test(NAME qwen3_tts_audio_api_test COMMAND qwen3_tts_audio_api_test)
   set_tests_properties(qwen3_tts_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;server;api;audio;quality")
@@ -1239,10 +1240,30 @@ if (BUILD_TESTING)
     tests/models/ming_tts/serve_test.cpp
     src/cli/serve/audio_tts_api.cpp
     src/cli/serve/tts_service.cpp)
-  target_link_libraries(ming_tts_serve_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts)
+  target_link_libraries(ming_tts_serve_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2)
   add_test(NAME ming_tts_serve_test COMMAND ming_tts_serve_test)
   set_tests_properties(ming_tts_serve_test PROPERTIES
     LABELS "cpu;models;ming-tts;server;api;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE)
+
+  add_executable(voxcpm2_oracle_test
+    tests/models/voxcpm2/oracle_test.cpp)
+  target_link_libraries(voxcpm2_oracle_test PRIVATE gufo_voxcpm2 gufo_qwen3_tts)
+  add_test(NAME voxcpm2_oracle_test COMMAND voxcpm2_oracle_test)
+  set_tests_properties(voxcpm2_oracle_test PROPERTIES
+    LABELS "cpu;models;voxcpm2;quality;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE)
+
+  add_executable(voxcpm2_serve_test
+    tests/models/voxcpm2/serve_test.cpp
+    src/cli/serve/audio_tts_api.cpp
+    src/cli/serve/tts_service.cpp)
+  target_link_libraries(voxcpm2_serve_test PRIVATE gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2)
+  add_test(NAME voxcpm2_serve_test COMMAND voxcpm2_serve_test)
+  set_tests_properties(voxcpm2_serve_test PROPERTIES
+    LABELS "cpu;models;voxcpm2;server;api;external-model"
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE)
 
@@ -1435,6 +1456,15 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(voxcpm2_hip_test
+      tests/models/voxcpm2/hip_test.cpp)
+    target_link_libraries(voxcpm2_hip_test PRIVATE gufo_voxcpm2)
+    add_test(NAME voxcpm2_hip_test COMMAND voxcpm2_hip_test)
+    set_tests_properties(voxcpm2_hip_test PROPERTIES
+      LABELS "gpu;models;voxcpm2;quality;external-model"
+      SKIP_RETURN_CODE 77
+      RUN_SERIAL TRUE)
+
     add_executable(ming_tts_hip_test
       tests/models/ming_tts/hip_test.cpp)
     target_link_libraries(ming_tts_hip_test PRIVATE gufo_ming_tts)
