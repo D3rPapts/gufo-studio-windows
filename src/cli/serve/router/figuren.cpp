@@ -311,8 +311,8 @@ public:
 
   /// One chat through the router's own API; throws UpstreamError on a non-2xx
   /// answer.
-  std::string Ask(json::Value content, bool think,
-                  int max_tokens = kMaxTokens) const {
+  std::string Ask(json::Value content, bool think, int max_tokens = kMaxTokens,
+                  double temperature = 0) const {
     json::Value message = json::Value::object();
     message["role"] = "user";
     message["content"] = std::move(content);
@@ -322,7 +322,10 @@ public:
     body["model"] = model_;
     body["messages"] = std::move(messages);
     body["max_tokens"] = max_tokens;
-    body["temperature"] = 0;
+    if (temperature == 0)
+      body["temperature"] = 0;
+    else
+      body["temperature"] = temperature;
     if (!think) {
       json::Value kwargs = json::Value::object();
       kwargs["enable_thinking"] = false;
@@ -353,6 +356,25 @@ public:
     return text != nullptr && text->is_string() ? text->str() : std::string();
   }
 
+  /// figuren.py ask_json: Ask() + JsonFrom(); on unparsable JSON one repair
+  /// pass, then one new request at temperature 0.3 (so the answer can differ,
+  /// same thinking and max_tokens) parsed with repair, before AnswerError.
+  json::Value AskJson(const json::Value& content, bool want_array, bool think,
+                      int max_tokens = kMaxTokens) const {
+    std::string answer = Ask(content, think, max_tokens);
+    if (auto value = JsonFrom(answer, want_array))
+      return std::move(*value);
+    if (auto value = JsonFrom(RepairJson(answer), want_array))
+      return std::move(*value);
+    answer = Ask(content, think, max_tokens, 0.3);
+    if (auto value = JsonFrom(answer, want_array))
+      return std::move(*value);
+    const std::string repaired = RepairJson(answer);
+    if (auto value = JsonFrom(repaired, want_array))
+      return std::move(*value);
+    throw AnswerError("no JSON in answer: " + Tail(StripThinking(repaired)));
+  }
+
   std::vector<Person> FindPeople(const RgbaImage& frame) const {
     const std::string prompt =
         "List every person visible in this film frame. For each person give "
@@ -366,12 +388,9 @@ public:
     json::Value content = json::Value::array();
     content.push_back(ImagePart(DataUrl(frame, kFrameSide)));
     content.push_back(TextPart(prompt));
-    const std::string answer = Ask(std::move(content), false);
-    const auto people = JsonFrom(answer, true);
-    if (!people.has_value())
-      throw AnswerError("no JSON in answer: " + Tail(answer));
+    const json::Value people = AskJson(content, true, false);
     std::vector<Person> out;
-    for (const json::Value& entry : people->items()) {
+    for (const json::Value& entry : people.items()) {
       const json::Value* body = entry.find("person_box");
       const json::Value* head = entry.find("head_box");
       if (body == nullptr || head == nullptr)
@@ -413,10 +432,7 @@ public:
     content.push_back(ImagePart(DataUrl(reference.head, kHeadSide)));
     content.push_back(ImagePart(DataUrl(head, kHeadSide)));
     content.push_back(TextPart(std::move(prompt)));
-    const std::string answer = Ask(std::move(content), think);
-    const auto result = JsonFrom(answer, false);
-    if (!result.has_value())
-      throw AnswerError("no JSON in answer: " + Tail(answer));
+    const std::optional<json::Value> result = AskJson(content, false, think);
     Verdict verdict;
     double score = 0;
     if (const json::Value* value = result->find("aehnlichkeit")) {
@@ -472,10 +488,8 @@ public:
     content.push_back(ImagePart(DataUrl(*reference.front, kHeadSide)));
     content.push_back(ImagePart(DataUrl(torso, kHeadSide)));
     content.push_back(TextPart(std::move(prompt)));
-    const std::string answer = Ask(std::move(content), true, kCostumeTokens);
-    const auto result = JsonFrom(answer, false);
-    if (!result.has_value())
-      throw AnswerError("no JSON in answer: " + Tail(answer));
+    const std::optional<json::Value> result =
+        AskJson(content, false, true, kCostumeTokens);
     CostumeVerdict verdict;
     const json::Value* items = result->find("items");
     verdict.items = CheckCostumeItems(
@@ -648,6 +662,117 @@ std::optional<json::Value> JsonFrom(std::string_view raw, bool want_array) {
   return std::nullopt;
 }
 
+namespace {
+
+/// Python str.isspace() for one code point (what \s matches in a str pattern).
+bool IsPySpace(char32_t c) {
+  return (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x20) || c == 0x85 ||
+         c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+         c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+         c == 0x3000;
+}
+
+/// The code point starting at byte `pos` (invalid UTF-8: the byte itself).
+char32_t CodePointAt(std::string_view text, std::size_t pos) {
+  const unsigned char lead = static_cast<unsigned char>(text[pos]);
+  int extra = 0;
+  char32_t cp = lead;
+  if (lead >= 0xF0 && lead < 0xF8) {
+    extra = 3;
+    cp = lead & 0x07;
+  } else if (lead >= 0xE0) {
+    extra = 2;
+    cp = lead & 0x0F;
+  } else if (lead >= 0xC0) {
+    extra = 1;
+    cp = lead & 0x1F;
+  } else {
+    return lead;
+  }
+  if (pos + extra >= text.size())
+    return lead;
+  for (int k = 1; k <= extra; ++k) {
+    const unsigned char next = static_cast<unsigned char>(text[pos + k]);
+    if ((next & 0xC0) != 0x80)
+      return lead;
+    cp = (cp << 6) | (next & 0x3F);
+  }
+  return cp;
+}
+
+/// The code point that ends right before byte `pos`, nullopt at the start.
+std::optional<char32_t> CodePointBefore(std::string_view text,
+                                        std::size_t pos) {
+  if (pos == 0)
+    return std::nullopt;
+  std::size_t start = pos - 1;
+  while (start > 0 && pos - start < 4 &&
+         (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80)
+    --start;
+  return CodePointAt(text.substr(0, pos), start);
+}
+
+bool IsDigit(char c) { return c >= '0' && c <= '9'; }
+
+/// Lookbehind [\[,:\s] of repair_json.
+bool OpensNumber(std::string_view text, std::size_t pos) {
+  const auto before = CodePointBefore(text, pos);
+  return before.has_value() && (*before == '[' || *before == ',' ||
+                                *before == ':' || IsPySpace(*before));
+}
+
+}  // namespace
+
+std::string RepairJson(std::string_view input) {
+  // Three re.sub passes in figuren.py order; each scans left to right over
+  // the previous result, and a match consumes its digit.
+  // (1) (?<=[\[,:\s])(-?)\.(\d) -> \1 0.\2
+  std::string first;
+  first.reserve(input.size() + 8);
+  for (std::size_t i = 0; i < input.size();) {
+    if (OpensNumber(input, i)) {
+      const std::size_t dot = input[i] == '-' ? i + 1 : i;
+      if (dot + 1 < input.size() && input[dot] == '.' &&
+          IsDigit(input[dot + 1])) {
+        if (dot != i)
+          first.push_back('-');
+        first += "0.";
+        first.push_back(input[dot + 1]);
+        i = dot + 2;
+        continue;
+      }
+    }
+    first.push_back(input[i++]);
+  }
+  // (2) (\d)\.(?=[\s,\]}]) -> \1
+  std::string second;
+  second.reserve(first.size());
+  for (std::size_t i = 0; i < first.size();) {
+    if (IsDigit(first[i]) && i + 2 < first.size() && first[i + 1] == '.') {
+      const char32_t next = CodePointAt(first, i + 2);
+      if (next == ',' || next == ']' || next == '}' || IsPySpace(next)) {
+        second.push_back(first[i]);
+        i += 2;
+        continue;
+      }
+    }
+    second.push_back(first[i++]);
+  }
+  // (3) (?<=[\[,:\s])\+(\d) -> \1
+  std::string out;
+  out.reserve(second.size());
+  for (std::size_t i = 0; i < second.size();) {
+    if (second[i] == '+' && i + 1 < second.size() && IsDigit(second[i + 1]) &&
+        OpensNumber(second, i)) {
+      out.push_back(second[i + 1]);
+      i += 2;
+      continue;
+    }
+    out.push_back(second[i++]);
+  }
+  return out;
+}
+
 std::optional<Box> ToPixels(const json::Value& box, int width, int height) {
   if (!box.is_array() || box.size() != 4)
     return std::nullopt;
@@ -657,6 +782,17 @@ std::optional<Box> ToPixels(const json::Value& box, int width, int height) {
     if (!number.has_value())
       return std::nullopt;
     v[i] = *number;
+  }
+  const double largest = *std::max_element(v.begin(), v.end());
+  if (largest > 2) {
+    // 0..1000 box with one value written as a fraction (lauf_170: .948).
+    for (double& value : v)
+      if (value > 0 && value < 1)
+        value *= 1000;
+  } else if (largest <= 1) {
+    // Whole box given as 0..1 fractions.
+    for (double& value : v)
+      value *= 1000;
   }
   const auto scale = [](double value, int size) {
     return static_cast<int>(std::nearbyint(value * size / 1000));

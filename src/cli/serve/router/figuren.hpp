@@ -34,7 +34,8 @@
 // `schwelle` are compared again with thinking and that verdict counts.
 // Every chat goes through the router's own /v1/chat/completions (the fetch
 // below), so model loading, the memory guard and busy handling apply as for
-// any client.
+// any client. An answer without parsable JSON gets one repair pass
+// (RepairJson), then one new request at temperature 0.3, before the 502.
 // Costume (figuren.py kostueme): per figure with a front reference one chat
 // with thinking (max_tokens 14000) compares the front reference with the
 // head-to-belt crop of the frame (shirt, tie, glasses); shirt and tie items
@@ -65,8 +66,19 @@ std::string StripThinking(std::string_view text);
 /// bracket of the answer, after any thinking (figuren.py json_from).
 std::optional<json::Value> JsonFrom(std::string_view text, bool want_array);
 
+/// figuren.py repair_json: number forms the model sometimes writes that JSON
+/// rejects (lauf_170: "[75, 3, 702, .948]"). After "[", ",", ":" or
+/// whitespace a leading dot gets a zero (".948" -> "0.948", "-.5" -> "-0.5")
+/// and a plus sign is dropped ("+3" -> "3"); a dot after a digit and before
+/// whitespace, ",", "]" or "}" is dropped ("1." -> "1"). Everything else is
+/// kept. Whitespace is Python's str \s; digits are ASCII 0-9.
+std::string RepairJson(std::string_view text);
+
 /// Relative 0..1000 box to pixels, rounding half to even like Python round().
 /// Nullopt unless `box` is an array of four numbers (or numeric strings).
+/// As in figuren.py to_px: when the largest value is above 2, single values
+/// strictly between 0 and 1 are fractions of 1000 and scaled up (".948" ->
+/// 948); when no value is above 1, the whole box is 0..1 and scaled by 1000.
 std::optional<Box> ToPixels(const json::Value& box, int width, int height);
 
 /// Head crop rectangle (x0, y0, x1, y1, exclusive end): the head box padded

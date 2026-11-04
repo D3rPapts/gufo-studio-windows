@@ -5,6 +5,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -70,8 +71,45 @@ void TestJsonFrom() {
   assert(fenced.has_value() && fenced->size() == 1);
 }
 
+void TestRepair() {
+  // Expected values are figuren.py repair_json outputs.
+  assert(figuren::RepairJson("[75, 3, 702, .948]") == "[75, 3, 702, 0.948]");
+  assert(figuren::RepairJson("[-.5,.25]") == "[-0.5,0.25]");
+  assert(figuren::RepairJson("{\"a\": 1., \"b\": [2.]}") ==
+         "{\"a\": 1, \"b\": [2]}");
+  assert(figuren::RepairJson("[1.,2.]") == "[1,2]");
+  assert(figuren::RepairJson("[+3, +.5, 7.\n]") == "[3, +.5, 7\n]");
+  assert(figuren::RepairJson("v.5 -.5 :.5") == "v.5 -0.5 :0.5");
+  // Python \s includes U+00A0 (no-break space).
+  assert(figuren::RepairJson("\xc2\xa0.5") == "\xc2\xa0" "0.5");
+  // Text outside such numbers stays as it is.
+  const std::string text = "Wert 3.5 und x.y, a+1 [1.5] \xc3\xa4.5";
+  assert(figuren::RepairJson(text) == text);
+  assert(figuren::RepairJson("[1..]") == "[1..]");
+  assert(figuren::RepairJson("") == "");
+  assert(figuren::RepairJson(".5") == ".5");
+  // The lauf_170 answer parses after the repair.
+  const std::string lauf =
+      "[{\"person_box\": [75, 3, 702, .948], \"head_box\": [1, 2, 3, 4]}]";
+  assert(!figuren::JsonFrom(lauf, true).has_value());
+  auto repaired = figuren::JsonFrom(figuren::RepairJson(lauf), true);
+  assert(repaired.has_value() && repaired->size() == 1);
+}
+
 void TestBoxes() {
   const auto parse = [](const char* text) { return json::parse(text); };
+  // figuren.py to_px: a single fraction in a 0..1000 box is scaled up ...
+  auto frac = figuren::ToPixels(parse("[75, 3, 702, 0.948]"), 1000, 1000);
+  assert(frac.has_value() && (*frac == Box{75, 3, 702, 948}));
+  // ... 0 and 1 are kept (only 0 < v < 1) ...
+  frac = figuren::ToPixels(parse("[0, 1, 500, 0.5]"), 1000, 1000);
+  assert(frac.has_value() && (*frac == Box{0, 1, 500, 500}));
+  // ... a whole 0..1 box is scaled by 1000 ...
+  frac = figuren::ToPixels(parse("[0.1, 0, 0.5, 1]"), 100, 50);
+  assert(frac.has_value() && (*frac == Box{10, 0, 50, 50}));
+  // ... and a box with a maximum between 1 and 2 is left alone.
+  frac = figuren::ToPixels(parse("[0.5, 0, 2, 1.5]"), 1000, 1000);
+  assert(frac.has_value() && (*frac == Box{0, 0, 2, 2}));
   // Python round(): half to even (12.5 -> 12, 13.5 -> 14).
   auto px = figuren::ToPixels(parse("[125, 0, 135, 1000]"), 100, 50);
   assert(px.has_value());
@@ -221,7 +259,9 @@ void TestEndpoint() {
     assert(request.method == "POST" && request.path == "/v1/chat/completions");
     const json::Value body = json::parse(request.body);
     assert(body.find("model")->str() == "test-vlm");
-    assert(body.find("temperature")->as_double() == 0);
+    // 0.3 only for the one retry after an answer without JSON.
+    const double temperature = body.find("temperature")->as_double();
+    assert(temperature == 0 || temperature == 0.3);
     const bool think = body.find("chat_template_kwargs") == nullptr;
     if (think)
       ++thinking_calls;
@@ -422,9 +462,11 @@ void TestEndpoint() {
     assert(lars_out.find("kostuem_abweichungen")->dump() ==
            "[\"Brille fehlt\"]");
   }
-  // A costume answer without JSON is a bad gateway.
+  // A costume answer without JSON, also on the retry, is a bad gateway.
   costume_answer = "kein JSON";
+  calls = costume_calls = 0;
   assert(service.Handle(post)->status == 502);
+  assert(costume_calls == 2);
   costume_answer =
       "{\"items\": [{\"teil\": \"Hemd\", \"soll\": \"weiss\", \"ist\": "
       "\"weiss\", \"ok\": true}]}";
@@ -524,15 +566,168 @@ void TestEndpoint() {
   assert(service.Handle(bad)->status == 400);
 }
 
+/// Answers to the person search in order; every call's temperature, thinking
+/// flag and max_tokens are recorded. Head compares answer 8/10.
+struct ScriptedModel {
+  std::vector<std::string> find_answers;
+  std::vector<std::string> compare_answers;
+  std::vector<double> find_temperatures;
+  std::vector<bool> find_thinking;
+  std::vector<double> find_max_tokens;
+  std::vector<double> compare_temperatures;
+  std::vector<bool> compare_thinking;
+  std::vector<double> compare_max_tokens;
+
+  gufo::router::comfy::FetchResult operator()(const HttpRequest& request) {
+    const json::Value body = json::parse(request.body);
+    const std::string text = body.find("messages")
+                                 ->items()[0]
+                                 .find("content")
+                                 ->items()
+                                 .back()
+                                 .find("text")
+                                 ->str();
+    const double temperature = body.find("temperature")->as_double();
+    const bool think = body.find("chat_template_kwargs") == nullptr;
+    const double max_tokens = body.find("max_tokens")->as_double();
+    std::string answer;
+    if (text.starts_with("List every person")) {
+      answer = find_answers.at(find_temperatures.size());
+      find_temperatures.push_back(temperature);
+      find_thinking.push_back(think);
+      find_max_tokens.push_back(max_tokens);
+    } else {
+      answer = compare_answers.at(compare_temperatures.size());
+      compare_temperatures.push_back(temperature);
+      compare_thinking.push_back(think);
+      compare_max_tokens.push_back(max_tokens);
+    }
+    json::Value message = json::Value::object();
+    message["role"] = "assistant";
+    message["content"] = answer;
+    json::Value choice = json::Value::object();
+    choice["message"] = std::move(message);
+    json::Value choices = json::Value::array();
+    choices.push_back(std::move(choice));
+    json::Value out = json::Value::object();
+    out["choices"] = std::move(choices);
+    gufo::router::comfy::FetchResult result;
+    result.status = 200;
+    result.body = out.dump();
+    result.content_type = "application/json";
+    return result;
+  }
+};
+
+std::string OneFigureBody() {
+  json::Value body = json::Value::object();
+  body["bild"] = PngDataUrl(100, 50, 40);
+  json::Value ref = json::Value::object();
+  ref["name"] = "Lars";
+  ref["kopf"] = PngDataUrl(64, 64, 200);
+  json::Value refs = json::Value::array();
+  refs.push_back(std::move(ref));
+  body["referenzen"] = std::move(refs);
+  body["modell"] = "test-vlm";
+  return body.dump();
+}
+
+void TestRetry() {
+  HttpRequest post;
+  post.method = "POST";
+  post.path = "/v1/figuren";
+  post.body = OneFigureBody();
+  const std::string broken = "[{\"person_box\": [0, 0, 400, 1000}, oops";
+  const std::string valid =
+      "[{\"person_box\": [0, 0, 400, 1000], \"head_box\": [100, 0, 300, 400], "
+      "\"badge\": \"\"}]";
+
+  // Broken beyond repair, then valid at temperature 0.3: success, 2 calls.
+  {
+    auto model = std::make_shared<ScriptedModel>();
+    model->find_answers = {broken, valid};
+    model->compare_answers = {"{\"aehnlichkeit\": 8, \"abweichungen\": []}"};
+    figuren::Options options;
+    options.fetch = [model](const HttpRequest& r) { return (*model)(r); };
+    const figuren::FigurenService service(std::move(options));
+    const auto response = service.Handle(post);
+    if (response->status != 200)
+      std::cerr << response->body << '\n';
+    assert(response->status == 200);
+    assert(model->find_temperatures.size() == 2);
+    assert(model->find_temperatures[0] == 0 &&
+           model->find_temperatures[1] == 0.3);
+    // Same thinking setting and max_tokens on the retry.
+    assert(!model->find_thinking[0] && !model->find_thinking[1]);
+    assert(model->find_max_tokens[0] == 6000 &&
+           model->find_max_tokens[1] == 6000);
+    assert(model->compare_temperatures.size() == 1);
+    const json::Value out = json::parse(response->body);
+    assert(out.find("figuren")->items()[0].find("kopf_box")->dump() ==
+           "[10,0,30,20]");
+  }
+  // Repairable first answer (lauf_170): no second request.
+  {
+    auto model = std::make_shared<ScriptedModel>();
+    model->find_answers = {
+        "[{\"person_box\": [0, 0, 400, 1000], \"head_box\": [100, 0, 300, "
+        ".4], \"badge\": \"\"}]"};
+    model->compare_answers = {"{\"aehnlichkeit\": 8, \"abweichungen\": []}"};
+    figuren::Options options;
+    options.fetch = [model](const HttpRequest& r) { return (*model)(r); };
+    const figuren::FigurenService service(std::move(options));
+    const auto response = service.Handle(post);
+    assert(response->status == 200);
+    assert(model->find_temperatures.size() == 1);
+    const json::Value out = json::parse(response->body);
+    // .4 -> 0.4 -> 400 (scaled because the box maximum is above 2).
+    assert(out.find("figuren")->items()[0].find("kopf_box")->dump() ==
+           "[10,0,30,20]");
+  }
+  // Both answers broken: 502 after exactly 2 calls.
+  {
+    auto model = std::make_shared<ScriptedModel>();
+    model->find_answers = {broken, "still no JSON"};
+    figuren::Options options;
+    options.fetch = [model](const HttpRequest& r) { return (*model)(r); };
+    const figuren::FigurenService service(std::move(options));
+    const auto response = service.Handle(post);
+    assert(response->status == 502);
+    assert(response->body.find("model_answer_invalid") != std::string::npos);
+    assert(model->find_temperatures.size() == 2);
+    assert(model->compare_temperatures.empty());
+  }
+  // Head compare: the retry keeps the thinking setting; second answer counts.
+  {
+    auto model = std::make_shared<ScriptedModel>();
+    model->find_answers = {valid};
+    model->compare_answers = {"aehnlichkeit: acht",
+                              "{\"aehnlichkeit\": 9, \"abweichungen\": []}"};
+    figuren::Options options;
+    options.fetch = [model](const HttpRequest& r) { return (*model)(r); };
+    const figuren::FigurenService service(std::move(options));
+    const auto response = service.Handle(post);
+    assert(response->status == 200);
+    assert(model->compare_temperatures.size() == 2);
+    assert(model->compare_temperatures[1] == 0.3);
+    assert(!model->compare_thinking[0] && !model->compare_thinking[1]);
+    const json::Value out = json::parse(response->body);
+    assert(out.find("figuren")->items()[0].find("aehnlichkeit")->as_double() ==
+           0.9);
+  }
+}
+
 }  // namespace
 
 int main() {
   TestJsonFrom();
+  TestRepair();
   TestBoxes();
   TestAssign();
   TestTorsoCrop();
   TestColourRule();
   TestEndpoint();
+  TestRetry();
   std::cout << "router_figuren_test: ok\n";
   return 0;
 }
