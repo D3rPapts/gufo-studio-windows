@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "src/models/qwen/control_tokens.hpp"
+#include "src/models/qwen_image_21/control.hpp"
 #include "src/models/qwen_image_21/hip/memory.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
@@ -424,6 +425,10 @@ struct DiffusionContext {
   int shared_rows{0};
   // Prefill already filled keys/values; every step then runs target rows.
   bool prefilled{false};
+  // A Denoise call already ran the condition rows and filled the caches.
+  bool filled{false};
+  // Fun ControlNet: control-block K/V of the condition rows.
+  std::vector<Matrix> control_keys, control_values;
 };
 
 /// Leading encoder tokens shared by two prompts with the same references,
@@ -674,10 +679,24 @@ void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
   context.prefilled = true;
 }
 
+/// Fun ControlNet-Union state of one request (see control.hpp). The branch
+/// input before_proj(control_img_in(context)) is step-independent.
+struct ControlRun {
+  int blocks{0};
+  int stride{2};
+  float strength{1};
+  Matrix target_in;  // target rows x 4096, before_proj bias included
+};
+
 Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
                float sigma, int step, const CancellationCheck& cancelled,
-               const Observer& observer) {
-  const int prefix = step == 0 && !context.prefilled ? context.prefix.rows : 0;
+               const Observer& observer, const ControlRun* control = nullptr) {
+  // The first call of a context also runs its condition rows and fills the
+  // caches (a context first used after step 0 serves the steps outside a
+  // partial control range).
+  const int prefix =
+      !context.filled && !context.prefilled ? context.prefix.rows : 0;
+  context.filled = true;
   auto x = rt.Linear(latent, "transformer.img_in");
   if (prefix)
     x = Concat(rt, {context.prefix, x});
@@ -705,10 +724,12 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
   rt.Observe(observer, "dit." + std::to_string(step) + ".modulation",
              modulation);
   const auto factors = rt.ModulationFactors(modulation, true);
-  for (int layer = 0; layer < 32; ++layer) {
-    Cancel(cancelled);
-    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
-    const auto norm = rt.NormalizeModulate(x, factors, 0, prefix);
+  // One single-stream block over this step's rows. `keys`/`values` hold its
+  // condition rows (filled on the first call); `shared` reads the leading
+  // reference rows of `layer` from the positive pass.
+  const auto block = [&](Matrix h, const std::string& p, Matrix& keys,
+                         Matrix& values, bool shared, int layer) {
+    const auto norm = rt.NormalizeModulate(h, factors, 0, prefix);
     const auto q = rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_q"),
                                     p + ".attn.norm_q", 32, rope);
     auto k = rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_k"),
@@ -719,42 +740,85 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
       // Head-major caches read in place: shared reference rows, own
       // condition rows, then this step's target rows.
       std::vector<Runtime::HeadKeys> segments;
-      if (context.shared_rows)
+      if (shared)
         segments.push_back({context.base->keys[layer],
                             context.base->values[layer], context.shared_rows});
-      segments.push_back(
-          {context.keys[layer], context.values[layer], context.prefix.rows});
+      segments.push_back({keys, values, context.prefix.rows});
       segments.push_back({rt.HeadLayout(k), rt.HeadLayout(v), latent.rows});
       attended = rt.SegmentedAttention(q, segments);
     } else if (prefix) {
       // Copy only prefix rows: a view would pin full target K/V for all layers.
-      context.keys[layer] = rt.Concat(std::array{k.Slice(0, prefix)});
-      context.values[layer] = rt.Concat(std::array{v.Slice(0, prefix)});
-      if (context.shared_rows) {
+      keys = rt.Concat(std::array{k.Slice(0, prefix)});
+      values = rt.Concat(std::array{v.Slice(0, prefix)});
+      if (shared) {
         k = Concat(
             rt, {context.base->keys[layer].Slice(0, context.shared_rows), k});
         v = Concat(
             rt, {context.base->values[layer].Slice(0, context.shared_rows), v});
       }
-    } else if (context.shared_rows) {
+    } else if (shared) {
       k = Concat(rt, {context.base->keys[layer].Slice(0, context.shared_rows),
-                      context.keys[layer], k});
+                      keys, k});
       v = Concat(rt, {context.base->values[layer].Slice(0, context.shared_rows),
-                      context.values[layer], v});
+                      values, v});
     } else {
-      k = Concat(rt, {context.keys[layer], k});
-      v = Concat(rt, {context.values[layer], v});
+      k = Concat(rt, {keys, k});
+      v = Concat(rt, {values, v});
     }
     if (!context.prefilled)
       attended = rt.Attention(q, k, v, 32, 32, 128,
                               prefix ? context.limits : std::vector<int>{});
     const auto attention = rt.Linear(attended, p + ".attn.to_out.0");
-    x = rt.Modulate(attention, factors, 1, prefix, &x);
-    const auto norm2 = rt.NormalizeModulate(x, factors, 2, prefix);
+    h = rt.Modulate(attention, factors, 1, prefix, &h);
+    const auto norm2 = rt.NormalizeModulate(h, factors, 2, prefix);
     const auto mlp = rt.Linear(
         rt.GatedLinear(norm2, p + ".img_mlp.gate_layer", p + ".img_mlp.proj"),
         p + ".img_mlp.out");
-    x = rt.Modulate(mlp, factors, 3, prefix, &x);
+    return rt.Modulate(mlp, factors, 3, prefix, &h);
+  };
+  // Control stream: before_proj(control_joint) + x, where control_joint is
+  // zero on condition rows (they receive the bias alone).
+  Matrix c;
+  if (control) {
+    if (context.shared_rows || context.prefilled)
+      throw std::logic_error("ControlNet needs a text-only, unprefilled pass");
+    if (context.control_keys.size() !=
+        static_cast<std::size_t>(control->blocks)) {
+      context.control_keys.resize(control->blocks);
+      context.control_values.resize(control->blocks);
+    }
+    Matrix control_in = control->target_in;
+    if (prefix)
+      control_in = Concat(
+          rt, {rt.Linear(rt.Upload(std::vector<float>(
+                                       static_cast<std::size_t>(prefix) * 4096),
+                                   prefix, 4096),
+                         "controlnet.control_blocks.0.before_proj"),
+               control_in});
+    c = rt.Add(control_in, x);
+    rt.Observe(observer, "dit." + std::to_string(step) + ".control.input", c);
+  }
+  for (int layer = 0; layer < 32; ++layer) {
+    Cancel(cancelled);
+    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
+    x = block(std::move(x), p, context.keys[layer], context.values[layer],
+              context.shared_rows > 0, layer);
+    if (control && layer % control->stride == 0 &&
+        layer / control->stride < control->blocks) {
+      // The control branch never reads the base stream after its start, so
+      // block i may run after base block stride * i (as ComfyUI does) and
+      // only one control stream stays alive.
+      const int index = layer / control->stride;
+      const auto cp = "controlnet.control_blocks." + std::to_string(index);
+      c = block(std::move(c), cp, context.control_keys[index],
+                context.control_values[index], false, layer);
+      // hidden + bf16(skip * scale), as the reference adds its hints.
+      x = rt.Euler(x, rt.Linear(c, cp + ".after_proj"), control->strength);
+      rt.Observe(observer,
+                 "dit." + std::to_string(step) + ".control." +
+                     std::to_string(index),
+                 c);
+    }
     rt.Observe(
         observer,
         "dit." + std::to_string(step) + ".block." + std::to_string(layer), x);
@@ -767,6 +831,42 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
   x = rt.Linear(x, "transformer.proj_out");
   rt.Observe(observer, "dit." + std::to_string(step) + ".output", x);
   return x;
+}
+
+/// Encodes the control image (and, for the inpaint recipe, the masked start
+/// image), packs the 129-channel context and projects it once.
+ControlRun PrepareControl(Runtime& rt, const Weights& weights,
+                          const ControlnetInfo& info, const Request& request,
+                          const Image* init_image,
+                          const CancellationCheck& cancelled,
+                          const Observer& observer) {
+  const auto& input = *request.control;
+  const int rows = (request.height / 16) * (request.width / 16);
+  ControlRun run;
+  run.blocks = info.blocks;
+  run.stride = info.stride;
+  run.strength = input.strength;
+  const auto canvas = ControlCanvas(input.image, request.width, request.height);
+  const auto control = rt.Download(EncodeVae(rt, weights, canvas, cancelled,
+                                             Prefixed(observer, "control.")));
+  std::vector<float> keep, inpaint;
+  if (input.inpaint) {
+    if (!init_image || !request.mask)
+      throw std::invalid_argument("control inpaint needs init_image and mask");
+    keep = ControlKeepMask(*request.mask, request.mask_channel, request.width,
+                           request.height);
+    inpaint = rt.Download(EncodeVae(
+        rt, weights,
+        ControlInpaintSource(*init_image, *request.mask, request.mask_channel),
+        cancelled, Prefixed(observer, "control.inpaint.")));
+  }
+  const auto context = rt.Upload(
+      PackControlContext(control, keep, inpaint, rows), rows,
+      kControlInChannels);
+  rt.Observe(observer, "control.context", context);
+  run.target_in = rt.Linear(rt.Linear(context, "controlnet.control_img_in"),
+                            "controlnet.control_blocks.0.before_proj");
+  return run;
 }
 
 }  // namespace
@@ -786,6 +886,8 @@ struct Model::Impl {
   // Published by a completed switch.
   std::vector<Lora> active;
   mutable std::mutex active_mutex;
+  // Fun ControlNet-Union mapped under "controlnet." (Model::SetControlnet).
+  std::optional<ControlnetInfo> controlnet;
   explicit Impl(const std::filesystem::path& root)
       : weights(root), tokenizer(root), runtime(weights) {}
   double SelectLoras(const std::vector<Lora>& requested,
@@ -875,6 +977,23 @@ std::vector<Lora> Model::ActiveLoras() const {
   return impl_->active;
 }
 
+Model::ControlnetLayout Model::SetControlnet(
+    const std::filesystem::path& path) {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->controlnet)
+    throw std::invalid_argument("a ControlNet is already registered");
+  // Maps the file (header only); the runtime uploads "controlnet." as one
+  // group on the first control request.
+  impl_->weights.AddFile(path, std::string(kControlnetPrefix));
+  impl_->controlnet = InspectControlnet(impl_->weights);
+  return {impl_->controlnet->blocks, impl_->controlnet->bytes};
+}
+
+// Registered before serving, so no lock (a running request holds `mutex`).
+bool Model::HasControlnet() const {
+  return impl_->controlnet.has_value();
+}
+
 Result Model::Generate(const Request& request,
                        const CancellationCheck& cancelled,
                        const Observer& observer) {
@@ -931,6 +1050,19 @@ Result Model::Generate(const Request& request,
     // "negative.".
     const bool guided = request.guidance > 1;
     const auto negative_observer = Prefixed(observer, "negative.");
+    if (request.control && !impl_->controlnet)
+      throw std::invalid_argument(
+          "this Qwen-Image server has no ControlNet (--controlnet)");
+    // Steps outside a partial control range run without the branch on their
+    // own condition caches (the controlled caches carry its skips).
+    bool control_partial = false, control_any = false;
+    for (int step = 0; request.control && step < steps; ++step) {
+      const bool active = ControlActiveAt(*request.control, step, steps);
+      control_partial |= !active;
+      control_any |= active;
+    }
+    // No active step (strength 0): the plain path, nothing uploaded.
+    control_partial &= control_any;
     std::optional<EncodedPrompt> negative;
     if (guided) {
       Request text;
@@ -965,7 +1097,8 @@ Result Model::Generate(const Request& request,
         // their file mapping in host RAM while they upload (the first large
         // job after a load usually releases; later ones keep the encoder).
         const std::uint64_t loading =
-            rt.MissingBytes("transformer.") + rt.MissingBytes("vae.");
+            rt.MissingBytes("transformer.") + rt.MissingBytes("vae.") +
+            (request.control ? rt.MissingBytes(kControlnetPrefix) : 0);
         keep = hip::KeepsTextEncoder(need + loading, available, false);
         Log("event=memory_check text_encoder=" +
             std::string(keep ? "kept" : "release") +
@@ -1011,8 +1144,18 @@ Result Model::Generate(const Request& request,
                            cancelled, negative_observer, &*context,
                            SharedConditionTokens(prompt, *negative)));
       result.metrics.negative_condition_rows = negative_context->prefix.rows;
-      negative.reset();
     }
+    std::optional<DiffusionContext> plain_context, plain_negative_context;
+    if (control_partial) {
+      plain_context.emplace(PrepareDiffusion(rt, impl_->weights, prompt,
+                                             height, width, cancelled,
+                                             observer));
+      if (guided)
+        plain_negative_context.emplace(
+            PrepareDiffusion(rt, impl_->weights, *negative, height, width,
+                             cancelled, negative_observer));
+    }
+    negative.reset();
     const bool img2img =
         request.init_image && request.strength <= kFullStrength;
     const bool masked = request.init_image && request.mask;
@@ -1023,6 +1166,20 @@ Result Model::Generate(const Request& request,
           ResizeImage(*request.init_image, request.width, request.height);
       init_latent = EncodeVae(rt, impl_->weights, *init_image, cancelled,
                               Prefixed(observer, "init."));
+    }
+    // Fun ControlNet: the branch input (step-independent).
+    std::optional<ControlRun> control;
+    if (control_any) {
+      control.emplace(PrepareControl(rt, impl_->weights, *impl_->controlnet,
+                                     request,
+                                     init_image ? &*init_image : nullptr,
+                                     cancelled, observer));
+      Log("event=control blocks=" + std::to_string(control->blocks) +
+          " strength=" + std::to_string(control->strength) +
+          " range=" + std::to_string(request.control->start) + "-" +
+          std::to_string(request.control->end) +
+          " inpaint=" + std::to_string(request.control->inpaint ? 1 : 0) +
+          " partial=" + std::to_string(control_partial ? 1 : 0));
     }
     // Drop cached encoder and VAE-encoder temporaries before the caches fill.
     rt.Trim();
@@ -1069,7 +1226,9 @@ Result Model::Generate(const Request& request,
       latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
       rt.Observe(observer, "init.latent", latent);
     }
-    if (large) {
+    // Control requests are text-only (no reference rows), so their first
+    // step fills the caches jointly, with the control skips.
+    if (large && !control) {
       // Condition caches in head-major layout, filled chunk by chunk.
       Prefill(rt, *context, sigmas[0], cancelled);
       if (negative_context)
@@ -1079,12 +1238,18 @@ Result Model::Generate(const Request& request,
     for (int step = 0; step < steps; ++step) {
       if (large)
         GuardMemory(step);
-      auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
-                              cancelled, observer);
+      const bool controlled =
+          control && ControlActiveAt(*request.control, step, steps);
+      const ControlRun* branch = controlled ? &*control : nullptr;
+      auto velocity =
+          Denoise(rt, control && !controlled ? *plain_context : *context,
+                  latent, sigmas[step], step, cancelled, observer, branch);
       if (guided) {
-        const auto negative =
-            Denoise(rt, *negative_context, latent, sigmas[step], step,
-                    cancelled, negative_observer);
+        const auto negative = Denoise(
+            rt,
+            control && !controlled ? *plain_negative_context
+                                   : *negative_context,
+            latent, sigmas[step], step, cancelled, negative_observer, branch);
         velocity = rt.Guidance(velocity, negative, request.guidance);
         rt.Observe(observer, "dit." + std::to_string(step) + ".guided",
                    velocity);
@@ -1121,6 +1286,9 @@ Result Model::Generate(const Request& request,
     // decoder their memory.
     negative_context.reset();
     context.reset();
+    plain_negative_context.reset();
+    plain_context.reset();
+    control.reset();
     rt.Trim();
     report("denoised");
     const auto vae_start = Clock::now();

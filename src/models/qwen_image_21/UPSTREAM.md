@@ -115,3 +115,34 @@ Gufo additionally reads `lora_alpha`/`use_rslora` from the Diffusers
 partially. `tools/models/qwen_image_21/lora_reference.py` reimplements these
 rules in FP64 with numpy for qualification; ComfyUI source is GPL-3.0 and is
 not copied.
+
+## Fun ControlNet-Union
+
+[alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union/tree/8a4702014d4dabb5f896fcba917e2ee0a961465f)
+`8a4702014d4dabb5f896fcba917e2ee0a961465f`: one BF16 file (7,550,979,904
+bytes, SHA-256 `65d6b66d734da9e7ff5ef04e7db3a133553a52a3f29a7fcb3e9cce8fa21dcfcd`)
+under the same Qwen Research License. Reference code:
+[VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun/tree/e8c314fbfa494d0429bbef605c9f6112b79a7ead)
+`e8c314fbfa494d0429bbef605c9f6112b79a7ead`
+(`videox_fun/models/qwenimage21_transformer2d_control.py`,
+`videox_fun/pipeline/pipeline_qwenimage21_control.py`,
+`config/qwenimage21/qwenimage21_control.yaml`); ComfyUI node semantics from
+PR #16519 (`3b3939a78878ca0d5c0817d8829df8cbf7308ffd`,
+`comfy_extras/nodes_model_patch.py` `QwenImage21FunControlPatch`).
+
+A VACE-style branch: 16 copies of the base block (shared modulation, same
+RoPE and block-causal mask) start from `before_proj(control_joint) + x`, where
+`control_joint` is zero on condition rows and `control_img_in(context)` on
+target rows; after base block `2i` the base stream adds
+`after_proj(c_i) * control_context_scale` on every row. The context has 129
+channels per target cell: the control image's normalized VAE latent, the keep
+mask (1 keep, 0 regenerate; zero for pure control) and the latent of the start
+image with regenerated pixels at mid-gray (zero for pure control). Condition
+rows of the branch see only condition rows and use timestep zero, so their
+skips are step-independent: Gufo keeps its condition K/V caches (filled with
+the skips, plus 16 branch caches) where the reference pipeline disables its
+cache under control. The branch runs interleaved after base block `2i`, as
+ComfyUI does; the result is the same as running it first. Control requests
+are text-only (no reference images), as in the reference pipeline. `start` /
+`end` select a fraction of the steps; steps outside use separate condition
+caches without the branch. Gufo does not preprocess control images.

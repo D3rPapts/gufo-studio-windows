@@ -130,12 +130,23 @@ struct Parsed {
   std::vector<image::Image> images;
   std::optional<image::Image> init_image;
   std::optional<image::Image> mask;
+  std::optional<image::Image> control_image;
 };
 
-constexpr std::array<std::string_view, 10> kExtensionFields{
-    "negative_prompt", "guidance",     "strength",       "init_image",
-    "preview",         "mask",         "mask_channel",   "mask_composite",
-    "mask_feather",    "mask_blur"};
+constexpr std::array<std::string_view, 15> kExtensionFields{
+    "negative_prompt",  "guidance",      "strength",       "init_image",
+    "preview",          "mask",          "mask_channel",   "mask_composite",
+    "mask_feather",     "mask_blur",     "control_image",  "control_strength",
+    "control_start",    "control_end",   "control_inpaint"};
+
+// Form fields "gufo.<name>" whose value is JSON (numbers, booleans, objects).
+bool JsonFormField(std::string_view key) {
+  return key == "guidance" || key == "strength" || key == "preview" ||
+         key == "mask_composite" || key == "mask_feather" ||
+         key == "mask_blur" || key == "control_strength" ||
+         key == "control_start" || key == "control_end" ||
+         key == "control_inpaint";
+}
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -210,8 +221,25 @@ Parsed Multipart(const HttpRequest& request) {
     if (++fields > 32)
       throw std::invalid_argument("too many multipart fields");
     if (name == "image" || name == "image[]" || name == "init_image" ||
-        name == "mask") {
+        name == "mask" || name == "control_image") {
       const bool init = name == "init_image", mask = name == "mask";
+      if (name == "control_image") {
+        // Structure image for the ControlNet, not a reference.
+        if (parsed.control_image)
+          throw std::invalid_argument("duplicate field " + name);
+        if (data.size() > core::kMaxEncodedImageBytes - image_bytes)
+          throw std::invalid_argument("image inputs exceed 10 images or 20 MiB");
+        image_bytes += data.size();
+        const auto& decoded = parsed.control_image.emplace(image::DecodeImage(
+            std::span(reinterpret_cast<const std::uint8_t*>(data.data()),
+                      data.size())));
+        image_pixels +=
+            static_cast<std::size_t>(decoded.width) * decoded.height;
+        if (image_pixels > core::kMaxImagePixels)
+          throw std::invalid_argument(
+              "reference images exceed 32 megapixels combined");
+        continue;
+      }
       if ((init && parsed.init_image) || (mask && parsed.mask))
         throw std::invalid_argument("duplicate field " + name);
       if ((!init && !mask && parsed.images.size() == 10) ||
@@ -243,11 +271,8 @@ Parsed Multipart(const HttpRequest& request) {
         auto& extension = parsed.fields["gufo"];
         if (!extension.is_object() || extension.contains(key))
           throw std::invalid_argument("duplicate field " + name);
-        extension[key] = key == "guidance" || key == "strength" ||
-                                 key == "preview" || key == "mask_composite" ||
-                                 key == "mask_feather" || key == "mask_blur"
-                             ? ParseJson(data)
-                             : json::Value(std::string(data));
+        extension[key] =
+            JsonFormField(key) ? ParseJson(data) : json::Value(std::string(data));
       } else if (name == "gufo") {
         if (parsed.fields.contains(name))
           throw std::invalid_argument("duplicate field " + name);
@@ -379,6 +404,13 @@ ImageService::ImageService(const std::filesystem::path& root,
     model_->SetLog(
         [](const std::string& line) { Logger::Info("image", line); });
     sampling_ = model_->sampling();
+    if (!loras_.controlnet.empty()) {
+      const auto layout = model_->SetControlnet(loras_.controlnet);
+      Logger::Info("image", "event=controlnet_registered file=" +
+                                loras_.controlnet.filename().string() +
+                                " blocks=" + std::to_string(layout.blocks) +
+                                " mib=" + std::to_string(layout.bytes >> 20));
+    }
     for (const auto& [name, path] : loras_.files) {
       const auto& info = lora_info_[name] = model_->AddLora(name, path);
       Logger::Info("image", "event=lora_registered name=" + name +
@@ -536,6 +568,43 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
           *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
       generation.mask_blur = static_cast<int>(
           Number(*extension, "mask_blur", image::kDefaultMaskBlur, 0, 4));
+      if (const auto* control = extension->find("control_image")) {
+        if (parsed.control_image || !control->is_string() ||
+            control->str().starts_with("http"))
+          throw std::invalid_argument(
+              "gufo.control_image must be base64 or a data URL, given once");
+        const auto& text = control->str();
+        parsed.control_image = image::DecodeImage(core::ReadImageUrl(
+            text.starts_with("data:") ? text : "data:image/png;base64," + text));
+      }
+    }
+    // Fun ControlNet-Union: a ready structure image (pose skeleton, depth,
+    // canny, lineart ...); gufo does no preprocessing.
+    if (parsed.control_image) {
+      if (!service.has_controlnet())
+        throw std::invalid_argument(
+            "gufo.control_image needs a server started with --controlnet");
+      image::ControlInput control;
+      control.image = std::move(*parsed.control_image);
+      if (extension) {
+        control.strength = static_cast<float>(
+            Real(*extension, "control_strength", 1, 0, 2));
+        control.start = Real(*extension, "control_start", 0, 0, 1);
+        control.end = Real(*extension, "control_end", 1, 0, 1);
+        if (const auto* inpaint = extension->find("control_inpaint")) {
+          if (!inpaint->is_bool())
+            throw std::invalid_argument(
+                "gufo.control_inpaint must be a boolean");
+          control.inpaint = inpaint->as_bool();
+        }
+      }
+      generation.control = std::move(control);
+    } else if (extension) {
+      for (const char* key : {"control_strength", "control_start",
+                              "control_end", "control_inpaint"})
+        if (extension->contains(key))
+          throw std::invalid_argument(std::string("gufo.") + key +
+                                      " needs gufo.control_image");
     }
     if (extension && extension->contains("strength") && !parsed.init_image) {
       // A single uploaded "image" is the start image, not a reference.
@@ -563,8 +632,11 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
         };
         generation.width = grid(generation.init_image->width);
         generation.height = grid(generation.init_image->height);
-      } else if (!generation.images.empty()) {
-        const auto& last = generation.images.back();
+      } else if (!generation.images.empty() || generation.control) {
+        // The last reference, or the control image, sets the aspect ratio.
+        const auto& last = generation.images.empty()
+                               ? generation.control->image
+                               : generation.images.back();
         const double ratio = static_cast<double>(last.width) / last.height;
         const double w = std::sqrt(1024.0 * 1024 * ratio);
         generation.width = static_cast<int>(std::nearbyint(w / 32)) * 32;
@@ -650,6 +722,12 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       if (!service.loras().files.empty())
         details << " loras=" << LoraList(generation.loras)
                 << " lora_ms=" << result.metrics.lora_ms;
+      if (generation.control)
+        details << " control=1 control_strength=" << generation.control->strength
+                << " control_range=" << generation.control->start << '-'
+                << generation.control->end
+                << " control_inpaint=" << (generation.control->inpaint ? 1 : 0)
+                << " control_turbo=" << (service.sampling().IsTurbo() ? 1 : 0);
       details << " prompt_ms=" << result.metrics.prompt_ms
               << " denoise_ms=" << result.metrics.denoise_ms
               << " vae_ms=" << result.metrics.vae_ms

@@ -1,5 +1,5 @@
 add_library(gufo_qwen_image_21 STATIC image.cpp weights.cpp tokenizer.cpp
-  lora.cpp)
+  lora.cpp control.cpp)
 target_include_directories(gufo_qwen_image_21 PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_qwen_image_21 PUBLIC gufo_core ICU::i18n)
 
@@ -35,6 +35,24 @@ function(gufo_qwen_image_21_register_tests)
   target_link_libraries(qwen_image_21_test PRIVATE gufo_qwen_image_21 gufo_http)
   add_test(NAME qwen_image_21_test COMMAND qwen_image_21_test)
   set_tests_properties(qwen_image_21_test PROPERTIES LABELS "cpu;models;qwen-image")
+  # Fun ControlNet-Union host contract; GUFO_QWEN_IMAGE_CONTROLNET=<file>
+  # also checks a real checkpoint header (mapped, never read).
+  add_executable(qwen_image_21_control_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/control_test.cpp)
+  target_link_libraries(qwen_image_21_control_test PRIVATE gufo_qwen_image_21)
+  add_test(NAME qwen_image_21_control_test COMMAND qwen_image_21_control_test)
+  set_tests_properties(qwen_image_21_control_test PROPERTIES
+    LABELS "cpu;models;qwen-image")
+  # image_api.cpp alone: gufo_http also needs the HIP-only model ports.
+  add_executable(qwen_image_21_control_api_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/control_api_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/image_api.cpp)
+  target_link_libraries(qwen_image_21_control_api_test PRIVATE
+    gufo_qwen_image_21 gufo_preview gufo_logging)
+  add_test(NAME qwen_image_21_control_api_test
+    COMMAND qwen_image_21_control_api_test)
+  set_tests_properties(qwen_image_21_control_api_test PROPERTIES
+    LABELS "cpu;models;qwen-image")
   add_executable(qwen_image_21_lora_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/lora_test.cpp)
   target_link_libraries(qwen_image_21_lora_test PRIVATE gufo_qwen_image_21)

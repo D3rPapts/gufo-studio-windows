@@ -24,6 +24,9 @@ struct HttpResponse;
 struct ImageLoraOptions {
   std::vector<std::pair<std::string, std::filesystem::path>> files;
   std::vector<models::qwen_image_21::Lora> defaults;
+  /// Fun ControlNet-Union file (--controlnet); requests then accept
+  /// gufo.control_image. Empty: no control.
+  std::filesystem::path controlnet;
 };
 
 class ImageService {
@@ -50,6 +53,8 @@ public:
   }
   const ImageLoraOptions& loras() const { return loras_; }
   bool HasLora(std::string_view name) const;
+  /// A ControlNet is registered (with an injected runner: one was named).
+  bool has_controlnet() const { return !loras_.controlnet.empty(); }
   /// Empty with an injected runner (no files are read).
   const models::qwen_image_21::LoraInfo& lora_info(std::string_view name) const;
   std::vector<models::qwen_image_21::Lora> ActiveLoras() const;

@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/models/qwen_image_21/control.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 
 namespace gufo::models::qwen_image_21 {
@@ -489,6 +490,8 @@ void ValidateRequest(const Request& request) {
       throw std::invalid_argument(
           "LoRA scale must be finite and at most 10 in magnitude");
   }
+  if (request.control)
+    ValidateControl(*request.control, request);
 }
 
 namespace {
