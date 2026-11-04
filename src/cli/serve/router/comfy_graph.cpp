@@ -83,6 +83,14 @@ constexpr std::string_view kPlumbing[] = {
     "TrimVideoLatent",
     "ImageToMask",
     "InvertMask",
+    // Regional prompts (Qwen-Image): gufo.regions.
+    "ConditioningCombine",
+    "ConditioningSetMask",
+    "ConditioningSetArea",
+    "ConditioningSetAreaPercentage",
+    "ConditioningSetAreaStrength",
+    "SolidMask",
+    "MaskComposite",
     // InfiniteTalk (talk family).
     "WanInfiniteTalkToVideo",
     "AudioEncoderLoader",
@@ -479,6 +487,330 @@ std::string ClipText(const Graph& graph, const Conditioning& cond) {
   return "";
 }
 
+// Regional conditioning (ConditioningCombine / SetMask / SetArea...).
+constexpr std::string_view kRegionalClasses[] = {
+    "ConditioningCombine", "ConditioningSetMask", "ConditioningSetArea",
+    "ConditioningSetAreaPercentage", "ConditioningSetAreaStrength"};
+
+/// True when the conditioning behind `key` of `sampler` uses one of the
+/// regional nodes; such graphs map to gufo.regions.
+bool HasRegionalConditioning(const Graph& graph, const std::string& sampler,
+                             const std::string& key) {
+  const auto link = graph.LinkOf(sampler, key);
+  if (!link)
+    return false;
+  std::set<std::string> nodes = graph.Ancestors(link->node);
+  nodes.insert(link->node);
+  for (const std::string& id : nodes)
+    if (Contains(kRegionalClasses, graph.Class(id)))
+      return true;
+  return false;
+}
+
+constexpr std::size_t kMaxMaskValues = 16U << 20U;
+
+struct MaskSource {
+  std::optional<MaskGrid> grid;
+  std::optional<FileRef> file;
+  std::string channel;
+  bool invert{false};
+};
+
+/// The MASK a node input receives: SolidMask, MaskComposite and InvertMask
+/// are computed here; LoadImageMask / LoadImage MASK stay files.
+MaskSource EvalMask(const Graph& graph, const std::string& id,
+                    const std::string& key, const Link& link, int depth = 0) {
+  if (depth > 64)
+    throw NodeFailure(id, "invalid_prompt", "mask chain is too long");
+  const std::string source = graph.Class(link.node);
+  MaskSource mask;
+  if (source == "SolidMask") {
+    const double value = graph.Num(link.node, "value", 1.0);
+    const double width = graph.Num(link.node, "width", 512);
+    const double height = graph.Num(link.node, "height", 512);
+    if (value < 0 || value > 1)
+      throw NodeFailure(link.node, "unsupported_value",
+                        "value must be 0..1");
+    if (width < 1 || height < 1 || width > 16384 || height > 16384 ||
+        width * height > static_cast<double>(kMaxMaskValues))
+      throw NodeFailure(link.node, "unsupported_value",
+                        "gufo masks are 1..16384 pixels per side and at most "
+                        "16 megapixels");
+    MaskGrid grid;
+    grid.width = static_cast<int>(width);
+    grid.height = static_cast<int>(height);
+    grid.values.assign(static_cast<std::size_t>(grid.width) * grid.height,
+                       static_cast<float>(value));
+    mask.grid = std::move(grid);
+  } else if (source == "InvertMask") {
+    mask = EvalMask(graph, link.node, "mask",
+                    graph.RequireLink(link.node, "mask"), depth + 1);
+    if (mask.grid)
+      for (float& v : mask.grid->values)
+        v = 1.0F - v;
+    else
+      mask.invert = !mask.invert;
+  } else if (source == "MaskComposite") {
+    const MaskSource destination =
+        EvalMask(graph, link.node, "destination",
+                 graph.RequireLink(link.node, "destination"), depth + 1);
+    const MaskSource top =
+        EvalMask(graph, link.node, "source",
+                 graph.RequireLink(link.node, "source"), depth + 1);
+    if (!destination.grid || !top.grid)
+      throw NodeFailure(link.node, "unsupported_link",
+                        "gufo composites only computed masks (SolidMask, "
+                        "MaskComposite, InvertMask), not mask files; connect "
+                        "a LoadImageMask directly to ConditioningSetMask");
+    const double x = graph.Num(link.node, "x", 0);
+    const double y = graph.Num(link.node, "y", 0);
+    if (x < 0 || y < 0 || x > 16384 || y > 16384)
+      throw NodeFailure(link.node, "unsupported_value",
+                        "x and y must be 0..16384");
+    const std::string operation = graph.Str(link.node, "operation");
+    try {
+      mask.grid = CompositeMask(*destination.grid, *top.grid,
+                                static_cast<int>(x), static_cast<int>(y),
+                                operation);
+    } catch (const std::invalid_argument& error) {
+      throw NodeFailure(link.node, "value_not_in_list", error.what());
+    }
+  } else if ((source == "LoadImage" || source == "LoadImageOutput") &&
+             link.slot == 1) {
+    mask.file = ImageFile(graph, id, key, link);
+    mask.channel = "alpha";
+  } else if (source == "LoadImageMask") {
+    mask.file = ParseFileRef(graph.Str(link.node, "image"), "input");
+    mask.channel = graph.Str(link.node, "channel", "alpha");
+    if (mask.channel != "alpha" && mask.channel != "red" &&
+        mask.channel != "green" && mask.channel != "blue")
+      throw NodeFailure(link.node, "value_not_in_list",
+                        "channel must be alpha, red, green or blue");
+  } else {
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key +
+                          "' must come from SolidMask, MaskComposite, "
+                          "InvertMask, LoadImageMask or the MASK output of "
+                          "LoadImage, not " +
+                          source);
+  }
+  return mask;
+}
+
+/// One conditioning of a regional positive input before it becomes an
+/// ImageRegion or the base prompt.
+struct RegionCond {
+  std::string encoder;
+  int slot{0};
+  bool zeroed{false};
+  std::vector<Link> reference_latents;
+  double area_strength{1};
+  double mask_strength{1};
+  std::optional<std::array<double, 4>> area;
+  bool area_fraction{false};
+  std::optional<MaskSource> mask;
+  bool mask_bounds{false};
+};
+
+/// Walks the conditioning tree upstream; nodes nearer the sampler apply
+/// last, so they override (as ComfyUI's conditioning_set_values does).
+void CollectRegionConds(const Graph& graph, const std::string& sampler,
+                        const Link& link, std::vector<RegionCond>* out,
+                        int depth = 0) {
+  if (depth > 256)
+    throw NodeFailure(sampler, "invalid_prompt", "conditioning chain too long");
+  const std::string node = link.node;
+  const std::string cls = graph.Class(node);
+  if (cls == "ConditioningCombine") {
+    CollectRegionConds(graph, sampler,
+                       graph.RequireLink(node, "conditioning_1"), out,
+                       depth + 1);
+    CollectRegionConds(graph, sampler,
+                       graph.RequireLink(node, "conditioning_2"), out,
+                       depth + 1);
+    return;
+  }
+  if (cls == "TextEncodeQwenImage21" || cls == "CLIPTextEncode") {
+    if (cls == "TextEncodeQwenImage21" && link.slot > 1)
+      throw NodeFailure(node, "unsupported_link",
+                        "output " + std::to_string(link.slot) +
+                            " of TextEncodeQwenImage21 is not a conditioning");
+    RegionCond cond;
+    cond.encoder = node;
+    cond.slot = link.slot;
+    out->push_back(std::move(cond));
+    return;
+  }
+  const std::size_t start = out->size();
+  const auto upstream = [&](const char* input) {
+    CollectRegionConds(graph, sampler, graph.RequireLink(node, input), out,
+                       depth + 1);
+  };
+  const auto strength = [&](const char* input) {
+    const double value = graph.Num(node, input, 1.0);
+    if (value < 0 || value > 10)
+      throw NodeFailure(node, "unsupported_value", "strength must be 0..10");
+    return value;
+  };
+  if (cls == "ConditioningSetMask") {
+    upstream("conditioning");
+    const MaskSource mask =
+        EvalMask(graph, node, "mask", graph.RequireLink(node, "mask"));
+    const double value = strength("strength");
+    const std::string area = graph.Str(node, "set_cond_area", "default");
+    if (area != "default" && area != "mask bounds")
+      throw NodeFailure(node, "value_not_in_list",
+                        "set_cond_area must be default or mask bounds");
+    for (std::size_t i = start; i < out->size(); ++i) {
+      (*out)[i].mask = mask;
+      (*out)[i].mask_strength = value;
+      (*out)[i].mask_bounds = area == "mask bounds";
+    }
+  } else if (cls == "ConditioningSetArea" ||
+             cls == "ConditioningSetAreaPercentage") {
+    upstream("conditioning");
+    const bool fraction = cls == "ConditioningSetAreaPercentage";
+    const double high = fraction ? 1.0 : 16384.0;
+    std::array<double, 4> area{};
+    const char* keys[] = {"x", "y", "width", "height"};
+    for (int i = 0; i < 4; ++i) {
+      area[i] =
+          graph.Num(node, keys[i], i < 2 ? 0.0 : (fraction ? 1.0 : 64.0));
+      if (area[i] < 0 || area[i] > high || (i >= 2 && area[i] <= 0))
+        throw NodeFailure(node, "unsupported_value",
+                          std::string(keys[i]) +
+                              (fraction ? " must be 0..1" : " must be 0..16384") +
+                              (i >= 2 ? " and above 0" : ""));
+    }
+    const double value = strength("strength");
+    for (std::size_t i = start; i < out->size(); ++i) {
+      (*out)[i].area = area;
+      (*out)[i].area_fraction = fraction;
+      (*out)[i].area_strength = value;
+      (*out)[i].mask_bounds = false;  // ComfyUI resets set_area_to_bounds
+    }
+  } else if (cls == "ConditioningSetAreaStrength") {
+    upstream("conditioning");
+    const double value = strength("strength");
+    for (std::size_t i = start; i < out->size(); ++i)
+      (*out)[i].area_strength = value;
+  } else if (cls == "ReferenceLatent") {
+    upstream("conditioning");
+    if (auto latent = graph.LinkOf(node, "latent"))
+      for (std::size_t i = start; i < out->size(); ++i)
+        (*out)[i].reference_latents.push_back(*latent);
+  } else if (cls == "ConditioningZeroOut") {
+    upstream("conditioning");
+    for (std::size_t i = start; i < out->size(); ++i)
+      (*out)[i].zeroed = true;
+  } else {
+    throw NodeFailure(sampler, "unsupported_link",
+                      "input 'positive' passes through unsupported node " +
+                          cls);
+  }
+}
+
+/// Prompt and reference images of a text encoder output (images.image_N in
+/// N order, then ReferenceLatent images).
+void ReadEncoder(const Graph& graph, const std::string& sampler,
+                 const std::string& encoder, int slot,
+                 const std::vector<Link>& reference_latents,
+                 std::string* prompt, std::vector<FileRef>* references,
+                 int* resolution) {
+  const std::string encoder_class = graph.Class(encoder);
+  if (encoder_class == "TextEncodeQwenImage21") {
+    *prompt = slot == 1 ? graph.Str(encoder, "negative_prompt", "")
+                        : graph.Str(encoder, "prompt");
+    std::map<int, Link> ordered;
+    const json::Value* node = graph.Node(encoder);
+    for (const auto& [key, value] : node->find("inputs")->members()) {
+      if (!key.starts_with("images."))
+        continue;
+      const auto digits = key.find_last_not_of("0123456789");
+      const int index = digits + 1 < key.size()
+                            ? std::atoi(key.c_str() + digits + 1)
+                            : static_cast<int>(ordered.size()) + 1000;
+      if (auto link = Graph::AsLink(value))
+        ordered.emplace(index, *link);
+    }
+    for (const auto& [index, link] : ordered) {
+      (void)index;
+      references->push_back(ImageFile(graph, encoder, "images", link));
+    }
+    if (resolution)
+      *resolution = static_cast<int>(graph.Num(encoder, "resolution", 1024));
+  } else {
+    *prompt = graph.Str(encoder, "text");
+  }
+  for (const Link& reference : reference_latents) {
+    if (graph.Class(reference.node) != "VAEEncode")
+      throw NodeFailure(sampler, "unsupported_link",
+                        "ReferenceLatent latents must come from VAEEncode");
+    references->push_back(
+        ImageFile(graph, reference.node, "pixels",
+                  graph.RequireLink(reference.node, "pixels")));
+  }
+  if (references->size() > 10)
+    throw NodeFailure(encoder, "unsupported_value",
+                      "gufo Qwen-Image takes at most 10 reference images per "
+                      "prompt");
+}
+
+/// The regional positive input: the first conditioning without area or
+/// mask is the base prompt, every other one a region.
+void BuildRegions(const Graph& graph, const std::string& sampler,
+                  ImageTask* task) {
+  std::vector<RegionCond> conds;
+  CollectRegionConds(graph, sampler, graph.RequireLink(sampler, "positive"),
+                     &conds);
+  bool have_base = false;
+  std::size_t images = 0;
+  for (const RegionCond& cond : conds) {
+    if (cond.zeroed)
+      throw NodeFailure(cond.encoder, "unsupported_link",
+                        "ConditioningZeroOut is not supported in a regional "
+                        "positive conditioning");
+    if (!have_base && !cond.area && !cond.mask) {
+      have_base = true;
+      task->base_strength = cond.area_strength;
+      ReadEncoder(graph, sampler, cond.encoder, cond.slot,
+                  cond.reference_latents, &task->prompt, &task->references,
+                  &task->resolution);
+      images += task->references.size();
+      continue;
+    }
+    ImageRegion region;
+    region.node = cond.encoder;
+    ReadEncoder(graph, sampler, cond.encoder, cond.slot,
+                cond.reference_latents, &region.prompt, &region.references,
+                nullptr);
+    images += region.references.size();
+    region.strength = cond.area_strength * cond.mask_strength;
+    region.area = cond.area;
+    region.area_fraction = cond.area_fraction;
+    if (cond.mask) {
+      region.mask = cond.mask->grid;
+      region.mask_file = cond.mask->file;
+      region.mask_channel = cond.mask->channel;
+      region.mask_invert = cond.mask->invert;
+      region.mask_bounds = cond.mask_bounds;
+    }
+    task->regions.push_back(std::move(region));
+  }
+  if (!have_base) {
+    task->base_strength = 0;
+    task->prompt.clear();
+  }
+  if (task->regions.size() > 16)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo Qwen-Image takes at most 16 regional "
+                      "conditionings");
+  if (images > 20)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo Qwen-Image takes at most 20 reference images "
+                      "over all regional conditionings");
+}
+
 std::string SeedKey(const std::string& cls) {
   return cls == "KSamplerAdvanced" ? "noise_seed" : "seed";
 }
@@ -718,51 +1050,61 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
       Lower(chain.loader).find("qwen_image") == std::string::npos)
     warnings->push_back("model " + chain.loader + " is served by " +
                         task.model);
-  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
-  if (positive.encoder.empty())
-    throw NodeFailure(sampler, "required_input_missing",
-                      "positive conditioning is not connected");
-  const std::string encoder_class = graph.Class(positive.encoder);
-  if (encoder_class == "TextEncodeQwenImage21") {
-    task.prompt = graph.Str(positive.encoder, "prompt");
-    // Reference images "images.image_N", in N order.
-    std::map<int, Link> ordered;
-    const json::Value* node = graph.Node(positive.encoder);
-    for (const auto& [key, value] : node->find("inputs")->members()) {
-      if (!key.starts_with("images."))
-        continue;
-      const auto digits = key.find_last_not_of("0123456789");
-      const int index = digits + 1 < key.size()
-                            ? std::atoi(key.c_str() + digits + 1)
-                            : static_cast<int>(ordered.size()) + 1000;
-      if (auto link = Graph::AsLink(value))
-        ordered.emplace(index, *link);
-    }
-    for (const auto& [index, link] : ordered) {
-      (void)index;
-      task.references.push_back(
-          ImageFile(graph, positive.encoder, "images", link));
-    }
-    task.resolution =
-        static_cast<int>(graph.Num(positive.encoder, "resolution", 1024));
-  } else if (encoder_class == "CLIPTextEncode") {
-    task.prompt = graph.Str(positive.encoder, "text");
+  const bool regional = HasRegionalConditioning(graph, sampler, "positive");
+  if (regional) {
+    BuildRegions(graph, sampler, &task);
   } else {
-    throw NodeFailure(sampler, "unsupported_link",
-                      "positive conditioning must come from "
-                      "TextEncodeQwenImage21 or CLIPTextEncode");
-  }
-  for (const Link& reference : positive.reference_latents) {
-    if (graph.Class(reference.node) != "VAEEncode")
+    const Conditioning positive =
+        FollowConditioning(graph, sampler, "positive");
+    if (positive.encoder.empty())
+      throw NodeFailure(sampler, "required_input_missing",
+                        "positive conditioning is not connected");
+    const std::string encoder_class = graph.Class(positive.encoder);
+    if (encoder_class == "TextEncodeQwenImage21") {
+      task.prompt = graph.Str(positive.encoder, "prompt");
+      // Reference images "images.image_N", in N order.
+      std::map<int, Link> ordered;
+      const json::Value* node = graph.Node(positive.encoder);
+      for (const auto& [key, value] : node->find("inputs")->members()) {
+        if (!key.starts_with("images."))
+          continue;
+        const auto digits = key.find_last_not_of("0123456789");
+        const int index = digits + 1 < key.size()
+                              ? std::atoi(key.c_str() + digits + 1)
+                              : static_cast<int>(ordered.size()) + 1000;
+        if (auto link = Graph::AsLink(value))
+          ordered.emplace(index, *link);
+      }
+      for (const auto& [index, link] : ordered) {
+        (void)index;
+        task.references.push_back(
+            ImageFile(graph, positive.encoder, "images", link));
+      }
+      task.resolution =
+          static_cast<int>(graph.Num(positive.encoder, "resolution", 1024));
+    } else if (encoder_class == "CLIPTextEncode") {
+      task.prompt = graph.Str(positive.encoder, "text");
+    } else {
       throw NodeFailure(sampler, "unsupported_link",
-                        "ReferenceLatent latents must come from VAEEncode");
-    task.references.push_back(
-        ImageFile(graph, reference.node, "pixels",
-                  graph.RequireLink(reference.node, "pixels")));
+                        "positive conditioning must come from "
+                        "TextEncodeQwenImage21 or CLIPTextEncode");
+    }
+    for (const Link& reference : positive.reference_latents) {
+      if (graph.Class(reference.node) != "VAEEncode")
+        throw NodeFailure(sampler, "unsupported_link",
+                          "ReferenceLatent latents must come from VAEEncode");
+      task.references.push_back(
+          ImageFile(graph, reference.node, "pixels",
+                    graph.RequireLink(reference.node, "pixels")));
+    }
+    if (task.references.size() > 10)
+      throw NodeFailure(positive.encoder, "unsupported_value",
+                        "gufo Qwen-Image takes at most 10 reference images");
   }
-  if (task.references.size() > 10)
-    throw NodeFailure(positive.encoder, "unsupported_value",
-                      "gufo Qwen-Image takes at most 10 reference images");
+  if (HasRegionalConditioning(graph, sampler, "negative"))
+    throw NodeFailure(sampler, "unsupported_link",
+                      "regional conditioning (ConditioningCombine / SetMask / "
+                      "SetArea) is supported on the positive input only");
   // Negative prompt: sent as gufo.negative_prompt (with true CFG).
   const Conditioning negative = FollowConditioning(graph, sampler, "negative");
   if (!negative.encoder.empty() && !negative.zeroed) {
@@ -2317,6 +2659,131 @@ json::Value ImageExtension(const ImageTask& task) {
   if (!task.mask.name.empty())
     gufo["mask_channel"] = task.mask_channel;
   return gufo;
+}
+
+MaskGrid CompositeMask(const MaskGrid& destination, const MaskGrid& source,
+                       int x, int y, std::string_view operation) {
+  enum class Op { kMultiply, kAdd, kSubtract, kAnd, kOr, kXor };
+  Op op;
+  if (operation == "multiply")
+    op = Op::kMultiply;
+  else if (operation == "add")
+    op = Op::kAdd;
+  else if (operation == "subtract")
+    op = Op::kSubtract;
+  else if (operation == "and")
+    op = Op::kAnd;
+  else if (operation == "or")
+    op = Op::kOr;
+  else if (operation == "xor")
+    op = Op::kXor;
+  else
+    throw std::invalid_argument(
+        "operation must be multiply, add, subtract, and, or or xor");
+  if (destination.values.size() !=
+          static_cast<std::size_t>(destination.width) * destination.height ||
+      source.values.size() !=
+          static_cast<std::size_t>(source.width) * source.height)
+    throw std::invalid_argument("mask size mismatch");
+  MaskGrid out = destination;
+  // ComfyUI: the visible part of the source at (x, y), then a clamp of the
+  // whole output to 0..1.
+  const int right = std::min(x + source.width, destination.width);
+  const int bottom = std::min(y + source.height, destination.height);
+  for (int row = y; row < bottom; ++row)
+    for (int col = x; col < right; ++col) {
+      float& d = out.values[static_cast<std::size_t>(row) * out.width + col];
+      const float v =
+          source.values[static_cast<std::size_t>(row - y) * source.width +
+                        (col - x)];
+      const bool a = std::nearbyint(d) != 0, b = std::nearbyint(v) != 0;
+      switch (op) {
+        case Op::kMultiply: d = d * v; break;
+        case Op::kAdd: d = d + v; break;
+        case Op::kSubtract: d = d - v; break;
+        case Op::kAnd: d = a && b ? 1.0F : 0.0F; break;
+        case Op::kOr: d = a || b ? 1.0F : 0.0F; break;
+        case Op::kXor: d = a != b ? 1.0F : 0.0F; break;
+      }
+    }
+  for (float& v : out.values)
+    v = std::clamp(v, 0.0F, 1.0F);
+  return out;
+}
+
+MaskGrid ResampleMask(const MaskGrid& mask, int width, int height) {
+  if (mask.width <= 0 || mask.height <= 0 || width <= 0 || height <= 0 ||
+      mask.values.size() != static_cast<std::size_t>(mask.width) * mask.height)
+    throw std::invalid_argument("invalid mask resample");
+  const auto span = [](int cell, int size, int cells) {
+    const auto begin =
+        static_cast<int>(static_cast<std::int64_t>(cell) * size / cells);
+    const auto end = static_cast<int>(
+        (static_cast<std::int64_t>(cell + 1) * size + cells - 1) / cells);
+    return std::pair{std::min(begin, size - 1),
+                     std::min(size, std::max(begin + 1, end))};
+  };
+  MaskGrid out;
+  out.width = width;
+  out.height = height;
+  out.values.resize(static_cast<std::size_t>(width) * height);
+  for (int r = 0; r < height; ++r) {
+    const auto [y0, y1] = span(r, mask.height, height);
+    for (int c = 0; c < width; ++c) {
+      const auto [x0, x1] = span(c, mask.width, width);
+      double sum = 0;
+      for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+          sum += mask.values[static_cast<std::size_t>(y) * mask.width + x];
+      out.values[static_cast<std::size_t>(r) * width + c] =
+          static_cast<float>(sum / ((y1 - y0) * (x1 - x0)));
+    }
+  }
+  return out;
+}
+
+json::Value ImageRegionsField(const ImageTask& task, int width, int height) {
+  json::Value regions = json::Value::array();
+  for (const ImageRegion& region : task.regions) {
+    json::Value entry = json::Value::object();
+    entry["prompt"] = region.prompt;
+    if (region.strength != 1.0)
+      entry["strength"] = region.strength;
+    if (region.area) {
+      json::Value area = json::Value::object();
+      area["x"] = (*region.area)[0];
+      area["y"] = (*region.area)[1];
+      area["width"] = (*region.area)[2];
+      area["height"] = (*region.area)[3];
+      area["unit"] = region.area_fraction ? "fraction" : "px";
+      entry["area"] = std::move(area);
+    }
+    if (region.mask) {
+      // One value per 16-pixel cell of the output (what the worker blends
+      // on); the mask is stretched to the image like ComfyUI does.
+      const MaskGrid cells = ResampleMask(*region.mask, std::max(1, width / 16),
+                                          std::max(1, height / 16));
+      std::string bytes(cells.values.size(), '\0');
+      for (std::size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<char>(static_cast<unsigned char>(
+            std::lround(std::clamp(cells.values[i], 0.0F, 1.0F) * 255.0F)));
+      json::Value mask = json::Value::object();
+      mask["width"] = cells.width;
+      mask["height"] = cells.height;
+      mask["data"] = Base64Encode(bytes);
+      entry["mask"] = std::move(mask);
+    } else if (region.mask_file) {
+      entry["mask_channel"] = region.mask_channel;
+      if (region.mask_invert)
+        entry["mask_invert"] = true;
+    }
+    if (region.mask_bounds)
+      entry["mask_bounds"] = true;
+    if (!region.references.empty())
+      entry["images"] = static_cast<double>(region.references.size());
+    regions.push_back(std::move(entry));
+  }
+  return regions;
 }
 
 json::Value ImageLoras(const ImageTask& task) {

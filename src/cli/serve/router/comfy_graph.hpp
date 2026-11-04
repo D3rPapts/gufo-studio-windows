@@ -9,6 +9,9 @@
 // Supported families (each keyed by the node that produces the media):
 //   image  KSampler <- TextEncodeQwenImage21 / CLIPTextEncode (Qwen-Image)
 //          -> /v1/images/generations, or /v1/images/edits with references;
+//          regional prompts through ConditioningCombine / ConditioningSetMask
+//          / ConditioningSetArea(Percentage) with SolidMask / MaskComposite
+//          masks -> gufo.regions (each region with its own references);
 //          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only)
 //   h3     KSampler <- MiniMaxH3ImageToVideo (+ MiniMaxH3AddGuide, whose
 //          image / audio may come from LoadVideo -> GetVideoComponents as a
@@ -43,6 +46,7 @@
 // may feed WanUni3CControlnetApply.render_video or
 // WanCameraImageToVideo.camera_conditions.
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -111,6 +115,47 @@ enum class SizeSource {
   kSquare,          // resolution x resolution
 };
 
+/// A ComfyUI MASK (SolidMask, MaskComposite, InvertMask), row-major 0..1.
+struct MaskGrid {
+  int width{0};
+  int height{0};
+  std::vector<float> values;
+  bool operator==(const MaskGrid&) const = default;
+};
+
+/// ComfyUI MaskComposite: `source` placed at (x, y) on `destination`,
+/// combined by "multiply", "add", "subtract", "and", "or" or "xor" (the
+/// logic ones on rounded values) and clamped to 0..1.
+MaskGrid CompositeMask(const MaskGrid& destination, const MaskGrid& source,
+                       int x, int y, std::string_view operation);
+/// Area-average resample to width x height (stretched, like ComfyUI's
+/// resize of a conditioning mask to the latent).
+MaskGrid ResampleMask(const MaskGrid& mask, int width, int height);
+
+/// One regional conditioning of a Qwen-Image graph: an encoder with its own
+/// reference images, limited by ConditioningSetArea /
+/// ConditioningSetAreaPercentage / ConditioningSetMask, collected through
+/// ConditioningCombine (conditioning_1 before conditioning_2).
+struct ImageRegion {
+  std::string node;  // the text encoder node
+  std::string prompt;
+  std::vector<FileRef> references;
+  /// ConditioningSetArea strength times ConditioningSetMask strength.
+  double strength{1};
+  /// x, y, width, height: pixels (SetArea) or fractions (SetAreaPercentage).
+  std::optional<std::array<double, 4>> area;
+  bool area_fraction{false};
+  /// A computed mask (SolidMask / MaskComposite / InvertMask) ...
+  std::optional<MaskGrid> mask;
+  /// ... or a mask file (LoadImageMask, LoadImage MASK), sent as an image
+  /// with its channel ("alpha" = 1 - alpha), possibly inverted.
+  std::optional<FileRef> mask_file;
+  std::string mask_channel;
+  bool mask_invert{false};
+  /// set_cond_area "mask bounds".
+  bool mask_bounds{false};
+};
+
 struct ImageTask {
   std::string model;
   std::string prompt;
@@ -135,7 +180,18 @@ struct ImageTask {
   /// LoraLoader(ModelOnly) chain -> top-level "loras" [{name, scale}], in
   /// application order; names via LoraName, empty = field not sent.
   std::vector<std::pair<std::string, double>> loras;
+  /// Regional prompts (gufo.regions); `prompt` / `references` are then the
+  /// conditioning without area or mask, weighted `base_strength` (0 = the
+  /// graph has none, `prompt` empty).
+  std::vector<ImageRegion> regions;
+  double base_strength{1};
 };
+
+/// gufo.regions for a width x height image without the file data: computed
+/// masks resampled to the 16-pixel cell grid, "images" as the count of
+/// region_image[] parts (in region order). The executor adds "mask_image"
+/// for mask files.
+json::Value ImageRegionsField(const ImageTask& task, int width, int height);
 
 struct SpeechTask {
   std::string model;

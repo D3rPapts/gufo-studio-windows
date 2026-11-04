@@ -4,6 +4,7 @@
 // built from the node signatures ComfyUI's /object_info reports.
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -630,6 +631,320 @@ void TestMaskedEdit() {
   image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
   assert(image.mask.name.empty() && image.init_image.name.empty());
   assert(comfy::ImageExtension(image).find("mask_channel") == nullptr);
+}
+
+// Regional prompts (M12): the five-column desk scene at 1344x768. The global
+// prompt carries place and light, each person a column mask (268 px wide,
+// y 250..768) with an own reference, the door a background mask in column
+// 5; ConditioningCombine chains them in order.
+constexpr const char* kQwenRegional = R"({
+ "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_int8_convrot.safetensors", "type": "qwen_image", "device": "default"}},
+ "2": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
+ "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"}},
+ "5": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "office at night, five desks", "negative_prompt": "extra person", "vae": ["2", 0], "resolution": 1024}},
+ "i1": {"class_type": "LoadImage", "inputs": {"image": "ref_a.png"}},
+ "i2": {"class_type": "LoadImage", "inputs": {"image": "ref_b.png"}},
+ "i3": {"class_type": "LoadImage", "inputs": {"image": "ref_c.png"}},
+ "i4": {"class_type": "LoadImage", "inputs": {"image": "ref_d.png"}},
+ "i5": {"class_type": "LoadImage", "inputs": {"image": "ref_e.png [output]"}},
+ "t1": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "A (<image1>) sits at the desk", "negative_prompt": "", "vae": ["2", 0], "resolution": 1024, "images.image_1": ["i1", 0]}},
+ "t2": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "B (<image1>) sits at the desk", "negative_prompt": "", "vae": ["2", 0], "resolution": 1024, "images.image_1": ["i2", 0]}},
+ "t3": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "C (<image1>) sits at the desk", "negative_prompt": "", "vae": ["2", 0], "resolution": 1024, "images.image_1": ["i3", 0]}},
+ "t4": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "D (<image1>) sits at the desk", "negative_prompt": "", "vae": ["2", 0], "resolution": 1024, "images.image_1": ["i4", 0]}},
+ "t5": {"class_type": "TextEncodeQwenImage21", "inputs": {"clip": ["1", 0], "prompt": "E (<image1>) sits at the desk", "negative_prompt": "", "vae": ["2", 0], "resolution": 1024, "images.image_1": ["i5", 0]}},
+ "td": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 0], "text": "a closed office door with an access panel"}},
+ "m0": {"class_type": "SolidMask", "inputs": {"value": 0.0, "width": 1344, "height": 768}},
+ "mc": {"class_type": "SolidMask", "inputs": {"value": 1.0, "width": 268, "height": 518}},
+ "md": {"class_type": "SolidMask", "inputs": {"value": 1.0, "width": 268, "height": 250}},
+ "k1": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["mc", 0], "x": 0, "y": 250, "operation": "add"}},
+ "k2": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["mc", 0], "x": 268, "y": 250, "operation": "add"}},
+ "k3": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["mc", 0], "x": 536, "y": 250, "operation": "add"}},
+ "k4": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["mc", 0], "x": 804, "y": 250, "operation": "add"}},
+ "k5": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["mc", 0], "x": 1072, "y": 250, "operation": "add"}},
+ "kd": {"class_type": "MaskComposite", "inputs": {"destination": ["m0", 0], "source": ["md", 0], "x": 1072, "y": 0, "operation": "add"}},
+ "s1": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t1", 0], "mask": ["k1", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "s2": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t2", 0], "mask": ["k2", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "s3": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t3", 0], "mask": ["k3", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "s4": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t4", 0], "mask": ["k4", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "s5": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t5", 0], "mask": ["k5", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "sd": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["td", 0], "mask": ["kd", 0], "strength": 0.8, "set_cond_area": "default"}},
+ "c1": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["5", 0], "conditioning_2": ["s1", 0]}},
+ "c2": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["c1", 0], "conditioning_2": ["s2", 0]}},
+ "c3": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["c2", 0], "conditioning_2": ["s3", 0]}},
+ "c4": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["s4", 0], "conditioning_2": ["s5", 0]}},
+ "c5": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["c3", 0], "conditioning_2": ["c4", 0]}},
+ "c6": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["c5", 0], "conditioning_2": ["sd", 0]}},
+ "e": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1344, "height": 768, "batch_size": 1}},
+ "6": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["c6", 0], "negative": ["5", 1], "latent_image": ["e", 0], "seed": 22101, "steps": 25, "cfg": 2.5, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["2", 0]}},
+ "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "regional/desk"}}
+})";
+
+float MaskAt(const comfy::MaskGrid& mask, int x, int y) {
+  return mask.values[static_cast<std::size_t>(y) * mask.width + x];
+}
+
+void TestRegionalMasks() {
+  const comfy::Plan plan = PlanOf(kQwenRegional);
+  assert(plan.tasks.size() == 1);
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  // The conditioning without area or mask is the base prompt.
+  assert(image.prompt == "office at night, five desks");
+  assert(image.references.empty());
+  assert(image.base_strength == 1.0);
+  assert(image.negative_prompt == "extra person");
+  assert(image.size_source == comfy::SizeSource::kExplicit);
+  assert(image.width == 1344 && image.height == 768);
+  // Combine order: conditioning_1 before conditioning_2, depth first.
+  assert(image.regions.size() == 6);
+  const char* prompts[] = {"A", "B", "C", "D", "E"};
+  for (int i = 0; i < 5; ++i) {
+    const auto& region = image.regions[i];
+    assert(region.prompt.starts_with(prompts[i]));
+    assert(region.node == "t" + std::to_string(i + 1));
+    assert(region.references.size() == 1);
+    assert(region.mask && !region.mask_file && region.mask_bounds);
+    assert(region.strength == 1.0 && !region.area);
+    const auto& mask = *region.mask;
+    assert(mask.width == 1344 && mask.height == 768);
+    // Column i: x in [268 i, 268 i + 268), y in [250, 768).
+    const int left = 268 * i;
+    assert(MaskAt(mask, left, 250) == 1.0F);
+    assert(MaskAt(mask, left + 267, 767) == 1.0F);
+    assert(MaskAt(mask, left, 249) == 0.0F);
+    if (left + 268 < 1344)
+      assert(MaskAt(mask, left + 268, 400) == 0.0F);
+    if (left > 0)
+      assert(MaskAt(mask, left - 1, 400) == 0.0F);
+  }
+  assert((image.regions[4].references[0] ==
+          comfy::FileRef{"ref_e.png", "output"}));
+  const auto& door = image.regions[5];
+  assert(door.prompt == "a closed office door with an access panel");
+  assert(door.references.empty() && !door.mask_bounds);
+  assert(door.strength == 0.8);
+  assert(MaskAt(*door.mask, 1100, 100) == 1.0F &&
+         MaskAt(*door.mask, 1100, 250) == 0.0F &&
+         MaskAt(*door.mask, 1071, 100) == 0.0F);
+
+  // gufo.regions: one mask byte per 16-pixel cell (84 x 48 here).
+  const json::Value field = comfy::ImageRegionsField(image, 1344, 768);
+  assert(field.size() == 6);
+  const json::Value& first = field.items()[0];
+  assert(first.member_str("prompt") == "A (<image1>) sits at the desk");
+  assert(first.find("strength") == nullptr);
+  assert(first.find("mask_bounds")->as_bool());
+  assert(first.find("images")->as_double() == 1);
+  const json::Value* mask = first.find("mask");
+  assert(mask->find("width")->as_double() == 84);
+  assert(mask->find("height")->as_double() == 48);
+  const auto bytes = comfy::Base64Decode(mask->member_str("data"));
+  assert(bytes && bytes->size() == 84 * 48);
+  const auto cell = [&](int row, int col) {
+    return static_cast<unsigned char>((*bytes)[row * 84 + col]);
+  };
+  // Cell rows 0..14 end at y 240 (outside); row 15 (240..256) is 6/16
+  // inside; column 16 (256..272) is 12/16 inside.
+  assert(cell(10, 0) == 0 && cell(20, 0) == 255 && cell(47, 15) == 255);
+  assert(cell(15, 0) == 96);   // round(6 / 16 * 255)
+  assert(cell(20, 16) == 191);  // round(12 / 16 * 255)
+  assert(cell(20, 17) == 0);
+  const json::Value& door_field = field.items()[5];
+  assert(door_field.find("strength")->as_double() == 0.8);
+  assert(door_field.find("images") == nullptr);
+  assert(door_field.find("mask_bounds") == nullptr);
+  // The base prompt keeps its gufo fields.
+  assert(comfy::ImageExtension(image).member_str("negative_prompt") ==
+         "extra person");
+}
+
+void TestRegionalAreas() {
+  // SetArea (pixels), SetAreaPercentage (fractions), SetAreaStrength and a
+  // SetMask on top of an area.
+  std::string text = Replace(
+      kQwenRegional,
+      R"("s1": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t1", 0], "mask": ["k1", 0], "strength": 1.0, "set_cond_area": "mask bounds"}})",
+      R"("s1": {"class_type": "ConditioningSetArea", "inputs": {"conditioning": ["t1", 0], "width": 268, "height": 518, "x": 0, "y": 250, "strength": 1.5}})");
+  text = Replace(
+      text,
+      R"("s2": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t2", 0], "mask": ["k2", 0], "strength": 1.0, "set_cond_area": "mask bounds"}})",
+      R"("s2": {"class_type": "ConditioningSetAreaPercentage", "inputs": {"conditioning": ["t2", 0], "width": 0.2, "height": 0.675, "x": 0.2, "y": 0.325, "strength": 1.0}})");
+  // s3: an area, then a mask with "mask bounds" (bounds win), strengths
+  // multiply; s4: mask bounds first, then an area (ComfyUI resets bounds).
+  text = Replace(
+      text,
+      R"("s3": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t3", 0], "mask": ["k3", 0], "strength": 1.0, "set_cond_area": "mask bounds"}})",
+      R"("a3": {"class_type": "ConditioningSetArea", "inputs": {"conditioning": ["t3", 0], "width": 400, "height": 768, "x": 500, "y": 0, "strength": 2.0}},
+ "s3": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["a3", 0], "mask": ["k3", 0], "strength": 0.5, "set_cond_area": "mask bounds"}})");
+  text = Replace(
+      text,
+      R"("s4": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t4", 0], "mask": ["k4", 0], "strength": 1.0, "set_cond_area": "mask bounds"}})",
+      R"("b4": {"class_type": "ConditioningSetMask", "inputs": {"conditioning": ["t4", 0], "mask": ["k4", 0], "strength": 1.0, "set_cond_area": "mask bounds"}},
+ "s4": {"class_type": "ConditioningSetArea", "inputs": {"conditioning": ["b4", 0], "width": 268, "height": 518, "x": 804, "y": 250, "strength": 1.0}})");
+  // The base prompt at strength 0.5 through ConditioningSetAreaStrength.
+  text = Replace(text,
+                 R"("conditioning_1": ["5", 0], "conditioning_2": ["s1", 0])",
+                 R"("conditioning_1": ["g", 0], "conditioning_2": ["s1", 0])");
+  text = Replace(
+      text, R"( "e": {"class_type")",
+      R"( "g": {"class_type": "ConditioningSetAreaStrength", "inputs": {"conditioning": ["5", 0], "strength": 0.5}},
+ "e": {"class_type")");
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.base_strength == 0.5);
+  assert(image.regions.size() == 6);
+  const auto& a = image.regions[0];
+  assert(a.area && !a.area_fraction && !a.mask && a.strength == 1.5);
+  assert(((*a.area) == std::array<double, 4>{0, 250, 268, 518}));
+  const auto& b = image.regions[1];
+  assert(b.area && b.area_fraction && !b.mask);
+  assert(((*b.area) == std::array<double, 4>{0.2, 0.325, 0.2, 0.675}));
+  const auto& c = image.regions[2];
+  assert(c.area && c.mask && c.mask_bounds && c.strength == 1.0);
+  const auto& d = image.regions[3];
+  assert(d.area && d.mask && !d.mask_bounds);
+  const json::Value field = comfy::ImageRegionsField(image, 1344, 768);
+  const json::Value* area = field.items()[1].find("area");
+  assert(area->member_str("unit") == "fraction" &&
+         area->find("x")->as_double() == 0.2);
+  assert(field.items()[0].find("area")->member_str("unit") == "px");
+  assert(field.items()[0].find("strength")->as_double() == 1.5);
+  // Values outside the node ranges fail validation.
+  assert(ErrorOf(Replace(text, R"("width": 0.2, "height": 0.675)",
+                         R"("width": 1.2, "height": 0.675)"))
+             .message.find("0..1") != std::string::npos);
+  assert(ErrorOf(Replace(text, R"("strength": 1.5)", R"("strength": 11)"))
+             .message.find("strength") != std::string::npos);
+}
+
+void TestRegionalCombineAndErrors() {
+  // Without a conditioning free of area and mask the base prompt is empty
+  // and weighs nothing.
+  std::string text = Replace(
+      kQwenRegional,
+      R"("conditioning_1": ["5", 0], "conditioning_2": ["s1", 0])",
+      R"("conditioning_1": ["s1", 0], "conditioning_2": ["s1", 0])");
+  comfy::Plan plan = PlanOf(text.c_str());
+  auto image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.prompt.empty() && image.base_strength == 0);
+  assert(image.regions.size() == 7);
+  assert(image.regions[0].prompt == image.regions[1].prompt);
+  // A second plain conditioning is a full-image region.
+  text = Replace(kQwenRegional,
+                 R"("conditioning_1": ["c5", 0], "conditioning_2": ["sd", 0])",
+                 R"("conditioning_1": ["c5", 0], "conditioning_2": ["td", 0])");
+  plan = PlanOf(text.c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.regions.size() == 6 && !image.regions[5].mask &&
+         !image.regions[5].area);
+  assert(image.prompt == "office at night, five desks");
+  // A combined negative is not supported.
+  assert(ErrorOf(Replace(kQwenRegional, R"("negative": ["5", 1])",
+                         R"("negative": ["c1", 0])"))
+             .message.find("positive input only") != std::string::npos);
+  // ZeroOut inside the regional positive.
+  assert(
+      ErrorOf(Replace(
+                  Replace(kQwenRegional,
+                          R"("conditioning_1": ["5", 0], "conditioning_2": ["s1", 0])",
+                          R"("conditioning_1": ["z", 0], "conditioning_2": ["s1", 0])"),
+                  R"( "e": {"class_type")",
+                  R"( "z": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["5", 0]}},
+ "e": {"class_type")"))
+          .message.find("ConditioningZeroOut") != std::string::npos);
+  // Bad set_cond_area and composite operation.
+  assert(ErrorOf(Replace(kQwenRegional, R"("set_cond_area": "default")",
+                         R"("set_cond_area": "bounds")"))
+             .message.find("set_cond_area") != std::string::npos);
+  assert(ErrorOf(Replace(kQwenRegional,
+                         R"("x": 0, "y": 250, "operation": "add")",
+                         R"("x": 0, "y": 250, "operation": "divide")"))
+             .message.find("operation") != std::string::npos);
+  // Mask files: LoadImageMask keeps its channel, InvertMask flips it; a
+  // file cannot be composited.
+  text = Replace(
+      kQwenRegional,
+      R"("conditioning": ["td", 0], "mask": ["kd", 0])",
+      R"("conditioning": ["td", 0], "mask": ["fi", 0])");
+  text = Replace(
+      text, R"( "e": {"class_type")",
+      R"( "f": {"class_type": "LoadImageMask", "inputs": {"image": "door_mask.png", "channel": "red"}},
+ "fi": {"class_type": "InvertMask", "inputs": {"mask": ["f", 0]}},
+ "e": {"class_type")");
+  plan = PlanOf(text.c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  const auto& door = image.regions[5];
+  assert(!door.mask && door.mask_file && door.mask_invert);
+  assert((*door.mask_file == comfy::FileRef{"door_mask.png", "input"}));
+  assert(door.mask_channel == "red");
+  const json::Value field = comfy::ImageRegionsField(image, 1344, 768);
+  assert(field.items()[5].member_str("mask_channel") == "red");
+  assert(field.items()[5].find("mask_invert")->as_bool());
+  assert(field.items()[5].find("mask") == nullptr);
+  std::string composite = Replace(
+      kQwenRegional, R"("destination": ["m0", 0], "source": ["md", 0])",
+      R"("destination": ["m0", 0], "source": ["f", 0])");
+  composite = Replace(
+      composite, R"( "e": {"class_type")",
+      R"( "f": {"class_type": "LoadImageMask", "inputs": {"image": "door_mask.png", "channel": "red"}},
+ "e": {"class_type")");
+  assert(ErrorOf(composite).message.find("mask files") != std::string::npos);
+  // InvertMask of a computed mask is computed.
+  text = Replace(kQwenRegional,
+                 R"("conditioning": ["td", 0], "mask": ["kd", 0])",
+                 R"("conditioning": ["td", 0], "mask": ["iv", 0])");
+  text = Replace(text, R"( "e": {"class_type")",
+                 R"( "iv": {"class_type": "InvertMask", "inputs": {"mask": ["kd", 0]}},
+ "e": {"class_type")");
+  plan = PlanOf(text.c_str());
+  image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(MaskAt(*image.regions[5].mask, 1100, 100) == 0.0F &&
+         MaskAt(*image.regions[5].mask, 10, 700) == 1.0F);
+}
+
+void TestMaskComposite() {
+  comfy::MaskGrid destination{4, 3, std::vector<float>(12, 0.5F)};
+  comfy::MaskGrid source{2, 2, {1.0F, 0.25F, 0.0F, 0.75F}};
+  // Placed at (3, 2): only the top-left source pixel is visible.
+  auto out = comfy::CompositeMask(destination, source, 3, 2, "add");
+  assert(MaskAt(out, 3, 2) == 1.0F);  // 0.5 + 1 clamped
+  assert(MaskAt(out, 2, 2) == 0.5F && MaskAt(out, 3, 1) == 0.5F);
+  out = comfy::CompositeMask(destination, source, 1, 0, "multiply");
+  assert(MaskAt(out, 1, 0) == 0.5F && MaskAt(out, 2, 0) == 0.125F &&
+         MaskAt(out, 1, 1) == 0.0F && MaskAt(out, 2, 1) == 0.375F &&
+         MaskAt(out, 0, 0) == 0.5F && MaskAt(out, 3, 0) == 0.5F);
+  out = comfy::CompositeMask(destination, source, 0, 0, "subtract");
+  assert(MaskAt(out, 0, 0) == 0.0F && MaskAt(out, 1, 0) == 0.25F &&
+         MaskAt(out, 0, 1) == 0.5F);
+  // Logic operations round both sides (0.5 rounds to 0, half to even).
+  comfy::MaskGrid ones{2, 1, {1.0F, 0.0F}};
+  comfy::MaskGrid other{2, 1, {1.0F, 1.0F}};
+  out = comfy::CompositeMask(ones, other, 0, 0, "and");
+  assert(out.values == (std::vector<float>{1.0F, 0.0F}));
+  out = comfy::CompositeMask(ones, other, 0, 0, "or");
+  assert(out.values == (std::vector<float>{1.0F, 1.0F}));
+  out = comfy::CompositeMask(ones, other, 0, 0, "xor");
+  assert(out.values == (std::vector<float>{0.0F, 1.0F}));
+  out = comfy::CompositeMask(destination, ones, 0, 0, "and");
+  assert(MaskAt(out, 0, 0) == 0.0F && MaskAt(out, 3, 2) == 0.5F);
+  // Outside the destination nothing changes.
+  out = comfy::CompositeMask(destination, source, 9, 9, "add");
+  assert(out == destination);
+  bool rejected = false;
+  try {
+    (void)comfy::CompositeMask(destination, source, 0, 0, "max");
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+  // Area-average resample, stretched.
+  comfy::MaskGrid half{4, 2, {1, 1, 0, 0, 1, 1, 0, 0}};
+  auto small = comfy::ResampleMask(half, 2, 1);
+  assert(small.values == (std::vector<float>{1.0F, 0.0F}));
+  small = comfy::ResampleMask(half, 1, 1);
+  assert(small.values == (std::vector<float>{0.5F}));
+  const auto big = comfy::ResampleMask(half, 8, 4);
+  assert(MaskAt(big, 3, 3) == 1.0F && MaskAt(big, 4, 0) == 0.0F);
 }
 
 void TestQwenLoras() {
@@ -1700,6 +2015,10 @@ int main() {
   TestUnsupportedNodes();
   TestImageToImage();
   TestMaskedEdit();
+  TestRegionalMasks();
+  TestRegionalAreas();
+  TestRegionalCombineAndErrors();
+  TestMaskComposite();
   TestQwenLoras();
   TestQwenTurbo();
   TestRife();
