@@ -25,8 +25,17 @@ struct SynthesisRequest {
   // 恐惧/fear, 厌恶/disgust, 惊讶/surprise, 中性/neutral).
   std::string emotion;
   // FREEFORM task: free-text caption (e.g. a whisper description). Takes
-  // precedence over `emotion`.
+  // precedence over `emotion`; must not be combined with the controls below.
   std::string instruction;
+  // BASIC task: speaking rate (慢速/中速/快速), pitch and volume (低/中/高),
+  // as values or names accepted by SpeedLabel/PitchLabel/VolumeLabel. Any
+  // subset may be set; unset ones stay null in the caption.
+  std::string speed;
+  std::string pitch;
+  std::string volume;
+  // DIALECT task: "cantonese" or "chuanyu dialect" (DialectLabel names). As
+  // in the reference, a dialect request drops the "Target language" line.
+  std::string dialect;
   // Reference voice (mono) for the CAM++ speaker embedding.
   std::vector<float> reference_audio;
   std::uint32_t reference_sample_rate{0};
@@ -55,6 +64,15 @@ struct SynthesisRequest {
   std::function<void(std::size_t fragment, std::int64_t step, float* noise)>
       noise_source;
 };
+
+// BASIC/DIALECT caption from request.speed/pitch/volume/dialect (zh schema
+// for BASIC, en schema for DIALECT, as tts_tasks.build_task_instruction).
+// Leaves *instruction empty when none of them is set. Fails on unknown
+// values and, like the reference (one task per request), when BASIC and
+// DIALECT are mixed or combined with `emotion` or `instruction`.
+[[nodiscard]] bool ResolveTaskInstruction(const SynthesisRequest& request,
+                                          std::optional<std::string>* instruction,
+                                          std::string* error);
 
 struct SynthesisResult {
   std::uint32_t sample_rate{44100};

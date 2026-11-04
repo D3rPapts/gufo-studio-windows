@@ -212,6 +212,10 @@ struct TtsService::Impl {
             ming.language = request.language;
             ming.emotion = request.emotion;
             ming.instruction = request.instruct;
+            ming.speed = request.tempo;
+            ming.pitch = request.pitch;
+            ming.volume = request.volume;
+            ming.dialect = request.dialect;
             ming.reference_text = request.reference_text;
             const auto& audio = request.reference_audio;
             if (!audio.samples.empty() && audio.channels > 0) {

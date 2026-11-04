@@ -177,6 +177,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                                                   "language",
                                                   "instructions",
                                                   "emotion",
+                                                  "tempo",
+                                                  "pitch",
+                                                  "volume",
+                                                  "dialect",
                                                   "seed",
                                                   "max_new_tokens",
                                                   "greedy",
@@ -348,7 +352,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "'speed' other than 1.0 requires response_format 'wav'",
                  "invalid_speed");
   }
-  for (const std::string_view name : {"language", "instructions", "emotion"}) {
+  for (const std::string_view name : {"language", "instructions", "emotion",
+                                       "tempo", "pitch", "volume", "dialect"}) {
     const json::Value* value = body.find(std::string(name));
     if (value != nullptr && !value->is_string()) {
       return Error(400, "Bad Request",
@@ -367,6 +372,50 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "'emotion' must be happy, sad, angry, fear, disgust, surprise "
                  "or neutral",
                  "invalid_emotion");
+  }
+  // Ming-3.0-tts BASIC task ("tempo", "pitch", "volume": slow/medium/fast,
+  // low/medium/high) and DIALECT task ("dialect"). "tempo" is the model's own
+  // speaking rate; the OpenAI "speed" time stretch stays separate.
+  const bool ming_basic = !body.member_str("tempo").empty() ||
+                          !body.member_str("pitch").empty() ||
+                          !body.member_str("volume").empty();
+  const bool ming_dialect = !body.member_str("dialect").empty();
+  if ((ming_basic || ming_dialect) && !service.is_ming_tts()) {
+    return Error(400, "Bad Request",
+                 "'tempo', 'pitch', 'volume' and 'dialect' are supported only "
+                 "by Ming-3.0-tts",
+                 "unsupported_field");
+  }
+  if (const std::string value = body.member_str("tempo");
+      !value.empty() && !models::ming_tts::SpeedLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'tempo' must be slow, medium or fast",
+                 "invalid_tempo");
+  }
+  if (const std::string value = body.member_str("pitch");
+      !value.empty() && !models::ming_tts::PitchLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'pitch' must be low, medium or high",
+                 "invalid_pitch");
+  }
+  if (const std::string value = body.member_str("volume");
+      !value.empty() && !models::ming_tts::VolumeLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'volume' must be low, medium or high",
+                 "invalid_volume");
+  }
+  if (const std::string value = body.member_str("dialect");
+      !value.empty() && !models::ming_tts::DialectLabel(value).has_value()) {
+    return Error(400, "Bad Request",
+                 "'dialect' must be cantonese or chuanyu dialect",
+                 "invalid_dialect");
+  }
+  // One Ming task per request, as in the reference (tts_tasks).
+  if ((ming_basic && ming_dialect) ||
+      ((ming_basic || ming_dialect) &&
+       (!body.member_str("emotion").empty() ||
+        !body.member_str("instructions").empty()))) {
+    return Error(400, "Bad Request",
+                 "use only one of 'tempo'/'pitch'/'volume', 'dialect', "
+                 "'emotion' or 'instructions' per request",
+                 "conflicting_controls");
   }
   std::size_t max_new_tokens = 0;
   if (!ReadUnsigned(body, "max_new_tokens", 3000, kMaximumNewTokens,
@@ -439,6 +488,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
       .language = std::move(language),
       .instruct = body.member_str("instructions"),
       .emotion = body.member_str("emotion"),
+      .tempo = body.member_str("tempo"),
+      .pitch = body.member_str("pitch"),
+      .volume = body.member_str("volume"),
+      .dialect = body.member_str("dialect"),
       .reference_audio = std::move(reference_audio),
       .reference_text = std::move(reference_text),
       .speaker_embedding_only = speaker_embedding_only,

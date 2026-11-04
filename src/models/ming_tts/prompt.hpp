@@ -34,12 +34,32 @@ inline constexpr std::uint32_t kAudioStartId = 151706;
 // 高兴 悲伤 愤怒 恐惧 厌恶 惊讶 中性.
 [[nodiscard]] std::optional<std::string> EmotionLabel(std::string_view name);
 
-// Structured caption (tts_tasks.build_structured_instruction, zh schema).
+// BASIC task speaking rate (tts_tasks.BASIC_ATTRIBUTE_VALUES["speed"]):
+// 慢速/中速/快速 for slow/medium/fast (also normal; German langsam, mittel,
+// normal, schnell; the Chinese values themselves); nullopt when unknown.
+[[nodiscard]] std::optional<std::string> SpeedLabel(std::string_view name);
+
+// BASIC task pitch or volume level: 低/中/高 for low/medium/high (also
+// normal; German tief/niedrig, mittel/normal, hoch; for volume also
+// quiet/soft/loud and leise/laut); nullopt when unknown.
+[[nodiscard]] std::optional<std::string> PitchLabel(std::string_view name);
+[[nodiscard]] std::optional<std::string> VolumeLabel(std::string_view name);
+
+// DIALECT task value (tts_tasks.DIALECT_VALUES): "cantonese" (also yue,
+// kantonesisch, 粤语) or "chuanyu dialect" (also chuanyu, sichuanese,
+// 川渝话); nullopt when unknown.
+[[nodiscard]] std::optional<std::string> DialectLabel(std::string_view name);
+
+// Structured caption (tts_tasks.build_structured_instruction). The reference
+// uses the zh schema for every task except DIALECT, which uses the en schema
+// (build_task_instruction).
+enum class InstructionSchema { kChinese, kEnglish };
 struct StructuredControls {
   std::optional<std::string> dialect, style, speed, pitch, volume, emotion, ip;
 };
 [[nodiscard]] std::string BuildStructuredInstruction(
-    const StructuredControls& controls);
+    const StructuredControls& controls,
+    InstructionSchema schema = InstructionSchema::kChinese);
 
 struct InputLayout {
   std::vector<std::uint32_t> ids;

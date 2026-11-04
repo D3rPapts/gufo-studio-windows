@@ -109,6 +109,60 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir,
   return engine;
 }
 
+bool ResolveTaskInstruction(const SynthesisRequest& request,
+                            std::optional<std::string>* instruction,
+                            std::string* error) {
+  instruction->reset();
+  const bool basic =
+      !request.speed.empty() || !request.pitch.empty() || !request.volume.empty();
+  const bool dialect = !request.dialect.empty();
+  if (!basic && !dialect) {
+    return true;
+  }
+  if ((basic && dialect) || !request.emotion.empty() ||
+      !request.instruction.empty()) {
+    SetError(error,
+             "Ming controls are one task per request: use either speed/pitch/"
+             "volume, dialect, emotion or a free-text instruction");
+    return false;
+  }
+  StructuredControls controls;
+  if (dialect) {
+    controls.dialect = DialectLabel(request.dialect);
+    if (!controls.dialect.has_value()) {
+      SetError(error, "unknown Ming dialect '" + request.dialect +
+                          "' (cantonese, chuanyu dialect)");
+      return false;
+    }
+    *instruction = BuildStructuredInstruction(controls, InstructionSchema::kEnglish);
+    return true;
+  }
+  const auto resolve = [&](const std::string& value, auto label_of,
+                           std::optional<std::string>* slot, const char* name,
+                           const char* allowed) {
+    if (value.empty()) {
+      return true;
+    }
+    *slot = label_of(value);
+    if (!slot->has_value()) {
+      SetError(error, std::string("unknown Ming ") + name + " '" + value + "' (" +
+                          allowed + ")");
+      return false;
+    }
+    return true;
+  };
+  if (!resolve(request.speed, SpeedLabel, &controls.speed, "speed",
+               "slow, medium, fast") ||
+      !resolve(request.pitch, PitchLabel, &controls.pitch, "pitch",
+               "low, medium, high") ||
+      !resolve(request.volume, VolumeLabel, &controls.volume, "volume",
+               "low, medium, high")) {
+    return false;
+  }
+  *instruction = BuildStructuredInstruction(controls);
+  return true;
+}
+
 Engine::~Engine() = default;
 
 const char* Engine::backend_name() const noexcept {
@@ -135,8 +189,15 @@ bool Engine::Generate(const SynthesisRequest& request,
 
   // --- task -> instruction
   std::optional<std::string> instruction;
+  std::optional<std::string> task_instruction;
+  if (!ResolveTaskInstruction(request, &task_instruction, error)) {
+    return false;
+  }
+  const bool dialect_task = !request.dialect.empty();
   if (!request.instruction.empty()) {
     instruction = request.instruction;  // FREEFORM
+  } else if (task_instruction.has_value()) {
+    instruction = std::move(task_instruction);  // BASIC or DIALECT
   } else if (!request.emotion.empty()) {
     const auto label = EmotionLabel(request.emotion);
     if (!label.has_value()) {
@@ -211,7 +272,9 @@ bool Engine::Generate(const SynthesisRequest& request,
     return false;
   }
   out.fragments = fragments;
-  const std::string prompt = BuildTtsPrompt(request.language);
+  // DIALECT does not use a language ID (tts_tasks.build_task_generation_kwargs).
+  const std::string prompt =
+      BuildTtsPrompt(dialect_task ? std::string_view{} : std::string_view(request.language));
   // MingTTS: split FREEFORM (STYLE) requests reuse the first generated
   // fragment as voice prompt (latents + speaker embedding + its text).
   const bool reuse_first_fragment =

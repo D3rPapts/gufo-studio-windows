@@ -48,6 +48,25 @@ Request fields specific to Ming:
 | --- | --- |
 | `emotion` | EMOTION task. One of `happy`, `sad`, `angry`, `fear`, `disgust`, `surprise`, `neutral` (German names such as `Wut`, `Trauer`, `Angst` and the Chinese labels 高兴/悲伤/愤怒/恐惧/厌恶/惊讶/中性 also work). |
 | `instructions` | Free-text style caption (FREEFORM task), e.g. a whisper description. Takes precedence over `emotion`. |
+| `tempo` | BASIC task: the model's own speaking rate, `slow`, `medium` or `fast` (also `normal`, German `langsam`/`mittel`/`schnell`, or the Chinese values 慢速/中速/快速). Not the same as OpenAI `speed`, which time-stretches the finished WAV; both may be combined. |
+| `pitch` | BASIC task: `low`, `medium` or `high` (also `normal`, German `tief`/`mittel`/`hoch`, or 低/中/高). |
+| `volume` | BASIC task: `low`, `medium` or `high` (also `quiet`/`loud`, German `leise`/`mittel`/`laut`, or 低/中/高). |
+| `dialect` | DIALECT task: `cantonese` or `chuanyu dialect` (Sichuan-Chongqing; also `chuanyu`). Chinese text only. Like the reference, a dialect request drops the `Target language:` line (the request or preset `language` is ignored). |
+
+`tempo`, `pitch` and `volume` may be combined with each other (unset ones stay
+`null` in the caption). As in the reference `tts_tasks`, each request uses one
+task: BASIC controls, `dialect`, `emotion` and `instructions` cannot be mixed
+(400 `conflicting_controls`). Unknown values return 400 `invalid_tempo`,
+`invalid_pitch`, `invalid_volume` or `invalid_dialect`; other models reject
+these fields with `unsupported_field`. The model was trained on these
+controls mainly with Chinese and English speech; their effect on German has
+not been measured yet.
+
+```sh
+curl -sS http://127.0.0.1:8080/v1/audio/speech   -H 'Content-Type: application/json'   -d '{"model":"ming-3.0-tts","voice":"erzaehler","language":"de",
+       "tempo":"slow","pitch":"low","volume":"low",
+       "input":"Es war einmal, vor langer Zeit."}'   --output slow.wav
+```
 | `language` | `de`, `en`, `zh`, `ja`, `ko`, `fr`, `es` (or full names). Adds the `Target language:` line; omitted means Ming's default prompt without it. |
 | `reference_audio` | Base64 WAV for the CAM++ speaker embedding (no transcript needed). Embeddings are cached per reference. |
 | `reference_text` | Transcript of `reference_audio`: additionally encodes the reference with the audio-VAE encoder into prompt latents (the reference's ZERO_SHOT layout). `--voice-text` does the same for presets. |

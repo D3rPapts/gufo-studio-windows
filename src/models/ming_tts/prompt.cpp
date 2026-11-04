@@ -556,7 +556,90 @@ std::optional<std::string> EmotionLabel(std::string_view name) {
   return std::nullopt;
 }
 
-std::string BuildStructuredInstruction(const StructuredControls& c) {
+namespace {
+
+template <std::size_t N>
+std::optional<std::string> LookupLabel(
+    const std::array<std::pair<std::string_view, std::string_view>, N>& table,
+    std::string_view name) {
+  const std::string lower = ToLower(Trim(name));
+  for (const auto& [key, value] : table) {
+    if (lower == key) {
+      return std::string(value);
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+std::optional<std::string> SpeedLabel(std::string_view name) {
+  static const std::array<std::pair<std::string_view, std::string_view>, 11>
+      kLabels = {{
+          {"慢速", "慢速"}, {"slow", "慢速"},   {"langsam", "慢速"},
+          {"中速", "中速"}, {"medium", "中速"}, {"normal", "中速"},
+          {"mittel", "中速"}, {"快速", "快速"}, {"fast", "快速"},
+          {"schnell", "快速"}, {"zügig", "快速"},
+      }};
+  return LookupLabel(kLabels, name);
+}
+
+std::optional<std::string> PitchLabel(std::string_view name) {
+  static const std::array<std::pair<std::string_view, std::string_view>, 11>
+      kLabels = {{
+          {"低", "低"},     {"low", "低"},      {"tief", "低"},
+          {"niedrig", "低"}, {"中", "中"},       {"medium", "中"},
+          {"normal", "中"}, {"mittel", "中"},   {"高", "高"},
+          {"high", "高"},   {"hoch", "高"},
+      }};
+  return LookupLabel(kLabels, name);
+}
+
+std::optional<std::string> VolumeLabel(std::string_view name) {
+  static const std::array<std::pair<std::string_view, std::string_view>, 15>
+      kLabels = {{
+          {"低", "低"},      {"low", "低"},     {"quiet", "低"},
+          {"soft", "低"},    {"leise", "低"},   {"中", "中"},
+          {"medium", "中"},  {"normal", "中"},  {"mittel", "中"},
+          {"高", "高"},      {"high", "高"},    {"loud", "高"},
+          {"laut", "高"},    {"hoch", "高"},    {"niedrig", "低"},
+      }};
+  return LookupLabel(kLabels, name);
+}
+
+std::optional<std::string> DialectLabel(std::string_view name) {
+  static const std::array<std::pair<std::string_view, std::string_view>, 10>
+      kLabels = {{
+          {"cantonese", "cantonese"},
+          {"yue", "cantonese"},
+          {"kantonesisch", "cantonese"},
+          {"粤语", "cantonese"},
+          {"chuanyu dialect", "chuanyu dialect"},
+          {"chuanyu", "chuanyu dialect"},
+          {"sichuanese", "chuanyu dialect"},
+          {"sichuan", "chuanyu dialect"},
+          {"sichuanisch", "chuanyu dialect"},
+          {"川渝话", "chuanyu dialect"},
+      }};
+  return LookupLabel(kLabels, name);
+}
+
+std::string BuildStructuredInstruction(const StructuredControls& c,
+                                       InstructionSchema schema) {
+  if (schema == InstructionSchema::kEnglish) {
+    std::string out = "{\"audio_sequence\": [{\"id\": 1, \"speaker\": \"speaker_1\", ";
+    out += "\"dialect\": " + JsonOptional(c.dialect) + ", ";
+    out += "\"style\": " + JsonOptional(c.style) + ", ";
+    out += "\"speed\": " + JsonOptional(c.speed) + ", ";
+    out += "\"pitch\": " + JsonOptional(c.pitch) + ", ";
+    out += "\"volume\": " + JsonOptional(c.volume) + ", ";
+    out += "\"emotion\": " + JsonOptional(c.emotion) + ", ";
+    out += "\"BGM\": {\"Genre\": null, \"Mood\": null, \"Instrument\": null, "
+           "\"Theme\": null, \"ENV\": null, \"SNR\": null}, ";
+    out += "\"ip\": " + JsonOptional(c.ip);
+    out += "}]}";
+    return out;
+  }
   std::string out = "{\"audio_sequence\": [{";
   out += "\"\xE5\xBA\x8F\xE5\x8F\xB7\": 1, ";                  // 序号
   out += "\"\xE8\xAF\xB4\xE8\xAF\x9D\xE4\xBA\xBA\": \"speaker_1\", ";  // 说话人

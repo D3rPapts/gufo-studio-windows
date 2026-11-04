@@ -811,6 +811,8 @@ neither has anything to apply them to.
 `stream_format`, talker `temperature`/`top_k`/`top_p`/`repetition_penalty`, and
 predictor `subtalker_dosample`/`subtalker_temperature`/`subtalker_top_k`/`subtalker_top_p`.
 Base additionally accepts `reference_audio`, `reference_text`, `voice_clone_mode`.
+Ming-3.0-tts additionally accepts `emotion`, `tempo`, `pitch`, `volume` and
+`dialect` ([Ming README](models/ming-tts/README.md)).
 Unknown fields are rejected. `response_format` supports buffered `wav` and
 streaming `pcm`; `stream_format: "sse"` emits OpenAI audio events with base64
 PCM. `speed` (0.25--4.0, default 1.0) time-stretches the finished `wav`
