@@ -130,12 +130,17 @@ struct Parsed {
   std::vector<image::Image> images;
   std::optional<image::Image> init_image;
   std::optional<image::Image> mask;
+  /// "region_image[]" parts in order; gufo.regions[i].images counts them.
+  std::vector<image::Image> region_images;
 };
 
-constexpr std::array<std::string_view, 10> kExtensionFields{
-    "negative_prompt", "guidance",     "strength",       "init_image",
-    "preview",         "mask",         "mask_channel",   "mask_composite",
-    "mask_feather",    "mask_blur"};
+constexpr std::array<std::string_view, 12> kExtensionFields{
+    "negative_prompt", "guidance",      "strength",       "init_image",
+    "preview",         "mask",          "mask_channel",   "mask_composite",
+    "mask_feather",    "mask_blur",     "regions",        "base_strength"};
+
+/// The "gufo" field carries regional masks; other text fields stay small.
+constexpr std::size_t kMaxGufoFieldBytes = 8U << 20U;
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -210,21 +215,26 @@ Parsed Multipart(const HttpRequest& request) {
     if (++fields > 32)
       throw std::invalid_argument("too many multipart fields");
     if (name == "image" || name == "image[]" || name == "init_image" ||
-        name == "mask") {
+        name == "mask" || name == "region_image[]") {
       const bool init = name == "init_image", mask = name == "mask";
+      const bool region = name == "region_image[]";
       if ((init && parsed.init_image) || (mask && parsed.mask))
         throw std::invalid_argument("duplicate field " + name);
-      if ((!init && !mask && parsed.images.size() == 10) ||
+      if ((!init && !mask && !region && parsed.images.size() == 10) ||
+          (region && parsed.images.size() + parsed.region_images.size() >=
+                         image::kMaxReferenceImages) ||
           data.size() > core::kMaxEncodedImageBytes - image_bytes)
-        throw std::invalid_argument("image inputs exceed 10 images or 20 MiB");
+        throw std::invalid_argument(
+            "image inputs exceed 10 images (20 with regions) or 20 MiB");
       image_bytes += data.size();
       auto decoded_image = image::DecodeImage(std::span(
           reinterpret_cast<const std::uint8_t*>(data.data()), data.size()));
       // OpenAI mask: transparent pixels mark the area to edit.
       const auto& decoded =
-          init   ? parsed.init_image.emplace(std::move(decoded_image))
-          : mask ? parsed.mask.emplace(std::move(decoded_image))
-                 : parsed.images.emplace_back(std::move(decoded_image));
+          init     ? parsed.init_image.emplace(std::move(decoded_image))
+          : mask   ? parsed.mask.emplace(std::move(decoded_image))
+          : region ? parsed.region_images.emplace_back(std::move(decoded_image))
+                   : parsed.images.emplace_back(std::move(decoded_image));
       image_pixels += static_cast<std::size_t>(decoded.width) * decoded.height;
       if (image_pixels > core::kMaxImagePixels)
         throw std::invalid_argument(
@@ -232,7 +242,7 @@ Parsed Multipart(const HttpRequest& request) {
     } else {
       if (parsed.fields.contains(name))
         throw std::invalid_argument("duplicate field " + name);
-      if (data.size() > (64U << 10U))
+      if (data.size() > (name == "gufo" ? kMaxGufoFieldBytes : (64U << 10U)))
         throw std::invalid_argument("multipart field too large");
       if (name.starts_with("gufo.")) {
         // Form fields "gufo.<name>" fill the same extension object as the
@@ -260,7 +270,8 @@ Parsed Multipart(const HttpRequest& request) {
       }
     }
   }
-  if (parsed.images.empty() && !parsed.init_image)
+  if (parsed.images.empty() && !parsed.init_image &&
+      parsed.region_images.empty())
     throw std::invalid_argument("image edit requires an image");
   return parsed;
 }
@@ -298,6 +309,149 @@ std::string String(const json::Value& fields, const char* name,
   if (!value->is_string())
     throw std::invalid_argument(std::string(name) + " must be a string");
   return value->str();
+}
+
+std::vector<std::uint8_t> DecodeBase64(std::string_view text) {
+  std::vector<std::uint8_t> out;
+  out.reserve(text.size() / 4 * 3);
+  std::uint32_t word = 0;
+  int bits = 0;
+  for (const char c : text) {
+    int value;
+    if (c >= 'A' && c <= 'Z')
+      value = c - 'A';
+    else if (c >= 'a' && c <= 'z')
+      value = c - 'a' + 26;
+    else if (c >= '0' && c <= '9')
+      value = c - '0' + 52;
+    else if (c == '+')
+      value = 62;
+    else if (c == '/')
+      value = 63;
+    else if (c == '=')
+      break;
+    else
+      throw std::invalid_argument("invalid base64 in gufo.regions");
+    word = (word << 6) | static_cast<std::uint32_t>(value);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<std::uint8_t>((word >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+image::Image InlineImage(const json::Value& value, const char* what) {
+  // Inline data only: base64 or a data URL, never a server-side fetch.
+  if (!value.is_string() || value.str().starts_with("http"))
+    throw std::invalid_argument(std::string("gufo.regions ") + what +
+                                " must be base64 or a data URL");
+  const auto& text = value.str();
+  return image::DecodeImage(core::ReadImageUrl(
+      text.starts_with("data:") ? text : "data:image/png;base64," + text));
+}
+
+/// gufo.regions: [{prompt, strength, area {x, y, width, height, unit "px" |
+/// "fraction"}, mask {width, height, data: base64 bytes 0..255} or
+/// mask_image (+ mask_channel, mask_invert), mask_bounds, images}] where
+/// images is a count of the next "region_image[]" parts (multipart) or an
+/// array of data URLs.
+std::vector<image::Region> ParseRegions(const json::Value& value,
+                                        std::vector<image::Image>& uploaded) {
+  if (!value.is_array() || value.size() > image::kMaxRegions)
+    throw std::invalid_argument("gufo.regions must be an array of at most " +
+                                std::to_string(image::kMaxRegions) +
+                                " objects");
+  static const std::set<std::string> kKeys{
+      "prompt",       "strength",    "area",        "mask", "mask_image",
+      "mask_channel", "mask_invert", "mask_bounds", "images"};
+  std::vector<image::Region> regions;
+  std::size_t next = 0;
+  for (const auto& entry : value.items()) {
+    if (!entry.is_object())
+      throw std::invalid_argument("gufo.regions entries must be objects");
+    for (const auto& [key, member] : entry.members()) {
+      (void)member;
+      if (!kKeys.contains(key))
+        throw std::invalid_argument("unsupported region parameter: " + key);
+    }
+    auto& region = regions.emplace_back();
+    region.prompt = String(entry, "prompt", "");
+    region.strength = static_cast<float>(Real(entry, "strength", 1, 0, 10));
+    if (const auto* area = entry.find("area")) {
+      if (!area->is_object())
+        throw std::invalid_argument("region area must be an object");
+      const auto unit = String(*area, "unit", "px");
+      if (unit != "px" && unit != "fraction")
+        throw std::invalid_argument("region area unit must be px or fraction");
+      const bool fraction = unit == "fraction";
+      const double high = fraction ? 1 : 16384;
+      region.area = image::RegionArea{
+          .x = Real(*area, "x", 0, 0, high),
+          .y = Real(*area, "y", 0, 0, high),
+          .width = Real(*area, "width", fraction ? 1 : 0, 0, high),
+          .height = Real(*area, "height", fraction ? 1 : 0, 0, high),
+          .fraction = fraction};
+    }
+    const auto* mask = entry.find("mask");
+    const auto* mask_image = entry.find("mask_image");
+    if (mask && mask_image)
+      throw std::invalid_argument("a region takes mask or mask_image");
+    if (mask) {
+      if (!mask->is_object())
+        throw std::invalid_argument("region mask must be an object");
+      const auto width = static_cast<int>(Number(*mask, "width", 0, 1, 16384));
+      const auto height =
+          static_cast<int>(Number(*mask, "height", 0, 1, 16384));
+      if (static_cast<std::uint64_t>(width) * height > (16ULL << 20))
+        throw std::invalid_argument("region mask exceeds 16 M values");
+      const auto bytes = DecodeBase64(String(*mask, "data", ""));
+      if (bytes.size() != static_cast<std::size_t>(width) * height)
+        throw std::invalid_argument(
+            "region mask data must hold width x height bytes");
+      image::RegionMask grid{width, height, std::vector<float>(bytes.size())};
+      for (std::size_t i = 0; i < bytes.size(); ++i)
+        grid.values[i] = static_cast<float>(bytes[i]) / 255.0F;
+      region.mask = std::move(grid);
+    } else if (mask_image) {
+      bool invert = false;
+      if (const auto* flag = entry.find("mask_invert")) {
+        if (!flag->is_bool())
+          throw std::invalid_argument("region mask_invert must be a boolean");
+        invert = flag->as_bool();
+      }
+      region.mask = image::RegionMaskFromImage(
+          InlineImage(*mask_image, "mask_image"),
+          image::ParseMaskChannel(String(entry, "mask_channel", "auto")),
+          invert);
+    } else if (entry.contains("mask_channel") ||
+               entry.contains("mask_invert")) {
+      throw std::invalid_argument("mask_channel needs a region mask_image");
+    }
+    if (const auto* bounds = entry.find("mask_bounds")) {
+      if (!bounds->is_bool())
+        throw std::invalid_argument("region mask_bounds must be a boolean");
+      region.mask_bounds = bounds->as_bool();
+    }
+    if (const auto* images = entry.find("images")) {
+      if (images->is_array()) {
+        for (const auto& item : images->items())
+          region.images.push_back(InlineImage(item, "images"));
+      } else {
+        const auto count = Number(entry, "images", 0, 0, 10);
+        if (next + count > uploaded.size())
+          throw std::invalid_argument(
+              "gufo.regions names more images than region_image[] parts");
+        for (std::uint64_t i = 0; i < count; ++i)
+          region.images.push_back(std::move(uploaded[next++]));
+      }
+    }
+  }
+  if (next != uploaded.size())
+    throw std::invalid_argument(
+        "region_image[] parts must all belong to gufo.regions");
+  return regions;
 }
 
 std::vector<image::Lora> ParseLoras(const json::Value& fields,
@@ -536,7 +690,14 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
           *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
       generation.mask_blur = static_cast<int>(
           Number(*extension, "mask_blur", image::kDefaultMaskBlur, 0, 4));
+      if (const auto* regions = extension->find("regions"))
+        generation.regions = ParseRegions(*regions, parsed.region_images);
+      generation.base_strength =
+          static_cast<float>(Real(*extension, "base_strength", 1, 0, 10));
     }
+    if (!parsed.region_images.empty() &&
+        (!extension || !extension->contains("regions")))
+      throw std::invalid_argument("region_image[] needs gufo.regions");
     if (extension && extension->contains("strength") && !parsed.init_image) {
       // A single uploaded "image" is the start image, not a reference.
       if (generation.images.size() != 1)
@@ -643,6 +804,11 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " strength=" << generation.strength
               << " init_image=" << (generation.init_image ? 1 : 0)
               << " mask=" << (generation.mask ? 1 : 0);
+      if (!generation.regions.empty())
+        details << " regions=" << generation.regions.size()
+                << " base_strength=" << generation.base_strength
+                << " region_rows=" << result.metrics.region_condition_rows
+                << " region_passes=" << result.metrics.region_passes;
       if (generation.mask)
         details << " mask_composite=" << (generation.mask_composite ? 1 : 0)
                 << " mask_feather=" << generation.mask_feather

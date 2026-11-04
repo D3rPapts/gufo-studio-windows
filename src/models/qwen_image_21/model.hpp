@@ -81,6 +81,81 @@ struct Lora {
   bool operator==(const Lora&) const = default;
 };
 
+/// Regional conditioning (ComfyUI ConditioningSetArea / SetAreaPercentage /
+/// SetMask, combined with ConditioningCombine). Each region is a prompt with
+/// its own reference images; every step evaluates the transformer once per
+/// region and blends the velocities like ComfyUI's calc_cond_batch:
+///   v = sum_i(w_i * v_i) / sum_i(w_i)  per latent cell,
+/// with w_i = strength * mask (or the area with ComfyUI's soft edge). The
+/// base prompt (Request::prompt, Request::images) takes part with
+/// `base_strength` over the whole image. Cells no conditioning covers get
+/// velocity 0, as in ComfyUI.
+struct RegionArea {
+  double x{0}, y{0}, width{0}, height{0};
+  /// false: pixels of the output image (ConditioningSetArea); true:
+  /// fractions 0..1 of it (ConditioningSetAreaPercentage).
+  bool fraction{false};
+};
+/// A ComfyUI MASK, row-major, values 0..1; stretched to the output image.
+struct RegionMask {
+  int width{0};
+  int height{0};
+  std::vector<float> values;
+};
+struct Region {
+  std::string prompt;
+  std::vector<Image> images;  // <image1>.. of this region's prompt
+  float strength{1};
+  std::optional<RegionArea> area;
+  std::optional<RegionMask> mask;
+  /// set_cond_area "mask bounds": evaluate only the mask's bounding box.
+  bool mask_bounds{false};
+};
+/// Cells (16 x 16 output pixels) a region is evaluated on: the rectangle
+/// [top, top + rows) x [left, left + cols) of the (height / 16) x
+/// (width / 16) grid, and its blend weight per rectangle cell (row-major).
+/// `crop` = the transformer sees only the rectangle (ComfyUI evaluates area
+/// conditionings on the cropped latent); otherwise it is the whole grid.
+struct RegionCells {
+  int top{0}, left{0}, rows{0}, cols{0};
+  bool crop{false};
+  std::vector<float> weights;
+  /// No cell has weight: the region is skipped.
+  bool Empty() const;
+};
+inline constexpr std::size_t kMaxRegions = 16;
+/// Reference images of a request, base and regions together.
+inline constexpr std::size_t kMaxReferenceImages = 20;
+/// Smallest crop the transformer is run on, in cells (crops grow to it).
+inline constexpr int kMinRegionCells = 128;
+/// ComfyUI's soft area edge (8 latent pixels = 4 cells here).
+inline constexpr int kRegionEdgeCells = 4;
+/// The cells and weights of `region` for a width x height output:
+/// - area without mask: the area's cells (rounded outward), weight
+///   strength, fading over kRegionEdgeCells at edges inside the image;
+/// - mask: mask averaged per cell times strength, on the whole grid, on the
+///   area when one is set, or on the mask's bounding box with mask_bounds;
+/// - neither: the whole grid at strength.
+/// Crops smaller than kMinRegionCells grow (weight 0 on the added cells).
+RegionCells PlanRegion(const Region& region, int width, int height);
+/// The full-strength base prompt over the whole grid.
+RegionCells FullRegion(int width, int height, float strength);
+/// Rows of a row-major latent (grid_cols cells per grid row, `channels`
+/// values per cell) inside the crop, row-major.
+std::vector<float> CropLatent(std::span<const float> latent, int grid_cols,
+                              int channels, const RegionCells& cells);
+/// sum += w * velocity and total += w over the region's cells; `velocity`
+/// covers the crop (crop) or the whole grid.
+void AccumulateRegion(std::span<float> sum, std::span<float> total,
+                      std::span<const float> velocity, int grid_cols,
+                      int channels, const RegionCells& cells);
+/// sum / total per cell; cells with total 0 become 0.
+std::vector<float> FinishRegions(std::span<const float> sum,
+                                 std::span<const float> total, int channels);
+/// Per-pixel edit values (0..1) of a mask image, see MaskChannel.
+RegionMask RegionMaskFromImage(const Image& mask, MaskChannel channel,
+                               bool invert);
+
 struct Request {
   std::string prompt;
   std::vector<Image> images;
@@ -123,6 +198,11 @@ struct Request {
   models::PreviewHook preview;
   // Applied in order; scale 0 entries are ignored.
   std::vector<Lora> loras{};
+  /// Regional prompts (see Region); empty = the single prompt as before.
+  std::vector<Region> regions{};
+  /// Weight of the base prompt beside regions; 0 leaves it out (every
+  /// conditioning of the graph has an area or a mask).
+  float base_strength{1};
 };
 
 struct Metrics {
@@ -138,6 +218,9 @@ struct Metrics {
   /// The text encoder left GPU memory for this request's caches.
   bool released_text_encoder{false};
   double lora_ms{0};  // adapter switch, before prompt encoding
+  /// Regional prompts: their condition rows and transformer passes.
+  int region_condition_rows{0};
+  int region_passes{0};
 };
 
 struct Result {
