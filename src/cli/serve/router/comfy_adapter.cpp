@@ -346,6 +346,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(image->canvas);
       if (image->strength)
         files->push_back(image->init_image);
+      if (image->control)
+        files->push_back(image->control->image);
     } else if (const auto* speech = std::get_if<SpeechTask>(&task.spec)) {
       if (speech->reference_audio)
         files->push_back(*speech->reference_audio);
@@ -1411,6 +1413,10 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     init_image = ReadFileRef(spec.init_image);
   if (!spec.mask.name.empty())
     mask = ReadFileRef(spec.mask);
+  // Qwen-Image ControlNet: the structure image, a file part on edits and a
+  // data URL (gufo.control_image) on generations.
+  const std::string control =
+      spec.control ? ReadFileRef(spec.control->image) : std::string();
   const json::Value extension = ImageExtension(spec);
   const json::Value loras = ImageLoras(spec);
   // Live preview under this id; the worker renders it only while the relay
@@ -1439,6 +1445,12 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       body["response_format"] = "b64_json";
       if (!fields.empty())
         body["gufo"] = fields;
+      if (!control.empty()) {
+        if (!body.contains("gufo"))
+          body["gufo"] = json::Value::object();
+        body["gufo"]["control_image"] = "data:" + SniffImageType(control) +
+                                        ";base64," + Base64Encode(control);
+      }
       if (!loras.is_null())
         body["loras"] = loras;
       return Call(job, "POST", "/v1/images/generations", body.dump(),
@@ -1471,6 +1483,12 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       parts.push_back({"mask", type == "image/jpeg" ? "mask.jpg" : "mask.png",
                        type, mask});
     }
+    if (!control.empty()) {
+      const std::string type = SniffImageType(control);
+      parts.push_back({"control_image",
+                       type == "image/jpeg" ? "control.jpg" : "control.png",
+                       type, control});
+    }
     for (std::size_t i = 0; i < references.size(); ++i) {
       const std::string type = SniffImageType(references[i]);
       parts.push_back({"image[]",
@@ -1495,7 +1513,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   relay.request_stop();
   relay.join();
   if (result.status == 400 && !extension.empty() && !spec.strength &&
-      spec.mask.name.empty() &&
+      spec.mask.name.empty() && !spec.control &&
       ErrorMessage(result).find("gufo") != std::string::npos) {
     // An image worker without the gufo fields (negative prompt, guidance):
     // render without them and say so, as before.

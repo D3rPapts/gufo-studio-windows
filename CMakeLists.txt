@@ -784,6 +784,15 @@ if (BUILD_TESTING)
   add_test(NAME router_comfy_graph_test COMMAND router_comfy_graph_test)
   set_tests_properties(router_comfy_graph_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
+  add_executable(router_comfy_control_test
+    tests/cli/router_comfy_control_test.cpp
+    src/cli/serve/router/comfy_graph.cpp)
+  target_include_directories(router_comfy_control_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_comfy_control_test PRIVATE cxx_std_20)
+  add_test(NAME router_comfy_control_test COMMAND router_comfy_control_test)
+  set_tests_properties(router_comfy_control_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 30)
 
   # POSIX sockets, fork and signals: Linux only.
   if (NOT WIN32)
