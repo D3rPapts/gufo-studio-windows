@@ -43,6 +43,12 @@ public:
   /// runtime. Only the payload layout is validated, not a model configuration.
   static Weights FromFiles(std::span<const SafetensorsSource> files,
                            json::Value vae_config = {});
+  /// Maps one more BF16/F32 safetensors file whose tensors receive `prefix`
+  /// (an optional branch such as a ControlNet). Reads only the header; the
+  /// payload stays mapped until a runtime uploads it.
+  void AddFile(const std::filesystem::path& path, const std::string& prefix) {
+    Load(path, prefix);
+  }
   const Weight& Get(std::string_view name) const;
   bool Contains(std::string_view name) const;
   void Prefetch(std::string_view prefix) const;

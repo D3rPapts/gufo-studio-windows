@@ -185,6 +185,16 @@ struct ImageTask {
   /// graph has none, `prompt` empty).
   std::vector<ImageRegion> regions;
   double base_strength{1};
+  /// ModelPatchLoader -> QwenImageDiffsynthControlnet / ZImageFunControlnet
+  /// (Qwen-Image 2.1 Fun ControlNet-Union) -> gufo.control_*.
+  struct Control {
+    FileRef image;  // the ready structure image (sent as control_image)
+    double strength{1};
+    double start{0};  // start_percent / end_percent as step fractions
+    double end{1};
+    bool inpaint{false};  // inpaint_image + mask = the masked edit's inputs
+  };
+  std::optional<Control> control;
 };
 
 /// gufo.regions for a width x height image without the file data: computed

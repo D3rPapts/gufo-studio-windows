@@ -69,6 +69,9 @@ constexpr std::string_view kPlumbing[] = {
     "WanCameraEmbedding",
     "WanUni3CControlnetApply",
     "ModelPatchLoader",
+    // Qwen-Image 2.1 Fun ControlNet-Union (ApplyQwenControl).
+    "QwenImageDiffsynthControlnet",
+    "ZImageFunControlnet",
     "CLIPVisionLoader",
     "CLIPVisionEncode",
     "LoadVideo",
@@ -396,6 +399,7 @@ struct ModelChain {
   std::vector<std::string> lora_nodes;                 // node ids, same order
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
   std::string talk;   // WanInfiniteTalkToVideo node id, "" if none
+  std::string control;  // Qwen-Image ControlNet apply node id, "" if none
 };
 
 ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
@@ -416,6 +420,13 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
     } else if (cls == "WanInfiniteTalkToVideo") {
       if (chain.talk.empty())
         chain.talk = link.node;
+    } else if (cls == "QwenImageDiffsynthControlnet" ||
+               cls == "ZImageFunControlnet") {
+      if (!chain.control.empty())
+        throw NodeFailure(sampler, "unsupported_link",
+                          "the model input passes through two Qwen-Image "
+                          "ControlNet nodes (gufo applies one)");
+      chain.control = link.node;
     } else if (cls == "UNETLoader") {
       chain.loader = graph.Str(link.node, "unet_name", "");
       chain.loader_node = link.node;
@@ -972,6 +983,94 @@ bool IsQwenImageTurboFile(std::string_view name) {
 }
 
 namespace {
+
+/// ModelPatchLoader -> QwenImageDiffsynthControlnet / ZImageFunControlnet on
+/// the sampler's model input: gufo.control_* of a built image task. The
+/// control image must be ready (LoadImage); gufo has no preprocessor nodes.
+void ApplyQwenControl(const Graph& graph, const std::string& sampler,
+                      ImageTask* task, std::vector<std::string>* warnings) {
+  const std::string node = FollowModel(graph, sampler).control;
+  if (node.empty())
+    return;
+  const Link patch = graph.RequireLink(node, "model_patch");
+  if (graph.Class(patch.node) != "ModelPatchLoader")
+    throw NodeFailure(node, "unsupported_link",
+                      "model_patch must come from ModelPatchLoader (the "
+                      "Qwen-Image 2.1 Fun ControlNet-Union)");
+  const std::string file = graph.Str(patch.node, "name", "");
+  if (Lower(file).find("qwen") == std::string::npos ||
+      Lower(file).find("control") == std::string::npos)
+    warnings->push_back("node " + patch.node + ": gufo applies its registered "
+                        "Qwen-Image 2.1 Fun ControlNet-Union, not " + file);
+  ImageTask::Control control;
+  control.strength = graph.Num(node, "strength", 1.0);
+  if (!std::isfinite(control.strength) || control.strength < 0 ||
+      control.strength > 2)
+    throw NodeFailure(node, "unsupported_value",
+                      "strength must be 0..2 for the gufo Qwen-Image "
+                      "ControlNet");
+  if (control.strength == 0) {
+    warnings->push_back("node " + node + ": strength 0 leaves the model "
+                        "unchanged; the control image is not sent");
+    return;
+  }
+  control.start = graph.Num(node, "start_percent", 0.0);
+  control.end = graph.Num(node, "end_percent", 1.0);
+  if (!(control.start >= 0 && control.start < control.end &&
+        control.end <= 1))
+    throw NodeFailure(node, "unsupported_value",
+                      "start_percent and end_percent must satisfy 0 <= "
+                      "start < end <= 1");
+  if (control.start != 0 || control.end != 1)
+    warnings->push_back("node " + node + ": gufo runs start_percent/"
+                        "end_percent as fractions of the steps (ComfyUI: of "
+                        "the sigma range)");
+  const auto image = graph.LinkOf(node, "image");
+  if (!image)
+    throw NodeFailure(node, "required_input_missing",
+                      "gufo needs the control image (pose, depth, canny ...) "
+                      "on input 'image'");
+  const std::string source = graph.Class(image->node);
+  if (source != "LoadImage" && source != "LoadImageOutput")
+    throw NodeFailure(node, "unsupported_link",
+                      "the control image must be a ready image from "
+                      "LoadImage; gufo has no preprocessor node " + source +
+                          " (run the preprocessor elsewhere and load its "
+                          "result)");
+  control.image = ImageFile(graph, node, "image", *image);
+  const auto inpaint = graph.LinkOf(node, "inpaint_image");
+  const auto mask = graph.LinkOf(node, "mask");
+  if (inpaint || mask) {
+    // The checkpoint's inpaint channels: gufo fills them from the masked
+    // edit (SetLatentNoiseMask over VAEEncode) and requires the same inputs.
+    if (!inpaint || !mask)
+      throw NodeFailure(node, "required_input_missing",
+                        "gufo runs the ControlNet inpaint recipe with both "
+                        "inpaint_image and mask");
+    ImageTask probe;
+    MaskFile(graph, node, *mask, &probe);
+    if (task->init_image.name.empty() || task->mask.name.empty() ||
+        !(task->init_image == ImageFile(graph, node, "inpaint_image",
+                                        *inpaint)) ||
+        !(task->mask == probe.mask) ||
+        task->mask_channel != probe.mask_channel)
+      throw NodeFailure(node, "unsupported_value",
+                        "inpaint_image and mask must be the start image and "
+                        "mask of the masked edit (SetLatentNoiseMask over "
+                        "VAEEncode)");
+    control.inpaint = true;
+  }
+  if (!task->references.empty())
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo runs the Qwen-Image ControlNet on text-only "
+                      "prompts; remove the reference images");
+  if (!task->regions.empty())
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo runs the Qwen-Image ControlNet without regional "
+                      "conditioning (ConditioningSetMask / SetArea / "
+                      "Combine); remove the regions or the ControlNet");
+  task->control = std::move(control);
+}
 
 ImageTask BuildImage(const Graph& graph, const std::string& sampler,
                      const ModelIds& models, const Link& latent,
@@ -2667,6 +2766,16 @@ json::Value ImageExtension(const ImageTask& task) {
     gufo["strength"] = *task.strength;
   if (!task.mask.name.empty())
     gufo["mask_channel"] = task.mask_channel;
+  if (task.control) {
+    // control_image itself travels as a file (comfy_adapter).
+    gufo["control_strength"] = task.control->strength;
+    if (task.control->start != 0)
+      gufo["control_start"] = task.control->start;
+    if (task.control->end != 1)
+      gufo["control_end"] = task.control->end;
+    if (task.control->inpaint)
+      gufo["control_inpaint"] = true;
+  }
   return gufo;
 }
 
@@ -3119,9 +3228,12 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           else if (latent_class == "EmptyAceStep1.5LatentAudio")
             task.spec = BuildMusic(graph, generator, models, latent,
                                    &plan->warnings);
-          else
-            task.spec =
+          else {
+            ImageTask image =
                 BuildImage(graph, generator, models, latent, &plan->warnings);
+            ApplyQwenControl(graph, generator, &image, &plan->warnings);
+            task.spec = std::move(image);
+          }
         }
         found = task_of.emplace(generator, plan->tasks.size()).first;
         plan->tasks.push_back(std::move(task));

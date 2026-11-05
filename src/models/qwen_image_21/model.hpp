@@ -74,6 +74,22 @@ inline constexpr int kDefaultMaskFeather = 16;
 /// Default widening of the latent mask, in 16-pixel cells.
 inline constexpr int kDefaultMaskBlur = 1;
 
+/// Fun ControlNet-Union input (pose skeleton, depth, canny, lineart, HED,
+/// MLSD, scribble or grayscale image, already preprocessed by the caller).
+/// Needs a server started with a control branch (Model::SetControlnet).
+struct ControlInput {
+  /// Resized to the output canvas, alpha dropped, VAE-encoded.
+  Image image;
+  /// control_context_scale: multiplies every control skip; 0 disables.
+  float strength{1};
+  /// Fraction of the steps [start, end) that run the control branch.
+  double start{0};
+  double end{1};
+  /// Also feed the request's start image and mask into the branch's inpaint
+  /// channels (the checkpoint's inpaint recipe); needs init_image and mask.
+  bool inpaint{false};
+};
+
 /// A registered adapter selected by name; strength multiplies its alpha/rank.
 struct Lora {
   std::string name;
@@ -194,6 +210,8 @@ struct Request {
   /// One cell (half weight 16 px past the mask) measured a smoother seam
   /// under the default composite; the feather covers it.
   int mask_blur{kDefaultMaskBlur};
+  /// Structure control (Fun ControlNet-Union); text-only prompts.
+  std::optional<ControlInput> control;
   /// Live preview of the denoised estimate; never changes the image.
   models::PreviewHook preview;
   // Applied in order; scale 0 entries are ignored.
@@ -293,6 +311,14 @@ public:
   /// Adapters merged into the transformer weights now (does not wait for
   /// Generate); empty while a switch is in progress or after one failed.
   std::vector<Lora> ActiveLoras() const;
+  /// Map a Fun ControlNet-Union file (validated, uploaded on first use)
+  /// before serving; returns its layout. Once per model.
+  struct ControlnetLayout {
+    int blocks{0};
+    std::size_t bytes{0};
+  };
+  ControlnetLayout SetControlnet(const std::filesystem::path& path);
+  bool HasControlnet() const;
 
 private:
   struct Impl;

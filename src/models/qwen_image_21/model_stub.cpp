@@ -28,4 +28,10 @@ LoraInfo Model::AddLora(const std::string&, const std::filesystem::path&) {
 std::vector<Lora> Model::ActiveLoras() const {
   return {};
 }
+Model::ControlnetLayout Model::SetControlnet(const std::filesystem::path&) {
+  throw std::runtime_error("Qwen-Image requires HIP");
+}
+bool Model::HasControlnet() const {
+  return false;
+}
 }  // namespace gufo::models::qwen_image_21

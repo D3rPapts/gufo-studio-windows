@@ -621,6 +621,11 @@ void AddImageOptions(ArgParser& parser, ImageOptions* options) {
             {std::string(value.substr(0, separator)), scale});
         return true;
       });
+  parser.AddOption("", "--controlnet", "SAFETENSORS",
+                   "Qwen-Image-2.1 Fun ControlNet-Union file; enables "
+                   "\"gufo\":{\"control_image\":...} (pose, depth, canny, "
+                   "lineart, ...)",
+                   "Model", &options->loras.controlnet);
 }
 
 void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
@@ -1468,6 +1473,16 @@ int RunServe(std::span<const char* const> args) {
       name = moss ? "MOSS-Image" : "Qwen-Image-2.1";
     if (moss && !options.loras.files.empty()) {
       std::cerr << "Error: --lora is only supported for Qwen-Image-2.1\n";
+      return 2;
+    }
+    if (moss && !options.loras.controlnet.empty()) {
+      std::cerr << "Error: --controlnet is only supported for Qwen-Image-2.1\n";
+      return 2;
+    }
+    if (!options.loras.controlnet.empty() &&
+        !std::filesystem::is_regular_file(options.loras.controlnet)) {
+      std::cerr << "Error: --controlnet file not found: "
+                << options.loras.controlnet.string() << '\n';
       return 2;
     }
     if (validate_only)

@@ -881,7 +881,8 @@ Matrix Runtime::Weight(std::string_view name) {
   // visual encoder.
   for (const std::string_view prefix :
        {"transformer.", "text_encoder.model.language_model.",
-        "text_encoder.model.visual.", "vae.encoder.", "vae.decoder."}) {
+        "text_encoder.model.visual.", "vae.encoder.", "vae.decoder.",
+        "controlnet."}) {
     if (name.starts_with(prefix) &&
         std::ranges::find(prefetched_groups_, prefix) ==
             prefetched_groups_.end()) {
