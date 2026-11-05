@@ -773,5 +773,276 @@ int main(int argc, char** argv) {
     static_assert(!KeepsTextEncoder(30 * GiB, 20 * GiB, false));
     static_assert(!KeepsTextEncoder(GiB, UINT64_MAX, false));
   }
+  // Regional prompts: cells, weights, crops and the ComfyUI-style blend.
+  {
+    // 1344 x 768 = 84 x 48 cells. A 268-pixel column (y 250..768) as an
+    // area rounds outward to cells 16..33 x 15..47 and fades inside the
+    // image over kRegionEdgeCells.
+    Region column{.prompt = "B",
+                  .images = {},
+                  .strength = 2,
+                  .area = RegionArea{.x = 268, .y = 250, .width = 268,
+                                     .height = 518, .fraction = false},
+                  .mask = {},
+                  .mask_bounds = false};
+    auto cells = PlanRegion(column, 1344, 768);
+    assert(cells.crop && cells.top == 15 && cells.left == 16 &&
+           cells.rows == 33 && cells.cols == 18 && !cells.Empty());
+    const auto at = [&](const RegionCells& c, int r, int k) {
+      return c.weights[static_cast<std::size_t>(r) * c.cols + k];
+    };
+    // Bottom edge is the image border (no fade), top and sides fade.
+    assert(at(cells, 32, 9) == 2.0F);
+    assert(at(cells, 0, 9) == 2.0F / 4);
+    assert(at(cells, 20, 0) == 2.0F / 4 && at(cells, 20, 17) == 2.0F / 4);
+    assert(at(cells, 0, 0) == 2.0F / 16);
+    assert(at(cells, 20, 3) == 2.0F && at(cells, 3, 9) == 2.0F);
+    // Fractions round to the nearest cell (ConditioningSetAreaPercentage).
+    Region fraction = column;
+    fraction.area = RegionArea{.x = 0.5, .y = 0, .width = 0.5, .height = 1,
+                               .fraction = true};
+    cells = PlanRegion(fraction, 1344, 768);
+    assert(cells.crop && cells.top == 0 && cells.left == 42 &&
+           cells.rows == 48 && cells.cols == 42);
+    assert(at(cells, 10, 0) == 2.0F / 4 && at(cells, 10, 41) == 2.0F);
+    // The whole image is no crop.
+    fraction.area = RegionArea{.x = 0, .y = 0, .width = 1, .height = 1,
+                               .fraction = true};
+    cells = PlanRegion(fraction, 1344, 768);
+    assert(!cells.crop && cells.rows == 48 && cells.cols == 84 &&
+           at(cells, 0, 0) == 2.0F);
+    // A mask (stretched: 84 x 48 values for 1344 x 768) on the whole grid,
+    // or on its bounding box with mask_bounds.
+    RegionMask mask{84, 48, std::vector<float>(84 * 48, 0)};
+    for (int r = 16; r < 48; ++r)
+      for (int c = 0; c < 17; ++c)
+        mask.values[r * 84 + c] = c == 16 ? 0.5F : 1.0F;
+    Region masked{.prompt = "A",
+                  .images = {},
+                  .strength = 1,
+                  .area = {},
+                  .mask = mask,
+                  .mask_bounds = false};
+    cells = PlanRegion(masked, 1344, 768);
+    assert(!cells.crop && cells.rows == 48 && cells.cols == 84);
+    assert(at(cells, 20, 0) == 1.0F && at(cells, 20, 16) == 0.5F &&
+           at(cells, 20, 17) == 0.0F && at(cells, 15, 0) == 0.0F);
+    masked.mask_bounds = true;
+    cells = PlanRegion(masked, 1344, 768);
+    assert(cells.crop && cells.top == 16 && cells.left == 0 &&
+           cells.rows == 32 && cells.cols == 17);
+    assert(at(cells, 0, 0) == 1.0F && at(cells, 0, 16) == 0.5F);
+    // A mask at another size is stretched and averaged per cell.
+    masked.mask = RegionMask{2, 1, {1.0F, 0.0F}};
+    masked.mask_bounds = false;
+    cells = PlanRegion(masked, 64, 32);
+    assert(cells.weights == (std::vector<float>{1, 1, 0, 0, 1, 1, 0, 0}));
+    // Mask and area: evaluated on the area, weighted by the mask, no fade.
+    masked.mask = mask;
+    masked.area = RegionArea{.x = 0, .y = 0, .width = 512, .height = 768,
+                             .fraction = false};
+    cells = PlanRegion(masked, 1344, 768);
+    assert(cells.crop && cells.left == 0 && cells.cols == 32 &&
+           cells.rows == 48 && at(cells, 20, 0) == 1.0F &&
+           at(cells, 0, 0) == 0.0F);
+    // Small crops grow to kMinRegionCells with weight 0 around them.
+    Region small{.prompt = "door",
+                 .images = {},
+                 .strength = 1,
+                 .area = RegionArea{.x = 640, .y = 384, .width = 32,
+                                    .height = 32, .fraction = false},
+                 .mask = {},
+                 .mask_bounds = false};
+    cells = PlanRegion(small, 1344, 768);
+    assert(cells.crop && cells.rows * cells.cols >= kMinRegionCells);
+    assert(cells.top <= 24 && cells.top + cells.rows >= 26 &&
+           cells.left <= 40 && cells.left + cells.cols >= 42);
+    float weight = 0;
+    for (const float w : cells.weights)
+      weight += w;
+    // 2 x 2 cells faded on all four sides: (1/4 * 2/4)^2 each, as ComfyUI
+    // shrinks very small areas.
+    assert(weight == 1.0F / 16);
+    // Empty masks and areas outside the image are skipped.
+    masked.area.reset();
+    masked.mask = RegionMask{4, 4, std::vector<float>(16, 0)};
+    assert(PlanRegion(masked, 1344, 768).Empty());
+    masked.mask_bounds = true;
+    assert(PlanRegion(masked, 1344, 768).Empty());
+    small.area->x = 2000;
+    assert(PlanRegion(small, 1344, 768).Empty());
+
+    // Blend: overlapping regions average by weight; uncovered cells are 0.
+    // Grid 2 x 3 cells, 2 channels.
+    const int channels = 2;
+    std::vector<float> sum(6 * channels), total(6);
+    RegionCells base{.top = 0, .left = 0, .rows = 2, .cols = 3,
+                     .crop = false, .weights = {1, 1, 1, 1, 1, 0}};
+    std::vector<float> v1(6 * channels, 1.0F);
+    AccumulateRegion(sum, total, v1, 3, channels, base);
+    RegionCells crop{.top = 0, .left = 1, .rows = 2, .cols = 1, .crop = true,
+                     .weights = {3, 0}};
+    AccumulateRegion(sum, total, std::vector<float>{5, 9, 7, 7}, 3, channels,
+                     crop);
+    const auto blended = FinishRegions(sum, total, channels);
+    // Cell (0, 1): (1 * 1 + 3 * 5) / 4 = 4 and (1 + 3 * 9) / 4 = 7.
+    assert(blended[2] == 4.0F && blended[3] == 7.0F);
+    assert(blended[0] == 1.0F && blended[8] == 1.0F);
+    assert(blended[10] == 0.0F && blended[11] == 0.0F);  // cell (1, 2)
+    // One region at weight 1 everywhere returns its velocity exactly.
+    std::vector<float> s2(6 * channels), t2(6);
+    std::vector<float> v2{0.1F, -2, 3.5F, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    AccumulateRegion(s2, t2, v2, 3, channels,
+                     RegionCells{.top = 0, .left = 0, .rows = 2, .cols = 3,
+                                 .crop = false,
+                                 .weights = std::vector<float>(6, 1)});
+    assert(FinishRegions(s2, t2, channels) == v2);
+    // Crops of the latent, row-major.
+    const std::vector<float> latent{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    assert((CropLatent(latent, 3, channels, crop) ==
+            std::vector<float>{2, 3, 8, 9}));
+    bool rejected = false;
+    try {
+      AccumulateRegion(sum, total, std::vector<float>(3), 3, channels, crop);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+    assert(FullRegion(64, 32, 0.5F).weights ==
+           std::vector<float>(8, 0.5F));
+
+    // Mask images: channel and inversion.
+    Image red{2, 1, {255, 0, 0, 255, 0, 0, 0, 255}};
+    const auto from_image = RegionMaskFromImage(red, MaskChannel::kRed, false);
+    assert(from_image.values == (std::vector<float>{1.0F, 0.0F}));
+    assert(RegionMaskFromImage(red, MaskChannel::kRed, true).values ==
+           (std::vector<float>{0.0F, 1.0F}));
+
+    // Validation.
+    ValidateRequest(Request{.prompt = "office",
+                            .regions = {column, masked},
+                            .base_strength = 0});
+    for (const auto& invalid : std::vector<Request>{
+             Request{.prompt = "a", .base_strength = 0.5F},
+             Request{.prompt = "a",
+                     .regions = std::vector<Region>(kMaxRegions + 1)},
+             Request{.prompt = "a",
+                     .regions = {Region{.prompt = "b", .strength = 11}}},
+             Request{.prompt = "a",
+                     .regions = {Region{.prompt = "b", .mask_bounds = true}}},
+             Request{.prompt = "a",
+                     .regions = {Region{
+                         .prompt = "b",
+                         .mask = RegionMask{2, 2, {0, 1, 2, 0}}}}},
+             Request{.prompt = "a",
+                     .regions = {Region{
+                         .prompt = "b",
+                         .area = RegionArea{.x = 0, .y = 0, .width = 0,
+                                            .height = 1, .fraction = true}}}},
+             Request{.prompt = "a",
+                     .regions = {Region{
+                         .prompt = "b",
+                         .images = std::vector<Image>(11, image)}}},
+             Request{.prompt = "a",
+                     .images = std::vector<Image>(10, image),
+                     .regions = {Region{
+                         .prompt = "b",
+                         .images = std::vector<Image>(10, image)},
+                                 Region{.prompt = "c",
+                                        .images = {image}}}}}) {
+      bool bad = false;
+      try {
+        ValidateRequest(invalid);
+      } catch (const std::invalid_argument&) {
+        bad = true;
+      }
+      assert(bad);
+    }
+
+    // HTTP: gufo.regions with region_image[] parts and a cell mask.
+    Request regional;
+    gufo::server::ImageService regions_service(
+        {}, "image-test",
+        [&](const Request& request, const CancellationCheck&) {
+          regional = request;
+          return Result{.image = image};
+        });
+    gufo::server::HttpRequest post;
+    post.method = "POST";
+    post.path = "/v1/images/edits";
+    post.headers = {
+        {"Content-Type", "multipart/form-data; boundary=\"boundary\""}};
+    const auto region_png = EncodePng(image);
+    const auto part = [&](const std::string& name, const std::string& value) {
+      post.body += "--boundary\r\nContent-Disposition: form-data; name=\"" +
+                   name + "\"\r\n\r\n" + value + "\r\n";
+    };
+    const auto image_part = [&](const std::string& name) {
+      post.body += "--boundary\r\nContent-Disposition: form-data; name=\"" +
+                   name +
+                   "\"; filename=\"r.png\"\r\nContent-Type: image/png\r\n\r\n";
+      post.body.append(reinterpret_cast<const char*>(region_png.data()),
+                       region_png.size());
+      post.body += "\r\n";
+    };
+    const auto request_with = [&](const std::string& gufo, int images) {
+      post.body.clear();
+      part("prompt", "office");
+      part("size", "64x32");
+      part("gufo", gufo);
+      for (int i = 0; i < images; ++i)
+        image_part("region_image[]");
+      post.body += "--boundary--\r\n";
+      return gufo::server::HandleImageApiRequest(post, regions_service).status;
+    };
+    // 4 x 2 cells; "/wAA/wAAAAA=" = 255 0 0 255 0 0 0 0.
+    const std::string gufo_field =
+        R"j({"guidance":2.5,"negative_prompt":"extra","base_strength":0.5,"regions":[)j"
+        R"j({"prompt":"A (<image1>)","images":1,"mask":{"width":4,"height":2,"data":"/wAA/wAAAAA="},"mask_bounds":true},)j"
+        R"j({"prompt":"B (<image1>) and (<image2>)","strength":0.8,"images":2,"area":{"x":0.5,"y":0,"width":0.5,"height":1,"unit":"fraction"}},)j"
+        R"j({"prompt":"door"}]})j";
+    assert(request_with(gufo_field, 3) == 200);
+    assert(regional.prompt == "office" && regional.images.empty());
+    assert(regional.base_strength == 0.5F && regional.guidance == 2.5F);
+    assert(regional.regions.size() == 3);
+    assert(regional.regions[0].images.size() == 1 &&
+           regional.regions[0].mask_bounds &&
+           regional.regions[0].mask->width == 4 &&
+           regional.regions[0].mask->values[0] == 1.0F &&
+           regional.regions[0].mask->values[1] == 0.0F &&
+           regional.regions[0].mask->values[3] == 1.0F);
+    assert(regional.regions[1].images.size() == 2 &&
+           regional.regions[1].strength == 0.8F &&
+           regional.regions[1].area->fraction &&
+           regional.regions[1].area->x == 0.5);
+    assert(regional.regions[2].prompt == "door" &&
+           regional.regions[2].images.empty() && !regional.regions[2].mask);
+    // Parts and counts must agree; unknown keys and bad masks fail.
+    assert(request_with(gufo_field, 2) == 400);
+    assert(request_with(gufo_field, 4) == 400);
+    assert(request_with(R"({"regions":[]})", 1) == 400);
+    // JSON generations take regions with inline images.
+    post.path = "/v1/images/generations";
+    post.headers = {{"Content-Type", "application/json"}};
+    post.body =
+        R"({"prompt":"office","size":"64x32","gufo":{"regions":[{"prompt":"a","area":{"x":0,"y":0,"width":32,"height":32}}]}})";
+    assert(gufo::server::HandleImageApiRequest(post, regions_service).status ==
+           200);
+    assert(regional.regions.size() == 1 && !regional.regions[0].area->fraction &&
+           regional.regions[0].area->width == 32);
+    for (const auto* body : {
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","color":1}]}})",
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","mask":{"width":4,"height":2,"data":"/w=="}}]}})",
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","mask_channel":"red"}]}})",
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","images":1}]}})",
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","images":["https://example.com/x.png"]}]}})",
+             R"({"prompt":"a","gufo":{"regions":[{"prompt":"a","area":{"x":0,"y":0,"width":2,"height":1,"unit":"fraction"}}]}})",
+             R"({"prompt":"a","gufo":{"regions":{}}})",
+             R"({"prompt":"a","gufo":{"base_strength":0.5}})"}) {
+      post.body = body;
+      assert(gufo::server::HandleImageApiRequest(post, regions_service)
+                 .status == 400);
+    }
+  }
   std::cout << "Qwen-Image image and schedule contracts passed\n";
 }

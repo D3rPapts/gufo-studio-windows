@@ -346,6 +346,12 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(image->canvas);
       if (image->strength)
         files->push_back(image->init_image);
+      for (const ImageRegion& region : image->regions) {
+        files->insert(files->end(), region.references.begin(),
+                      region.references.end());
+        if (region.mask_file)
+          files->push_back(*region.mask_file);
+      }
     } else if (const auto* speech = std::get_if<SpeechTask>(&task.spec)) {
       if (speech->reference_audio)
         files->push_back(*speech->reference_audio);
@@ -1411,7 +1417,29 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     init_image = ReadFileRef(spec.init_image);
   if (!spec.mask.name.empty())
     mask = ReadFileRef(spec.mask);
-  const json::Value extension = ImageExtension(spec);
+  json::Value extension = ImageExtension(spec);
+  // Regional prompts: gufo.regions with their references as
+  // "region_image[]" parts (in region order) and mask files inline.
+  std::vector<std::string> region_references;
+  if (!spec.regions.empty()) {
+    const json::Value fields = ImageRegionsField(spec, width, height);
+    json::Value regions = json::Value::array();
+    for (std::size_t i = 0; i < spec.regions.size(); ++i) {
+      const ImageRegion& region = spec.regions[i];
+      json::Value entry = fields.items()[i];
+      if (region.mask_file) {
+        const std::string bytes = ReadFileRef(*region.mask_file);
+        entry["mask_image"] =
+            "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
+      }
+      regions.push_back(std::move(entry));
+      for (const FileRef& ref : region.references)
+        region_references.push_back(ReadFileRef(ref));
+    }
+    extension["regions"] = std::move(regions);
+    if (spec.base_strength != 1.0)
+      extension["base_strength"] = spec.base_strength;
+  }
   const json::Value loras = ImageLoras(spec);
   // Live preview under this id; the worker renders it only while the relay
   // below polls it for a connected /ws client.
@@ -1428,7 +1456,8 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   };
   const auto send = [&](bool with_extension, bool with_preview) {
     const json::Value fields = gufo_fields(with_extension, with_preview);
-    if (references.empty() && init_image.empty()) {
+    if (references.empty() && init_image.empty() &&
+        region_references.empty()) {
       json::Value body = json::Value::object();
       body["model"] = spec.model;
       body["prompt"] = spec.prompt;
@@ -1478,6 +1507,13 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
                            (type == "image/jpeg" ? ".jpg" : ".png"),
                        type, references[i]});
     }
+    for (std::size_t i = 0; i < region_references.size(); ++i) {
+      const std::string type = SniffImageType(region_references[i]);
+      parts.push_back({"region_image[]",
+                       "region-reference-" + std::to_string(i + 1) +
+                           (type == "image/jpeg" ? ".jpg" : ".png"),
+                       type, region_references[i]});
+    }
     const std::string boundary = "gufocomfy" + NewUuid();
     return Call(job, "POST", "/v1/images/edits",
                 BuildMultipart(parts, boundary),
@@ -1495,7 +1531,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   relay.request_stop();
   relay.join();
   if (result.status == 400 && !extension.empty() && !spec.strength &&
-      spec.mask.name.empty() &&
+      spec.mask.name.empty() && spec.regions.empty() &&
       ErrorMessage(result).find("gufo") != std::string::npos) {
     // An image worker without the gufo fields (negative prompt, guidance):
     // render without them and say so, as before.
@@ -1509,6 +1545,11 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
                "event=image prompt_id=" + job->id + " size=" + size +
                    " steps=" + std::to_string(spec.steps) +
                    " references=" + std::to_string(spec.references.size()) +
+                   (spec.regions.empty()
+                        ? std::string()
+                        : " regions=" + std::to_string(spec.regions.size()) +
+                              " region_references=" +
+                              std::to_string(region_references.size())) +
                    (loras.is_null() ? "" : " loras=" + loras.dump()) +
                    " status=" + std::to_string(result.status));
   if (result.status != 200)

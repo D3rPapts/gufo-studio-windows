@@ -558,7 +558,7 @@ int RowsOf(const EncodedPrompt& prompt, std::size_t begin, std::size_t end) {
 /// and per-step working sets, the bounded pool cache and a margin.
 std::uint64_t LargeRequestBytes(const Runtime& rt, const EncodedPrompt& prompt,
                                 const EncodedPrompt* negative,
-                                int target_rows) {
+                                int target_rows, int region_rows = 0) {
   constexpr std::uint64_t kCacheRow = 32ULL * 2 * 4096 * 2;
   // Activations of one row through a DiT block (about 19 row-sized
   // 4096-wide BF16 tensors including the 12288-wide MLP).
@@ -569,6 +569,8 @@ std::uint64_t LargeRequestBytes(const Runtime& rt, const EncodedPrompt& prompt,
     const auto shared = SharedConditionTokens(prompt, *negative);
     cache += RowsOf(*negative, shared, negative->ids.size() - negative->drop);
   }
+  // Regional prompts keep their own caches beside the base prompt's.
+  cache += static_cast<std::uint64_t>(region_rows);
   const std::uint64_t prefill = 3 * rows * 4096 * 2 + 4096 * kWorkRow;
   const std::uint64_t step = static_cast<std::uint64_t>(target_rows) * kWorkRow;
   return rt.MissingBytes("transformer.") + rt.MissingBytes("vae.") +
@@ -939,6 +941,46 @@ Result Model::Generate(const Request& request,
       negative = EncodePrompt(rt, impl_->tokenizer, text, cancelled,
                               negative_observer);
     }
+    // Regional prompts: each with its own references and cells; regions
+    // that cover no cell are dropped before encoding.
+    struct RegionPass {
+      std::size_t index{0};
+      RegionCells cells;
+      std::optional<EncodedPrompt> prompt;
+      std::optional<DiffusionContext> context;
+    };
+    std::vector<RegionPass> regions;
+    int region_rows = 0;
+    for (std::size_t i = 0; i < request.regions.size(); ++i) {
+      const auto& region = request.regions[i];
+      RegionPass pass{.index = i,
+                      .cells = PlanRegion(region, request.width,
+                                          request.height),
+                      .prompt = {},
+                      .context = {}};
+      if (pass.cells.Empty()) {
+        Log("event=region_skipped index=" + std::to_string(i) +
+            " reason=no_weight");
+        continue;
+      }
+      Request text;
+      text.prompt = region.prompt;
+      text.images = region.images;
+      pass.prompt = EncodePrompt(
+          rt, impl_->tokenizer, text, cancelled,
+          Prefixed(observer, "region." + std::to_string(i) + "."));
+      region_rows += ConditionRows(*pass.prompt);
+      Log("event=region index=" + std::to_string(i) +
+          " cells=" + std::to_string(pass.cells.top) + "," +
+          std::to_string(pass.cells.left) + "," +
+          std::to_string(pass.cells.rows) + "x" +
+          std::to_string(pass.cells.cols) +
+          " crop=" + (pass.cells.crop ? "1" : "0") +
+          " references=" + std::to_string(region.images.size()));
+      regions.push_back(std::move(pass));
+    }
+    const bool regional = !request.regions.empty();
+    result.metrics.region_condition_rows = region_rows;
     // Every DiT condition row keeps 32 layers of K and V (512 KiB per row).
     // With several references these caches can outgrow the memory beside all
     // weights; then the text encoder (16 GB) leaves until the next request.
@@ -947,12 +989,13 @@ Result Model::Generate(const Request& request,
     const int condition_rows = ConditionRows(prompt);
     result.metrics.condition_rows = condition_rows;
     report("encoded");
-    const bool large = condition_rows > kReleaseEncoderRows;
+    const bool large = condition_rows + region_rows > kReleaseEncoderRows;
     if (large) {
       // Freed temporaries stay cached up to this bound (8 GB otherwise).
       rt.SetCacheLimit(kLargeRequestCacheBytes);
-      const auto need = LargeRequestBytes(
-          rt, prompt, negative ? &*negative : nullptr, height * width);
+      const auto need =
+          LargeRequestBytes(rt, prompt, negative ? &*negative : nullptr,
+                            height * width, region_rows);
       const char* force = std::getenv("GUFO_QWEN_IMAGE_RELEASE_TEXT_ENCODER");
       const bool force_release = force && *force && std::string(force) != "0";
       bool keep = false;
@@ -984,8 +1027,9 @@ Result Model::Generate(const Request& request,
       // Refuse before the caches fill instead of failing inside a kernel:
       // an exhausted shared segment ends in a launch failure or a driver
       // reset, not in an allocation error.
-      const auto need = LargeRequestBytes(
-          rt, prompt, negative ? &*negative : nullptr, height * width);
+      const auto need =
+          LargeRequestBytes(rt, prompt, negative ? &*negative : nullptr,
+                            height * width, region_rows);
       const auto memory = hip::QueryDeviceMemory();
       const auto available = memory.Available(kHostReserveBytes);
       Log("event=memory_check need_mib=" + std::to_string(need >> 20) +
@@ -994,7 +1038,8 @@ Result Model::Generate(const Request& request,
       if (need > available)
         throw InsufficientMemory(
             "Qwen-Image needs about " + std::to_string(need >> 30) +
-            " GiB of GPU memory for " + std::to_string(condition_rows) +
+            " GiB of GPU memory for " +
+            std::to_string(condition_rows + region_rows) +
             " condition rows, but only " + std::to_string(available >> 30) +
             " GiB are free; use fewer or smaller reference images");
       report("released");
@@ -1013,6 +1058,23 @@ Result Model::Generate(const Request& request,
       result.metrics.negative_condition_rows = negative_context->prefix.rows;
       negative.reset();
     }
+    for (auto& pass : regions) {
+      const bool crop = pass.cells.crop;
+      pass.context.emplace(PrepareDiffusion(
+          rt, impl_->weights, *pass.prompt, crop ? pass.cells.rows : height,
+          crop ? pass.cells.cols : width, cancelled,
+          Prefixed(observer, "region." + std::to_string(pass.index) + ".")));
+      pass.prompt.reset();
+    }
+    // The base prompt runs unless its weight is 0 and no negative pass
+    // reads its shared reference caches.
+    const bool run_base =
+        !regional || request.base_strength > 0 ||
+        (negative_context && negative_context->shared_rows > 0);
+    const RegionCells base_cells =
+        regional ? FullRegion(request.width, request.height,
+                              request.base_strength)
+                 : RegionCells{};
     const bool img2img =
         request.init_image && request.strength <= kFullStrength;
     const bool masked = request.init_image && request.mask;
@@ -1074,13 +1136,49 @@ Result Model::Generate(const Request& request,
       Prefill(rt, *context, sigmas[0], cancelled);
       if (negative_context)
         Prefill(rt, *negative_context, sigmas[0], cancelled);
+      for (auto& pass : regions)
+        Prefill(rt, *pass.context, sigmas[0], cancelled);
       report("prefilled");
     }
     for (int step = 0; step < steps; ++step) {
       if (large)
         GuardMemory(step);
-      auto velocity = Denoise(rt, *context, latent, sigmas[step], step,
-                              cancelled, observer);
+      Matrix velocity;
+      if (!regional) {
+        velocity = Denoise(rt, *context, latent, sigmas[step], step,
+                           cancelled, observer);
+      } else {
+        // ComfyUI calc_cond_batch: every conditioning predicts on its cells
+        // (the crop for areas), blended by weight in FP32 on the host.
+        const int cells = height * width;
+        std::vector<float> sum(static_cast<std::size_t>(cells) * 64);
+        std::vector<float> total(static_cast<std::size_t>(cells));
+        const auto host_latent = rt.Download(latent);
+        if (run_base) {
+          const auto base = Denoise(rt, *context, latent, sigmas[step], step,
+                                    cancelled, observer);
+          if (request.base_strength > 0) {
+            AccumulateRegion(sum, total, rt.Download(base), width, 64,
+                             base_cells);
+            ++result.metrics.region_passes;
+          }
+        }
+        for (auto& pass : regions) {
+          const auto& c = pass.cells;
+          const Matrix input =
+              c.crop ? rt.Upload(CropLatent(host_latent, width, 64, c),
+                                 c.rows * c.cols, 64)
+                     : latent;
+          const auto region = Denoise(
+              rt, *pass.context, input, sigmas[step], step, cancelled,
+              Prefixed(observer, "region." + std::to_string(pass.index) + "."));
+          AccumulateRegion(sum, total, rt.Download(region), width, 64, c);
+          ++result.metrics.region_passes;
+        }
+        velocity = rt.Upload(FinishRegions(sum, total, 64), cells, 64);
+        rt.Observe(observer, "dit." + std::to_string(step) + ".regional",
+                   velocity);
+      }
       if (guided) {
         const auto negative =
             Denoise(rt, *negative_context, latent, sigmas[step], step,
@@ -1120,6 +1218,7 @@ Result Model::Generate(const Request& request,
     // The condition caches and DiT temporaries are done; give the VAE
     // decoder their memory.
     negative_context.reset();
+    regions.clear();
     context.reset();
     rt.Trim();
     report("denoised");

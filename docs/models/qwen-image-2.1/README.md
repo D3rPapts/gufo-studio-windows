@@ -118,6 +118,40 @@ under the mask instead of gray and ignores `grow_mask_by` (with a warning);
 at `denoise` 1 that makes no difference. The ComfyUI mask editor upload
 (`/upload/mask`) is not supported; upload the mask as an image.
 
+### Regional prompts
+
+`gufo.regions` gives parts of the image their own prompt and reference
+images, like ComfyUI's area and mask conditioning. Every step runs the
+transformer once for the base prompt (weight `gufo.base_strength`, default 1,
+over the whole image) and once per region, then blends the predictions per
+16 x 16-pixel cell as ComfyUI does: `v = Σ wᵢ·vᵢ / Σ wᵢ`, so overlapping
+regions mix by weight, and cells no conditioning covers get no update. Each
+region encodes its prompt with its own references (`<image1>` is that
+region's first image); the negative prompt stays global.
+
+| Region field | Behavior |
+| --- | --- |
+| `prompt` | The region's text. |
+| `strength` | 0–10, default 1 (ComfyUI SetArea strength × SetMask strength). |
+| `area` | `{x, y, width, height, unit}`: pixels (`px`, rounded outward to cells) or fractions (`fraction`). The transformer sees only that crop (as ComfyUI does); edges inside the image fade over 4 cells. |
+| `mask` | `{width, height, data}`: base64 bytes 0–255, stretched to the image and averaged per cell. Or `mask_image` (data URL) with `mask_channel` and `mask_invert`. Without `area` the region is evaluated on the whole image. |
+| `mask_bounds` | `true`: evaluate only the mask's bounding box (ComfyUI `set_cond_area: "mask bounds"`). |
+| `images` | Multipart: how many of the following `region_image[]` parts belong to the region (in region order). JSON: an array of data URLs. |
+
+Up to 16 regions and 20 reference images per request (base and regions);
+crops smaller than 128 cells grow with weight 0 around them. Every region
+costs one transformer pass per step on its cells (a full pass without area or
+bounds) plus its own condition cache; regions with crops are much cheaper.
+
+The router's ComfyUI adapter maps `ConditioningCombine`,
+`ConditioningSetMask`, `ConditioningSetArea`, `ConditioningSetAreaPercentage`
+and `ConditioningSetAreaStrength` on the KSampler's positive input to this.
+The first conditioning without area or mask is the base prompt (none: base
+weight 0). Masks come from `SolidMask`, `MaskComposite` (all six operations)
+and `InvertMask`, computed by the router, or directly from `LoadImageMask` /
+the MASK output of `LoadImage`. Each regional `TextEncodeQwenImage21` keeps
+its own `images.image_N`.
+
 For llama-swap, add this model and send the same requests to the proxy:
 
 ```yaml
