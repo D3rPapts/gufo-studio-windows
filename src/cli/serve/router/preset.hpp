@@ -54,6 +54,13 @@ struct RemoteSpec {
   std::size_t max_request_bytes{0};
 };
 
+/// Where a model's requests go: the local worker or the remote router.
+enum class Placement { kLocal, kRemote };
+
+[[nodiscard]] inline const char* PlacementName(Placement placement) {
+  return placement == Placement::kRemote ? "remote" : "local";
+}
+
 struct PresetModel {
   std::string modality;  // "llm"|"video"|"image"|"tts"|"asr"|"embedding"|
                          // "external"; a remote section's `modality` key
@@ -65,8 +72,15 @@ struct PresetModel {
   /// positional arguments first (`args = serve llm` for another gufo build).
   std::string command;
   PresetHints hints{};
-  /// Set for `[remote/<id>]` sections only.
+  /// Set for `[remote/<id>]` sections, and for a local section with a
+  /// `[remote/<id>]` twin of the same id.
   std::optional<RemoteSpec> remote;
+  /// A local section with a `[remote/<id>]` twin: POST /router/placement
+  /// moves it between the local worker and the remote router at runtime.
+  bool switchable{false};
+  /// Start placement: kRemote for `[remote/<id>]` alone, kLocal for a local
+  /// section; a twin's `placement = local|remote` key (default local).
+  Placement placement{Placement::kLocal};
 };
 
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves

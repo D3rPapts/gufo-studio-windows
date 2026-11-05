@@ -96,6 +96,8 @@ private:
   server::HttpResponse SystemStats();
   server::HttpResponse ObjectInfo(std::string_view class_type);
   server::HttpResponse Socket(const server::HttpRequest& request);
+  server::HttpResponse FilmstudioProgress();
+  server::HttpResponse FilmstudioPreview();
 
   void WorkerMain();
   void Execute(const std::shared_ptr<Job>& job);
@@ -172,6 +174,23 @@ private:
     std::string jpeg;
   };
   std::map<std::string, Preview, std::less<>> previews_;
+  /// Film studio polling (/filmstudio/progress, /filmstudio/preview, as the
+  /// filmstudio_progress ComfyUI plugin): the running prompt for any client.
+  struct Live {
+    std::string prompt_id;
+    std::string node;
+    std::string class_type;
+    int value{0};
+    int max{0};
+    bool has_progress{false};
+    int nodes_done{0};
+    int nodes_total{0};
+  };
+  Live live_;
+  /// Newest preview of any client, for /filmstudio/preview.
+  Preview last_preview_;
+  /// A /filmstudio poll counts as watching for 10 s: previews get rendered.
+  std::chrono::steady_clock::time_point http_watch_until_{};
   std::uint64_t next_preview_{1};
   std::uint64_t next_event_{1};
   std::uint64_t work_counter_{0};

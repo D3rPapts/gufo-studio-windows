@@ -319,15 +319,26 @@ SystemMemory WithCommit(SystemMemory memory, double commit_free) {
 
 void TestCommitLimit() {
   const MemoryPolicy policy;
-  // RAM and GPU fit, but GPU + host (20 + 4 GB) exceed free commit minus
-  // the 3 GB reserve: wait instead of a bad_alloc.
-  auto plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 25), {}, "m",
-                            Need(20, 4), false, policy);
+  // Only host bytes are committed (own host/shared buffers + what spills
+  // from dedicated); dedicated GPU memory is a BIOS carve-out (03.11.: the
+  // 27B with 37 GB gpu need took ~6 GB commit on 48/16). RAM and GPU fit,
+  // but the 12 GB host need exceeds free commit minus the 3 GB reserve.
+  auto plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 14), {}, "m",
+                            Need(10, 12), false, policy);
   CHECK(plan.action == Action::kWait);
   CHECK(plan.reason.find("commit") != std::string::npos);
-  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 28), {}, "m",
-                       Need(20, 4), false, policy);
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 16), {}, "m",
+                       Need(10, 12), false, policy);
   CHECK(plan.action == Action::kSpawn && !plan.alone);
+  // Dedicated GPU bytes alone never wait for commit (qwen-image-2.1 waited
+  // 10 min at 49 GB free commit for a 48 GB gpu need, 03.11.).
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 8), {}, "m",
+                       Need(28, 2), false, policy);
+  CHECK(plan.action == Action::kSpawn);
+  // What spills from dedicated into shared is host RAM and is committed.
+  plan = PlanAdmission(WithCommit(Machine(28, 0.2, 20), 10), {}, "m",
+                       Need(10, 2), false, policy);
+  CHECK(plan.action == Action::kWait);  // 6 GB spill + 2 GB host > 10 - 3
   // The model's own shared buffers are in its GPU and host need: counted once.
   MemoryNeed with_shared = Need(20, 4);
   with_shared.shared = Gb(3);
@@ -338,18 +349,18 @@ void TestCommitLimit() {
   // An idle resident's private bytes come back when it is evicted.
   ResidentView idle = Resident("idle", 10, 10, 1);
   idle.current.commit = Gb(12);
-  plan = PlanAdmission(WithCommit(Machine(12, 0.2, 18), 20), {idle}, "m",
-                       Need(20, 4), false, policy);
+  plan = PlanAdmission(WithCommit(Machine(12, 0.2, 18), 15), {idle}, "m",
+                       Need(10, 14), false, policy);
   CHECK(plan.action == Action::kEvict && plan.evict.size() == 1 &&
         plan.evict[0] == "idle");
   // A loading resident still owes commit up to its need (10 + 2 GB, holds 5).
   ResidentView loading = Resident("l", 10, 3, 1, false, true);
   loading.current.commit = Gb(5);
   plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 19.5), {loading}, "m",
-                       Need(8, 2), false, policy);
-  CHECK(plan.action == Action::kWait);  // 19.5 - 7 owed - 3 < 10
+                       Need(8, 10), false, policy);
+  CHECK(plan.action == Action::kWait);  // 19.5 - 7 owed - 3 < 10 host
   plan = PlanAdmission(WithCommit(Machine(3, 0.2, 25), 21), {loading}, "m",
-                       Need(8, 2), false, policy);
+                       Need(8, 10), false, policy);
   CHECK(plan.action == Action::kSpawn);
   // A custom reserve.
   MemoryPolicy loose = policy;
@@ -448,6 +459,75 @@ void TestMemoryBook() {
   std::filesystem::remove(file, ignored);
 }
 
+// A BIOS split change (32 -> 48 GiB dedicated): the peak learned with 32 GiB,
+// whose shared spill now fits into dedicated memory, stops counting that
+// spill as host RAM; the old peak stays in the file and returns with 32 GiB.
+void TestLayoutChange() {
+  const auto file =
+      std::filesystem::temp_directory_path() /
+      ("router_memory_layout_" + std::to_string(std::rand()) + ".json");
+  {
+    // A file from before layouts were recorded (the 27B on 31.10.).
+    std::ofstream(file)
+        << R"({"version":1,"models":{"llm":{"estimate_gpu_gb":35.5,)"
+           R"("estimate_host_gb":6.5,"learned_gpu_gb":36,"learned_host_gb":8.3,)"
+           R"("learned_shared_gb":6.2,"learned_at":"x","learned_complete":true},)"
+           R"("small":{"learned_gpu_gb":4,"learned_host_gb":1,)"
+           R"("learned_shared_gb":0,"learned_at":"y","learned_complete":true}}})";
+  }
+  bool exclusive = false;
+  {
+    MemoryBook book(file);
+    std::string error;
+    CHECK(book.Load(&error));
+    book.SetLayout(Gb(48));
+    MemoryNeed need = book.Need("llm", 1.15, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(36));
+    CHECK(need.host > Gb(2.05) && need.host < Gb(2.15));  // 8.3 - 6.2
+    CHECK(need.shared == 0);
+    // No spill: the peak counts as learned with 48 GiB, unchanged.
+    need = book.Need("small", 1.0, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(4) && need.host == Gb(1));
+    CHECK(book.Get("small").learned_layout_gb == 48);
+    // Learning with 48 GiB starts afresh and does not keep the old host peak.
+    ProcessMemory usage;
+    usage.valid = true;
+    usage.gpu_dedicated = Gb(1);
+    usage.host_working_set = Gb(0.5);
+    CHECK(book.Observe("llm", usage));
+    // A partial peak of the new layout keeps the derived need, not the
+    // (larger) estimate.
+    need = book.Need("llm", 1.15, 1.0, &exclusive);
+    CHECK(need.gpu == Gb(36));
+    CHECK(need.host > Gb(2.05) && need.host < Gb(2.15));
+    usage.gpu_dedicated = Gb(36);
+    usage.host_working_set = Gb(2.5);
+    CHECK(book.Observe("llm", usage));
+    book.MarkComplete("llm");
+    need = book.Need("llm", 1.0, 1.0, &exclusive);
+    CHECK(need.host == Gb(2.5));
+    CHECK(book.Save(&error));
+  }
+  {
+    MemoryBook book(file);
+    std::string error;
+    CHECK(book.Load(&error));
+    const MemoryBook::Record record = book.Get("llm");
+    CHECK(record.learned_layout_gb == 48);
+    CHECK(record.other_layouts.count(0) == 1);
+    CHECK(record.other_layouts.count(0) == 1 &&
+          record.other_layouts.at(0).need.host > Gb(8.25));
+    // Back to 32 GiB: the 48 GiB peak is kept, the unknown-layout one is
+    // used (largest layout not above 32).
+    book.SetLayout(Gb(32));
+    const MemoryNeed need = book.Need("llm", 1.0, 1.0, &exclusive);
+    CHECK(need.host > Gb(8.25));
+    CHECK(book.Get("llm").other_layouts.count(48) == 1);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(file, ignored);
+}
+
 void TestPresetHintsAndIdleOverride() {
   const auto dir = std::filesystem::temp_directory_path();
   const auto file = dir / "router_memory_test_preset.ini";
@@ -521,6 +601,7 @@ int main() {
   TestCommitWatchdog();
   TestFactors();
   TestMemoryBook();
+  TestLayoutChange();
   TestPresetHintsAndIdleOverride();
   if (failures != 0) {
     std::cerr << failures << " router memory checks failed.\n";

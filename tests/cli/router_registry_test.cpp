@@ -348,6 +348,62 @@ void TestReusedJobIdKeepsNewestOwner() {
   assert(!registry.Busy("b"));
 }
 
+void TestPlacementAndSplitBusy() {
+  using gufo::router::Placement;
+  using gufo::router::RemoteSpec;
+  FakeClock clock;
+  RegistryOptions options;
+  auto presets = Models({{"llm", "local"}, {"llm", "twin"}, {"image", "far"}});
+  presets[1].remote = RemoteSpec{};
+  presets[1].switchable = true;
+  presets[2].remote = RemoteSpec{};
+  presets[2].argv.clear();
+  presets[2].placement = Placement::kRemote;
+  Registry registry(std::move(presets), options, clock);
+  assert(!registry.RoutesRemote("local") && !registry.RoutesRemote("twin"));
+  assert(registry.RoutesRemote("far"));
+  // Only switchable models move.
+  assert(!registry.SetPlacement("local", Placement::kRemote));
+  assert(!registry.SetPlacement("far", Placement::kLocal));
+  assert(!registry.SetPlacement("nope", Placement::kRemote));
+  assert(registry.SetPlacement("twin", Placement::kRemote));
+  assert(registry.RoutesRemote("twin"));
+  assert(registry.PlacementOf("twin") == Placement::kRemote);
+
+  // A relay never makes the local worker busy, and leaves its idle clock.
+  registry.MarkLoading("twin");
+  registry.MarkReady("twin");
+  clock.Advance(5);
+  registry.RequestStarted("twin", /*remote=*/true);
+  assert(!registry.Busy("twin") && registry.RemoteBusy("twin"));
+  assert(registry.Residents()[0].last_active < clock());
+  registry.RequestStarted("twin");  // a local request still running
+  assert(registry.Busy("twin"));
+  registry.RequestFinished("twin");
+  registry.RequestFinished("twin", /*remote=*/true);
+  assert(!registry.Busy("twin") && !registry.RemoteBusy("twin"));
+
+  // Remote jobs: tracked for routing, not local work, not in OpenJobs.
+  registry.TrackVideoJob("video_r", "twin", /*remote=*/true);
+  registry.TrackVideoJob("video_l", "twin");
+  assert(registry.JobRemote("video_r") && !registry.JobRemote("video_l"));
+  assert(registry.JobOwner("video_r") == "twin");
+  assert(registry.Busy("twin") && registry.RemoteBusy("twin"));
+  const auto open = registry.OpenJobs();
+  assert(open.size() == 1 && open[0].first == "video_l");
+  registry.CompleteVideoJob("video_l");
+  assert(!registry.Busy("twin") && registry.RemoteBusy("twin"));
+  registry.CompleteVideoJob("video_r");
+  assert(!registry.RemoteBusy("twin"));
+  // Finished remote jobs keep routing to the remote router.
+  assert(registry.JobRemote("video_r") && registry.JobOwner("video_r") == "twin");
+  // A reused id created locally is local again.
+  registry.TrackVideoJob("video_r", "twin");
+  assert(!registry.JobRemote("video_r") && registry.Busy("twin"));
+  registry.CompleteVideoJob("video_r");
+  assert(!registry.Busy("twin") && !registry.RemoteBusy("twin"));
+}
+
 int main() {
   TestSpawnAwaitQueue();
   TestLoadTimeout();
@@ -357,6 +413,7 @@ int main() {
   TestMultiModalityResidency();
   TestJobOwnerRoundTrip();
   TestReusedJobIdKeepsNewestOwner();
+  TestPlacementAndSplitBusy();
   std::cout << "All router registry tests passed.\n";
   return 0;
 }

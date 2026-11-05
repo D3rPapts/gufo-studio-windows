@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iterator>
@@ -18,6 +19,27 @@ namespace json = gufo::json;
 
 constexpr std::int64_t kUnbounded = std::int64_t{1} << 60;
 constexpr std::int64_t kLearnStep = 256LL * 1024 * 1024;
+/// A peak with spilled shared memory is taken to fit a larger dedicated size
+/// only with this much room left.
+constexpr std::int64_t kLayoutSlack = 2LL * 1024 * 1024 * 1024;
+
+int LayoutGb(std::int64_t dedicated_total) {
+  return static_cast<int>((dedicated_total + 512LL * 1024 * 1024) >> 30);
+}
+
+/// The peak learned with a smaller dedicated size, applied to `layout_gb`: a
+/// shared part that now fits into dedicated memory was host RAM only because
+/// dedicated was short, so it leaves the host need.
+MemoryNeed ForLayout(const MemoryNeed& learned, int layout_gb) {
+  MemoryNeed need = learned;
+  if (layout_gb > 0 && learned.shared > 0 &&
+      learned.gpu + kLayoutSlack <= (std::int64_t{layout_gb} << 30)) {
+    need.host = std::max<std::int64_t>(0, learned.host - learned.shared);
+    need.shared = 0;
+  }
+  need.dedicated = 0;
+  return need;
+}
 
 /// Free bytes still available to a new worker.
 struct Room {
@@ -101,10 +123,14 @@ bool Fits(const Room& room, const MemoryNeed& need,
   if (room.host - policy.reserve_host - spill < need.host) {
     return false;
   }
-  // Windows commits GPU and host bytes alike: a load that fits RAM but not
-  // the commit limit fails with bad_alloc (or waits for the page file to
-  // grow) instead.
-  return room.commit - policy.reserve_commit >= CommitNeed(need);
+  // A load that fits RAM but not the commit limit fails with bad_alloc (or
+  // waits for the page file to grow). Only host bytes are committed: the
+  // model's own host/shared buffers (need.host) and what spills from
+  // dedicated into shared. Dedicated GPU memory (BIOS carve-out) is not
+  // charged: 03.11. on 48/16 the 27B (37 GB gpu need) took ~6 GB of commit,
+  // while counting gpu + host kept qwen-image-2.1 (48 GB gpu need) waiting
+  // for 10 minutes at 49 GB free commit.
+  return room.commit - policy.reserve_commit >= need.host + spill;
 }
 
 /// True when even an empty machine could not give `need` (estimate larger
@@ -117,9 +143,13 @@ bool NeverFits(const SystemMemory& system, const MemoryNeed& need,
                               need.gpu) {
     return true;
   }
-  if (system.commit_valid &&
-      system.commit_limit - policy.reserve_commit < CommitNeed(need)) {
-    return true;
+  if (system.commit_valid) {
+    const std::int64_t spill = std::max<std::int64_t>(
+        0, need.gpu - need.shared -
+               (system.gpu_valid ? system.gpu_dedicated_total : 0));
+    if (system.commit_limit - policy.reserve_commit < need.host + spill) {
+      return true;
+    }
   }
   return system.host_valid &&
          system.host_total - policy.reserve_host < need.host;
@@ -395,6 +425,25 @@ bool MemoryBook::Load(std::string* error) {
           complete != nullptr && complete->is_bool()) {
         record.learned_complete = complete->as_bool();
       }
+      if (const auto* layout = entry.find("learned_layout_gb");
+          layout != nullptr && layout->is_number()) {
+        record.learned_layout_gb = static_cast<int>(layout->as_double());
+      }
+    }
+    if (const auto* layouts = entry.find("learned_layouts");
+        layouts != nullptr && layouts->is_object()) {
+      for (const auto& [key, value] : layouts->members()) {
+        Learned learned;
+        learned.need.gpu = FromGb(value.member_double("gpu_gb"));
+        learned.need.host = FromGb(value.member_double("host_gb"));
+        learned.need.shared = FromGb(value.member_double("shared_gb"));
+        learned.at = value.member_str("at");
+        if (const auto* complete = value.find("complete");
+            complete != nullptr && complete->is_bool()) {
+          learned.complete = complete->as_bool();
+        }
+        record.other_layouts[std::atoi(key.c_str())] = std::move(learned);
+      }
     }
   }
   return true;
@@ -427,6 +476,22 @@ bool MemoryBook::Save(std::string* error) {
         entry["learned_shared_gb"] = round(record.learned.shared);
         entry["learned_at"] = record.learned_at;
         entry["learned_complete"] = record.learned_complete;
+        if (record.learned_layout_gb > 0) {
+          entry["learned_layout_gb"] = record.learned_layout_gb;
+        }
+      }
+      if (!record.other_layouts.empty()) {
+        json::Value layouts = json::Value::object();
+        for (const auto& [layout, learned] : record.other_layouts) {
+          json::Value item = json::Value::object();
+          item["gpu_gb"] = round(learned.need.gpu);
+          item["host_gb"] = round(learned.need.host);
+          item["shared_gb"] = round(learned.need.shared);
+          item["at"] = learned.at;
+          item["complete"] = learned.complete;
+          layouts[std::to_string(layout)] = std::move(item);
+        }
+        entry["learned_layouts"] = std::move(layouts);
       }
       models[id] = std::move(entry);
     }
@@ -478,6 +543,7 @@ bool MemoryBook::Observe(std::string_view id, const ProcessMemory& usage) {
     record.has_learned = true;
     record.learned = {gpu, host, usage.gpu_shared};
     record.learned_at = NowText();
+    record.learned_layout_gb = layout_gb_;
     dirty_ = true;
     return true;
   }
@@ -501,6 +567,9 @@ bool MemoryBook::Observe(std::string_view id, const ProcessMemory& usage) {
 void MemoryBook::RaiseLearned(std::string_view id, const MemoryNeed& need) {
   const std::lock_guard<std::mutex> lock(mutex_);
   Record& record = records_[std::string(id)];
+  if (!record.has_learned) {
+    record.learned_layout_gb = layout_gb_;
+  }
   record.has_learned = true;
   record.learned.gpu = std::max(record.learned.gpu, need.gpu);
   record.learned.host = std::max(record.learned.host, need.host);
@@ -519,12 +588,61 @@ void MemoryBook::MarkComplete(std::string_view id) {
   dirty_ = true;
 }
 
+void MemoryBook::SetLayout(std::int64_t gpu_dedicated_total) {
+  const int layout = LayoutGb(gpu_dedicated_total);
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (layout <= 0 || layout == layout_gb_) {
+    return;
+  }
+  layout_gb_ = layout;
+  for (auto& [id, record] : records_) {
+    AdoptLayoutLocked(record);
+  }
+}
+
+void MemoryBook::AdoptLayoutLocked(Record& record) {
+  if (record.has_learned && record.learned_layout_gb == layout_gb_) {
+    return;
+  }
+  if (record.has_learned && record.learned_layout_gb == 0) {
+    // Learned before layouts were recorded. A peak that spilled into shared
+    // memory but fits this dedicated size came from a smaller one; anything
+    // else is taken to be from this layout.
+    if (ForLayout(record.learned, layout_gb_).host == record.learned.host) {
+      record.learned_layout_gb = layout_gb_;
+      dirty_ = true;
+      return;
+    }
+  }
+  if (record.has_learned) {
+    record.other_layouts[record.learned_layout_gb] = {
+        record.learned, record.learned_at, record.learned_complete};
+    record.has_learned = false;
+    record.learned = {};
+    record.learned_at.clear();
+    record.learned_complete = false;
+    record.learned_layout_gb = 0;
+    dirty_ = true;
+  }
+  if (const auto it = record.other_layouts.find(layout_gb_);
+      it != record.other_layouts.end()) {
+    record.has_learned = true;
+    record.learned = it->second.need;
+    record.learned_at = it->second.at;
+    record.learned_complete = it->second.complete;
+    record.learned_layout_gb = layout_gb_;
+    record.other_layouts.erase(it);
+    dirty_ = true;
+  }
+}
+
 MemoryNeed MemoryBook::Need(std::string_view id, double factor,
                             double learned_factor, bool* exclusive) const {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = records_.find(id);
   if (it == records_.end() ||
-      (!it->second.has_estimate && !it->second.has_learned)) {
+      (!it->second.has_estimate && !it->second.has_learned &&
+       it->second.other_layouts.empty())) {
     *exclusive = true;
     return {};
   }
@@ -534,13 +652,30 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
     return static_cast<std::int64_t>(static_cast<double>(bytes) * by);
   };
   MemoryNeed need;
-  if (record.has_estimate && !(record.has_learned && record.learned_complete)) {
+  const bool complete = record.has_learned && record.learned_complete;
+  if (!complete && !record.other_layouts.empty()) {
+    // Until this layout has a complete peak, one measured with another
+    // layout beats the estimate: the largest layout not above this one (else
+    // the smallest above it). A partial peak of this layout only raises it.
+    auto prior = record.other_layouts.upper_bound(layout_gb_);
+    if (prior != record.other_layouts.begin()) {
+      --prior;
+    }
+    const MemoryNeed derived = ForLayout(prior->second.need, layout_gb_);
+    need.gpu = scale(derived.gpu, learned_factor);
+    need.host = scale(derived.host, learned_factor);
+    need.shared = std::min(scale(derived.shared, learned_factor), need.gpu);
+    if (!record.has_learned) {
+      return need;
+    }
+  } else if (record.has_estimate && !complete) {
     need.gpu = scale(record.estimate.gpu, factor);
     need.host = scale(record.estimate.host, factor);
   }
   if (record.has_learned) {
-    need.shared = std::min(scale(record.learned.shared, learned_factor),
-                           scale(record.learned.gpu, learned_factor));
+    need.shared = std::max(need.shared,
+                           std::min(scale(record.learned.shared, learned_factor),
+                                    scale(record.learned.gpu, learned_factor)));
     need.gpu = std::max(need.gpu, scale(record.learned.gpu, learned_factor));
     need.host = std::max(need.host, scale(record.learned.host, learned_factor));
     if (record.learned_complete) {

@@ -945,6 +945,21 @@ void TestAceStep() {
               "\"PreviewAudio\", \"inputs\": {\"audio\": [\"9\", 0]}")
           .c_str());
   assert(preview.tasks[0].outputs[0].temp);
+  // SaveAudioMP3 / SaveAudioOpus (v100_lauf_169's music used SaveAudioMP3).
+  for (const char* node : {"SaveAudioMP3", "SaveAudioOpus"}) {
+    const comfy::Plan coded = PlanOf(
+        Replace(kAceStep, "\"SaveAudio\", \"inputs\": {\"audio\": [\"9\", 0], "
+                          "\"filename_prefix\": \"film/musik/titel\"}",
+                std::string("\"") + node +
+                    "\", \"inputs\": {\"audio\": [\"9\", 0], "
+                    "\"filename_prefix\": \"film/musik/titel\", "
+                    "\"quality\": \"V0\"}")
+            .c_str());
+    assert(coded.tasks.size() == 1);
+    assert(coded.tasks[0].outputs[0].kind == comfy::OutputKind::kAudio);
+    assert(coded.tasks[0].outputs[0].class_type == node);
+    assert(coded.tasks[0].outputs[0].prefix == "film/musik/titel");
+  }
   assert(ErrorOf(Replace(kAceStep, "\"SaveAudio\", \"inputs\": {\"audio\"",
                          "\"SaveImage\", \"inputs\": {\"images\""))
              .message.find("cannot store") != std::string::npos);

@@ -133,14 +133,28 @@ bool ParseWhole(std::string_view text, long long min, long long max,
 }
 
 /// `[remote/<id>]`: only the remote keys; no worker argv, no router hints.
+/// `modality` and `placement` are checked by LoadPreset once it knows
+/// whether a local twin section exists; `placement_given` reports the key.
 bool ParseRemoteSection(const Section& section, PresetModel* model,
-                        std::string* error) {
+                        bool* placement_given, std::string* error) {
   RemoteSpec spec;
   bool has_url = false;
+  model->placement = Placement::kRemote;
   for (const auto& [key, value] : section.entries) {
     long long number = 0;
     std::string url_error;
-    if (key == "url") {
+    if (key == "placement") {
+      const std::string_view text = TrimSpaces(value);
+      if (text != "local" && text != "remote") {
+        return SectionError(section,
+                            "placement takes local|remote, not '" + value +
+                                "'",
+                            error);
+      }
+      model->placement =
+          text == "remote" ? Placement::kRemote : Placement::kLocal;
+      *placement_given = true;
+    } else if (key == "url") {
       if (!ParseRemoteUrl(value, /*allow_path=*/false, &spec.url,
                           &url_error)) {
         return SectionError(section, "url: " + url_error, error);
@@ -215,9 +229,6 @@ bool ParseRemoteSection(const Section& section, PresetModel* model,
   }
   if (!has_url) {
     return SectionError(section, "remote sections need 'url'", error);
-  }
-  if (model->modality.empty()) {
-    return SectionError(section, "remote sections need 'modality'", error);
   }
   if (!spec.api_key_env.empty()) {
     const char* key = std::getenv(spec.api_key_env.c_str());
@@ -311,17 +322,29 @@ bool LoadPreset(const std::filesystem::path& file,
     return false;
   }
   models->clear();
+  // `[remote/<id>]` sections, merged into a local twin of the same id (a
+  // switchable model) or kept as remote-only models at the end.
+  struct RemoteSection {
+    Section section;
+    PresetModel model;
+    bool placement_given{false};
+  };
+  std::vector<RemoteSection> remote_sections;
 
   const auto flush = [&](const Section& section) -> bool {
     if (section.entries.empty()) {
       return SectionError(section, "empty section body", error);
     }
     if (section.modality == "remote") {
-      PresetModel model;
-      if (!ParseRemoteSection(section, &model, error)) {
+      RemoteSection remote{section, {}, false};
+      if (!ParseRemoteSection(section, &remote.model, &remote.placement_given,
+                              error)) {
         return false;
       }
-      models->push_back(std::move(model));
+      remote_sections.push_back(std::move(remote));
+      // Placeholder keeps the section order; filled in after the file.
+      models->push_back({});
+      models->back().id = section.id;
       return true;
     }
     const bool external = section.modality == "external";
@@ -404,6 +427,7 @@ bool LoadPreset(const std::filesystem::path& file,
   };
 
   std::set<std::string> ids;
+  std::set<std::string> remote_ids;
   Section section;
   bool in_section = false;
   std::string raw;
@@ -448,7 +472,11 @@ bool LoadPreset(const std::filesystem::path& file,
       if (section.id.empty()) {
         return SectionError(section, "empty model id", error);
       }
-      if (!ids.insert(section.id).second) {
+      // A local section and one `[remote/<id>]` may share an id (a model
+      // switchable between this machine and the remote router).
+      if (!(section.modality == "remote" ? remote_ids : ids)
+               .insert(section.id)
+               .second) {
         return SectionError(section, "duplicate model id '" + section.id + "'",
                             error);
       }
@@ -478,6 +506,45 @@ bool LoadPreset(const std::filesystem::path& file,
   }
   if (in_section && !flush(section)) {
     return false;
+  }
+  for (RemoteSection& remote : remote_sections) {
+    const std::string& id = remote.section.id;
+    const auto placeholder = std::find_if(
+        models->begin(), models->end(), [&id](const PresetModel& model) {
+          return model.id == id && model.modality.empty();
+        });
+    const auto twin = std::find_if(
+        models->begin(), models->end(), [&id](const PresetModel& model) {
+          return model.id == id && !model.modality.empty();
+        });
+    if (twin == models->end()) {
+      if (remote.placement_given) {
+        return SectionError(remote.section,
+                            "'placement' needs a local section with the "
+                            "same id (e.g. [llm/" +
+                                id + "])",
+                            error);
+      }
+      if (remote.model.modality.empty()) {
+        return SectionError(remote.section, "remote sections need 'modality'",
+                            error);
+      }
+      *placeholder = std::move(remote.model);
+      continue;
+    }
+    if (!remote.model.modality.empty() &&
+        remote.model.modality != twin->modality) {
+      return SectionError(remote.section,
+                          "modality '" + remote.model.modality +
+                              "' differs from the local section's '" +
+                              twin->modality + "'",
+                          error);
+    }
+    twin->remote = std::move(remote.model.remote);
+    twin->switchable = true;
+    twin->placement = remote.placement_given ? remote.model.placement
+                                             : Placement::kLocal;
+    models->erase(placeholder);
   }
   return true;
 }

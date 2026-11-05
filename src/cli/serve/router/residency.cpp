@@ -83,6 +83,9 @@ std::vector<ResidentView> Residency::ViewsLocked(
 
 void Residency::SampleLocked(const WorkerPids& pids) {
   system_ = probe_->System();
+  if (system_.gpu_valid) {
+    book_.SetLayout(system_.gpu_dedicated_total);
+  }
   // Workers that are gone (exit, stop) leave the cache; their peaks stay in
   // the book.
   for (auto it = current_.begin(); it != current_.end();) {

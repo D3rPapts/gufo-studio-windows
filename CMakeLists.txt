@@ -457,6 +457,7 @@ target_link_libraries(gufo_preview PUBLIC gufo_core JPEG::JPEG PkgConfig::WEBP
 add_library(gufo_http STATIC
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/figuren.cpp
   src/cli/serve/router/jobs.cpp
   src/cli/serve/router/names.cpp
   src/cli/serve/router/preset.cpp
@@ -757,6 +758,13 @@ if (BUILD_TESTING)
   add_executable(router_names_test tests/cli/router_names_test.cpp)
   target_link_libraries(router_names_test PRIVATE gufo_http)
   add_test(NAME router_names_test COMMAND router_names_test)
+  # POST /v1/figuren: JSON extraction, badge assignment, box math and the
+  # endpoint against a scripted fetch (no model).
+  add_executable(router_figuren_test tests/cli/router_figuren_test.cpp)
+  target_link_libraries(router_figuren_test PRIVATE gufo_http)
+  add_test(NAME router_figuren_test COMMAND router_figuren_test)
+  set_tests_properties(router_figuren_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
   add_executable(router_proxy_remote_test tests/cli/router_proxy_remote_test.cpp)
   target_link_libraries(router_proxy_remote_test PRIVATE gufo_http)
   add_test(NAME router_proxy_remote_test COMMAND router_proxy_remote_test)
@@ -928,6 +936,12 @@ if (BUILD_TESTING)
       $<TARGET_FILE:gufo>)
   set_tests_properties(router_remote_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 240)
+
+  add_test(NAME router_placement_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_placement_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_placement_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
 
   # Real-model smoke check: gpu-only labels, so the hosted check-pr name
   # filter skips it and gpu-fast excludes it while gpu-full executes it.
