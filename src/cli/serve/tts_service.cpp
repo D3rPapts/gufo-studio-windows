@@ -13,6 +13,8 @@
 #include "src/models/ming_tts/synthesis.hpp"
 #include "src/models/qwen3_tts/config.hpp"
 #include "src/models/qwen3_tts/hip/synthesis_runtime.hpp"
+#include "src/models/voxcpm2/config.hpp"
+#include "src/models/voxcpm2/synthesis.hpp"
 
 namespace gufo::server {
 namespace {
@@ -35,6 +37,11 @@ std::string ModelId(models::qwen3_tts::ModelVariant variant) {
 
 struct TtsService::Impl {
   explicit Impl(TtsServiceOptions supplied) : options(std::move(supplied)) {
+    if (!options.model_root.empty() &&
+        models::voxcpm2::LooksLikeVoxCpm2(options.model_root.string())) {
+      InitVoxCpm2();
+      return;
+    }
     if (!options.model_root.empty() &&
         models::ming_tts::LooksLikeMingTts(options.model_root.string())) {
       InitMing();
@@ -257,7 +264,88 @@ struct TtsService::Impl {
     ready = true;
   }
 
+  // VoxCPM2: reference-voice cloning (isolated prefix), "ultimate" cloning
+  // with a transcript (reference + continuation prompt), zero-shot without a
+  // voice, and the style/emotion instruction as a "(...)" text prefix.
+  void InitVoxCpm2() {
+    is_voxcpm2 = true;
+    sample_rate = 48000;
+    options.variant = models::qwen3_tts::ModelVariant::kBase;
+    if (options.model_id.empty()) {
+      options.model_id = "voxcpm2";
+    }
+    if (options.voices.empty()) {
+      options.voices.push_back("default");
+      options.voices.push_back("voice-clone");
+    }
+    for (const auto& [name, unused] : options.voice_presets) {
+      (void)unused;
+      if (std::ranges::find(options.voices, name) == options.voices.end()) {
+        options.voices.push_back(name);
+      }
+    }
+    if (!options.runner) {
+      voxcpm2_engine = models::voxcpm2::Engine::Create(options.model_root.string(),
+                                                       &initialization_error);
+      if (voxcpm2_engine == nullptr) {
+        return;
+      }
+      options.runner =
+          [this](const models::qwen3_tts::SynthesisRequest& request,
+                 const models::qwen3_tts::CancellationCheck& is_cancelled,
+                 models::qwen3_tts::SynthesisResult* result,
+                 std::string* error) {
+            models::voxcpm2::SynthesisRequest vox;
+            vox.text = request.text;
+            // "emotion" and "instructions" are both free text for VoxCPM2.
+            vox.instruction = request.emotion;
+            if (!request.instruct.empty()) {
+              vox.instruction += (vox.instruction.empty() ? "" : ", ") + request.instruct;
+            }
+            const auto& audio = request.reference_audio;
+            if (!audio.samples.empty() && audio.channels > 0) {
+              const std::size_t frames = audio.samples.size() / audio.channels;
+              vox.reference_audio.resize(frames);
+              for (std::size_t f = 0; f < frames; ++f) {
+                double sum = 0.0;
+                for (std::uint32_t c = 0; c < audio.channels; ++c) {
+                  sum += audio.samples[f * audio.channels + c];
+                }
+                vox.reference_audio[f] =
+                    static_cast<float>(sum / static_cast<double>(audio.channels));
+              }
+              vox.reference_sample_rate = audio.sample_rate;
+              if (!request.reference_text.empty() && !request.speaker_embedding_only) {
+                // "Ultimate cloning": the same clip also continues as prompt.
+                vox.prompt_audio = vox.reference_audio;
+                vox.prompt_sample_rate = audio.sample_rate;
+                vox.prompt_text = request.reference_text;
+              }
+            }
+            vox.seed = request.sampling.seed;
+            vox.max_len = static_cast<std::int32_t>(
+                std::min<std::size_t>(request.max_new_tokens, 4096));
+            vox.on_audio = request.on_audio;
+            models::voxcpm2::SynthesisResult vox_result;
+            if (!voxcpm2_engine->Generate(vox, is_cancelled, &vox_result, error)) {
+              return false;
+            }
+            if (result != nullptr) {
+              result->sample_rate = vox_result.sample_rate;
+              result->code_groups = 1;
+              result->codes.assign(static_cast<std::size_t>(vox_result.steps), 0);
+              result->sample_count = vox_result.samples.size();
+              result->samples = std::move(vox_result.samples);
+            }
+            return true;
+          };
+    }
+    std::ranges::sort(options.voices);
+    ready = true;
+  }
+
   TtsServiceOptions options;
+  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
   std::unique_ptr<models::ming_tts::Engine> ming_engine;
   std::unique_ptr<models::qwen3_tts::hip::SynthesisHipRuntime> native_runtime;
   std::unique_ptr<models::fish_drama3::hip::SynthesisHipRuntime> drama3_runtime;
@@ -265,6 +353,7 @@ struct TtsService::Impl {
   core::CancellableGate generation_gate;
   bool is_drama3{false};
   bool is_ming{false};
+  bool is_voxcpm2{false};
   std::uint32_t sample_rate{24000};
   bool ready{false};
 };
@@ -287,6 +376,11 @@ std::string TtsService::model_id() const {
 }
 
 std::string TtsService::backend_name() const {
+  if (impl_->is_voxcpm2) {
+    return impl_->voxcpm2_engine != nullptr
+               ? std::string("native-") + impl_->voxcpm2_engine->backend_name()
+               : std::string("native-cpu");
+  }
   if (impl_->is_ming) {
     return impl_->ming_engine != nullptr
                ? std::string("native-") + impl_->ming_engine->backend_name()
@@ -314,6 +408,10 @@ bool TtsService::is_fish_drama3() const noexcept {
 
 bool TtsService::is_ming_tts() const noexcept {
   return impl_->is_ming;
+}
+
+bool TtsService::is_voxcpm2() const noexcept {
+  return impl_->is_voxcpm2;
 }
 
 std::uint32_t TtsService::sample_rate() const noexcept {
