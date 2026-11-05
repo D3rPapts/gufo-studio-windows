@@ -107,6 +107,13 @@ constexpr std::string_view kGenerators[] = {
     "MMAudioSampler",
 };
 
+// ComfyUI's split sampler: LowerCustomSamplers() rewrites these into a
+// KSampler before validation, so they never reach the planner; they are
+// listed so /object_info names every class the adapter accepts.
+constexpr std::string_view kLowered[] = {
+    "SamplerCustomAdvanced", "RandomNoise", "BasicGuider",
+    "CFGGuider",             "KSamplerSelect", "BasicScheduler"};
+
 constexpr std::string_view kOutputs[] = {
     "SaveImage", "PreviewImage", "SaveAudio", "PreviewAudio", "SaveVideo",
     "VHS_VideoCombine"};
@@ -2119,6 +2126,8 @@ const std::vector<std::string>& SupportedClassTypes() {
     for (auto name : kGenerators)
       all.emplace_back(name);
     for (auto name : kOutputs)
+      all.emplace_back(name);
+    for (auto name : kLowered)
       all.emplace_back(name);
     std::sort(all.begin(), all.end());
     all.erase(std::unique(all.begin(), all.end()), all.end());

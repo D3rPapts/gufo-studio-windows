@@ -1135,6 +1135,12 @@ void TestVace() {
   for (const char* name : {"WanVaceToVideo", "TrimVideoLatent", "ImageToMask",
                            "InvertMask"})
     assert(std::find(classes.begin(), classes.end(), name) != classes.end());
+  // The split sampler is lowered before planning; /object_info still lists it.
+  for (const char* name : {"SamplerCustomAdvanced", "RandomNoise", "BasicGuider",
+                           "CFGGuider", "KSamplerSelect", "BasicScheduler"})
+    assert(std::find(classes.begin(), classes.end(), name) != classes.end());
+  assert(std::is_sorted(classes.begin(), classes.end()));
+  assert(std::adjacent_find(classes.begin(), classes.end()) == classes.end());
 }
 
 void TestInfiniteTalk() {
