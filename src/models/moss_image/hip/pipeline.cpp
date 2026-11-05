@@ -434,7 +434,8 @@ Result Model::Generate(const Request& request,
     const auto cond = PrepareText(rt, positive, height, width);
     Conditioning uncond;
     if (guided) {
-      const auto negative = impl_->EncodeText("");
+      // An empty negative prompt encodes like MOSS's own unconditional "".
+      const auto negative = impl_->EncodeText(request.negative_prompt);
       rt.Observe(observer, "text.negative", negative);
       uncond = PrepareText(rt, negative, height, width);
     }
