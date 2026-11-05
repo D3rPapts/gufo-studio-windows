@@ -14,6 +14,7 @@
 
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
+#include "src/models/ming_tts/prompt.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::server {
@@ -175,6 +176,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                                                   "speed",
                                                   "language",
                                                   "instructions",
+                                                  "emotion",
+                                                  "tempo",
+                                                  "pitch",
+                                                  "volume",
+                                                  "dialect",
                                                   "seed",
                                                   "max_new_tokens",
                                                   "greedy",
@@ -205,7 +211,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "invalid_parameter_type");
   }
   if (model->str() != service.model_id() && model->str() != "qwen3-tts" &&
-      !(service.is_fish_drama3() && model->str() == "fish-drama-3")) {
+      !(service.is_fish_drama3() && model->str() == "fish-drama-3") &&
+      !(service.is_ming_tts() && model->str() == "ming-3.0-tts")) {
     return Error(400, "Bad Request", "unsupported audio speech model",
                  "invalid_model");
   }
@@ -258,7 +265,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     reference_text = preset->reference_text;
     speaker_embedding_only = preset->speaker_embedding_only;
   } else if (service.variant() == models::qwen3_tts::ModelVariant::kBase &&
-             (!service.is_fish_drama3() ||
+             ((!service.is_fish_drama3() && !service.is_ming_tts()) ||
               body.find("reference_audio") != nullptr ||
               body.find("reference_text") != nullptr)) {
     const json::Value* encoded_audio = body.find("reference_audio");
@@ -279,8 +286,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                    "'speaker_embedding_only'",
                    "invalid_voice_clone_mode");
     }
+    // Ming-3.0-tts clones from the CAM++ speaker embedding alone.
     speaker_embedding_only =
-        clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only";
+        service.is_ming_tts() ||
+        (clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only");
     if (!speaker_embedding_only &&
         (clone_text == nullptr || !clone_text->is_string() ||
          clone_text->str().empty())) {
@@ -343,13 +352,70 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "'speed' other than 1.0 requires response_format 'wav'",
                  "invalid_speed");
   }
-  for (const std::string_view name : {"language", "instructions"}) {
+  for (const std::string_view name : {"language", "instructions", "emotion",
+                                       "tempo", "pitch", "volume", "dialect"}) {
     const json::Value* value = body.find(std::string(name));
     if (value != nullptr && !value->is_string()) {
       return Error(400, "Bad Request",
                    "'" + std::string(name) + "' must be a string",
                    "invalid_parameter_type");
     }
+  }
+  if (!body.member_str("emotion").empty() && !service.is_ming_tts()) {
+    return Error(400, "Bad Request",
+                 "'emotion' is supported only by Ming-3.0-tts",
+                 "unsupported_field");
+  }
+  if (!body.member_str("emotion").empty() &&
+      !models::ming_tts::EmotionLabel(body.member_str("emotion")).has_value()) {
+    return Error(400, "Bad Request",
+                 "'emotion' must be happy, sad, angry, fear, disgust, surprise "
+                 "or neutral",
+                 "invalid_emotion");
+  }
+  // Ming-3.0-tts BASIC task ("tempo", "pitch", "volume": slow/medium/fast,
+  // low/medium/high) and DIALECT task ("dialect"). "tempo" is the model's own
+  // speaking rate; the OpenAI "speed" time stretch stays separate.
+  const bool ming_basic = !body.member_str("tempo").empty() ||
+                          !body.member_str("pitch").empty() ||
+                          !body.member_str("volume").empty();
+  const bool ming_dialect = !body.member_str("dialect").empty();
+  if ((ming_basic || ming_dialect) && !service.is_ming_tts()) {
+    return Error(400, "Bad Request",
+                 "'tempo', 'pitch', 'volume' and 'dialect' are supported only "
+                 "by Ming-3.0-tts",
+                 "unsupported_field");
+  }
+  if (const std::string value = body.member_str("tempo");
+      !value.empty() && !models::ming_tts::SpeedLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'tempo' must be slow, medium or fast",
+                 "invalid_tempo");
+  }
+  if (const std::string value = body.member_str("pitch");
+      !value.empty() && !models::ming_tts::PitchLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'pitch' must be low, medium or high",
+                 "invalid_pitch");
+  }
+  if (const std::string value = body.member_str("volume");
+      !value.empty() && !models::ming_tts::VolumeLabel(value).has_value()) {
+    return Error(400, "Bad Request", "'volume' must be low, medium or high",
+                 "invalid_volume");
+  }
+  if (const std::string value = body.member_str("dialect");
+      !value.empty() && !models::ming_tts::DialectLabel(value).has_value()) {
+    return Error(400, "Bad Request",
+                 "'dialect' must be cantonese or chuanyu dialect",
+                 "invalid_dialect");
+  }
+  // One Ming task per request, as in the reference (tts_tasks).
+  if ((ming_basic && ming_dialect) ||
+      ((ming_basic || ming_dialect) &&
+       (!body.member_str("emotion").empty() ||
+        !body.member_str("instructions").empty()))) {
+    return Error(400, "Bad Request",
+                 "use only one of 'tempo'/'pitch'/'volume', 'dialect', "
+                 "'emotion' or 'instructions' per request",
+                 "conflicting_controls");
   }
   std::size_t max_new_tokens = 0;
   if (!ReadUnsigned(body, "max_new_tokens", 3000, kMaximumNewTokens,
@@ -405,7 +471,12 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   // would otherwise synthesize it as English. An explicit request language
   // still wins, so one voice can be driven in another language on purpose.
   std::string language = body.member_str("language");
-  if (language.empty()) {
+  if (language.empty() && service.is_ming_tts()) {
+    // Ming's own default: no "Target language" line unless a preset sets one.
+    if (preset != nullptr) {
+      language = preset->language;
+    }
+  } else if (language.empty()) {
     language = (preset != nullptr && !preset->language.empty())
                    ? preset->language
                    : std::string("english");
@@ -416,6 +487,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
       .speaker = selected_voice,
       .language = std::move(language),
       .instruct = body.member_str("instructions"),
+      .emotion = body.member_str("emotion"),
+      .tempo = body.member_str("tempo"),
+      .pitch = body.member_str("pitch"),
+      .volume = body.member_str("volume"),
+      .dialect = body.member_str("dialect"),
       .reference_audio = std::move(reference_audio),
       .reference_text = std::move(reference_text),
       .speaker_embedding_only = speaker_embedding_only,
@@ -488,7 +564,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
               "model=" + service.model_id() +
               " stream=" + (sse ? "sse" : "pcm") + " audio_ms=" +
               std::to_string(1000ULL * samples /
-                             (service.is_fish_drama3() ? 44100ULL : 24000ULL)) +
+                             std::max<std::uint64_t>(1, service.sample_rate())) +
               " synthesis_ms=" +
               std::to_string(
                   std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -1,6 +1,7 @@
 #include "src/cli/serve/tts_service.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -8,6 +9,8 @@
 #include "src/core/cancellable_gate.hpp"
 #include "src/models/fish_drama3/config.hpp"
 #include "src/models/fish_drama3/hip/synthesis_runtime.hpp"
+#include "src/models/ming_tts/config.hpp"
+#include "src/models/ming_tts/synthesis.hpp"
 #include "src/models/qwen3_tts/config.hpp"
 #include "src/models/qwen3_tts/hip/synthesis_runtime.hpp"
 
@@ -33,8 +36,14 @@ std::string ModelId(models::qwen3_tts::ModelVariant variant) {
 struct TtsService::Impl {
   explicit Impl(TtsServiceOptions supplied) : options(std::move(supplied)) {
     if (!options.model_root.empty() &&
+        models::ming_tts::LooksLikeMingTts(options.model_root.string())) {
+      InitMing();
+      return;
+    }
+    if (!options.model_root.empty() &&
         models::fish_drama3::LooksLikeFishDrama3(options.model_root.string())) {
       is_drama3 = true;
+      sample_rate = 44100;
       options.variant = models::qwen3_tts::ModelVariant::kBase;
       if (options.model_id.empty()) {
         options.model_id = "fish-drama-3";
@@ -168,12 +177,95 @@ struct TtsService::Impl {
     ready = true;
   }
 
+  // Ming-3.0-tts: speaker-embedding cloning (CAM++), EMOTION labels and
+  // free-text instructions; CPU reference runtime.
+  void InitMing() {
+    is_ming = true;
+    sample_rate = 44100;
+    options.variant = models::qwen3_tts::ModelVariant::kBase;
+    if (options.model_id.empty()) {
+      options.model_id = "ming-3.0-tts-0.5b";
+    }
+    if (options.voices.empty()) {
+      options.voices.push_back("default");
+      options.voices.push_back("voice-clone");
+    }
+    for (const auto& [name, unused] : options.voice_presets) {
+      (void)unused;
+      if (std::ranges::find(options.voices, name) == options.voices.end()) {
+        options.voices.push_back(name);
+      }
+    }
+    if (!options.runner) {
+      ming_engine = models::ming_tts::Engine::Create(options.model_root.string(),
+                                                     &initialization_error);
+      if (ming_engine == nullptr) {
+        return;
+      }
+      options.runner =
+          [this](const models::qwen3_tts::SynthesisRequest& request,
+                 const models::qwen3_tts::CancellationCheck& is_cancelled,
+                 models::qwen3_tts::SynthesisResult* result,
+                 std::string* error) {
+            models::ming_tts::SynthesisRequest ming;
+            ming.text = request.text;
+            ming.language = request.language;
+            ming.emotion = request.emotion;
+            ming.instruction = request.instruct;
+            ming.speed = request.tempo;
+            ming.pitch = request.pitch;
+            ming.volume = request.volume;
+            ming.dialect = request.dialect;
+            ming.reference_text = request.reference_text;
+            const auto& audio = request.reference_audio;
+            if (!audio.samples.empty() && audio.channels > 0) {
+              const std::size_t frames = audio.samples.size() / audio.channels;
+              ming.reference_audio.resize(frames);
+              for (std::size_t f = 0; f < frames; ++f) {
+                double sum = 0.0;
+                for (std::uint32_t c = 0; c < audio.channels; ++c) {
+                  sum += audio.samples[f * audio.channels + c];
+                }
+                ming.reference_audio[f] =
+                    static_cast<float>(sum / static_cast<double>(audio.channels));
+              }
+              ming.reference_sample_rate = audio.sample_rate;
+            }
+            ming.seed = request.sampling.seed;
+            ming.max_decode_steps = static_cast<std::int32_t>(
+                std::min<std::size_t>(request.max_new_tokens, 1000));
+            ming.on_audio = request.on_audio;
+            models::ming_tts::SynthesisResult ming_result;
+            if (!ming_engine->Generate(ming, is_cancelled, &ming_result, error)) {
+              return false;
+            }
+            if (result != nullptr) {
+              result->sample_rate = ming_result.sample_rate;
+              result->code_groups = 1;
+              result->codes.assign(
+                  static_cast<std::size_t>(std::accumulate(
+                      ming_result.fragment_steps.begin(),
+                      ming_result.fragment_steps.end(), std::int64_t{0})),
+                  0);
+              result->sample_count = ming_result.samples.size();
+              result->samples = std::move(ming_result.samples);
+            }
+            return true;
+          };
+    }
+    std::ranges::sort(options.voices);
+    ready = true;
+  }
+
   TtsServiceOptions options;
+  std::unique_ptr<models::ming_tts::Engine> ming_engine;
   std::unique_ptr<models::qwen3_tts::hip::SynthesisHipRuntime> native_runtime;
   std::unique_ptr<models::fish_drama3::hip::SynthesisHipRuntime> drama3_runtime;
   std::string initialization_error;
   core::CancellableGate generation_gate;
   bool is_drama3{false};
+  bool is_ming{false};
+  std::uint32_t sample_rate{24000};
   bool ready{false};
 };
 
@@ -195,6 +287,11 @@ std::string TtsService::model_id() const {
 }
 
 std::string TtsService::backend_name() const {
+  if (impl_->is_ming) {
+    return impl_->ming_engine != nullptr
+               ? std::string("native-") + impl_->ming_engine->backend_name()
+               : std::string("native-cpu");
+  }
   return "native-hip";
 }
 
@@ -213,6 +310,14 @@ models::qwen3_tts::ModelVariant TtsService::variant() const noexcept {
 
 bool TtsService::is_fish_drama3() const noexcept {
   return impl_->is_drama3;
+}
+
+bool TtsService::is_ming_tts() const noexcept {
+  return impl_->is_ming;
+}
+
+std::uint32_t TtsService::sample_rate() const noexcept {
+  return impl_->sample_rate;
 }
 
 bool TtsService::Synthesize(

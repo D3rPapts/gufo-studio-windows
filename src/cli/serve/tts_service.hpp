@@ -2,6 +2,7 @@
 #define GUFO_SERVER_TTS_SERVICE_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -45,8 +46,8 @@ struct TtsServiceOptions {
   Runner runner;
 };
 
-/// Synchronous, bounded native HIP TTS service (supports Qwen3-TTS and Fish
-/// Drama-3).
+/// Synchronous, bounded native TTS service (supports Qwen3-TTS, Fish Drama-3
+/// and Ming-3.0-tts).
 class TtsService {
 public:
   explicit TtsService(TtsServiceOptions options);
@@ -67,6 +68,8 @@ public:
       const std::string& name) const;
   [[nodiscard]] models::qwen3_tts::ModelVariant variant() const noexcept;
   [[nodiscard]] bool is_fish_drama3() const noexcept;
+  [[nodiscard]] bool is_ming_tts() const noexcept;
+  [[nodiscard]] std::uint32_t sample_rate() const noexcept;
 
   [[nodiscard]] bool Synthesize(
       const models::qwen3_tts::SynthesisRequest& request,

@@ -18,6 +18,14 @@ struct SynthesisRequest {
   std::string speaker{"vivian"};
   std::string language{"english"};
   std::string instruct;
+  // Ming-3.0-tts EMOTION task label/name (ignored by the other engines).
+  std::string emotion;
+  // Ming-3.0-tts BASIC (tempo/pitch/volume) and DIALECT controls, as sent in
+  // the request (ignored by the other engines).
+  std::string tempo;
+  std::string pitch;
+  std::string volume;
+  std::string dialect;
   AudioBuffer reference_audio;
   std::string reference_text;
   bool speaker_embedding_only{false};
