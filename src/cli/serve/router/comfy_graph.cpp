@@ -1752,10 +1752,10 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
   task.width = static_cast<int>(graph.Num(video, "width", 832));
   task.height = static_cast<int>(graph.Num(video, "height", 480));
   if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 16 ||
-      task.height < 16 || task.width * task.height > 832 * 480)
+      task.height < 16 || task.width * task.height > 896 * 512)
     throw NodeFailure(video, "unsupported_value",
                       "gufo wan2.1-uni3c needs width/height in multiples of "
-                      "16 and at most 832x480 pixels, not " +
+                      "16 and at most 896x512 pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));
   task.frames = static_cast<int>(graph.Num(video, "length", 81));
@@ -2131,10 +2131,10 @@ VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
   task.width = static_cast<int>(graph.Num(node, "width", 832));
   task.height = static_cast<int>(graph.Num(node, "height", 480));
   if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 256 ||
-      task.height < 256 || task.width * task.height > 832 * 480)
+      task.height < 256 || task.width * task.height > 896 * 512)
     throw NodeFailure(node, "unsupported_value",
                       "gufo wan2.1-infinitetalk-14b needs width/height in "
-                      "multiples of 16 (at least 256) and at most 832x480 "
+                      "multiples of 16 (at least 256) and at most 896x512 "
                       "pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));

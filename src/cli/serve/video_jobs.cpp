@@ -98,7 +98,7 @@ bool ValidateWan21TalkParameters(const minimax_h3::GenerationParameters& p,
     return fail("InfiniteTalk jobs use the 'wan21-talk' preset");
   const int w = p.output_width, h = p.output_height;
   if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
-      h % 16 != 0 || w * h > 832 * 480)
+      h % 16 != 0 || w * h > 896 * 512)
     return fail(
         "size must be WxH with multiples of 16, 256..1024 per side and at "
         "most 832x480 pixels");
@@ -135,7 +135,7 @@ bool ValidateWan21Parameters(const minimax_h3::GenerationParameters& p,
     return fail("Wan 2.1 camera jobs use the 'wan21' preset");
   const int w = p.output_width, h = p.output_height;
   if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
-      h % 16 != 0 || w * h > 832 * 480)
+      h % 16 != 0 || w * h > 896 * 512)
     return fail(
         "size must be WxH with multiples of 16, 256..1024 per side and at "
         "most 832x480 pixels");

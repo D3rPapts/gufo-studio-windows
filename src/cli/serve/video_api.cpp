@@ -874,7 +874,7 @@ std::optional<std::vector<std::uint8_t>> DecodeBase64(std::string_view text) {
 }
 
 // Wan 2.1 I2V 14B + Uni3C ("wan2.1-uni3c"): {"model", "prompt", "size"
-// (default "832x480", multiples of 16, at most 832x480 pixels), "seconds"
+// (default "832x480", multiples of 16, at most 896x512 pixels), "seconds"
 // (0.25..5 at 16 fps, default 5), "first_frame" or "input_reference"
 // (required), "gufo": {"seed", "steps" (default 4), "frames",
 // "interpolate", "camera": {"type", "amount", "speed", "ease"} |
@@ -1614,7 +1614,7 @@ HttpResponse CreateWan21VaceVideo(
 }
 
 // Wan 2.1 I2V 14B + InfiniteTalk ("wan2.1-infinitetalk-14b"): {"model",
-// "prompt", "size" (default "832x480", multiples of 16, at most 832x480
+// "prompt", "size" (default "832x480", multiples of 16, at most 896x512
 // pixels), "seconds" (optional, 0.04..60 at 25 fps; default: the audio
 // length), "first_frame" or "input_reference" (required), "gufo": {"seed",
 // "steps" (default 4), "interpolate", "upscale", "preview", "talk": {"audio":
