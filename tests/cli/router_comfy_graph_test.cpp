@@ -1531,6 +1531,23 @@ void TestInfiniteTalk() {
   assert(ErrorOf(Replace(two, "\"mode.mask_2\": [\"43\", 1]",
                          "\"mode.mask_2\": [\"43\", 0]"))
              .message.find("LoadImageMask") != std::string::npos);
+  // ImageToMask on a loaded still keeps its colour channel (mehrsprecher
+  // graphs build speaker masks this way).
+  std::string to_mask = Replace(
+      two, "\"mode.mask_1\": [\"42\", 0]", "\"mode.mask_1\": [\"45\", 0]");
+  to_mask = Replace(
+      to_mask, " \"10\": {",
+      " \"44\": {\"class_type\": \"LoadImage\", \"inputs\": {\"image\": "
+      "\"maske_rot.png\"}},\n \"45\": {\"class_type\": \"ImageToMask\", "
+      "\"inputs\": {\"image\": [\"44\", 0], \"channel\": \"red\"}},\n "
+      "\"10\": {");
+  const comfy::Plan to_mask_plan = PlanOf(to_mask.c_str());
+  const auto& red = std::get<comfy::VideoTask>(to_mask_plan.tasks[0].spec);
+  assert((red.talk_masks[0] == comfy::FileRef{"maske_rot.png", "input"}));
+  assert(red.talk_mask_channels[0] == "red");
+  assert(ErrorOf(Replace(to_mask, "\"channel\": \"red\"}},\n \"10\"",
+                         "\"channel\": \"alpha\"}},\n \"10\""))
+             .message.find("red, green or blue") != std::string::npos);
 
   // A second window continuing from the first (previous_frames) runs as one
   // job: 81 + (81 - 9) frames.

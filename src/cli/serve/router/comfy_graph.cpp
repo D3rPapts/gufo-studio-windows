@@ -2092,10 +2092,27 @@ std::pair<FileRef, std::string> TalkMask(const Graph& graph,
     return {ParseFileRef(graph.Str(link.node, "image"), "input"),
             channel == "alpha" ? "inverted_alpha" : channel};
   }
+  if (source == "ImageToMask") {
+    // ImageToMask(LoadImage, channel): one colour channel of a loaded
+    // still, as mehrsprecher-style graphs build speaker masks.
+    const std::string channel = graph.Str(link.node, "channel", "red");
+    if (channel != "red" && channel != "green" && channel != "blue")
+      throw NodeFailure(link.node, "value_not_in_list",
+                        "channel must be red, green or blue");
+    const Link image = graph.RequireLink(link.node, "image");
+    const std::string loader = graph.Class(image.node);
+    if ((loader != "LoadImage" && loader != "LoadImageOutput") ||
+        image.slot != 0)
+      throw NodeFailure(link.node, "unsupported_link",
+                        "ImageToMask for '" + key +
+                            "' must read the IMAGE output of LoadImage, not " +
+                            loader);
+    return {ImageFile(graph, link.node, "image", image), channel};
+  }
   throw NodeFailure(id, "unsupported_link",
                     "input '" + key +
-                        "' must come from LoadImageMask or the MASK output of "
-                        "LoadImage, not " +
+                        "' must come from LoadImageMask, ImageToMask (on "
+                        "LoadImage) or the MASK output of LoadImage, not " +
                         source);
 }
 
