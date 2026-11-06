@@ -569,12 +569,15 @@ bool WriteMp4WithAudio(const std::filesystem::path& path,
       Widen(size),    L"-framerate",   std::to_wstring(fps),
       L"-i",          L"-"};
   if (!audio.empty()) {
-    // Second input: the audio track, AAC, cut to the video.
+    // Second input: the audio track, AAC. apad pads a shorter track with
+    // silence, so -shortest always ends at the video: without it FFmpeg
+    // stops reading the frames when the audio ends and the pipe write fails.
     for (const std::wstring& argument :
          {std::wstring(L"-i"), audio.wstring(), std::wstring(L"-map"),
           std::wstring(L"0:v"), std::wstring(L"-map"), std::wstring(L"1:a"),
-          std::wstring(L"-c:a"), std::wstring(L"aac"), std::wstring(L"-b:a"),
-          std::wstring(L"192k"), std::wstring(L"-shortest")})
+          std::wstring(L"-af"), std::wstring(L"apad"), std::wstring(L"-c:a"),
+          std::wstring(L"aac"), std::wstring(L"-b:a"), std::wstring(L"192k"),
+          std::wstring(L"-shortest")})
       arguments.push_back(argument);
   }
   for (const wchar_t* argument :
@@ -594,7 +597,8 @@ bool WriteMp4WithAudio(const std::filesystem::path& path,
       " -i - " +
       (audio.empty() ? std::string()
                      : "-i '" + audio.string() +
-                           "' -map 0:v -map 1:a -c:a aac -b:a 192k -shortest ") +
+                           "' -map 0:v -map 1:a -af apad -c:a aac -b:a 192k "
+                           "-shortest ") +
       "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags "
       "+faststart '" +
       partial.string() + "' 2> '" + log.string() + "'";
