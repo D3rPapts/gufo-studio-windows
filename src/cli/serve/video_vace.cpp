@@ -26,51 +26,6 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
-// Up to `max_frames` frames of an MP4, each fitted to width x height like the
-// first frame of the other Wan runners (cover, centre crop).
-bool ReadFittedVideo(const std::filesystem::path& path, int width, int height,
-                     int max_frames, std::vector<std::uint8_t>* frames,
-                     int* count, std::string* error) {
-  models::rife::VideoInfo info;
-  if (!models::rife::ProbeVideo(path, &info, error))
-    return false;
-  if (info.width < 16 || info.height < 16 || info.width > 4096 ||
-      info.height > 4096) {
-    SetError(error, "a VACE video has an unsupported size");
-    return false;
-  }
-  models::rife::FrameReader reader;
-  if (!reader.Open(path, info.width, info.height, error))
-    return false;
-  const std::size_t frame = static_cast<std::size_t>(width) * height * 3;
-  std::vector<std::uint8_t> source(static_cast<std::size_t>(info.width) *
-                                   info.height * 3);
-  frames->clear();
-  *count = 0;
-  for (int f = 0; f < max_frames; ++f) {
-    bool end = false;
-    if (!reader.Read(source.data(), &end, error)) {
-      if (!end)
-        return false;
-      break;
-    }
-    const auto fitted = models::wan22::FitImage(source, info.width,
-                                                info.height, width, height);
-    if (fitted.size() != frame) {
-      SetError(error, "cannot scale a VACE video");
-      return false;
-    }
-    frames->insert(frames->end(), fitted.begin(), fitted.end());
-    ++*count;
-  }
-  reader.Close();
-  if (*count == 0) {
-    SetError(error, "a VACE video has no frames");
-    return false;
-  }
-  return true;
-}
-
 // Binary PPM (P6, maxval 255) as written by the video API for still masks.
 bool ReadPpm(const std::filesystem::path& path, std::vector<std::uint8_t>* rgb,
              int* width, int* height, std::string* error) {
@@ -96,6 +51,51 @@ bool ReadPpm(const std::filesystem::path& path, std::vector<std::uint8_t>* rgb,
 #endif
 
 }  // namespace
+
+#if defined(ENGINE_ENABLE_HIP)
+bool ReadFittedVideo(const std::filesystem::path& path, int width, int height,
+                     int max_frames, std::vector<std::uint8_t>* frames,
+                     int* count, std::string* error) {
+  models::rife::VideoInfo info;
+  if (!models::rife::ProbeVideo(path, &info, error))
+    return false;
+  if (info.width < 16 || info.height < 16 || info.width > 4096 ||
+      info.height > 4096) {
+    SetError(error, "a video input has an unsupported size");
+    return false;
+  }
+  models::rife::FrameReader reader;
+  if (!reader.Open(path, info.width, info.height, error))
+    return false;
+  const std::size_t frame = static_cast<std::size_t>(width) * height * 3;
+  std::vector<std::uint8_t> source(static_cast<std::size_t>(info.width) *
+                                   info.height * 3);
+  frames->clear();
+  *count = 0;
+  for (int f = 0; f < max_frames; ++f) {
+    bool end = false;
+    if (!reader.Read(source.data(), &end, error)) {
+      if (!end)
+        return false;
+      break;
+    }
+    const auto fitted = models::wan22::FitImage(source, info.width,
+                                                info.height, width, height);
+    if (fitted.size() != frame) {
+      SetError(error, "cannot scale a video input");
+      return false;
+    }
+    frames->insert(frames->end(), fitted.begin(), fitted.end());
+    ++*count;
+  }
+  reader.Close();
+  if (*count == 0) {
+    SetError(error, "a video input has no frames");
+    return false;
+  }
+  return true;
+}
+#endif
 
 bool RunWan21VaceJob(const minimax_h3::GenerationRequest& request,
                      const minimax_h3::CancellationToken* cancellation,

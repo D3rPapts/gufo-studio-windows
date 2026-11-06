@@ -378,6 +378,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->guide_video);
       if (video->control_video)
         files->push_back(*video->control_video);
+      if (video->talk_video)
+        files->push_back(*video->talk_video);
       if (video->vace_mask)
         files->push_back(*video->vace_mask);
       files->insert(files->end(), video->reference_images.begin(),
@@ -1896,6 +1898,9 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                                   Base64Encode(ReadFileRef(ref))));
     body["gufo"]["talk"]["audio"] = std::move(audio);
   }
+  if (spec.talk_video)
+    body["gufo"]["talk"]["video"] = "data:video/mp4;base64," +
+                                    Base64Encode(ReadFileRef(*spec.talk_video));
   if (!spec.talk_masks.empty()) {
     // gufo reads bright pixels as the speaker: extract the ComfyUI mask
     // channel (inverted alpha, red, green or blue) as a grey image.

@@ -31,7 +31,11 @@
 //          after it -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
 //          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
-//          windows via previous_frames become one job)
+//          windows via previous_frames become one job; video to video:
+//          latent_image from VAEEncode of LoadVideo -> GetVideoComponents
+//          or VHS_LoadVideo with denoise < 1 (KSampler denoise,
+//          KSamplerAdvanced start_at_step, BasicScheduler denoise or
+//          SplitSigmas))
 //          -> /v1/videos (wan2.1-infinitetalk-14b, gufo.talk, 25 fps)
 //   foley  MMAudioSampler (kijai/ComfyUI-MMAudio) <- MMAudioModelLoader +
 //          MMAudioFeatureUtilsLoader, images from VHS_LoadVideo /
@@ -360,6 +364,11 @@ struct VideoTask {
   std::vector<FileRef> talk_audio;
   std::vector<FileRef> talk_masks;
   std::vector<std::string> talk_mask_channels;
+  /// Talk video to video: the sampler's latent is VAEEncode of this video
+  /// (LoadVideo -> GetVideoComponents, or VHS_LoadVideo) with denoise < 1,
+  /// sent as gufo.talk.video (by the executor) and gufo.talk.denoise.
+  std::optional<FileRef> talk_video;
+  std::optional<double> talk_denoise;
   double audio_scale{1.0};
   int motion_frames{9};
 };

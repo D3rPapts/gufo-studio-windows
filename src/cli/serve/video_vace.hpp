@@ -3,7 +3,10 @@
 
 // Written with AI assistance (Claude Code).
 
+#include <cstdint>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include "src/models/minimax_h3/generation.hpp"
 
@@ -31,6 +34,15 @@ namespace gufo::server {
     const minimax_h3::CancellationToken* cancellation,
     minimax_h3::GenerationProgress progress, void* progress_opaque,
     minimax_h3::GenerationTelemetry* telemetry, std::string* error);
+
+// Up to `max_frames` frames of an MP4, each fitted to width x height like the
+// first frame of the Wan runners (cover, centre crop), as RGB8 frames one
+// after another; `count` is how many were read (at least one). HIP builds
+// only (VACE control video, InfiniteTalk input video).
+[[nodiscard]] bool ReadFittedVideo(const std::filesystem::path& path,
+                                   int width, int height, int max_frames,
+                                   std::vector<std::uint8_t>* frames,
+                                   int* count, std::string* error);
 
 }  // namespace gufo::server
 
