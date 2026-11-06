@@ -1498,7 +1498,7 @@ void TestInfiniteTalk() {
   const json::Value* talk = gufo->find("talk");
   assert(talk->find("audio_scale")->as_double() == 1.0);
   assert(talk->find("motion_frames")->as_double() == 9);
-  assert(talk->member_str("audio_mode") == "add");
+  assert(talk->member_str("audio_mode") == "auto");
 
   // Two speakers: mask_1 from LoadImageMask (alpha), mask_2 from LoadImage's
   // MASK output.

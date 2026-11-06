@@ -176,8 +176,10 @@ bool ParseTalkOptions(const json::Value& talk, std::string* normalized,
     out["audio_scale"] = v;
   }
   if (const json::Value* mode = talk.find("audio_mode")) {
-    if (!mode->is_string() || (mode->str() != "add" && mode->str() != "para")) {
-      SetError(error, "'gufo.talk.audio_mode' must be \"add\" or \"para\"");
+    if (!mode->is_string() || (mode->str() != "add" && mode->str() != "para" &&
+                               mode->str() != "auto")) {
+      SetError(error,
+               "'gufo.talk.audio_mode' must be \"add\", \"para\" or \"auto\"");
       return false;
     }
     out["audio_mode"] = mode->str();

@@ -2684,7 +2684,9 @@ json::Value VideoRequestBody(const VideoTask& task) {
     json::Value talk = json::Value::object();
     talk["audio_scale"] = task.audio_scale;
     talk["motion_frames"] = task.motion_frames;
-    talk["audio_mode"] = "add";
+    // "auto": two tracks of the same length -> "para" (each line at its place
+    // on one time line), else "add" as in ComfyUI core.
+    talk["audio_mode"] = "auto";
     gufo["talk"] = std::move(talk);
   } else {
     body["size"] =

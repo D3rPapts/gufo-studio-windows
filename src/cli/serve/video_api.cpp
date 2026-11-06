@@ -1620,7 +1620,8 @@ HttpResponse CreateWan21VaceVideo(
 // "steps" (default 4), "interpolate", "upscale", "preview", "talk": {"audio":
 // [one or two audio files as data URLs / base64], "speaker_masks": [two
 // images, bright = the speaker; required with two speakers], "audio_scale",
-// "audio_mode" ("add": speaker 2 after speaker 1, "para": together),
+// "audio_mode" ("add": speaker 2 after speaker 1, "para": together, "auto":
+// "para" when both tracks have the same length, else "add"),
 // "motion_frames"}}}. Multipart uploads may carry "audio_1", "audio_2",
 // "mask_1" and "mask_2" files instead.
 HttpResponse CreateTalkVideo(const json::Value& body,
@@ -1854,6 +1855,15 @@ HttpResponse CreateTalkVideo(const json::Value& body,
                  "two speakers need exactly two speaker masks (and one "
                  "speaker none)",
                  "invalid_speaker_masks");
+  }
+  // "auto" (ComfyUI adapter): two tracks of the same length already share one
+  // time line -> "para"; otherwise "add", like the patched ComfyUI node.
+  if (talk_json.find("\"auto\"") != std::string::npos) {
+    const bool same = speakers.size() == 2 &&
+                      TalkFramesForAudio(speakers[0].waveform) ==
+                          TalkFramesForAudio(speakers[1].waveform);
+    talk_json.replace(talk_json.find("\"auto\""), 6,
+                      same ? "\"para\"" : "\"add\"");
   }
   // Duration: "seconds", or the audio ("add": the speakers in turn).
   int audio_frames = 0;
