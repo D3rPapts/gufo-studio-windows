@@ -385,9 +385,12 @@ bool GenerateTalk21(const Talk21Request& request,
       progress("denoiser", done, total_steps);
     }
     // Continuations decode with the motion latents in front (ComfyUI's
-    // InfiniteTalkOuterSampleWrapper), then drop those frames.
-    if (window > 0)
-      pin(latents);
+    // InfiniteTalkOuterSampleWrapper), then drop those frames. The first
+    // window also gets the start image's latent back: the model's own
+    // prediction of that frame comes out with more contrast than the start
+    // image (a visible colour jump at frame 0 of every clip; ComfyUI keeps
+    // the prediction).
+    pin(latents);
     if (window == 0)
       dump("final", latents, shape16);
     if (cancelled())
