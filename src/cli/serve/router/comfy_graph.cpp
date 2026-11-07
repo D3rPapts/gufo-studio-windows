@@ -939,8 +939,9 @@ json::Value LowerCustomSamplers(const json::Value& prompt,
     folded["class_type"] = "KSampler";
     folded["inputs"] = std::move(inputs);
     lowered.emplace(id, std::move(folded));
-    for (const Link* part : {&noise, &guider, &sampler, &sigmas})
+    for (const Link* part : {&noise, &guider, &sampler})
       parts.insert(part->node);
+    parts.insert(sigmas.node);
     if (split)
       parts.insert(split->node);
   }
