@@ -5,7 +5,7 @@ How gufo-studio-windows serves chat, images, video, speech and music from two GM
 Every model sits behind one port on each machine; the routers know each other and hand requests across a
 direct cable.
 
-_Written with AI assistance (Claude Code) from our configuration and test logs. Status: November 2026, updated for release 1.4.2._
+_Written with AI assistance (Claude Code) from our configuration and test logs. Status: November 2026, updated for release 1.4.3._
 
 ## Schematic
 
