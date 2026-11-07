@@ -210,6 +210,9 @@ struct Engine::Impl {
   std::uint64_t cached_key{0};
   bool has_cache{false};
   RefCond cache;
+  // 25 Euler steps, CFG 0.7 as in infer_v2_5.py; GUFO_INDEXTTS_CFM_STEPS (4..50) trades quality for
+  // speed (opt-in, not the reference).
+  CfmOptions cfm;
 
   void BuildReference(std::span<const float> mono, std::int64_t rate, RefCond* out) {
     // _load_and_cut_audio(spk, 15)
@@ -281,6 +284,9 @@ std::unique_ptr<Engine> Engine::Create(const std::filesystem::path& dir, std::st
   if (m.s2mel == nullptr) return nullptr;
   m.vocoder = BigVgan::Load(dir / "bigvgan_v2_22khz_80band_256x", error);
   if (m.vocoder == nullptr) return nullptr;
+  if (const char* steps = std::getenv("GUFO_INDEXTTS_CFM_STEPS"); steps != nullptr) {
+    m.cfm.steps = std::clamp(std::atoi(steps), 4, 50);
+  }
   // GUFO_INDEXTTS_BACKEND=cpu forces the CPU path, =hip makes a missing GPU an error.
   const char* backend = std::getenv("GUFO_INDEXTTS_BACKEND");
   const std::string want = backend != nullptr ? backend : "";
@@ -435,9 +441,9 @@ bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
       const std::vector<float> mel =
           m.gpu != nullptr
               ? m.gpu->CfmSample(noise, mu.data(), total, ref.ref_mel.data(), ref.ref_frames, ref.style.data(),
-                                 CfmOptions{})
+                                 m.cfm)
               : m.s2mel->Sample(std::move(noise), mu.data(), total, ref.ref_mel.data(), ref.ref_frames,
-                                ref.style.data(), CfmOptions{});
+                                ref.style.data(), m.cfm);
       result->s2mel_seconds += Seconds(t0);
       t0 = Clock::now();
       const std::vector<float> wav = m.gpu != nullptr

@@ -64,6 +64,10 @@ void LaunchClamp(float* y, float lo, float hi, std::size_t n, hipStream_t stream
 // dst[r, 0:a_cols] = a[r], dst[r, a_cols:] = b[r]
 void LaunchConcatCols(const float* a, const float* b, float* dst, std::size_t rows,
                       std::size_t a_cols, std::size_t b_cols, hipStream_t stream);
+// y = bf16(x), round to nearest even (GEMM operands of the hipBLASLt DiT path).
+void LaunchF32ToBf16(const float* x, std::uint16_t* y, std::size_t n, hipStream_t stream);
+// In-place FP32 softmax of each row of s [rows, cols] (attention scores).
+void LaunchSoftmaxRows(float* s, std::size_t rows, std::size_t cols, hipStream_t stream);
 
 }  // namespace gufo::models::indextts::hip
 #endif

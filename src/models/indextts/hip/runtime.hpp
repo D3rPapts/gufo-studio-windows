@@ -42,6 +42,12 @@ public:
   // BigVgan::Synthesize on the device.
   [[nodiscard]] std::vector<float> Vocode(const float* mel, std::int64_t frames);
 
+  // DiT/CFM kernels: true (default, unless GUFO_INDEXTTS_DIT_FAST=0) = CFG as batch 2, hipBLASLt BF16
+  // projections and GEMM attention; false = the first port's tiled GEMM / per-row attention (A/B tests).
+  void SetFastDit(bool fast);
+  // With GUFO_INDEXTTS_PROFILE=1: per-category GPU times of the last CfmSample, else empty.
+  [[nodiscard]] std::string LastCfmProfile() const;
+
   struct Impl;
 
 private:

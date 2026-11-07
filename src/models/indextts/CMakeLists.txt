@@ -48,10 +48,13 @@ elseif (MSVC)
 endif()
 
 if (ENGINE_ENABLE_HIP)
-  target_sources(gufo_indextts PRIVATE hip/ops.hip)
+  # blas.cpp: hipBLASLt BF16 projections + FP32 batched attention GEMMs of the DiT/CFM.
+  target_sources(gufo_indextts PRIVATE hip/ops.hip hip/blas.cpp)
   target_compile_definitions(gufo_indextts PRIVATE ENGINE_ENABLE_HIP=1)
   target_link_libraries(gufo_indextts PUBLIC
     gufo_voxcpm2
     gufo_fish_drama3
-    hip::host)
+    hip::host
+    roc::hipblas
+    roc::hipblaslt)
 endif()

@@ -5,11 +5,15 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #include "src/models/fish_drama3/hip/codec_ops.hpp"
+#include "src/models/indextts/hip/blas.hpp"
 #include "src/models/indextts/hip/ops.hpp"
 #include "src/models/ming_tts/hip/ops.hpp"
 #include "src/models/voxcpm2/hip/ops.hpp"
@@ -39,6 +43,8 @@ std::vector<float> Runtime::Velocity(const float*, const float*, float, const fl
   return {};
 }
 std::vector<float> Runtime::Vocode(const float*, std::int64_t) { return {}; }
+void Runtime::SetFastDit(bool) {}
+std::string Runtime::LastCfmProfile() const { return {}; }
 
 #else
 
@@ -142,6 +148,58 @@ struct ActDev {
   const float* down{nullptr};
 };
 
+// Optional per-category GPU timing of the CFM loop (GUFO_INDEXTTS_PROFILE=1):
+// an event is recorded at every category boundary on the single stream; the
+// time between two marks is charged to the category of the first one.
+struct Prof {
+  enum Cat { kGemm = 0, kAttention, kConv, kOther, kCount };
+  bool on{false};
+  std::vector<hipEvent_t> pool;
+  std::vector<int> cats;
+  std::size_t used{0};
+  double ms[kCount]{};
+  ~Prof() {
+    for (hipEvent_t e : pool) {
+      (void)hipEventDestroy(e);
+    }
+  }
+  void Reset() {
+    for (double& m : ms) {
+      m = 0.0;
+    }
+    used = 0;
+    cats.clear();
+  }
+  void Mark(Cat cat, hipStream_t stream) {
+    if (!on) {
+      return;
+    }
+    if (used == pool.size()) {
+      hipEvent_t e = nullptr;
+      Check(hipEventCreate(&e), "profile event");
+      pool.push_back(e);
+    }
+    Check(hipEventRecord(pool[used], stream), "profile record");
+    cats.push_back(cat);
+    ++used;
+  }
+  void Flush() {
+    if (!on) {
+      return;
+    }
+    if (used >= 2) {
+      Check(hipEventSynchronize(pool[used - 1]), "profile sync");
+      for (std::size_t i = 0; i + 1 < used; ++i) {
+        float m = 0.0F;
+        (void)hipEventElapsedTime(&m, pool[i], pool[i + 1]);
+        ms[cats[i]] += m;
+      }
+    }
+    used = 0;
+    cats.clear();
+  }
+};
+
 }  // namespace
 
 struct Runtime::Impl {
@@ -173,8 +231,21 @@ struct Runtime::Impl {
   Lin wn_res[8], wn_skip[8];
   float* inv_freq{nullptr};
   Buf h, h2, xin, dq, dk, dv, datt, f1, f3, col, c_cond, c_uncond, wx, out, rs, sk, acts, v_c, v_u,
-      dx, dprompt, dcond, ada, wng, fmod, tmp, xres;
+      dx, dprompt, dcond, ada, wng, fmod, tmp, xres, xb, scores;
   std::vector<std::unique_ptr<Buf>> skips;
+  // Fast DiT path (default): CFG branches as one batch of 2, hipBLASLt BF16
+  // projections, FP32 GEMM attention. GUFO_INDEXTTS_DIT_FAST=0 selects the
+  // first port's kernels (tiled FP32xBF16 GEMM, per-row attention) for A/B.
+  bool fast{true};
+  std::unique_ptr<Blas> blas;
+  Prof prof;
+  std::string last_profile;
+  // time-only conditioning of the current step (device) and the cache of the
+  // whole Euler time grid (the same for every request with the same step count)
+  const float *cur_ada{nullptr}, *cur_wng{nullptr}, *cur_fmod{nullptr};
+  std::vector<float> grid_times;
+  Buf grid_ada, grid_wng, grid_fmod;
+  std::size_t ada_n{0}, wng_n{0}, fmod_n{0};
   // ---- BigVGAN
   const BigVgan* voc{nullptr};
   Conv pre, post;
@@ -417,23 +488,79 @@ struct Runtime::Impl {
     Check(hipStreamSynchronize(stream), "gpt sync");
   }
 
-  // One DiT estimator evaluation on device buffers: x/v [t, 80], c = merge(prompt, cond, style) [t, 512].
-  void Estimator(const float* xd, const float* cd, std::int64_t t, float* vout) {
+  // ---- DiT building blocks: fast path (hipBLASLt / GEMM attention) or the first port's kernels
+  // y = x W^T + b (+ y when `accumulate`). Fast path: y must hold Blas::PaddedRows(rows) rows.
+  void DLinear(const float* x_in, std::int64_t rows, const Lin& l, float* y_out, bool accumulate) {
+    prof.Mark(Prof::kGemm, stream);
+    if (!fast) {
+      if (accumulate) {
+        LinearAdd(x_in, rows, l, y_out);
+      } else {
+        Linear(x_in, rows, l, y_out);
+      }
+      prof.Mark(Prof::kOther, stream);
+      return;
+    }
+    const auto r = static_cast<std::size_t>(rows);
+    const std::size_t padded = Blas::PaddedRows(r);
+    auto* x16 = reinterpret_cast<std::uint16_t*>(xb.Ensure((padded * static_cast<std::size_t>(l.in) + 1) / 2));
+    LaunchF32ToBf16(x_in, x16, r * static_cast<std::size_t>(l.in), stream);
+    blas->Gemm(l.w, x16, y_out, r, static_cast<std::size_t>(l.out), static_cast<std::size_t>(l.in), accumulate);
+    if (l.b != nullptr) {
+      ming::LaunchAddBias(y_out, l.b, r, static_cast<std::size_t>(l.out), stream);
+    }
+    prof.Mark(Prof::kOther, stream);
+  }
+  // Non-causal 8-head attention of `nb` independent sequences of t rows ([nb * t, 512]).
+  void DAttention(const float* qp, const float* kp, const float* vp, float* ap, std::size_t t, std::size_t nb) {
+    constexpr std::size_t D = 512;
+    prof.Mark(Prof::kAttention, stream);
+    if (!fast) {
+      vox::LaunchAttention(qp, kp, vp, ap, nb, t, t, 8, 8, 64, t * D, t * D, false, 0, stream);
+    } else {
+      float* s = scores.Ensure(8 * t * t);
+      for (std::size_t b = 0; b < nb; ++b) {
+        blas->Attention64(qp + b * t * D, kp + b * t * D, vp + b * t * D, ap + b * t * D, s, t, 8);
+      }
+    }
+    prof.Mark(Prof::kOther, stream);
+  }
+  // Time-major conv of `nb` sequences of t rows (im2col per sequence, one GEMM).
+  void DConv(const Conv& c, const float* x_in, std::int64_t t, std::int64_t nb, float* y_out) {
+    const std::int64_t t_out = t + c.pad_left + c.pad_right - c.dil * (c.k - 1);
+    const auto per = static_cast<std::size_t>(t_out * c.k * c.cin);
+    float* colp = col.Ensure(per * static_cast<std::size_t>(nb));
+    prof.Mark(Prof::kConv, stream);
+    for (std::int64_t b = 0; b < nb; ++b) {
+      LaunchIm2colTM(x_in + b * t * c.cin, colp + static_cast<std::size_t>(b) * per, static_cast<std::size_t>(t),
+                     static_cast<std::size_t>(t_out), static_cast<std::size_t>(c.cin),
+                     static_cast<std::size_t>(c.k), static_cast<std::size_t>(c.dil), c.pad_left, c.mode, stream);
+    }
+    DLinear(colp, t_out * nb, c.lin, y_out, false);
+    prof.Mark(Prof::kOther, stream);
+  }
+
+  // One DiT estimator evaluation of `nb` sequences (CFG: nb = 2, conditional then unconditional) on
+  // device buffers: x/v [nb * t, 80], c = merge(prompt, cond, style) [nb * t, 512]. Time-only terms from
+  // cur_ada / cur_wng / cur_fmod.
+  void Estimator(const float* xd, const float* cd, std::int64_t t, std::int64_t nb, float* vout) {
     constexpr std::int64_t D = 512;
     const auto tt = static_cast<std::size_t>(t);
-    float* hp = h.Ensure(tt * D);
-    float* yp = h2.Ensure(tt * D);
-    Linear(xd, t, merge_x, hp);
-    ming::LaunchAdd(hp, cd, tt * D, stream);
-    float* qkvp = xin.Ensure(tt * 3 * D);
-    float* qp = dq.Ensure(tt * D);
-    float* kp = dk.Ensure(tt * D);
-    float* vp = dv.Ensure(tt * D);
-    float* ap = datt.Ensure(tt * D);
-    float* f1p = f1.Ensure(tt * 1536);
-    float* f3p = f3.Ensure(tt * 1536);
-    float* catp = tmp.Ensure(tt * 2 * D);  // also LinearAdd scratch for rows > 32 (sized below)
-    (void)catp;
+    const auto rows = static_cast<std::size_t>(t * nb);
+    const std::int64_t R = t * nb;
+    const std::size_t pr = Blas::PaddedRows(rows);  // GEMM outputs hold padded rows
+    float* hp = h.Ensure(pr * D);
+    float* yp = h2.Ensure(pr * D);
+    prof.Mark(Prof::kOther, stream);
+    DLinear(xd, R, merge_x, hp, false);
+    ming::LaunchAdd(hp, cd, rows * D, stream);
+    float* qkvp = xin.Ensure(pr * 3 * D);
+    float* qp = dq.Ensure(pr * D);
+    float* kp = dk.Ensure(pr * D);
+    float* vp = dv.Ensure(pr * D);
+    float* ap = datt.Ensure(pr * D);
+    float* f1p = f1.Ensure(pr * 1536);
+    float* f3p = f3.Ensure(pr * 1536);
     while (skips.size() < 6) {
       skips.push_back(std::make_unique<Buf>());
     }
@@ -441,52 +568,54 @@ struct Runtime::Impl {
     for (int l = 0; l < 13; ++l) {
       const DitLayer& L = dit[static_cast<std::size_t>(l)];
       if (l > 6) {
-        float* cat = col.Ensure(tt * 2 * D);
-        LaunchConcatCols(hp, skips[--skip_top]->p, cat, tt, D, D, stream);
-        Linear(cat, t, L.skip_in, hp);
+        float* cat = col.Ensure(rows * 2 * D);
+        LaunchConcatCols(hp, skips[--skip_top]->p, cat, rows, D, D, stream);
+        DLinear(cat, R, L.skip_in, hp, false);
       }
-      LaunchAdaRmsNorm(hp, L.attn_norm, ada.p + (2 * l) * 2 * D, yp, tt, D, 1e-5F, stream);
-      Linear(yp, t, L.wqkv, qkvp);
-      LaunchSplitQkv(qkvp, qp, kp, vp, tt, D, stream);
-      ming::LaunchRopeInterleaved(qp, tt, tt, 8, 64, inv_freq, stream);
-      ming::LaunchRopeInterleaved(kp, tt, tt, 8, 64, inv_freq, stream);
-      vox::LaunchAttention(qp, kp, vp, ap, 1, tt, tt, 8, 8, 64, tt * D, tt * D, false, 0, stream);
-      LinearAdd(ap, t, L.wo, hp);
-      LaunchAdaRmsNorm(hp, L.ffn_norm, ada.p + (2 * l + 1) * 2 * D, yp, tt, D, 1e-5F, stream);
-      Linear(yp, t, L.w1, f1p);
-      Linear(yp, t, L.w3, f3p);
-      ming::LaunchSiluMul(f1p, f3p, tt * 1536, stream);
-      LinearAdd(f1p, t, L.w2, hp);
+      LaunchAdaRmsNorm(hp, L.attn_norm, cur_ada + (2 * l) * 2 * D, yp, rows, D, 1e-5F, stream);
+      DLinear(yp, R, L.wqkv, qkvp, false);
+      LaunchSplitQkv(qkvp, qp, kp, vp, rows, D, stream);
+      ming::LaunchRopeInterleaved(qp, rows, tt, 8, 64, inv_freq, stream);  // position = row % t
+      ming::LaunchRopeInterleaved(kp, rows, tt, 8, 64, inv_freq, stream);
+      DAttention(qp, kp, vp, ap, tt, static_cast<std::size_t>(nb));
+      DLinear(ap, R, L.wo, hp, true);
+      LaunchAdaRmsNorm(hp, L.ffn_norm, cur_ada + (2 * l + 1) * 2 * D, yp, rows, D, 1e-5F, stream);
+      DLinear(yp, R, L.w1, f1p, false);
+      DLinear(yp, R, L.w3, f3p, false);
+      ming::LaunchSiluMul(f1p, f3p, rows * 1536, stream);
+      DLinear(f1p, R, L.w2, hp, true);
       if (l < 6) {
-        float* s = skips[skip_top++]->Ensure(tt * D);
-        Check(hipMemcpyAsync(s, hp, tt * D * 4, hipMemcpyDeviceToDevice, stream), "skip");
+        float* s = skips[skip_top++]->Ensure(rows * D);
+        Check(hipMemcpyAsync(s, hp, rows * D * 4, hipMemcpyDeviceToDevice, stream), "skip");
       }
     }
-    LaunchAdaRmsNorm(hp, final_norm_w, ada.p + 26 * 2 * D, yp, tt, D, 1e-5F, stream);
-    float* cat = col.Ensure(tt * (D + 80));
-    LaunchConcatCols(yp, xd, cat, tt, D, 80, stream);
-    float* xr = xres.Ensure(tt * D);
-    Linear(cat, t, skip_linear, xr);
-    float* w = wx.Ensure(tt * D);
-    Linear(xr, t, conv1, w);
-    float* o = out.Ensure(tt * D);
-    Check(hipMemsetAsync(o, 0, tt * D * 4, stream), "zero");
-    float* a2 = rs.Ensure(tt * 2 * D);
-    float* ac = acts.Ensure(tt * D);
+    LaunchAdaRmsNorm(hp, final_norm_w, cur_ada + 26 * 2 * D, yp, rows, D, 1e-5F, stream);
+    float* cat = col.Ensure(rows * (D + 80));
+    LaunchConcatCols(yp, xd, cat, rows, D, 80, stream);
+    float* xr = xres.Ensure(pr * D);
+    DLinear(cat, R, skip_linear, xr, false);
+    float* w = wx.Ensure(pr * D);
+    DLinear(xr, R, conv1, w, false);
+    float* o = out.Ensure(pr * D);
+    Check(hipMemsetAsync(o, 0, rows * D * 4, stream), "zero");
+    float* a2 = rs.Ensure(pr * 2 * D);
+    float* ac = acts.Ensure(pr * D);
     for (int i = 0; i < 8; ++i) {
-      RunConv(wn_in[i], w, t, a2);
-      LaunchWaveNetGate(a2, wng.p + i * 2 * D, ac, tt, D, stream);
+      DConv(wn_in[i], w, t, nb, a2);
+      LaunchWaveNetGate(a2, cur_wng + i * 2 * D, ac, rows, D, stream);
       if (i < 7) {
-        LinearAdd(ac, t, wn_res[i], w);
+        DLinear(ac, R, wn_res[i], w, true);
       }
-      LinearAdd(ac, t, wn_skip[i], o);
+      DLinear(ac, R, wn_skip[i], o, true);
     }
-    LinearAdd(xr, t, res_projection, o);
-    LaunchModulatedLayerNorm(o, fmod.p, yp, tt, D, 1e-6F, stream);
-    Linear(yp, t, final_linear, ap);
-    Linear(ap, t, conv2, vout);
+    DLinear(xr, R, res_projection, o, true);
+    LaunchModulatedLayerNorm(o, cur_fmod, yp, rows, D, 1e-6F, stream);
+    DLinear(yp, R, final_linear, ap, false);
+    DLinear(ap, R, conv2, vout, false);
+    prof.Mark(Prof::kOther, stream);
   }
 
+  // Time-only conditioning of one time value into the single-step buffers (tests / Velocity).
   void UploadTime(float time) {
     const S2Mel::TimeConditioning tc = s2mel->TimeCondition(time);
     Check(hipMemcpyAsync(ada.Ensure(tc.ada.size()), tc.ada.data(), tc.ada.size() * 4, hipMemcpyHostToDevice,
@@ -499,9 +628,39 @@ struct Runtime::Impl {
                          hipMemcpyHostToDevice, stream),
           "fmod");
     Check(hipStreamSynchronize(stream), "time sync");
+    cur_ada = ada.p;
+    cur_wng = wng.p;
+    cur_fmod = fmod.p;
   }
 
-  // c = merge_rest([prompt, cond_projection(mu), style]) + bias for one branch
+  // The time conditioning of every Euler step depends only on the step count, so it is computed once on
+  // the CPU and kept on the device (the first port recomputed and uploaded it every step).
+  void PrepareTimeGrid(const std::vector<float>& times) {
+    if (times == grid_times) {
+      return;
+    }
+    std::vector<float> a, w, f;
+    for (const float time : times) {
+      const S2Mel::TimeConditioning tc = s2mel->TimeCondition(time);
+      ada_n = tc.ada.size();
+      wng_n = tc.wavenet.size();
+      fmod_n = tc.final_mod.size();
+      a.insert(a.end(), tc.ada.begin(), tc.ada.end());
+      w.insert(w.end(), tc.wavenet.begin(), tc.wavenet.end());
+      f.insert(f.end(), tc.final_mod.begin(), tc.final_mod.end());
+    }
+    Check(hipMemcpy(grid_ada.Ensure(a.size()), a.data(), a.size() * 4, hipMemcpyHostToDevice), "grid ada");
+    Check(hipMemcpy(grid_wng.Ensure(w.size()), w.data(), w.size() * 4, hipMemcpyHostToDevice), "grid wn");
+    Check(hipMemcpy(grid_fmod.Ensure(f.size()), f.data(), f.size() * 4, hipMemcpyHostToDevice), "grid fmod");
+    grid_times = times;
+  }
+  void SelectGridStep(std::size_t step) {
+    cur_ada = grid_ada.p + step * ada_n;
+    cur_wng = grid_wng.p + step * wng_n;
+    cur_fmod = grid_fmod.p + step * fmod_n;
+  }
+
+  // c = merge_rest([prompt, cond_projection(mu), style]) + bias for one branch (t rows, once per request)
   void Conditioning(const float* prompt_d, const float* mu_d, const float* style_h, std::int64_t t, float* c) {
     constexpr std::int64_t D = 512;
     const auto tt = static_cast<std::size_t>(t);
@@ -606,6 +765,11 @@ std::unique_ptr<Runtime> Runtime::Create(const UnifiedVoice& gpt, const S2Mel& s
   rt->impl_ = std::make_unique<Impl>();
   try {
     Check(hipStreamCreate(&rt->impl_->stream), "stream");
+    rt->impl_->blas = std::make_unique<Blas>(rt->impl_->stream);
+    const char* fast = std::getenv("GUFO_INDEXTTS_DIT_FAST");
+    rt->impl_->fast = fast == nullptr || fast[0] != '0';
+    const char* profile = std::getenv("GUFO_INDEXTTS_PROFILE");
+    rt->impl_->prof.on = profile != nullptr && profile[0] == '1';
     rt->impl_->LoadGpt(gpt);
     rt->impl_->LoadDit(s2mel);
     rt->impl_->LoadVocoder(vocoder);
@@ -678,6 +842,7 @@ std::vector<float> Runtime::Velocity(const float* x, const float* prompt, float 
                                      const float* cond, std::int64_t t) {
   Impl& m = *impl_;
   const auto tt = static_cast<std::size_t>(t);
+  const std::size_t pr = Blas::PaddedRows(tt);
   m.UploadTime(time);
   float* xd = m.dx.Ensure(tt * 80);
   float* pd = m.dprompt.Ensure(tt * 80);
@@ -687,8 +852,8 @@ std::vector<float> Runtime::Velocity(const float* x, const float* prompt, float 
   Check(hipMemcpy(cd, cond, tt * 512 * 4, hipMemcpyHostToDevice), "cond");
   float* c = m.c_cond.Ensure(tt * 512);
   m.Conditioning(pd, cd, style, t, c);
-  float* v = m.v_c.Ensure(tt * 80);
-  m.Estimator(xd, c, t, v);
+  float* v = m.v_c.Ensure(pr * 80);
+  m.Estimator(xd, c, t, 1, v);
   std::vector<float> out(tt * 80);
   Check(hipMemcpy(out.data(), v, out.size() * 4, hipMemcpyDeviceToHost), "v");
   return out;
@@ -699,41 +864,66 @@ std::vector<float> Runtime::CfmSample(const std::vector<float>& noise, const flo
                                       const CfmOptions& options) {
   Impl& m = *impl_;
   const auto tt = static_cast<std::size_t>(t);
+  const std::size_t pr2 = Blas::PaddedRows(2 * tt);
   std::vector<float> prompt_x(tt * 80, 0.0F);
   std::copy_n(prompt_mel, prompt_len * 80, prompt_x.data());
   std::vector<float> x0(noise);
   std::fill(x0.begin(), x0.begin() + prompt_len * 80, 0.0F);
-  float* xd = m.dx.Ensure(tt * 80);
+  // CFG as one batch of two sequences, as in the reference solve_euler: rows [0, t) conditional,
+  // [t, 2t) unconditional (prompt 0, mu 0, style 0); both branches see the same x.
+  float* xd = m.dx.Ensure(2 * tt * 80);
   float* pd = m.dprompt.Ensure(tt * 80);
   float* md = m.dcond.Ensure(tt * 512);
   Check(hipMemcpy(xd, x0.data(), tt * 80 * 4, hipMemcpyHostToDevice), "x");
+  Check(hipMemcpy(xd + tt * 80, x0.data(), tt * 80 * 4, hipMemcpyHostToDevice), "x");
   Check(hipMemcpy(pd, prompt_x.data(), tt * 80 * 4, hipMemcpyHostToDevice), "prompt");
   Check(hipMemcpy(md, mu, tt * 512 * 4, hipMemcpyHostToDevice), "mu");
-  float* cc = m.c_cond.Ensure(tt * 512);
-  m.Conditioning(pd, md, style, t, cc);
-  // unconditional branch: prompt 0, mu 0, style 0
+  float* c2 = m.c_cond.Ensure(2 * tt * 512);
+  m.Conditioning(pd, md, style, t, c2);
   Check(hipMemsetAsync(pd, 0, tt * 80 * 4, m.stream), "zero prompt");
   Check(hipMemsetAsync(md, 0, tt * 512 * 4, m.stream), "zero mu");
   const std::vector<float> zero_style(192, 0.0F);
-  float* cu = m.c_uncond.Ensure(tt * 512);
-  m.Conditioning(pd, md, zero_style.data(), t, cu);
+  m.Conditioning(pd, md, zero_style.data(), t, c2 + tt * 512);
   const std::vector<float> span = TorchLinspace01(options.steps);
+  std::vector<float> times;
   float time = span[0];
-  float* vc = m.v_c.Ensure(tt * 80);
-  float* vu = m.v_u.Ensure(tt * 80);
+  for (int step = 1; step <= options.steps; ++step) {
+    times.push_back(time);
+    time = time + (span[static_cast<std::size_t>(step)] - span[static_cast<std::size_t>(step - 1)]);
+  }
+  m.PrepareTimeGrid(times);
+  float* v = m.v_c.Ensure(pr2 * 80);
+  m.prof.Reset();
+  const auto t0 = std::chrono::steady_clock::now();
   for (int step = 1; step <= options.steps; ++step) {
     const float dt = span[static_cast<std::size_t>(step)] - span[static_cast<std::size_t>(step - 1)];
-    m.UploadTime(time);
-    m.Estimator(xd, cc, t, vc);
-    m.Estimator(xd, cu, t, vu);
-    LaunchCfgEulerTM(xd, vc, vu, options.cfg_rate, dt, tt, 80, static_cast<std::size_t>(prompt_len), m.stream);
-    time = time + dt;
+    m.SelectGridStep(static_cast<std::size_t>(step - 1));
+    m.Estimator(xd, c2, t, 2, v);
+    LaunchCfgEulerTM(xd, v, v + tt * 80, options.cfg_rate, dt, tt, 80, static_cast<std::size_t>(prompt_len),
+                     m.stream);
+    Check(hipMemcpyAsync(xd + tt * 80, xd, tt * 80 * 4, hipMemcpyDeviceToDevice, m.stream), "x copy");
+    m.prof.Flush();
   }
   std::vector<float> out(tt * 80);
   Check(hipMemcpyAsync(out.data(), xd, out.size() * 4, hipMemcpyDeviceToHost, m.stream), "mel");
   Check(hipStreamSynchronize(m.stream), "cfm sync");
+  if (m.prof.on) {
+    const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    char line[400];
+    std::snprintf(line, sizeof(line),
+                  "cfm profile (%s, %lld frames x2, %d steps): wall %.1f ms | gemm %.1f, attention %.1f, im2col %.1f, "
+                  "other %.1f ms (GPU, incl. per-step sync)",
+                  m.fast ? "fast" : "legacy", static_cast<long long>(t), options.steps, wall, m.prof.ms[Prof::kGemm],
+                  m.prof.ms[Prof::kAttention], m.prof.ms[Prof::kConv], m.prof.ms[Prof::kOther]);
+    m.last_profile = line;
+    std::fprintf(stderr, "indextts %s\n", line);
+  }
   return out;
 }
+
+void Runtime::SetFastDit(bool fast) { impl_->fast = fast; }
+
+std::string Runtime::LastCfmProfile() const { return impl_->last_profile; }
 
 std::vector<float> Runtime::Vocode(const float* mel, std::int64_t frames) { return impl_->Vocode(mel, frames); }
 

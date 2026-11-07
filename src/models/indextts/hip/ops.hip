@@ -233,6 +233,58 @@ __global__ void ConcatColsKernel(const float* a, const float* b, float* dst, std
   dst[i] = c < ac ? a[r * ac + c] : b[r * bc + (c - ac)];
 }
 
+__global__ void F32ToBf16Kernel(const float* x, std::uint16_t* y, std::size_t n) {
+  const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  std::uint32_t bits = __float_as_uint(x[i]);
+  if ((bits & 0x7F800000U) != 0x7F800000U) {  // round to nearest even; Inf/NaN truncate
+    bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  }
+  y[i] = static_cast<std::uint16_t>(bits >> 16U);
+}
+
+// One block per row: s[r, :] = softmax(s[r, :]) in place (FP32).
+__global__ void SoftmaxRowsKernel(float* s, std::size_t cols) {
+  __shared__ float shared[32];
+  float* row = s + static_cast<std::size_t>(blockIdx.x) * cols;
+  float m = -INFINITY;
+  for (std::size_t c = threadIdx.x; c < cols; c += blockDim.x) {
+    m = fmaxf(m, row[c]);
+  }
+  for (int o = warpSize / 2; o > 0; o >>= 1) {
+    m = fmaxf(m, __shfl_down(m, o));
+  }
+  const int lane = static_cast<int>(threadIdx.x) % warpSize;
+  const int warp = static_cast<int>(threadIdx.x) / warpSize;
+  if (lane == 0) {
+    shared[warp] = m;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int warps = (static_cast<int>(blockDim.x) + warpSize - 1) / warpSize;
+    float mm = shared[0];
+    for (int w = 1; w < warps; ++w) {
+      mm = fmaxf(mm, shared[w]);
+    }
+    shared[0] = mm;
+  }
+  __syncthreads();
+  const float mx = shared[0];
+  __syncthreads();
+  float sum = 0.0F;
+  for (std::size_t c = threadIdx.x; c < cols; c += blockDim.x) {
+    const float e = expf(row[c] - mx);
+    row[c] = e;
+    sum += e;
+  }
+  const float inv = 1.0F / BlockSum(sum, shared);
+  for (std::size_t c = threadIdx.x; c < cols; c += blockDim.x) {
+    row[c] *= inv;
+  }
+}
+
 }  // namespace
 
 void LaunchSplitQkv(const float* qkv, float* q, float* k_out, float* v_out, std::size_t rows,
@@ -299,6 +351,15 @@ void LaunchConcatCols(const float* a, const float* b, float* dst, std::size_t ro
                       std::size_t a_cols, std::size_t b_cols, hipStream_t stream) {
   hipLaunchKernelGGL(ConcatColsKernel, dim3(Blocks(rows * (a_cols + b_cols))), dim3(kThreads), 0,
                      stream, a, b, dst, rows, a_cols, b_cols);
+}
+
+void LaunchF32ToBf16(const float* x, std::uint16_t* y, std::size_t n, hipStream_t stream) {
+  hipLaunchKernelGGL(F32ToBf16Kernel, dim3(Blocks(n)), dim3(kThreads), 0, stream, x, y, n);
+}
+
+void LaunchSoftmaxRows(float* s, std::size_t rows, std::size_t cols, hipStream_t stream) {
+  hipLaunchKernelGGL(SoftmaxRowsKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0, stream, s,
+                     cols);
 }
 
 }  // namespace gufo::models::indextts::hip

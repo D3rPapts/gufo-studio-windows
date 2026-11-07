@@ -216,6 +216,12 @@ int main() {
   const std::int64_t total = ref_frames + target;
   std::vector<float> mu(prompt_cond);
   mu.insert(mu.end(), cond.begin(), cond.end());
+  // DiT / CFM: the first port's kernels ("legacy", GUFO_INDEXTTS_DIT_FAST=0) first, then the fast path
+  // (CFG batch 2, hipBLASLt BF16, GEMM attention). Checks apply to the fast path; legacy is INFO only.
+  std::vector<float> velocity_legacy, mel_legacy;
+  for (const bool fast : {false, true}) {
+  rt->SetFastDit(fast);
+  const char* tag = fast ? "fast" : "legacy";
   {
     const std::vector<float> x0 = O("cfm_call0_x");
     const std::vector<float> p0 = O("cfm_call0_prompt_x");
@@ -223,12 +229,20 @@ int main() {
     const std::size_t half = static_cast<std::size_t>(80 * total);
     const std::vector<float> xa = Tr(std::vector<float>(x0.begin(), x0.begin() + half), 80, total);
     const std::vector<float> pa = Tr(std::vector<float>(p0.begin(), p0.begin() + half), 80, total);
+    (void)rt->Velocity(xa.data(), pa.data(), 0.0F, style.data(), mu.data(), total);  // warm-up / GEMM tuning
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<float> vc = rt->Velocity(xa.data(), pa.data(), 0.0F, style.data(), mu.data(), total);
     const double one = Seconds(t0);
-    Check("DiT velocity (cond) step 0", Cos(Tr(vc, total, 80), std::vector<float>(v0.begin(), v0.begin() + half)),
-          0.999);
-    std::printf("     DiT evaluation (%lld frames, incl. upload) %.1f ms\n", static_cast<long long>(total), one * 1000.0);
+    const double cos = Cos(Tr(vc, total, 80), std::vector<float>(v0.begin(), v0.begin() + half));
+    if (fast) {
+      Check("DiT velocity (cond) step 0 [fast]", cos, 0.999);
+      std::printf("INFO DiT velocity fast vs legacy           cos=%.6f\n", Cos(vc, velocity_legacy));
+    } else {
+      std::printf("INFO DiT velocity (cond) step 0 [legacy]   cos=%.6f\n", cos);
+      velocity_legacy = vc;
+    }
+    std::printf("     DiT evaluation [%s] (%lld frames, 1 branch, incl. upload) %.1f ms\n", tag,
+                static_cast<long long>(total), one * 1000.0);
   }
   std::vector<float> mel;
   {
@@ -237,9 +251,21 @@ int main() {
     const auto t0 = std::chrono::steady_clock::now();
     mel = rt->CfmSample(noise, mu.data(), total, ref_tm.data(), ref_frames, style.data(), itts::CfmOptions{});
     const double secs = Seconds(t0);
-    Check("CFM 25 steps (oracle noise)", Cos(Tr(mel, total, 80), O("cfm_out")), 0.995);
-    std::printf("     CFM %.1f ms (%lld frames, 50 evaluations)\n", secs * 1000.0, static_cast<long long>(total));
+    const double cos = Cos(Tr(mel, total, 80), O("cfm_out"));
+    if (fast) {
+      Check("CFM 25 steps (oracle noise) [fast]", cos, 0.995);
+      std::printf("INFO CFM fast vs legacy                    cos=%.6f\n", Cos(mel, mel_legacy));
+    } else {
+      std::printf("INFO CFM 25 steps (oracle noise) [legacy]  cos=%.6f\n", cos);
+      mel_legacy = mel;
+    }
+    std::printf("TIME CFM [%s] %.1f ms (%lld frames, 25 steps x CFG 2)\n", tag, secs * 1000.0,
+                static_cast<long long>(total));
+    if (!rt->LastCfmProfile().empty()) {
+      std::printf("PROF %s\n", rt->LastCfmProfile().c_str());
+    }
   }
+  }  // legacy / fast
   {
     const std::vector<float> vc_target = Tr(O("vc_target"), 80, target);
     const auto t0 = std::chrono::steady_clock::now();
