@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/prefault.hpp"
 #include "src/models/ming_tts/safetensors.hpp"
 
 namespace gufo::models::voxcpm2 {
@@ -427,6 +428,11 @@ bool LoadPth(const std::filesystem::path& path, VaeWeights* raw, std::string* er
     out.data.resize(static_cast<std::size_t>(count));
     std::memcpy(out.data.data(), found->second.data + tensor.offset * 4,
                 static_cast<std::size_t>(count) * 4);
+    // Copied: drop the mapped pages so the file and the copy are not both
+    // resident (#829).
+    platform::ReleaseMappedRange(mapped.data(), mapped.size(),
+                                 found->second.data + tensor.offset * 4,
+                                 static_cast<std::size_t>(count) * 4);
     (*raw)[name] = std::move(out);
   }
   return true;
@@ -467,7 +473,7 @@ bool LoadVaeWeights(const std::filesystem::path& model_dir, VaeWeights* out,
   // Fold weight norm: w = g * v / ||v|| (norm over all dims but 0).
   out->clear();
   std::set<std::string> consumed;
-  for (const auto& [name, g] : raw) {
+  for (auto& [name, g] : raw) {
     static constexpr std::string_view kG = ".weight_g";
     if (!name.ends_with(kG)) {
       continue;
@@ -495,6 +501,9 @@ bool LoadVaeWeights(const std::filesystem::path& model_dir, VaeWeights* out,
       }
     }
     (*out)[base + ".weight"] = std::move(folded);
+    // Free the raw pair now, not after the loop: the folded copy replaces it.
+    std::vector<float>().swap(v->second.data);
+    std::vector<float>().swap(g.data);
     consumed.insert(name);
     consumed.insert(base + ".weight_v");
   }
