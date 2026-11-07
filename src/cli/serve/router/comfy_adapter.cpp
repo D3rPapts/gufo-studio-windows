@@ -378,6 +378,8 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->guide_video);
       if (video->control_video)
         files->push_back(*video->control_video);
+      if (video->talk_video)
+        files->push_back(*video->talk_video);
       if (video->vace_mask)
         files->push_back(*video->vace_mask);
       files->insert(files->end(), video->reference_images.begin(),
@@ -1832,8 +1834,29 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     }
     return "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
   };
-  if (spec.first_frame)
+  if (spec.first_frame && spec.first_frame_index) {
+    // One frame of a video (ImageFromBatch over LoadVideo): extracted as a
+    // PNG by ffmpeg, frame n counted from 0 in decode order.
+    const fs::path png = WorkFile("png");
+    std::string error;
+    if (!RunFfmpeg({"-i", FilePath(*spec.first_frame), "-vf",
+                    "select=eq(n\\," +
+                        std::to_string(*spec.first_frame_index) +
+                        "),setpts=PTS-STARTPTS",
+                    "-frames:v", "1", png},
+                   &error) ||
+        !fs::exists(png))
+      throw std::runtime_error("cannot take frame " +
+                               std::to_string(*spec.first_frame_index) +
+                               " of " + spec.first_frame->name + ": " +
+                               (error.empty() ? "no such frame" : error));
+    const std::string bytes = ReadAll(png);
+    fs::remove(png);
+    body["first_frame"] =
+        "data:image/png;base64," + Base64Encode(bytes);
+  } else if (spec.first_frame) {
     body["first_frame"] = data_url(*spec.first_frame);
+  }
   if (spec.last_frame)
     body["last_frame"] = data_url(*spec.last_frame);
   if (!spec.keyframes.empty()) {
@@ -1896,6 +1919,9 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                                   Base64Encode(ReadFileRef(ref))));
     body["gufo"]["talk"]["audio"] = std::move(audio);
   }
+  if (spec.talk_video)
+    body["gufo"]["talk"]["video"] = "data:video/mp4;base64," +
+                                    Base64Encode(ReadFileRef(*spec.talk_video));
   if (!spec.talk_masks.empty()) {
     // gufo reads bright pixels as the speaker: extract the ComfyUI mask
     // channel (inverted alpha, red, green or blue) as a grey image.

@@ -71,6 +71,22 @@ int TalkWindows(int frames, int window, int motion_frames) {
   return 1 + (frames - length + step - 1) / step;
 }
 
+std::vector<double> TalkSigmas(int steps, float denoise, float shift) {
+  // KSampler: denoise < 1 computes int(steps / denoise) sigmas and keeps
+  // the last steps + 1 (a small tolerance keeps e.g. 2 / (2 / 3) at 3).
+  int schedule = steps;
+  if (denoise < 1.0F)
+    schedule = std::max(
+        steps, static_cast<int>(static_cast<double>(steps) / denoise + 1e-3));
+  std::vector<double> sigmas;
+  for (int i = schedule - steps; i < schedule; ++i) {
+    const double t = 1.0 - static_cast<double>(i) / schedule;
+    sigmas.push_back(shift * t / (1.0 + (shift - 1.0) * t));
+  }
+  sigmas.push_back(0.0);
+  return sigmas;
+}
+
 bool GenerateTalk21(const Talk21Request& request,
                     const I2V21Callbacks& callbacks, DecodedVideo* video,
                     Talk21Telemetry* telemetry, std::string* error) {
@@ -88,6 +104,16 @@ bool GenerateTalk21(const Talk21Request& request,
              "InfiniteTalk: width/height must be multiples of 16, window and "
              "motion frames 4k+1 (motion < window), and the first frame must "
              "be at the video size");
+    return false;
+  }
+  const bool v2v = request.denoise < 1.0F;
+  if (!(request.denoise > 0.0F && request.denoise <= 1.0F) ||
+      (v2v && (request.input_video_frames < 1 ||
+               request.input_video.size() !=
+                   static_cast<std::size_t>(w) * h * 3 *
+                       request.input_video_frames))) {
+    SetError(error, "InfiniteTalk: denoise must be in (0, 1], and below 1 "
+                    "needs an input video at the video size");
     return false;
   }
   if (speakers < 1 || speakers > InfiniteTalk::kMaxSpeakers ||
@@ -129,6 +155,14 @@ bool GenerateTalk21(const Talk21Request& request,
   const int total_frames = request.frames > 0 ? request.frames : audio_frames;
   if (total_frames < 1) {
     SetError(error, "InfiniteTalk: the audio is too short");
+    return false;
+  }
+  if (v2v && request.input_video_frames < total_frames) {
+    SetError(error, "InfiniteTalk: the input video has " +
+                        std::to_string(request.input_video_frames) +
+                        " frames, the output needs " +
+                        std::to_string(total_frames) +
+                        " (frame f starts from input frame f, 25 fps)");
     return false;
   }
   const int length = WindowLength(total_frames, request.window);
@@ -275,12 +309,8 @@ bool GenerateTalk21(const Talk21Request& request,
   for (int c = 0; c < 4; ++c)
     std::fill_n(input.begin() + (16 + c) * plane, frame_plane, 1.0F);
   std::copy(condition.begin(), condition.end(), input.begin() + 20 * plane);
-  std::vector<double> sigmas;
-  for (int i = 0; i < request.steps; ++i) {
-    const double t = 1.0 - static_cast<double>(i) / request.steps;
-    sigmas.push_back(request.shift * t / (1.0 + (request.shift - 1.0) * t));
-  }
-  sigmas.push_back(0.0);
+  const std::vector<double> sigmas =
+      TalkSigmas(request.steps, request.denoise, request.shift);
   std::vector<std::span<const float>> feature_spans;
   for (const auto& f : features)
     feature_spans.emplace_back(f);
@@ -330,6 +360,37 @@ bool GenerateTalk21(const Talk21Request& request,
     };
     const std::uint64_t seed = request.seed + static_cast<std::uint64_t>(window);
     std::vector<float> latents = GaussianNoise(16 * plane, seed);
+    if (v2v) {
+      // KSampler with a VAEEncode latent and denoise < 1: this window's
+      // frames of the input video (the last one held past its end),
+      // encoded and noised to the first sigma.
+      const auto encode_start = Clock::now();
+      const int first = window == 0 ? 0 : produced - request.motion_frames;
+      std::vector<float> pixels(frame_bytes * length);
+      for (int f = 0; f < length; ++f) {
+        const std::size_t source =
+            frame_bytes *
+            static_cast<std::size_t>(
+                std::min(first + f, request.input_video_frames - 1));
+        for (std::size_t i = 0; i < frame_bytes; ++i)
+          pixels[frame_bytes * f + i] =
+              static_cast<float>(request.input_video[source + i]) / 127.5F -
+              1.0F;
+      }
+      std::vector<float> encoded;
+      if (!vae_encoder->EncodeVideo(pixels, length, h, w, true, &encoded,
+                                    error))
+        return false;
+      if (encoded.size() != latents.size()) {
+        SetError(error, "InfiniteTalk: unexpected input video latent size");
+        return false;
+      }
+      const float s0 = static_cast<float>(sigmas.front());
+      for (std::size_t i = 0; i < latents.size(); ++i)
+        latents[i] = (1.0F - s0) * encoded[i] + s0 * latents[i];
+      tel.motion_ms += Ms(encode_start);
+      TrackDevice(&tel.peak_device_bytes);
+    }
     std::vector<float> velocity;
     for (int step = 0; step < request.steps; ++step) {
       if (cancelled())

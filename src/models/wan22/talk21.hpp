@@ -33,6 +33,13 @@ struct TalkSpeaker {
 /// pins latent frame 0 to the start image, each next one continues from the
 /// last `motion_frames` decoded frames (re-encoded and pinned as the first
 /// latent frames at every step, then dropped from the output). 25 fps.
+///
+/// Video to video (ComfyUI: KSampler latent_image = VAEEncode of the input
+/// video, denoise < 1): with `denoise` < 1 every window starts from its
+/// slice of `input_video`, encoded and noised to the first sigma of the
+/// shortened schedule ((1 - s) * video + s * noise), so the motion of the
+/// input video is kept and the audio mostly drives the mouth. The schedule
+/// is ComfyUI's: int(steps / denoise) sigmas, of which the last `steps` run.
 struct Talk21Request {
   std::filesystem::path wan21_root;  // Diffusers Wan2.1-I2V-14B-480P: vae,
                                      // image_encoder
@@ -50,13 +57,22 @@ struct Talk21Request {
   int frames{0};
   int window{81};        // 4k + 1
   int motion_frames{9};  // 4k + 1, < window
+  /// Sampler steps that run (KSampler "steps").
   int steps{4};
+  /// KSampler "denoise", (0, 1]; below 1 needs `input_video`.
+  float denoise{1.0F};
   float shift{5.0F};
   std::uint64_t seed{42};  // window w samples with seed + w
   float audio_scale{1.0F};
   std::string audio_mode{"add"};  // "add" (in turn) or "para" (together)
   /// RGB8 [height, width, 3] at the video size.
   std::span<const std::uint8_t> first_frame;
+  /// Video to video: RGB8 [input_video_frames, height, width, 3] at the
+  /// video size, at least the output's frame count (frame f of the output
+  /// starts from frame f of the input; the last frame is held where a
+  /// window reaches past the end). Used only when `denoise` < 1.
+  std::span<const std::uint8_t> input_video;
+  int input_video_frames{0};
   /// One or two speakers (two need masks).
   std::vector<TalkSpeaker> speakers;
 };
@@ -80,6 +96,11 @@ int TalkAudioFrames(const std::vector<TalkSpeaker>& speakers,
 
 /// Windows a request of `frames` output frames needs.
 int TalkWindows(int frames, int window, int motion_frames);
+
+/// The sigmas a talk request samples (`steps` + 1 values ending in 0):
+/// ComfyUI's simple schedule with `shift`, and with `denoise` < 1 the last
+/// `steps` + 1 of a schedule of int(steps / denoise) steps (KSampler).
+std::vector<double> TalkSigmas(int steps, float denoise, float shift);
 
 bool GenerateTalk21(const Talk21Request& request,
                     const I2V21Callbacks& callbacks, DecodedVideo* video,

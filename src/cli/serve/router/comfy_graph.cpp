@@ -122,8 +122,9 @@ constexpr std::string_view kGenerators[] = {
 // KSampler before validation, so they never reach the planner; they are
 // listed so /object_info names every class the adapter accepts.
 constexpr std::string_view kLowered[] = {
-    "SamplerCustomAdvanced", "RandomNoise", "BasicGuider",
-    "CFGGuider",             "KSamplerSelect", "BasicScheduler"};
+    "SamplerCustomAdvanced", "RandomNoise",    "BasicGuider",
+    "CFGGuider",             "KSamplerSelect", "BasicScheduler",
+    "SplitSigmas"};
 
 constexpr std::string_view kOutputs[] = {
     "SaveImage",    "PreviewImage",  "SaveAudio",       "PreviewAudio",
@@ -860,7 +861,9 @@ json::Value InputOf(const Graph& graph, const std::string& id,
 
 /// ComfyUI's split sampler: SamplerCustomAdvanced <- RandomNoise (seed),
 /// BasicGuider / CFGGuider (model, conditioning, cfg), KSamplerSelect
-/// (sampler) and BasicScheduler (steps, scheduler, denoise). Returns `prompt`
+/// (sampler) and BasicScheduler (steps, scheduler, denoise), optionally
+/// through SplitSigmas (its low_sigmas: a late start, folded into the
+/// KSampler steps / denoise that sample the same sigmas). Returns `prompt`
 /// with each one folded into a KSampler under the same node id, its parts
 /// removed and links to its second output (denoised_output) moved to the
 /// first; a null value when the prompt has no SamplerCustomAdvanced.
@@ -875,7 +878,17 @@ json::Value LowerCustomSamplers(const json::Value& prompt,
     const Link noise = PartOf(graph, id, "noise", {"RandomNoise"});
     const Link guider = PartOf(graph, id, "guider", {"BasicGuider", "CFGGuider"});
     const Link sampler = PartOf(graph, id, "sampler", {"KSamplerSelect"});
-    const Link sigmas = PartOf(graph, id, "sigmas", {"BasicScheduler"});
+    Link sigmas =
+        PartOf(graph, id, "sigmas", {"BasicScheduler", "SplitSigmas"});
+    std::optional<Link> split;
+    if (graph.Class(sigmas.node) == "SplitSigmas") {
+      if (sigmas.slot != 1)
+        throw NodeFailure(id, "unsupported_link",
+                          "sigmas from SplitSigmas must be its low_sigmas "
+                          "(output 1): gufo samples to the end");
+      split = sigmas;
+      sigmas = PartOf(graph, split->node, "sigmas", {"BasicScheduler"});
+    }
     const bool cfg_guider = graph.Class(guider.node) == "CFGGuider";
     json::Value inputs = json::Value::object();
     inputs["model"] = InputOf(graph, guider.node, "model");
@@ -894,6 +907,24 @@ json::Value LowerCustomSamplers(const json::Value& prompt,
     inputs["scheduler"] = InputOf(graph, sigmas.node, "scheduler");
     if (const json::Value* denoise = graph.Raw(sigmas.node, "denoise"))
       inputs["denoise"] = *denoise;
+    if (split) {
+      // BasicScheduler(N, d) has the last N + 1 sigmas of an int(N / d)
+      // step schedule; SplitSigmas(step s) keeps them from index s on: the
+      // sigmas KSampler(steps N - s, denoise (N - s) / int(N / d)) samples.
+      const int steps = static_cast<int>(graph.Num(sigmas.node, "steps"));
+      const double denoise = graph.Num(sigmas.node, "denoise", 1.0);
+      const int step = static_cast<int>(graph.Num(split->node, "step"));
+      if (steps < 1 || denoise <= 0.0 || denoise > 1.0 || step < 1 ||
+          step >= steps)
+        throw NodeFailure(split->node, "unsupported_value",
+                          "SplitSigmas step must be 1.." +
+                              std::to_string(std::max(steps - 1, 1)) +
+                              " of BasicScheduler's steps (denoise 0..1)");
+      const int total =
+          denoise < 1.0 ? static_cast<int>(steps / denoise) : steps;
+      inputs["steps"] = steps - step;
+      inputs["denoise"] = static_cast<double>(steps - step) / total;
+    }
     // BasicScheduler reads the model only for its sigma shift; gufo takes
     // the shift from the guider's model chain, so the two should agree.
     if (auto scheduler_model = graph.LinkOf(sigmas.node, "model")) {
@@ -908,8 +939,11 @@ json::Value LowerCustomSamplers(const json::Value& prompt,
     folded["class_type"] = "KSampler";
     folded["inputs"] = std::move(inputs);
     lowered.emplace(id, std::move(folded));
-    for (const Link* part : {&noise, &guider, &sampler, &sigmas})
+    for (const Link* part : {&noise, &guider, &sampler})
       parts.insert(part->node);
+    parts.insert(sigmas.node);
+    if (split)
+      parts.insert(split->node);
   }
   if (lowered.empty())
     return json::Value();
@@ -1868,7 +1902,7 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
 /// VHS_LoadVideo (gufo decodes and fits the file itself).
 FileRef VideoFile(const Graph& graph, const std::string& id,
                   const std::string& key, const Link& link,
-                  std::vector<std::string>* warnings) {
+                  std::vector<std::string>* warnings, int fps = 16) {
   const std::string source = graph.Class(link.node);
   if (source == "VHS_LoadVideo") {
     // gufo reads the file's frames in order from the start.
@@ -1880,7 +1914,8 @@ FileRef VideoFile(const Graph& graph, const std::string& id,
       if (graph.Num(link.node, option, fallback) != fallback)
         warnings->push_back("node " + link.node + ": " + option +
                             " is not applied (gufo reads every frame from "
-                            "the start; prepare the video at 16 fps)");
+                            "the start; prepare the video at " +
+                            std::to_string(fps) + " fps)");
     }
     return ParseFileRef(graph.Str(link.node, "video"), "input");
   }
@@ -2116,14 +2151,47 @@ std::pair<FileRef, std::string> TalkMask(const Graph& graph,
                         source);
 }
 
+/// One frame of a video as an IMAGE input: ImageFromBatch (length 1) over
+/// GetVideoComponents <- LoadVideo or VHS_LoadVideo. Returns the video and
+/// sets `index` to the frame (the executor extracts it with ffmpeg).
+FileRef VideoFrameFile(const Graph& graph, const std::string& id,
+                       const std::string& key, const Link& link, int fps,
+                       int* index, std::vector<std::string>* warnings) {
+  const std::string batch = link.node;
+  if (graph.Class(batch) != "ImageFromBatch")
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key + "' must come from LoadImage or "
+                      "ImageFromBatch over a video");
+  const json::Value* length = graph.Literal(batch, "length");
+  const json::Value* first = graph.Literal(batch, "batch_index");
+  if (length == nullptr || !length->is_number() ||
+      length->as_double() != 1.0 || first == nullptr ||
+      !first->is_number() || first->as_double() < 0 ||
+      first->as_double() != static_cast<double>(static_cast<int>(
+                                first->as_double())))
+    throw NodeFailure(batch, "unsupported_value",
+                      "ImageFromBatch for '" + key +
+                          "' must pick one frame: length 1 and a literal "
+                          "batch_index >= 0");
+  *index = static_cast<int>(first->as_double());
+  return VideoFile(graph, batch, "image", graph.RequireLink(batch, "image"),
+                   warnings, fps);
+}
+
 /// Wan 2.1 I2V + InfiniteTalk (wan2.1-infinitetalk-14b, 25 fps). A chain of
 /// WanInfiniteTalkToVideo windows (previous_frames from the decoded frames
 /// of the window before) is one gufo job: gufo windows the video itself
-/// (81 frames, continued from the last motion frames).
+/// (81 frames, continued from the last motion frames). Video to video: the
+/// sampler's latent_image is VAEEncode of a video (LoadVideo ->
+/// GetVideoComponents or VHS_LoadVideo) and denoise < 1; the
+/// WanInfiniteTalkToVideo node is then the one behind the sampler's
+/// positive conditioning.
 VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
                     const ModelIds& models, const Link& latent,
                     std::vector<std::string>* warnings) {
-  const std::string node = latent.node;
+  const bool from_video = graph.Class(latent.node) == "VAEEncode";
+  const std::string node =
+      from_video ? graph.RequireLink(sampler, "positive").node : latent.node;
   VideoTask task;
   task.family = VideoFamily::kTalk;
   task.model = models.talk;
@@ -2142,7 +2210,16 @@ VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
   if (!start)
     throw NodeFailure(node, "required_input_missing",
                       "gufo wan2.1-infinitetalk-14b needs a start_image");
-  task.first_frame = ImageFile(graph, node, "start_image", *start);
+  // A still (LoadImage), or one frame of a video (ImageFromBatch over
+  // LoadVideo / VHS_LoadVideo, e.g. frame 0 of the motion video).
+  if (graph.Class(start->node) == "ImageFromBatch") {
+    int index = 0;
+    task.first_frame = VideoFrameFile(graph, node, "start_image", *start, 25,
+                                      &index, warnings);
+    task.first_frame_index = index;
+  } else {
+    task.first_frame = ImageFile(graph, node, "start_image", *start);
+  }
   const Link patch = graph.RequireLink(node, "model_patch");
   if (graph.Class(patch.node) != "ModelPatchLoader")
     throw NodeFailure(node, "unsupported_link",
@@ -2244,6 +2321,46 @@ VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
   if (task.steps < 1 || task.steps > 20)
     throw NodeFailure(sampler, "unsupported_value",
                       "gufo wan2.1-infinitetalk-14b takes 1..20 steps");
+  // Partial denoise: KSampler denoise, or KSamplerAdvanced from
+  // start_at_step (the same sigmas as KSampler(steps - start, denoise
+  // (steps - start) / steps)).
+  double denoise = graph.Num(sampler, "denoise", 1.0);
+  if (graph.Class(sampler) == "KSamplerAdvanced") {
+    const int start = static_cast<int>(graph.Num(sampler, "start_at_step", 0));
+    const int end = static_cast<int>(graph.Num(sampler, "end_at_step", 10000));
+    if (graph.Str(sampler, "add_noise", "enable") != "enable" ||
+        end < task.steps || start < 0 || start >= task.steps)
+      throw NodeFailure(sampler, "unsupported_value",
+                        "gufo InfiniteTalk needs KSamplerAdvanced with "
+                        "add_noise enable, start_at_step below steps and "
+                        "end_at_step at least steps");
+    denoise = static_cast<double>(task.steps - start) / task.steps;
+    task.steps -= start;
+  }
+  if (denoise <= 0.0 || denoise > 1.0)
+    throw NodeFailure(sampler, "unsupported_value", "denoise must be 0..1");
+  if (from_video) {
+    if (chain.size() > 1)
+      throw NodeFailure(sampler, "unsupported_link",
+                        "gufo InfiniteTalk video to video takes one "
+                        "WanInfiniteTalkToVideo (no previous_frames chain; "
+                        "gufo windows long videos itself)");
+    const Link pixels = graph.RequireLink(latent.node, "pixels");
+    if (denoise < 0.999) {
+      task.talk_video =
+          VideoFile(graph, latent.node, "pixels", pixels, warnings, 25);
+      task.talk_denoise = denoise;
+    } else {
+      warnings->push_back("node " + sampler +
+                          ": denoise 1 starts from pure noise; the "
+                          "VAEEncode video is not used");
+    }
+  } else if (denoise < 0.999) {
+    throw NodeFailure(sampler, "unsupported_value",
+                      "denoise below 1 needs latent_image from VAEEncode of "
+                      "a video (LoadVideo -> GetVideoComponents or "
+                      "VHS_LoadVideo)");
+  }
   task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
   if (graph.Num(sampler, "cfg", 1.0) != 1.0)
     warnings->push_back("node " + sampler +
@@ -2687,6 +2804,9 @@ json::Value VideoRequestBody(const VideoTask& task) {
     // "auto": two tracks of the same length -> "para" (each line at its place
     // on one time line), else "add" as in ComfyUI core.
     talk["audio_mode"] = "auto";
+    // Video to video; the executor adds the video as talk.video.
+    if (task.talk_denoise)
+      talk["denoise"] = *task.talk_denoise;
     gufo["talk"] = std::move(talk);
   } else {
     body["size"] =
@@ -3241,7 +3361,11 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           else if (latent_class == "WanVaceToVideo")
             task.spec = BuildVace(graph, generator, models, latent,
                                   &plan->warnings);
-          else if (latent_class == "WanInfiniteTalkToVideo")
+          else if (latent_class == "WanInfiniteTalkToVideo" ||
+                   (latent_class == "VAEEncode" &&
+                    graph.LinkOf(generator, "positive") &&
+                    graph.Class(graph.LinkOf(generator, "positive")->node) ==
+                        "WanInfiniteTalkToVideo"))
             task.spec = BuildTalk(graph, generator, models, latent,
                                   &plan->warnings);
           else if (latent_class == "EmptyAceStep1.5LatentAudio")

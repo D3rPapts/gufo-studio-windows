@@ -13,6 +13,8 @@
 #include <system_error>
 #include <utility>
 
+#include "src/cli/serve/video_vace.hpp"
+
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/talk21.hpp"
@@ -160,9 +162,10 @@ bool ParseTalkOptions(const json::Value& talk, std::string* normalized,
   }
   for (const auto& [key, value] : talk.members()) {
     (void)value;
-    if (key != "audio_scale" && key != "audio_mode" && key != "motion_frames") {
+    if (key != "audio_scale" && key != "audio_mode" &&
+        key != "motion_frames" && key != "denoise") {
       SetError(error, "'gufo.talk' may contain only 'audio_scale', "
-                      "'audio_mode' and 'motion_frames'");
+                      "'audio_mode', 'motion_frames' and 'denoise'");
       return false;
     }
   }
@@ -192,6 +195,14 @@ bool ParseTalkOptions(const json::Value& talk, std::string* normalized,
       return false;
     }
     out["motion_frames"] = static_cast<int>(v);
+  }
+  if (const json::Value* denoise = talk.find("denoise")) {
+    const double v = denoise->is_number() ? denoise->as_double(NAN) : NAN;
+    if (!std::isfinite(v) || v <= 0.0 || v > 1.0) {
+      SetError(error, "'gufo.talk.denoise' must be > 0 and <= 1");
+      return false;
+    }
+    out["denoise"] = v;
   }
   *normalized = out.dump();
   return true;
@@ -263,6 +274,23 @@ bool RunWan21TalkJob(const minimax_h3::GenerationRequest& request,
     return false;
   }
   job.first_frame = first_frame;
+  // Video to video: the input video ("gufo.talk.video") fitted to the video
+  // size like the start image, frame for frame (no frame-rate conversion);
+  // up to one window past the output, which the last window may reach into.
+  job.denoise = static_cast<float>(options.member_double("denoise", 1.0));
+  std::vector<std::uint8_t> input_video;
+  if (job.denoise < 1.0F) {
+    if (request.guide_video_path.empty()) {
+      SetError(error, "'gufo.talk.denoise' below 1 needs 'gufo.talk.video'");
+      return false;
+    }
+    if (!ReadFittedVideo(request.guide_video_path, job.width, job.height,
+                         (job.frames > 0 ? job.frames : 1500) + job.window,
+                         &input_video,
+                         &job.input_video_frames, error))
+      return false;
+    job.input_video = input_video;
+  }
   for (int s = 0; s < speakers; ++s) {
     wan22::TalkSpeaker speaker;
     speaker.audio = TalkMono16k(request.audio_guides[s].waveform);

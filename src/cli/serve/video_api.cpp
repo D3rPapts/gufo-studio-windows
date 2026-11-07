@@ -262,9 +262,9 @@ bool IsKeyframeField(std::string_view name) {
          name == "render_video" || name == "source_video" ||
          name.starts_with("keyframe_") || name == "control_video" ||
          name == "mask" || name.starts_with("reference_image") ||
-         // InfiniteTalk speakers and their masks.
+         // InfiniteTalk speakers, their masks and the input video.
          name == "audio_1" || name == "audio_2" || name == "mask_1" ||
-         name == "mask_2";
+         name == "mask_2" || name == "talk_video";
 }
 
 // Uploaded keyframe files are returned in `files`; every other part becomes a
@@ -1622,8 +1622,13 @@ HttpResponse CreateWan21VaceVideo(
 // images, bright = the speaker; required with two speakers], "audio_scale",
 // "audio_mode" ("add": speaker 2 after speaker 1, "para": together, "auto":
 // "para" when both tracks have the same length, else "add"),
-// "motion_frames"}}}. Multipart uploads may carry "audio_1", "audio_2",
-// "mask_1" and "mask_2" files instead.
+// "motion_frames", "denoise" (0 < d <= 1, default 1), "video" (MP4 data URL
+// or base64; with denoise < 1: video to video, the sampler starts from this
+// video's frames so its motion stays and the audio drives the mouth; it is
+// fitted to "size" like the start image and read frame for frame at 25 fps,
+// so it needs at least the output's frame count)}}}. Multipart uploads may
+// carry "audio_1", "audio_2", "mask_1", "mask_2" and "talk_video" files
+// instead.
 HttpResponse CreateTalkVideo(const json::Value& body,
                              const std::map<std::string, std::string>& files,
                              VideoJobService& service) {
@@ -1769,11 +1774,59 @@ HttpResponse CreateTalkVideo(const json::Value& body,
     }
     json::Value options = json::Value::object();
     for (const auto& [key, value] : talk->members())
-      if (key != "audio" && key != "speaker_masks")
+      if (key != "audio" && key != "speaker_masks" && key != "video")
         options[key] = value;
     std::string talk_error;
     if (!ParseTalkOptions(options, &talk_json, &talk_error)) {
       return Error(400, "Bad Request", talk_error, "invalid_talk");
+    }
+  }
+  // Video to video: the input video ("gufo.talk.video" or a "talk_video"
+  // upload), decoded by the worker; it needs denoise < 1.
+  std::vector<std::uint8_t> talk_video;
+  {
+    const json::Value* video = talk != nullptr ? talk->find("video") : nullptr;
+    const auto upload = files.find("talk_video");
+    if (video != nullptr && upload != files.end()) {
+      return Error(400, "Bad Request", "the talk video is given twice",
+                   "invalid_talk_video");
+    }
+    if (upload != files.end()) {
+      talk_video.assign(upload->second.begin(), upload->second.end());
+    } else if (video != nullptr) {
+      std::string_view text = video->is_string() ? std::string_view(video->str())
+                                                 : std::string_view();
+      if (text.starts_with("data:")) {
+        const auto comma = text.find(',');
+        if (comma == std::string_view::npos ||
+            text.substr(0, comma).find(";base64") == std::string_view::npos) {
+          return Error(400, "Bad Request",
+                       "'gufo.talk.video' data URL must be base64",
+                       "invalid_talk_video");
+        }
+        text.remove_prefix(comma + 1);
+      }
+      auto decoded = DecodeBase64(text);
+      if (!video->is_string() || !decoded.has_value() ||
+          decoded->size() < 64) {
+        return Error(400, "Bad Request",
+                     "'gufo.talk.video' must be an MP4 data URL or base64",
+                     "invalid_talk_video");
+      }
+      talk_video = std::move(*decoded);
+    }
+    const bool partial =
+        json::parse(talk_json).member_double("denoise", 1.0) < 1.0;
+    if (partial && talk_video.empty()) {
+      return Error(400, "Bad Request",
+                   "'gufo.talk.denoise' below 1 needs 'gufo.talk.video'",
+                   "invalid_talk_video");
+    }
+    if (!partial && !talk_video.empty()) {
+      return Error(400, "Bad Request",
+                   "'gufo.talk.video' needs 'gufo.talk.denoise' below 1 "
+                   "(at 1 the sampler starts from pure noise)",
+                   "invalid_talk_video");
     }
   }
   if (audio != nullptr && (!audio->is_array() || audio->empty() ||
@@ -1912,6 +1965,7 @@ HttpResponse CreateTalkVideo(const json::Value& body,
       .interpolate_fps_num = interpolate.fps_num,
       .interpolate_fps_den = interpolate.fps_den,
       .upscale = std::move(upscale),
+      .guide_video = std::move(talk_video),
       .talk_json = std::move(talk_json),
       .speaker_masks = std::move(masks),
       .preview = preview,

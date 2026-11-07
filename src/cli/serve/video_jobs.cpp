@@ -1422,8 +1422,9 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
                 static_cast<std::size_t>(
                     std::max(request.first_frame_height, 0)) *
                 3U ||
-        !request.camera_json.empty() || !request.guide_video.empty() ||
-        !request.vace_json.empty() || !request.mask_file.empty()) {
+        !request.camera_json.empty() || !request.vace_json.empty() ||
+        !request.mask_file.empty()) {
+      // guide_video: the video-to-video input ("gufo.talk.video").
       return {.result = VideoJobResult::kInvalid,
               .job = std::nullopt,
               .error = "invalid Wan 2.1 InfiniteTalk video job request"};
