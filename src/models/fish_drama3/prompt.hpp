@@ -33,6 +33,10 @@ void ValidateDrama3Codes(const FishDacCodes& codes, std::int64_t codebook_size);
     const ModelConfig& config, const Drama3Tokenizer& tokenizer,
     const std::string& text, const std::vector<Drama3Take>& references = {},
     const std::vector<Drama3Take>& history = {});
+// Frames of the final user turn plus the assistant header (the tail of
+// BuildDrama3Prompt for `text`).
+[[nodiscard]] std::vector<Drama3Frame> BuildDrama3PromptSuffix(
+    const Drama3Tokenizer& tokenizer, const std::string& text);
 
 }  // namespace gufo::models::fish_drama3
 

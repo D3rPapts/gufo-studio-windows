@@ -261,11 +261,25 @@ bool SynthesisHipRuntime::Generate(const SynthesisRequest& request,
 
     const auto prompt = BuildDrama3Prompt(impl_->config, *impl_->tokenizer,
                                           request.text, refs, request.history);
-    const std::size_t max_new = request.sampling.max_new_frames;
-    if (prompt.size() + max_new > impl_->max_context_frames) {
-      SetError(error, "Drama 3 prompt + max_new_frames exceeds context limit");
+    if (prompt.size() >= impl_->max_context_frames) {
+      SetError(error, "Drama 3 prompt exceeds context limit");
       return false;
     }
+    // Budget: an explicit small max_new_frames (< 1024) is honoured as is;
+    // the large defaults (e.g. 3000) are capped at 16 frames per text-turn
+    // token (min 384 frames, ~18 s) so a missed end-of-speech cannot run
+    // for minutes. Both are clamped to the context that is left.
+    const std::size_t avail_ctx = impl_->max_context_frames - prompt.size();
+    const std::size_t suffix_len =
+        BuildDrama3PromptSuffix(*impl_->tokenizer, request.text).size();
+    const std::size_t adaptive_cap = std::min<std::size_t>(
+        avail_ctx, std::max<std::size_t>(384U, suffix_len * 16U));
+    const std::size_t max_new =
+        request.sampling.max_new_frames >= 1024U
+            ? std::min<std::size_t>(request.sampling.max_new_frames,
+                                    adaptive_cap)
+            : std::min<std::size_t>(request.sampling.max_new_frames,
+                                    avail_ctx);
 
     impl_->backbone->Reset();
     impl_->tower->Reset();
