@@ -40,7 +40,11 @@ add_library(gufo_qwen_kernels STATIC
   ssm_row_split.hip
   swiglu.hip
   unpack.hip
-  verify_gemm_27b.hip)
+  verify_gemm_27b.hip
+  # Windows 27B decode-cycle kernels (production port, see copy_27b.hpp).
+  attention_27b.hip
+  copy_27b.hip
+  sample_27b.hip)
 
 target_include_directories(gufo_qwen_kernels PUBLIC ${PROJECT_SOURCE_DIR})
 # gufo_core supplied these device headers privately, so they are repeated here

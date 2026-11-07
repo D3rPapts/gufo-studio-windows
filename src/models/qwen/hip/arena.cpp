@@ -13,6 +13,7 @@
 
 #include "src/families/qwen/hip_common/attention_policy.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
 namespace gufo::hip {
@@ -472,6 +473,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   if (valid_context > max_context_) {
     throw std::length_error("Qwen snapshot exceeds the context length");
   }
+  const qwen27::ScopedPromptStep step("target_snapshot", valid_context);
 
   auto snapshot = std::unique_ptr<QwenGpuSnapshot>(new QwenGpuSnapshot());
   snapshot->num_layers_ = config_.num_layers;
