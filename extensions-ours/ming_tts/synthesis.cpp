@@ -106,6 +106,9 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir,
       return nullptr;
     }
   }
+  // Whatever loading touched leaves the working set (#829); the GPU uploads
+  // already dropped their pages tensor by tensor.
+  impl.model->ReleaseHostPages();
   return engine;
 }
 
@@ -405,6 +408,11 @@ std::vector<float> Engine::EncodePrompt(std::span<const float> audio,
   std::int64_t patches = 0;
   const std::vector<float> params =
       model.EncodePosterior(wave.data(), static_cast<std::int64_t>(wave.size()), &patches);
+  if (impl_->gpu != nullptr) {
+    // The audio encoder runs on the CPU from the mapping; with the decoder on
+    // the GPU nothing else reads those pages until the next prompt (#829).
+    model.ReleaseHostPages();
+  }
   std::vector<float> eps(static_cast<std::size_t>(patches * config.latent_dim));
   if (noise.size() == eps.size()) {
     std::copy(noise.begin(), noise.end(), eps.begin());

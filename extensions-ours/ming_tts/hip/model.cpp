@@ -158,6 +158,9 @@ struct Model::Impl {
     allocations.push_back(device);
     Check(hipMemcpy(device, host, count * sizeof(T), hipMemcpyHostToDevice),
           "weight upload");
+    // hipMemcpy has finished reading: drop the mapped source pages, or
+    // Windows keeps every uploaded tensor in the working set (#829).
+    cpu->ReleaseHostPages(host, count * sizeof(T));
     return static_cast<T*>(device);
   }
   const float* UploadVector(const std::vector<float>& host) {
