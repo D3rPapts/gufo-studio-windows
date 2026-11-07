@@ -143,6 +143,9 @@ std::unique_ptr<Engine> Engine::Create(const std::string& model_dir, std::string
     return nullptr;
   }
 #endif
+  // Whatever loading touched (headers, the delta-time MLP) leaves the working
+  // set; the GPU uploads already dropped their pages tensor by tensor.
+  impl.model->ReleaseHostPages();
   return engine;
 }
 

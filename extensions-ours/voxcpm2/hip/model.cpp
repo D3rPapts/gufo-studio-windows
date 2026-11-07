@@ -251,6 +251,9 @@ struct Model::Impl {
     Check(hipMalloc(&device, count * sizeof(T)), "weight alloc");
     allocations.push_back(device);
     Check(hipMemcpy(device, host, count * sizeof(T), hipMemcpyHostToDevice), "weight upload");
+    // hipMemcpy has finished reading: drop the mapped source pages, or
+    // Windows keeps the whole 4.4 GB file in the working set (#829).
+    cpu->ReleaseHostPages(host, count * sizeof(T));
     return static_cast<T*>(device);
   }
   const float* UploadVector(const std::vector<float>& host) {
@@ -290,6 +293,8 @@ struct Model::Impl {
                         hipMemcpyHostToDevice), "weight upload");
         Check(hipMemcpy(base + f * hin, layer.up.weight, f * hin * sizeof(std::uint16_t),
                         hipMemcpyHostToDevice), "weight upload");
+        cpu->ReleaseHostPages(layer.gate.weight, f * hin * sizeof(std::uint16_t));
+        cpu->ReleaseHostPages(layer.up.weight, f * hin * sizeof(std::uint16_t));
         if (!layer.gate.bias.empty() || !layer.up.bias.empty()) {
           throw std::runtime_error("VoxCPM2 HIP: MLP biases are not expected");
         }
