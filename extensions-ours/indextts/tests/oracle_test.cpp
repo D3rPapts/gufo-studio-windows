@@ -21,6 +21,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
+
 #include <gufo/ext/json.hpp>
 #include "indextts/audio.hpp"
 #include "indextts/bigvgan.hpp"
@@ -37,6 +44,28 @@ namespace json = gufo::json;
 using gufo::models::ming_tts::SafetensorsFile;
 
 namespace {
+
+// Peak host memory of this run (the router's admission measure on Windows is
+// the peak working set, which includes resident file-mapping pages, #829).
+void PrintPeakMemory() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  if (GetProcessMemoryInfo(GetCurrentProcess(),
+                           reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                           sizeof(counters)) != 0) {
+    std::printf("host memory: peak working set %.3f GiB, working set %.3f GiB, private %.3f GiB\n",
+                static_cast<double>(counters.PeakWorkingSetSize) / (1ULL << 30U),
+                static_cast<double>(counters.WorkingSetSize) / (1ULL << 30U),
+                static_cast<double>(counters.PrivateUsage) / (1ULL << 30U));
+  }
+#else
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    std::printf("host memory: peak RSS %.3f GiB\n",
+                static_cast<double>(usage.ru_maxrss) / (1ULL << 20U));
+  }
+#endif
+}
 
 int g_failures = 0;
 constexpr double kMinCos = 0.999;
@@ -250,6 +279,7 @@ int main() {
 
   if (oracle->Find("spk_cond_emb") == nullptr) {  // light oracle (text, audio, CAM++ only)
     std::printf("light oracle: later stages skipped\ntotal %.1f s, %d failure(s)\n", Seconds(t_all), g_failures);
+    PrintPeakMemory();
     return g_failures == 0 ? 0 : 1;
   }
 
@@ -558,5 +588,6 @@ int main() {
     }
   }
   std::printf("total %.1f s, %d failure(s)\n", Seconds(t_all), g_failures);
+  PrintPeakMemory();
   return g_failures == 0 ? 0 : 1;
 }
