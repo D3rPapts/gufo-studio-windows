@@ -19,13 +19,13 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/ming_tts/cpu/model.hpp"
-#include "src/models/ming_tts/prompt.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
-#include "src/models/ming_tts/speaker.hpp"
-#include "src/models/ming_tts/synthesis.hpp"
-#include "src/models/ming_tts/tokenizer.hpp"
+#include <gufo/ext/json.hpp>
+#include "ming_tts/cpu/model.hpp"
+#include "ming_tts/prompt.hpp"
+#include "ming_tts/safetensors.hpp"
+#include "ming_tts/speaker.hpp"
+#include "ming_tts/synthesis.hpp"
+#include "ming_tts/tokenizer.hpp"
 
 namespace ming = gufo::models::ming_tts;
 namespace json = gufo::json;

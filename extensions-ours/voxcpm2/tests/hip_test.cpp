@@ -24,13 +24,13 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
-#include "src/models/voxcpm2/cpu/audio_vae.hpp"
-#include "src/models/voxcpm2/cpu/model.hpp"
-#include "src/models/voxcpm2/hip/audio_vae.hpp"
-#include "src/models/voxcpm2/hip/model.hpp"
-#include "src/models/voxcpm2/synthesis.hpp"
+#include <gufo/ext/json.hpp>
+#include "ming_tts/safetensors.hpp"
+#include "voxcpm2/cpu/audio_vae.hpp"
+#include "voxcpm2/cpu/model.hpp"
+#include "voxcpm2/hip/audio_vae.hpp"
+#include "voxcpm2/hip/model.hpp"
+#include "voxcpm2/synthesis.hpp"
 
 namespace vox = gufo::models::voxcpm2;
 namespace json = gufo::json;

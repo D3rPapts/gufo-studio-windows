@@ -1,11 +1,11 @@
-#include "src/models/voxcpm2/config.hpp"
+#include "voxcpm2/config.hpp"
 
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::voxcpm2 {
 namespace {

@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/ming_tts/hip/model.hpp"
+#include "ming_tts/hip/model.hpp"
 
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
@@ -13,8 +13,7 @@
 #include <string>
 #include <utility>
 
-#include "src/models/fish_drama3/hip/backbone_ops.hpp"
-#include "src/models/ming_tts/hip/ops.hpp"
+#include "ming_tts/hip/ops.hpp"
 
 namespace gufo::models::ming_tts::hip {
 namespace {
@@ -218,7 +217,7 @@ struct Model::Impl {
   // y[rows, out] = x[rows, in] W^T (+ b)
   void Linear(const DevLinear& layer, const float* x, std::int64_t rows, float* y) {
     if (rows <= kGemvRows) {
-      fish_drama3::hip::LaunchBackboneBf16Gemv(
+      ming_tts::hip::LaunchBf16Gemv(
           layer.weight, x, y, static_cast<std::size_t>(rows),
           static_cast<std::size_t>(layer.out), static_cast<std::size_t>(layer.in),
           stream);
@@ -230,7 +229,7 @@ struct Model::Impl {
       // bf16 scratch holds uint16 values; size in floats rounded up.
       auto* x_bf16 = reinterpret_cast<std::uint16_t*>(
           bf16.Ensure(static_cast<std::size_t>((rows * layer.in + 1) / 2)));
-      fish_drama3::hip::LaunchBackboneFloatToBf16(
+      ming_tts::hip::LaunchFloatToBf16(
           x, x_bf16, static_cast<std::size_t>(rows * layer.in), stream);
       const float alpha = 1.0F;
       const float beta = 0.0F;

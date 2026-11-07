@@ -1,4 +1,4 @@
-#include "src/models/voxcpm2/synthesis.hpp"
+#include "voxcpm2/synthesis.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,16 +8,16 @@
 #include <mutex>
 #include <random>
 
-#include "src/models/ming_tts/speaker.hpp"
-#include "src/models/voxcpm2/config.hpp"
-#include "src/models/voxcpm2/cpu/audio_vae.hpp"
-#include "src/models/voxcpm2/cpu/model.hpp"
+#include "ming_tts/speaker.hpp"
+#include "voxcpm2/config.hpp"
+#include "voxcpm2/cpu/audio_vae.hpp"
+#include "voxcpm2/cpu/model.hpp"
 #if defined(ENGINE_ENABLE_HIP)
-#include "src/models/voxcpm2/hip/audio_vae.hpp"
-#include "src/models/voxcpm2/hip/model.hpp"
+#include "voxcpm2/hip/audio_vae.hpp"
+#include "voxcpm2/hip/model.hpp"
 #endif
-#include "src/models/voxcpm2/vae_runner.hpp"
-#include "src/models/voxcpm2/tokenizer.hpp"
+#include "voxcpm2/vae_runner.hpp"
+#include "voxcpm2/tokenizer.hpp"
 
 namespace gufo::models::voxcpm2 {
 namespace {

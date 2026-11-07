@@ -22,9 +22,9 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/ming_tts/synthesis.hpp"
-#include "src/models/qwen3_tts/audio.hpp"
+#include <gufo/ext/json.hpp>
+#include "ming_tts/synthesis.hpp"
+#include "ming_tts/wav.hpp"
 
 namespace json = gufo::json;
 namespace ming = gufo::models::ming_tts;
@@ -113,8 +113,8 @@ int main(int argc, char** argv) {
   for (const std::string& voice : voices) {
     const std::filesystem::path wav_path = std::filesystem::path(voices_dir) / (voice + "_ref.wav");
     const std::string bytes = ReadFile(wav_path);
-    gufo::models::qwen3_tts::AudioBuffer audio;
-    if (!gufo::models::qwen3_tts::DecodeWav(
+    gufo::models::ming_tts::WavAudio audio;
+    if (!gufo::models::ming_tts::DecodeWav(
             std::span(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()), &audio,
             &error)) {
       std::fprintf(stderr, "%s: %s\n", wav_path.string().c_str(), error.c_str());

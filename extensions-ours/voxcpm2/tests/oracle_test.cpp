@@ -21,15 +21,15 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
-#include "src/models/ming_tts/speaker.hpp"
-#include "src/models/qwen3_tts/audio.hpp"
-#include "src/models/voxcpm2/config.hpp"
-#include "src/models/voxcpm2/cpu/audio_vae.hpp"
-#include "src/models/voxcpm2/cpu/model.hpp"
-#include "src/models/voxcpm2/synthesis.hpp"
-#include "src/models/voxcpm2/tokenizer.hpp"
+#include <gufo/ext/json.hpp>
+#include "ming_tts/safetensors.hpp"
+#include "ming_tts/speaker.hpp"
+#include "ming_tts/wav.hpp"
+#include "voxcpm2/config.hpp"
+#include "voxcpm2/cpu/audio_vae.hpp"
+#include "voxcpm2/cpu/model.hpp"
+#include "voxcpm2/synthesis.hpp"
+#include "voxcpm2/tokenizer.hpp"
 
 namespace vox = gufo::models::voxcpm2;
 namespace json = gufo::json;
@@ -254,8 +254,8 @@ int main() {
   if (Want(stages, "resample")) {
     const std::filesystem::path voice(meta.member_str("voice"));
     const std::string bytes = ReadText(voice);
-    gufo::models::qwen3_tts::AudioBuffer audio;
-    if (!gufo::models::qwen3_tts::DecodeWav(
+    gufo::models::ming_tts::WavAudio audio;
+    if (!gufo::models::ming_tts::DecodeWav(
             std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes.data()),
                                        bytes.size()),
             &audio, &error)) {

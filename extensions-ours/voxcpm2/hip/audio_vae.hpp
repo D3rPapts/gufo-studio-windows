@@ -11,8 +11,8 @@
 #include <memory>
 #include <string>
 
-#include "src/models/voxcpm2/cpu/audio_vae.hpp"
-#include "src/models/voxcpm2/vae_runner.hpp"
+#include "voxcpm2/cpu/audio_vae.hpp"
+#include "voxcpm2/vae_runner.hpp"
 
 namespace gufo::models::voxcpm2::hip {
 

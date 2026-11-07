@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/voxcpm2/hip/model.hpp"
+#include "voxcpm2/hip/model.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -15,9 +15,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/fish_drama3/hip/backbone_ops.hpp"
-#include "src/models/ming_tts/hip/ops.hpp"
-#include "src/models/voxcpm2/hip/ops.hpp"
+#include "ming_tts/hip/ops.hpp"
+#include "voxcpm2/hip/ops.hpp"
 
 namespace gufo::models::voxcpm2::hip {
 namespace {
@@ -324,7 +323,7 @@ struct Model::Impl {
   // y[rows, out] = x[rows, in] W^T (+ b)
   void Linear(const DevLinear& layer, const float* xin, std::int64_t rows, float* y) {
     if (rows <= kGemvRows) {
-      fish_drama3::hip::LaunchBackboneBf16Gemv(layer.weight, xin, y,
+      ming_tts::hip::LaunchBf16Gemv(layer.weight, xin, y,
                                                static_cast<std::size_t>(rows),
                                                static_cast<std::size_t>(layer.out),
                                                static_cast<std::size_t>(layer.in), stream);

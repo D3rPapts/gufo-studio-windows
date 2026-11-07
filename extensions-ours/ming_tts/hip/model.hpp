@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-#include "src/models/ming_tts/backend.hpp"
-#include "src/models/ming_tts/cpu/model.hpp"
+#include "ming_tts/backend.hpp"
+#include "ming_tts/cpu/model.hpp"
 
 namespace gufo::models::ming_tts::hip {
 

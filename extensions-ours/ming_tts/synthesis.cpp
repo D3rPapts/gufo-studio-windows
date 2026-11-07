@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/synthesis.hpp"
+#include "ming_tts/synthesis.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -9,13 +9,13 @@
 #include <mutex>
 #include <random>
 
-#include "src/models/ming_tts/cpu/model.hpp"
+#include "ming_tts/cpu/model.hpp"
 #if defined(ENGINE_ENABLE_HIP)
-#include "src/models/ming_tts/hip/model.hpp"
+#include "ming_tts/hip/model.hpp"
 #endif
-#include "src/models/ming_tts/prompt.hpp"
-#include "src/models/ming_tts/speaker.hpp"
-#include "src/models/ming_tts/tokenizer.hpp"
+#include "ming_tts/prompt.hpp"
+#include "ming_tts/speaker.hpp"
+#include "ming_tts/tokenizer.hpp"
 
 namespace gufo::models::ming_tts {
 namespace {

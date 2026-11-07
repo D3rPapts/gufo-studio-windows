@@ -1,6 +1,6 @@
 // HIP kernels for the Ming-3.0-tts gfx1151 runtime. Matrix-vector products,
-// RMSNorm and residual adds reuse the Fish Drama-3 backbone kernels; this
-// file adds what Ming needs on top (QKV bias, half and interleaved RoPE,
+// RMSNorm and residual adds come from the Fish Drama-3 backbone kernels
+// (copied in, see LaunchBf16Gemv); this file adds what Ming needs on top (QKV bias, half and interleaved RoPE,
 // windowed GQA attention, GELU-tanh, the DiT input/sampler glue, linear
 // upsampling and the ISTFT head). Written with AI assistance (Claude Code).
 #ifndef GUFO_MODELS_MING_TTS_HIP_OPS_HPP_
@@ -13,6 +13,16 @@
 #include <hip/hip_runtime.h>
 
 namespace gufo::models::ming_tts::hip {
+
+// out[batch, rows] = W[rows, cols] (BF16) * in[batch, cols] (FP32); cols must
+// be a multiple of 8. Copied from the Fish Drama-3 backbone GEMV.
+void LaunchBf16Gemv(const std::uint16_t* weight_bf16, const float* input_f32,
+                    float* output_f32, std::size_t batch, std::size_t rows,
+                    std::size_t cols, hipStream_t stream);
+
+// Round-to-nearest-even FP32 -> BF16 bits.
+void LaunchFloatToBf16(const float* input, std::uint16_t* output,
+                       std::size_t elements, hipStream_t stream);
 
 // C[M, N] = A[M, K] (FP32) * W[N, K]^T (BF16), FP32 accumulation; 64x64
 // tiles. Keeps prefill and VAE activations in FP32 (rocBLAS needs BF16 A).

@@ -1,9 +1,9 @@
-#include "src/models/ming_tts/safetensors.hpp"
+#include "ming_tts/safetensors.hpp"
 
 #include <cmath>
 #include <stdexcept>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::ming_tts {
 namespace {

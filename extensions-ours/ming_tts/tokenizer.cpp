@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/tokenizer.hpp"
+#include "ming_tts/tokenizer.hpp"
 
 #include <unicode/normalizer2.h>
 #include <unicode/stringpiece.h>
@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::ming_tts {
 namespace {

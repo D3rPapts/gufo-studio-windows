@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/voxcpm2/config.hpp"
+#include "voxcpm2/config.hpp"
 
 namespace gufo::models::voxcpm2::cpu {
 

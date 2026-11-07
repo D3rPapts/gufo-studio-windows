@@ -1,27 +1,20 @@
 // Ming-3.0-tts BASIC (tempo/pitch/volume) and DIALECT controls: value
 // mapping, captions against the reference tts_tasks.build_task_instruction
-// output, task resolution and the /v1/audio/speech fields. CPU only, no
-// checkpoint: the API part uses a stub model directory and a fake runner.
+// output, task resolution, and (extension API 0.2) the controls carried in
+// `instructions` plus the gufo::ext::SynthesisRequest -> engine request
+// mapping. CPU only, no checkpoint.
 // Written with AI assistance (Claude Code).
+#include <gufo/ext/tts.hpp>
+
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
 #include <optional>
 #include <string>
-#include <system_error>
 
-#include "src/cli/serve/audio_tts_api.hpp"
-#include "src/cli/serve/tts_service.hpp"
-#include "src/models/ming_tts/prompt.hpp"
-#include "src/models/ming_tts/synthesis.hpp"
+#include "ming_tts/ext_request.hpp"
+#include "ming_tts/prompt.hpp"
+#include "ming_tts/synthesis.hpp"
 
 namespace ming = gufo::models::ming_tts;
-namespace qwen3_tts = gufo::models::qwen3_tts;
-using gufo::server::HandleAudioTtsApiRequest;
-using gufo::server::HttpRequest;
-using gufo::server::HttpResponse;
-using gufo::server::TtsService;
-using gufo::server::TtsServiceOptions;
 
 namespace {
 
@@ -112,152 +105,117 @@ void TestResolve() {
          error);
 }
 
-// Smallest config.json that LoadModelConfigFromPath accepts.
-constexpr const char* kStubConfig = R"({
-  "architectures": ["BailingMMNativeForConditionalGeneration"],
-  "model_type": "dense",
-  "llm_config": {"hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 1,
-                 "num_attention_heads": 2, "num_key_value_heads": 1,
-                 "rms_norm_eps": 1e-6, "rope_theta": 10000},
-  "ditar_config": {"hidden_size": 8, "depth": 1, "num_heads": 2, "mlp_ratio": 2},
-  "aggregator_config": {"hidden_size": 8, "depth": 1, "num_heads": 2, "mlp_ratio": 2},
-  "audio_tokenizer_config": {
-    "patch_size": 4, "sample_rate": 44100,
-    "dec_kwargs": {"latent_dim": 4, "output_dim": 16,
-                   "backbone": {"hidden_size": 8, "intermediate_size": 16,
-                                "num_hidden_layers": 1, "num_attention_heads": 2,
-                                "num_key_value_heads": 1, "rms_norm_eps": 1e-6,
-                                "rope_theta": 10000}},
-    "enc_kwargs": {"input_dim": 16,
-                   "backbone": {"hidden_size": 8, "intermediate_size": 16,
-                                "num_hidden_layers": 1, "num_attention_heads": 2,
-                                "num_key_value_heads": 1, "rms_norm_eps": 1e-6,
-                                "rope_theta": 10000}}
-  }
-})";
-
-struct FakeRunner {
-  int calls{0};
-  qwen3_tts::SynthesisRequest latest;
-};
-
-HttpResponse Post(TtsService& service, const std::string& body) {
-  return HandleAudioTtsApiRequest(HttpRequest{.method = "POST",
-                                              .path = "/v1/audio/speech",
-                                              .query = {},
-                                              .body = body,
-                                              .headers = {},
-                                              .is_cancelled = {}},
-                                  service);
+std::string Join(const ming::InstructControls& c) {
+  return "emotion=" + c.emotion + "|instruction=" + c.instruction + "|speed=" + c.speed +
+         "|pitch=" + c.pitch + "|volume=" + c.volume + "|dialect=" + c.dialect;
 }
 
-std::string ErrorCode(const HttpResponse& response) {
-  const auto at = response.body.find("\"code\"");
-  if (at == std::string::npos) {
-    return response.body;
-  }
-  const auto open = response.body.find('"', response.body.find(':', at) + 1);
-  const auto close = response.body.find('"', open + 1);
-  return response.body.substr(open + 1, close - open - 1);
+// API 0.2 carries the controls in `instructions` (SynthesisRequest::instruct).
+void TestInstructParsing() {
+  ming::InstructControls c;
+  std::string error;
+  Expect("empty instructions", ming::ParseInstructControls("  ", &c, &error) &&
+                                   Join(c) == Join(ming::InstructControls{}));
+  Expect("JSON BASIC",
+         ming::ParseInstructControls(R"({"tempo":"langsam","pitch":"low","volume":"laut"})",
+                                     &c, &error) &&
+             c.speed == "langsam" && c.pitch == "low" && c.volume == "laut" &&
+             c.dialect.empty() && c.emotion.empty() && c.instruction.empty(),
+         Join(c) + " " + error);
+  Expect("JSON DIALECT", ming::ParseInstructControls(R"( {"dialect":"cantonese"} )", &c, &error) &&
+                             c.dialect == "cantonese",
+         Join(c) + " " + error);
+  Expect("JSON speed alias + caption",
+         ming::ParseInstructControls(R"({"speed":"fast","instruction":"leise"})", &c, &error) &&
+             c.speed == "fast" && c.instruction == "leise",
+         Join(c) + " " + error);
+  Expect("JSON unknown key rejected",
+         !ming::ParseInstructControls(R"({"tempo":"fast","speed2":"x"})", &c, &error) &&
+             error.find("speed2") != std::string::npos,
+         error);
+  Expect("JSON non-string rejected",
+         !ming::ParseInstructControls(R"({"tempo":1.5})", &c, &error), error);
+  Expect("JSON malformed rejected", !ming::ParseInstructControls(R"({"tempo":)", &c, &error),
+         error);
+  Expect("key=value list",
+         ming::ParseInstructControls("Tempo = slow; pitch=low", &c, &error) &&
+             c.speed == "slow" && c.pitch == "low",
+         Join(c) + " " + error);
+  Expect("key=value dialect with space",
+         ming::ParseInstructControls("dialect=chuanyu dialect", &c, &error) &&
+             c.dialect == "chuanyu dialect",
+         Join(c) + " " + error);
+  Expect("list mixed with free text rejected",
+         !ming::ParseInstructControls("tempo=slow, whisper please", &c, &error), error);
+  Expect("emotion name", ming::ParseInstructControls(" Wut ", &c, &error) &&
+                             c.emotion == "Wut" && c.instruction.empty(),
+         Join(c));
+  const std::string caption =
+      "Whisper very softly and tensely, almost breathless, close to the microphone.";
+  Expect("free-text caption", ming::ParseInstructControls(caption, &c, &error) &&
+                                  c.instruction == caption && c.emotion.empty(),
+         Join(c));
+  Expect("free text with '=' but no known key",
+         ming::ParseInstructControls("say 2+2=4 slowly", &c, &error) &&
+             c.instruction == "say 2+2=4 slowly",
+         Join(c));
 }
 
-TtsServiceOptions FakeOptions(const std::filesystem::path& root, FakeRunner* runner) {
-  return TtsServiceOptions{
-      .model_root = root,
-      .native_context_tokens = 4096,
-      .validate_model = false,
-      .model_id = {},
-      .voices = {},
-      .voice_presets = {},
-      .runner = [runner](const qwen3_tts::SynthesisRequest& request,
-                         const qwen3_tts::CancellationCheck&,
-                         qwen3_tts::SynthesisResult* result, std::string*) {
-        ++runner->calls;
-        runner->latest = request;
-        result->sample_rate = 44100;
-        result->code_groups = 1;
-        result->samples = {0.0F, 0.25F, -0.25F, 0.0F};
-        result->sample_count = result->samples.size();
-        return true;
-      },
+void TestEngineRequest() {
+  std::string error;
+  gufo::ext::SynthesisRequest in;
+  in.text = "Hallo.";
+  in.language = "de";
+  in.instruct = R"({"tempo":"langsam","pitch":"low","volume":"laut"})";
+  in.max_new_tokens = 3000;
+  in.sampling.seed = 7;
+  ming::SynthesisRequest out;
+  Expect("BASIC request", ming::BuildEngineRequest(in, &out, &error) &&
+                              out.speed == "langsam" && out.pitch == "low" &&
+                              out.volume == "laut" && out.language == "de" &&
+                              out.seed == 7 && out.max_decode_steps == 1000,
+         error);
+  std::optional<std::string> instruction;
+  Expect("BASIC request caption",
+         ming::ResolveTaskInstruction(out, &instruction, &error) && instruction.has_value());
+
+  const auto expect_error = [&](const std::string& name, const std::string& instruct,
+                                const std::string& needle) {
+    gufo::ext::SynthesisRequest bad = in;
+    bad.instruct = instruct;
+    std::string message;
+    ming::SynthesisRequest ignored;
+    Expect(name, !ming::BuildEngineRequest(bad, &ignored, &message) &&
+                     message.find(needle) != std::string::npos,
+           message);
   };
-}
+  expect_error("bad tempo", R"({"tempo":"1.5"})", "speed");
+  expect_error("bad pitch", R"({"pitch":"loud"})", "pitch");
+  expect_error("bad volume", R"({"volume":"x"})", "volume");
+  expect_error("bad dialect", R"({"dialect":"bairisch"})", "dialect");
+  expect_error("tempo + emotion", R"({"tempo":"fast","emotion":"angry"})", "one task");
+  expect_error("pitch + caption", R"({"pitch":"high","instruction":"whisper"})", "one task");
+  expect_error("volume + dialect", R"({"volume":"high","dialect":"cantonese"})", "one task");
+  expect_error("bad emotion (JSON)", R"({"emotion":"langweilig"})", "emotion");
 
-void TestApi() {
-  std::error_code ec;
-  const std::filesystem::path root =
-      std::filesystem::temp_directory_path() / "gufo_ming_controls_test";
-  std::filesystem::create_directories(root, ec);
-  std::ofstream(root / "config.json", std::ios::binary) << kStubConfig;
-  std::ofstream(root / "model.safetensors", std::ios::binary) << "";
-  std::ofstream(root / "campplus.onnx", std::ios::binary) << "";
-
-  FakeRunner runner;
-  TtsService service(FakeOptions(root, &runner));
-  Expect("stub detected as Ming", service.ready() && service.is_ming_tts(),
-         service.initialization_error());
-  if (!service.ready()) {
-    std::filesystem::remove_all(root, ec);
-    return;
-  }
-
-  HttpResponse ok = Post(service,
-                         R"({"model":"ming-3.0-tts","input":"Hallo.","tempo":"langsam",)"
-                         R"("pitch":"low","volume":"laut"})");
-  Expect("BASIC request 200", ok.status == 200 && runner.calls == 1, ok.body);
-  Expect("BASIC fields forwarded", runner.latest.tempo == "langsam" &&
-                                       runner.latest.pitch == "low" &&
-                                       runner.latest.volume == "laut" &&
-                                       runner.latest.dialect.empty());
-
-  ok = Post(service, R"({"model":"ming-3.0-tts","input":"你好。","dialect":"cantonese"})");
-  Expect("DIALECT request 200", ok.status == 200 && runner.latest.dialect == "cantonese",
-         ok.body);
-
-  ok = Post(service, R"({"model":"ming-3.0-tts","input":"Hallo.","tempo":"fast","speed":1.2})");
-  Expect("tempo + OpenAI speed allowed", ok.status == 200, ok.body);
-
-  const auto expect_error = [&](const std::string& name, const std::string& body,
-                                const std::string& code) {
-    const int before = runner.calls;
-    const HttpResponse response = Post(service, body);
-    Expect(name, response.status == 400 && ErrorCode(response) == code &&
-                     runner.calls == before,
-           std::to_string(response.status) + " " + response.body);
-  };
-  expect_error("bad tempo", R"({"model":"ming-3.0-tts","input":"Hallo.","tempo":"1.5"})",
-               "invalid_tempo");
-  expect_error("bad pitch", R"({"model":"ming-3.0-tts","input":"Hallo.","pitch":"loud"})",
-               "invalid_pitch");
-  expect_error("bad volume", R"({"model":"ming-3.0-tts","input":"Hallo.","volume":"x"})",
-               "invalid_volume");
-  expect_error("bad dialect", R"({"model":"ming-3.0-tts","input":"Hallo.","dialect":"bairisch"})",
-               "invalid_dialect");
-  expect_error("tempo not a string", R"({"model":"ming-3.0-tts","input":"Hallo.","tempo":1})",
-               "invalid_parameter_type");
-  expect_error("tempo + emotion",
-               R"({"model":"ming-3.0-tts","input":"Hallo.","tempo":"fast","emotion":"angry"})",
-               "conflicting_controls");
-  expect_error("pitch + instructions",
-               R"({"model":"ming-3.0-tts","input":"Hallo.","pitch":"high","instructions":"whisper"})",
-               "conflicting_controls");
-  expect_error("volume + dialect",
-               R"({"model":"ming-3.0-tts","input":"Hallo.","volume":"high","dialect":"cantonese"})",
-               "conflicting_controls");
-
-  // Non-Ming services reject the fields.
-  FakeRunner other_runner;
-  TtsServiceOptions other = FakeOptions({}, &other_runner);
-  other.model_id = "qwen3-tts-12hz-1.7b-customvoice";
-  other.voices = {"vivian"};
-  TtsService qwen(std::move(other));
-  const HttpResponse rejected =
-      Post(qwen, R"({"model":"qwen3-tts","voice":"vivian","input":"Hi.","pitch":"high"})");
-  Expect("Qwen3-TTS rejects pitch",
-         rejected.status == 400 && ErrorCode(rejected) == "unsupported_field" &&
-             other_runner.calls == 0,
-         rejected.body);
-  std::filesystem::remove_all(root, ec);
+  // Reference audio: stereo is mixed down; the transcript is dropped for
+  // speaker_embedding_only.
+  gufo::ext::SynthesisRequest clone;
+  clone.text = "Hallo.";
+  clone.reference_audio = {.sample_rate = 16000, .channels = 2,
+                           .samples = {0.5F, -0.5F, 1.0F, 0.0F}};
+  clone.reference_text = "Transkript.";
+  Expect("clone mixdown",
+         ming::BuildEngineRequest(clone, &out, &error) && out.reference_audio.size() == 2 &&
+             out.reference_audio[0] == 0.0F && out.reference_audio[1] == 0.5F &&
+             out.reference_sample_rate == 16000 && out.reference_text == "Transkript.",
+         error);
+  clone.speaker_embedding_only = true;
+  Expect("speaker_embedding_only drops transcript",
+         ming::BuildEngineRequest(clone, &out, &error) && out.reference_text.empty(), error);
+  clone.max_new_tokens = 200;
+  Expect("max_new_tokens below the cap",
+         ming::BuildEngineRequest(clone, &out, &error) && out.max_decode_steps == 200, error);
 }
 
 }  // namespace
@@ -266,7 +224,8 @@ int main() {
   TestLabels();
   TestCaptions();
   TestResolve();
-  TestApi();
+  TestInstructParsing();
+  TestEngineRequest();
   std::printf("%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }

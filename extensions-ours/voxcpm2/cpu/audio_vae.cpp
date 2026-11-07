@@ -1,11 +1,11 @@
-#include "src/models/voxcpm2/cpu/audio_vae.hpp"
+#include "voxcpm2/cpu/audio_vae.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
 
-#include "src/models/voxcpm2/vae_weights.hpp"
+#include "voxcpm2/vae_weights.hpp"
 
 namespace gufo::models::voxcpm2::cpu {
 namespace {

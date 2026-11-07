@@ -1,4 +1,4 @@
-#include "src/models/voxcpm2/tokenizer.hpp"
+#include "voxcpm2/tokenizer.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -7,7 +7,7 @@
 #include <limits>
 #include <sstream>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::voxcpm2 {
 namespace {

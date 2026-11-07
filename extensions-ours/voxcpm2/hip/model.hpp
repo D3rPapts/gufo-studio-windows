@@ -13,8 +13,8 @@
 #include <memory>
 #include <string>
 
-#include "src/models/voxcpm2/backend.hpp"
-#include "src/models/voxcpm2/cpu/model.hpp"
+#include "voxcpm2/backend.hpp"
+#include "voxcpm2/cpu/model.hpp"
 
 namespace gufo::models::voxcpm2::hip {
 

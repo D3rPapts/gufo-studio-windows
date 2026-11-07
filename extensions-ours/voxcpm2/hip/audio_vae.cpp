@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/voxcpm2/hip/audio_vae.hpp"
+#include "voxcpm2/hip/audio_vae.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -8,8 +8,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/ming_tts/hip/ops.hpp"
-#include "src/models/voxcpm2/hip/ops.hpp"
+#include "ming_tts/hip/ops.hpp"
+#include "voxcpm2/hip/ops.hpp"
 
 namespace gufo::models::voxcpm2::hip {
 namespace {

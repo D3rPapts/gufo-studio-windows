@@ -21,11 +21,11 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/ming_tts/cpu/model.hpp"
-#include "src/models/ming_tts/hip/model.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
-#include "src/models/ming_tts/synthesis.hpp"
+#include <gufo/ext/json.hpp>
+#include "ming_tts/cpu/model.hpp"
+#include "ming_tts/hip/model.hpp"
+#include "ming_tts/safetensors.hpp"
+#include "ming_tts/synthesis.hpp"
 
 namespace ming = gufo::models::ming_tts;
 namespace json = gufo::json;

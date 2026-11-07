@@ -11,10 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "src/models/ming_tts/backend.hpp"
-#include "src/models/ming_tts/config.hpp"
-#include "src/models/ming_tts/cpu/ops.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
+#include "ming_tts/backend.hpp"
+#include "ming_tts/config.hpp"
+#include "ming_tts/cpu/ops.hpp"
+#include "ming_tts/safetensors.hpp"
 
 namespace gufo::models::ming_tts::cpu {
 

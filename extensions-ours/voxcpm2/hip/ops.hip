@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/voxcpm2/hip/ops.hpp"
+#include "voxcpm2/hip/ops.hpp"
 
 #include <hip/hip_runtime.h>
 

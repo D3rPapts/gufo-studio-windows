@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/prompt.hpp"
+#include "ming_tts/prompt.hpp"
 
 #include <unicode/normalizer2.h>
 #include <unicode/uchar.h>

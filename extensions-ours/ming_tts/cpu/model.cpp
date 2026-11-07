@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/cpu/model.hpp"
+#include "ming_tts/cpu/model.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +8,7 @@
 #include <numbers>
 #include <stdexcept>
 
-#include "src/models/ming_tts/cpu/fft.hpp"
+#include "ming_tts/cpu/fft.hpp"
 
 namespace gufo::models::ming_tts::cpu {
 namespace {

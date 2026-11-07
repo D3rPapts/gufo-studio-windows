@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/voxcpm2/backend.hpp"
+#include "voxcpm2/backend.hpp"
 
 namespace gufo::models::voxcpm2 {
 

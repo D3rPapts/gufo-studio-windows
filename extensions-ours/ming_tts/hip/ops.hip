@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/ming_tts/hip/ops.hpp"
+#include "ming_tts/hip/ops.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -501,6 +501,126 @@ void LaunchOverlapAdd(const float* frames_in, const float* window, float* out,
                       hipStream_t stream) {
   hipLaunchKernelGGL(OverlapAddKernel, dim3(Blocks(frames * hop)), dim3(kThreads), 0,
                      stream, frames_in, window, out, frames, n_fft, hop);
+}
+
+
+// BF16 GEMV and FP32 -> BF16 conversion, copied from the Fish Drama-3
+// backbone kernels (rikaaa0928, MIT; Bf16GemvKernel / FloatToBf16Kernel in
+// fish_drama3/hip/backbone_ops.hip) so this extension does not depend on the
+// external fish_drama3 extension.
+namespace bf16_detail {
+
+constexpr std::size_t kGemvThreads = 256;
+constexpr std::size_t kWaveSize = 32;
+constexpr std::size_t kWavesPerBlock = kGemvThreads / kWaveSize;
+
+__device__ __forceinline__ float Bf16Bits(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+__device__ __forceinline__ std::uint16_t ToBf16Bits(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7fffffffU) > 0x7f800000U) {
+    return static_cast<std::uint16_t>((bits >> 16U) | 0x0040U);
+  }
+  const std::uint32_t lsb = (bits >> 16U) & 1U;
+  return static_cast<std::uint16_t>((bits + 0x7fffU + lsb) >> 16U);
+}
+
+__device__ __forceinline__ float WaveSum(float val) {
+#pragma unroll
+  for (int offset = kWaveSize / 2; offset > 0; offset >>= 1) {
+    val += __shfl_down(val, offset, kWaveSize);
+  }
+  return val;
+}
+
+__global__ void FloatToBf16Kernel(const float* input, std::uint16_t* output,
+                                  std::size_t elements) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    output[idx] = ToBf16Bits(input[idx]);
+  }
+}
+
+__device__ __forceinline__ void AccumulateBf16Vec8(const uint4& w_pack,
+                                                   const float4& x0,
+                                                   const float4& x1,
+                                                   float& acc) {
+  const std::uint16_t* w16 = reinterpret_cast<const std::uint16_t*>(&w_pack);
+  acc = fmaf(Bf16Bits(w16[0]), x0.x, acc);
+  acc = fmaf(Bf16Bits(w16[1]), x0.y, acc);
+  acc = fmaf(Bf16Bits(w16[2]), x0.z, acc);
+  acc = fmaf(Bf16Bits(w16[3]), x0.w, acc);
+  acc = fmaf(Bf16Bits(w16[4]), x1.x, acc);
+  acc = fmaf(Bf16Bits(w16[5]), x1.y, acc);
+  acc = fmaf(Bf16Bits(w16[6]), x1.z, acc);
+  acc = fmaf(Bf16Bits(w16[7]), x1.w, acc);
+}
+
+// One output row per 256-thread workgroup (8 wavefronts walk the row together
+// in a single coalesced stream).
+__launch_bounds__(kGemvThreads) __global__
+    void Bf16GemvKernel(const std::uint16_t* __restrict__ weight_bf16,
+                        const float* __restrict__ input_f32,
+                        float* __restrict__ output_f32, std::size_t batch,
+                        std::size_t rows, std::size_t cols) {
+  const std::size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float wave_sums[kWavesPerBlock];
+  const std::size_t wave_id = threadIdx.x / kWaveSize;
+  const std::size_t lane = threadIdx.x % kWaveSize;
+  const std::size_t vec_cols = cols / 8U;
+  const uint4* w_vec = reinterpret_cast<const uint4*>(weight_bf16 + row * cols);
+
+  for (std::size_t b = 0; b < batch; ++b) {
+    const float4* x_vec = reinterpret_cast<const float4*>(input_f32 + b * cols);
+    float acc = 0.0F;
+    for (std::size_t idx = threadIdx.x; idx < vec_cols; idx += kGemvThreads) {
+      const uint4 w_pack = w_vec[idx];
+      const float4 x0 = x_vec[2U * idx];
+      const float4 x1 = x_vec[2U * idx + 1U];
+      AccumulateBf16Vec8(w_pack, x0, x1, acc);
+    }
+    const float w_sum = WaveSum(acc);
+    if (lane == 0) {
+      wave_sums[wave_id] = w_sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float total = 0.0F;
+#pragma unroll
+      for (std::size_t w = 0; w < kWavesPerBlock; ++w) {
+        total += wave_sums[w];
+      }
+      output_f32[b * rows + row] = total;
+    }
+    if (batch > 1U) {
+      __syncthreads();
+    }
+  }
+}
+
+}  // namespace bf16_detail
+
+void LaunchBf16Gemv(const std::uint16_t* weight_bf16, const float* input_f32,
+                    float* output_f32, std::size_t batch, std::size_t rows,
+                    std::size_t cols, hipStream_t stream) {
+  hipLaunchKernelGGL(bf16_detail::Bf16GemvKernel, dim3(rows),
+                     dim3(bf16_detail::kGemvThreads), 0, stream, weight_bf16,
+                     input_f32, output_f32, batch, rows, cols);
+}
+
+void LaunchFloatToBf16(const float* input, std::uint16_t* output,
+                       std::size_t elements, hipStream_t stream) {
+  const std::size_t blocks =
+      (elements + bf16_detail::kGemvThreads - 1U) / bf16_detail::kGemvThreads;
+  hipLaunchKernelGGL(bf16_detail::FloatToBf16Kernel, dim3(blocks),
+                     dim3(bf16_detail::kGemvThreads), 0, stream, input, output,
+                     elements);
 }
 
 }  // namespace gufo::models::ming_tts::hip

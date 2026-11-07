@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/ming_tts/tokenizer.hpp"
+#include "ming_tts/tokenizer.hpp"
 
 namespace gufo::models::ming_tts {
 

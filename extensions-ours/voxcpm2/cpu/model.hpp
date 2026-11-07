@@ -11,10 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "src/models/ming_tts/cpu/ops.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
-#include "src/models/voxcpm2/backend.hpp"
-#include "src/models/voxcpm2/config.hpp"
+#include "ming_tts/cpu/ops.hpp"
+#include "ming_tts/safetensors.hpp"
+#include "voxcpm2/backend.hpp"
+#include "voxcpm2/config.hpp"
 
 namespace gufo::models::voxcpm2::cpu {
 

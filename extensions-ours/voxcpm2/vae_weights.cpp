@@ -1,4 +1,4 @@
-#include "src/models/voxcpm2/vae_weights.hpp"
+#include "voxcpm2/vae_weights.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -7,8 +7,8 @@
 #include <string_view>
 #include <unordered_map>
 
-#include "src/core/platform/mapped_file.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include "ming_tts/safetensors.hpp"
 
 namespace gufo::models::voxcpm2 {
 namespace {

@@ -1,4 +1,4 @@
-#include "src/models/voxcpm2/cpu/model.hpp"
+#include "voxcpm2/cpu/model.hpp"
 
 #include <algorithm>
 #include <cmath>

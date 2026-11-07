@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/speaker.hpp"
+#include "ming_tts/speaker.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "src/core/platform/mapped_file.hpp"
-#include "src/models/ming_tts/cpu/fft.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include "ming_tts/cpu/fft.hpp"
 
 namespace gufo::models::ming_tts {
 namespace {

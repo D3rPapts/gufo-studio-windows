@@ -1,4 +1,4 @@
-#include "src/models/ming_tts/cpu/ops.hpp"
+#include "ming_tts/cpu/ops.hpp"
 
 #include <algorithm>
 #include <cmath>

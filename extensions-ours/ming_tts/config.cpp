@@ -1,11 +1,11 @@
-#include "src/models/ming_tts/config.hpp"
+#include "ming_tts/config.hpp"
 
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::ming_tts {
 namespace {
