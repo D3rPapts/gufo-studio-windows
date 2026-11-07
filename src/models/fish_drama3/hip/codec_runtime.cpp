@@ -1170,8 +1170,46 @@ bool FishDacCodecHipRuntime::Decode(const FishDacCodes& codes,
     return false;
   }
   try {
-    impl_->active_stream = nullptr;
-    *output_samples = impl_->RunDecodePass(codes);
+    constexpr std::int64_t kMaxBatchFrames = 64;
+    if (codes.frames <= kMaxBatchFrames) {
+      impl_->active_stream = nullptr;
+      *output_samples = impl_->RunDecodePass(codes);
+      return true;
+    }
+    // Decode long sequences in causal chunks of at most 64 frames through
+    // the streaming state (conv histories + windowed KV cache), so the
+    // workspace stays at its steady size regardless of utterance length.
+    impl_->stream_state.Reset();
+    impl_->active_stream = &impl_->stream_state;
+    struct Guard {
+      Impl* impl;
+      ~Guard() {
+        impl->active_stream = nullptr;
+        impl->stream_state.Reset();
+      }
+    } guard{impl_.get()};
+
+    output_samples->clear();
+    output_samples->reserve(static_cast<std::size_t>(codes.frames) *
+                            impl_->config.frame_length);
+    const std::size_t total_frames = static_cast<std::size_t>(codes.frames);
+    const std::size_t total_cb = static_cast<std::size_t>(codes.codebooks);
+    for (std::size_t start = 0; start < total_frames;
+         start += static_cast<std::size_t>(kMaxBatchFrames)) {
+      const std::size_t len = std::min<std::size_t>(
+          static_cast<std::size_t>(kMaxBatchFrames), total_frames - start);
+      FishDacCodes chunk;
+      chunk.codebooks = codes.codebooks;
+      chunk.frames = static_cast<std::int64_t>(len);
+      chunk.codes.resize(total_cb * len);
+      for (std::size_t cb = 0; cb < total_cb; ++cb) {
+        std::copy_n(codes.codes.data() + cb * total_frames + start, len,
+                    chunk.codes.data() + cb * len);
+      }
+      auto chunk_pcm = impl_->RunDecodePass(chunk);
+      output_samples->insert(output_samples->end(), chunk_pcm.begin(),
+                             chunk_pcm.end());
+    }
     return true;
   } catch (const std::exception& ex) {
     SetError(error, ex.what());
