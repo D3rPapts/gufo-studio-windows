@@ -4,12 +4,13 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0)**
-> (zip, branch `release/1.3`): text, images, speech, music and video from one
-> OpenAI-compatible port on Windows 11, plus a ComfyUI-compatible API. Unpack
-> it, edit `examples\router.ini`, run `start-router.cmd`; models load on the
-> first request. The release notes list what was tested.
-> Previous: [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> **Download [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1)**
+> (`gufo-studio-windows-1.4.1-windows-x64-gfx1151.zip`, branch `release/1.4`): text,
+> images, speech, music and video from one OpenAI-compatible port on Windows 11, plus a
+> ComfyUI-compatible API. Unpack it, edit `examples\router.ini`, run `start-router.cmd`;
+> models load on the first request. The ROCm runtime is included; FFmpeg is not
+> (`winget install Gyan.FFmpeg`). The release notes list what was tested.
+> Previous: [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
 > This repository was called `gufo_windows` until 31 October 2026; old links still work.
 
 ### Focus
@@ -20,11 +21,33 @@ creative work, connected by a direct cable. The goal is one tool that covers eve
 a film pipeline needs: text, images, speech, music and video. New features land here
 when that setup needs them, and the measurements in the release notes come from it.
 Since 1.3 the two machines share the work: a model on one machine can be used through
-the router of the other ([docs/TWO-MACHINES.md](docs/TWO-MACHINES.md), with diagrams).
+the router of the other ([docs/TWO-MACHINES.md](docs/TWO-MACHINES.md), with diagrams);
+since 1.4 a model can be moved between the machines at runtime.
 Other Strix Halo machines should work too, and we help in the issues, but only this
 setup is tested here.
 
 _(AI-assisted text, written with Claude Code.)_
+
+### New in 1.4 and 1.4.1
+
+- **Switch a model between local and remote at runtime:** a local section and a
+  `[remote/<id>]` section with the same id make a model switchable;
+  `POST /router/placement` moves it without a restart.
+- **Qwen-Image 2.1 regional prompts** (`gufo.regions`: own prompt, references, strength
+  and area per region) and **ControlNet** (Fun ControlNet-Union: pose, depth, canny, …;
+  `serve image --controlnet FILE`), both also through the ComfyUI adapter. The two
+  cannot be combined in one request yet. The alibaba-pai ControlNet weights are not
+  cleared for commercial use.
+- **Voices:** VoxCPM2 in `gufo serve tts` (presets, cloning, instructions, streaming);
+  `tempo`, `pitch`, `volume` and `dialect` controls for Ming-3.0-tts.
+- **InfiniteTalk (Wan 2.1, one or two speakers)** runs through the ComfyUI adapter and
+  is GPU-checked; 1.4.1 raises InfiniteTalk and Uni3C to 896x512 pixels and removes the
+  colour jump at the first frame.
+- **Figure check for film keyframes** (`POST /v1/figuren`), MOSS-Image now applies
+  `gufo.negative_prompt`, memory guard fixes, and no more "bad allocation" when a text
+  model loads with little free RAM (also fixed upstream, see below).
+- **MMAudio foley** had its first GPU run with the 1.4.0 build (8 s of audio from text in 3.2 s);
+  a listening check is still open.
 
 ### New in 1.3
 
@@ -48,8 +71,10 @@ _(AI-assisted text, written with Claude Code.)_
   gender, reproducible with `seed`) and `/v1/names/origins`.
 - **Pages:** background jobs per browser (images, voice, music are picked up after you
   come back), "My jobs on this device" on the start page.
-- **Experimental, not yet run on the GPU:** VACE, InfiniteTalk, MMAudio (non-commercial
-  weights) and an H3 stage disk cache.
+- **Experimental in 1.3, not run on the GPU at the time:** VACE, InfiniteTalk, MMAudio
+  (non-commercial weights) and an H3 stage disk cache. Since then InfiniteTalk was
+  GPU-checked (1.4.0) and MMAudio had a first GPU run (1.4.0 build); VACE and the H3 stage
+  disk cache have no GPU run in the release notes yet.
 - The memory guard also checks the Windows commit limit; upstream fixes #914 and #875.
 
 ### New in 1.2
@@ -101,8 +126,8 @@ llama.cpp's server or the OpenAI API work against it.
 
 The easiest way to use it is the release zip above. The step-by-step guide
 further down builds `main` from source and covers Qwen3.8-27B only; the
-release branches (`release/1.1`, `release/1.1.1-ttft`, `release/1.2`, `release/1.3`)
-carry everything in the tables below. Everything on this page was run on the two
+release branches (`release/1.1`, `release/1.1.1-ttft`, `release/1.2`, `release/1.3`,
+`release/1.4`) carry everything in the tables below. Everything on this page was run on the two
 machines below;
 Linux users should use [upstream Gufo](https://github.com/gufo-org/gufo).
 
@@ -110,12 +135,12 @@ The port, the fixes and the measurements were done by Claude (Anthropic,
 Claude Opus 5.5) in Claude Code, at the request of the repository owner. MIT
 licensed, like upstream.
 
-## What runs here now (1.3.0, November 2026)
+## What runs here now (1.4.1, November 2026)
 
 All of this runs on the two EVO-X2 below (64 GB, and 128 GB where noted), under Windows 11, behind one
 OpenAI-compatible router on one port. Models load on the first request;
 with the memory guard several stay loaded while they fit. Numbers are single
-requests on this machine, measured on the version in the last column.
+requests on these machines, measured on the version in the last column.
 
 | Area | Model | Measured here | Version |
 | --- | --- | --- | --- |
@@ -129,13 +154,17 @@ requests on this machine, measured on the version in the last column.
 | Image, film keyframe | Qwen-Image 2.1, 1344x768, 9 reference images, 25 steps, CFG 2.5 | 601-611 s; 391-396 s with flash attention (128 GB machine) | 1.3 code (test build) |
 | Image, fast | Qwen-Image 2.1 Turbo (8 steps) | 512² 4.3 s; 1024² 22.7-24.0 s; 1920x1088 63 s | 1.1.1 |
 | Image style | LoRA adapters for Qwen-Image 2.1 | switching 2.9-4.2 s, no extra time per step | 1.1.1 |
+| Image control | Qwen-Image 2.1 ControlNet and regional prompts, 768x768, 20 steps | plain 32.6 s, canny control 40.8 s, two regions 48.0 s | 1.4.0 |
 | Image layout | MOSS-Image (JSON layout prompt with boxes) | 512² / 30 steps 27.1 s; 1024² / 50 steps 172 s | #907 build |
 | Video with sound | MiniMax H3 (Turbo LoRA, first/last frame) | 1 s 512² in 60-66 s | 1.1.0 |
 | Video, film shots | MiniMax H3 via ComfyUI graphs, 512² | start image + voice, 124 frames 241 s; start + end frame, 107 frames 206 s; continuation from an anchor clip 331 s (128 GB machine) | 1.3 code (test build) |
 | Video | Wan 2.2 TI2V-5B | 1 s 480² / 20 steps in 41-46 s | 1.1.0 |
 | Camera moves | Wan 2.1 I2V 14B + Uni3C | 3 s 832x480 orbit, 4 steps, in 197 s | 1.1.0 |
+| Talking people | Wan 2.1 InfiniteTalk, two speakers | 101 frames at 896x512 in 1050 s (832x480: 941 s) | 1.4.1 |
 | Video delivery | RIFE 4.7, Real-ESRGAN | RIFE 5.9 ms per new frame (24 to 60 fps); 832x512 to 1920x1200 in 34-62 ms per frame | 1.1.0 |
 | Speech | Qwen3-TTS 1.7B (CustomVoice, VoiceDesign, cloning, `speed`) | ~2x realtime | 1.0 |
+| Speech | VoxCPM2 | 4.5 s of speech in 3.7 s (warm) | 1.4.0 |
+| Foley | MMAudio large_44k_v2 (non-commercial weights) | 8 s of audio from text in 3.2 s, 4 s from a video clip in 6.2 s; listening check open | 1.4.0 |
 | Speech recognition | Qwen3-ASR 1.7B with SRT/VTT subtitles | 12-25 s German WAV in 1.1-1.5 s | 1.2.0 |
 | Upscaling on the NPU | realesr-animevideov3 (int8), 896x512 → 1920x1080 | 135 ms per frame, identical to the reference pipeline | 1.3 code (test build) |
 | Music | ACE-Step 1.5 XL turbo | 10 s of music in 10.7 s | 1.1.0 |
@@ -186,12 +215,20 @@ Given back to upstream Gufo:
   [#830](https://github.com/gufo-org/gufo/pull/830) (Qwen-Image loading),
   [#856](https://github.com/gufo-org/gufo/pull/856) (H3 on Windows),
   [#872](https://github.com/gufo-org/gufo/pull/872) (`/Ob2` for HIP sources).
+- Reported and fixed upstream: [#1053](https://github.com/gufo-org/gufo/issues/1053)
+  ("bad allocation" when a text model loads with little free RAM); our fix
+  ([#1054](https://github.com/gufo-org/gufo/pull/1054)) was taken upstream in
+  [#1063](https://github.com/gufo-org/gufo/pull/1063) (merged).
 - Open: [#885](https://github.com/gufo-org/gufo/pull/885) (Qwen-Image true CFG
   and multi-reference edits), [#904](https://github.com/gufo-org/gufo/pull/904)
   (Windows table for the 27B verification GEMMs),
-  [#907](https://github.com/gufo-org/gufo/pull/907) (MOSS-Image).
+  [#1049](https://github.com/gufo-org/gufo/pull/1049) and
+  [#1050](https://github.com/gufo-org/gufo/pull/1050) (extension API for text and
+  image models).
+- Closed without merge: [#907](https://github.com/gufo-org/gufo/pull/907) (MOSS-Image;
+  it stays in this fork).
 - Asked: [#926](https://github.com/gufo-org/gufo/issues/926) (interest check:
-  sharing models across several Strix Halo machines at the router level).
+  sharing models across several Strix Halo machines at the router level; closed).
 - Elsewhere: [slimsami/strycast#7](https://github.com/slimsami/strycast/pull/7)
   (MMQ decode for the 35B experts, merged);
   [stockmind/gufo#1](https://github.com/stockmind/gufo/pull/1) (faster
@@ -202,7 +239,7 @@ Given back to upstream Gufo:
 
 Machines: **GMKtec EVO-X2** (Ryzen AI MAX+ 395, 64 GB: 32 GB dedicated GPU
 memory, 32 GB left to Windows) and a second EVO-X2 with **128 GB** (64 GB left to
-Windows) for the rows marked "128 GB", connected by a direct Ethernet cable. Both run in its **normal performance mode, not the
+Windows) for the rows marked "128 GB", connected by a direct Ethernet cable. Both run in their **normal performance mode, not the
 high-performance mode**, Windows power plan "Balanced". Windows 11 Pro
 (build 26200), AMD driver 32.0.32015.7029, TheRock ROCm 10.0.0. llama.cpp
 and gufo ran under the same settings; the faster modes were not tried.
@@ -402,7 +439,7 @@ for the numbers.
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
-  [What runs here now](#what-runs-here-now-130-november-2026) were tested on their
+  [What runs here now](#what-runs-here-now-141-november-2026) were tested on their
   branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
@@ -425,7 +462,16 @@ was not tested here; its prerequisites are in
 Gufo's original code is [MIT licensed](LICENSE). Adapted code and
 dependencies retain their own notices in [NOTICE](NOTICE),
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `licenses/`. Model
-weights are not included and keep their publishers' terms.
+weights are not included and keep their publishers' terms; checking that your
+use of each model is allowed is up to you. Weights with restrictions that the
+release packages support:
+
+- **Qwen-Image 2.1 and Qwen-Image 2.1 Turbo:** Qwen Research License,
+  non-commercial use only.
+- **MMAudio:** CC BY-NC 4.0, non-commercial use only.
+- **alibaba-pai Qwen-Image 2.1 ControlNet (Fun ControlNet-Union):** not cleared
+  for commercial use.
+- InfiniteTalk, VACE and Wan 2.1: see each model card before use.
 
 ## Credits
 

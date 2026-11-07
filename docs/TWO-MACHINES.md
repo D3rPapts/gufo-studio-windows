@@ -5,7 +5,7 @@ How gufo-studio-windows serves chat, images, video, speech and music from two GM
 Every model sits behind one port on each machine; the routers know each other and hand requests across a
 direct cable.
 
-_Written with AI assistance (Claude Code) from our configuration and test logs. Status: November 2026, build 1.2.1-fsk2._
+_Written with AI assistance (Claude Code) from our configuration and test logs. Status: November 2026, updated for release 1.4.1._
 
 ## Schematic
 
@@ -13,7 +13,10 @@ _Written with AI assistance (Claude Code) from our configuration and test logs. 
 
 Each machine runs one `gufo router`. The router owns the API surface and starts one `gufo serve` worker
 process per model when a request needs it. A `[remote/<id>]` preset section makes a model on the other
-machine look local (see [SERVER.md on release/1.3](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.3/docs/SERVER.md#remote-models)).
+machine look local (see [SERVER.md on release/1.4](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#remote-models)).
+Since 1.4, a local section and a `[remote/<id>]` section with the same id make a model switchable:
+`POST /router/placement` moves it between the machines without a restart
+([details](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#switching-a-model-between-local-and-remote)).
 
 | Machine | Memory | Role |
 |---|---|---|
@@ -91,13 +94,16 @@ package; each model keeps its own licence.
   on one machine as long as possible.
 - **Text:** Qwen3.8-27B with DFlash2 speculative decoding; Hemmingway-1.5 (non-commercial licence);
   Qwen3.6-35B-A3B; Qwen3.8-Flash-Next with SSD expert streaming; Qwen3-Omni captioner for audio.
-- **Image:** Qwen-Image 2.1 and Turbo (text-to-image, edit, masks, LoRA; non-commercial licence); MOSS-Image;
-  live preview while a client watches.
+- **Image:** Qwen-Image 2.1 and Turbo (text-to-image, edit, masks, LoRA, regional prompts; Qwen Research
+  License, non-commercial); ControlNet (alibaba-pai Fun ControlNet-Union weights, not cleared for commercial use);
+  MOSS-Image; live preview while a client watches; figure check for keyframes (`POST /v1/figuren`).
 - **Video:** MiniMax H3 (start/end frame, voice, anchor clips from the previous shot); Wan 2.2 TI2V-5B;
-  Wan 2.1 Uni3C camera moves; RIFE interpolation and upscaling, also on an existing MP4.
-  Experimental (built, CPU tests pass, no GPU run yet): VACE, InfiniteTalk.
-- **Audio:** Qwen3-ASR with SRT / VTT subtitles; Qwen3-TTS (preset voices, voice design, cloning); ACE-Step 1.5
-  music. Experimental: MMAudio foley (weights CC BY-NC 4.0, non-commercial).
+  Wan 2.1 Uni3C camera moves and InfiniteTalk (one or two speakers, up to 896x512, GPU-checked);
+  RIFE interpolation and upscaling, also on an existing MP4.
+  Experimental (built, CPU tests pass, no GPU run reported yet): VACE.
+- **Audio:** Qwen3-ASR with SRT / VTT subtitles; Qwen3-TTS (preset voices, voice design, cloning); VoxCPM2;
+  Ming-3.0-tts controls; ACE-Step 1.5 music. MMAudio foley (weights CC BY-NC 4.0, non-commercial): first GPU run
+  done, listening check open.
 
 ## Measured on this setup
 
