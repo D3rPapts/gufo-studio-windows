@@ -100,6 +100,16 @@ struct HttpServerOptions {
   /// generation answer 503 `device_lost` from then on; the hook decides how the
   /// process exits.
   std::function<void()> on_device_lost{};
+  /// gufo-studio-windows router front (`gufo router`): when set,
+  /// handle_request returns dispatcher(request) for every request; built-in
+  /// health/model routes are skipped and the constructor registers no model
+  /// routes (a null backend is then legal).
+  std::function<HttpResponse(const HttpRequest&)> dispatcher{};
+  /// gufo-studio-windows router front: the router drains in-flight requests
+  /// after a shutdown signal, so the signal path only stops the listener;
+  /// established connections stay usable until the caller's drain ends and
+  /// the destructor stops them.
+  bool graceful_shutdown{false};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
@@ -135,6 +145,12 @@ public:
   void run(bool handle_signals = false);
 
   void stop();
+
+  /// Stop accepting new connections only. With
+  /// HttpServerOptions::graceful_shutdown the shutdown-signal path uses this
+  /// instead of stop() so an external drain (the router) can keep serving the
+  /// established connections until it ends.
+  void stop_listening();
 
   [[nodiscard]] int port() const noexcept { return port_; }
 

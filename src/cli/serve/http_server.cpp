@@ -1925,7 +1925,9 @@ HttpServer::HttpServer(std::string host, int port,
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
   }
-  register_routes();
+  // The router front (options_.dispatcher) serves its own routes.
+  if (!options_.dispatcher)
+    register_routes();
 }
 
 HttpServer::~HttpServer() {
@@ -2076,7 +2078,14 @@ void HttpServer::run(bool handle_signals) {
       if (signal != 0) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
-        stop();
+        // A graceful front (the router) keeps established connections for
+        // its own drain; stop() would shut their descriptors down and cut
+        // in-flight streams mid-relay. The destructor stops them once the
+        // drain has ended.
+        if (options_.graceful_shutdown)
+          stop_listening();
+        else
+          stop();
         platform::NotifyShutdownHandled();
         break;
       }
@@ -2137,13 +2146,17 @@ void HttpServer::run(bool handle_signals) {
   reap_workers();
 }
 
-void HttpServer::stop() {
+void HttpServer::stop_listening() {
   const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
   if (!was_stopped && listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
     (void)net::ShutdownSocket(listen_fd_, net::ShutdownHow::kReadWrite);
   }
+}
+
+void HttpServer::stop() {
+  stop_listening();
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
   {
@@ -2174,6 +2187,8 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (options_.dispatcher)
+    return options_.dispatcher(req);
   // The voice page holds no data; it opens its WebSocket when the user
   // connects.
   if (req.method == "GET" && req.path == "/voice" && asr_ &&
