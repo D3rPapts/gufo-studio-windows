@@ -65,8 +65,98 @@ def log(msg):
     print(f"[{time.time() - t_start:7.1f}s] {msg}", flush=True)
 
 
+import collections, collections.abc, pickle, struct, zipfile
+_NP = {"FloatStorage": np.float32, "LongStorage": np.int64, "IntStorage": np.int32, "HalfStorage": np.float16,
+       "DoubleStorage": np.float64, "BoolStorage": np.bool_}
+
+
+class _Ref:  # a tensor inside a torch zip checkpoint, read on access with plain file reads (no mmap / commit)
+    def __init__(self, st, off, size, stride):
+        self.st, self.off, self.size = st, off, tuple(size)
+
+    def load(self, zf, prefix):
+        dtype = _NP[self.st[0]]
+        raw = bytearray(zf.read(prefix + "data/" + str(self.st[1])))
+        arr = np.frombuffer(raw, dtype=dtype)
+        n = int(np.prod(self.size)) if self.size else 1
+        t = torch.from_numpy(arr[self.off:self.off + n].reshape(self.size))
+        return t
+
+
+class _Unpickler(pickle.Unpickler):
+    def find_class(self, mod, name):
+        if name in ("_rebuild_tensor_v2", "_rebuild_tensor"):
+            return lambda st, off, size, stride, *a: _Ref(st, off, size, stride)
+        if name == "_rebuild_from_type_v2":
+            return lambda func, typ, args, state: func(*args)
+        if name == "_rebuild_parameter":
+            return lambda t, *a: t
+        if mod == "collections" and name == "OrderedDict":
+            return collections.OrderedDict
+        if name.endswith("Storage"):
+            return name
+        if mod in ("builtins", "_codecs", "collections"):
+            return super().find_class(mod, name)
+        return lambda *a, **k: None
+
+    def persistent_load(self, pid):
+        return (pid[1], pid[2])
+
+
+class LazyDict(collections.abc.Mapping):
+    def __init__(self, d, zf, prefix):
+        self.d, self.zf, self.prefix = d, zf, prefix
+
+    def __getitem__(self, k):
+        v = self.d[k]
+        if isinstance(v, _Ref):
+            return v.load(self.zf, self.prefix)
+        if isinstance(v, dict):
+            return LazyDict(v, self.zf, self.prefix)
+        return v
+
+    def __contains__(self, k):
+        return k in self.d
+
+    def __iter__(self):
+        return iter(self.d)
+
+    def __len__(self):
+        return len(self.d)
+
+
 def load_pth(path):
-    return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    zf = zipfile.ZipFile(path)
+    pkl = [n for n in zf.namelist() if n.endswith("/data.pkl")][0]
+    root = _Unpickler(zf.open(pkl)).load()
+    if isinstance(root, _Ref):
+        return root.load(zf, pkl[:-8])
+    return LazyDict(root, zf, pkl[:-8])
+
+
+class LeanSafetensors:  # plain reads per tensor, no mmap
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        n = struct.unpack("<Q", self.f.read(8))[0]
+        self.h = {k: v for k, v in json.loads(self.f.read(n)).items() if k != "__metadata__"}
+        self.base = 8 + n
+
+    def keys(self):
+        return list(self.h)
+
+    def get_tensor(self, k):
+        m = self.h[k]
+        assert m["dtype"] == "F32", m["dtype"]
+        b, e = m["data_offsets"]
+        self.f.seek(self.base + b)
+        return torch.frombuffer(bytearray(self.f.read(e - b)), dtype=torch.float32).reshape(m["shape"])
+
+
+def assign_checked(module, sd):
+    module.load_state_dict(sd, strict=True, assign=True)
+    left = [n for n, b in list(module.named_parameters()) + list(module.named_buffers()) if b.is_meta]
+    assert not left, left[:10]
+    return module.eval()
 
 
 cfg = OmegaConf.load(os.path.join(BUNDLE, "config.yaml"))
@@ -84,8 +174,10 @@ def finish(vc_target):  # BigVGAN + write the oracle files
     from indextts.s2mel.modules.bigvgan import bigvgan
     BV =os.path.join(BUNDLE, "bigvgan_v2_22khz_80band_256x")
     h = bigvgan.load_hparams_from_json(os.path.join(BV, "config.json"))
-    voc = bigvgan.BigVGAN(h, use_cuda_kernel=False)
-    voc.load_state_dict(load_pth(os.path.join(BV, "bigvgan_generator.pt"))["generator"])
+    with torch.device("meta"):
+        voc = bigvgan.BigVGAN(h, use_cuda_kernel=False)
+    _g = load_pth(os.path.join(BV, "bigvgan_generator.pt"))["generator"]
+    assign_checked(voc, {k: _g[k] for k in voc.state_dict()})
     voc.remove_weight_norm(); voc.eval()
     wav = voc(vc_target.float()).squeeze().unsqueeze(0)
     put("wav_float", wav[0])
@@ -218,6 +310,7 @@ text_ids = main["ids"][0]
 put("text_ids", torch.tensor(text_ids))
 log(f"text: {main['final']!r} -> {len(text_ids)} ids")
 
+# === STAGE: front ===
 # ------------------------------------------------------------------------------------------------------- audio --
 audio_np, sr = librosa.load(VOICE, sr=None, mono=True)       # _load_and_cut_audio(spk, 15)
 audio = torch.tensor(audio_np).unsqueeze(0)[:, :int(15 * sr)]
@@ -259,6 +352,7 @@ if os.environ.get("INDEXTTS_ORACLE_LIGHT") == "1":  # text + audio front end + C
     log("light oracle written")
     sys.exit(0)
 
+# === STAGE: w2v ===
 # --------------------------------------------------------------------------------------------------- w2v-BERT --
 from transformers import SeamlessM4TFeatureExtractor, Wav2Vec2BertConfig
 from transformers.models.wav2vec2_bert.modeling_wav2vec2_bert import (Wav2Vec2BertEncoderLayer,
@@ -268,19 +362,20 @@ extractor = SeamlessM4TFeatureExtractor.from_pretrained(W2V, local_files_only=Tr
 w2v_cfg = Wav2Vec2BertConfig.from_pretrained(W2V, local_files_only=True)
 stats = load_pth(os.path.join(BUNDLE, cfg.w2v_stat))
 sem_mean, sem_std = stats["mean"], torch.sqrt(stats["var"])
-ST = safe_open(os.path.join(W2V, "model.safetensors"), framework="pt")
+ST = LeanSafetensors(os.path.join(W2V, "model.safetensors"))
 
 
-def load_module(module, prefix):
-    module.load_state_dict({k[len(prefix):]: ST.get_tensor(k) for k in ST.keys() if k.startswith(prefix)})
-    return module.eval()
+def load_module(module_fn, prefix):
+    with torch.device("meta"):
+        module = module_fn()
+    return assign_checked(module, {k[len(prefix):]: ST.get_tensor(k) for k in ST.keys() if k.startswith(prefix)})
 
 
 def get_emb(wave16k, tag):  # IndexTTS2.get_emb == hidden_states[17] of Wav2Vec2BertModel, normalised
     inputs = extractor(wave16k, sampling_rate=16000, return_tensors="pt")
     x, mask = inputs["input_features"], inputs["attention_mask"]
     put(f"{tag}_w2v_input", x[0]); put(f"{tag}_w2v_mask", mask[0])
-    proj = load_module(Wav2Vec2BertFeatureProjection(w2v_cfg), "feature_projection.")
+    proj = load_module(lambda: Wav2Vec2BertFeatureProjection(w2v_cfg), "feature_projection.")
     h, _ = proj(x)
     put(f"{tag}_w2v_proj", h[0])
     conv_mask = mask
@@ -288,7 +383,7 @@ def get_emb(wave16k, tag):  # IndexTTS2.get_emb == hidden_states[17] of Wav2Vec2
     ext = (1.0 - mask[:, None, None, :].to(h.dtype)) * torch.finfo(h.dtype).min
     ext = ext.expand(ext.shape[0], 1, ext.shape[-1], ext.shape[-1])
     for i in range(17):
-        layer = load_module(Wav2Vec2BertEncoderLayer(w2v_cfg), f"encoder.layers.{i}.")
+        layer = load_module(lambda: Wav2Vec2BertEncoderLayer(w2v_cfg), f"encoder.layers.{i}.")
         h = layer(h, attention_mask=ext, relative_position_embeddings=None, conv_attention_mask=conv_mask)[0]
         if i in (0, 8):
             put(f"{tag}_w2v_layer{i}", h[0])
@@ -304,6 +399,7 @@ spk_cond_emb = get_emb(audio_16k, "spk")
 emo_cond_emb = get_emb(emo_16k, "emo")
 log(f"w2v-BERT done: spk {tuple(spk_cond_emb.shape)}, emo {tuple(emo_cond_emb.shape)}")
 
+# === STAGE: emo ===
 # ----------------------------------------------------------------------------------------- emotion conditioning --
 GPT_SD = load_pth(GPT_PATH)["model"]
 from indextts.gpt.conformer_encoder import ConformerEncoder
@@ -311,16 +407,18 @@ from indextts.gpt.perceiver import PerceiverResampler
 
 
 def sub_sd(prefix):
-    return {k[len(prefix):]: v for k, v in GPT_SD.items() if k.startswith(prefix)}
+    return {k[len(prefix):]: GPT_SD[k] for k in GPT_SD if k.startswith(prefix)}
 
 
 emc = cfg.gpt.emo_condition_module
-emo_enc = ConformerEncoder(input_size=1024, output_size=emc.output_size, linear_units=emc.linear_units,
-                           attention_heads=emc.attention_heads, num_blocks=emc.num_blocks, input_layer=emc.input_layer)
-emo_enc.load_state_dict(sub_sd("emo_conditioning_encoder.")); emo_enc.eval()
-emo_perc = PerceiverResampler(1024, dim_context=emc.output_size, ff_mult=emc.perceiver_mult,
-                              heads=emc.attention_heads, num_latents=1)
-emo_perc.load_state_dict(sub_sd("emo_perceiver_encoder.")); emo_perc.eval()
+with torch.device("meta"):
+    emo_enc = ConformerEncoder(input_size=1024, output_size=emc.output_size, linear_units=emc.linear_units,
+                               attention_heads=emc.attention_heads, num_blocks=emc.num_blocks,
+                               input_layer=emc.input_layer)
+    emo_perc = PerceiverResampler(1024, dim_context=emc.output_size, ff_mult=emc.perceiver_mult,
+                                  heads=emc.attention_heads, num_latents=1)
+assign_checked(emo_enc, sub_sd("emo_conditioning_encoder."))
+assign_checked(emo_perc, sub_sd("emo_perceiver_encoder."))
 emovec_layer = torch.nn.Linear(1024, 1280); emovec_layer.load_state_dict(sub_sd("emovec_layer.")); emovec_layer.eval()
 emo_layer = torch.nn.Linear(1280, 1280); emo_layer.load_state_dict(sub_sd("emo_layer.")); emo_layer.eval()
 emo_cond_mask_pad = torch.nn.ConstantPad1d((1, 0), True)
@@ -378,70 +476,93 @@ META["emo_index"] = index
 put("emovec_mat", emovec_mat[0]); put("emovec", emovec[0])
 log(f"emotion: normalized {emo_norm}, matrix rows {index}")
 
+# === STAGE: gpt ===
 # ----------------------------------------------------------------------------------------------------- GPT AR --
-import indextts.gpt.model_v2 as model_v2
-from indextts.gpt.transformers_gpt2 import GPT2Attention
-from transformers import LogitsProcessorList
-from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+# Same math as UnifiedVoice.inference_speech + GPT2InferenceModel + HF GPT2 (eager attention, gelu_new), written out
+# so each of the 24 layers can be re-read from gpt.pth for every step (keeps the working set and commit low). The left
+# pad row of prepare_gpt_inputs is attention-masked for every query, so it is left out (identical result).
+from transformers.generation.logits_process import (RepetitionPenaltyLogitsProcessor, TemperatureLogitsWarper,
+                                                    TopKLogitsWarper, TopPLogitsWarper)
+GPT_SD = load_pth(GPT_PATH)["model"]
+G = lambda k: GPT_SD[k]
+DIM, HEADS, LAYERS = cfg.gpt.model_dim, cfg.gpt.heads, cfg.gpt.layers
+HD = DIM // HEADS
+spk_latent = F.linear(style, G("spk_emb_proj.weight"), G("spk_emb_proj.bias"))
+put("spk_latent", spk_latent[0])
+ids = torch.tensor(text_ids)
+text_in = torch.cat([torch.tensor([0]), ids[(ids != 1) & (ids != 0)], torch.tensor([1])])
+_te = G("text_embedding.weight")
+temb = _te[text_in] + G("text_pos_embedding.emb.weight")[: len(text_in)]
+del _te
+temb = temb + G("lang_embedding.weight")[lang_to_token("de")]
+prefix = torch.cat([spk_latent + emovec, torch.zeros(2, DIM), temb], 0)
+put("gpt_prefix_emb", prefix)
+MEL = G("mel_embedding.weight"); MPOS = G("mel_pos_embedding.emb.weight")
+LNF = (G("gpt.ln_f.weight"), G("gpt.ln_f.bias")); FN = (G("final_norm.weight"), G("final_norm.bias"))
+HEAD = (G("mel_head.weight"), G("mel_head.bias"))
+NAMES = ["ln_1.weight", "ln_1.bias", "attn.c_attn.weight", "attn.c_attn.bias", "attn.c_proj.weight", "attn.c_proj.bias",
+         "ln_2.weight", "ln_2.bias", "mlp.c_fc.weight", "mlp.c_fc.bias", "mlp.c_proj.weight", "mlp.c_proj.bias"]
+KC = [torch.zeros(0, DIM) for _ in range(LAYERS)]
+VC = [torch.zeros(0, DIM) for _ in range(LAYERS)]
 
-with torch.device("meta"):
-    gpt = model_v2.UnifiedVoice(**cfg.gpt, use_accel=False, spk_cond_mode="campplus")
-gpt.load_state_dict(GPT_SD, strict=True, assign=True)
-for mod in gpt.modules():  # non-persistent GPT2Attention buffers (transformers' GPT2Model is used here)
-    if isinstance(mod._buffers.get("bias"), torch.Tensor) and mod._buffers["bias"].is_meta:
-        n = mod.config.max_position_embeddings
-        mod.bias = torch.tril(torch.ones((n, n), dtype=torch.bool)).view(1, 1, n, n)
-    if isinstance(mod._buffers.get("masked_bias"), torch.Tensor) and mod._buffers["masked_bias"].is_meta:
-        mod.masked_bias = torch.tensor(-1e4)
-META["gpt2_class"] = type(gpt.gpt).__module__ + "." + type(gpt.gpt).__name__
-META["gpt2_attn_impl"] = str(getattr(gpt.gpt.config, "_attn_implementation", None))
-META["gpt2_activation"] = gpt.gpt.config.activation_function
-left = [n for n, b in list(gpt.named_parameters()) + list(gpt.named_buffers()) if b.is_meta]
-assert not left, left
-gpt.eval()
-gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=False)
+
+def gelu_new(x):
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+
+def gpt_forward(x):
+    h = x
+    for i in range(LAYERS):
+        W = {n: G(f"gpt.h.{i}.{n}") for n in NAMES}
+        a = F.layer_norm(h, (DIM,), W["ln_1.weight"], W["ln_1.bias"], 1e-5)
+        q, k, v = torch.addmm(W["attn.c_attn.bias"], a, W["attn.c_attn.weight"]).split(DIM, dim=1)
+        KC[i] = torch.cat([KC[i], k]); VC[i] = torch.cat([VC[i], v])
+        nq, nk = q.shape[0], KC[i].shape[0]
+        qh = q.view(nq, HEADS, HD).transpose(0, 1)
+        kh = KC[i].view(nk, HEADS, HD).transpose(0, 1)
+        vh = VC[i].view(nk, HEADS, HD).transpose(0, 1)
+        w = torch.matmul(qh, kh.transpose(-1, -2)) / torch.full([], HD ** 0.5)
+        causal = torch.ones(nq, nk, dtype=torch.bool).tril(nk - nq)
+        w = torch.where(causal, w, torch.full([], torch.finfo(w.dtype).min))
+        o = torch.matmul(torch.softmax(w, dim=-1), vh).transpose(0, 1).reshape(nq, DIM)
+        h = h + torch.addmm(W["attn.c_proj.bias"], o, W["attn.c_proj.weight"])
+        m = F.layer_norm(h, (DIM,), W["ln_2.weight"], W["ln_2.bias"], 1e-5)
+        f = gelu_new(torch.addmm(W["mlp.c_fc.bias"], m, W["mlp.c_fc.weight"]))
+        h = h + torch.addmm(W["mlp.c_proj.bias"], f, W["mlp.c_proj.weight"])
+        del W
+    z = F.layer_norm(F.layer_norm(h[-1:], (DIM,), LNF[0], LNF[1], 1e-5), (DIM,), FN[0], FN[1], 1e-5)
+    return F.linear(z, HEAD[0], HEAD[1])
+
 
 rng = np.random.RandomState(SEED)
 WARPERS = [TemperatureLogitsWarper(0.7), TopKLogitsWarper(top_k=30), TopPLogitsWarper(top_p=0.8)]
+PENALTY = RepetitionPenaltyLogitsProcessor(10.0)
 REC = {"scores": [], "u": [], "tok": [], "kept": []}
-
-
-class InverseCdfSampler:
-    def __call__(self, input_ids, scores):
-        REC["scores"].append(scores[0].clone())
-        s = scores
-        for w in WARPERS:
-            s = w(input_ids, s)
-        probs = torch.softmax(s[0].float(), dim=-1).double().numpy()
-        u = float(rng.random_sample())
-        cum = np.cumsum(probs)
-        tok = int(np.searchsorted(cum, u * cum[-1], side="right"))
-        tok = min(tok, len(probs) - 1)
-        while probs[tok] == 0.0 and tok > 0:
-            tok -= 1
-        REC["u"].append(u); REC["tok"].append(tok); REC["kept"].append(int((probs > 0).sum()))
-        out = torch.full_like(scores, -float("inf"))
-        out[0, tok] = 0.0
-        return out
-
-
-model_v2.LogitsProcessorList = lambda *a, **k: LogitsProcessorList([InverseCdfSampler()])
-_store = gpt.inference_model.store_mel_emb
-gpt.inference_model.store_mel_emb = lambda emb: (put("gpt_prefix_emb", emb[0]), _store(emb))[1]
-text_tokens = torch.IntTensor(text_ids).unsqueeze(0)
-lang = torch.LongTensor([lang_to_token("de")])
-put("spk_latent", gpt.spk_emb_proj(style)[0])
-t0 = time.time()
-codes, _ = gpt.inference_speech(spk_cond_emb, text_tokens, lang, emo_cond_emb,
-                                cond_lengths=torch.tensor([spk_cond_emb.shape[-1]]),
-                                emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]]),
-                                emo_vec=emovec, campplus_embedding=style, wav=VOICE,
-                                do_sample=False, num_return_sequences=1, length_penalty=0.0, num_beams=1,
-                                repetition_penalty=10.0, max_generate_length=MAXTOK)
-META["gpt_seconds"] = time.time() - t0
-codes = codes[0].tolist()
-assert codes == REC["tok"][:len(codes)], "greedy search did not take the sampled tokens"
 stop = cfg.gpt.stop_mel_token
+input_ids = [1] * (prefix.shape[0] + 1) + [cfg.gpt.start_mel_token]  # fake ids incl. the masked pad row
+t0 = time.time()
+logits = gpt_forward(torch.cat([prefix, (MEL[cfg.gpt.start_mel_token] + MPOS[0])[None]], 0))
+for step in range(MAXTOK):
+    scores = PENALTY(torch.tensor([input_ids]), logits.clone())
+    REC["scores"].append(scores[0].clone())
+    sc = scores
+    for wp in WARPERS:
+        sc = wp(torch.tensor([input_ids]), sc)
+    probs = torch.softmax(sc[0].float(), dim=-1).double().numpy()
+    u = float(rng.random_sample())
+    cum = np.cumsum(probs)
+    tok = min(int(np.searchsorted(cum, u * cum[-1], side="right")), len(probs) - 1)
+    while probs[tok] == 0.0 and tok > 0:
+        tok -= 1
+    REC["u"].append(u); REC["tok"].append(tok); REC["kept"].append(int((probs > 0).sum()))
+    input_ids.append(tok)
+    if tok == stop:
+        break
+    logits = gpt_forward((MEL[tok] + MPOS[step + 2])[None])  # GPT2InferenceModel mel position quirk
+    if step % 10 == 0:
+        log(f"GPT step {step}")
+META["gpt_seconds"] = time.time() - t0
+codes = REC["tok"]
 code_len = codes.index(stop) if stop in codes else len(codes)
 META["codes_raw"] = codes
 META["code_len"] = code_len
@@ -453,8 +574,9 @@ META["gpt_kept"] = REC["kept"]
 codes_t = torch.tensor(codes[:code_len]).unsqueeze(0)
 put("codes", codes_t[0])
 log(f"GPT: {len(codes)} steps ({code_len} codes, stop {stop in codes}) in {META['gpt_seconds']:.1f} s")
-del gpt, GPT_SD, model_v2; gc.collect()
+del KC, VC, GPT_SD; gc.collect()
 
+# === STAGE: s2mel ===
 # --------------------------------------------------------------------------------------- semantic codec / s2mel --
 from indextts.codec.models import EnhancedCodec
 import indextts.s2mel
@@ -466,11 +588,10 @@ for _name in ("indextts.s2mel.dac", "indextts.s2mel.dac.nn"):
     sys.modules[_name] = _pkg
 from indextts.s2mel.modules.commons import MyModel
 
-codec = EnhancedCodec(**cfg.semantic_codec, cfg=cfg.semantic_codec)
+with torch.device("meta"):
+    codec = EnhancedCodec(**cfg.semantic_codec, cfg=cfg.semantic_codec)
 saved = load_pth(os.path.join(BUNDLE, "codec.pth"))["model"]
-own = codec.state_dict()
-codec.load_state_dict({k: (saved[k] if k in saved and saved[k].shape == v.shape else v) for k, v in own.items()})
-codec.eval()
+assign_checked(codec, {k: saved[k] for k in codec.state_dict()})
 q = codec.quantizer.vq2emb(codes_t.unsqueeze(0))
 put("codec_vq2emb", q[0])
 dec = codec.decoder(q)
@@ -479,13 +600,14 @@ S_infer = codec.decode(codes_t)
 put("S_infer", S_infer[0])
 del codec, saved; gc.collect()
 
-s2mel = MyModel(cfg.s2mel, use_gpt_latent=False)
+with torch.device("meta"):
+    s2mel = MyModel(cfg.s2mel, use_gpt_latent=False)
 params = load_pth(os.path.join(BUNDLE, cfg.s2mel_checkpoint))["net"]
 for key in s2mel.models:
-    sd = {k[len("module."):] if k.startswith("module.") else k: v for k, v in params[key].items()}
+    sub = params[key]
+    names = {(k[len("module."):] if k.startswith("module.") else k): k for k in sub}
     msd = s2mel.models[key].state_dict()
-    s2mel.models[key].load_state_dict({k: v for k, v in sd.items() if k in msd and v.shape == msd[k].shape},
-                                      strict=False)
+    assign_checked(s2mel.models[key], {k: sub[names[k]] for k in msd})  # every module key is in the checkpoint
 s2mel.eval()
 s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
 lr = s2mel.models['length_regulator']
@@ -529,4 +651,5 @@ log(f"s2mel: prompt {ref_mel.size(-1)} + target {target_lengths.item()} frames, 
 del s2mel, params; gc.collect()
 torch.save({"T": T, "META": META}, os.path.join(OUT, "partial_s2mel.pt"))  # resume point (INDEXTTS_ORACLE_RESUME=1)
 
+# === STAGE: vocoder ===
 finish(vc_target)
