@@ -700,6 +700,7 @@ void PrintServeHelp(std::string_view program_name,
     bool log_progress = false;
     bool enable_yarn = false;
     std::uint64_t expert_cache_bytes = 0;
+    std::string expert_profile;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -729,6 +730,10 @@ void PrintServeHelp(std::string_view program_name,
                      "Flash-Next: device bytes for routed experts streamed "
                      "from the GGUF (default: 0 = all experts resident)",
                      "Model", &expert_cache_bytes);
+    parser.AddOption("", "--expert-profile", "FILE",
+                     "Flash-Next: routing profile kept across restarts; its "
+                     "most routed experts are loaded at startup",
+                     "Model", &expert_profile);
 
     // Sampling Defaults
     parser.AddOption(
@@ -1423,6 +1428,7 @@ int RunServe(std::span<const char* const> args) {
     bool log_progress = false;
     bool enable_yarn = false;
     std::uint64_t expert_cache_bytes = 0;
+    std::string expert_profile;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1464,6 +1470,10 @@ int RunServe(std::span<const char* const> args) {
                          "streamed from the GGUF (default: 0 = all experts "
                          "resident)",
                          "Model", &expert_cache_bytes);
+    llm_parser.AddOption("", "--expert-profile", "FILE",
+                         "Flash-Next: routing profile kept across restarts; "
+                         "its most routed experts are loaded at startup",
+                         "Model", &expert_profile);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1705,6 +1715,13 @@ int RunServe(std::span<const char* const> args) {
       _putenv_s("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str());
 #else
       setenv("GUFO_FLASH_NEXT_EXPERT_CACHE_BYTES", value.c_str(), 1);
+#endif
+    }
+    if (!expert_profile.empty()) {
+#if defined(_WIN32)
+      _putenv_s("GUFO_FLASH_NEXT_EXPERT_PROFILE", expert_profile.c_str());
+#else
+      setenv("GUFO_FLASH_NEXT_EXPERT_PROFILE", expert_profile.c_str(), 1);
 #endif
     }
     const bool load_ok = backend->load(
