@@ -452,6 +452,9 @@ target_compile_definitions(gufo PRIVATE
   GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
   GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
+# gufo-studio-windows: `gufo router` (library, CLI wiring and its CPU tests).
+include(src/cli/serve/router/router.cmake)
+
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip)
 endif()
