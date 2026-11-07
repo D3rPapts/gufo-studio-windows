@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "src/core/cancellable_gate.hpp"
+#include "src/models/indextts/synthesis.hpp"
 #include "src/models/fish_drama3/config.hpp"
 #include "src/models/fish_drama3/hip/synthesis_runtime.hpp"
 #include "src/models/ming_tts/config.hpp"
@@ -37,6 +38,11 @@ std::string ModelId(models::qwen3_tts::ModelVariant variant) {
 
 struct TtsService::Impl {
   explicit Impl(TtsServiceOptions supplied) : options(std::move(supplied)) {
+    if (!options.model_root.empty() &&
+        models::indextts::LooksLikeIndexTts25(options.model_root)) {
+      InitIndexTts();
+      return;
+    }
     if (!options.model_root.empty() &&
         models::voxcpm2::LooksLikeVoxCpm2(options.model_root.string())) {
       InitVoxCpm2();
@@ -344,8 +350,106 @@ struct TtsService::Impl {
     ready = true;
   }
 
-  TtsServiceOptions options;
-  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
+  // IndexTTS-2.5 with the German GPT fine-tune: reference-voice cloning
+  // (CAM++ + w2v-BERT conditioning of the clip), emotion as the 8-value
+  // emo_vector or emotion names, German text frontend; 22.05 kHz output.
+  void InitIndexTts() {
+    is_indextts = true;
+    sample_rate = static_cast<std::uint32_t>(models::indextts::kOutputRate);
+    options.variant = models::qwen3_tts::ModelVariant::kBase;
+    if (options.model_id.empty()) {
+      options.model_id = "indextts-2.5-german";
+    }
+    if (options.voices.empty()) {
+      options.voices.push_back("voice-clone");
+    }
+    for (const auto& [name, unused] : options.voice_presets) {
+      (void)unused;
+      if (std::ranges::find(options.voices, name) == options.voices.end()) {
+        options.voices.push_back(name);
+      }
+    }
+    if (!options.runner) {
+      indextts_engine = models::indextts::Engine::Create(options.model_root, &initialization_error);
+      if (indextts_engine == nullptr) {
+        return;
+      }
+      options.runner =
+          [this](const models::qwen3_tts::SynthesisRequest& request,
+                 const models::qwen3_tts::CancellationCheck& is_cancelled,
+                 models::qwen3_tts::SynthesisResult* result,
+                 std::string* error) {
+            models::indextts::SynthesisRequest req;
+            req.text = request.text;
+            if (!request.language.empty()) {
+              req.language = request.language;
+            }
+            if (!models::indextts::ParseEmotionSpec(request.emotion, &req.emotion, error)) {
+              return false;
+            }
+            const auto& audio = request.reference_audio;
+            if (audio.samples.empty() || audio.channels == 0) {
+              if (error != nullptr) {
+                *error = "IndexTTS-2.5 needs a reference voice";
+              }
+              return false;
+            }
+            const std::size_t frames = audio.samples.size() / audio.channels;
+            req.reference.resize(frames);
+            for (std::size_t f = 0; f < frames; ++f) {
+              double sum = 0.0;
+              for (std::uint32_t c = 0; c < audio.channels; ++c) {
+                sum += audio.samples[f * audio.channels + c];
+              }
+              req.reference[f] = static_cast<float>(sum / static_cast<double>(audio.channels));
+            }
+            req.reference_rate = audio.sample_rate;
+            req.seed = request.sampling.seed;
+            req.sampling.temperature = request.sampling.temperature;
+            req.sampling.top_k = static_cast<std::int32_t>(request.sampling.top_k);
+            req.sampling.top_p = request.sampling.top_p;
+            req.sampling.repetition_penalty = request.sampling.repetition_penalty;
+            req.sampling.max_tokens = static_cast<std::int32_t>(
+                std::min<std::size_t>(request.max_new_tokens, 1500));
+            // int16 -> float so that the API's truncating PCM16 encoder
+            // reproduces the exact int16 samples of the reference pipeline.
+            const auto to_float = [](std::int16_t s) {
+              return s == 0 ? 0.0F
+                            : (static_cast<float>(s) + (s > 0 ? 0.25F : -0.25F)) / 32767.0F;
+            };
+            bool stopped = false;
+            models::indextts::Engine::ChunkFn on_chunk;
+            if (request.on_audio) {
+              on_chunk = [&](std::span<const std::int16_t> pcm) {
+                std::vector<float> chunk(pcm.size());
+                std::transform(pcm.begin(), pcm.end(), chunk.begin(), to_float);
+                if (!stopped && !request.on_audio(chunk)) {
+                  stopped = true;
+                }
+              };
+            }
+            const auto cancelled = [&] { return stopped || (is_cancelled && is_cancelled()); };
+            models::indextts::SynthesisResult res;
+            if (!indextts_engine->Generate(req, cancelled, on_chunk, &res, error)) {
+              return false;
+            }
+            if (result != nullptr) {
+              result->sample_rate = static_cast<std::uint32_t>(models::indextts::kOutputRate);
+              result->code_groups = 1;
+              result->codes.assign(static_cast<std::size_t>(res.gpt_steps), 0);
+              result->samples.resize(res.samples.size());
+              std::transform(res.samples.begin(), res.samples.end(), result->samples.begin(), to_float);
+              result->sample_count = result->samples.size();
+            }
+            return true;
+          };
+    }
+    std::ranges::sort(options.voices);
+    ready = true;
+  }
+
+  TtsServiceOptions options;  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
+  std::unique_ptr<models::indextts::Engine> indextts_engine;
   std::unique_ptr<models::ming_tts::Engine> ming_engine;
   std::unique_ptr<models::qwen3_tts::hip::SynthesisHipRuntime> native_runtime;
   std::unique_ptr<models::fish_drama3::hip::SynthesisHipRuntime> drama3_runtime;
@@ -354,6 +458,7 @@ struct TtsService::Impl {
   bool is_drama3{false};
   bool is_ming{false};
   bool is_voxcpm2{false};
+  bool is_indextts{false};
   std::uint32_t sample_rate{24000};
   bool ready{false};
 };
@@ -376,6 +481,11 @@ std::string TtsService::model_id() const {
 }
 
 std::string TtsService::backend_name() const {
+  if (impl_->is_indextts) {
+    return impl_->indextts_engine != nullptr
+               ? std::string("native-") + impl_->indextts_engine->backend_name()
+               : std::string("native-cpu");
+  }
   if (impl_->is_voxcpm2) {
     return impl_->voxcpm2_engine != nullptr
                ? std::string("native-") + impl_->voxcpm2_engine->backend_name()
@@ -412,6 +522,10 @@ bool TtsService::is_ming_tts() const noexcept {
 
 bool TtsService::is_voxcpm2() const noexcept {
   return impl_->is_voxcpm2;
+}
+
+bool TtsService::is_indextts() const noexcept {
+  return impl_->is_indextts;
 }
 
 std::uint32_t TtsService::sample_rate() const noexcept {

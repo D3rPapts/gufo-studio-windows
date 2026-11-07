@@ -14,6 +14,7 @@
 
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
+#include "src/models/indextts/synthesis.hpp"
 #include "src/models/ming_tts/prompt.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
@@ -26,6 +27,8 @@ constexpr std::size_t kMaximumInputBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 8192;
 // VoxCPM2 encodes the whole reference clip into its 8192-position context.
 constexpr std::size_t kMaximumVoxCpm2ReferenceSeconds = 60;
+// IndexTTS-2.5: the serve API accepts reference clips up to 10 s.
+constexpr std::size_t kMaximumIndexTtsReferenceSeconds = 10;
 
 bool ReadUnsigned(const json::Value& body, std::string_view name,
                   std::size_t default_value, std::size_t maximum,
@@ -215,7 +218,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   if (model->str() != service.model_id() && model->str() != "qwen3-tts" &&
       !(service.is_fish_drama3() && model->str() == "fish-drama-3") &&
       !(service.is_ming_tts() && model->str() == "ming-3.0-tts") &&
-      !(service.is_voxcpm2() && model->str() == "voxcpm2")) {
+      !(service.is_voxcpm2() && model->str() == "voxcpm2") &&
+      !(service.is_indextts() && (model->str() == "indextts-2.5" ||
+                                  model->str() == "indextts-2.5-german" ||
+                                  model->str() == "indextts"))) {
     return Error(400, "Bad Request", "unsupported audio speech model",
                  "invalid_model");
   }
@@ -294,7 +300,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     // VoxCPM2 clones from the reference audio alone unless a transcript (or
     // voice_clone_mode "icl") asks for the reference + continuation layout.
     speaker_embedding_only =
-        service.is_ming_tts() ||
+        service.is_ming_tts() || service.is_indextts() ||
         (clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only") ||
         (service.is_voxcpm2() && clone_mode == nullptr &&
          (clone_text == nullptr || !clone_text->is_string() || clone_text->str().empty()));
@@ -360,20 +366,72 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "'speed' other than 1.0 requires response_format 'wav'",
                  "invalid_speed");
   }
+  // IndexTTS-2.5: "emotion" may also be the 8-value emo_vector
+  // [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm] or an
+  // object {"Wut": 0.6, "Angst": 0.2}; both become the canonical string form.
+  std::string emotion_spec = body.member_str("emotion");
+  if (const json::Value* value = body.find("emotion");
+      service.is_indextts() && value != nullptr && !value->is_string()) {
+    std::string spec;
+    if (value->is_array() && value->size() == 8) {
+      for (const auto& item : value->items()) {
+        if (!item.is_number()) {
+          spec.clear();
+          break;
+        }
+        spec += (spec.empty() ? "" : ",") + std::to_string(item.as_double());
+      }
+    } else if (value->is_object() && !value->empty()) {
+      for (const auto& [name, weight] : value->members()) {
+        if (!weight.is_number()) {
+          spec.clear();
+          break;
+        }
+        spec += (spec.empty() ? "" : ",") + name + ":" + std::to_string(weight.as_double());
+      }
+    }
+    if (spec.empty()) {
+      return Error(400, "Bad Request",
+                   "'emotion' must be a name, an object of name weights or an array of 8 numbers",
+                   "invalid_emotion");
+    }
+    emotion_spec = std::move(spec);
+  }
   for (const std::string_view name : {"language", "instructions", "emotion",
                                        "tempo", "pitch", "volume", "dialect"}) {
     const json::Value* value = body.find(std::string(name));
+    if (name == "emotion" && service.is_indextts()) {
+      continue;
+    }
     if (value != nullptr && !value->is_string()) {
       return Error(400, "Bad Request",
                    "'" + std::string(name) + "' must be a string",
                    "invalid_parameter_type");
     }
   }
-  if (!body.member_str("emotion").empty() && !service.is_ming_tts() &&
-      !service.is_voxcpm2()) {
+  if (!emotion_spec.empty() && !service.is_ming_tts() && !service.is_voxcpm2() &&
+      !service.is_indextts()) {
     return Error(400, "Bad Request",
-                 "'emotion' is supported only by Ming-3.0-tts and VoxCPM2",
+                 "'emotion' is supported only by Ming-3.0-tts, VoxCPM2 and IndexTTS-2.5",
                  "unsupported_field");
+  }
+  if (service.is_indextts()) {
+    std::optional<std::array<float, 8>> parsed;
+    std::string emotion_error;
+    if (!models::indextts::ParseEmotionSpec(emotion_spec, &parsed, &emotion_error)) {
+      return Error(400, "Bad Request", emotion_error, "invalid_emotion");
+    }
+    if (!body.member_str("instructions").empty()) {
+      return Error(400, "Bad Request",
+                   "IndexTTS-2.5 takes the style through 'emotion', not 'instructions'",
+                   "unsupported_field");
+    }
+    const std::string lang = body.member_str("language");
+    if (!lang.empty() && lang != "de" && lang != "german" && lang != "deutsch" &&
+        lang != "German" && lang != "Deutsch" && lang != "DE") {
+      return Error(400, "Bad Request", "IndexTTS-2.5-German supports language 'de' only",
+                   "invalid_language");
+    }
   }
   // VoxCPM2 takes any free-text style ("froehlich", "whispering ..."); Ming
   // only knows its seven labels.
@@ -450,6 +508,13 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     greedy = value->as_bool();
   }
   models::qwen3_tts::SamplingOptions sampling;
+  if (service.is_indextts()) {
+    // indextts_de.py defaults (num_beams 1)
+    sampling.temperature = 0.7F;
+    sampling.top_k = 30;
+    sampling.top_p = 0.8F;
+    sampling.repetition_penalty = 10.0F;
+  }
   sampling.seed = static_cast<std::uint32_t>(seed);
   sampling.sample = !greedy;
   sampling.predictor_sample = !greedy;
@@ -491,8 +556,20 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                      std::to_string(kMaximumVoxCpm2ReferenceSeconds) + " seconds",
                  "invalid_reference_audio");
   }
+  if (service.is_indextts() && !reference_audio.samples.empty() &&
+      reference_audio.sample_rate > 0 && reference_audio.channels > 0 &&
+      reference_audio.samples.size() / reference_audio.channels >
+          static_cast<std::size_t>(reference_audio.sample_rate) *
+              kMaximumIndexTtsReferenceSeconds) {
+    return Error(400, "Bad Request",
+                 "IndexTTS-2.5 reference audio must not exceed " +
+                     std::to_string(kMaximumIndexTtsReferenceSeconds) + " seconds",
+                 "invalid_reference_audio");
+  }
   std::string language = body.member_str("language");
-  if (language.empty() && (service.is_ming_tts() || service.is_voxcpm2())) {
+  if (language.empty() && service.is_indextts()) {
+    language = "de";
+  } else if (language.empty() && (service.is_ming_tts() || service.is_voxcpm2())) {
     // VoxCPM2 detects the language from the text and ignores this field.
     // Ming's own default: no "Target language" line unless a preset sets one.
     if (preset != nullptr) {
@@ -509,7 +586,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
       .speaker = selected_voice,
       .language = std::move(language),
       .instruct = body.member_str("instructions"),
-      .emotion = body.member_str("emotion"),
+      .emotion = std::move(emotion_spec),
       .tempo = body.member_str("tempo"),
       .pitch = body.member_str("pitch"),
       .volume = body.member_str("volume"),
