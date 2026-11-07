@@ -627,6 +627,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
     return nullptr;
   }
+  // Every weight is on the device: release the upload's pinned read buffers
+  // (16 x 16 MiB) before the expert stream pins its own staging.
+  if (!EagerStaging())
+    stager.reset();
   if (expert_slots > 0) {
     // One reopened handle per shard serves the concurrent expert reads.
     for (const auto& shard : shards) {
