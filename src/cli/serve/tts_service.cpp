@@ -448,7 +448,8 @@ struct TtsService::Impl {
     ready = true;
   }
 
-  TtsServiceOptions options;  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
+  TtsServiceOptions options;
+  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
   std::unique_ptr<models::indextts::Engine> indextts_engine;
   std::unique_ptr<models::ming_tts::Engine> ming_engine;
   std::unique_ptr<models::qwen3_tts::hip::SynthesisHipRuntime> native_runtime;

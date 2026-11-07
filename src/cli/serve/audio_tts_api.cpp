@@ -27,7 +27,9 @@ constexpr std::size_t kMaximumInputBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 8192;
 // VoxCPM2 encodes the whole reference clip into its 8192-position context.
 constexpr std::size_t kMaximumVoxCpm2ReferenceSeconds = 60;
-// IndexTTS-2.5: the serve API accepts reference clips up to 10 s.
+// IndexTTS-2.5: inline reference clips (request 'reference_audio') may be up to
+// 10 s. Server-side presets (--voice name=wav) are not limited here: the
+// engine cuts every reference at 15 s like _load_and_cut_audio(spk, 15).
 constexpr std::size_t kMaximumIndexTtsReferenceSeconds = 10;
 
 bool ReadUnsigned(const json::Value& body, std::string_view name,
@@ -556,7 +558,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                      std::to_string(kMaximumVoxCpm2ReferenceSeconds) + " seconds",
                  "invalid_reference_audio");
   }
-  if (service.is_indextts() && !reference_audio.samples.empty() &&
+  if (service.is_indextts() && preset == nullptr && !reference_audio.samples.empty() &&
       reference_audio.sample_rate > 0 && reference_audio.channels > 0 &&
       reference_audio.samples.size() / reference_audio.channels >
           static_cast<std::size_t>(reference_audio.sample_rate) *
