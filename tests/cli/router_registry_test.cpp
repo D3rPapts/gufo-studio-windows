@@ -404,7 +404,20 @@ void TestPlacementAndSplitBusy() {
   assert(!registry.Busy("twin") && !registry.RemoteBusy("twin"));
 }
 
+// #957: an alias resolves to its section id; ids resolve to themselves.
+void TestCanonicalIdAliases() {
+  auto presets = Models({{"llm", "qwen"}, {"tts", "voice"}});
+  presets[0].aliases = {"gpt-4o", "local"};
+  const Registry registry(std::move(presets), RegistryOptions{});
+  assert(registry.CanonicalId("qwen") == "qwen");
+  assert(registry.CanonicalId("gpt-4o") == "qwen");
+  assert(registry.CanonicalId("local") == "qwen");
+  assert(registry.CanonicalId("voice") == "voice");
+  assert(registry.CanonicalId("unknown").empty());
+}
+
 int main() {
+  TestCanonicalIdAliases();
   TestSpawnAwaitQueue();
   TestLoadTimeout();
   TestIdleUnload();

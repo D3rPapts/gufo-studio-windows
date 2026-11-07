@@ -75,7 +75,7 @@ struct PresetModel {
   /// upstream #957 every `gufo serve` modality accepts each repeated
   /// `--served-model-name` as an alias, so the router routes these names to
   /// this section too (the request keeps the alias as its `model`).
-  std::vector<std::string> aliases;
+  std::vector<std::string> aliases{};
   PresetHints hints{};
   /// Set for `[remote/<id>]` sections, and for a local section with a
   /// `[remote/<id>]` twin of the same id.

@@ -334,8 +334,42 @@ std::string RejectBogus(std::string_view, const std::vector<std::string>& argv) 
   return {};
 }
 
+// #957: extra `served-model-name` values are aliases of the section; the
+// section id itself never is one, and repeats collapse.
+void TestServedNameAliases() {
+  const auto file = WriteFixture("gufo_router_preset_aliases.conf",
+                                 "[llm/qwen]\n"
+                                 "model = x.gguf\n"
+                                 "served-model-name = qwen\n"
+                                 "served-model-name = gpt-4o\n"
+                                 "served-model-name = gpt-4o\n"
+                                 "served-model-name = local\n"
+                                 "[tts/voice]\n"
+                                 "model = tts\n");
+  std::vector<PresetModel> models;
+  std::string error;
+  assert(LoadPreset(file, "", &models, &error));
+  assert(models.size() == 2);
+  const std::vector<std::string> aliases = {"gpt-4o", "local"};
+  assert(models[0].aliases == aliases);
+  assert(models[1].aliases.empty());
+}
+
+#if !GUFO_ROUTER_FORK_SERVE
+// Without the fork's `gufo serve omni` a local omni section cannot start.
+void TestLocalOmniRejected() {
+  TestErrorMentionsSectionAndToken("gufo_router_preset_omni.conf",
+                                   "[omni/cap]\nmodel = m\n", "[omni/cap]",
+                                   "gufo serve omni");
+}
+#endif
+
 int main() {
   gufo::cli::SetServeArgvValidator(&RejectBogus);
+  TestServedNameAliases();
+#if !GUFO_ROUTER_FORK_SERVE
+  TestLocalOmniRejected();
+#endif
   TestHappyPath();
   TestErrors();
   TestCrlfAndBomMatchLf();

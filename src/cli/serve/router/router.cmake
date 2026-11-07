@@ -36,12 +36,20 @@ else()
   target_sources(gufo_router PRIVATE src/cli/serve/router/workers.cpp
                                      src/cli/serve/router/memory_posix.cpp)
 endif()
-target_compile_definitions(gufo_router PRIVATE
+target_compile_definitions(gufo_router PUBLIC
   GUFO_ROUTER_FORK_SERVE=$<BOOL:${GUFO_ROUTER_FORK_SERVE}>)
 target_link_libraries(gufo_router PUBLIC gufo_http gufo_core)
 target_link_libraries(gufo PRIVATE gufo_router)
 
 if (BUILD_TESTING)
+  # This file is included before the top-level `add_compile_options(-UNDEBUG)`
+  # for tests, so the router tests turn their assertions back on themselves.
+  if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(gufo_router_test_undebug /UNDEBUG)
+  else()
+    set(gufo_router_test_undebug -UNDEBUG)
+  endif()
+
   add_test(NAME gufo_router_help COMMAND gufo router --help)
   set_tests_properties(gufo_router_help PROPERTIES
     LABELS "cpu;server;cli"
@@ -54,6 +62,7 @@ if (BUILD_TESTING)
       router_jobs_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
+    target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
     add_test(NAME ${router_test} COMMAND ${router_test})
     set_tests_properties(${router_test} PROPERTIES LABELS "cpu;router"
       TIMEOUT 60)
@@ -66,6 +75,7 @@ if (BUILD_TESTING)
       src/cli/serve/router/comfy_graph.cpp)
     target_include_directories(${router_test} PRIVATE ${PROJECT_SOURCE_DIR})
     target_compile_features(${router_test} PRIVATE cxx_std_20)
+    target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
     add_test(NAME ${router_test} COMMAND ${router_test})
     set_tests_properties(${router_test} PROPERTIES LABELS "cpu;router"
       TIMEOUT 30)
@@ -77,7 +87,8 @@ if (BUILD_TESTING)
         router_ws_relay_test)
       add_executable(${router_test} tests/cli/${router_test}.cpp)
       target_link_libraries(${router_test} PRIVATE gufo_router)
-      add_test(NAME ${router_test} COMMAND ${router_test})
+      target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
+    add_test(NAME ${router_test} COMMAND ${router_test})
       set_tests_properties(${router_test} PROPERTIES LABELS "cpu;router"
         TIMEOUT 30)
     endforeach()
