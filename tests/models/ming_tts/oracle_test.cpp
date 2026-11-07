@@ -19,6 +19,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
+
 #include "src/core/json.hpp"
 #include "src/models/ming_tts/cpu/model.hpp"
 #include "src/models/ming_tts/prompt.hpp"
@@ -31,6 +38,28 @@ namespace ming = gufo::models::ming_tts;
 namespace json = gufo::json;
 
 namespace {
+
+// Peak host memory of this run (the router's admission measure on Windows is
+// the peak working set, which includes resident file-mapping pages, #829).
+void PrintPeakMemory() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  if (GetProcessMemoryInfo(GetCurrentProcess(),
+                           reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                           sizeof(counters)) != 0) {
+    std::printf("host memory: peak working set %.3f GiB, working set %.3f GiB, private %.3f GiB\n",
+                static_cast<double>(counters.PeakWorkingSetSize) / (1ULL << 30U),
+                static_cast<double>(counters.WorkingSetSize) / (1ULL << 30U),
+                static_cast<double>(counters.PrivateUsage) / (1ULL << 30U));
+  }
+#else
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    std::printf("host memory: peak RSS %.3f GiB\n",
+                static_cast<double>(usage.ru_maxrss) / (1ULL << 20U));
+  }
+#endif
+}
 
 int g_failures = 0;
 constexpr double kMinCos = 0.999;
@@ -598,5 +627,6 @@ int main() {
 
   std::printf("%s: %d failure(s), %.1f s\n", g_failures == 0 ? "PASS" : "FAIL",
               g_failures, Seconds(t0));
+  PrintPeakMemory();
   return g_failures == 0 ? 0 : 1;
 }
