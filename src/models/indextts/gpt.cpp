@@ -95,6 +95,8 @@ std::vector<float> UnifiedVoice::EmoVec(const float* cond, std::int64_t rows, co
               kEmoDim, W(e + "embed.out.0.bias", kEmoDim), x.data());
   sub.clear();
   sub.shrink_to_fit();
+  // embed.out alone is 535 MB of F32, read once per reference (#829).
+  sd_->ReleaseTensorPages("model." + e + "embed.");
   const float xscale = std::sqrt(static_cast<float>(kEmoDim));
   for (float& v : x) {
     v *= xscale;
@@ -276,6 +278,8 @@ std::vector<float> UnifiedVoice::EmoVec(const float* cond, std::int64_t rows, co
   std::vector<float> b(static_cast<std::size_t>(dim));
   cpu::Linear(lat.data(), 1, kD, W("emovec_layer.weight", dim * kD), dim, W("emovec_layer.bias", dim), a.data());
   cpu::Linear(a.data(), 1, dim, W("emo_layer.weight", dim * dim), dim, W("emo_layer.bias", dim), b.data());
+  sd_->ReleaseTensorPages("model." + e);
+  sd_->ReleaseTensorPages("model." + pp);
   return b;
 }
 

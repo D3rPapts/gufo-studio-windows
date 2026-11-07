@@ -25,6 +25,9 @@ public:
   [[nodiscard]] std::vector<float> Embed(std::span<const float> fbank, std::int64_t frames,
                                          std::vector<float>* head_out = nullptr) const;
 
+  // Drops this process's resident pages of the weight mapping (#829).
+  void ReleaseHostPages() const noexcept { sd_->ReleaseResidentPages(); }
+
 private:
   std::unique_ptr<PthArchive> sd_;
 };

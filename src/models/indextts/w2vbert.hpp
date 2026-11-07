@@ -34,6 +34,9 @@ public:
 
   [[nodiscard]] const float* F(const std::string& name, std::int64_t numel) const;
 
+  // Drops this process's resident pages of the weight mapping (#829).
+  void ReleaseHostPages() const noexcept { st_->ReleaseResidentPages(); }
+
 private:
   std::unique_ptr<ming_tts::SafetensorsFile> st_;
   std::vector<float> mean_;

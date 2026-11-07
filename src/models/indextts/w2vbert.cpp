@@ -211,6 +211,9 @@ std::vector<float> W2vBert::Embed(const W2vFeatures& in, const Tap& tap) const {
     if (tap && (layer == 0 || layer == 8)) {
       tap("layer" + std::to_string(layer), h);
     }
+    // ~96 MB of F32 weights per layer, read once per reference: keep only the
+    // current layer resident (#829).
+    st_->ReleaseResidentPages();
   }
   if (tap) {
     tap("hidden17", h);
