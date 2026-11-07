@@ -97,6 +97,9 @@ constexpr std::string_view kPresetGrammar =
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
 constexpr int kSpawnAttempts = 3;
+// How long a cold load may wait for memory that only programs outside the
+// router can release before the request is answered with the reason.
+constexpr std::chrono::seconds kMemoryWaitLimit{45};
 constexpr std::chrono::seconds kShutdownDrain{10};
 /// Remote routers: model list refresh period and the bound of one probe.
 constexpr std::chrono::seconds kRemoteProbeEvery{5};
@@ -2222,11 +2225,13 @@ private:
 
   /// Memory admission for a cold start of `model_id` (state mutex held; it
   /// is released while evicted workers stop and their memory returns).
-  Gate MemoryGateLocked(const std::string& model_id, std::string* last_wait) {
+  Gate MemoryGateLocked(const std::string& model_id, std::string* last_wait,
+                        std::string* wait_reason) {
     const auto residents = registry.Residents();
     const router::AdmissionPlan plan =
         residency->PlanFor(model_id, residents, PidsLocked());
     if (plan.action == router::AdmissionPlan::Action::kWait) {
+      *wait_reason = plan.reason;
       // One event per kind of wait, not one per changed number.
       const std::string kind = plan.reason.substr(0, plan.reason.find(';'));
       if (kind != *last_wait) {
@@ -2480,6 +2485,7 @@ private:
     // the front tracks the outer bound itself.
     const auto began = std::chrono::steady_clock::now();
     std::string last_wait;
+    std::optional<std::chrono::steady_clock::time_point> outside_wait_since;
     for (;;) {
       if (options.load_timeout > std::chrono::seconds(0) &&
           std::chrono::steady_clock::now() - began >= options.load_timeout) {
@@ -2505,8 +2511,28 @@ private:
             return Err(502, "Bad Gateway", "router is shutting down",
                        "server_error", "upstream_unavailable");
           }
-          const Gate gate = MemoryGateLocked(model_id, &last_wait);
+          std::string wait_reason;
+          const Gate gate = MemoryGateLocked(model_id, &last_wait, &wait_reason);
           if (gate == Gate::kWait) {
+            // Memory held outside the router (other programs, the OS) cannot
+            // be freed by evicting workers. Waiting for it only ends in a
+            // client timeout, so after kMemoryWaitLimit answer with the
+            // reason (how much is needed and how much is free) instead.
+            if (wait_reason.rfind("not enough free memory", 0) == 0) {
+              const auto now = std::chrono::steady_clock::now();
+              if (!outside_wait_since) {
+                outside_wait_since = now;
+              } else if (now - *outside_wait_since >= kMemoryWaitLimit) {
+                registry.MarkUnloaded(model_id);
+                residency->Event("gave up loading " + model_id + ": " +
+                                 wait_reason);
+                return Err(507, "Insufficient Storage",
+                           "cannot load '" + model_id + "': " + wait_reason,
+                           "server_error", "insufficient_memory");
+              }
+            } else {
+              outside_wait_since.reset();
+            }
             mutex.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             mutex.lock();
