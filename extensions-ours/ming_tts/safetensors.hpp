@@ -44,6 +44,11 @@ public:
       const noexcept {
     return tensors_;
   }
+  // Drops this process's resident pages of the mapping (all of it, or the
+  // part of [data, data + bytes) inside it) once their contents were copied
+  // elsewhere. Views stay valid; a later read refaults from the file cache.
+  void ReleaseResidentPages() const noexcept;
+  void ReleaseResidentPages(const void* data, std::size_t bytes) const noexcept;
 
 private:
   platform::ReadOnlyMappedFile file_;

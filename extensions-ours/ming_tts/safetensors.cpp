@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include <gufo/ext/json.hpp>
+#include <gufo/ext/platform/prefault.hpp>
 
 namespace gufo::models::ming_tts {
 namespace {
@@ -216,7 +217,18 @@ std::vector<float> SafetensorsFile::ToF32(std::string_view name) const {
         throw std::runtime_error("unsupported dtype for " + std::string(name));
     }
   }
+  // The copy is all callers read: drop the source pages (#829).
+  ReleaseResidentPages(view.data, view.byte_size);
   return out;
+}
+
+void SafetensorsFile::ReleaseResidentPages() const noexcept {
+  platform::ReleaseMappedPages(file_.data(), file_.size());
+}
+
+void SafetensorsFile::ReleaseResidentPages(const void* data,
+                                           std::size_t bytes) const noexcept {
+  platform::ReleaseMappedRange(file_.data(), file_.size(), data, bytes);
 }
 
 std::vector<std::int64_t> SafetensorsFile::ToI64(std::string_view name) const {

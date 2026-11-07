@@ -49,6 +49,13 @@ public:
     return tensors_;
   }
   [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+  // Drops this process's resident pages of the mapping (all of it, or the part
+  // of [data, data + bytes) inside it). Views stay valid; a later read
+  // refaults from the file cache (Windows keeps touched pages otherwise, #829).
+  void ReleaseResidentPages() const noexcept;
+  void ReleaseResidentPages(const void* data, std::size_t bytes) const noexcept;
+  // The same for every contiguous tensor whose key starts with `prefix`.
+  void ReleaseTensorPages(std::string_view prefix) const noexcept;
 
 private:
   platform::ReadOnlyMappedFile file_;
