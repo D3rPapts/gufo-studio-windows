@@ -13,9 +13,9 @@
 #include <string>
 #include <vector>
 
-#include "src/models/indextts/audio.hpp"
-#include "src/models/indextts/pth.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
+#include "indextts/audio.hpp"
+#include "indextts/pth.hpp"
+#include "ming_tts/safetensors.hpp"
 
 namespace gufo::models::indextts {
 

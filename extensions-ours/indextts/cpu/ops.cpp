@@ -1,4 +1,4 @@
-#include "src/models/indextts/cpu/ops.hpp"
+#include "indextts/cpu/ops.hpp"
 
 #include <immintrin.h>
 

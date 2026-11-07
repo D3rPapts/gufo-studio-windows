@@ -1,4 +1,4 @@
-#include "src/models/indextts/text.hpp"
+#include "indextts/text.hpp"
 
 #include <unicode/locid.h>
 #include <unicode/normalizer2.h>

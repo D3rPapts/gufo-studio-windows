@@ -1,4 +1,4 @@
-#include "src/models/indextts/bigvgan.hpp"
+#include "indextts/bigvgan.hpp"
 
 #include <algorithm>
 #include <cmath>

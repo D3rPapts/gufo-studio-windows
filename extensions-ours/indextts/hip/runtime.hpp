@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
-#include "src/models/indextts/bigvgan.hpp"
-#include "src/models/indextts/gpt.hpp"
-#include "src/models/indextts/s2mel.hpp"
+#include "indextts/bigvgan.hpp"
+#include "indextts/gpt.hpp"
+#include "indextts/s2mel.hpp"
 
 namespace gufo::models::indextts::hip {
 

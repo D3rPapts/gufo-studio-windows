@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/models/indextts/hip/ops.hpp"
+#include "indextts/hip/ops.hpp"
 
 namespace gufo::models::indextts::hip {
 namespace {

@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-#include "src/models/indextts/cpu/conv.hpp"
-#include "src/models/indextts/pth.hpp"
+#include "indextts/cpu/conv.hpp"
+#include "indextts/pth.hpp"
 
 namespace gufo::models::indextts {
 

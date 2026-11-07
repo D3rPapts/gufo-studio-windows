@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/indextts/pth.hpp"
+#include "indextts/pth.hpp"
 
 namespace gufo::models::indextts {
 

@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/indextts/hip/blas.hpp"
+#include "indextts/hip/blas.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hipblas/hipblas.h>
@@ -14,7 +14,7 @@
 #include <tuple>
 #include <vector>
 
-#include "src/models/indextts/hip/ops.hpp"
+#include "indextts/hip/ops.hpp"
 
 namespace gufo::models::indextts::hip {
 namespace {

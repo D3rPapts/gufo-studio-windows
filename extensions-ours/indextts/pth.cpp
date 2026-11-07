@@ -1,4 +1,4 @@
-#include "src/models/indextts/pth.hpp"
+#include "indextts/pth.hpp"
 
 #include <algorithm>
 #include <cmath>

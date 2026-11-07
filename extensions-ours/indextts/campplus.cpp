@@ -1,10 +1,10 @@
-#include "src/models/indextts/campplus.hpp"
+#include "indextts/campplus.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
-#include "src/models/indextts/cpu/ops.hpp"
+#include "indextts/cpu/ops.hpp"
 
 namespace gufo::models::indextts {
 namespace {

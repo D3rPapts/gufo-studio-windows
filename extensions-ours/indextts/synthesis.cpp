@@ -1,4 +1,4 @@
-#include "src/models/indextts/synthesis.hpp"
+#include "indextts/synthesis.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -12,13 +12,14 @@
 #include <sstream>
 #include <unordered_map>
 
-#include "src/models/indextts/audio.hpp"
-#include "src/models/indextts/bigvgan.hpp"
-#include "src/models/indextts/campplus.hpp"
-#include "src/models/indextts/hip/runtime.hpp"
-#include "src/models/indextts/s2mel.hpp"
-#include "src/models/indextts/text.hpp"
-#include "src/models/indextts/w2vbert.hpp"
+#include "indextts/audio.hpp"
+#include "indextts/bigvgan.hpp"
+#include "indextts/bundle.hpp"
+#include "indextts/campplus.hpp"
+#include "indextts/hip/runtime.hpp"
+#include "indextts/s2mel.hpp"
+#include "indextts/text.hpp"
+#include "indextts/w2vbert.hpp"
 
 namespace gufo::models::indextts {
 namespace {
@@ -26,14 +27,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double Seconds(Clock::time_point a) {
   return std::chrono::duration<double>(Clock::now() - a).count();
-}
-
-std::filesystem::path GptPath(const std::filesystem::path& dir) {
-  std::error_code ec;
-  if (std::filesystem::is_regular_file(dir / "german" / "gpt.pth", ec)) {
-    return dir / "german" / "gpt.pth";
-  }
-  return dir / "gpt.pth";
 }
 
 std::string Lower(std::string s) {
@@ -79,28 +72,6 @@ std::uint64_t HashSamples(std::span<const float> s, std::int64_t rate) {
 }
 
 }  // namespace
-
-bool LooksLikeIndexTts25(const std::filesystem::path& dir) {
-  std::error_code ec;
-  const auto exists = [&](const std::filesystem::path& p) {
-    return std::filesystem::is_regular_file(p, ec);
-  };
-  if (!exists(dir / "config.yaml") || !exists(GptPath(dir)) || !exists(dir / "s2mel.pth") ||
-      !exists(dir / "codec.pth") || !exists(dir / "multilingual_zh_ja_yue_char_del.tiktoken") ||
-      !exists(dir / "w2v-bert-2.0" / "model.safetensors") ||
-      !exists(dir / "campplus" / "campplus_cn_common.bin") ||
-      !exists(dir / "bigvgan_v2_22khz_80band_256x" / "bigvgan_generator.pt")) {
-    return false;
-  }
-  std::ifstream in(dir / "config.yaml");
-  std::string line;
-  while (std::getline(in, line)) {
-    if (line.rfind("version:", 0) == 0 && line.find("2.5") != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
-}
 
 int EmotionIndex(const std::string& raw) {
   static const std::vector<std::pair<std::string, int>> names = {

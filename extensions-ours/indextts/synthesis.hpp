@@ -17,16 +17,12 @@
 #include <string>
 #include <vector>
 
-#include "src/models/indextts/gpt.hpp"
+#include "indextts/bundle.hpp"
+#include "indextts/gpt.hpp"
 
 namespace gufo::models::indextts {
 
 inline constexpr std::int64_t kOutputRate = 22050;
-
-// True for an IndexTTS-2.5 bundle directory (config.yaml "version: 2.5",
-// gpt.pth / german/gpt.pth, s2mel.pth, codec.pth, w2v-bert-2.0, campplus,
-// bigvgan_v2_22khz_80band_256x, multilingual tiktoken).
-[[nodiscard]] bool LooksLikeIndexTts25(const std::filesystem::path& dir);
 
 // Emotion names (English and German, case-insensitive) -> index in
 // [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]; -1 if unknown.

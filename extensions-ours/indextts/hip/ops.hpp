@@ -1,6 +1,6 @@
 // HIP kernels for the IndexTTS-2.5 gfx1151 runtime (time-major [T, C]
-// activations, FP32). GEMMs, LayerNorm/RMSNorm, attention, GELU/SiLU come from
-// the Ming-3.0-tts / VoxCPM2 / Fish Drama-3 kernels; this file adds the glue
+// activations, FP32). GEMMs, RMSNorm, attention, GELU/SiLU come from
+// the Ming-3.0-tts / VoxCPM2 kernels (affine LayerNorm copied from Fish Drama-3); this file adds the glue
 // IndexTTS needs: QKV split into a KV cache, adaptive RMSNorm, modulated
 // LayerNorm, WaveNet gate, time-major im2col with zero/reflect padding, the
 // transposed-conv gather, the fused anti-aliased SnakeBeta of BigVGAN and the
@@ -28,6 +28,11 @@ void LaunchAdaRmsNorm(const float* x, const float* norm_w, const float* ss, floa
 // y = LayerNorm_noaffine(x, eps) * (1 + mod[dim + c]) + mod[c] (DiT FinalLayer).
 void LaunchModulatedLayerNorm(const float* x, const float* mod, float* y, std::size_t rows,
                               std::size_t dim, float eps, hipStream_t stream);
+
+// y = (x - mean) * rsqrt(var + eps) * weight + bias per row (affine LayerNorm,
+// copied from the Fish Drama-3 codec kernels).
+void LaunchLayerNorm(const float* input, const float* weight, const float* bias, float* output,
+                     std::size_t rows, std::size_t columns, float epsilon, hipStream_t stream);
 
 // acts[r, c] = tanh(a[r, c] + g[c]) * sigmoid(a[r, dim + c] + g[dim + c]); a [rows, 2 dim].
 void LaunchWaveNetGate(const float* a, const float* g, float* acts, std::size_t rows,

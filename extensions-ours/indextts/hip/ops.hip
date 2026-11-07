@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/indextts/hip/ops.hpp"
+#include "indextts/hip/ops.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -65,6 +65,56 @@ __global__ void AdaRmsNormKernel(const float* x, const float* w, const float* ss
   const float inv = rsqrtf(total / static_cast<float>(dim) + eps);
   for (std::size_t c = threadIdx.x; c < dim; c += blockDim.x) {
     y[r * dim + c] = ss[c] * (xr[c] * inv * w[c]) + ss[dim + c];
+  }
+}
+
+// Affine LayerNorm, one block per row; a copy of the Fish Drama-3 codec
+// LayerNormKernel (fish_drama3/hip/codec_ops.hip, 1.x fork) so that this
+// extension does not depend on the Fish extension. Needs blockDim.x == 256.
+__global__ void AffineLayerNormKernel(const float* input, const float* weight,
+                                      const float* bias, float* output,
+                                      std::size_t rows, std::size_t columns,
+                                      float epsilon) {
+  const std::size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float reduction[256];
+  const std::size_t base = row * columns;
+  float sum = 0.0F;
+  for (std::size_t column = threadIdx.x; column < columns;
+       column += blockDim.x) {
+    sum += input[base + column];
+  }
+  reduction[threadIdx.x] = sum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float mean = reduction[0] / static_cast<float>(columns);
+  float squared = 0.0F;
+  for (std::size_t column = threadIdx.x; column < columns;
+       column += blockDim.x) {
+    const float centered = input[base + column] - mean;
+    squared = fmaf(centered, centered, squared);
+  }
+  reduction[threadIdx.x] = squared;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse =
+      rsqrtf(reduction[0] / static_cast<float>(columns) + epsilon);
+  for (std::size_t column = threadIdx.x; column < columns;
+       column += blockDim.x) {
+    output[base + column] =
+        (input[base + column] - mean) * inverse * weight[column] + bias[column];
   }
 }
 
@@ -303,6 +353,12 @@ void LaunchModulatedLayerNorm(const float* x, const float* mod, float* y, std::s
                               std::size_t dim, float eps, hipStream_t stream) {
   hipLaunchKernelGGL(ModulatedLayerNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      stream, x, mod, y, dim, eps);
+}
+
+void LaunchLayerNorm(const float* input, const float* weight, const float* bias, float* output,
+                     std::size_t rows, std::size_t columns, float epsilon, hipStream_t stream) {
+  hipLaunchKernelGGL(AffineLayerNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     stream, input, weight, bias, output, rows, columns, epsilon);
 }
 
 void LaunchWaveNetGate(const float* a, const float* g, float* acts, std::size_t rows,

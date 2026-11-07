@@ -1,5 +1,5 @@
 // Written with AI assistance (Claude Code).
-#include "src/models/indextts/hip/runtime.hpp"
+#include "indextts/hip/runtime.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -12,11 +12,10 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "src/models/fish_drama3/hip/codec_ops.hpp"
-#include "src/models/indextts/hip/blas.hpp"
-#include "src/models/indextts/hip/ops.hpp"
-#include "src/models/ming_tts/hip/ops.hpp"
-#include "src/models/voxcpm2/hip/ops.hpp"
+#include "indextts/hip/blas.hpp"
+#include "indextts/hip/ops.hpp"
+#include "ming_tts/hip/ops.hpp"
+#include "voxcpm2/hip/ops.hpp"
 #endif
 
 namespace gufo::models::indextts::hip {
@@ -53,7 +52,6 @@ namespace {
 
 namespace ming = ming_tts::hip;
 namespace vox = voxcpm2::hip;
-namespace fish = fish_drama3::hip;
 
 void Check(hipError_t status, const char* what) {
   if (status != hipSuccess) {
@@ -460,8 +458,8 @@ struct Runtime::Impl {
     float* mp = mlp.Ensure(static_cast<std::size_t>(rows * 4 * d));
     for (std::size_t l = 0; l < gpt.size(); ++l) {
       const GptLayer& L = gpt[l];
-      fish::LaunchCodecLayerNorm(xp, L.ln1_w, L.ln1_b, yp, static_cast<std::size_t>(rows),
-                                 static_cast<std::size_t>(d), 1e-5F, stream);
+      LaunchLayerNorm(xp, L.ln1_w, L.ln1_b, yp, static_cast<std::size_t>(rows),
+                      static_cast<std::size_t>(d), 1e-5F, stream);
       Linear(yp, rows, L.attn, qkvp);
       LaunchSplitQkv(qkvp, qp, kcache[l] + len * d, vcache[l] + len * d, static_cast<std::size_t>(rows),
                      static_cast<std::size_t>(d), stream);
@@ -471,8 +469,8 @@ struct Runtime::Impl {
                            static_cast<std::size_t>(rows * d), static_cast<std::size_t>(cap * d), true,
                            static_cast<std::size_t>(len), stream);
       LinearAdd(ap, rows, L.proj, xp);
-      fish::LaunchCodecLayerNorm(xp, L.ln2_w, L.ln2_b, yp, static_cast<std::size_t>(rows),
-                                 static_cast<std::size_t>(d), 1e-5F, stream);
+      LaunchLayerNorm(xp, L.ln2_w, L.ln2_b, yp, static_cast<std::size_t>(rows),
+                      static_cast<std::size_t>(d), 1e-5F, stream);
       Linear(yp, rows, L.fc, mp);
       ming::LaunchGeluTanh(mp, static_cast<std::size_t>(rows * 4 * d), stream);
       LinearAdd(mp, rows, L.mproj, xp);
@@ -481,8 +479,8 @@ struct Runtime::Impl {
     const float* last = xp + (rows - 1) * d;
     float* a = yp;
     float* b = qp;
-    fish::LaunchCodecLayerNorm(last, lnf_w, lnf_b, a, 1, static_cast<std::size_t>(d), 1e-5F, stream);
-    fish::LaunchCodecLayerNorm(a, fn_w, fn_b, b, 1, static_cast<std::size_t>(d), 1e-5F, stream);
+    LaunchLayerNorm(last, lnf_w, lnf_b, a, 1, static_cast<std::size_t>(d), 1e-5F, stream);
+    LaunchLayerNorm(a, fn_w, fn_b, b, 1, static_cast<std::size_t>(d), 1e-5F, stream);
     const std::int64_t codes = voice->config().mel_codes;
     float* lp = logits.Ensure(static_cast<std::size_t>(codes));
     Linear(b, 1, mel_head, lp);

@@ -20,15 +20,15 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/models/indextts/audio.hpp"
-#include "src/models/indextts/bigvgan.hpp"
-#include "src/models/indextts/gpt.hpp"
-#include "src/models/indextts/hip/runtime.hpp"
-#include "src/models/indextts/s2mel.hpp"
-#include "src/models/indextts/synthesis.hpp"
-#include "src/models/indextts/text.hpp"
-#include "src/models/ming_tts/safetensors.hpp"
+#include <gufo/ext/json.hpp>
+#include "indextts/audio.hpp"
+#include "indextts/bigvgan.hpp"
+#include "indextts/gpt.hpp"
+#include "indextts/hip/runtime.hpp"
+#include "indextts/s2mel.hpp"
+#include "indextts/synthesis.hpp"
+#include "indextts/text.hpp"
+#include "ming_tts/safetensors.hpp"
 
 namespace itts = gufo::models::indextts;
 namespace json = gufo::json;

@@ -1,11 +1,11 @@
-#include "src/models/indextts/w2vbert.hpp"
+#include "indextts/w2vbert.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
-#include "src/models/indextts/cpu/ops.hpp"
+#include "indextts/cpu/ops.hpp"
 
 namespace gufo::models::indextts {
 namespace {

@@ -1,4 +1,4 @@
-#include "src/models/indextts/gpt.hpp"
+#include "indextts/gpt.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 #include <numeric>
 #include <stdexcept>
 
-#include "src/models/indextts/cpu/ops.hpp"
+#include "indextts/cpu/ops.hpp"
 
 namespace gufo::models::indextts {
 namespace {

@@ -1,4 +1,4 @@
-#include "src/models/indextts/audio.hpp"
+#include "indextts/audio.hpp"
 
 #include <soxr.h>
 
@@ -10,8 +10,8 @@
 #include <numbers>
 #include <stdexcept>
 
-#include "src/models/ming_tts/cpu/fft.hpp"
-#include "src/models/ming_tts/speaker.hpp"
+#include "ming_tts/cpu/fft.hpp"
+#include "ming_tts/speaker.hpp"
 
 namespace gufo::models::indextts {
 namespace {
