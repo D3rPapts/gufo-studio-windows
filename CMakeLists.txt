@@ -395,6 +395,8 @@ add_subdirectory(src/models/ming_tts)
 add_subdirectory(src/models/voxcpm2)
 add_subdirectory(src/models/indextts)
 add_subdirectory(src/models/moss_image)
+# CCIP + anime face detector for POST /v1/figuren ("verfahren": "ccip").
+add_subdirectory(src/models/ccip)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
@@ -461,6 +463,7 @@ add_library(gufo_http STATIC
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
   src/cli/serve/router/figuren.cpp
+  src/cli/serve/router/figuren_ccip.cpp
   src/cli/serve/router/jobs.cpp
   src/cli/serve/router/names.cpp
   src/cli/serve/router/preset.cpp
@@ -512,6 +515,8 @@ else()
 endif()
 # Real-ESRGAN on the NPU / CPU (ONNX Runtime) behind `gufo serve upscale`.
 target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
+# CCIP figure check ("verfahren": "ccip" in POST /v1/figuren), CPU only.
+target_link_libraries(gufo_http PUBLIC gufo_ccip)
 target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2 gufo_indextts gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
 if (ENGINE_ENABLE_HIP)
   # Wan 2.2 TI2V-5B behind `gufo serve video` (src/models/wan22).
@@ -662,6 +667,7 @@ if (BUILD_TESTING)
   gufo_qwen_image_21_register_tests()
 
   add_subdirectory(tests/models/embedding_gemma2)
+  add_subdirectory(tests/models/ccip)
 
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES
@@ -768,6 +774,24 @@ if (BUILD_TESTING)
   add_test(NAME router_figuren_test COMMAND router_figuren_test)
   set_tests_properties(router_figuren_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
+  # "verfahren": "ccip" decision rule (top 3, feature contradictions, cap,
+  # margin) on the prototype's table cases; JSON only, no model.
+  add_executable(router_figuren_ccip_test tests/cli/router_figuren_ccip_test.cpp
+    src/cli/serve/router/figuren_ccip.cpp)
+  target_include_directories(router_figuren_ccip_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_figuren_ccip_test PRIVATE cxx_std_20)
+  add_test(NAME router_figuren_ccip_test COMMAND router_figuren_ccip_test)
+  set_tests_properties(router_figuren_ccip_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+  # "verfahren": "ccip" through FigurenService: validation, 503 without
+  # models; with GUFO_CCIP_MODEL/FACE/FRAME/CROP_DIR a real frame end to end.
+  add_executable(router_figuren_ccip_endpoint_test
+    tests/cli/router_figuren_ccip_endpoint_test.cpp)
+  target_link_libraries(router_figuren_ccip_endpoint_test PRIVATE gufo_http)
+  add_test(NAME router_figuren_ccip_endpoint_test
+    COMMAND router_figuren_ccip_endpoint_test)
+  set_tests_properties(router_figuren_ccip_endpoint_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 600)
   add_executable(router_proxy_remote_test tests/cli/router_proxy_remote_test.cpp)
   target_link_libraries(router_proxy_remote_test PRIVATE gufo_http)
   add_test(NAME router_proxy_remote_test COMMAND router_proxy_remote_test)

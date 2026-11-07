@@ -584,6 +584,34 @@ loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
 /embeddings` goes to the embedding model named in its body.
 
+### Figure check (`POST /v1/figuren`)
+
+The front answers `POST /v1/figuren` itself and asks the vision model
+through its own `/v1/chat/completions` (default `qwen3.8-27b`, `"modell"`
+overrides). The default method lists the people of a frame with the model,
+assigns them by badge or position and rates each head against the figure's
+reference (request and answer fields: header comment of
+`src/cli/serve/router/figuren.hpp`).
+
+`"verfahren": "ccip"` (1.4.5, opt-in) assigns by appearance instead and never
+by position or badge: the anime face detector (YOLOv8n) finds the heads,
+CCIP (deepghs CAFormer character fingerprints, CPU) compares each head with
+every reference image of every figure (`kopf`, `front`, `bilder`, plus
+`galerie` crops from other shots), the 27B only reads hard features
+(moustache, full beard, glasses, hair) from the head and from each
+`steckbrief`, and a candidate whose features contradict is dropped. A figure
+is named only when its diff is below `ccip_cap` (default 0.05) and the next
+remaining figure is at least `ccip_abstand` (0.01) farther; otherwise the
+person is `"unbekannt"`. Each person returns `name`, `box` (face),
+`kopf_box`, `beste`, `zweitbeste`, `abstand`, `diff` per figure, `merkmale`,
+`llm_gefragt` and a German `begruendung`. The models are converted once with
+`src/models/ccip/reference/convert_weights.py`; the router finds them through
+`--ccip-model-dir` and `--ccip-face-dir` (Windows defaults
+`D:\llm-modelle\deepghs\ccip_onnx\gufo` and
+`D:\llm-modelle\deepghs\anime_face_detection\gufo`), loads them on the first
+ccip request (~165 MB host RAM) and answers 503 `ccip_unavailable` when they
+are missing. `--ccip-threads` (default 8) bounds the CPU threads.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

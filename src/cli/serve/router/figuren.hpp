@@ -41,9 +41,53 @@
 // head-to-belt crop of the frame (shirt, tie, glasses); shirt and tie items
 // whose wanted and seen colour name different colour families are then
 // marked wrong even when the model passed them.
+//
+// Opt-in method "verfahren": "ccip" (1.4.5; agreed with Regie #56-496/#56-498;
+// spec = Python prototype ccip_merkmale.py). Without "verfahren" (or with
+// "llm") everything above applies unchanged.
+//   POST /v1/figuren
+//     {"verfahren": "ccip",
+//      "bild": "<frame>",
+//      "referenzen": [{"name": "Lars", "kopf": "<image>", "front": "<image>",
+//                      "bilder": ["<image>", ...]}, ...],   front/bilder optional
+//      "galerie": [{"name": "Lars", "bild": "<head crop from another shot>"}],
+//      "steckbrief": {"Lars": "appearance text"},  optional
+//      "ccip_cap": 0.05, "ccip_abstand": 0.01,       optional
+//      "modell": "qwen3.8-27b"}                      optional
+//   -> {"verfahren": "ccip", "figuren": [{"name": figure | "unbekannt",
+//        "box": face box [x0,y0,x1,y1], "kopf_box": head crop, "gesicht": score,
+//        "beste", "zweitbeste", "abstand", "diff": {figure: 0..1},
+//        "kandidaten": [top 3 names], "passend": [kept names],
+//        "merkmale": {...} | null, "llm_gefragt": bool, "begruendung"}],
+//       "sekunden": n}
+//   People come from the anime face detector (YOLOv8n, letterbox 640, conf
+//   0.25, NMS 0.7), sorted left to right; the head crop is the face box grown
+//   to a square of 1.6 x its longer side. CCIP (CAFormer, 768 features) per
+//   head; diff = clip((1 - cos) / 2, 0, 1), per figure the minimum over every
+//   reference image (whole image AND its own centre-face head crop, for kopf,
+//   front and bilder) and every gallery image (centre-face head crop, the
+//   whole image when no face is found). The decision is DecideCcip
+//   (figuren_ccip.hpp): top 3 by diff, the 27B (own /v1/chat/completions,
+//   thinking off, temperature 0, head crop at most 512 px) reads moustache,
+//   full beard, glasses and hair; candidates whose Steckbrief features (read
+//   once per text by the 27B, cached in the process) contradict are dropped;
+//   the best kept one is assigned when diff < ccip_cap and it is alone or the
+//   next kept one is >= ccip_abstand farther, else "unbekannt". The 27B is
+//   only asked when it can change the result (best diff < cap and a top-3
+//   figure has Steckbrief features); otherwise merkmale is null and
+//   llm_gefragt false. Never assigned by position or badge. Models: router
+//   options --ccip-model-dir / --ccip-face-dir (converted safetensors, see
+//   src/models/ccip), loaded on the first ccip request and kept (~165 MB host);
+//   503 "ccip_unavailable" when missing. Embeddings of reference and gallery
+//   images are cached by SHA-256 of the image string, so only the first
+//   request pays for them (~1.1 s CPU per reference image). CPU work is
+//   serialised over one lock and uses --ccip-threads OpenMP threads.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -127,17 +171,30 @@ struct Options {
   /// Sends one request to the router's own model API.
   comfy::Fetch fetch;
   std::string default_model = "qwen3.8-27b";
+  /// "verfahren": "ccip": dirs with ccip_caformer.{safetensors,json} and
+  /// face_yolov8n.{safetensors,json}; OpenMP threads for the CPU work.
+  std::filesystem::path ccip_model_dir;
+  std::filesystem::path ccip_face_dir;
+  int ccip_threads = 8;
 };
+
+struct CcipState;
 
 class FigurenService {
 public:
   explicit FigurenService(Options options);
+  ~FigurenService();
   /// Answers POST /v1/figuren, nullopt for other paths.
   std::optional<server::HttpResponse> Handle(
       const server::HttpRequest& request) const;
 
 private:
+  std::optional<server::HttpResponse> HandleCcip(
+      const json::Value& body,
+      std::chrono::steady_clock::time_point started) const;
+
   Options options_;
+  std::shared_ptr<CcipState> ccip_;
 };
 
 }  // namespace gufo::router::figuren

@@ -13,8 +13,14 @@
 #include <stdexcept>
 #include <utility>
 
+#include <map>
+#include <mutex>
+
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/figuren_ccip.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/image.hpp"
+#include "src/models/ccip/ccip.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 
 namespace gufo::router::figuren {
@@ -609,7 +615,304 @@ Request ParseRequest(const std::string& text, const std::string& default_model) 
   return request;
 }
 
+// ---- "verfahren": "ccip" ----
+
+namespace ccip = models::ccip;
+
+constexpr std::size_t kMaxCcipImagesPerFigure = 64;
+constexpr std::size_t kMaxCcipGallery = 512;
+constexpr std::size_t kMaxCcipCacheEntries = 4096;
+constexpr int kCcipFeatureTokens = 300;
+constexpr int kCcipFeatureSide = 512;
+constexpr double kHeadGrow = 1.6;
+
+struct CcipFigureInput {
+  std::string name;
+  /// kopf, front, bilder (image strings, decoded only on a cache miss).
+  std::vector<std::string> images;
+  std::string profile;
+};
+
+struct CcipRequest {
+  std::string frame;
+  std::vector<CcipFigureInput> figures;
+  /// (figure index, image string)
+  std::vector<std::pair<std::size_t, std::string>> gallery;
+  double cap{kCcipCap};
+  double margin{kCcipMargin};
+  std::string model;
+};
+
+const std::string& ImageString(const json::Value* value, const std::string& what) {
+  if (value == nullptr || !value->is_string() || value->str().empty())
+    throw std::invalid_argument(what + " must be a data URL or base64 image");
+  return value->str();
+}
+
+double OptionalNumber(const json::Value& body, const std::string& key,
+                      double fallback) {
+  const json::Value* value = body.find(key);
+  if (value == nullptr || value->is_null())
+    return fallback;
+  if (!value->is_number() || !std::isfinite(value->as_double()) ||
+      value->as_double() < 0)
+    throw std::invalid_argument(key + " must be a number >= 0");
+  return value->as_double();
+}
+
+CcipRequest ParseCcipRequest(const json::Value& body,
+                             const std::string& default_model) {
+  CcipRequest request;
+  request.frame = ImageString(body.find("bild"), "bild");
+  const json::Value* refs = body.find("referenzen");
+  if (refs == nullptr || !refs->is_array() || refs->empty())
+    throw std::invalid_argument(
+        "referenzen must be a non-empty list of {name, kopf}");
+  if (refs->size() > kMaxReferences)
+    throw std::invalid_argument("too many referenzen");
+  const json::Value* profiles = body.find("steckbrief");
+  if (profiles != nullptr && !profiles->is_null() && !profiles->is_object())
+    throw std::invalid_argument("steckbrief must be an object {name: text}");
+  std::set<std::string> seen;
+  for (const json::Value& entry : refs->items()) {
+    const json::Value* name = entry.find("name");
+    if (name == nullptr || !name->is_string() || name->str().empty())
+      throw std::invalid_argument("every referenz needs a name and a kopf image");
+    if (!seen.insert(name->str()).second)
+      throw std::invalid_argument("duplicate referenz name: " + name->str());
+    CcipFigureInput figure;
+    figure.name = name->str();
+    figure.images.push_back(ImageString(entry.find("kopf"), "kopf of " + figure.name));
+    if (const json::Value* front = entry.find("front");
+        front != nullptr && !front->is_null())
+      figure.images.push_back(ImageString(front, "front of " + figure.name));
+    if (const json::Value* more = entry.find("bilder");
+        more != nullptr && !more->is_null()) {
+      if (!more->is_array())
+        throw std::invalid_argument("bilder of " + figure.name +
+                                    " must be a list of images");
+      for (const json::Value& image : more->items())
+        figure.images.push_back(ImageString(&image, "bilder of " + figure.name));
+    }
+    if (figure.images.size() > kMaxCcipImagesPerFigure)
+      throw std::invalid_argument("too many images for " + figure.name);
+    if (profiles != nullptr && profiles->is_object()) {
+      if (const json::Value* profile = profiles->find(figure.name);
+          profile != nullptr && profile->is_string())
+        figure.profile = Trim(profile->str());
+    }
+    request.figures.push_back(std::move(figure));
+  }
+  if (const json::Value* gallery = body.find("galerie");
+      gallery != nullptr && !gallery->is_null()) {
+    if (!gallery->is_array())
+      throw std::invalid_argument("galerie must be a list of {name, bild}");
+    if (gallery->size() > kMaxCcipGallery)
+      throw std::invalid_argument("too many galerie entries");
+    for (const json::Value& entry : gallery->items()) {
+      const json::Value* name = entry.find("name");
+      if (name == nullptr || !name->is_string())
+        throw std::invalid_argument("every galerie entry needs a name and a bild");
+      const auto it = std::find_if(
+          request.figures.begin(), request.figures.end(),
+          [&name](const CcipFigureInput& f) { return f.name == name->str(); });
+      if (it == request.figures.end())
+        throw std::invalid_argument("galerie name is not a referenz: " +
+                                    name->str());
+      request.gallery.emplace_back(
+          static_cast<std::size_t>(it - request.figures.begin()),
+          ImageString(entry.find("bild"), "galerie bild of " + name->str()));
+    }
+  }
+  request.cap = OptionalNumber(body, "ccip_cap", kCcipCap);
+  request.margin = OptionalNumber(body, "ccip_abstand", kCcipMargin);
+  request.model = default_model;
+  if (const json::Value* model = body.find("modell");
+      model != nullptr && !model->is_null()) {
+    if (!model->is_string() || model->str().empty())
+      throw std::invalid_argument("modell must be a model id");
+    request.model = model->str();
+  }
+  return request;
+}
+
+/// RGB8 like PIL convert("RGB") (alpha dropped, see core/image.cpp).
+ccip::RgbImage ReadRgb(const std::string& input, const std::string& what) {
+  const std::string url = StartsWith(input, "data:") ||
+                                  StartsWith(input, "https://")
+                              ? input
+                              : "data:image/png;base64," + input;
+  core::ImageReadBudget budget;
+  core::Image rgb;
+  try {
+    rgb = core::DecodeImage(core::ReadImageUrl(url, budget));
+  } catch (const std::exception& error) {
+    throw std::invalid_argument(what + ": " + error.what());
+  }
+  ccip::RgbImage image;
+  image.width = static_cast<int>(rgb.width);
+  image.height = static_cast<int>(rgb.height);
+  image.rgb = std::move(rgb.pixels);
+  return image;
+}
+
+RgbaImage ToRgba(const ccip::RgbImage& image) {
+  RgbaImage out;
+  out.width = image.width;
+  out.height = image.height;
+  const std::size_t pixels = static_cast<std::size_t>(image.width) * image.height;
+  out.rgba.resize(pixels * 4);
+  for (std::size_t i = 0; i < pixels; ++i) {
+    out.rgba[i * 4] = image.rgb[i * 3];
+    out.rgba[i * 4 + 1] = image.rgb[i * 3 + 1];
+    out.rgba[i * 4 + 2] = image.rgb[i * 3 + 2];
+    out.rgba[i * 4 + 3] = 255;
+  }
+  return out;
+}
+
+std::string HashText(std::string_view text) {
+  return crypto::Sha256Hex(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+}
+
+double Round(double value, double scale) {
+  return std::round(value * scale) / scale;
+}
+
+/// Head crop of a face box (ccip_ref.head_crop), at least one pixel.
+Box HeadBox(const ccip::Face& face, int width, int height) {
+  const auto b = ccip::HeadCropBox(face.box, width, height, kHeadGrow);
+  Box box{b[0], b[1], b[2], b[3]};
+  box[0] = std::clamp(box[0], 0, std::max(0, width - 1));
+  box[1] = std::clamp(box[1], 0, std::max(0, height - 1));
+  box[2] = std::clamp(box[2], box[0] + 1, width);
+  box[3] = std::clamp(box[3], box[1] + 1, height);
+  return box;
+}
+
+ccip::RgbImage CropRgb(const ccip::RgbImage& image, const Box& box) {
+  return ccip::Crop(image, box[0], box[1], box[2], box[3]);
+}
+
+/// Asks the 27B for the feature JSON; an answer without JSON reads as no
+/// features (nothing is dropped then).
+json::Value AskFeatures(const Session& session, json::Value content) {
+  const std::string answer =
+      session.Ask(std::move(content), false, kCcipFeatureTokens);
+  if (auto value = JsonFrom(answer, false))
+    return std::move(*value);
+  if (auto value = JsonFrom(RepairJson(answer), false))
+    return std::move(*value);
+  return json::Value::object();
+}
+
+HttpResponse RelayUpstream(const UpstreamError& error) {
+  HttpResponse response;
+  response.status = error.status;
+  response.reason = error.status == 404   ? "Not Found"
+                    : error.status == 503 ? "Service Unavailable"
+                                          : "Upstream Error";
+  response.body = error.body;
+  response.headers = {
+      {"Content-Type", error.content_type.empty() ? "application/json"
+                                                  : error.content_type}};
+  return response;
+}
+
 }  // namespace
+
+/// Models and caches of "verfahren": "ccip", shared by all requests.
+struct CcipState {
+  std::mutex load_mutex;
+  std::unique_ptr<ccip::CcipModel> model;
+  std::unique_ptr<ccip::FaceDetector> detector;
+  /// CPU work (detection, embeddings) and the embedding cache.
+  std::mutex compute_mutex;
+  std::map<std::string, std::vector<std::vector<float>>> embeddings;
+  std::mutex features_mutex;
+  std::map<std::string, json::Value> figure_features;  // by SHA-256 of text
+
+  bool Ensure(const Options& options, std::string* error) {
+    std::lock_guard<std::mutex> lock(load_mutex);
+    if (model != nullptr && detector != nullptr)
+      return true;
+    if (options.ccip_model_dir.empty() || options.ccip_face_dir.empty()) {
+      *error = "CCIP is not configured: start the router with "
+               "--ccip-model-dir and --ccip-face-dir";
+      return false;
+    }
+    const std::filesystem::path need[] = {
+        options.ccip_model_dir / "ccip_caformer.safetensors",
+        options.ccip_model_dir / "ccip_caformer.json",
+        options.ccip_face_dir / "face_yolov8n.safetensors",
+        options.ccip_face_dir / "face_yolov8n.json"};
+    for (const auto& path : need) {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) {
+        *error = "CCIP model file missing: " + path.string() +
+                 " (convert with src/models/ccip/reference/convert_weights.py)";
+        return false;
+      }
+    }
+    std::string load_error;
+    auto loaded_model = ccip::CcipModel::Load(options.ccip_model_dir, &load_error);
+    if (loaded_model == nullptr) {
+      *error = "CCIP model: " + load_error;
+      return false;
+    }
+    auto loaded_detector = ccip::FaceDetector::Load(options.ccip_face_dir, &load_error);
+    if (loaded_detector == nullptr) {
+      *error = "face detector: " + load_error;
+      return false;
+    }
+    model = std::move(loaded_model);
+    detector = std::move(loaded_detector);
+    return true;
+  }
+
+  /// Embeddings of one reference (whole image and centre-face head crop) or
+  /// gallery image (centre-face head crop, else whole), cached by SHA-256 of
+  /// the image string. compute_mutex held.
+  const std::vector<std::vector<float>>& ImageEmbeddings(const std::string& image,
+                                                         bool reference,
+                                                         const std::string& what) {
+    const std::string key = (reference ? "ref:" : "gal:") + HashText(image);
+    if (const auto it = embeddings.find(key); it != embeddings.end())
+      return it->second;
+    const ccip::RgbImage rgb = ReadRgb(image, what);
+    const std::vector<ccip::Face> faces = detector->Detect(rgb);
+    const int centre = ccip::CentreFace(faces, rgb.width, rgb.height);
+    std::vector<std::vector<float>> out;
+    if (reference || centre < 0)
+      out.push_back(model->Embed(rgb));
+    if (centre >= 0)
+      out.push_back(model->Embed(CropRgb(
+          rgb, HeadBox(faces[static_cast<std::size_t>(centre)], rgb.width,
+                       rgb.height))));
+    if (embeddings.size() >= kMaxCcipCacheEntries)
+      embeddings.clear();
+    return embeddings.emplace(key, std::move(out)).first->second;
+  }
+
+  /// Steckbrief features, read once per text.
+  json::Value FigureFeatures(const Session& session, const std::string& text) {
+    if (text.empty())
+      return json::Value::object();
+    const std::string key = HashText(text);
+    {
+      std::lock_guard<std::mutex> lock(features_mutex);
+      if (const auto it = figure_features.find(key); it != figure_features.end())
+        return it->second;
+    }
+    json::Value content = json::Value::array();
+    content.push_back(TextPart(CcipFigurePrompt(text)));
+    json::Value features = AskFeatures(session, std::move(content));
+    std::lock_guard<std::mutex> lock(features_mutex);
+    figure_features[key] = features;
+    return features;
+  }
+};
 
 std::string StripThinking(std::string_view text) {
   constexpr std::string_view kOpen = "<think>";
@@ -932,7 +1235,164 @@ std::vector<Assignment> Assign(const std::vector<Person>& people,
   return out;
 }
 
-FigurenService::FigurenService(Options options) : options_(std::move(options)) {}
+FigurenService::FigurenService(Options options)
+    : options_(std::move(options)), ccip_(std::make_shared<CcipState>()) {}
+
+FigurenService::~FigurenService() = default;
+
+std::optional<HttpResponse> FigurenService::HandleCcip(
+    const json::Value& body, std::chrono::steady_clock::time_point started) const {
+  CcipRequest parsed;
+  try {
+    parsed = ParseCcipRequest(body, options_.default_model);
+  } catch (const std::exception& error) {
+    return Error(400, "Bad Request", error.what(), "invalid_request");
+  }
+  std::string unavailable;
+  if (!ccip_->Ensure(options_, &unavailable))
+    return Error(503, "Service Unavailable", unavailable, "ccip_unavailable");
+  struct Head {
+    ccip::Face face;
+    Box kopf{};
+    ccip::RgbImage crop;
+    std::vector<CcipCandidate> diffs;  // reference order
+  };
+  std::vector<Head> heads;
+  try {
+    // CPU work: detection, head embeddings, reference/gallery embeddings.
+    std::lock_guard<std::mutex> lock(ccip_->compute_mutex);
+    ccip::SetCpuThreads(options_.ccip_threads);
+    const ccip::RgbImage frame = ReadRgb(parsed.frame, "bild");
+    std::vector<ccip::Face> faces = ccip_->detector->Detect(frame);
+    std::stable_sort(faces.begin(), faces.end(),
+                     [](const ccip::Face& a, const ccip::Face& b) {
+                       return a.box[0] < b.box[0];
+                     });
+    std::vector<std::vector<float>> vectors;
+    for (const ccip::Face& face : faces) {
+      Head head;
+      head.face = face;
+      head.kopf = HeadBox(face, frame.width, frame.height);
+      head.crop = CropRgb(frame, head.kopf);
+      vectors.push_back(ccip_->model->Embed(head.crop));
+      heads.push_back(std::move(head));
+    }
+    if (!heads.empty()) {
+      // Per figure: references (whole + head) and its gallery crops.
+      std::vector<std::vector<std::vector<float>>> owned(parsed.figures.size());
+      for (std::size_t f = 0; f < parsed.figures.size(); ++f) {
+        const CcipFigureInput& figure = parsed.figures[f];
+        for (std::size_t i = 0; i < figure.images.size(); ++i) {
+          for (const auto& v : ccip_->ImageEmbeddings(
+                   figure.images[i], true,
+                   "referenz " + figure.name + " bild " + std::to_string(i)))
+            owned[f].push_back(v);
+        }
+      }
+      for (std::size_t g = 0; g < parsed.gallery.size(); ++g) {
+        const auto& [f, image] = parsed.gallery[g];
+        for (const auto& v : ccip_->ImageEmbeddings(
+                 image, false, "galerie " + std::to_string(g)))
+          owned[f].push_back(v);
+      }
+      for (std::size_t h = 0; h < heads.size(); ++h) {
+        for (std::size_t f = 0; f < parsed.figures.size(); ++f) {
+          double best = -1.0;
+          for (const auto& r : owned[f]) {
+            double dot = 0;
+            for (std::size_t k = 0; k < r.size() && k < vectors[h].size(); ++k)
+              dot += static_cast<double>(r[k]) * vectors[h][k];
+            best = std::max(best, dot);
+          }
+          heads[h].diffs.push_back(
+              {parsed.figures[f].name, std::clamp((1.0 - best) / 2.0, 0.0, 1.0)});
+        }
+      }
+    }
+  } catch (const std::invalid_argument& error) {
+    return Error(400, "Bad Request", error.what(), "invalid_request");
+  } catch (const std::exception& error) {
+    return Error(500, "Internal Server Error", error.what(), "figuren_failed");
+  }
+  try {
+    const Session session(options_.fetch, parsed.model);
+    // Figures with a Steckbrief can be checked against read features.
+    std::map<std::string, json::Value> has_profile;
+    for (const CcipFigureInput& figure : parsed.figures) {
+      if (!figure.profile.empty()) {
+        json::Value marker = json::Value::object();
+        marker["steckbrief"] = true;
+        has_profile[figure.name] = std::move(marker);
+      }
+    }
+    std::map<std::string, json::Value> figure_features;
+    json::Value figures_out = json::Value::array();
+    for (Head& head : heads) {
+      const std::vector<CcipCandidate> sorted = SortCandidates(head.diffs);
+      std::optional<json::Value> seen;
+      if (CcipNeedsFeatures(sorted, has_profile, parsed.cap)) {
+        for (std::size_t i = 0; i < sorted.size() && i < kCcipTop; ++i) {
+          const std::string& name = sorted[i].name;
+          if (figure_features.count(name) != 0)
+            continue;
+          const auto it = std::find_if(
+              parsed.figures.begin(), parsed.figures.end(),
+              [&name](const CcipFigureInput& f) { return f.name == name; });
+          figure_features[name] = ccip_->FigureFeatures(session, it->profile);
+        }
+        json::Value content = json::Value::array();
+        content.push_back(
+            ImagePart(DataUrl(ToRgba(head.crop), kCcipFeatureSide)));
+        content.push_back(TextPart(CcipCropPrompt()));
+        seen = AskFeatures(session, std::move(content));
+      }
+      const CcipDecision decision =
+          DecideCcip(sorted, figure_features, seen ? &*seen : nullptr,
+                     parsed.cap, parsed.margin);
+      json::Value person = json::Value::object();
+      person["name"] = decision.name;
+      person["box"] = BoxJson({static_cast<int>(std::lround(head.face.box[0])),
+                               static_cast<int>(std::lround(head.face.box[1])),
+                               static_cast<int>(std::lround(head.face.box[2])),
+                               static_cast<int>(std::lround(head.face.box[3]))});
+      person["kopf_box"] = BoxJson(head.kopf);
+      person["gesicht"] = Round(head.face.score, 1000);
+      person["beste"] = decision.beste;
+      person["zweitbeste"] = decision.zweitbeste;
+      person["abstand"] = Round(decision.abstand, 10000);
+      json::Value diff = json::Value::object();
+      for (const CcipCandidate& c : head.diffs)
+        diff[c.name] = Round(c.diff, 10000);
+      person["diff"] = std::move(diff);
+      json::Value top = json::Value::array();
+      for (const CcipCandidate& c : decision.top)
+        top.push_back(c.name);
+      person["kandidaten"] = std::move(top);
+      json::Value kept = json::Value::array();
+      for (const CcipCandidate& c : decision.kept)
+        kept.push_back(c.name);
+      person["passend"] = std::move(kept);
+      person["merkmale"] = seen ? *seen : json::Value(nullptr);
+      person["llm_gefragt"] = seen.has_value();
+      person["begruendung"] = decision.begruendung;
+      figures_out.push_back(std::move(person));
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+            .count();
+    json::Value out = json::Value::object();
+    out["verfahren"] = "ccip";
+    out["figuren"] = std::move(figures_out);
+    out["sekunden"] = std::round(seconds * 10) / 10;
+    return JsonResponse(200, "OK", out.dump());
+  } catch (const UpstreamError& error) {
+    return RelayUpstream(error);
+  } catch (const AnswerError& error) {
+    return Error(502, "Bad Gateway", error.what(), "model_answer_invalid");
+  } catch (const std::exception& error) {
+    return Error(500, "Internal Server Error", error.what(), "figuren_failed");
+  }
+}
 
 std::optional<HttpResponse> FigurenService::Handle(
     const HttpRequest& request) const {
@@ -941,6 +1401,29 @@ std::optional<HttpResponse> FigurenService::Handle(
   if (request.method != "POST")
     return Error(405, "Method Not Allowed", "use POST", "method_not_allowed");
   const auto started = std::chrono::steady_clock::now();
+  // "verfahren": "ccip" is opt-in; without it (or with "llm") the request
+  // takes the unchanged path below.
+  {
+    json::Value peek;
+    bool is_object = false;
+    try {
+      peek = json::parse(request.body);
+      is_object = peek.is_object();
+    } catch (const std::exception&) {
+      // ParseRequest below reports the invalid body as before.
+    }
+    if (is_object) {
+      if (const json::Value* method = peek.find("verfahren");
+          method != nullptr && !method->is_null()) {
+        if (method->is_string() && method->str() == "ccip")
+          return HandleCcip(peek, started);
+        if (!method->is_string() || method->str() != "llm")
+          return Error(400, "Bad Request",
+                       "verfahren must be \"ccip\" or \"llm\"",
+                       "invalid_request");
+      }
+    }
+  }
   Request parsed;
   try {
     parsed = ParseRequest(request.body, options_.default_model);
@@ -1019,16 +1502,7 @@ std::optional<HttpResponse> FigurenService::Handle(
     body["sekunden"] = std::round(seconds * 10) / 10;
     return JsonResponse(200, "OK", body.dump());
   } catch (const UpstreamError& error) {
-    HttpResponse response;
-    response.status = error.status;
-    response.reason = error.status == 404   ? "Not Found"
-                      : error.status == 503 ? "Service Unavailable"
-                                            : "Upstream Error";
-    response.body = error.body;
-    response.headers = {
-        {"Content-Type", error.content_type.empty() ? "application/json"
-                                                    : error.content_type}};
-    return response;
+    return RelayUpstream(error);
   } catch (const AnswerError& error) {
     return Error(502, "Bad Gateway", error.what(), "model_answer_invalid");
   } catch (const std::exception& error) {
