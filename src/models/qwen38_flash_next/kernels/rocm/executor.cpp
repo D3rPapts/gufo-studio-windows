@@ -79,6 +79,10 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+/// Streamed experts: decode and verification batches up to this many rows
+/// map their experts per call; tiled batches (every prefill batch) run in
+/// expert waves, other wider batches in row slices of this width.
+constexpr std::uint32_t kStreamRows = 8;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -957,6 +961,17 @@ Executor::~Executor() {
   for (float* p : wide_allocations_)
     (void)hipFree(p);
   (void)hipFree(verification_penalties_);
+  (void)hipFree(predict_router_);
+  (void)hipFree(predict_ids_);
+  (void)hipFree(predict_weights_);
+  if (stream_ids_ready_ != nullptr) {
+    (void)hipEventSynchronize(stream_ids_ready_);
+    (void)hipEventDestroy(stream_ids_ready_);
+  }
+  if (stream_ids_host_ != nullptr) {
+    (void)hipStreamSynchronize(stream_);
+    (void)hipHostFree(stream_ids_host_);
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -2065,12 +2080,16 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
       static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
-  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+  // Expert waves (StreamedWaves) launch tiles only for ids below the slot
+  // limit; rows of later waves keep ids at or above it.
+  const std::uint32_t experts =
+      routed_expert_limit_ != 0 ? routed_expert_limit_ : c.num_experts;
+  for (std::uint32_t e = 0; e < experts; ++e) {
     max_rows = std::max(max_rows, counts_host_[e]);
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   const auto append = [&](std::uint32_t tile_rows) {
-    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+    for (std::uint32_t e = 0; e < experts; ++e) {
       for (std::uint32_t j = 0;
            j < (counts_host_[e] + tile_rows - 1) / tile_rows; ++j) {
         tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
@@ -2087,7 +2106,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
     routed_n_tiles_ = n_tiles;
   }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
-      counts_host_, static_cast<int>(c.num_experts));
+      counts_host_, static_cast<int>(experts));
   return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
                                               n_tiles * sizeof(std::int32_t),
                                               hipMemcpyHostToDevice, stream_),
@@ -3023,13 +3042,86 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  // Streamed experts (--expert-cache-bytes): a trunk layer keeps only some
+  // routed experts in device slots. Tiled batches, every prefill batch among
+  // them, run as expert waves (StreamedWaves) with the arithmetic of the
+  // resident model; decode and verification batches map their experts per
+  // call; any other batch wider than kStreamRows runs in row slices that
+  // fit the slots.
+  ExpertStream* const expert_stream = model_->expert_stream();
+  const bool streamed = StreamedLayer(l);
+  const bool waves = streamed && WmmaExperts(l, n_tokens);
+  if (streamed && !waves && n_tokens > kStreamRows) {
+    for (std::uint32_t start = 0; start < n_tokens; start += kStreamRows) {
+      const std::uint32_t rows = std::min(kStreamRows, n_tokens - start);
+      const std::size_t offset =
+          static_cast<std::size_t>(start) * c.hidden_size;
+      if ((!last_only || start + rows == n_tokens) &&
+          !Moe(l, x + offset, out + offset, rows, error_msg, false))
+        return false;
+    }
+    return true;
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
-  if (ExpertMatrixRows(n_tokens)) {
+  const auto& trunk = model_->layers();
+  const auto layer =
+      streamed ? static_cast<std::uint32_t>(&l - trunk.data()) : 0U;
+  const std::size_t count = static_cast<std::size_t>(n_tokens) * used;
+  // The residual stream changes little between layers, so the next trunk
+  // layer's router applied to this layer's input predicts most of its
+  // experts; their reads overlap this layer's expert GEMMs and the next
+  // layer's attention. Off by default: on a 64 GB Strix Halo the extra reads
+  // cost more SSD bandwidth than the overlap saves.
+  static const bool prefetch_on = [] {
+    const char* env = std::getenv("GUFO_FLASH_NEXT_PREFETCH");
+    return env != nullptr && env[0] == '1';
+  }();
+  const bool predict = streamed && !waves && prefetch_on &&
+                       layer + 1 < trunk.size() && n_tokens <= kStreamRows;
+  if (streamed) {
+    if (predict) {
+      if (predict_router_ == nullptr &&
+          (!Check(hipMalloc(reinterpret_cast<void**>(&predict_router_),
+                            sizeof(float) * kStreamRows * (c.num_experts + 1)),
+                  "prediction router allocation", error_msg) ||
+           !Check(hipMalloc(reinterpret_cast<void**>(&predict_ids_),
+                            sizeof(std::int32_t) * kStreamRows * used),
+                  "prediction ids allocation", error_msg) ||
+           !Check(hipMalloc(reinterpret_cast<void**>(&predict_weights_),
+                            sizeof(float) * kStreamRows * used),
+                  "prediction weights allocation", error_msg)))
+        return false;
+      if (!Dense(trunk[layer + 1].router, x, predict_router_, n_tokens,
+                 error_msg))
+        return false;
+      RouterTopK(predict_router_, c.num_experts + 1, predict_ids_,
+                 predict_weights_, n_tokens, c.num_experts, used, stream_);
+    }
+    // Pinned host ids: the download stays asynchronous, so the shared
+    // expert below is queued before the host waits for the routing.
+    if (!StreamIds(2 * count, error_msg))
+      return false;
+    if (!Check(hipMemcpyAsync(stream_ids_host_, s_.ids,
+                              count * sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "routed ids download", error_msg) ||
+        (predict && !Check(hipMemcpyAsync(stream_ids_host_ + count,
+                                          predict_ids_,
+                                          count * sizeof(std::int32_t),
+                                          hipMemcpyDeviceToHost, stream_),
+                           "predicted ids download", error_msg)) ||
+        !Check(hipEventRecord(stream_ids_ready_, stream_), "routed ids event",
+               error_msg))
+      return false;
+  }
+  // Streamed layers count their experts after the slot mapping (below, or
+  // per wave in StreamedWaves).
+  if (!streamed && ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
@@ -3103,6 +3195,54 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (!shared_ok) {
     return false;
   }
+  if (streamed) {
+    // The GPU runs the shared expert while the host waits for the routing
+    // and reads the missing experts.
+    if (!Check(hipEventSynchronize(stream_ids_ready_), "routed ids wait",
+               error_msg))
+      return false;
+    const std::span<std::int32_t> ids(stream_ids_host_, count);
+    if (waves)
+      return StreamedWaves(l, x, out, n_tokens, layer, ids, error_msg) &&
+             JoinSide(error_msg);
+    if (predict) {
+      // RouterTopK emits each row's experts by falling weight: prefetching
+      // only the first ranks skips the guesses that miss most often.
+      static const std::uint32_t top = [used] {
+        const char* env = std::getenv("GUFO_FLASH_NEXT_PREFETCH_TOP");
+        return env == nullptr
+                   ? used
+                   : static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+      }();
+      std::vector<std::int32_t> predicted;
+      predicted.reserve(count);
+      for (std::size_t k = 0; k < count; ++k)
+        if (k % used < top)
+          predicted.push_back(stream_ids_host_[count + k]);
+      (void)expert_stream->Prefetch(layer + 1, predicted);
+    }
+    // The expert kernels read slot ids from the routing buffer. The upload
+    // needs no wait: the next MoE step rewrites the pinned ids only after
+    // its own download, which the stream orders after this upload.
+    if (!expert_stream->Map(layer, ids, stream_, error_msg) ||
+        !Check(hipMemcpyAsync(s_.ids, stream_ids_host_,
+                              count * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "slot ids upload", error_msg))
+      return false;
+    if (ExpertMatrixRows(n_tokens)) {
+      ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
+                   stream_);
+      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                                c.num_experts * sizeof(std::uint32_t),
+                                hipMemcpyDeviceToHost, stream_),
+                 "expert counts download", error_msg) ||
+          !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
+                 error_msg)) {
+        return false;
+      }
+    }
+  }
   if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
       l.ffn_up_exps.type == GgmlType::kQ8_0 &&
       l.ffn_down_exps.type == GgmlType::kQ8_0) {
@@ -3146,8 +3286,8 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                          std::uint32_t n_tokens,
-                          std::string* error_msg) const {
+                          std::uint32_t n_tokens, std::string* error_msg,
+                          bool epilogue) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
@@ -3231,6 +3371,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
+  // Expert waves (StreamedWaves) leave the epilogue to their last wave.
+  if (!epilogue)
+    return true;
   // The epilogue reads the shared expert's output.
   if (!JoinSide(error_msg))
     return false;
@@ -3251,6 +3394,138 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   } else {
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
+  }
+  return true;
+}
+
+bool Executor::StreamedLayer(const DeviceLayer& l) const {
+  const auto& trunk = model_->layers();
+  return model_->expert_stream() != nullptr && !trunk.empty() &&
+         &l >= trunk.data() && &l < trunk.data() + trunk.size();
+}
+
+bool Executor::StreamIds(std::size_t count, std::string* error_msg) const {
+  if (stream_ids_ready_ == nullptr &&
+      !Check(hipEventCreateWithFlags(&stream_ids_ready_, hipEventDisableTiming),
+             "routed ids event", error_msg))
+    return false;
+  if (count <= stream_ids_capacity_)
+    return true;
+  // An earlier slot-id upload may still read the old buffer.
+  if (stream_ids_host_ != nullptr) {
+    if (!Check(hipStreamSynchronize(stream_), "routed ids drain", error_msg))
+      return false;
+    (void)hipHostFree(stream_ids_host_);
+    stream_ids_host_ = nullptr;
+    stream_ids_capacity_ = 0;
+  }
+  const std::size_t capacity = std::max<std::size_t>(
+      count, std::size_t{2} * kStreamRows * config().num_experts_used);
+  if (!Check(hipHostMalloc(reinterpret_cast<void**>(&stream_ids_host_),
+                           capacity * sizeof(std::int32_t),
+                           hipHostMallocDefault),
+             "routed ids staging", error_msg))
+    return false;
+  stream_ids_capacity_ = capacity;
+  return true;
+}
+
+bool Executor::StreamedWaves(const DeviceLayer& l, const float* x, float* out,
+                             std::uint32_t n_tokens, std::uint32_t layer,
+                             std::span<const std::int32_t> routed,
+                             std::string* error_msg) const {
+  // Tiled batches over streamed experts: the router ran once for every row;
+  // the routed expert GEMMs now run in waves of experts that fit the layer's
+  // slots. Each wave loads its missing experts once and computes all of
+  // their rows; rows of other experts keep ids at or above the slot count,
+  // which RouteHints leaves without tiles, so every (token, expert) row is
+  // written by exactly one wave. Gate/up and down outputs are addressed by
+  // (token, expert) slot, so earlier waves' rows survive later waves, and
+  // the epilogue (or the combine that absorbs it) runs after the last wave.
+  const Config& c = config();
+  const std::uint32_t used = c.num_experts_used;
+  ExpertStream* const stream = model_->expert_stream();
+  const std::size_t count = routed.size();
+  std::vector<std::uint32_t> rows(c.num_experts, 0);
+  for (const std::int32_t expert : routed) {
+    if (expert < 0 || static_cast<std::uint32_t>(expert) >= c.num_experts) {
+      AssignError(error_msg, "routed expert id out of range");
+      return false;
+    }
+    ++rows[expert];
+  }
+  stream->AddUses(layer, rows);
+  // Resident experts first (no reads), then the most routed ones.
+  std::vector<std::int32_t> order;
+  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+    if (rows[e] != 0) {
+      order.push_back(static_cast<std::int32_t>(e));
+    }
+  }
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::int32_t a, std::int32_t b) {
+                     const bool ra = stream->Resident(layer, a);
+                     const bool rb = stream->Resident(layer, b);
+                     return ra != rb ? ra : rows[a] > rows[b];
+                   });
+  const std::uint32_t limit = stream->slots();
+  const std::uint32_t spare = c.num_experts - limit;
+  std::vector<std::int32_t> slot_for(c.num_experts);
+  std::vector<std::int32_t> wave_ids(count);
+  struct LimitGuard {
+    std::uint32_t& limit;
+    ~LimitGuard() { limit = 0; }
+  } limit_guard{routed_expert_limit_};
+  for (std::size_t next = 0; next < order.size();) {
+    std::vector<std::int32_t> wave;
+    std::uint32_t missing = 0;
+    while (next < order.size() && wave.size() < limit) {
+      const bool resident = stream->Resident(layer, order[next]);
+      if (!resident && missing >= stream->max_misses()) {
+        break;
+      }
+      missing += resident ? 0 : 1;
+      wave.push_back(order[next++]);
+    }
+    std::vector<std::int32_t> slots = wave;
+    if (!stream->Map(layer, slots, stream_, error_msg)) {
+      return false;
+    }
+    std::fill(slot_for.begin(), slot_for.end(), -1);
+    for (std::size_t i = 0; i < wave.size(); ++i) {
+      slot_for[wave[i]] = slots[i];
+    }
+    for (std::size_t k = 0; k < count; ++k) {
+      const std::int32_t slot = slot_for[routed[k]];
+      wave_ids[k] =
+          slot >= 0
+              ? slot
+              : static_cast<std::int32_t>(
+                    limit + static_cast<std::uint32_t>(routed[k]) % spare);
+    }
+    // The host rewrites wave_ids for the next wave: wait for this upload.
+    if (!Check(hipMemcpyAsync(s_.ids, wave_ids.data(),
+                              count * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "wave ids upload", error_msg) ||
+        !Check(hipStreamSynchronize(stream_), "wave ids wait", error_msg)) {
+      return false;
+    }
+    ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
+                 stream_);
+    if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                              c.num_experts * sizeof(std::uint32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "expert counts download", error_msg) ||
+        !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
+               error_msg)) {
+      return false;
+    }
+    routed_expert_limit_ = limit;
+    if (!MoeExperts(l, x, out, n_tokens, error_msg,
+                    /*epilogue=*/next >= order.size())) {
+      return false;
+    }
   }
   return true;
 }
@@ -3341,6 +3616,10 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Streamed experts wait on the host inside every MoE layer; that cannot
+  // be captured.
+  if (model_->expert_stream() != nullptr)
+    graph = false;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {

@@ -768,6 +768,19 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                         std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Moe(l, x, out, rows, error);
+  if (model_->expert_stream() != nullptr) {
+    // Streamed experts load per decode-width row slice inside Moe(), which
+    // keeps every row's vector arithmetic and bounds the experts one slice
+    // can miss.
+    const auto& c = config();
+    for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+      const std::size_t offset = std::size_t{r} * c.hidden_size;
+      if (!Moe(l, x + offset, out + offset, std::min(kDecodeRows, rows - r),
+               error))
+        return false;
+    }
+    return true;
+  }
   const auto& c = config();
   const Scratch base = s_;
   if (!DenseBatch(l.router, x, base.router, rows, error))

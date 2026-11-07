@@ -4,9 +4,12 @@
 //
 //   reference_probe --model FIRST_SHARD.gguf [--prompt TEXT | --tokens 1,2,3]
 //                   [--generate N] [--dump logits.bin] [--top 5]
+//                   [--expert-trace experts.bin]
 //
 // --dump writes float32 logits for every prompt position (and generated
 // position) back to back; the row width is the vocabulary size.
+// --expert-trace writes the routed expert ids of every position as uint16,
+// layer-major then selection order (num_layers * num_experts_used per row).
 
 #include <algorithm>
 #include <chrono>
@@ -77,6 +80,7 @@ int main(int argc, char** argv) {
   std::string prompt;
   std::string tokens_arg;
   std::string dump_path;
+  std::string trace_path;
   int generate = 0;
   std::uint32_t top = 5;
   bool tokenize_only = false;
@@ -93,6 +97,8 @@ int main(int argc, char** argv) {
       tokens_arg = next();
     } else if (arg == "--dump") {
       dump_path = next();
+    } else if (arg == "--expert-trace") {
+      trace_path = next();
     } else if (arg == "--generate") {
       generate = std::atoi(next().c_str());
     } else if (arg == "--top") {
@@ -167,6 +173,12 @@ int main(int argc, char** argv) {
 
   q::ReferenceModel model(*weights, ngram.get(),
                           static_cast<std::uint32_t>(tokens.size()) + generate);
+  std::ofstream trace_file;
+  std::vector<std::uint32_t> trace;
+  if (!trace_path.empty()) {
+    trace_file.open(trace_path, std::ios::binary);
+    model.SetExpertTrace(&trace);
+  }
   std::vector<float> logits(c.vocab_size);
   const std::size_t total = tokens.size() + static_cast<std::size_t>(generate);
   for (std::size_t i = 0; i < total; ++i) {
@@ -190,6 +202,14 @@ int main(int argc, char** argv) {
     std::printf("pos %zu token %d '%s' (%.0f ms)%s\n", i, token, text.c_str(),
                 ms, i >= tokens.size() - (generate > 0 ? 0 : 1) ? "" : "");
     PrintTop(logits, *tokenizer, top);
+    if (trace_file.is_open()) {
+      for (std::uint32_t e : trace) {
+        const auto id = static_cast<std::uint16_t>(e);
+        trace_file.write(reinterpret_cast<const char*>(&id), sizeof(id));
+      }
+      trace_file.flush();
+      trace.clear();
+    }
     if (dump.is_open()) {
       dump.write(reinterpret_cast<const char*>(logits.data()),
                  static_cast<std::streamsize>(logits.size() * sizeof(float)));

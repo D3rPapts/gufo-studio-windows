@@ -624,8 +624,20 @@ private:
   /// following combine absorbs (see Moe).
   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
+  /// `epilogue` false leaves the epilogue to a later expert wave.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                  std::uint32_t n_tokens, std::string* error_msg) const;
+                  std::uint32_t n_tokens, std::string* error_msg,
+                  bool epilogue = true) const;
+  /// Trunk layer whose routed experts are streamed from disk.
+  bool StreamedLayer(const DeviceLayer& l) const;
+  /// Grows the pinned routed-ids staging to `count` ids.
+  bool StreamIds(std::size_t count, std::string* error_msg) const;
+  /// Routed experts of a tiled batch over streamed experts, in waves that
+  /// fit the layer's slots; `routed` holds the batch's expert ids.
+  bool StreamedWaves(const DeviceLayer& l, const float* x, float* out,
+                     std::uint32_t n_tokens, std::uint32_t layer,
+                     std::span<const std::int32_t> routed,
+                     std::string* error_msg) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Whether a draft of `session` requesting the small head gets it.
@@ -887,6 +899,17 @@ private:
   mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
   mutable std::uint32_t routed_n_tiles_{0};     ///< routed_tile_rows_ tiles
   mutable std::uint32_t routed_wide_tiles_{0};  ///< prefill 128-row tiles
+  /// Expert waves: RouteHints tiles only ids below this (0 = all).
+  mutable std::uint32_t routed_expert_limit_{0};
+  /// Streamed experts: pinned routed ids (then predicted ids) of a MoE step.
+  mutable std::int32_t* stream_ids_host_{nullptr};
+  mutable std::size_t stream_ids_capacity_{0};
+  mutable hipEvent_t stream_ids_ready_{nullptr};
+  /// Streamed experts: the next layer's router on this layer's input
+  /// (GUFO_FLASH_NEXT_PREFETCH=1).
+  mutable float* predict_router_{nullptr};
+  mutable std::int32_t* predict_ids_{nullptr};
+  mutable float* predict_weights_{nullptr};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};

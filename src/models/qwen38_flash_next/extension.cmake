@@ -75,6 +75,7 @@ gufo_extension_target(
     kernels/rocm/device_model.cpp
     kernels/rocm/executor.cpp
     kernels/rocm/batch.cpp
+    kernels/rocm/expert_stream.cpp
     engine.cpp
     runner.cpp
     drivers.cpp
