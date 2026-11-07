@@ -275,7 +275,8 @@ struct ConvHistory {
 struct AttentionHistory {
   DeviceBuffer<float> key;
   DeviceBuffer<float> value;
-  std::size_t frames{0};
+  std::size_t frames{0};    // KV rows currently buffered (<= window)
+  std::size_t position{0};  // cumulative RoPE position of the stream
 };
 
 struct StreamingState {
@@ -288,6 +289,7 @@ struct StreamingState {
     }
     for (auto& attn : post_module_attention) {
       attn.frames = 0;
+      attn.position = 0;
     }
   }
 };
@@ -300,16 +302,25 @@ struct Workspace {
   DeviceBuffer<float> history_input;
   DeviceBuffer<float> history_output;
 
-  void EnsureForSamples(std::size_t samples) {
-    if (samples <= max_samples) {
-      return;
-    }
-    // At 1/2 downsample (samples/2), channels can be 768 (decoder block 1
-    // output) or at samples/1, channels = 96. Max intermediate elements is
-    // max(samples * 96, (samples / 2) * 768) = samples * 384.
+  void AllocateExact(std::size_t samples) {
+    // Peak intermediate activation across all Encoder/Decoder stages is
+    // max(samples * 96, (samples / 2) * 192, (samples / 8) * 384, ...)
+    // = samples * 96 floats (plus causal conv history padding). The largest
+    // im2col is a kernel-7 conv over 96 channels at full rate, i.e.
+    // 7 * samples * 96 floats, which `columns` covers.
     const std::size_t scratch_elements =
-        std::max<std::size_t>(samples * 384U, 65536U * 1024U);
+        std::max<std::size_t>((samples + 64U) * 96U, 16384U * 1024U);
     const std::size_t col_elements = scratch_elements * 7U;
+    // Release existing buffers first so peak usage during a resize never
+    // doubles and a failed allocation never leaves oversized buffers behind.
+    max_samples = 0;
+    for (auto& buf : scratch) {
+      buf.Reset(0);
+    }
+    columns.Reset(0);
+    history_input.Reset(0);
+    history_output.Reset(0);
+
     codes.Reset(4096U * 10U);
     for (auto& buf : scratch) {
       buf.Reset(scratch_elements);
@@ -318,6 +329,19 @@ struct Workspace {
     history_input.Reset(scratch_elements);
     history_output.Reset(scratch_elements);
     max_samples = samples;
+  }
+
+  void EnsureForSamples(std::size_t samples) {
+    if (samples <= max_samples) {
+      return;
+    }
+    AllocateExact(samples);
+  }
+
+  void ShrinkToSteadyState(std::size_t steady_samples) {
+    if (max_samples > steady_samples) {
+      AllocateExact(steady_samples);
+    }
   }
 };
 
@@ -846,7 +870,7 @@ struct FishDacCodecHipRuntime::Impl {
 
       if (use_stream_cache && active_stream != nullptr) {
         auto& cache = active_stream->post_module_attention[l];
-        start_pos = cache.frames;
+        start_pos = cache.position;
         LaunchCodecInterleavedRope(q, k, frames, kCodecHeads, kCodecHeadDim,
                                    kCodecRopeTheta, stream, start_pos);
         const std::size_t keep_prev =
@@ -900,7 +924,8 @@ struct FishDacCodecHipRuntime::Impl {
                                   frames * kCodecDim * sizeof(float),
                                   hipMemcpyDeviceToDevice, stream),
                    "append codec V");
-        cache.frames += frames;
+        cache.frames = key_frames;
+        cache.position += frames;
         k_ctx = cache.key.get();
         v_ctx = cache.value.get();
       } else {
@@ -1092,6 +1117,10 @@ struct FishDacCodecHipRuntime::Impl {
                               hipMemcpyDeviceToHost, stream),
                "download Fish DAC encoded codes");
     RequireHip(hipStreamSynchronize(stream), "synchronize Fish DAC encode");
+    // A long reference clip grows the workspace far beyond what decoding
+    // needs; drop back to the steady decode size (128 + 16 frames).
+    workspace.ShrinkToSteadyState(
+        144U * static_cast<std::size_t>(config.frame_length));
     return result;
   }
 };
@@ -1141,8 +1170,46 @@ bool FishDacCodecHipRuntime::Decode(const FishDacCodes& codes,
     return false;
   }
   try {
-    impl_->active_stream = nullptr;
-    *output_samples = impl_->RunDecodePass(codes);
+    constexpr std::int64_t kMaxBatchFrames = 64;
+    if (codes.frames <= kMaxBatchFrames) {
+      impl_->active_stream = nullptr;
+      *output_samples = impl_->RunDecodePass(codes);
+      return true;
+    }
+    // Decode long sequences in causal chunks of at most 64 frames through
+    // the streaming state (conv histories + windowed KV cache), so the
+    // workspace stays at its steady size regardless of utterance length.
+    impl_->stream_state.Reset();
+    impl_->active_stream = &impl_->stream_state;
+    struct Guard {
+      Impl* impl;
+      ~Guard() {
+        impl->active_stream = nullptr;
+        impl->stream_state.Reset();
+      }
+    } guard{impl_.get()};
+
+    output_samples->clear();
+    output_samples->reserve(static_cast<std::size_t>(codes.frames) *
+                            impl_->config.frame_length);
+    const std::size_t total_frames = static_cast<std::size_t>(codes.frames);
+    const std::size_t total_cb = static_cast<std::size_t>(codes.codebooks);
+    for (std::size_t start = 0; start < total_frames;
+         start += static_cast<std::size_t>(kMaxBatchFrames)) {
+      const std::size_t len = std::min<std::size_t>(
+          static_cast<std::size_t>(kMaxBatchFrames), total_frames - start);
+      FishDacCodes chunk;
+      chunk.codebooks = codes.codebooks;
+      chunk.frames = static_cast<std::int64_t>(len);
+      chunk.codes.resize(total_cb * len);
+      for (std::size_t cb = 0; cb < total_cb; ++cb) {
+        std::copy_n(codes.codes.data() + cb * total_frames + start, len,
+                    chunk.codes.data() + cb * len);
+      }
+      auto chunk_pcm = impl_->RunDecodePass(chunk);
+      output_samples->insert(output_samples->end(), chunk_pcm.begin(),
+                             chunk_pcm.end());
+    }
     return true;
   } catch (const std::exception& ex) {
     SetError(error, ex.what());

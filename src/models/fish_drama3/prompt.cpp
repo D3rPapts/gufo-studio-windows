@@ -158,4 +158,22 @@ std::vector<Drama3Frame> BuildDrama3Prompt(
   return frames;
 }
 
+std::vector<Drama3Frame> BuildDrama3PromptSuffix(
+    const Drama3Tokenizer& tokenizer, const std::string& text) {
+  ValidateDrama3Text(text, "input");
+  std::vector<Drama3Frame> frames;
+  const auto append_text = [&](const std::string& segment) {
+    for (const auto token : tokenizer.Encode(segment)) {
+      Drama3Frame row{};
+      row[0] = token;
+      frames.push_back(row);
+    }
+  };
+  append_text("<|im_start|>user\n");
+  append_text(TaggedText(text, false));
+  append_text("<|im_end|>\n");
+  append_text("<|im_start|>assistant\n<|voice|>");
+  return frames;
+}
+
 }  // namespace gufo::models::fish_drama3
