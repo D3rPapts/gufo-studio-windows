@@ -62,6 +62,15 @@ public:
                                          float iou = 0.7f) const;
 };
 
+// OpenMP threads for CCIP work started from the calling thread (no-op
+// without OpenMP). The setting is per calling thread.
+void SetCpuThreads(int threads);
+
+// The face nearest to the horizontal centre (and the upper half) of the
+// image, as ccip_eval.head picks it: |cx - W/2| / W + 0.3 * max(0, cy/H - 0.5).
+// Index into `faces`, -1 when empty.
+[[nodiscard]] int CentreFace(const std::vector<Face>& faces, int width, int height);
+
 // ccip_ref.faces post-processing of a raw output (exposed for tests).
 [[nodiscard]] std::vector<Face> DecodeFaces(const std::vector<float>& raw, int anchors,
                                             const LetterboxInput& lb, int width, int height,

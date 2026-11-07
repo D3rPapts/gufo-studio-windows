@@ -3072,6 +3072,17 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path comfy_ffmpeg;
   std::filesystem::path jobs_dir;
   std::filesystem::path names_file;
+  // POST /v1/figuren "verfahren": "ccip" (converted deepghs models, see
+  // src/models/ccip). Defaults: the .198 install paths on Windows.
+#ifdef _WIN32
+  std::filesystem::path ccip_model_dir = "D:\\llm-modelle\\deepghs\\ccip_onnx\\gufo";
+  std::filesystem::path ccip_face_dir =
+      "D:\\llm-modelle\\deepghs\\anime_face_detection\\gufo";
+#else
+  std::filesystem::path ccip_model_dir;
+  std::filesystem::path ccip_face_dir;
+#endif
+  std::size_t ccip_threads = 8;
   std::size_t jobs_parallel = 1;
   std::string jobs_webhook_allow;
   std::string remote_allow;
@@ -3132,6 +3143,18 @@ int RunRouter(std::span<const char* const> args) {
                    "gender) and /v1/names/origins from FILE: UTF-8 lines "
                    "kind<TAB>name<TAB>origin<TAB>gender (kind nach|vor)",
                    "Router", &names_file);
+  parser.AddOption("", "--ccip-model-dir", "DIR",
+                   "CCIP character fingerprints for POST /v1/figuren with "
+                   "\"verfahren\": \"ccip\" (ccip_caformer.safetensors + "
+                   ".json; loaded on first use)",
+                   "Router", &ccip_model_dir);
+  parser.AddOption("", "--ccip-face-dir", "DIR",
+                   "Anime face detector for \"verfahren\": \"ccip\" "
+                   "(face_yolov8n.safetensors + .json)",
+                   "Router", &ccip_face_dir);
+  parser.AddOption("", "--ccip-threads", "N",
+                   "CPU threads for \"verfahren\": \"ccip\" (default: 8)",
+                   "Router", &ccip_threads);
   parser.AddOption("", "--jobs-parallel", "N",
                    "Jobs running at the same time (default: 1)", "Jobs",
                    &jobs_parallel);
@@ -3395,6 +3418,9 @@ int RunRouter(std::span<const char* const> args) {
   {
     router::figuren::Options figuren_options;
     figuren_options.fetch = self_fetch;
+    figuren_options.ccip_model_dir = ccip_model_dir;
+    figuren_options.ccip_face_dir = ccip_face_dir;
+    figuren_options.ccip_threads = static_cast<int>(ccip_threads);
     state->figuren = std::make_unique<router::figuren::FigurenService>(
         std::move(figuren_options));
   }

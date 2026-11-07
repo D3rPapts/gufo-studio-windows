@@ -16,6 +16,10 @@
 
 #include <gufo/ext/json.hpp>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "ccip/ccip.hpp"
 #include "ccip/cpu/kernels.hpp"
 #include "ccip/tensors.hpp"
@@ -341,6 +345,32 @@ std::vector<Face> DecodeFaces(const std::vector<float>& raw, int anchors,
     order = std::move(rest);
   }
   return faces;
+}
+
+void SetCpuThreads(int threads) {
+#ifdef _OPENMP
+  if (threads > 0) omp_set_num_threads(threads);
+#else
+  (void)threads;
+#endif
+}
+
+int CentreFace(const std::vector<Face>& faces, int width, int height) {
+  int best = -1;
+  double best_d = 0;
+  const double w = width;
+  const double h = height;
+  for (std::size_t i = 0; i < faces.size(); ++i) {
+    const auto& b = faces[i].box;
+    const double cx = (static_cast<double>(b[0]) + b[2]) / 2;
+    const double cy = (static_cast<double>(b[1]) + b[3]) / 2;
+    const double d = std::fabs(cx - w / 2) / w + 0.3 * std::max(0.0, cy / h - 0.5);
+    if (best < 0 || d < best_d) {
+      best = static_cast<int>(i);
+      best_d = d;
+    }
+  }
+  return best;
 }
 
 std::vector<Face> FaceDetector::Detect(const RgbImage& image, float conf, float iou) const {

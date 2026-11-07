@@ -14,6 +14,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
   src/cli/serve/router/figuren.cpp
+  src/cli/serve/router/figuren_ccip.cpp
   src/cli/serve/router/jobs.cpp
   src/cli/serve/router/names.cpp
   src/cli/serve/router/preset.cpp
@@ -60,7 +61,7 @@ if (BUILD_TESTING)
   foreach (router_test IN ITEMS
       router_preset_test router_registry_test router_memory_test
       router_names_test router_figuren_test router_proxy_remote_test
-      router_jobs_test router_pool_test)
+      router_jobs_test router_pool_test router_figuren_ccip_endpoint_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
@@ -94,4 +95,21 @@ if (BUILD_TESTING)
         TIMEOUT 30)
     endforeach()
   endif()
+endif()
+
+# CCIP figure check ("verfahren": "ccip" in POST /v1/figuren), CPU only; the
+# library is the extensions-ours/ccip extension (gufo_ccip).
+if (TARGET gufo_ccip)
+  target_link_libraries(gufo_router PUBLIC gufo_ccip)
+else()
+  message(FATAL_ERROR "gufo router needs the ccip extension (GUFO_EXTENSION_DIRS with extensions-ours)")
+endif()
+if (BUILD_TESTING)
+  add_executable(router_figuren_ccip_test tests/cli/router_figuren_ccip_test.cpp
+    src/cli/serve/router/figuren_ccip.cpp)
+  target_include_directories(router_figuren_ccip_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_figuren_ccip_test PRIVATE cxx_std_20)
+  add_test(NAME router_figuren_ccip_test COMMAND router_figuren_ccip_test)
+  set_tests_properties(router_figuren_ccip_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
 endif()
