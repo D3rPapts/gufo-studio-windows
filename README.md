@@ -4,13 +4,13 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1)**
-> (`gufo-studio-windows-1.4.1-windows-x64-gfx1151.zip`, branch `release/1.4`): text,
+> **Download [1.4.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.2)**
+> (`gufo-studio-windows-1.4.2-windows-x64-gfx1151.zip`, branch `release/1.4`): text,
 > images, speech, music and video from one OpenAI-compatible port on Windows 11, plus a
 > ComfyUI-compatible API. Unpack it, edit `examples\router.ini`, run `start-router.cmd`;
 > models load on the first request. The ROCm runtime is included; FFmpeg is not
 > (`winget install Gyan.FFmpeg`). The release notes list what was tested.
-> Previous: [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> Previous: [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1), [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
 > This repository was called `gufo_windows` until 31 October 2026; old links still work.
 
 ### Focus
@@ -28,7 +28,7 @@ setup is tested here.
 
 _(AI-assisted text, written with Claude Code.)_
 
-### New in 1.4 and 1.4.1
+### New in 1.4 to 1.4.2
 
 - **Switch a model between local and remote at runtime:** a local section and a
   `[remote/<id>]` section with the same id make a model switchable;
@@ -42,7 +42,8 @@ _(AI-assisted text, written with Claude Code.)_
   `tempo`, `pitch`, `volume` and `dialect` controls for Ming-3.0-tts.
 - **InfiniteTalk (Wan 2.1, one or two speakers)** runs through the ComfyUI adapter and
   is GPU-checked; 1.4.1 raises InfiniteTalk and Uni3C to 896x512 pixels and removes the
-  colour jump at the first frame.
+  colour jump at the first frame. 1.4.2 adds video to video (lip-sync on an existing clip,
+  the clip's motion stays) and a start image taken from a video frame.
 - **Figure check for film keyframes** (`POST /v1/figuren`), MOSS-Image now applies
   `gufo.negative_prompt`, memory guard fixes, and no more "bad allocation" when a text
   model loads with little free RAM (also fixed upstream, see below).
@@ -135,7 +136,7 @@ The port, the fixes and the measurements were done by Claude (Anthropic,
 Claude Opus 5.5) in Claude Code, at the request of the repository owner. MIT
 licensed, like upstream.
 
-## What runs here now (1.4.1, November 2026)
+## What runs here now (1.4.2, November 2026)
 
 All of this runs on the two EVO-X2 below (64 GB, and 128 GB where noted), under Windows 11, behind one
 OpenAI-compatible router on one port. Models load on the first request;
@@ -439,7 +440,7 @@ for the numbers.
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
-  [What runs here now](#what-runs-here-now-141-november-2026) were tested on their
+  [What runs here now](#what-runs-here-now-142-november-2026) were tested on their
   branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
