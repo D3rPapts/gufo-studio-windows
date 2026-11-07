@@ -235,6 +235,32 @@ std::vector<float> S2Mel::TimeEmbed(const std::string& prefix, float time) const
   return out;
 }
 
+S2Mel::TimeConditioning S2Mel::TimeCondition(float time) const {
+  TimeConditioning out;
+  const std::vector<float> t1 = TimeEmbed("t_embedder", time);
+  out.ada.resize(static_cast<std::size_t>((2 * kDepth + 1) * 2 * kD));
+  auto proj = [&](const std::string& p, float* dst) {
+    cpu::Linear(t1.data(), 1, kD, W(p + ".project_layer.weight", 2 * kD * kD), 2 * kD,
+                W(p + ".project_layer.bias"), dst);
+  };
+  for (int l = 0; l < kDepth; ++l) {
+    const std::string p = "transformer.layers." + std::to_string(l);
+    proj(p + ".attention_norm", out.ada.data() + (2 * l) * 2 * kD);
+    proj(p + ".ffn_norm", out.ada.data() + (2 * l + 1) * 2 * kD);
+  }
+  proj("transformer.norm", out.ada.data() + (2 * kDepth) * 2 * kD);
+  const std::vector<float> t2 = TimeEmbed("t_embedder2", time);
+  out.wavenet.resize(static_cast<std::size_t>(2 * kWn * kWnLayers));
+  cpu::Linear(t2.data(), 1, kWn, wn_cond_.data(), 2 * kWn * kWnLayers,
+              W("wavenet.cond_layer.conv.conv.bias", 2 * kWn * kWnLayers), out.wavenet.data());
+  std::vector<float> st1(t1);
+  cpu::SiluInPlace(st1.data(), st1.size());
+  out.final_mod.resize(2 * kWn);
+  cpu::Linear(st1.data(), 1, kWn, W("final_layer.adaLN_modulation.1.weight", 2 * kWn * kWn), 2 * kWn,
+              W("final_layer.adaLN_modulation.1.bias"), out.final_mod.data());
+  return out;
+}
+
 std::vector<float> S2Mel::Velocity(const float* x, const float* prompt, float time, const float* style,
                                    const float* cond, std::int64_t t) const {
   const std::vector<float> t1 = TimeEmbed("t_embedder", time);

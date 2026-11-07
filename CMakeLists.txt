@@ -208,13 +208,13 @@ if (ENGINE_ENABLE_HIP)
   add_subdirectory(src/models/deepseek_v4_flash)
 endif()
 
-# Qwen3.8-Flash-Next â€” model-private CPU reference plus ROCm runtime.
+# Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
-# Qwen3-TTS â€” CPU reference + HIP kernels (CustomVoice 12Hz).
+# Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
-# Qwen3-ASR â€” model-private 1.7B speech recognition runtime.
+# Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
 
 # EmbeddingGemma 2 is a model-private BF16 text/image embedding runtime.
@@ -1507,6 +1507,14 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(indextts_hip_test
+      tests/models/indextts/hip_test.cpp)
+    target_link_libraries(indextts_hip_test PRIVATE gufo_indextts)
+    add_test(NAME indextts_hip_test COMMAND indextts_hip_test)
+    set_tests_properties(indextts_hip_test PROPERTIES
+      LABELS "gpu;models;indextts;quality;external-model"
+      SKIP_RETURN_CODE 77
+      RUN_SERIAL TRUE)
     add_executable(voxcpm2_hip_test
       tests/models/voxcpm2/hip_test.cpp)
     target_link_libraries(voxcpm2_hip_test PRIVATE gufo_voxcpm2)

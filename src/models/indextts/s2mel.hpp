@@ -62,8 +62,25 @@ public:
                                           const CfmOptions& options,
                                           const StepTap& velocity_tap = {}) const;
 
-private:
+  // Everything of one estimator call that depends only on the time step:
+  // adaptive-norm weight/bias pairs ([13 * 2 + 1][1024]: attention_norm,
+  // ffn_norm per layer, then transformer.norm), the WaveNet condition
+  // cond_layer(t_embedder2(t)) [8192] and the FinalLayer modulation [1024].
+  struct TimeConditioning {
+    std::vector<float> ada;
+    std::vector<float> wavenet;
+    std::vector<float> final_mod;
+  };
+  [[nodiscard]] TimeConditioning TimeCondition(float time) const;
+
+  // Weight access for the GPU runtime.
   [[nodiscard]] const float* W(const std::string& name, std::int64_t numel = -1) const;
+  [[nodiscard]] const PthArchive& archive() const noexcept { return *sd_; }
+  [[nodiscard]] const cpu::Conv1dTM& wavenet_in(int i) const { return wn_in_[i]; }
+  [[nodiscard]] const std::vector<float>& wavenet_res(int i) const { return wn_res_[i]; }
+  [[nodiscard]] const std::vector<float>& final_linear() const { return final_linear_; }
+
+private:
   [[nodiscard]] std::vector<float> TimeEmbed(const std::string& prefix, float time) const;
 
   std::unique_ptr<PthArchive> sd_;

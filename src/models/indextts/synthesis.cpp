@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include "src/models/indextts/audio.hpp"
 #include "src/models/indextts/bigvgan.hpp"
 #include "src/models/indextts/campplus.hpp"
+#include "src/models/indextts/hip/runtime.hpp"
 #include "src/models/indextts/s2mel.hpp"
 #include "src/models/indextts/text.hpp"
 #include "src/models/indextts/w2vbert.hpp"
@@ -41,7 +43,7 @@ std::string Lower(std::string s) {
     const auto c = static_cast<unsigned char>(s[i]);
     if (c == 0xC3 && i + 1 < s.size()) {
       unsigned char d = static_cast<unsigned char>(s[i + 1]);
-      if (d == 0x84 || d == 0x96 || d == 0x9C) {  // Ã„ Ã– Ãœ -> Ã¤ Ã¶ Ã¼
+      if (d == 0x84 || d == 0x96 || d == 0x9C) {  // Ä Ö Ü -> ä ö ü
         d = static_cast<unsigned char>(d + 0x20);
       }
       out.push_back(static_cast<char>(c));
@@ -103,16 +105,16 @@ bool LooksLikeIndexTts25(const std::filesystem::path& dir) {
 int EmotionIndex(const std::string& raw) {
   static const std::vector<std::pair<std::string, int>> names = {
       {"happy", 0},        {"happiness", 0},     {"joy", 0},           {"freude", 0},
-      {"frÃ¶hlich", 0},     {"froehlich", 0},     {"glÃ¼cklich", 0},     {"gluecklich", 0},
-      {"angry", 1},        {"anger", 1},         {"wut", 1},           {"wÃ¼tend", 1},
-      {"wuetend", 1},      {"zorn", 1},          {"Ã¤rger", 1},         {"aerger", 1},
+      {"fröhlich", 0},     {"froehlich", 0},     {"glücklich", 0},     {"gluecklich", 0},
+      {"angry", 1},        {"anger", 1},         {"wut", 1},           {"wütend", 1},
+      {"wuetend", 1},      {"zorn", 1},          {"ärger", 1},         {"aerger", 1},
       {"sad", 2},          {"sadness", 2},       {"trauer", 2},        {"traurig", 2},
-      {"afraid", 3},       {"fear", 3},          {"angst", 3},         {"Ã¤ngstlich", 3},
+      {"afraid", 3},       {"fear", 3},          {"angst", 3},         {"ängstlich", 3},
       {"aengstlich", 3},   {"furcht", 3},        {"disgusted", 4},     {"disgust", 4},
       {"ekel", 4},         {"angeekelt", 4},     {"abscheu", 4},       {"melancholic", 5},
       {"melancholy", 5},   {"melancholie", 5},   {"melancholisch", 5}, {"niedergeschlagen", 5},
-      {"surprised", 6},    {"surprise", 6},      {"Ã¼berraschung", 6},  {"ueberraschung", 6},
-      {"Ã¼berrascht", 6},   {"ueberrascht", 6},   {"calm", 7},          {"neutral", 7},
+      {"surprised", 6},    {"surprise", 6},      {"überraschung", 6},  {"ueberraschung", 6},
+      {"überrascht", 6},   {"ueberrascht", 6},   {"calm", 7},          {"neutral", 7},
       {"ruhe", 7},         {"ruhig", 7},         {"gelassen", 7}};
   const std::string n = Lower(raw);
   for (const auto& [k, v] : names) {
@@ -203,6 +205,7 @@ struct Engine::Impl {
   std::unique_ptr<SemanticCodec> codec;
   std::unique_ptr<S2Mel> s2mel;
   std::unique_ptr<BigVgan> vocoder;
+  std::unique_ptr<hip::Runtime> gpu;  // GPT, CFM and vocoder on the GPU when available
   std::mutex mutex;
   std::uint64_t cached_key{0};
   bool has_cache{false};
@@ -278,10 +281,23 @@ std::unique_ptr<Engine> Engine::Create(const std::filesystem::path& dir, std::st
   if (m.s2mel == nullptr) return nullptr;
   m.vocoder = BigVgan::Load(dir / "bigvgan_v2_22khz_80band_256x", error);
   if (m.vocoder == nullptr) return nullptr;
+  // GUFO_INDEXTTS_BACKEND=cpu forces the CPU path, =hip makes a missing GPU an error.
+  const char* backend = std::getenv("GUFO_INDEXTTS_BACKEND");
+  const std::string want = backend != nullptr ? backend : "";
+  if (want != "cpu") {
+    std::string gpu_error;
+    m.gpu = hip::Runtime::Create(*m.gpt, *m.s2mel, *m.vocoder, &gpu_error);
+    if (m.gpu == nullptr && want == "hip") {
+      if (error != nullptr) {
+        *error = "IndexTTS-2.5 HIP runtime unavailable: " + gpu_error;
+      }
+      return nullptr;
+    }
+  }
   return e;
 }
 
-const char* Engine::backend_name() const noexcept { return "cpu"; }
+const char* Engine::backend_name() const noexcept { return impl_ != nullptr && impl_->gpu != nullptr ? "hip" : "cpu"; }
 
 bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
                       const ChunkFn& on_chunk, SynthesisResult* result, std::string* error) {
@@ -355,7 +371,11 @@ bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
           m.gpt->BuildPrefix(spk_latent, emovec, text.ids[seg], lang_token, &rows);
       UnifiedVoice::State st;
       std::vector<float> logits;
-      m.gpt->Prefill(prefix, rows, &st, &logits, req.sampling.max_tokens);
+      if (m.gpu != nullptr) {
+        m.gpu->GptPrefill(prefix, rows, req.sampling.max_tokens, &logits);
+      } else {
+        m.gpt->Prefill(prefix, rows, &st, &logits, req.sampling.max_tokens);
+      }
       std::vector<std::int32_t> history = {1, m.gpt->config().start_mel};
       std::vector<std::int32_t> codes;
       for (std::int32_t step = 0; step < req.sampling.max_tokens; ++step) {
@@ -377,7 +397,11 @@ bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
         }
         codes.push_back(tok);
         if (step + 1 < req.sampling.max_tokens) {
-          m.gpt->Step(tok, &st, &logits);
+          if (m.gpu != nullptr) {
+            m.gpu->GptStep(tok, &logits);
+          } else {
+            m.gpt->Step(tok, &st, &logits);
+          }
         }
       }
       result->gpt_seconds += Seconds(t0);
@@ -408,12 +432,17 @@ bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
           v = normal(rng);
         }
       }
-      const std::vector<float> mel = m.s2mel->Sample(std::move(noise), mu.data(), total, ref.ref_mel.data(),
-                                                     ref.ref_frames, ref.style.data(), CfmOptions{});
+      const std::vector<float> mel =
+          m.gpu != nullptr
+              ? m.gpu->CfmSample(noise, mu.data(), total, ref.ref_mel.data(), ref.ref_frames, ref.style.data(),
+                                 CfmOptions{})
+              : m.s2mel->Sample(std::move(noise), mu.data(), total, ref.ref_mel.data(), ref.ref_frames,
+                                ref.style.data(), CfmOptions{});
       result->s2mel_seconds += Seconds(t0);
       t0 = Clock::now();
-      const std::vector<float> wav =
-          m.vocoder->Synthesize(mel.data() + ref.ref_frames * 80, target);
+      const std::vector<float> wav = m.gpu != nullptr
+                                         ? m.gpu->Vocode(mel.data() + ref.ref_frames * 80, target)
+                                         : m.vocoder->Synthesize(mel.data() + ref.ref_frames * 80, target);
       result->vocoder_seconds += Seconds(t0);
       std::vector<std::int16_t> pcm(wav.size());
       for (std::size_t i = 0; i < wav.size(); ++i) {

@@ -14,7 +14,7 @@ BigVGAN, Wav2Vec2BertModel layers). Only two things differ, both for reproducibi
   * memory (<= ~2 GB working set): checkpoints are mmap-loaded, the GPT is built on the meta device and assigned the
     mapped tensors, the 17 needed w2v-BERT layers are built and run one at a time.
 
-Run: venv-indextts python -I indextts_oracle.py <bundle_dir> <out_dir> <ref_code_dir (â€¦/engines/index_tts)>
+Run: venv-indextts python -I indextts_oracle.py <bundle_dir> <out_dir> <ref_code_dir (…/engines/index_tts)>
 Env: INDEXTTS_ORACLE_TEXT, INDEXTTS_ORACLE_VOICE, INDEXTTS_ORACLE_EMO (8 comma separated floats), INDEXTTS_ORACLE_SEED,
      INDEXTTS_ORACLE_THREADS, INDEXTTS_ORACLE_MAXTOK
 CPU only; no CUDA/ROCm device is touched. Written with AI assistance (Claude Code)."""
@@ -118,10 +118,10 @@ spec.loader.exec_module(german_text)
 from indextts.utils.tokenizer import get_encoding, lang_to_token, LANGUAGE_DICT
 
 enc = get_encoding(name="multilingual_zh_ja_yue_char_del", num_languages=99, model_dir=BUNDLE)
-CHAR_REP = {"ï¼š": ",", "ï¼›": ",", ";": ",", "ï¼Œ": ",", "ã€‚": ".", "ï¼": "!", "ï¼Ÿ": "?", "\n": " ", "Â·": "-", "ã€": ",",
-            "...": "â€¦", ",,,": "â€¦", "ï¼Œï¼Œï¼Œ": "â€¦", "â€¦â€¦": "â€¦", "â€œ": "'", "â€": "'", '"': "'", "â€˜": "'", "â€™": "'",
-            "ï¼ˆ": "'", "ï¼‰": "'", "(": "'", ")": "'", "ã€Š": "'", "ã€‹": "'", "ã€": "'", "ã€‘": "'", "[": "'", "]": "'",
-            "â€”": "-", "ï½ž": "-", "~": "-", "ã€Œ": "'", "ã€": "'", ":": ","}  # TextNormalizer.char_rep_map (front.py)
+CHAR_REP = {"：": ",", "；": ",", ";": ",", "，": ",", "。": ".", "！": "!", "？": "?", "\n": " ", "·": "-", "、": ",",
+            "...": "…", ",,,": "…", "，，，": "…", "……": "…", "“": "'", "”": "'", '"': "'", "‘": "'", "’": "'",
+            "（": "'", "）": "'", "(": "'", ")": "'", "《": "'", "》": "'", "【": "'", "】": "'", "[": "'", "]": "'",
+            "—": "-", "～": "-", "~": "-", "「": "'", "」": "'", ":": ","}  # TextNormalizer.char_rep_map (front.py)
 CLEAN = re.compile("|".join(re.escape(p) for p in CHAR_REP))
 PRON = re.compile(r'<([^|>\n]+)\|([^>\n]+)>')
 PROTECT = re.compile(r'<\|SPECIAL_TOKEN_\d+\|>.*?<\|SPECIAL_TOKEN_\d+\|>')
@@ -163,7 +163,7 @@ def split_text_by_tokens(text, max_tokens, lang_prefix):  # IndexTTS2.split_text
         if atomic:
             chunks.append(piece)
             continue
-        for part in re.split(r'(?<=[ï¼Œã€‚ï¼ï¼Ÿã€ï¼›ï¼š,\.!\?;:\n])', piece):
+        for part in re.split(r'(?<=[，。！？、；：,\.!\?;:\n])', piece):
             if not part:
                 continue
             if tok_len(part) <= budget:
@@ -202,12 +202,12 @@ def frontend(raw, lang="de", max_tokens=120):
 
 
 CASES = [TEXT,
-         "Am 3.10.2026 um 14:30 Uhr kostet das 12,50 â‚¬ â€“ ca. 15 % mehr als 1999.",
-         "GrÃ¶ÃŸe: 1.234 km, z. B. StraÃŸe; â€žAnfÃ¼hrungâ€œ (Klammer) [eckig] â€¦ ja?! Nr. 7 und Dr. MÃ¼ller.",
-         "Ã„Ã–Ãœ Ã¤Ã¶Ã¼ ÃŸ â€” Gedankenstrich ~ Tilde; Zahlen 0 1 21 101 1000000 3,1415.",
+         "Am 3.10.2026 um 14:30 Uhr kostet das 12,50 € – ca. 15 % mehr als 1999.",
+         "Größe: 1.234 km, z. B. Straße; „Anführung“ (Klammer) [eckig] … ja?! Nr. 7 und Dr. Müller.",
+         "ÄÖÜ äöü ß — Gedankenstrich ~ Tilde; Zahlen 0 1 21 101 1000000 3,1415.",
          "Ein <Wort|W ER T> mit Aussprache und <|special_token_3|> Token.",
-         "  Doppelte  Leerzeichen\tund Tabs\nund Zeilen... Ende,,, wirklichã€‚",
-         "Er rief: \"Halt!\" Dann - Stille. 8:05 Uhr, 23.59 Uhr, 5 kg, 3 mÂ², 100 km/h, $5, 7 GB."]
+         "  Doppelte  Leerzeichen\tund Tabs\nund Zeilen... Ende,,, wirklich。",
+         "Er rief: \"Halt!\" Dann - Stille. 8:05 Uhr, 23.59 Uhr, 5 kg, 3 m², 100 km/h, $5, 7 GB."]
 META["text_cases"] = [frontend(c) for c in CASES]
 META["lang_token"] = lang_to_token("de")
 META["n_vocab_ranks"] = enc.n_vocab
@@ -247,6 +247,17 @@ style = campplus(feat.unsqueeze(0))
 put("style", style[0])
 del campplus; gc.collect()
 log("CAM++ done")
+if os.environ.get("INDEXTTS_ORACLE_LIGHT") == "1":  # text + audio front end + CAM++ only (no large weights)
+    from transformers import SeamlessM4TFeatureExtractor
+    _ex = SeamlessM4TFeatureExtractor.from_pretrained(os.path.join(BUNDLE, "w2v-bert-2.0"), local_files_only=True)
+    for _tag, _wave in (("spk", audio_16k), ("emo", emo_16k)):
+        _inp = _ex(_wave, sampling_rate=16000, return_tensors="pt")
+        put(f"{_tag}_w2v_input", _inp["input_features"][0]); put(f"{_tag}_w2v_mask", _inp["attention_mask"][0])
+    save_file(T, os.path.join(OUT, "oracle.safetensors"))
+    with open(os.path.join(OUT, "oracle.json"), "w", encoding="utf-8") as f:
+        json.dump(META, f, ensure_ascii=False, indent=1)
+    log("light oracle written")
+    sys.exit(0)
 
 # --------------------------------------------------------------------------------------------------- w2v-BERT --
 from transformers import SeamlessM4TFeatureExtractor, Wav2Vec2BertConfig

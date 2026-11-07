@@ -248,6 +248,11 @@ int main() {
     std::printf("     campplus %.2f s\n", Seconds(t0));
   }
 
+  if (oracle->Find("spk_cond_emb") == nullptr) {  // light oracle (text, audio, CAM++ only)
+    std::printf("light oracle: later stages skipped\ntotal %.1f s, %d failure(s)\n", Seconds(t_all), g_failures);
+    return g_failures == 0 ? 0 : 1;
+  }
+
   // ------------------------------------------------------ w2v-BERT ------
   std::vector<float> spk_cond = O("spk_cond_emb");
   std::vector<float> emo_cond = O("emo_cond_emb");

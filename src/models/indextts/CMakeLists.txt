@@ -20,6 +20,7 @@ add_library(gufo_indextts STATIC
   w2vbert.cpp
   cpu/conv.cpp
   cpu/ops.cpp
+  hip/runtime.cpp
 )
 
 target_include_directories(gufo_indextts PUBLIC ${PROJECT_SOURCE_DIR})
@@ -44,4 +45,13 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endif()
 elseif (MSVC)
   set_source_files_properties(cpu/ops.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+endif()
+
+if (ENGINE_ENABLE_HIP)
+  target_sources(gufo_indextts PRIVATE hip/ops.hip)
+  target_compile_definitions(gufo_indextts PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(gufo_indextts PUBLIC
+    gufo_voxcpm2
+    gufo_fish_drama3
+    hip::host)
 endif()

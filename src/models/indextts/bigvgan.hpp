@@ -31,12 +31,19 @@ public:
     float down[12]{};
   };
 
-private:
   struct ResBlock {
     std::vector<cpu::Conv1dTM> c1;
     std::vector<cpu::Conv1dTM> c2;
     std::vector<Act> acts;  // 2 per (c1, c2) pair
   };
+  // Layer access for the GPU runtime.
+  [[nodiscard]] const cpu::Conv1dTM& pre() const noexcept { return pre_; }
+  [[nodiscard]] const std::vector<cpu::ConvTranspose1dTM>& ups() const noexcept { return ups_; }
+  [[nodiscard]] const std::vector<ResBlock>& blocks() const noexcept { return blocks_; }
+  [[nodiscard]] const Act& post_act() const noexcept { return post_act_; }
+  [[nodiscard]] const cpu::Conv1dTM& post() const noexcept { return post_; }
+
+private:
   cpu::Conv1dTM pre_;
   std::vector<cpu::ConvTranspose1dTM> ups_;
   std::vector<ResBlock> blocks_;  // 6 stages x 3 kernels
