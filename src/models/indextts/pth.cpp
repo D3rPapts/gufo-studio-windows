@@ -194,7 +194,17 @@ NodePtr ParsePickle(const std::uint8_t* pkl, std::size_t len) {
     v->i = value;
     stack.push_back(std::move(v));
   };
-  auto reduce = [&](const NodePtr& fn, const NodePtr& args) -> NodePtr {
+  auto reduce = [&](NodePtr fn, NodePtr args) -> NodePtr {
+    // torch._tensor._rebuild_from_type_v2(func, new_type, args, state): tensors saved as a subclass
+    // (e.g. nn.Parameter in s2mel.pth) -> apply the inner rebuild function to its args, drop the type/state.
+    if (fn->kind == Kind::kGlobal && fn->s == "torch._tensor _rebuild_from_type_v2" &&
+        args->kind == Kind::kTuple && args->items.size() >= 3 && args->items[0]->kind == Kind::kGlobal &&
+        args->items[2]->kind == Kind::kTuple) {
+      NodePtr inner_fn = args->items[0];
+      NodePtr inner_args = args->items[2];
+      fn = std::move(inner_fn);
+      args = std::move(inner_args);
+    }
     if (fn->kind == Kind::kGlobal) {
       if (fn->s == "collections OrderedDict" || fn->s == "builtins dict") {
         return Make(Kind::kDict);
