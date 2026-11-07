@@ -44,6 +44,9 @@ struct VideoJobRequest {
   std::string output_format{"mp4"};
   ext::VideoParameters parameters;
   std::uint64_t seed{42};
+  /// Provider-owned options and inputs (`VideoProvider::prepare_request`).
+  std::string options_json;
+  std::vector<ext::VideoAttachment> attachments;
 };
 
 struct VideoJobSnapshot {
@@ -68,6 +71,9 @@ struct VideoJobContent {
 };
 
 struct VideoJobServiceOptions {
+  /// Video provider id; empty: the provider whose probe accepts
+  /// `model_root` (highest `probe_priority`), else `minimax-h3`.
+  std::string provider_id;
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
   std::filesystem::path storage_root;
@@ -115,6 +121,11 @@ public:
 
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] std::string initialization_error() const;
+  /// The provider this service runs (nullptr when initialization failed).
+  [[nodiscard]] const ext::VideoProvider* provider() const noexcept;
+  /// Canonical model name: the provider id of a provider with
+  /// `prepare_request`, else `minimax-h3`.
+  [[nodiscard]] std::string model_id() const;
   /// True for a canonical `minimax-h3` name or a configured alias (#957).
   [[nodiscard]] bool serves_model(std::string_view name) const;
   /// The request name as a canonical model: aliases map to the root

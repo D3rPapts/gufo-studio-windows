@@ -253,12 +253,14 @@ const VideoProvider* FindVideoProvider(std::string_view id) {
 }
 
 const VideoProvider* ProbeVideoProvider(std::string_view model_root) {
+  const VideoProvider* best = nullptr;
   for (const auto& provider : g_video_providers) {
-    if (provider.probe && provider.probe(model_root)) {
-      return &provider;
+    if ((best == nullptr || provider.probe_priority > best->probe_priority) &&
+        provider.probe && provider.probe(model_root)) {
+      best = &provider;
     }
   }
-  return nullptr;
+  return best;
 }
 
 void Registry::AddVideoProvider(VideoProvider provider) {

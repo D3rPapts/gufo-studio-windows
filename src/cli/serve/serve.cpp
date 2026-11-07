@@ -1218,12 +1218,14 @@ int RunServe(std::span<const char* const> args) {
             .runner = {},
         });
     if (!video_jobs->ready()) {
-      std::cerr << "Error enabling MiniMax H3 video service: "
+      std::cerr << "Error enabling video service: "
                 << video_jobs->initialization_error() << '\n';
       return 1;
     }
     load_log.Complete(
-        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
+        "model=" + video_jobs->model_id() +
+            " sessions=1 queue_capacity=1 weights=lazy",
+        false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
     SpeechOptions options{.context = is_tts ? 4096U : 1024U};

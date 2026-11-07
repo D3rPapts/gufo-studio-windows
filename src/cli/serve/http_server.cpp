@@ -760,22 +760,30 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
+    // The provider's canonical name; MiniMax H3 adds its preset variants.
+    const std::string root_id = video_jobs->model_id();
+    const bool h3 = root_id == "minimax-h3";
+    const std::string owner =
+        h3 ? "operator-supplied-minimax" : "operator-supplied";
     json::Value root_model = json::Value::object();
-    root_model["id"] = "minimax-h3";
+    root_model["id"] = root_id;
     root_model["object"] = "model";
     root_model["created"] = Now();
-    root_model["owned_by"] = "operator-supplied-minimax";
+    root_model["owned_by"] = owner;
     root_model["capability"] = "video";
     data.push_back(std::move(root_model));
     for (const std::string_view preset :
          {"minimax-h3-exact", "minimax-h3-fast", "minimax-h3-aggressive",
           "minimax-h3-dev", "minimax-h3-fullres"}) {
+      if (!h3) {
+        break;
+      }
       json::Value model = json::Value::object();
       model["id"] = std::string(preset);
       model["object"] = "model";
       model["created"] = Now();
-      model["owned_by"] = "operator-supplied-minimax";
-      model["root"] = "minimax-h3";
+      model["owned_by"] = owner;
+      model["root"] = root_id;
       model["capability"] = "video";
       data.push_back(std::move(model));
     }
@@ -785,8 +793,8 @@ HttpResponse ListModels(TextGenerationBackend* backend,
       model["id"] = alias;
       model["object"] = "model";
       model["created"] = Now();
-      model["owned_by"] = "operator-supplied-minimax";
-      model["root"] = "minimax-h3";
+      model["owned_by"] = owner;
+      model["root"] = root_id;
       model["capability"] = "video";
       data.push_back(std::move(model));
     }
@@ -2241,6 +2249,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = decisions_->model_id;
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
+    } else if (video_jobs_ != nullptr && video_jobs_->ready()) {
+      body["model"] = video_jobs_->model_id();
     } else {
       body["model"] = "minimax-h3";
     }

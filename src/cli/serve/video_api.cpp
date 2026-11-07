@@ -21,36 +21,36 @@
 namespace gufo::server {
 namespace {
 
-std::optional<int> ResolveDurationFrames(std::string_view seconds,
+std::optional<int> ResolveDurationFrames(const ext::VideoProvider* provider,
+                                         std::string_view seconds,
                                          std::string* error = nullptr) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
   if (provider && provider->resolve_duration_frames) {
     return provider->resolve_duration_frames(seconds, error);
   }
   if (error)
-    *error = "video provider 'minimax-h3' not available";
+    *error = "video provider not available";
   return std::nullopt;
 }
 
 std::optional<ext::VideoParameters> ResolveGenerationPreset(
-    std::string_view preset, std::string* error = nullptr) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
+    const ext::VideoProvider* provider, std::string_view preset,
+    std::string* error = nullptr) {
   if (provider && provider->resolve_preset) {
     return provider->resolve_preset(preset, error);
   }
   if (error)
-    *error = "video provider 'minimax-h3' not available";
+    *error = "video provider not available";
   return std::nullopt;
 }
 
-bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
+bool ValidateGenerationParameters(const ext::VideoProvider* provider,
+                                  const ext::VideoParameters& parameters,
                                   std::string* error = nullptr) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
   if (provider && provider->validate_parameters) {
     return provider->validate_parameters(parameters, error);
   }
   if (error)
-    *error = "video provider 'minimax-h3' not available";
+    *error = "video provider not available";
   return false;
 }
 
@@ -264,8 +264,11 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
   return boundary;
 }
 
-std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
-                                              std::string* error) {
+// File parts are returned in `files` (bytes kept for providers that parse
+// their own inputs) and also appear as empty string members of the result.
+std::optional<json::Value> ParseMultipartBody(
+    const HttpRequest& request, std::vector<ext::VideoAttachment>* files,
+    std::string* error) {
   const auto boundary = MultipartBoundary(request.header("content-type"));
   if (!boundary.has_value()) {
     *error = "multipart video request has an invalid boundary";
@@ -378,6 +381,11 @@ std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
     } else {
       result[field_name] =
           filename_present ? std::string() : std::string(content);
+      if (filename_present) {
+        files->push_back({.name = field_name,
+                          .bytes = std::vector<std::uint8_t>(content.begin(),
+                                                             content.end())});
+      }
     }
     cursor = content_end + next_boundary.size();
   }
@@ -412,12 +420,99 @@ bool IsUnsupportedConditioning(const json::Value& body) {
   });
 }
 
+HttpResponse CreatedResponse(const VideoJobCreateResult& created) {
+  if (created.result == VideoJobResult::kQueueFull) {
+    HttpResponse response =
+        Error(429, "Too Many Requests", created.error, "video_queue_full");
+    response.headers.emplace_back("Retry-After", "1");
+    return response;
+  }
+  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
+    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
+    return Error(
+        status, status == 503 ? "Service Unavailable" : "Bad Request",
+        created.error,
+        status == 503 ? "video_service_unavailable" : "invalid_video_request");
+  }
+  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
+  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
+  return response;
+}
+
+std::string StatusReason(int status) {
+  switch (status) {
+    case 400:
+      return "Bad Request";
+    case 413:
+      return "Payload Too Large";
+    case 415:
+      return "Unsupported Media Type";
+    case 422:
+      return "Unprocessable Entity";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return "Error";
+  }
+}
+
+// Providers with `prepare_request` parse the whole request themselves
+// (conditioning images, audio, video, provider options); the core only maps
+// the model name and queues the result.
+HttpResponse CreatePreparedVideo(const json::Value& body,
+                                 const std::vector<ext::VideoAttachment>& files,
+                                 VideoJobService& service) {
+  const ext::VideoProvider* provider = service.provider();
+  const json::Value* model_value = body.find("model");
+  if (model_value == nullptr || !model_value->is_string()) {
+    return Error(400, "Bad Request", "'model' must be a string",
+                 "invalid_parameter_type");
+  }
+  const std::string model = service.normalize_model(model_value->str());
+  if (model != service.model_id()) {
+    return Error(400, "Bad Request", "unsupported video model",
+                 "invalid_model");
+  }
+  const std::string body_json = body.dump();
+  ext::VideoPreparedRequest prepared;
+  ext::VideoRequestError failure;
+  bool accepted = false;
+  try {
+    accepted = provider->prepare_request(
+        {.model = model, .body_json = body_json, .files = files}, &prepared,
+        &failure);
+  } catch (const std::exception& exception) {
+    failure = {.status = 400,
+               .code = "invalid_video_request",
+               .message = exception.what()};
+  }
+  if (!accepted) {
+    const int status =
+        failure.status >= 400 && failure.status < 600 ? failure.status : 400;
+    return Error(status, StatusReason(status), std::move(failure.message),
+                 std::move(failure.code));
+  }
+  return CreatedResponse(service.Create({
+      .model = model,
+      .prompt = std::move(prepared.prompt),
+      .size = std::move(prepared.size),
+      .seconds = std::move(prepared.seconds),
+      .output_format = std::move(prepared.output_format),
+      .parameters = std::move(prepared.parameters),
+      .seed = prepared.seed,
+      .options_json = std::move(prepared.options_json),
+      .attachments = std::move(prepared.attachments),
+  }));
+}
+
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
+  std::vector<ext::VideoAttachment> files;
+  const ext::VideoProvider* provider = service.provider();
   const std::string content_type = request.header("content-type");
   if (IsMultipartFormData(content_type)) {
     std::string multipart_error;
-    auto parsed = ParseMultipartBody(request, &multipart_error);
+    auto parsed = ParseMultipartBody(request, &files, &multipart_error);
     if (!parsed.has_value()) {
       return Error(400, "Bad Request", std::move(multipart_error),
                    "invalid_multipart_form");
@@ -443,6 +538,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (!body.is_object()) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
+  }
+  if (provider != nullptr && provider->prepare_request != nullptr) {
+    return CreatePreparedVideo(body, files, service);
   }
   // Unknown members are ignored, as in the other OpenAI-compatible servers;
   // known conditioning fields are refused rather than silently dropped.
@@ -480,7 +578,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "missing_required_parameter");
   }
   std::string duration_error;
-  const auto duration_frames = ResolveDurationFrames(seconds, &duration_error);
+  const auto duration_frames =
+      ResolveDurationFrames(provider, seconds, &duration_error);
   if (!duration_frames) {
     return Error(400, "Bad Request", duration_error, "invalid_seconds");
   }
@@ -563,7 +662,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   }
 
   std::string preset_error;
-  auto parameters = ResolveGenerationPreset(preset, &preset_error);
+  auto parameters = ResolveGenerationPreset(provider, preset, &preset_error);
   if (!parameters.has_value()) {
     return Error(400, "Bad Request", preset_error, "invalid_preset");
   }
@@ -589,7 +688,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "invalid_output_format");
   }
   std::string parameter_error;
-  if (!ValidateGenerationParameters(*parameters, &parameter_error)) {
+  if (!ValidateGenerationParameters(provider, *parameters,
+                                    &parameter_error)) {
     return Error(400, "Bad Request", parameter_error, "invalid_frames");
   }
   if (parameters->frames != *duration_frames) {
@@ -606,23 +706,10 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .output_format = output_format,
       .parameters = std::move(*parameters),
       .seed = seed,
+      .options_json = {},
+      .attachments = {},
   });
-  if (created.result == VideoJobResult::kQueueFull) {
-    HttpResponse response =
-        Error(429, "Too Many Requests", created.error, "video_queue_full");
-    response.headers.emplace_back("Retry-After", "1");
-    return response;
-  }
-  if (created.result != VideoJobResult::kOk || !created.job.has_value()) {
-    const int status = created.result == VideoJobResult::kIoError ? 503 : 400;
-    return Error(
-        status, status == 503 ? "Service Unavailable" : "Bad Request",
-        created.error,
-        status == 503 ? "video_service_unavailable" : "invalid_video_request");
-  }
-  HttpResponse response = SnapshotResponse(202, "Accepted", *created.job);
-  response.headers.emplace_back("Location", "/v1/videos/" + created.job->id);
-  return response;
+  return CreatedResponse(created);
 }
 
 HttpResponse LookupVideo(std::string_view id, VideoJobService& service) {

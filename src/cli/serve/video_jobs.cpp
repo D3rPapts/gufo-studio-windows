@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -32,36 +33,36 @@
 namespace gufo::server {
 namespace {
 
-std::optional<int> ResolveDurationFrames(std::string_view seconds,
+std::optional<int> ResolveDurationFrames(const ext::VideoProvider* provider,
+                                         std::string_view seconds,
                                          std::string* error = nullptr) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
   if (provider && provider->resolve_duration_frames) {
     return provider->resolve_duration_frames(seconds, error);
   }
   return std::nullopt;
 }
 
-bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
+bool ValidateGenerationParameters(const ext::VideoProvider* provider,
+                                  const ext::VideoParameters& parameters,
                                   std::string* error = nullptr) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
   if (provider && provider->validate_parameters) {
     return provider->validate_parameters(parameters, error);
   }
   return false;
 }
 
-std::string GenerationParametersJson(const ext::VideoParameters& parameters,
+std::string GenerationParametersJson(const ext::VideoProvider* provider,
+                                     const ext::VideoParameters& parameters,
                                      std::uint64_t seed,
                                      std::string_view prompt_sha256) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
   if (provider && provider->parameters_json) {
     return provider->parameters_json(parameters, seed, prompt_sha256);
   }
   return "{}";
 }
 
-std::string GenerationTelemetryJson(const ext::VideoTelemetry& telemetry) {
-  const auto* provider = ext::FindVideoProvider("minimax-h3");
+std::string GenerationTelemetryJson(const ext::VideoProvider* provider,
+                                    const ext::VideoTelemetry& telemetry) {
   if (provider && provider->telemetry_json) {
     return provider->telemetry_json(telemetry);
   }
@@ -85,9 +86,41 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
          (model == "minimax-h3-fullres" && preset == "exact-1344x768");
 }
 
-bool MatchesOutputContract(const VideoJobRequest& request) {
+// Providers that parse their own requests: the provider id is the model,
+// output is always MP4 and the provider checks everything else.
+bool IsPreparedProvider(const ext::VideoProvider* provider) {
+  return provider != nullptr && provider->prepare_request != nullptr;
+}
+
+bool IsServedModel(const ext::VideoProvider* provider, std::string_view model) {
+  return IsPreparedProvider(provider) ? model == provider->id
+                                      : IsH3Model(model);
+}
+
+bool ParseSize(std::string_view size, int* width, int* height) {
+  const auto x = size.find('x');
+  if (x == std::string_view::npos || x == 0 || x + 1 >= size.size()) {
+    return false;
+  }
+  const auto first = std::from_chars(size.data(), size.data() + x, *width);
+  const auto second =
+      std::from_chars(size.data() + x + 1, size.data() + size.size(), *height);
+  return first.ec == std::errc() && first.ptr == size.data() + x &&
+         second.ec == std::errc() && second.ptr == size.data() + size.size() &&
+         *width > 0 && *height > 0;
+}
+
+bool MatchesOutputContract(const ext::VideoProvider* provider,
+                           const VideoJobRequest& request) {
   const auto& parameters = request.parameters;
-  const auto frames = ResolveDurationFrames(request.seconds);
+  if (IsPreparedProvider(provider)) {
+    int width = 0;
+    int height = 0;
+    return request.output_format == "mp4" &&
+           ParseSize(request.size, &width, &height) &&
+           ResolveDurationFrames(provider, request.seconds).has_value();
+  }
+  const auto frames = ResolveDurationFrames(provider, request.seconds);
   if (!frames || parameters.frames != *frames ||
       !ModelMatchesPreset(request.model, parameters.preset)) {
     return false;
@@ -329,9 +362,24 @@ struct VideoJobService::Impl {
     if (!options.now) {
       options.now = UnixNow;
     }
+    // The provider: named, else the one that accepts the model directory,
+    // else MiniMax H3 (the only provider before provider-owned requests).
+    provider = options.provider_id.empty()
+                   ? ext::ProbeVideoProvider(options.model_root.string())
+                   : ext::FindVideoProvider(options.provider_id);
+    if (provider == nullptr && options.provider_id.empty()) {
+      provider = ext::FindVideoProvider("minimax-h3");
+    }
+    if (provider == nullptr) {
+      initialization_error =
+          "video provider '" +
+          (options.provider_id.empty() ? std::string("minimax-h3")
+                                       : options.provider_id) +
+          "' is not available";
+      return;
+    }
     if (!options.runner) {
-      const auto* provider = ext::FindVideoProvider("minimax-h3");
-      if (provider && provider->create) {
+      if (provider->create) {
         std::string create_err;
         auto video_runner =
             provider->create(options.model_root.string(), &create_err);
@@ -353,27 +401,26 @@ struct VideoJobService::Impl {
     if (options.model_root.empty() || options.source_manifest.empty() ||
         options.storage_root.empty() || options.queue_capacity == 0 ||
         options.artifact_ttl <= std::chrono::seconds::zero()) {
-      initialization_error = "invalid MiniMax H3 video job configuration";
+      initialization_error = "invalid video job configuration";
       return;
     }
 #if !defined(ENGINE_ENABLE_HIP)
     if (options.validate_model_inventory) {
       initialization_error =
-          "MiniMax H3 video serving requires a ROCm HIP-enabled build; no CPU "
-          "inference fallback is provided";
+          "video serving (" + provider->id +
+          ") requires a ROCm HIP-enabled build; no CPU inference fallback is "
+          "provided";
       return;
     }
 #endif
     if (options.validate_model_inventory) {
-      const auto* provider = ext::FindVideoProvider("minimax-h3");
       std::string resolve_error;
-      if (provider == nullptr ||
-          (provider->resolve &&
+      if ((provider->resolve &&
            !provider->resolve(options.model_root.string(),
                               options.source_manifest.string(),
                               &resolve_error))) {
         initialization_error = resolve_error.empty()
-                                   ? "MiniMax H3 model not resolved"
+                                   ? "video model not resolved"
                                    : std::move(resolve_error);
         return;
       }
@@ -487,7 +534,14 @@ struct VideoJobService::Impl {
         const double completed_at = value.member_double("completed_at", -1);
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
-        const bool valid_output = (job->snapshot.output_format == "mp4" &&
+        int recovered_width = 0;
+        int recovered_height = 0;
+        const bool valid_output =
+            IsPreparedProvider(provider)
+                ? job->snapshot.output_format == "mp4" &&
+                      ParseSize(job->snapshot.size, &recovered_width,
+                                &recovered_height)
+                : (job->snapshot.output_format == "mp4" &&
                                    (job->snapshot.size == "512x512" ||
                                     job->snapshot.size == "1344x768")) ||
                                   (job->snapshot.output_format == "ppm" &&
@@ -509,8 +563,9 @@ struct VideoJobService::Impl {
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
         if (value.member_str("schema") != "gufo.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
-            !IsH3Model(job->snapshot.model) ||
-            !ResolveDurationFrames(job->snapshot.seconds) || !valid_output ||
+            !IsServedModel(provider, job->snapshot.model) ||
+            !ResolveDurationFrames(provider, job->snapshot.seconds) ||
+            !valid_output ||
             !valid_numbers || expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
           std::filesystem::remove_all(entry.path(), filesystem_error);
@@ -652,12 +707,17 @@ struct VideoJobService::Impl {
           .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
+          .options_json = job->request.options_json,
+          .attachments = {},
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
         generation.prompt = std::move(job->request.prompt);
         WipeString(&job->request.prompt);
+        // Inputs are needed once; the job keeps only its metadata.
+        generation.attachments = std::move(job->request.attachments);
+        job->request.attachments.clear();
       }
       const std::string prompt_hash =
           crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -665,7 +725,8 @@ struct VideoJobService::Impl {
               generation.prompt.size()));
       std::string metadata_error;
       if (!WriteAtomic(job->directory / "parameters.json",
-                       GenerationParametersJson(job->request.parameters,
+                       GenerationParametersJson(provider,
+                                                job->request.parameters,
                                                 job->request.seed, prompt_hash),
                        &metadata_error)) {
         WipeString(&generation.prompt);
@@ -732,7 +793,7 @@ struct VideoJobService::Impl {
       if (output_ready) {
         std::string telemetry_error;
         if (!WriteAtomic(job->directory / "telemetry.json",
-                         GenerationTelemetryJson(telemetry),
+                         GenerationTelemetryJson(provider, telemetry),
                          &telemetry_error)) {
           output_ready = false;
           storage_failure = true;
@@ -811,6 +872,7 @@ struct VideoJobService::Impl {
   }
 
   VideoJobServiceOptions options;
+  const ext::VideoProvider* provider{nullptr};
   bool ready{false};
   std::string initialization_error;
   std::filesystem::path canonical_storage_root;
@@ -836,17 +898,26 @@ std::string VideoJobService::initialization_error() const {
                           : impl_->initialization_error;
 }
 
+const ext::VideoProvider* VideoJobService::provider() const noexcept {
+  return impl_ == nullptr ? nullptr : impl_->provider;
+}
+
+std::string VideoJobService::model_id() const {
+  const auto* video = provider();
+  return IsPreparedProvider(video) ? video->id : std::string("minimax-h3");
+}
+
 bool VideoJobService::serves_model(std::string_view name) const {
-  return IsH3Model(name) ||
+  return IsServedModel(impl_->provider, name) ||
          std::find(impl_->options.model_aliases.begin(),
                    impl_->options.model_aliases.end(),
                    std::string(name)) != impl_->options.model_aliases.end();
 }
 
 std::string VideoJobService::normalize_model(std::string_view name) const {
-  if (IsH3Model(name))
+  if (IsServedModel(impl_->provider, name))
     return std::string(name);
-  return serves_model(name) ? "minimax-h3" : std::string(name);
+  return serves_model(name) ? model_id() : std::string(name);
 }
 
 const std::vector<std::string>& VideoJobService::model_aliases() const {
@@ -859,14 +930,21 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .job = std::nullopt,
             .error = initialization_error()};
   }
-  if (!IsH3Model(request.model) || request.prompt.empty() ||
+  const ext::VideoProvider* video = impl_->provider;
+  // Prepared providers decide whether a prompt is required (an empty prompt
+  // is legal for image- or audio-driven video).
+  if (!IsServedModel(video, request.model) ||
+      (request.prompt.empty() && !IsPreparedProvider(video)) ||
       request.prompt.find('\0') != std::string::npos ||
       (request.output_format != "mp4" && request.output_format != "ppm") ||
-      !ValidateGenerationParameters(request.parameters, nullptr) ||
-      !MatchesOutputContract(request)) {
+      (!IsPreparedProvider(video) &&
+       !ValidateGenerationParameters(video, request.parameters, nullptr)) ||
+      (IsPreparedProvider(video) && video->validate_parameters != nullptr &&
+       !ValidateGenerationParameters(video, request.parameters, nullptr)) ||
+      !MatchesOutputContract(video, request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
-            .error = "invalid MiniMax H3 video job request"};
+            .error = "invalid video job request for " + video->id};
   }
 
   auto job = std::make_shared<Impl::Job>();
@@ -894,7 +972,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
       WipeString(&job->request.prompt);
       return {.result = VideoJobResult::kQueueFull,
               .job = std::nullopt,
-              .error = "MiniMax H3 video queue is full"};
+              .error = "video queue is full"};
     }
     if (impl_->jobs.contains(job->snapshot.id)) {
       WipeString(&job->request.prompt);

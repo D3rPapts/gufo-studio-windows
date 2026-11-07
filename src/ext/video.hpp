@@ -29,6 +29,14 @@ struct VideoParameters {
   std::vector<int> selected_frames;
 };
 
+/// A named binary input of a video request: an uploaded multipart file, or
+/// bytes a provider decoded from the request body (images, audio, video).
+/// The bytes stay in their uploaded container format; providers decode them.
+struct VideoAttachment {
+  std::string name;
+  std::vector<std::uint8_t> bytes;
+};
+
 struct VideoRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -38,6 +46,45 @@ struct VideoRequest {
   std::string prompt;
   std::uint64_t seed{0};
   VideoParameters parameters;
+  /// Provider-owned conditioning and options as a JSON object, produced by
+  /// the provider's `prepare_request` (empty for providers without one).
+  std::string options_json;
+  /// Binary inputs referenced by `options_json` (images, audio, video).
+  std::vector<VideoAttachment> attachments;
+};
+
+/// One `POST /v1/videos` request as the server received it, for providers
+/// that parse their own conditioning (`VideoProvider::prepare_request`).
+struct VideoRequestInput {
+  /// Canonical model name (aliases already mapped to the provider id).
+  std::string_view model;
+  /// The request body as a JSON object; multipart text fields appear as
+  /// strings, a multipart `gufo` field as its parsed object.
+  std::string_view body_json;
+  /// Multipart file parts by field name, in upload order.
+  std::span<const VideoAttachment> files;
+};
+
+/// A request the provider accepted: what the job service queues and later
+/// hands back to the runner in `VideoRequest`.
+struct VideoPreparedRequest {
+  std::string prompt;
+  /// Echoed in the job object (`size`, `seconds`).
+  std::string size;
+  std::string seconds;
+  std::string output_format{"mp4"};
+  std::uint64_t seed{42};
+  VideoParameters parameters;
+  std::string options_json;
+  std::vector<VideoAttachment> attachments;
+};
+
+/// A rejected request: HTTP status (400 by default), OpenAI-style error code
+/// and message.
+struct VideoRequestError {
+  int status{400};
+  std::string code{"invalid_request"};
+  std::string message;
 };
 
 struct VideoTelemetry {
@@ -99,6 +146,16 @@ struct VideoProvider {
                                  std::uint64_t seed,
                                  std::string_view prompt_sha256) = nullptr;
   std::string (*telemetry_json)(const VideoTelemetry& telemetry) = nullptr;
+  /// Optional: parses and validates a whole request, including image, audio
+  /// and video conditioning the core does not model. When set, the server
+  /// accepts the provider id (plus configured aliases) as the model name and
+  /// skips its own preset and duration handling for this provider.
+  bool (*prepare_request)(const VideoRequestInput& input,
+                          VideoPreparedRequest* prepared,
+                          VideoRequestError* error) = nullptr;
+  /// Probe order when several providers accept a model directory: the
+  /// highest priority wins, ties keep registration order.
+  int probe_priority{0};
 };
 
 void RegisterVideoProvider(VideoProvider provider);
