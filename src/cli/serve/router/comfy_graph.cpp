@@ -2151,6 +2151,33 @@ std::pair<FileRef, std::string> TalkMask(const Graph& graph,
                         source);
 }
 
+/// One frame of a video as an IMAGE input: ImageFromBatch (length 1) over
+/// GetVideoComponents <- LoadVideo or VHS_LoadVideo. Returns the video and
+/// sets `index` to the frame (the executor extracts it with ffmpeg).
+FileRef VideoFrameFile(const Graph& graph, const std::string& id,
+                       const std::string& key, const Link& link, int fps,
+                       int* index, std::vector<std::string>* warnings) {
+  const std::string batch = link.node;
+  if (graph.Class(batch) != "ImageFromBatch")
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key + "' must come from LoadImage or "
+                      "ImageFromBatch over a video");
+  const json::Value* length = graph.Literal(batch, "length");
+  const json::Value* first = graph.Literal(batch, "batch_index");
+  if (length == nullptr || !length->is_number() ||
+      length->as_double() != 1.0 || first == nullptr ||
+      !first->is_number() || first->as_double() < 0 ||
+      first->as_double() != static_cast<double>(static_cast<int>(
+                                first->as_double())))
+    throw NodeFailure(batch, "unsupported_value",
+                      "ImageFromBatch for '" + key +
+                          "' must pick one frame: length 1 and a literal "
+                          "batch_index >= 0");
+  *index = static_cast<int>(first->as_double());
+  return VideoFile(graph, batch, "image", graph.RequireLink(batch, "image"),
+                   warnings, fps);
+}
+
 /// Wan 2.1 I2V + InfiniteTalk (wan2.1-infinitetalk-14b, 25 fps). A chain of
 /// WanInfiniteTalkToVideo windows (previous_frames from the decoded frames
 /// of the window before) is one gufo job: gufo windows the video itself
@@ -2183,7 +2210,16 @@ VideoTask BuildTalk(const Graph& graph, const std::string& sampler,
   if (!start)
     throw NodeFailure(node, "required_input_missing",
                       "gufo wan2.1-infinitetalk-14b needs a start_image");
-  task.first_frame = ImageFile(graph, node, "start_image", *start);
+  // A still (LoadImage), or one frame of a video (ImageFromBatch over
+  // LoadVideo / VHS_LoadVideo, e.g. frame 0 of the motion video).
+  if (graph.Class(start->node) == "ImageFromBatch") {
+    int index = 0;
+    task.first_frame = VideoFrameFile(graph, node, "start_image", *start, 25,
+                                      &index, warnings);
+    task.first_frame_index = index;
+  } else {
+    task.first_frame = ImageFile(graph, node, "start_image", *start);
+  }
   const Link patch = graph.RequireLink(node, "model_patch");
   if (graph.Class(patch.node) != "ModelPatchLoader")
     throw NodeFailure(node, "unsupported_link",

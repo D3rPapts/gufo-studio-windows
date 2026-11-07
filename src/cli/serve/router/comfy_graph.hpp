@@ -311,6 +311,11 @@ struct VideoTask {
   int steps{0};
   std::optional<double> guidance;
   std::optional<FileRef> first_frame;
+  /// Set when first_frame names a video (LoadVideo / VHS_LoadVideo behind
+  /// ImageFromBatch with length 1): the frame to use, counted from 0. The
+  /// executor extracts it as a PNG with ffmpeg (--comfy-ffmpeg) and sends
+  /// that as first_frame. Talk family only.
+  std::optional<int> first_frame_index;
   std::optional<FileRef> last_frame;
   std::string lora;
   std::optional<double> lora_strength;

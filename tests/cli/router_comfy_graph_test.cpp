@@ -1761,6 +1761,42 @@ void TestInfiniteTalkVideoToVideo() {
                     "0]}},\n \"60\"");
   assert(ErrorOf(chained).message.find("previous_frames") !=
          std::string::npos);
+
+  // The start image as frame 0 of the motion video: ImageFromBatch
+  // (length 1) over GetVideoComponents <- LoadVideo; the executor extracts
+  // the frame with ffmpeg.
+  std::string from_frame = Replace(
+      v2v, "\"start_image\": [\"10\", 0]", "\"start_image\": [\"64\", 0]");
+  from_frame = Replace(
+      from_frame, " \"30\": {",
+      " \"64\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+      "{\"image\": [\"61\", 0], \"batch_index\": 0, \"length\": 1}},\n "
+      "\"30\": {");
+  const comfy::Plan frame_plan = PlanOf(from_frame.c_str());
+  const auto& framed = std::get<comfy::VideoTask>(frame_plan.tasks[0].spec);
+  assert((framed.first_frame == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(framed.first_frame_index && *framed.first_frame_index == 0);
+  assert((framed.talk_video == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(frame_plan.warnings.empty());
+  assert(!video.first_frame_index);
+  // Frame 12 of a VHS_LoadVideo.
+  const comfy::Plan vhs_frame_plan = PlanOf(
+      Replace(Replace(from_frame, "\"image\": [\"61\", 0], \"batch_index\": 0",
+                      "\"image\": [\"65\", 0], \"batch_index\": 12"),
+              " \"30\": {",
+              " \"65\": {\"class_type\": \"VHS_LoadVideo\", \"inputs\": "
+              "{\"video\": \"anna_vhs.mp4\"}},\n \"30\": {")
+          .c_str());
+  const auto& vhs_frame =
+      std::get<comfy::VideoTask>(vhs_frame_plan.tasks[0].spec);
+  assert((vhs_frame.first_frame == comfy::FileRef{"anna_vhs.mp4", "input"}));
+  assert(*vhs_frame.first_frame_index == 12);
+  // Only one frame, from a video.
+  assert(ErrorOf(Replace(from_frame, "\"length\": 1}", "\"length\": 2}"))
+             .message.find("length 1") != std::string::npos);
+  assert(ErrorOf(Replace(from_frame, "\"image\": [\"61\", 0], \"batch_index\"",
+                         "\"image\": [\"10\", 0], \"batch_index\""))
+             .message.find("LoadVideo") != std::string::npos);
 }
 
 void TestWanFunCamera() {
