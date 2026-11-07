@@ -205,7 +205,8 @@ void Model::ResetCache() {
 void Model::Qwen2Forward(const Qwen2Stack& stack, float* hidden,
                          std::int64_t rows, std::int64_t first_position,
                          bool use_cache,
-                         std::vector<std::vector<float>>* layer_outputs) const {
+                         std::vector<std::vector<float>>* layer_outputs,
+                         bool release_pages) const {
   const Qwen2Config& c = stack.config;
   const std::int64_t h = c.hidden_size;
   const std::int64_t q_width = static_cast<std::int64_t>(c.num_heads) * c.head_dim;
@@ -260,6 +261,17 @@ void Model::Qwen2Forward(const Qwen2Stack& stack, float* hidden,
     }
     if (layer_outputs != nullptr) {
       layer_outputs->emplace_back(hidden, hidden + rows * h);
+    }
+    if (release_pages) {
+      // A stack read once per call (the prompt encoder): keep only the
+      // current layer resident, not the whole stack (#829).
+      for (const Linear* linear : {&layer.q, &layer.k, &layer.v, &layer.o,
+                                   &layer.gate, &layer.up, &layer.down}) {
+        ReleaseHostPages(linear->weight,
+                         static_cast<std::size_t>(linear->out_features *
+                                                  linear->in_features) *
+                             sizeof(std::uint16_t));
+      }
     }
   }
 }
@@ -536,7 +548,7 @@ std::vector<float> Model::EncodePosterior(const float* wave,
   LinearForward(encoder_.fc1, framed.data(), frames, x1.data());
   LinearForward(encoder_.fc2, x1.data(), frames, x2.data());
   Qwen2Forward(encoder_.backbone, x2.data(), frames, 0, /*use_cache=*/false,
-               nullptr);
+               nullptr, /*release_pages=*/true);
   RmsNorm(x2.data(), frames, h, encoder_.backbone.final_norm,
           encoder_.backbone.config.rms_norm_eps);
   // pad_patch_insert_cls: groups of `patch` frames (zero padded) + CLS.
@@ -555,7 +567,7 @@ std::vector<float> Model::EncodePosterior(const float* wave,
               seq.begin() + (p * group + patch) * h);
   }
   Qwen2Forward(encoder_.aggregator, seq.data(), *patches * group, 0,
-               /*use_cache=*/false, nullptr);
+               /*use_cache=*/false, nullptr, /*release_pages=*/true);
   std::vector<float> cls_rows(static_cast<std::size_t>(*patches * h));
   for (std::int64_t p = 0; p < *patches; ++p) {
     RmsNormTo(seq.data() + (p * group + patch) * h, cls_rows.data() + p * h, 1, h,

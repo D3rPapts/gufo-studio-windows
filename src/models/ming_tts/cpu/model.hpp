@@ -97,6 +97,12 @@ public:
                                                    std::string* error);
 
   [[nodiscard]] const ModelConfig& config() const noexcept { return config_; }
+  // Drops resident pages of the weight mapping (all, or the part of a range
+  // inside it) once a device copy exists; reads refault from the file cache.
+  void ReleaseHostPages() const noexcept { weights_->ReleaseResidentPages(); }
+  void ReleaseHostPages(const void* data, std::size_t bytes) const noexcept {
+    weights_->ReleaseResidentPages(data, bytes);
+  }
   // Loaded weights (BF16 matrices borrowed from the mapped checkpoint), used
   // to upload the GPU runtime.
   [[nodiscard]] const Qwen2Stack& llm() const noexcept { return llm_; }
@@ -161,7 +167,8 @@ private:
                   std::int64_t seq) const;
   void Qwen2Forward(const Qwen2Stack& stack, float* hidden, std::int64_t rows,
                     std::int64_t first_position, bool use_cache,
-                    std::vector<std::vector<float>>* layer_outputs) const;
+                    std::vector<std::vector<float>>* layer_outputs,
+                    bool release_pages = false) const;
 
   ModelConfig config_;
   std::unique_ptr<SafetensorsFile> weights_;
