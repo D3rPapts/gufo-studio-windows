@@ -359,6 +359,9 @@ struct Runtime::Impl {
       L.fc = MakeLin(W(p + "mlp.c_fc.weight"), W(p + "mlp.c_fc.bias"), 4 * d, d, true);
       L.mproj = MakeLin(W(p + "mlp.c_proj.weight"), W(p + "mlp.c_proj.bias"), d, 4 * d, true);
       gpt.push_back(L);
+      // Converted and uploaded: drop the layer's 79 MB of mapped F32 pages,
+      // or Windows keeps the whole gpt.pth in the working set (#829).
+      sd.ReleaseTensorPages("model." + p);
     }
     lnf_w = arena.F32(W("gpt.ln_f.weight"), static_cast<std::size_t>(d));
     lnf_b = arena.F32(W("gpt.ln_f.bias"), static_cast<std::size_t>(d));
@@ -382,6 +385,7 @@ struct Runtime::Impl {
       L.w2 = MakeLin(s.W(p + "feed_forward.w2.weight"), nullptr, D, 1536);
       L.skip_in = MakeLin(s.W(p + "skip_in_linear.weight"), s.W(p + "skip_in_linear.bias"), D, 2 * D);
       dit.push_back(L);
+      s.archive().ReleaseTensorPages("net.cfm.estimator." + p);
     }
     final_norm_w = arena.F32(s.W("transformer.norm.norm.weight", D), D);
     // cond_x_merge_linear [512, 864] = [x 80 | prompt 80 | cond 512 | style 192]
@@ -782,6 +786,11 @@ std::unique_ptr<Runtime> Runtime::Create(const UnifiedVoice& gpt, const S2Mel& s
     rt->impl_->LoadDit(s2mel);
     rt->impl_->LoadVocoder(vocoder);
     Check(hipDeviceSynchronize(), "upload sync");
+    // Everything else the uploads read (#829); the per-step embedding rows
+    // and time conditioning refault from the file cache.
+    gpt.ReleaseHostPages();
+    s2mel.ReleaseHostPages();
+    rt->impl_->voc = nullptr;  // only read while uploading; the engine may free it
   } catch (const std::exception& e) {
     if (error != nullptr) {
       *error = e.what();

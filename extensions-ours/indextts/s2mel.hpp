@@ -29,6 +29,9 @@ public:
                                           std::vector<float>* vq = nullptr,
                                           std::vector<float>* dec = nullptr) const;
 
+  // Drops this process's resident pages of the weight mapping (#829).
+  void ReleaseHostPages() const noexcept { sd_->ReleaseResidentPages(); }
+
 private:
   std::unique_ptr<PthArchive> sd_;
   std::vector<float> out_project_;  // folded weight norm [1024, 8]
@@ -79,6 +82,9 @@ public:
   [[nodiscard]] const cpu::Conv1dTM& wavenet_in(int i) const { return wn_in_[i]; }
   [[nodiscard]] const std::vector<float>& wavenet_res(int i) const { return wn_res_[i]; }
   [[nodiscard]] const std::vector<float>& final_linear() const { return final_linear_; }
+
+  // Drops this process's resident pages of the weight mapping (#829).
+  void ReleaseHostPages() const noexcept { sd_->ReleaseResidentPages(); }
 
 private:
   [[nodiscard]] std::vector<float> TimeEmbed(const std::string& prefix, float time) const;

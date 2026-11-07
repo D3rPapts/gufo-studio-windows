@@ -85,6 +85,9 @@ public:
 
   [[nodiscard]] const PthArchive& archive() const noexcept { return *sd_; }
 
+  // Drops this process's resident pages of the weight mapping (#829).
+  void ReleaseHostPages() const noexcept { sd_->ReleaseResidentPages(); }
+
 private:
   void Forward(std::vector<float>& x, std::int64_t rows, State* state, float* last_logits) const;
   [[nodiscard]] const float* W(const std::string& name, std::int64_t numel = -1) const;

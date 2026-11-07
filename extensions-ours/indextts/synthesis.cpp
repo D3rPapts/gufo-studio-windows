@@ -224,6 +224,23 @@ struct Engine::Impl {
     for (std::size_t i = 0; i < emo_vec.size(); ++i) {
       out->merged_emovec[i] = base_vec[i] + 1.0F * (emo_vec[i] - base_vec[i]);
     }
+    ReleaseHostPages();
+  }
+
+  // The reference encoders (CAM++, w2v-BERT, emotion conformer, length
+  // regulator) and the semantic codec read their weights on the CPU from file
+  // mappings. Windows keeps every touched page in the working set (#829), so
+  // drop them after use; the next use refaults from the file cache. With the
+  // GPU runtime the GPT and CFM weights on the host are only read per step
+  // (embedding rows, time conditioning), so their mappings go too.
+  void ReleaseHostPages() const noexcept {
+    campplus->ReleaseHostPages();
+    w2v->ReleaseHostPages();
+    codec->ReleaseHostPages();
+    if (gpu != nullptr) {
+      gpt->ReleaseHostPages();
+      s2mel->ReleaseHostPages();
+    }
   }
 };
 
@@ -271,6 +288,12 @@ std::unique_ptr<Engine> Engine::Create(const std::filesystem::path& dir, std::st
       return nullptr;
     }
   }
+  if (m.gpu != nullptr) {
+    // Generate() vocodes on the GPU whenever the runtime exists; the CPU copy
+    // of BigVGAN (~0.45 GB of F32) would only sit in the working set.
+    m.vocoder.reset();
+  }
+  m.ReleaseHostPages();
   return e;
 }
 
@@ -388,6 +411,7 @@ bool Engine::Generate(const SynthesisRequest& req, const CancelFn& cancelled,
       result->codes = codes;
       t0 = Clock::now();
       const std::vector<float> s_infer = m.codec->Decode(codes);
+      m.codec->ReleaseHostPages();
       const auto s_rows = static_cast<std::int64_t>(codes.size()) * 2;
       const auto target = static_cast<std::int64_t>(static_cast<double>(s_rows) * 1.72 *
                                                     static_cast<double>(req.duration_factor));
