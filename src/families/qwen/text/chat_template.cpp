@@ -756,8 +756,21 @@ std::optional<std::string> QwenChatTemplate::Render(
       messages.back().images.empty() && messages.size() >= 2 &&
       (messages[messages.size() - 2].role == ChatRole::kTool ||
        messages[messages.size() - 2].role == ChatRole::kUser);
+  // A long system or developer prompt (instructions, a document, a schema)
+  // followed by one question is often kept by the next request while the
+  // question changes. Keep the stable boundary at the end of the
+  // instructions so that request restores them instead of prefilling them
+  // again (Windows 27B port; 17.5K-token system prompt: 1.7 s instead of
+  // 20.5 s for a new question). An unchanged retry still restores the
+  // complete prompt, which the runner captures after the stable boundary.
+  const bool after_instructions =
+      last_user_index + 1 == messages.size() &&
+      messages.back().images.empty() && messages.size() >= 2 &&
+      (messages[messages.size() - 2].role == ChatRole::kSystem ||
+       messages[messages.size() - 2].role == ChatRole::kDeveloper);
   bool seen_assistant = false;
   std::optional<std::size_t> final_user_start;
+  std::optional<std::size_t> instructions_end;
   for (; message_index < messages.size(); ++message_index) {
     const auto& msg = messages[message_index];
     const bool tool_result = msg.role == ChatRole::kTool;
@@ -791,6 +804,8 @@ std::optional<std::string> QwenChatTemplate::Render(
     else if (final_user_turn && seen_assistant &&
              message_index == last_user_index)
       final_user_start = output.size();
+    if (after_instructions && message_index == last_user_index)
+      instructions_end = output.size();
     const auto role_name = ToString(msg.role);
     output.append(kImStart);
     output.append(role_name);
@@ -824,8 +839,10 @@ std::optional<std::string> QwenChatTemplate::Render(
   }
 
   if (stable_prefix_bytes != nullptr)
-    *stable_prefix_bytes = std::min(mutable_reasoning.value_or(output.size()),
-                                    final_user_start.value_or(output.size()));
+    *stable_prefix_bytes =
+        std::min({mutable_reasoning.value_or(output.size()),
+                  final_user_start.value_or(output.size()),
+                  instructions_end.value_or(output.size())});
   if (options.add_generation_prompt)
     output.append(GenerationPrompt(options.enable_thinking));
 

@@ -1193,6 +1193,51 @@ void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
          "opening turn keeps the boundary before the generation prompt");
 }
 
+void TestStableBoundaryFollowsLeadingInstructions() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::QwenChatTemplate;
+
+  gufo::tokenization::ChatTemplateOptions options;
+  options.add_generation_prompt = true;
+  options.enable_thinking = false;
+  const auto render = [&](const std::vector<ChatMessage>& messages) {
+    std::size_t stable = 0;
+    auto text = QwenChatTemplate::Render(messages, {}, options, nullptr,
+                                         nullptr, &stable);
+    Expect(text.has_value(), "instructions render");
+    return std::pair{*text, stable};
+  };
+  // The next request keeps the instructions and asks another question.
+  for (const auto role : {ChatRole::kSystem, ChatRole::kDeveloper}) {
+    const ChatMessage instructions{role, "Classify mails. Schema: ..."};
+    const auto [first_text, first_stable] =
+        render({instructions, {ChatRole::kUser, "Mail one."}});
+    const auto [second_text, second_stable] =
+        render({instructions, {ChatRole::kUser, "Another mail."}});
+    Expect(first_stable < first_text.size() &&
+               first_text.compare(first_stable, 12, kImStart) == 0 &&
+               first_text.substr(0, first_stable).find("Schema") !=
+                   std::string::npos &&
+               first_text.substr(first_stable).find("Mail one.") !=
+                   std::string::npos,
+           "the stable boundary is the end of the instructions");
+    Expect(second_stable == first_stable &&
+               second_text.starts_with(first_text.substr(0, first_stable)),
+           "a new question keeps the instructions");
+  }
+  // A later turn keeps the boundary before the generation prompt.
+  const auto [later_text, later_stable] =
+      render({{ChatRole::kSystem, "Be brief."},
+              {ChatRole::kUser, "Hello"},
+              {ChatRole::kAssistant, "Hi."},
+              {ChatRole::kUser, "Again"}});
+  Expect(later_text.compare(later_stable, std::string::npos,
+                            gufo::tokenization::GenerationPrompt(
+                                options.enable_thinking)) == 0,
+         "a later turn keeps the boundary before the generation prompt");
+}
+
 }  // namespace
 
 int main() {
@@ -1217,6 +1262,7 @@ int main() {
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestStableBoundaryFollowsLeadingInstructions();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }
