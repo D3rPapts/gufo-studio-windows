@@ -1,4 +1,4 @@
-#include "src/cli/serve/video_rife.hpp"
+#include "src/cli/serve/media/video_rife.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/rife/interpolate.hpp"
@@ -10,8 +10,8 @@ bool RunRifeInterpolation(const std::filesystem::path& weights,
                           const std::filesystem::path& input,
                           const std::filesystem::path& output,
                           const VideoInterpolation& spec,
-                          const minimax_h3::CancellationToken* cancellation,
-                          minimax_h3::GenerationProgress progress,
+                          const ext::CancellationCheck& cancelled,
+                          ext::VideoProgress progress,
                           void* progress_opaque, std::string* error) {
 #if defined(ENGINE_ENABLE_HIP)
   namespace rife = models::rife;
@@ -29,9 +29,7 @@ bool RunRifeInterpolation(const std::filesystem::path& weights,
     if (progress != nullptr)
       progress("interpolate", done, total, progress_opaque);
   };
-  options.cancelled = [cancellation] {
-    return cancellation != nullptr && cancellation->IsCancelled();
-  };
+  options.cancelled = [&cancelled] { return cancelled && cancelled(); };
   return rife::InterpolateVideoFile(*interpolator, input, output, options,
                                     nullptr, error);
 #else
@@ -39,7 +37,7 @@ bool RunRifeInterpolation(const std::filesystem::path& weights,
   (void)input;
   (void)output;
   (void)spec;
-  (void)cancellation;
+  (void)cancelled;
   (void)progress;
   (void)progress_opaque;
   if (error != nullptr)

@@ -1,6 +1,6 @@
 // Real-ESRGAN image upscaling behind /v1/images/upscale (see upscale_api.hpp).
 // Written with AI assistance (Claude Code).
-#include "src/cli/serve/upscale_api.hpp"
+#include "src/cli/serve/media/upscale_api.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,7 +11,7 @@
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
-#include "src/models/qwen_image_21/model.hpp"
+#include <png.h>
 
 #if defined(GUFO_HAVE_ONNXRUNTIME)
 #include "src/models/realesrgan/ort_upscaler.hpp"
@@ -43,19 +43,25 @@ HttpResponse Error(int status, std::string reason, std::string message,
   return Json(status, std::move(reason), root);
 }
 
+// 8-bit RGB PNG (libpng). 1.x used Qwen-Image's RGBA encoder; on 2.0
+// Qwen-Image is an extension the server must not link.
 std::vector<std::uint8_t> EncodePngRgb(const std::vector<std::uint8_t>& rgb,
                                        int w, int h) {
-  models::qwen_image_21::Image image;
-  image.width = w;
-  image.height = h;
-  image.rgba.resize(static_cast<std::size_t>(w) * h * 4);
-  for (std::size_t i = 0, n = static_cast<std::size_t>(w) * h; i < n; ++i) {
-    image.rgba[i * 4] = rgb[i * 3];
-    image.rgba[i * 4 + 1] = rgb[i * 3 + 1];
-    image.rgba[i * 4 + 2] = rgb[i * 3 + 2];
-    image.rgba[i * 4 + 3] = 255;
-  }
-  return models::qwen_image_21::EncodePng(image);
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  image.width = static_cast<png_uint_32>(w);
+  image.height = static_cast<png_uint_32>(h);
+  image.format = PNG_FORMAT_RGB;
+  png_alloc_size_t size = 0;
+  if (!png_image_write_to_memory(&image, nullptr, &size, 0, rgb.data(), 0,
+                                 nullptr))
+    return {};
+  std::vector<std::uint8_t> png(size);
+  if (!png_image_write_to_memory(&image, png.data(), &size, 0, rgb.data(), 0,
+                                 nullptr))
+    return {};
+  png.resize(size);
+  return png;
 }
 
 std::string Ms(double seconds) {
@@ -66,6 +72,16 @@ std::string Ms(double seconds) {
 
 bool IsUpscaleApiPath(std::string_view path) noexcept {
   return path == kUpscaleImagePath;
+}
+
+bool UpscaleService::HandlesPath(std::string_view path) const {
+  return IsUpscaleApiPath(path);
+}
+
+void UpscaleService::Describe(json::Value* entry, bool ready) const {
+  (*entry)["device"] = engine_->device;
+  if (!ready)
+    (*entry)["runtime"] = engine_->runtime;
 }
 
 bool ParseUpscaleSize(std::string_view text, int* w, int* h) {
@@ -303,6 +319,9 @@ HttpResponse UpscaleService::Handle(const HttpRequest& request) {
   const auto encode_start = std::chrono::steady_clock::now();
   const std::vector<std::uint8_t> png =
       EncodePngRgb(out.rgb24, out.width, out.height);
+  if (png.empty())
+    return Error(500, "Internal Server Error", "PNG encoding failed",
+                 "encode_failed");
   const double encode_seconds = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() -
                                     encode_start)

@@ -34,6 +34,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/media/media_serve.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
@@ -605,6 +606,17 @@ void PrintServeHelp(std::string_view program_name,
     parser.PrintHelp();
     return;
   }
+  if (server::IsMediaServeCommand(subcommand)) {
+    server::MediaServeArgs media_args;
+    ArgParser parser(
+        std::string(program_name) + " serve " + std::string(subcommand),
+        server::MediaServeDescription(subcommand));
+    server::AddMediaServeOptions(subcommand, parser, &media_args);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
+    parser.PrintHelp();
+    return;
+  }
   if (subcommand == "video") {
     std::filesystem::path video_model;
     std::filesystem::path video_root = "video-jobs";
@@ -628,6 +640,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Storage", &video_ttl_seconds);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(parser, &video_names);
+    server::VideoPostProcessArgs post_args;
+    server::AddVideoPostProcessOptions(parser, &post_args);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -836,7 +850,9 @@ void PrintServeHelp(std::string_view program_name,
          "(/v1/audio/transcriptions)\n"
       << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
          "(/v1/embeddings)\n"
-      << "  decision  Serve decision models (/v1/systemone)\n\n"
+      << "  decision  Serve decision models (/v1/systemone)\n"
+      // gufo-studio-windows media services (src/cli/serve/media).
+      << server::MediaServeCommandsHelp() << "\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -931,7 +947,8 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image" || arg == "embedding" || arg == "decision") {
+        arg == "image" || arg == "embedding" || arg == "decision" ||
+        server::IsMediaServeCommand(arg)) {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -939,7 +956,8 @@ int RunServe(std::span<const char* const> args) {
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
-          topic != "embedding" && topic != "decision") {
+          topic != "embedding" && topic != "decision" &&
+          !server::IsMediaServeCommand(topic)) {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1024,8 +1042,43 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::ImageService> images;
   std::shared_ptr<server::EmbeddingService> embeddings;
   std::shared_ptr<server::DecisionService> decisions;
+  std::shared_ptr<server::MediaService> media;
 
-  if (subcommand == "decision") {
+  if (server::IsMediaServeCommand(subcommand)) {
+    // gufo-studio-windows: music, foley, upscale (src/cli/serve/media).
+    server::MediaServeArgs media_args;
+    ArgParser parser("gufo serve " + subcommand,
+                     server::MediaServeDescription(subcommand));
+    server::AddMediaServeOptions(subcommand, parser, &media_args);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", subcommand);
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    std::string media_error;
+    if (!server::ValidateMediaServeArgs(subcommand, &media_args,
+                                        &media_error)) {
+      std::cerr << "Error: " << media_error << '\n';
+      return 2;
+    }
+    ModelLoadLog load_log(subcommand,
+                          server::MediaServeArtifact(subcommand, media_args));
+    std::string details;
+    media = server::LoadMediaService(subcommand, media_args, &details,
+                                     &media_error);
+    if (media == nullptr) {
+      std::cerr << media_error << '\n';
+      return 1;
+    }
+    load_log.Complete(details, subcommand != "upscale" ||
+                                   media_args.upscale.device == "gpu");
+  } else if (subcommand == "decision") {
     std::filesystem::path model, mmproj;
     std::vector<std::string> names;
     std::size_t context = 8192;
@@ -1172,6 +1225,9 @@ int RunServe(std::span<const char* const> args) {
                            &video_ttl_seconds);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(video_parser, &video_names);
+    // gufo-studio-windows RIFE / Real-ESRGAN post-steps.
+    server::VideoPostProcessArgs post_args;
+    server::AddVideoPostProcessOptions(video_parser, &post_args);
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -1200,6 +1256,14 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 
+    server::VideoPostProcessors postprocessors;
+    std::string post_error;
+    if (!server::BuildVideoPostProcessors(post_args, &postprocessors,
+                                          &post_error)) {
+      std::cerr << "Error: " << post_error << '\n';
+      return 2;
+    }
+
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
@@ -1216,6 +1280,7 @@ int RunServe(std::span<const char* const> args) {
             .id_factory = {},
             .now = {},
             .runner = {},
+            .postprocessors = std::move(postprocessors),
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling video service: "
@@ -1224,7 +1289,9 @@ int RunServe(std::span<const char* const> args) {
     }
     load_log.Complete(
         "model=" + video_jobs->model_id() +
-            " sessions=1 queue_capacity=1 weights=lazy",
+            " sessions=1 queue_capacity=1 weights=lazy rife=" +
+            (post_args.rife_model.empty() ? "off" : "on") +
+            " upscale=" + std::to_string(post_args.upscale_models.size()),
         false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
@@ -1721,6 +1788,9 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .media = media != nullptr
+                       ? std::vector<std::shared_ptr<server::MediaService>>{media}
+                       : std::vector<std::shared_ptr<server::MediaService>>{},
       },
       images, embeddings, decisions);
   std::string err;

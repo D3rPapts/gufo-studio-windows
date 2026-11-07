@@ -26,6 +26,7 @@ class ImageService;
 class EmbeddingService;
 struct DecisionService;
 class WebSocket;
+class MediaService;
 
 struct HttpRequest {
   std::string method;  // "GET" / "POST" / ...
@@ -110,6 +111,10 @@ struct HttpServerOptions {
   /// established connections stay usable until the caller's drain ends and
   /// the destructor stops them.
   bool graceful_shutdown{false};
+  /// gufo-studio-windows media services without an upstream capability
+  /// (music, foley, image upscale; src/cli/serve/media). Asked before the
+  /// built-in routes and listed in /ready and /v1/models.
+  std::vector<std::shared_ptr<MediaService>> media{};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

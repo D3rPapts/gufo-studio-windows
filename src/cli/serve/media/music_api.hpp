@@ -1,5 +1,7 @@
-#ifndef GUFO_SERVER_MUSIC_API_HPP_
-#define GUFO_SERVER_MUSIC_API_HPP_
+// ACE-Step 1.5 text-to-music behind /v1/audio/music (`gufo serve music`).
+// gufo-studio-windows; no upstream capability (see media_service.hpp).
+#ifndef GUFO_SERVER_MEDIA_MUSIC_API_HPP_
+#define GUFO_SERVER_MEDIA_MUSIC_API_HPP_
 
 #include <condition_variable>
 #include <cstdint>
@@ -12,7 +14,7 @@
 #include <string_view>
 #include <thread>
 
-#include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/media/media_service.hpp"
 #include "src/models/ace_step/pipeline.hpp"
 
 namespace gufo::server {
@@ -28,7 +30,7 @@ inline constexpr std::string_view kMusicApiPath = "/v1/audio/music";
 ///   GET  /v1/audio/music/{id}/content  audio/wav
 /// One worker generates jobs in order; finished audio is kept for an hour
 /// (at most kKeptJobs results).
-class MusicService {
+class MusicService final : public MediaService {
 public:
   static constexpr std::size_t kQueueCapacity = 8;
   static constexpr std::size_t kKeptJobs = 16;
@@ -38,13 +40,26 @@ public:
   MusicService(const MusicService&) = delete;
   MusicService& operator=(const MusicService&) = delete;
 
-  [[nodiscard]] bool ready() const { return pipeline_ != nullptr; }
+  [[nodiscard]] bool ready() const override { return pipeline_ != nullptr; }
   [[nodiscard]] const std::string& initialization_error() const {
     return init_error_;
   }
-  [[nodiscard]] const std::string& model_id() const { return model_id_; }
+  [[nodiscard]] std::string model_id() const override { return model_id_; }
+  [[nodiscard]] std::string_view capability() const override {
+    return "music";
+  }
+  [[nodiscard]] std::string_view owned_by() const override {
+    return "operator-supplied-ace-step";
+  }
+  [[nodiscard]] bool HandlesPath(std::string_view path) const override;
+  [[nodiscard]] std::string_view unavailable_message() const override {
+    return "ACE-Step music is not ready";
+  }
+  [[nodiscard]] std::string_view unavailable_code() const override {
+    return "music_service_unavailable";
+  }
 
-  HttpResponse Handle(const HttpRequest& request);
+  HttpResponse Handle(const HttpRequest& request) override;
 
 private:
   struct Job;
@@ -55,7 +70,9 @@ private:
 
   std::string model_id_;
   std::string init_error_;
-  std::unique_ptr<models::ace_step::MusicPipeline> pipeline_;
+  // shared_ptr: its deleter comes from Load (HIP side), so a CPU build
+  // does not need the pipeline destructor.
+  std::shared_ptr<models::ace_step::MusicPipeline> pipeline_;
   std::mutex mutex_;
   std::condition_variable changed_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -69,4 +86,4 @@ private:
 
 }  // namespace gufo::server
 
-#endif  // GUFO_SERVER_MUSIC_API_HPP_
+#endif  // GUFO_SERVER_MEDIA_MUSIC_API_HPP_

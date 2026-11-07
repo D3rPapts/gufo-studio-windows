@@ -1,11 +1,10 @@
-#ifndef GUFO_SERVER_VIDEO_UPSCALE_HPP_
-#define GUFO_SERVER_VIDEO_UPSCALE_HPP_
+#ifndef GUFO_SERVER_MEDIA_VIDEO_UPSCALE_HPP_
+#define GUFO_SERVER_MEDIA_VIDEO_UPSCALE_HPP_
 
 #include <filesystem>
 #include <string>
 
-#include "src/cli/serve/video_jobs.hpp"
-#include "src/models/minimax_h3/generation.hpp"
+#include "src/cli/serve/media/video_postprocess.hpp"
 
 namespace gufo::server {
 
@@ -17,10 +16,10 @@ namespace gufo::server {
 [[nodiscard]] bool RunRealEsrganUpscale(
     const std::filesystem::path& weights, const std::filesystem::path& input,
     const std::filesystem::path& output, const VideoUpscale& spec,
-    const minimax_h3::CancellationToken* cancellation,
-    minimax_h3::GenerationProgress progress, void* progress_opaque,
+    const ext::CancellationCheck& cancelled, ext::VideoProgress progress,
+    void* progress_opaque,
     std::string* error);
 
 }  // namespace gufo::server
 
-#endif  // GUFO_SERVER_VIDEO_UPSCALE_HPP_
+#endif  // GUFO_SERVER_MEDIA_VIDEO_UPSCALE_HPP_

@@ -1,6 +1,6 @@
 // MMAudio video / text to audio behind /v1/audio/foley (see foley_api.hpp).
 // Written with AI assistance (Claude Code).
-#include "src/cli/serve/foley_api.hpp"
+#include "src/cli/serve/media/foley_api.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -75,15 +75,24 @@ bool IsFoleyApiPath(std::string_view path) noexcept {
           path[kFoleyApiPath.size()] == '/');
 }
 
+bool FoleyService::HandlesPath(std::string_view path) const {
+  return IsFoleyApiPath(path);
+}
+
 FoleyService::FoleyService(const std::filesystem::path& model_root,
                            std::string model_id)
     : model_id_(std::move(model_id)) {
+#if defined(ENGINE_ENABLE_HIP)
   mm::ModelPaths paths;
   if (!mm::ModelPaths::FromRoot(model_root, &paths, &init_error_))
     return;
   pipeline_ = mm::FoleyPipeline::Load(paths, &init_error_);
   if (pipeline_)
     worker_ = std::thread([this] { Worker(); });
+#else
+  (void)model_root;
+  init_error_ = "MMAudio foley needs a ROCm HIP build of gufo";
+#endif
 }
 
 FoleyService::~FoleyService() {
@@ -153,6 +162,7 @@ void FoleyService::Worker() {
     }
     std::vector<float> audio;
     mm::FoleyTelemetry telemetry;
+#if defined(ENGINE_ENABLE_HIP)
     if (ok)
       ok = pipeline_->Generate(
           request, &audio, &telemetry,
@@ -162,6 +172,10 @@ void FoleyService::Worker() {
             return !stop_;
           },
           &error);
+#else
+    // Not reached: without HIP the service never becomes ready.
+    ok = false;
+#endif
     std::string wav;
     if (ok)
       wav = mm::EncodeMonoWav(audio, mm::kSampleRate);

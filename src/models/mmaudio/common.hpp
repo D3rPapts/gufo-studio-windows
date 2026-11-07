@@ -3,6 +3,12 @@
 #ifndef GUFO_MODELS_MMAUDIO_COMMON_HPP_
 #define GUFO_MODELS_MMAUDIO_COMMON_HPP_
 
+// Device helpers: only the HIP sources of gufo_mmaudio include this header
+// (pipeline.hpp forward-declares the stages), so CPU builds never need the
+// HIP headers. Fail early with a clear message if that changes.
+#if !defined(ENGINE_ENABLE_HIP)
+#error "src/models/mmaudio/common.hpp needs a HIP build (ENGINE_ENABLE_HIP)"
+#endif
 #include <hip/hip_runtime_api.h>
 #include <rocblas/rocblas.h>
 

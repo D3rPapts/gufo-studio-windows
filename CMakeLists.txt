@@ -456,6 +456,9 @@ target_compile_definitions(gufo PRIVATE
 
 # gufo-studio-windows: `gufo router` (library, CLI wiring and its CPU tests).
 include(src/cli/serve/router/router.cmake)
+# gufo-studio-windows: music, foley, upscale and the RIFE / Real-ESRGAN video
+# post-steps (no upstream capability yet).
+include(src/cli/serve/media/media.cmake)
 
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip)

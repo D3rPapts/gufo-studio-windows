@@ -194,7 +194,7 @@ bool SafetensorsFile::Read(std::uint64_t offset, std::size_t bytes, int slot,
   const auto lead = static_cast<std::size_t>(offset - aligned);
   const std::size_t span = (lead + bytes + kSector - 1U) / kSector * kSector;
   auto* buffer = static_cast<std::byte*>(staging_[slot]);
-  if (platform::ReadFileParallel(file_, buffer, span, aligned) < lead + bytes)
+  if (ReadFileParallel(file_, buffer, span, aligned) < lead + bytes)
     return false;
   *data = buffer + lead;
   return true;

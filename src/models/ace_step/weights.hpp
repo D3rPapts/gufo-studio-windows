@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/core/platform/mapped_file.hpp"
+#include "src/models/ace_step/parallel_read.hpp"
 
 namespace gufo::models::ace_step {
 

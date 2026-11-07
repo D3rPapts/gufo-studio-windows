@@ -3,9 +3,10 @@
 # `gufo serve` workers. Not part of upstream gufo; included once from the top
 # CMakeLists.txt after the `gufo` executable is defined.
 
-# 1 when the build carries the fork-only `gufo serve` modalities (omni, music,
-# foley, upscale) of gufo-studio-windows 1.x. The v0.31.0 base has none, so
-# the router rejects local sections that would need them (see WAVE-A-STAND).
+# 1 when the build carries the fork-only `gufo serve omni` of
+# gufo-studio-windows 1.x. The 2.0 base does not have it yet, so the router
+# rejects local omni sections (see WAVE-A-STAND). music, foley and upscale
+# are back since Wave C (src/cli/serve/media).
 option(GUFO_ROUTER_FORK_SERVE
   "Router accepts local sections for fork-only gufo serve modalities" OFF)
 

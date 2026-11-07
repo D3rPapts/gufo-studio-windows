@@ -2,6 +2,11 @@
 // Written with AI assistance (Claude Code).
 #include "src/models/mmaudio/pipeline.hpp"
 
+#include "src/models/mmaudio/clip.hpp"
+#include "src/models/mmaudio/network.hpp"
+#include "src/models/mmaudio/synchformer.hpp"
+#include "src/models/mmaudio/vocoder.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -61,6 +66,8 @@ bool ModelPaths::FromRoot(const std::filesystem::path& root, ModelPaths* paths,
   *paths = std::move(p);
   return true;
 }
+
+FoleyPipeline::~FoleyPipeline() = default;
 
 std::unique_ptr<FoleyPipeline> FoleyPipeline::Load(const ModelPaths& paths,
                                                    std::string* error) {

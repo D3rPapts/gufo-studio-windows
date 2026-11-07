@@ -1,4 +1,4 @@
-#include "src/cli/serve/music_api.hpp"
+#include "src/cli/serve/media/music_api.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -77,15 +77,23 @@ bool IsMusicApiPath(std::string_view path) noexcept {
                                        std::string(kMusicApiPath) + "/");
 }
 
+bool MusicService::HandlesPath(std::string_view path) const {
+  return IsMusicApiPath(path);
+}
+
 MusicService::MusicService(const std::filesystem::path& model_root,
                            std::string model_id)
     : model_id_(std::move(model_id)) {
   ace::ModelPaths paths;
   if (!ace::ModelPaths::FromRoot(model_root, &paths, &init_error_))
     return;
+#if defined(ENGINE_ENABLE_HIP)
   pipeline_ = ace::MusicPipeline::Load(paths, &init_error_);
   if (pipeline_)
     worker_ = std::thread([this] { Worker(); });
+#else
+  init_error_ = "ACE-Step music needs a ROCm HIP build of gufo";
+#endif
 }
 
 MusicService::~MusicService() {
@@ -127,6 +135,7 @@ void MusicService::Worker() {
     std::vector<float> audio;
     std::string error;
     ace::MusicTelemetry telemetry;
+#if defined(ENGINE_ENABLE_HIP)
     const bool ok = pipeline_->Generate(
         job->request, &audio, &telemetry,
         [this, job](double fraction, std::string_view) {
@@ -135,6 +144,10 @@ void MusicService::Worker() {
           return !stop_;
         },
         &error);
+#else
+    // Not reached: without HIP the service never becomes ready.
+    const bool ok = false;
+#endif
     std::string wav;
     if (ok)
       wav = ace::EncodeStereoWav(audio, ace::kSampleRate);

@@ -1,8 +1,9 @@
 // Real-ESRGAN image upscaling behind POST /v1/images/upscale
 // (`gufo serve upscale --device npu|gpu|cpu`).
 // Written with AI assistance (Claude Code).
-#ifndef GUFO_SERVER_UPSCALE_API_HPP_
-#define GUFO_SERVER_UPSCALE_API_HPP_
+// gufo-studio-windows; no upstream capability (see media_service.hpp).
+#ifndef GUFO_SERVER_MEDIA_UPSCALE_API_HPP_
+#define GUFO_SERVER_MEDIA_UPSCALE_API_HPP_
 
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/media/media_service.hpp"
 
 namespace gufo::server {
 
@@ -75,19 +76,37 @@ struct UpscaleEngine {
 /// -> {created, model, device, width, height, data: [{b64_json}],
 ///     cost: {seconds, body_seconds, post_seconds}} or image/png.
 /// One request at a time on the device; at most kMaxWaiting wait.
-class UpscaleService {
+class UpscaleService final : public MediaService {
 public:
   static constexpr int kMaxWaiting = 8;
 
   explicit UpscaleService(std::unique_ptr<UpscaleEngine> engine);
 
-  [[nodiscard]] bool ready() const { return engine_ != nullptr; }
-  [[nodiscard]] const std::string& model_id() const {
+  [[nodiscard]] bool ready() const override { return engine_ != nullptr; }
+  [[nodiscard]] std::string model_id() const override {
     return engine_->model_names.front();
   }
+  [[nodiscard]] std::vector<std::string> model_ids() const override {
+    return engine_->model_names;
+  }
   [[nodiscard]] const UpscaleEngine& engine() const { return *engine_; }
+  [[nodiscard]] std::string_view capability() const override {
+    return "upscale";
+  }
+  [[nodiscard]] std::string_view owned_by() const override {
+    return "operator-supplied-realesrgan";
+  }
+  /// /v1/models: device and runtime; /ready: device.
+  void Describe(json::Value* entry, bool ready) const override;
+  [[nodiscard]] bool HandlesPath(std::string_view path) const override;
+  [[nodiscard]] std::string_view unavailable_message() const override {
+    return "upscaler is not ready";
+  }
+  [[nodiscard]] std::string_view unavailable_code() const override {
+    return "upscale_service_unavailable";
+  }
 
-  HttpResponse Handle(const HttpRequest& request);
+  HttpResponse Handle(const HttpRequest& request) override;
 
 private:
   std::unique_ptr<UpscaleEngine> engine_;
@@ -103,4 +122,4 @@ private:
 
 }  // namespace gufo::server
 
-#endif  // GUFO_SERVER_UPSCALE_API_HPP_
+#endif  // GUFO_SERVER_MEDIA_UPSCALE_API_HPP_

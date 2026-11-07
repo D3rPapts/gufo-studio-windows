@@ -34,6 +34,7 @@
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/media/media_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
@@ -2230,7 +2231,10 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (tts_ != nullptr && tts_->ready()) ||
                        (asr_ != nullptr && asr_->ready()) ||
                        (embeddings_ != nullptr && embeddings_->ready()) ||
-                       images_ != nullptr || decisions_ != nullptr;
+                       images_ != nullptr || decisions_ != nullptr ||
+                       std::ranges::any_of(options_.media, [](const auto& m) {
+                         return m != nullptr && m->ready();
+                       });
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2251,6 +2255,12 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = images_->model_id();
     } else if (video_jobs_ != nullptr && video_jobs_->ready()) {
       body["model"] = video_jobs_->model_id();
+    } else if (const auto media = std::ranges::find_if(
+                   options_.media,
+                   [](const auto& m) { return m != nullptr && m->ready(); });
+               media != options_.media.end()) {
+      body["model"] = (*media)->model_id();
+      (*media)->Describe(&body, true);
     } else {
       body["model"] = "minimax-h3";
     }
@@ -2258,8 +2268,32 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   }
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
-    return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get(), embeddings_.get(), decisions_.get());
+    HttpResponse listed =
+        ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
+                   images_.get(), embeddings_.get(), decisions_.get());
+    // gufo-studio-windows media services (src/cli/serve/media).
+    bool media_listed = false;
+    json::Value models;
+    for (const auto& media : options_.media) {
+      if (media == nullptr || !media->ready())
+        continue;
+      if (!media_listed)
+        models = json::parse(listed.body);
+      media_listed = true;
+      for (const std::string& id : media->model_ids()) {
+        json::Value model = json::Value::object();
+        model["id"] = id;
+        model["object"] = "model";
+        model["created"] = Now();
+        model["owned_by"] = std::string(media->owned_by());
+        model["capability"] = std::string(media->capability());
+        media->Describe(&model, false);
+        models["data"].push_back(std::move(model));
+      }
+    }
+    if (media_listed)
+      listed.body = models.dump();
+    return listed;
   }
   if (req.path == "/v1/systemone") {
     if (req.method != "POST")
@@ -2310,6 +2344,16 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return Err(503, "Service Unavailable", "ASR is not configured",
                  "server_error", "asr_service_unavailable");
     return HandleAsrWebSocket(req, *asr_);
+  }
+  for (const auto& media : options_.media) {
+    if (media == nullptr || !media->HandlesPath(req.path))
+      continue;
+    if (!media->ready())
+      return Err(503, "Service Unavailable",
+                 std::string(media->unavailable_message()).c_str(),
+                 "server_error",
+                 std::string(media->unavailable_code()).c_str());
+    return media->Handle(req);
   }
   if (IsVideoApiPath(req.path)) {
     if (video_jobs_ == nullptr || !video_jobs_->ready()) {

@@ -1,7 +1,8 @@
 // MMAudio video / text to audio ("foley") behind /v1/audio/foley.
 // Written with AI assistance (Claude Code).
-#ifndef GUFO_SERVER_FOLEY_API_HPP_
-#define GUFO_SERVER_FOLEY_API_HPP_
+// gufo-studio-windows; no upstream capability (see media_service.hpp).
+#ifndef GUFO_SERVER_MEDIA_FOLEY_API_HPP_
+#define GUFO_SERVER_MEDIA_FOLEY_API_HPP_
 
 #include <condition_variable>
 #include <cstdint>
@@ -14,7 +15,7 @@
 #include <string_view>
 #include <thread>
 
-#include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/media/media_service.hpp"
 #include "src/models/mmaudio/pipeline.hpp"
 
 namespace gufo::server {
@@ -33,7 +34,7 @@ inline constexpr std::string_view kFoleyApiPath = "/v1/audio/foley";
 /// reproduces ComfyUI-MMAudio's MMAudioSampler (frames at the source rate,
 /// after the VHS_LoadVideo options); "resample" is MMAudio's own 8 / 25 fps
 /// sampling. One worker runs the jobs in order; results are kept for an hour.
-class FoleyService {
+class FoleyService final : public MediaService {
 public:
   static constexpr std::size_t kQueueCapacity = 8;
   static constexpr std::size_t kKeptJobs = 16;
@@ -43,13 +44,26 @@ public:
   FoleyService(const FoleyService&) = delete;
   FoleyService& operator=(const FoleyService&) = delete;
 
-  [[nodiscard]] bool ready() const { return pipeline_ != nullptr; }
+  [[nodiscard]] bool ready() const override { return pipeline_ != nullptr; }
   [[nodiscard]] const std::string& initialization_error() const {
     return init_error_;
   }
-  [[nodiscard]] const std::string& model_id() const { return model_id_; }
+  [[nodiscard]] std::string model_id() const override { return model_id_; }
+  [[nodiscard]] std::string_view capability() const override {
+    return "foley";
+  }
+  [[nodiscard]] std::string_view owned_by() const override {
+    return "operator-supplied-mmaudio";
+  }
+  [[nodiscard]] bool HandlesPath(std::string_view path) const override;
+  [[nodiscard]] std::string_view unavailable_message() const override {
+    return "MMAudio foley is not ready";
+  }
+  [[nodiscard]] std::string_view unavailable_code() const override {
+    return "foley_service_unavailable";
+  }
 
-  HttpResponse Handle(const HttpRequest& request);
+  HttpResponse Handle(const HttpRequest& request) override;
 
 private:
   struct Job;
@@ -60,7 +74,9 @@ private:
 
   std::string model_id_;
   std::string init_error_;
-  std::unique_ptr<models::mmaudio::FoleyPipeline> pipeline_;
+  // shared_ptr: its deleter comes from Load (HIP side), so a CPU build
+  // does not need the pipeline destructor.
+  std::shared_ptr<models::mmaudio::FoleyPipeline> pipeline_;
   std::mutex mutex_;
   std::condition_variable changed_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -74,4 +90,4 @@ private:
 
 }  // namespace gufo::server
 
-#endif  // GUFO_SERVER_FOLEY_API_HPP_
+#endif  // GUFO_SERVER_MEDIA_FOLEY_API_HPP_
