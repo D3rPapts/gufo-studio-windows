@@ -219,9 +219,12 @@ int main() {
   // DiT / CFM: the first port's kernels ("legacy", GUFO_INDEXTTS_DIT_FAST=0) first, then the fast path
   // (CFG batch 2, hipBLASLt BF16, GEMM attention). Checks apply to the fast path; legacy is INFO only.
   std::vector<float> velocity_legacy, mel_legacy;
-  for (const bool fast : {false, true}) {
+  // mode 0 legacy, 1 fast with FP32 GEMM attention, 2 fast with the WMMA flash attention (default)
+  for (const int mode : {0, 1, 2}) {
+  const bool fast = mode > 0;
   rt->SetFastDit(fast);
-  const char* tag = fast ? "fast" : "legacy";
+  rt->SetFlashAttention(mode == 2);
+  const std::string tag = mode == 0 ? "legacy" : (mode == 1 ? "gemm-attn" : "flash");
   {
     const std::vector<float> x0 = O("cfm_call0_x");
     const std::vector<float> p0 = O("cfm_call0_prompt_x");
@@ -235,13 +238,13 @@ int main() {
     const double one = Seconds(t0);
     const double cos = Cos(Tr(vc, total, 80), std::vector<float>(v0.begin(), v0.begin() + half));
     if (fast) {
-      Check("DiT velocity (cond) step 0 [fast]", cos, 0.999);
-      std::printf("INFO DiT velocity fast vs legacy           cos=%.6f\n", Cos(vc, velocity_legacy));
+      Check("DiT velocity (cond) step 0 [" + tag + "]", cos, 0.999);
+      std::printf("INFO DiT velocity %s vs legacy  cos=%.6f\n", tag.c_str(), Cos(vc, velocity_legacy));
     } else {
       std::printf("INFO DiT velocity (cond) step 0 [legacy]   cos=%.6f\n", cos);
       velocity_legacy = vc;
     }
-    std::printf("     DiT evaluation [%s] (%lld frames, 1 branch, incl. upload) %.1f ms\n", tag,
+    std::printf("     DiT evaluation [%s] (%lld frames, 1 branch, incl. upload) %.1f ms\n", tag.c_str(),
                 static_cast<long long>(total), one * 1000.0);
   }
   std::vector<float> mel;
@@ -253,19 +256,20 @@ int main() {
     const double secs = Seconds(t0);
     const double cos = Cos(Tr(mel, total, 80), O("cfm_out"));
     if (fast) {
-      Check("CFM 25 steps (oracle noise) [fast]", cos, 0.995);
-      std::printf("INFO CFM fast vs legacy                    cos=%.6f\n", Cos(mel, mel_legacy));
+      Check("CFM 25 steps (oracle noise) [" + tag + "]", cos, 0.995);
+      std::printf("INFO CFM %s vs legacy  cos=%.6f\n", tag.c_str(), Cos(mel, mel_legacy));
     } else {
       std::printf("INFO CFM 25 steps (oracle noise) [legacy]  cos=%.6f\n", cos);
       mel_legacy = mel;
     }
-    std::printf("TIME CFM [%s] %.1f ms (%lld frames, 25 steps x CFG 2)\n", tag, secs * 1000.0,
+    std::printf("TIME CFM [%s] %.1f ms (%lld frames, 25 steps x CFG 2)\n", tag.c_str(), secs * 1000.0,
                 static_cast<long long>(total));
     if (!rt->LastCfmProfile().empty()) {
       std::printf("PROF %s\n", rt->LastCfmProfile().c_str());
     }
   }
-  }  // legacy / fast
+  }  // legacy / gemm-attn / flash
+  rt->SetFlashAttention(true);
   {
     const std::vector<float> vc_target = Tr(O("vc_target"), 80, target);
     const auto t0 = std::chrono::steady_clock::now();

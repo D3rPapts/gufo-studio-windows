@@ -66,6 +66,12 @@ void LaunchConcatCols(const float* a, const float* b, float* dst, std::size_t ro
                       std::size_t a_cols, std::size_t b_cols, hipStream_t stream);
 // y = bf16(x), round to nearest even (GEMM operands of the hipBLASLt DiT path).
 void LaunchF32ToBf16(const float* x, std::uint16_t* y, std::size_t n, hipStream_t stream);
+// WMMA flash attention, head dim 64, scale 1/8, non-causal, `sequences` independent sequences of `rows`
+// rows: q/k/v/out FP32 [sequences][rows][heads * 64]; Q, K, V and P enter the matrix cores as FP16, scores,
+// softmax and accumulation are FP32. scratch holds FlashAttention64ScratchHalves() FP16 values.
+std::size_t FlashAttention64ScratchHalves(std::size_t rows, std::size_t heads, std::size_t sequences);
+void LaunchFlashAttention64(const float* q, const float* k, const float* v, float* out, std::uint16_t* scratch,
+                            std::size_t rows, std::size_t heads, std::size_t sequences, hipStream_t stream);
 // In-place FP32 softmax of each row of s [rows, cols] (attention scores).
 void LaunchSoftmaxRows(float* s, std::size_t rows, std::size_t cols, hipStream_t stream);
 

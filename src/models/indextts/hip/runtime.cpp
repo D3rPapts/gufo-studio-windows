@@ -44,6 +44,7 @@ std::vector<float> Runtime::Velocity(const float*, const float*, float, const fl
 }
 std::vector<float> Runtime::Vocode(const float*, std::int64_t) { return {}; }
 void Runtime::SetFastDit(bool) {}
+void Runtime::SetFlashAttention(bool) {}
 std::string Runtime::LastCfmProfile() const { return {}; }
 
 #else
@@ -237,6 +238,10 @@ struct Runtime::Impl {
   // projections, FP32 GEMM attention. GUFO_INDEXTTS_DIT_FAST=0 selects the
   // first port's kernels (tiled FP32xBF16 GEMM, per-row attention) for A/B.
   bool fast{true};
+  // Attention of the fast path: WMMA flash kernel (default) or FP32 SGEMM + softmax
+  // (GUFO_INDEXTTS_DIT_ATTN=gemm).
+  bool flash{true};
+  Buf attn16;
   std::unique_ptr<Blas> blas;
   Prof prof;
   std::string last_profile;
@@ -517,6 +522,9 @@ struct Runtime::Impl {
     prof.Mark(Prof::kAttention, stream);
     if (!fast) {
       vox::LaunchAttention(qp, kp, vp, ap, nb, t, t, 8, 8, 64, t * D, t * D, false, 0, stream);
+    } else if (flash) {
+      auto* scratch = reinterpret_cast<std::uint16_t*>(attn16.Ensure((FlashAttention64ScratchHalves(t, 8, nb) + 1) / 2));
+      LaunchFlashAttention64(qp, kp, vp, ap, scratch, t, 8, nb, stream);
     } else {
       float* s = scores.Ensure(8 * t * t);
       for (std::size_t b = 0; b < nb; ++b) {
@@ -768,6 +776,8 @@ std::unique_ptr<Runtime> Runtime::Create(const UnifiedVoice& gpt, const S2Mel& s
     rt->impl_->blas = std::make_unique<Blas>(rt->impl_->stream);
     const char* fast = std::getenv("GUFO_INDEXTTS_DIT_FAST");
     rt->impl_->fast = fast == nullptr || fast[0] != '0';
+    const char* attn = std::getenv("GUFO_INDEXTTS_DIT_ATTN");
+    rt->impl_->flash = attn == nullptr || std::string(attn) != "gemm";
     const char* profile = std::getenv("GUFO_INDEXTTS_PROFILE");
     rt->impl_->prof.on = profile != nullptr && profile[0] == '1';
     rt->impl_->LoadGpt(gpt);
@@ -913,7 +923,8 @@ std::vector<float> Runtime::CfmSample(const std::vector<float>& noise, const flo
     std::snprintf(line, sizeof(line),
                   "cfm profile (%s, %lld frames x2, %d steps): wall %.1f ms | gemm %.1f, attention %.1f, im2col %.1f, "
                   "other %.1f ms (GPU, incl. per-step sync)",
-                  m.fast ? "fast" : "legacy", static_cast<long long>(t), options.steps, wall, m.prof.ms[Prof::kGemm],
+                  m.fast ? (m.flash ? "fast, flash attention" : "fast, gemm attention") : "legacy",
+                  static_cast<long long>(t), options.steps, wall, m.prof.ms[Prof::kGemm],
                   m.prof.ms[Prof::kAttention], m.prof.ms[Prof::kConv], m.prof.ms[Prof::kOther]);
     m.last_profile = line;
     std::fprintf(stderr, "indextts %s\n", line);
@@ -922,6 +933,8 @@ std::vector<float> Runtime::CfmSample(const std::vector<float>& noise, const flo
 }
 
 void Runtime::SetFastDit(bool fast) { impl_->fast = fast; }
+
+void Runtime::SetFlashAttention(bool flash) { impl_->flash = flash; }
 
 std::string Runtime::LastCfmProfile() const { return impl_->last_profile; }
 

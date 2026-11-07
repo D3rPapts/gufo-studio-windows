@@ -45,6 +45,9 @@ public:
   // DiT/CFM kernels: true (default, unless GUFO_INDEXTTS_DIT_FAST=0) = CFG as batch 2, hipBLASLt BF16
   // projections and GEMM attention; false = the first port's tiled GEMM / per-row attention (A/B tests).
   void SetFastDit(bool fast);
+  // Attention of the fast path: true (default, unless GUFO_INDEXTTS_DIT_ATTN=gemm) = WMMA flash kernel
+  // (head dim 64, FP16 operands), false = FP32 SGEMM + softmax.
+  void SetFlashAttention(bool flash);
   // With GUFO_INDEXTTS_PROFILE=1: per-category GPU times of the last CfmSample, else empty.
   [[nodiscard]] std::string LastCfmProfile() const;
 
