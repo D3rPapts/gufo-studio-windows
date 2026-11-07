@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "src/core/platform/prefault.hpp"
+
 namespace gufo::models::indextts {
 namespace {
 
@@ -684,7 +686,27 @@ std::vector<float> PthArchive::ToF32(std::string_view key) const {
         throw std::runtime_error("unsupported dtype for " + std::string(key));
     }
   }
+  // The copy is all callers read: drop the source pages (#829).
+  ReleaseResidentPages(t.data, static_cast<std::size_t>(t.numel) * ElementSize(t.dtype));
   return out;
+}
+
+void PthArchive::ReleaseTensorPages(std::string_view prefix) const noexcept {
+  for (auto it = tensors_.lower_bound(prefix);
+       it != tensors_.end() && std::string_view(it->first).starts_with(prefix); ++it) {
+    const PthTensor& t = it->second;
+    if (t.contiguous) {
+      ReleaseResidentPages(t.data, static_cast<std::size_t>(t.numel) * ElementSize(t.dtype));
+    }
+  }
+}
+
+void PthArchive::ReleaseResidentPages() const noexcept {
+  platform::ReleaseMappedPages(file_.data(), file_.size());
+}
+
+void PthArchive::ReleaseResidentPages(const void* data, std::size_t bytes) const noexcept {
+  platform::ReleaseMappedRange(file_.data(), file_.size(), data, bytes);
 }
 
 std::vector<float> FoldWeightNorm(const PthArchive& archive, const std::string& prefix) {
