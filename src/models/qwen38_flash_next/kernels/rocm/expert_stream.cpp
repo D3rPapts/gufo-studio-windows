@@ -18,6 +18,14 @@ void SetError(std::string* error_msg, std::string message) {
 
 }  // namespace
 
+bool EagerStaging() noexcept {
+  static const bool eager = [] {
+    const char* env = std::getenv("GUFO_FLASH_NEXT_EAGER_STAGING");
+    return env != nullptr && env[0] == '1';
+  }();
+  return eager;
+}
+
 std::unique_ptr<ExpertStream> ExpertStream::Create(
     std::vector<Layer> layers, std::uint32_t num_experts, std::uint32_t slots,
     std::uint32_t max_misses, std::uint32_t threads, std::string* error_msg) {
@@ -51,16 +59,25 @@ std::unique_ptr<ExpertStream> ExpertStream::Create(
     set_bytes = std::max(set_bytes, bytes);
   }
   s->staging_bytes_ = static_cast<std::size_t>(set_bytes) * max_misses;
+  // The prefetch staging (as large as staging_) is pinned on the first
+  // Prefetch() call: prefetch is off by default, and pinned host memory is
+  // part of the worker's working set from the moment it is allocated.
   if (hipHostMalloc(reinterpret_cast<void**>(&s->staging_), s->staging_bytes_,
                     hipHostMallocDefault) != hipSuccess ||
       hipEventCreateWithFlags(&s->staging_done_, hipEventDisableTiming) !=
           hipSuccess ||
-      hipHostMalloc(reinterpret_cast<void**>(&s->prefetch_staging_),
-                    s->staging_bytes_, hipHostMallocDefault) != hipSuccess ||
       hipEventCreateWithFlags(&s->prefetch_done_, hipEventDisableTiming) !=
           hipSuccess) {
     (void)hipGetLastError();
     SetError(error_msg, "cannot allocate expert staging");
+    return nullptr;
+  }
+  // GUFO_FLASH_NEXT_EAGER_STAGING=1 pins it up front as before (A/B runs).
+  if (EagerStaging() &&
+      hipHostMalloc(reinterpret_cast<void**>(&s->prefetch_staging_),
+                    s->staging_bytes_, hipHostMallocDefault) != hipSuccess) {
+    (void)hipGetLastError();
+    SetError(error_msg, "cannot allocate expert prefetch staging");
     return nullptr;
   }
   s->state_.resize(layers.size());
@@ -164,6 +181,19 @@ bool ExpertStream::Prefetch(std::uint32_t layer,
   // One prediction in flight: it covers the next layer only.
   if (prefetch_.active || layer >= layers_.size()) {
     return false;
+  }
+  if (prefetch_staging_ == nullptr) {
+    if (prefetch_unavailable_)
+      return false;
+    if (hipHostMalloc(reinterpret_cast<void**>(&prefetch_staging_),
+                      staging_bytes_, hipHostMallocDefault) != hipSuccess) {
+      // Without its staging the prediction is skipped; Map() still loads
+      // every routed expert itself.
+      (void)hipGetLastError();
+      prefetch_staging_ = nullptr;
+      prefetch_unavailable_ = true;
+      return false;
+    }
   }
   // Earlier prefetch uploads read this staging; they must have left it.
   if (hipEventSynchronize(prefetch_done_) != hipSuccess) {

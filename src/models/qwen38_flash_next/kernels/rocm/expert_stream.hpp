@@ -22,6 +22,11 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// GUFO_FLASH_NEXT_EAGER_STAGING=1: the old host staging pattern for A/B
+/// runs (prefetch staging pinned at creation, the upload's read buffers kept
+/// until the expert stream exists). Off by default.
+[[nodiscard]] bool EagerStaging() noexcept;
+
 /// Routed-expert cache for a host whose memory cannot hold every expert.
 ///
 /// Each MoE layer keeps `slots` experts of its gate, up and down matrices in
@@ -158,7 +163,9 @@ private:
     std::vector<std::int32_t> experts, slots;
   };
   PendingPrefetch prefetch_;
-  std::uint8_t* prefetch_staging_{nullptr};  ///< Pinned, like staging_.
+  /// Pinned like staging_, but only on the first Prefetch() call.
+  std::uint8_t* prefetch_staging_{nullptr};
+  bool prefetch_unavailable_{false};  ///< its allocation failed once
   hipEvent_t prefetch_done_{nullptr};
   bool FinishPrefetch(hipStream_t stream, std::string* error_msg);
   bool stop_{false};
