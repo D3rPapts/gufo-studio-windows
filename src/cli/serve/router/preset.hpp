@@ -71,6 +71,11 @@ struct PresetModel {
   /// 200 once ready, as llama-server does. An `args` key puts leading
   /// positional arguments first (`args = serve llm` for another gufo build).
   std::string command;
+  /// `served-model-name` values of a local section other than `id`. Since
+  /// upstream #957 every `gufo serve` modality accepts each repeated
+  /// `--served-model-name` as an alias, so the router routes these names to
+  /// this section too (the request keeps the alias as its `model`).
+  std::vector<std::string> aliases;
   PresetHints hints{};
   /// Set for `[remote/<id>]` sections, and for a local section with a
   /// `[remote/<id>]` twin of the same id.

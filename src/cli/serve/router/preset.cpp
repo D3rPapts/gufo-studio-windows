@@ -10,6 +10,13 @@
 
 #include "src/cli/serve/serve_options.hpp"
 
+// 1 when the build carries the fork-only `gufo serve` modalities (omni,
+// music, foley, upscale) of gufo-studio-windows 1.x; 0 on the plain upstream
+// v0.31.0 serve (WAVE-A). CMake sets it; default 0.
+#ifndef GUFO_ROUTER_FORK_SERVE
+#define GUFO_ROUTER_FORK_SERVE 0
+#endif
+
 namespace gufo::router {
 namespace {
 
@@ -347,10 +354,24 @@ bool LoadPreset(const std::filesystem::path& file,
       models->back().id = section.id;
       return true;
     }
+#if !GUFO_ROUTER_FORK_SERVE
+    // WAVE-A stub: `gufo serve omni` (Qwen3-Omni captioner) exists only in
+    // the release/1.x fork. On the v0.31.0 base a local omni section cannot
+    // start; a [remote/<id>] section with `modality = omni` still works.
+    if (section.modality == "omni") {
+      return SectionError(section,
+                          "local omni workers need the fork's `gufo serve "
+                          "omni` (not in this build); use [remote/<id>] "
+                          "with modality = omni or an [external/<id>] "
+                          "section",
+                          error);
+    }
+#endif
     const bool external = section.modality == "external";
     std::vector<std::string> argv;
     std::string command;
     PresetHints hints;
+    std::vector<std::string> aliases;
     for (const auto& [key, value] : section.entries) {
       if (key.starts_with("router-")) {
         std::string hint_error;
@@ -381,6 +402,10 @@ bool LoadPreset(const std::filesystem::path& file,
         }
         argv.insert(argv.begin(), leading.begin(), leading.end());
         continue;
+      }
+      if (!external && key == "served-model-name" && value != section.id &&
+          std::find(aliases.begin(), aliases.end(), value) == aliases.end()) {
+        aliases.push_back(value);
       }
       if (value == "true") {
         argv.push_back("--" + key);
@@ -422,6 +447,7 @@ bool LoadPreset(const std::filesystem::path& file,
       return SectionError(section, validation, error);
     }
     models->push_back({section.modality, section.id, std::move(argv), {}});
+    models->back().aliases = std::move(aliases);
     models->back().hints = hints;
     return true;
   };

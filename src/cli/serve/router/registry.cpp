@@ -1,5 +1,6 @@
 #include "src/cli/serve/router/registry.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -62,6 +63,19 @@ bool Registry::DeadlineExpired(const Entry& entry) const {
 const PresetModel* Registry::Find(std::string_view model_id) const {
   const Entry* entry = Lookup(model_id);
   return entry == nullptr ? nullptr : &entry->preset;
+}
+
+std::string Registry::CanonicalId(std::string_view name) const {
+  if (Lookup(name) != nullptr) {
+    return std::string(name);
+  }
+  for (const auto& entry : entries_) {
+    const auto& aliases = entry.preset.aliases;
+    if (std::find(aliases.begin(), aliases.end(), name) != aliases.end()) {
+      return entry.preset.id;
+    }
+  }
+  return "";
 }
 
 std::vector<std::pair<std::string, bool>> Registry::Listing() const {

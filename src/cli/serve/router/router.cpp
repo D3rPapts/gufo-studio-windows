@@ -76,8 +76,8 @@ constexpr std::string_view kPresetGrammar =
     "                                   --remote-allow (required)\n"
     "      modality = image             llm|image|video|tts|asr|embedding|\n"
     "                                   omni, as listed (required)\n"
-    "      api-key-env = NAME           environment variable with the remote\n"
-    "                                   router's --api-key\n"
+    "      api-key-env = NAME           environment variable with a bearer\n"
+    "                                   key for a 1.x remote router\n"
     "      connect-timeout-seconds = 3  unreachable -> 503 remote_unavailable\n"
     "      head-timeout-seconds = 0     response head deadline (0 = none)\n"
     "      gpu-slot = NAME              remote models sharing NAME run one\n"
@@ -978,6 +978,12 @@ public:
       return Err(404, "Not Found", "no route for this path",
                  "invalid_request_error", "not_found");
     }
+    // A `served-model-name` alias (#957) routes to its section; the body
+    // keeps the alias, which the upstream worker accepts.
+    if (std::string canonical = registry.CanonicalId(resolved.model_id);
+        !canonical.empty()) {
+      resolved.model_id = std::move(canonical);
+    }
     const std::string& model_id = resolved.model_id;
     const router::PresetModel* preset = registry.Find(model_id);
     if (preset == nullptr) {
@@ -1147,8 +1153,8 @@ public:
   /// requests, sockets and jobs already running finish where they started
   /// (never cut off), and a local worker left without local work is
   /// unloaded by the supervision tick. Answers the placements of all
-  /// switchable models and the ids that changed. Protected like
-  /// /models/load: the router's --api-key, when set. Not persisted: a
+  /// switchable models and the ids that changed. Unauthenticated like the
+  /// rest of the router since upstream #967 (trusted LAN). Not persisted: a
   /// restart starts from the preset's `placement` again.
   HttpResponse PlacementControl(const HttpRequest& req) {
     if (req.method != "GET" && req.method != "POST") {
@@ -2680,7 +2686,6 @@ int RunRouter(std::span<const char* const> args) {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
   ServerLogOptions log_options;
 
   ArgParser parser("gufo router",
@@ -2809,7 +2814,7 @@ int RunRouter(std::span<const char* const> args) {
                    "(Windows; default: 1)",
                    "Memory", &abort_commit_gb);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
-                   &max_request_body_bytes, &api_key, &log_options);
+                   &max_request_body_bytes, &log_options);
 
   // A bare `help` argument (e.g. `gufo router help`) prints the router help,
   // matching sibling commands; ArgParser only understands --help/-h.
@@ -2959,9 +2964,11 @@ int RunRouter(std::span<const char* const> args) {
   // The ComfyUI adapter and the job API call the router's own API.
   RouterState* const raw = state.get();
   router::comfy::Fetch self_fetch;
-  if (api_key.empty()) {
+  {
     // Jobs go through the front like any client, so they show up in the
-    // request log and count as busy for idle checks.
+    // request log and count as busy for idle checks. (release/1.4 dispatched
+    // in process when --api-key was set; the router has no front key since
+    // upstream #967 dropped API-key auth.)
     const std::string self_host =
         host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
             ? "127.0.0.1"
@@ -2971,11 +2978,6 @@ int RunRouter(std::span<const char* const> args) {
       target.host = self_host;
       target.port = port;
       return CollectResponse(router::ProxyToWorker(target, request));
-    };
-  } else {
-    // The loopback relay drops Authorization; dispatch in process instead.
-    self_fetch = [raw](const HttpRequest& request) {
-      return CollectResponse(raw->Dispatch(request));
     };
   }
   {
@@ -3039,7 +3041,6 @@ int RunRouter(std::span<const char* const> args) {
   HttpServerOptions options;
   options.max_request_body_bytes = max_request_body_bytes;
   options.max_connections = max_connections;
-  options.api_key = api_key;
   // SIGTERM only stops the listener here; the drain below keeps established
   // connections (and their relays) alive until they finish or the drain
   // window ends, instead of the front severing them on the signal.

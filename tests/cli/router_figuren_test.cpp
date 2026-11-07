@@ -11,9 +11,9 @@
 
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/figuren.hpp"
+#include "src/cli/serve/router/rgba_image.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
-#include "src/models/qwen_image_21/model.hpp"
 
 namespace json = gufo::json;
 namespace figuren = gufo::router::figuren;
@@ -24,13 +24,13 @@ using gufo::server::HttpRequest;
 namespace {
 
 std::string PngDataUrl(int width, int height, std::uint8_t shade) {
-  gufo::models::qwen_image_21::Image image;
+  gufo::router::image::RgbaImage image;
   image.width = width;
   image.height = height;
   image.rgba.assign(static_cast<std::size_t>(width) * height * 4, shade);
   for (std::size_t i = 3; i < image.rgba.size(); i += 4)
     image.rgba[i] = 255;
-  const auto png = gufo::models::qwen_image_21::EncodePng(image);
+  const auto png = gufo::router::image::EncodePng(image);
   return "data:image/png;base64," +
          gufo::router::comfy::Base64Encode(std::string_view(
              reinterpret_cast<const char*>(png.data()), png.size()));
