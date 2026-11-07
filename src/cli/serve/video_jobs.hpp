@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/serve/media/video_postprocess.hpp"
 #include "src/ext/video.hpp"
 
 namespace gufo::server {
@@ -47,6 +48,13 @@ struct VideoJobRequest {
   /// Provider-owned options and inputs (`VideoProvider::prepare_request`).
   std::string options_json;
   std::vector<ext::VideoAttachment> attachments;
+  /// gufo-studio-windows post-steps after the runner (RIFE, Real-ESRGAN);
+  /// need VideoJobServiceOptions::postprocessors.
+  VideoPostProcess post;
+  /// Post-processing only (MP4 bytes, e.g. ComfyUI LoadVideo -> RIFE VFI):
+  /// nothing is generated, the upload is interpolated and/or upscaled. Needs
+  /// a post-step; prompt, size and parameters are not used.
+  std::vector<std::uint8_t> source_video;
 };
 
 struct VideoJobSnapshot {
@@ -89,6 +97,9 @@ struct VideoJobServiceOptions {
                      ext::VideoProgress, void*, ext::VideoTelemetry*,
                      std::string*)>
       runner;
+  /// gufo-studio-windows: RIFE / Real-ESRGAN post-steps; empty members
+  /// reject requests that ask for them.
+  VideoPostProcessors postprocessors;
 };
 
 struct VideoJobCreateResult {

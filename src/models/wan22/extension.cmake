@@ -89,6 +89,7 @@ gufo_extension_target(
     ${PROJECT_SOURCE_DIR}/tests/models/wan22/video_request_test.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/video_api.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/video_jobs.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/media/video_postprocess.cpp
   LINK_LIBRARIES
     gufo_wan22
     gufo_logging

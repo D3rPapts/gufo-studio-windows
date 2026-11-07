@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/media/video_postprocess.hpp"
 #include "src/core/json.hpp"
 #include "src/ext/video.hpp"
 
@@ -461,6 +462,7 @@ std::string StatusReason(int status) {
 // the model name and queues the result.
 HttpResponse CreatePreparedVideo(const json::Value& body,
                                  const std::vector<ext::VideoAttachment>& files,
+                                 VideoPostProcess post,
                                  VideoJobService& service) {
   const ext::VideoProvider* provider = service.provider();
   const json::Value* model_value = body.find("model");
@@ -502,6 +504,29 @@ HttpResponse CreatePreparedVideo(const json::Value& body,
       .seed = prepared.seed,
       .options_json = std::move(prepared.options_json),
       .attachments = std::move(prepared.attachments),
+      .post = std::move(post),
+  }));
+}
+
+// gufo-studio-windows: post-processing of an existing MP4 on any video
+// server ({"model", "source_video", "gufo": {"interpolate", "upscale"}}).
+// Nothing is generated; the video is interpolated with RIFE and/or
+// upscaled, audio kept.
+HttpResponse CreateProcessVideo(const json::Value& body,
+                                const std::vector<ext::VideoAttachment>& files,
+                                VideoPostProcess post,
+                                VideoJobService& service) {
+  std::vector<std::uint8_t> source;
+  VideoPostProcessError error;
+  if (!ParseSourceVideoRequest(body, files, &source, &error)) {
+    return Error(400, "Bad Request", std::move(error.message),
+                 std::move(error.code));
+  }
+  return CreatedResponse(service.Create({
+      .model = service.model_id(),
+      .output_format = "mp4",
+      .post = std::move(post),
+      .source_video = std::move(source),
   }));
 }
 
@@ -539,8 +564,19 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
   }
+  // gufo-studio-windows post-steps (src/cli/serve/media): taken out of
+  // "gufo" here, so providers never see them, and run after any runner.
+  VideoPostProcess post;
+  VideoPostProcessError post_error;
+  if (!ExtractVideoPostProcess(&body, &post, &post_error)) {
+    return Error(400, "Bad Request", std::move(post_error.message),
+                 std::move(post_error.code));
+  }
+  if (IsSourceVideoRequest(body, files)) {
+    return CreateProcessVideo(body, files, std::move(post), service);
+  }
   if (provider != nullptr && provider->prepare_request != nullptr) {
-    return CreatePreparedVideo(body, files, service);
+    return CreatePreparedVideo(body, files, std::move(post), service);
   }
   // Unknown members are ignored, as in the other OpenAI-compatible servers;
   // known conditioning fields are refused rather than silently dropped.
@@ -708,6 +744,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .seed = seed,
       .options_json = {},
       .attachments = {},
+      .post = std::move(post),
   });
   return CreatedResponse(created);
 }

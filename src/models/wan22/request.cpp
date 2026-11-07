@@ -240,9 +240,8 @@ bool ParseBody(const ext::VideoRequestInput& input, Body* body,
   return true;
 }
 
-// "gufo.preview" (no preview service on 2.0 yet: checked, then ignored),
-// "gufo.interpolate" and "gufo.upscale" (RIFE / Real-ESRGAN post-steps are
-// not part of the video capability; they come back with Wave C).
+// "gufo.preview" (no preview service on 2.0 yet: checked, then ignored).
+// "gufo.interpolate" and "gufo.upscale" never reach the provider (see below).
 bool CheckPostSteps(const json::Value& extension,
                     ext::VideoRequestError* error) {
   if (const json::Value* preview = extension.find("preview")) {
@@ -263,17 +262,9 @@ bool CheckPostSteps(const json::Value& extension,
                   "'gufo.preview' needs a boolean 'always', 'every' >= 1 and "
                   "'max_side' >= 16");
   }
-  if (const json::Value* interpolate = extension.find("interpolate")) {
-    const auto multiplier = JsonFrame(interpolate);
-    if (!multiplier.has_value() || *multiplier != 1)
-      return Fail(error, "unsupported_postprocess",
-                  "'gufo.interpolate' (RIFE) is not available on this server "
-                  "yet; interpolate the finished video separately");
-  }
-  if (extension.contains("upscale"))
-    return Fail(error, "unsupported_postprocess",
-                "'gufo.upscale' (Real-ESRGAN) is not available on this server "
-                "yet; upscale the finished video separately");
+  // "interpolate" / "upscale" are post-steps of the server
+  // (src/cli/serve/media/video_postprocess): it takes them out of "gufo"
+  // before this provider sees the request and runs them on the finished MP4.
   return true;
 }
 

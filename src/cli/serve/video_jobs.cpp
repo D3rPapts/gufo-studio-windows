@@ -320,6 +320,9 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "media") {
     return scaled(97, 99);
   }
+  if (const auto post = VideoPostProcessPercent(phase, completed, total)) {
+    return *post;
+  }
   return 1;
 }
 
@@ -710,6 +713,7 @@ struct VideoJobService::Impl {
           .options_json = job->request.options_json,
           .attachments = {},
       };
+      std::vector<std::uint8_t> source_video;
       {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
@@ -718,6 +722,8 @@ struct VideoJobService::Impl {
         // Inputs are needed once; the job keeps only its metadata.
         generation.attachments = std::move(job->request.attachments);
         job->request.attachments.clear();
+        source_video = std::move(job->request.source_video);
+        job->request.source_video.clear();
       }
       const std::string prompt_hash =
           crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -746,11 +752,23 @@ struct VideoJobService::Impl {
       ext::VideoTelemetry telemetry;
       std::string error;
       bool success = false;
+      const ext::CancellationCheck is_cancelled = [&] {
+        return job->cancelled.load(std::memory_order_relaxed);
+      };
       try {
-        success = options.runner(
-            generation,
-            [&] { return job->cancelled.load(std::memory_order_relaxed); },
-            Progress, &progress, &telemetry, &error);
+        if (!source_video.empty()) {
+          // Post-processing only: the upload stands in for the generated MP4.
+          std::ofstream source(generation.output_path, std::ios::binary);
+          source.write(reinterpret_cast<const char*>(source_video.data()),
+                       static_cast<std::streamsize>(source_video.size()));
+          success = static_cast<bool>(source.flush());
+          if (!success)
+            error = "cannot store the uploaded source video";
+          std::vector<std::uint8_t>().swap(source_video);
+        } else {
+          success = options.runner(generation, is_cancelled, Progress,
+                                   &progress, &telemetry, &error);
+        }
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -766,6 +784,13 @@ struct VideoJobService::Impl {
       std::string media_type;
       bool output_ready =
           success && !job->cancelled.load(std::memory_order_relaxed);
+      if (output_ready && job->request.output_format == "mp4" &&
+          job->request.post.enabled()) {
+        // gufo-studio-windows post-steps (src/cli/serve/media).
+        output_ready = RunVideoPostProcess(
+            job->request.post, options.postprocessors, job->directory,
+            job->snapshot.id, is_cancelled, Progress, &progress);
+      }
       if (output_ready && job->request.output_format == "mp4") {
         content_path = job->directory / "output.mp4";
         media_type = "video/mp4";
@@ -931,20 +956,41 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .error = initialization_error()};
   }
   const ext::VideoProvider* video = impl_->provider;
-  // Prepared providers decide whether a prompt is required (an empty prompt
-  // is legal for image- or audio-driven video).
-  if (!IsServedModel(video, request.model) ||
-      (request.prompt.empty() && !IsPreparedProvider(video)) ||
-      request.prompt.find('\0') != std::string::npos ||
-      (request.output_format != "mp4" && request.output_format != "ppm") ||
-      (!IsPreparedProvider(video) &&
-       !ValidateGenerationParameters(video, request.parameters, nullptr)) ||
-      (IsPreparedProvider(video) && video->validate_parameters != nullptr &&
-       !ValidateGenerationParameters(video, request.parameters, nullptr)) ||
-      !MatchesOutputContract(video, request)) {
+  const bool process_only = !request.source_video.empty();
+  std::string post_error;
+  if (process_only) {
+    // Post-processing only: the generator's request shape does not apply.
+    if (request.output_format != "mp4" || !request.post.enabled()) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "'source_video' needs MP4 output and 'interpolate' or "
+                       "'upscale'"};
+    }
+  } else if (!IsServedModel(video, request.model) ||
+             // Prepared providers decide whether a prompt is required (an
+             // empty prompt is legal for image- or audio-driven video).
+             (request.prompt.empty() && !IsPreparedProvider(video)) ||
+             request.prompt.find('\0') != std::string::npos ||
+             (request.output_format != "mp4" &&
+              request.output_format != "ppm") ||
+             (!IsPreparedProvider(video) &&
+              !ValidateGenerationParameters(video, request.parameters,
+                                            nullptr)) ||
+             (IsPreparedProvider(video) &&
+              video->validate_parameters != nullptr &&
+              !ValidateGenerationParameters(video, request.parameters,
+                                            nullptr)) ||
+             !MatchesOutputContract(video, request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
             .error = "invalid video job request for " + video->id};
+  }
+  // gufo-studio-windows post-steps (src/cli/serve/media).
+  if (!ValidateVideoPostProcess(request.post, impl_->options.postprocessors,
+                                request.output_format, &post_error)) {
+    return {.result = VideoJobResult::kInvalid,
+            .job = std::nullopt,
+            .error = std::move(post_error)};
   }
 
   auto job = std::make_shared<Impl::Job>();
@@ -952,9 +998,11 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   job->snapshot.id = impl_->options.id_factory();
   job->snapshot.status = VideoJobStatus::kQueued;
   job->snapshot.created_at = impl_->options.now();
-  job->snapshot.model = request.model;
-  job->snapshot.size = request.size;
-  job->snapshot.seconds = request.seconds;
+  // A post-processing-only job is recorded under the served model with a
+  // size and duration every provider recovers after a restart.
+  job->snapshot.model = process_only ? model_id() : request.model;
+  job->snapshot.size = process_only ? std::string("512x512") : request.size;
+  job->snapshot.seconds = process_only ? std::string("1") : request.seconds;
   job->snapshot.output_format = request.output_format;
   if (!IsVideoId(job->snapshot.id)) {
     WipeString(&job->request.prompt);

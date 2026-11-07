@@ -412,6 +412,8 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  # gufo-studio-windows: RIFE / Real-ESRGAN post-steps of video jobs.
+  src/cli/serve/media/video_postprocess.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -1016,6 +1018,7 @@ endfunction()
     add_executable(video_jobs_test
       tests/cli/video_jobs_test.cpp
       src/cli/serve/video_jobs.cpp
+      src/cli/serve/media/video_postprocess.cpp
     )
     target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core
       ${gufo_minimax_h3_test_libraries} gufo_cache gufo_ext_runtime)
@@ -1027,6 +1030,7 @@ endfunction()
       tests/cli/video_api_test.cpp
       src/cli/serve/video_api.cpp
       src/cli/serve/video_jobs.cpp
+      src/cli/serve/media/video_postprocess.cpp
     )
     target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core
       ${gufo_minimax_h3_test_libraries} gufo_cache gufo_ext_runtime)

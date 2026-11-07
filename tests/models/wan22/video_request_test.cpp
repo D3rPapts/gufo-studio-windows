@@ -19,6 +19,7 @@
 #include <gufo/ext/video.hpp>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -343,10 +344,14 @@ void TestWan22(const std::filesystem::path& root) {
            "invalid_negative_prompt", "a numeric negative prompt");
   Rejected(service, head + R"(,"gufo":{"lora":"x"}})", "invalid_strix_options",
            "an unknown Wan 2.2 option");
+  // Post-steps are the server's (src/cli/serve/media); this service has
+  // no --rife-model / --upscale-model.
   Rejected(service, head + R"(,"gufo":{"interpolate":2}})",
-           "unsupported_postprocess", "RIFE interpolation");
+           "invalid_video_request", "RIFE without an interpolator");
   Rejected(service, head + R"(,"gufo":{"upscale":"960x960"}})",
-           "unsupported_postprocess", "Real-ESRGAN upscaling");
+           "invalid_video_request", "Real-ESRGAN without an upscaler");
+  Rejected(service, head + R"(,"gufo":{"interpolate":9}})",
+           "invalid_interpolate", "a RIFE multiplier above 8");
   Rejected(service,
            R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"500x480","seconds":1})",
            "invalid_parameters", "a size off the 32-pixel grid");
@@ -594,7 +599,7 @@ void TestTalk(const std::filesystem::path& root) {
            "invalid_parameters", "a talk size above 896x512 pixels");
   Rejected(service,
            head + R"(,"gufo":{"interpolate":4,"talk":{)" + speech + "}}}",
-           "unsupported_postprocess", "RIFE on a talk video");
+           "invalid_video_request", "RIFE on a talk video without RIFE");
   Rejected(service,
            R"({"model":"wan2.1-infinitetalk-14b","prompt":"x","gufo":{"talk":{)" +
                speech + "}}}",
@@ -606,6 +611,139 @@ void TestTalk(const std::filesystem::path& root) {
 
 // Probing: a Wan 2.2 Diffusers directory or a talk bundle selects the Wan
 // provider over a generic provider that accepts every directory.
+// gufo.interpolate / gufo.upscale on a Wan job: the server takes them out of
+// the request (the provider never sees them) and runs them on the finished
+// MP4 in order; "source_video" jobs only post-process an upload.
+void TestPostSteps(const std::filesystem::path& root) {
+  FakeRunner runner;
+  auto options = Options(root, "wan2.2-ti2v-5b", &runner);
+  std::mutex seen_mutex;
+  std::vector<std::string> order;
+  gufo::server::VideoInterpolation seen_interpolation;
+  gufo::server::VideoUpscale seen_upscale;
+  const auto read_all = [](const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+  };
+  options.postprocessors.interpolator =
+      [&](const std::filesystem::path& input,
+          const std::filesystem::path& output,
+          const gufo::server::VideoInterpolation& spec,
+          const gufo::ext::CancellationCheck&, VideoProgress progress,
+          void* opaque, std::string*) {
+        progress("interpolate", 1, 2, opaque);
+        const std::lock_guard<std::mutex> lock(seen_mutex);
+        order.push_back("interpolate:" + read_all(input));
+        seen_interpolation = spec;
+        std::ofstream(output, std::ios::binary) << "interpolated";
+        return true;
+      };
+  options.postprocessors.upscaler =
+      [&](const std::filesystem::path& input,
+          const std::filesystem::path& output,
+          const gufo::server::VideoUpscale& spec,
+          const gufo::ext::CancellationCheck&, VideoProgress, void*,
+          std::string*) {
+        const std::lock_guard<std::mutex> lock(seen_mutex);
+        order.push_back("upscale:" + read_all(input));
+        seen_upscale = spec;
+        std::ofstream(output, std::ios::binary) << "upscaled";
+        return true;
+      };
+  options.postprocessors.upscale_models = {"anime", "general"};
+  VideoJobService service(std::move(options));
+  Check(service.ready(), service.initialization_error());
+  int calls = 0;
+  VideoRequest raw;
+  (void)Accept(
+      service, runner, &calls, wan22::Family::kWan22,
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"seed":3,"interpolate":{"fps":60},"upscale":{"width":1920,"height":1080,"fit":"crop","model":"general"}}})",
+      {}, &raw);
+  {
+    const std::lock_guard<std::mutex> lock(seen_mutex);
+    Check(raw.options_json.find("interpolate") == std::string::npos &&
+              raw.options_json.find("upscale") == std::string::npos,
+          "the provider never sees the post-steps: " + raw.options_json);
+    Check(order.size() == 2 && order[0] == "interpolate:fake-video" &&
+              order[1] == "upscale:interpolated",
+          "RIFE runs on the generated MP4, Real-ESRGAN on its output");
+    Check(seen_interpolation.fps_num == 60 &&
+              seen_interpolation.multiplier == 1 &&
+              seen_upscale.width == 1920 && seen_upscale.height == 1080 &&
+              seen_upscale.fit == "crop" && seen_upscale.model == "general",
+          "post-steps get the requested rate, size, fit and model");
+    order.clear();
+  }
+
+  // A "gufo" object with only post-steps is removed before the provider.
+  (void)Accept(
+      service, runner, &calls, wan22::Family::kWan22,
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1,"gufo":{"interpolate":2}})");
+  {
+    const std::lock_guard<std::mutex> lock(seen_mutex);
+    Check(order.size() == 1 && seen_interpolation.multiplier == 2,
+          "a multiplier alone runs RIFE only");
+    order.clear();
+  }
+
+  const std::string head =
+      R"({"model":"wan2.2-ti2v-5b","prompt":"fox","size":"480x480","seconds":1)";
+  Rejected(service, head + R"(,"gufo":{"upscale":"1921x1080"}})",
+           "invalid_video_request", "an odd upscale width");
+  Rejected(service,
+           head +
+               R"(,"gufo":{"upscale":{"width":1920,"height":1080,"model":"x"}}})",
+           "invalid_video_request", "an unknown upscale model");
+  Rejected(service,
+           head + R"(,"gufo":{"interpolate":{"fps":60,"multiplier":2}}})",
+           "invalid_interpolate", "fps and a multiplier together");
+
+  // Post-processing only: the upload stands in for the generated video.
+  const std::string upload(100, 'v');
+  const HttpResponse created =
+      Send(service,
+           R"({"model":"wan2.2-ti2v-5b","source_video":"data:video/mp4;base64,)" +
+               Base64(upload) + R"(","gufo":{"interpolate":4}})");
+  Check(created.status == 202, "source_video job accepted: " + created.body);
+  WaitCompleted(service, CreatedId(created));
+  {
+    const std::lock_guard<std::mutex> lock(seen_mutex);
+    Check(order.size() == 1 && order[0] == "interpolate:" + upload &&
+              seen_interpolation.multiplier == 4,
+          "source_video is interpolated without running the generator");
+  }
+  Check(gufo::json::parse(Get(service, CreatedId(created)).body)
+                .member_str("model") == "wan2.2-ti2v-5b",
+        "source_video jobs are recorded under the served model");
+  const std::string boundary = "post-boundary";
+  const HttpResponse multipart =
+      Send(service,
+           Multipart(boundary, {{"model", "wan2.2-ti2v-5b"},
+                                {"gufo", R"({"upscale":"1280x720"})"},
+                                {"source_video", upload, true}}),
+           "multipart/form-data; boundary=" + boundary);
+  Check(multipart.status == 202,
+        "multipart source_video accepted: " + multipart.body);
+  WaitCompleted(service, CreatedId(multipart));
+  {
+    const std::lock_guard<std::mutex> lock(seen_mutex);
+    Check(order.size() == 2 && order[1] == "upscale:" + upload,
+          "a multipart source_video is upscaled");
+  }
+  Rejected(service,
+           R"({"model":"wan2.2-ti2v-5b","source_video":"data:video/mp4;base64,)" +
+               Base64(upload) + R"("})",
+           "invalid_video_request", "source_video without a post-step");
+  Rejected(service,
+           R"({"model":"wan2.2-ti2v-5b","prompt":"x","source_video":"data:video/mp4;base64,)" +
+               Base64(upload) + R"(","gufo":{"interpolate":2}})",
+           "unsupported_field", "source_video with a prompt");
+  Rejected(service,
+           R"({"model":"wan2.2-ti2v-5b","source_video":"AAAA","gufo":{"interpolate":2}})",
+           "invalid_source_video", "a too short source_video");
+}
+
 void TestProbe(const std::filesystem::path& root) {
   gufo::ext::RegisterVideoProvider({
       .id = "generic-test",
@@ -664,6 +802,7 @@ int main() {
   TestVace(base / "vace");
   TestUni3C(base / "uni3c");
   TestTalk(base / "talk");
+  TestPostSteps(base / "post");
   TestProbe(base / "probe");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Wan video request tests passed.\n";
