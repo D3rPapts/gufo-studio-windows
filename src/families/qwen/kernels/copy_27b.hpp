@@ -15,6 +15,11 @@ namespace gufo::hip {
 void LaunchDeviceCopy27(void* dst, const void* src, std::size_t bytes,
                         hipStream_t stream);
 
+/// Zero fill as a kernel, like hipMemsetAsync(dst, 0, bytes). On Windows a
+/// large hipMemsetAsync in the DFlash2 server ran at ~0.5 GB/s (151 MB
+/// recurrent state: ~0.33 s per reset); the kernel writes the same zeros.
+void LaunchDeviceZero27(void* dst, std::size_t bytes, hipStream_t stream);
+
 /// Row-strided copy: `rows` rows of `row_bytes`, like hipMemcpy2DAsync.
 void LaunchDeviceCopy2D27(void* dst, std::size_t dst_pitch, const void* src,
                           std::size_t src_pitch, std::size_t row_bytes,

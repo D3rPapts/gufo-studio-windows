@@ -41,6 +41,21 @@ __global__ void Copy2DVec16Kernel(std::uint8_t* __restrict__ dst,
     out[i] = in[i];
 }
 
+__global__ void ZeroVec16Kernel(uint4* __restrict__ dst, std::size_t count) {
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) +
+                       threadIdx.x;
+       i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    dst[i] = make_uint4(0U, 0U, 0U, 0U);
+}
+
+__global__ void ZeroBytesKernel(std::uint8_t* __restrict__ dst,
+                                std::size_t count) {
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) +
+                       threadIdx.x;
+       i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    dst[i] = 0;
+}
+
 unsigned Blocks(std::size_t items) {
   // Enough waves to saturate memory; the loops are grid-stride.
   return static_cast<unsigned>(
@@ -119,6 +134,23 @@ void LaunchDeviceCopy27(void* dst, const void* src, std::size_t bytes,
   CopyBytesKernel<<<Blocks(bytes), kThreads, 0, stream>>>(
       static_cast<std::uint8_t*>(dst), static_cast<const std::uint8_t*>(src),
       bytes);
+}
+
+void LaunchDeviceZero27(void* dst, std::size_t bytes, hipStream_t stream) {
+  if (bytes == 0)
+    return;
+  auto* out = static_cast<std::uint8_t*>(dst);
+  std::size_t done = 0;
+  if (Aligned16(dst)) {
+    const std::size_t vectors = bytes / 16;
+    if (vectors != 0)
+      ZeroVec16Kernel<<<Blocks(vectors), kThreads, 0, stream>>>(
+          reinterpret_cast<uint4*>(out), vectors);
+    done = vectors * 16;
+  }
+  if (done != bytes)
+    ZeroBytesKernel<<<Blocks(bytes - done), kThreads, 0, stream>>>(
+        out + done, bytes - done);
 }
 
 void LaunchDeviceCopy2D27(void* dst, std::size_t dst_pitch, const void* src,

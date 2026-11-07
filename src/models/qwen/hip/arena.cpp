@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/copy_27b.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -1144,17 +1145,25 @@ void QwenGpuArena::Reset() {
   // Attention only reads positions through the current token. Prefill/decode
   // writes those rows before use; clearing reserved future KV adds O(capacity)
   // work to every short conversation and snapshot restore.
-  if (d_ssm_conv_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(d_ssm_conv_state, 0, total_conv * sizeof(float),
-                             stream));
-  }
-  if (d_ssm_deltanet_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(
-        d_ssm_deltanet_state, 0,
-        total_deltanet *
-            QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
-        stream));
-  }
+  // Windows: hipMemsetAsync of the ~160 MB recurrent state ran at ~0.5 GB/s
+  // in the DFlash2 server (330-400 ms per reset, twice per new prompt); a
+  // grid-stride kernel writes the same zeros in ~1-4 ms. GUFO_QWEN27_ZERO27=0
+  // restores the memset.
+  const auto zero = [&](void* buffer, std::size_t bytes) {
+#ifdef _WIN32
+    if (qwen27::Zero27On()) {
+      LaunchDeviceZero27(buffer, bytes, stream);
+      return;
+    }
+#endif
+    HIP_CHECK(hipMemsetAsync(buffer, 0, bytes, stream));
+  };
+  if (d_ssm_conv_state != nullptr)
+    zero(d_ssm_conv_state, total_conv * sizeof(float));
+  if (d_ssm_deltanet_state != nullptr)
+    zero(d_ssm_deltanet_state,
+         total_deltanet *
+             QwenRecurrentStateElementBytes(policy_.recurrent_state_storage));
   DisableSsmReplayCapture();
   saved_context_ = 0;
   replay_last_position_ = 0;
