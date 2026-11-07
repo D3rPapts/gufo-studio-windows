@@ -16,6 +16,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/prefault.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -208,6 +209,9 @@ struct Uploader {
         Fail("upload failed for " + std::string(t.name));
         return d;
       }
+      // This is the one weight read through the file view: drop the chunk's
+      // pages, or on Windows the whole head stays in the working set (#829).
+      platform::ReleaseMappedPages(src + r0 * src_row, n * src_row);
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
                          nullptr);
