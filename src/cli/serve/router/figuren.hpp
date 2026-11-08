@@ -57,7 +57,7 @@
 //   -> {"verfahren": "ccip", "figuren": [{"name": figure | "unbekannt",
 //        "box": face box [x0,y0,x1,y1], "kopf_box": head crop, "gesicht": score,
 //        "beste", "zweitbeste", "abstand", "diff": {figure: 0..1},
-//        "kandidaten": [top 3 names], "passend": [kept names],
+//        "kandidaten": [every figure by diff], "passend": [kept names],
 //        "merkmale": {...} | null, "llm_gefragt": bool, "begruendung"}],
 //       "sekunden": n}
 //   People come from the anime face detector (YOLOv8n, letterbox 640, conf
@@ -67,7 +67,7 @@
 //   reference image (whole image AND its own centre-face head crop, for kopf,
 //   front and bilder) and every gallery image (centre-face head crop, the
 //   whole image when no face is found). The decision is DecideCcip
-//   (figuren_ccip.hpp): top 3 by diff, the 27B (own /v1/chat/completions,
+//   (figuren_ccip.hpp): every figure by diff, the 27B (own /v1/chat/completions,
 //   thinking off, temperature 0, head crop at most 512 px) reads moustache,
 //   full beard, glasses and hair; candidates whose Steckbrief features (read
 //   once per text by the 27B, cached in the process) contradict are dropped;
