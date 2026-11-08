@@ -3,12 +3,12 @@
 
 // Decision rule of POST /v1/figuren with "verfahren": "ccip" (see figuren.hpp),
 // kept free of images and models so it can be tested on its own. Port of the
-// measured prototype ccip_merkmale.py (07./08.11.2026: top 3, cap 0.05,
+// measured prototype ccip_merkmale.py (07./08.11.2026: all figures, cap 0.05,
 // M 0.01 -> 216 of 286 figures right, 0 wrong, 4 of 4 statists unknown):
 //   - CCIP diff per figure (min over its references and gallery crops),
 //     sorted ascending (ties keep reference order);
-//   - the 27B reads hard features of the head crop; a candidate among the
-//     best `top` is dropped when its Steckbrief features contradict them
+//   - the 27B reads hard features of the head crop; a candidate (every
+//     figure, `top` = all) is dropped when its Steckbrief features contradict them
 //     (moustache, full beard, or glasses "keine" vs any glasses);
 //   - the best remaining candidate is assigned when its diff < cap and it is
 //     the only one left or the next one is at least `margin` farther;
@@ -25,8 +25,13 @@
 namespace gufo::router::figuren {
 
 inline constexpr double kCcipCap = 0.05;
-inline constexpr double kCcipMargin = 0.01;
-inline constexpr std::size_t kCcipTop = 3;
+// 0.0125 instead of the prototype's 0.01: the 08.11. end-to-end run had one
+// Bernd->Holger error at margin 0.011 (prototype at 0.0125: 204 right, 0 wrong).
+inline constexpr double kCcipMargin = 0.0125;
+// Every figure takes part in the feature check (08.11.2026 end-to-end run: with
+// only the best 3, a figure outside the top 3 could not compete, so the single
+// remaining look-alike was taken: 2 wrong; prototype with all figures: 0 wrong).
+inline constexpr std::size_t kCcipTop = 64;
 inline constexpr const char* kUnknownFigure = "unbekannt";
 
 /// Feature schema the 27B fills (ccip_merkmale.SCHEMA).

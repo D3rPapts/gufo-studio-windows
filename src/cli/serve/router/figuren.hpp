@@ -52,7 +52,7 @@
 //                      "bilder": ["<image>", ...]}, ...],   front/bilder optional
 //      "galerie": [{"name": "Lars", "bild": "<head crop from another shot>"}],
 //      "steckbrief": {"Lars": "appearance text"},  optional
-//      "ccip_cap": 0.05, "ccip_abstand": 0.01,       optional
+//      "ccip_cap": 0.05, "ccip_abstand": 0.0125,     optional
 //      "modell": "qwen3.8-27b"}                      optional
 //   -> {"verfahren": "ccip", "figuren": [{"name": figure | "unbekannt",
 //        "box": face box [x0,y0,x1,y1], "kopf_box": head crop, "gesicht": score,
