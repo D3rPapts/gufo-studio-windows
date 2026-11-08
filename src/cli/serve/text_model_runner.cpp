@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -193,11 +194,31 @@ std::size_t HostSnapshotBudgetBytes() {
   return ClampToSize(HostAvailableBytes() / 2);
 }
 
+std::uint64_t HostSnapshotHeadroomBytes() {
+  static const std::uint64_t headroom = [] {
+    const char* text = std::getenv("GUFO_HOST_RESERVE_MIB");
+    if (!text || !*text)
+      return kHostSnapshotHeadroomBytes;
+    std::uint64_t mib = 0;
+    const auto end = text + std::char_traits<char>::length(text);
+    const auto parsed = std::from_chars(text, end, mib);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || mib < 512 ||
+        mib > 16384) {
+      Logger::Warn("cache", std::string("event=option_ignored "
+                                        "option=GUFO_HOST_RESERVE_MIB value=") +
+                                text + " reason=range_512_16384");
+      return kHostSnapshotHeadroomBytes;
+    }
+    Logger::Info("cache", "event=host_reserve mib=" + std::to_string(mib));
+    return mib << 20;
+  }();
+  return headroom;
+}
+
 std::size_t HostSnapshotCeilingBytes() {
   const auto available = HostAvailableBytes();
-  return ClampToSize(available > kHostSnapshotHeadroomBytes
-                         ? available - kHostSnapshotHeadroomBytes
-                         : 0);
+  const auto headroom = HostSnapshotHeadroomBytes();
+  return ClampToSize(available > headroom ? available - headroom : 0);
 }
 
 std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
