@@ -183,6 +183,7 @@ struct FakeApi {
   std::atomic<bool> release{false};
   int video_polls{0};
   bool video_deleted{false};
+  int unreachable_calls{0};
 
   jobs::FetchResult operator()(const HttpRequest& request) {
     {
@@ -200,6 +201,19 @@ struct FakeApi {
         while (!release.load() &&
                !(request.is_cancelled && request.is_cancelled()))
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (prompt.find("UNREACHABLE") != std::string::npos) {
+        // The router's 503 for a remote that went away (ONCE: only the
+        // first call).
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (++unreachable_calls == 1 ||
+            prompt.find("ONCE") == std::string::npos) {
+          result.status = 503;
+          result.body =
+              R"({"error":{"message":"remote model 'qwen-image' is )"
+              R"(unreachable: connect","code":"remote_unavailable"}})";
+          return result;
+        }
       }
       if (prompt.find("FAIL") != std::string::npos) {
         result.status = 500;
@@ -469,6 +483,26 @@ void TestFailedJob() {
   CHECK(error->member_double("status_code") == 500);
 }
 
+void TestRequeueOnceWhenRemoteGone() {
+  {
+    Harness h("requeue-once");
+    const json::Value job = h.Submit(ImageJob("UNREACHABLE ONCE"));
+    h.WaitFor(job.member_str("id"), "completed");
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(h.api->unreachable_calls == 2);
+  }
+  {
+    Harness h("requeue-gives-up");
+    const json::Value job = h.Submit(ImageJob("UNREACHABLE"));
+    const json::Value done = h.WaitFor(job.member_str("id"), "failed");
+    const json::Value* error = done.find("error");
+    CHECK(error != nullptr &&
+          error->member_str("code") == "remote_unavailable");
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(h.api->unreachable_calls == 2);  // the first run and one requeue
+  }
+}
+
 void TestBinaryResult() {
   Harness h("speech");
   const json::Value job = h.Submit(
@@ -684,6 +718,7 @@ int main() {
   TestSignature();
   TestImageLifecycle();
   TestFailedJob();
+  TestRequeueOnceWhenRemoteGone();
   TestBinaryResult();
   TestSubmitRejections();
   TestCancel();
