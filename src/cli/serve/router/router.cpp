@@ -30,6 +30,7 @@
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/names.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
@@ -92,7 +93,20 @@ constexpr std::string_view kPresetGrammar =
     "    \"placement\": \"local\"|\"remote\"} (or {\"all\": ...}) moves it at\n"
     "    runtime; running requests finish where they started. In the remote\n"
     "    section, modality may be left out and\n"
-    "      placement = local            start placement (local|remote)\n\n";
+    "      placement = local            start placement (local|remote|pool)\n"
+    "    placement = pool serves the model on both machines: each new POST\n"
+    "    goes to a machine that has it loaded and free (this one first), else\n"
+    "    to an idle machine that loads it (no other model loaded first, then\n"
+    "    one whose loaded models are all idle), else it waits up to\n"
+    "    queue-timeout-seconds. Never to a machine with GPU work (its ComfyUI\n"
+    "    adapter queue not empty, or an image/video/music model busy); at\n"
+    "    most one relay at a time per model to the remote; a remote that\n"
+    "    cannot be reached leaves this machine only, and a chat that got no\n"
+    "    answer from it is retried here once. After a machine held the model\n"
+    "    the other one loads it only once a request waited 10 s. Job reads\n"
+    "    follow their job; relayed requests (X-Gufo-Forwarded) stay here.\n"
+    "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
+    "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
 
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
@@ -231,10 +245,13 @@ json::Value AutoloadFailureJson(const AutoloadFailure& failure) {
 
 /// Router-managed paths answered by the front itself. Returns nullopt when
 /// the path belongs to the model-routing table instead.
-std::optional<HttpResponse> RouteFront(const router::Registry& registry,
-                                       const AutoloadFailures& failures,
-                                       const router::RemoteHub* remotes,
-                                       const HttpRequest& req) {
+/// `activity` (may be empty) gives the "activity" object of a model served
+/// here (placement = pool: the partner router's probe reads it).
+std::optional<HttpResponse> RouteFront(
+    const router::Registry& registry, const AutoloadFailures& failures,
+    const router::RemoteHub* remotes, const HttpRequest& req,
+    const std::function<json::Value(const router::PresetModel&)>& activity =
+        {}) {
   if (req.method == "GET" && (req.path == "/health" || req.path == "/healthz" ||
                               req.path == "/v1/health")) {
     json::Value body = json::Value::object();
@@ -275,7 +292,15 @@ std::optional<HttpResponse> RouteFront(const router::Registry& registry,
             router::PlacementName(registry.PlacementOf(preset->id));
         model["remote_url"] =
             "http://" + router::EndpointKey(preset->remote->url);
+        json::Value inflight = json::Value::object();
+        inflight["local"] =
+            static_cast<long long>(registry.LocalRequests(preset->id));
+        inflight["remote"] =
+            static_cast<long long>(registry.RemoteRequests(preset->id));
+        model["inflight"] = std::move(inflight);
       }
+      if (activity && !registry.RoutesRemote(preset->id))
+        model["activity"] = activity(*preset);
       if (registry.RoutesRemote(preset->id)) {
         const router::RemoteEndpoint& url = preset->remote->url;
         std::string error;
@@ -912,7 +937,10 @@ public:
       return ModelsControlLocked(req, lock);
     }
     if (const auto front =
-            RouteFront(registry, autoload_failed, remotes.get(), req)) {
+            RouteFront(registry, autoload_failed, remotes.get(), req,
+                       [this](const router::PresetModel& model) {
+                         return ActivityLocked(model.id);
+                       })) {
       return *front;
     }
     if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
@@ -992,10 +1020,27 @@ public:
     if (preset == nullptr) {
       return ModelNotFoundError();
     }
+    if (PooledLocked(*preset, req, music_job)) {
+      // placement = pool: this machine or the remote, per request.
+      return DispatchPoolLocked(req, model_id, *preset, music_job, lock);
+    }
     if (RoutesRemoteLocked(*preset, req, music_job)) {
       // Another router owns the model: no admission, load or memory here.
       return DispatchRemoteLocked(req, model_id, *preset->remote, lock);
     }
+    return DispatchLocalLocked(req, model_id, *preset, music_job, lock);
+  }
+
+  /// Serves a request on the local worker (state mutex held on entry;
+  /// released on the relay paths, held on the early answers). With
+  /// `admission_failed`, a failed load or admission sets it to true.
+  HttpResponse DispatchLocalLocked(const HttpRequest& req,
+                                   const std::string& model_id,
+                                   const router::PresetModel& local_preset,
+                                   const std::string& music_job,
+                                   std::unique_lock<std::mutex>& lock,
+                                   bool* admission_failed = nullptr) {
+    const router::PresetModel* preset = &local_preset;
     const bool ws_relay =
         IsWebSocketPath(req) && server::IsWebSocketUpgrade(req);
     if (ws_relay) {
@@ -1029,6 +1074,8 @@ public:
     }
     auto admitted = AdmitLocked(model_id, *preset);
     if (const auto* failed = std::get_if<HttpResponse>(&admitted)) {
+      if (admission_failed != nullptr)
+        *admission_failed = true;
       return std::move(*failed);
     }
     const int worker_port = std::get<int>(admitted);
@@ -1149,10 +1196,341 @@ public:
     return registry.RoutesRemote(preset.id);
   }
 
+  /// placement = pool bookkeeping per model (state mutex held).
+  struct PoolEntry {
+    /// Pool requests between their local pick and their armed busy count
+    /// (a cold load releases the mutex for minutes meanwhile).
+    int local_claims{0};
+    /// Pool requests waiting for a free machine.
+    int waiting{0};
+    /// Last time the model was seen loaded here / on the remote router.
+    std::chrono::steady_clock::time_point local_warm_at{};
+    std::chrono::steady_clock::time_point remote_warm_at{};
+    /// A local load or admission failed: kPoolLocalFailHold off the worker.
+    bool local_failed{false};
+    std::chrono::steady_clock::time_point local_failed_at{};
+    long long local_picks{0};
+    long long remote_picks{0};
+    long long retried_local{0};
+    /// Last decision ("remote: warm").
+    std::string last;
+  };
+  std::map<std::string, PoolEntry> pool_;
+
+  /// Whether this request for `preset` is decided by the pool: a POST (new
+  /// work) to a model placed in the pool. Everything else is served like
+  /// placement = local, and job reads follow their job (RoutesRemoteLocked).
+  bool PooledLocked(const router::PresetModel& preset, const HttpRequest& req,
+                    const std::string& music_job) const {
+    (void)music_job;
+    return preset.switchable && preset.remote.has_value() &&
+           registry.PlacementOf(preset.id) == router::Placement::kPool &&
+           req.method == "POST";
+  }
+
+  /// The pool's busy rule (state mutex held): GPU work runs on this
+  /// machine, i.e. the ComfyUI adapter queue is not empty (ignored for the
+  /// adapter's own calls, `from_comfy`) or an image/video/music model other
+  /// than `model_id` has work in flight. Read in process, never over HTTP.
+  bool GpuBusyLocked(const std::string& model_id, bool from_comfy,
+                     std::string* reason) const {
+    if (!from_comfy && comfy != nullptr) {
+      if (const int queued = comfy->QueueRemaining(); queued > 0) {
+        if (reason != nullptr)
+          *reason = "comfy queue " + std::to_string(queued);
+        return true;
+      }
+    }
+    for (const auto& [preset, status] : registry.Statuses()) {
+      (void)status;
+      if (preset->id != model_id && router::IsGpuWorkModel(*preset) &&
+          registry.Busy(preset->id)) {
+        if (reason != nullptr)
+          *reason = preset->id + " busy";
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Anything but `model_id` in flight here: another model's request,
+  /// socket or job, the ComfyUI queue (unless `from_comfy`) or another pool
+  /// model's claimed or waiting request.
+  bool OthersBusyLocked(const std::string& model_id, bool from_comfy) const {
+    if (!from_comfy && comfy != nullptr && comfy->QueueRemaining() > 0)
+      return true;
+    for (const auto& [preset, status] : registry.Statuses()) {
+      (void)status;
+      if (preset->id != model_id && registry.Busy(preset->id))
+        return true;
+    }
+    for (const auto& [id, entry] : pool_) {
+      if (id != model_id && (entry.local_claims > 0 || entry.waiting > 0))
+        return true;
+    }
+    return false;
+  }
+
+  /// GET /v1/models "activity" of a model served here: what the partner
+  /// router's pool reads from its probe.
+  json::Value ActivityLocked(const std::string& model_id) const {
+    json::Value out = json::Value::object();
+    bool busy = registry.Busy(model_id);
+    if (const auto it = pool_.find(model_id); it != pool_.end())
+      busy = busy || it->second.local_claims > 0 || it->second.waiting > 0;
+    out["busy"] = busy;
+    std::string reason;
+    const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
+    out["gpu_busy"] = gpu_busy;
+    if (gpu_busy)
+      out["gpu_busy_reason"] = reason;
+    out["others_busy"] = OthersBusyLocked(model_id, false);
+    return out;
+  }
+
+  /// Both machines as the pool decision sees them (state mutex held).
+  router::PoolInput PoolInputLocked(const router::PresetModel& preset,
+                                    bool forwarded, bool from_comfy,
+                                    bool remote_failed,
+                                    std::chrono::milliseconds waited) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto within = [now](std::chrono::steady_clock::time_point at) {
+      return at != std::chrono::steady_clock::time_point{} &&
+             now - at < router::kPoolSticky;
+    };
+    PoolEntry& pool = pool_[preset.id];
+    router::PoolInput in;
+    in.forwarded = forwarded;
+    in.waited = waited;
+
+    std::string_view status = "unloaded";
+    bool others_loaded = false;
+    for (const auto& [model, state] : registry.Statuses()) {
+      if (model->id == preset.id)
+        status = state;
+      else if (state != "unloaded")
+        others_loaded = true;
+    }
+    router::PoolSide& local = in.local;
+    local.available =
+        !(pool.local_failed &&
+          now - pool.local_failed_at < router::kPoolLocalFailHold);
+    local.warm = stopping.count(preset.id) == 0 &&
+                 (status == "loaded" || status == "loading");
+    local.free = !registry.Busy(preset.id) && pool.local_claims == 0;
+    local.gpu_busy = GpuBusyLocked(preset.id, from_comfy, nullptr);
+    local.idle = local.free && stopping.empty() &&
+                 !OthersBusyLocked(preset.id, from_comfy);
+    local.empty = !others_loaded;
+    if (local.warm)
+      pool.local_warm_at = now;
+    local.sticky = within(pool.local_warm_at);
+
+    router::PoolSide& remote = in.remote;
+    if (remotes != nullptr && !remote_failed) {
+      const router::RemoteEndpoint& url = preset.remote->url;
+      const router::RemoteHub::ModelView view = remotes->View(url, preset.id);
+      std::string error;
+      remote.available = view.served && remotes->Reachable(url, &error);
+      remote.warm = view.status == "loaded" || view.status == "loading";
+      const std::size_t ours = registry.RemoteRequests(preset.id);
+      // A probe from before our last relay ended may still count it.
+      const bool stale =
+          view.checked_at <= registry.LastRemoteFinished(preset.id);
+      const bool theirs = view.has_activity && view.activity.busy && !stale;
+      remote.free =
+          ours < static_cast<std::size_t>(router::kPoolRemoteCapacity) &&
+          gpu_slots.Idle(preset.remote->gpu_slot) && !theirs;
+      remote.gpu_busy = view.has_activity && view.activity.gpu_busy;
+      remote.idle = remote.free && ours == 0 &&
+                    !(view.has_activity && view.activity.others_busy);
+      remote.empty = !view.others_loaded;
+      if (remote.available && remote.warm)
+        pool.remote_warm_at = now;
+      remote.sticky = within(pool.remote_warm_at);
+    }
+    return in;
+  }
+
+  void NotePoolLocked(const std::string& model_id,
+                      const router::PoolDecision& decision,
+                      std::chrono::milliseconds waited) {
+    PoolEntry& pool = pool_[model_id];
+    pool.last = std::string(router::PoolChoiceName(decision.choice)) + ": " +
+                decision.reason;
+    Logger::Info("router", "event=pool model=" + model_id + " choice=" +
+                               router::PoolChoiceName(decision.choice) +
+                               " reason=\"" + decision.reason +
+                               "\" waited_ms=" +
+                               std::to_string(waited.count()));
+  }
+
+  /// placement = pool (see pool.hpp): picks this machine or the remote
+  /// router for one new request, waits (lock released) while neither fits,
+  /// up to the remote section's queue-timeout-seconds. A local load that
+  /// fails sends the request to the remote when it fits; a relay that got
+  /// no answer at all (connect failure, closed before the head) is decided
+  /// again without the remote, once, unless it created a job.
+  HttpResponse DispatchPoolLocked(const HttpRequest& req,
+                                  const std::string& model_id,
+                                  const router::PresetModel& preset,
+                                  const std::string& music_job,
+                                  std::unique_lock<std::mutex>& lock) {
+    constexpr std::chrono::milliseconds kPoolPoll{200};
+    const bool forwarded = !req.header(router::kForwardedHeader).empty();
+    const bool from_comfy =
+        !forwarded && req.header(router::kOriginHeader) == "comfy";
+    const bool may_retry = !IsVideoCreate(req) && !IsMusicCreate(req);
+    const auto began = std::chrono::steady_clock::now();
+    const auto deadline =
+        began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
+    bool remote_failed = false;
+    bool waiting = false;
+    std::optional<HttpResponse> local_failure;
+    const auto stop_waiting = [&] {
+      if (waiting) {
+        --pool_[model_id].waiting;
+        waiting = false;
+      }
+    };
+    for (;;) {
+      const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - began);
+      const router::PoolDecision decision =
+          router::ChoosePool(PoolInputLocked(preset, forwarded, from_comfy,
+                                             remote_failed, waited));
+      if (decision.choice == router::PoolChoice::kLocal) {
+        stop_waiting();
+        NotePoolLocked(model_id, decision, waited);
+        ++pool_[model_id].local_picks;
+        // The claim keeps the local worker "taken" for other pool requests
+        // until this one's busy count is armed (after a cold load).
+        struct Claim {
+          RouterState& state;
+          std::unique_lock<std::mutex>& lock;
+          const std::string& id;
+          ~Claim() {
+            if (!lock.owns_lock())
+              lock.lock();
+            --state.pool_[id].local_claims;
+          }
+        };
+        ++pool_[model_id].local_claims;
+        bool admission_failed = false;
+        std::optional<HttpResponse> response;
+        {
+          const Claim claim{*this, lock, model_id};
+          response = DispatchLocalLocked(req, model_id, preset, music_job, lock,
+                                         &admission_failed);
+        }
+        if (!admission_failed || forwarded)
+          return std::move(*response);
+        // The local worker cannot serve now: keep pool requests off it for
+        // a while and let the remote take this one if it fits.
+        PoolEntry& pool = pool_[model_id];
+        pool.local_failed = true;
+        pool.local_failed_at = std::chrono::steady_clock::now();
+        Logger::Warn("router", "event=pool_local_failed model=" + model_id +
+                                   " status=" +
+                                   std::to_string(response->status));
+        local_failure = std::move(response);
+        continue;
+      }
+      if (decision.choice == router::PoolChoice::kRemote) {
+        stop_waiting();
+        NotePoolLocked(model_id, decision, waited);
+        ++pool_[model_id].remote_picks;
+        pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
+        HttpResponse response =
+            DispatchRemoteLocked(req, model_id, *preset.remote, lock);
+        if (!lock.owns_lock())
+          lock.lock();
+        if (may_retry && !remote_failed && !response.streaming_body &&
+            response.status == 503 &&
+            response.log_details.starts_with("remote_unavailable")) {
+          // Nothing reached the client yet: decide again without the
+          // remote (this machine, or wait for it).
+          remote_failed = true;
+          ++pool_[model_id].retried_local;
+          Logger::Warn("router", "event=pool_retry_local model=" + model_id +
+                                     " detail=\"" + response.log_details +
+                                     "\"");
+          continue;
+        }
+        return response;
+      }
+      if (local_failure.has_value()) {
+        stop_waiting();
+        return std::move(*local_failure);
+      }
+      if (!waiting) {
+        waiting = true;
+        ++pool_[model_id].waiting;
+        NotePoolLocked(model_id, decision, waited);
+      }
+      const bool gone = req.is_cancelled && req.is_cancelled();
+      if (gone || std::chrono::steady_clock::now() >= deadline ||
+          stop_requested.load()) {
+        stop_waiting();
+        Logger::Warn("router", "event=pool_busy model=" + model_id +
+                                   " waited_ms=" +
+                                   std::to_string(waited.count()) +
+                                   (gone ? " client_left" : ""));
+        HttpResponse refused =
+            Err(503, "Service Unavailable",
+                "pool model '" + model_id +
+                    "' found no free machine (this one and the remote "
+                    "router) within " +
+                    std::to_string(preset.remote->queue_timeout_seconds) +
+                    " s",
+                "server_error", "pool_busy");
+        refused.headers.emplace_back("Retry-After", "30");
+        return refused;
+      }
+      lock.unlock();
+      std::this_thread::sleep_for(kPoolPoll);
+      lock.lock();
+    }
+  }
+
+  /// /router/status and /router/placement detail of a pool model.
+  json::Value PoolStatusLocked(const std::string& model_id) const {
+    json::Value out = json::Value::object();
+    out["local_inflight"] =
+        static_cast<long long>(registry.LocalRequests(model_id));
+    out["remote_inflight"] =
+        static_cast<long long>(registry.RemoteRequests(model_id));
+    std::string reason;
+    const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
+    out["local_gpu_busy"] = gpu_busy;
+    if (gpu_busy)
+      out["local_gpu_busy_reason"] = reason;
+    if (const auto it = pool_.find(model_id); it != pool_.end()) {
+      const PoolEntry& pool = it->second;
+      out["waiting"] = static_cast<long long>(pool.waiting);
+      out["local_claims"] = static_cast<long long>(pool.local_claims);
+      out["local_picks"] = pool.local_picks;
+      out["remote_picks"] = pool.remote_picks;
+      out["retried_local"] = pool.retried_local;
+      out["last"] = pool.last;
+      if (pool.local_failed) {
+        out["local_failed_s_ago"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - pool.local_failed_at)
+                .count());
+      }
+    } else {
+      out["waiting"] = 0LL;
+      out["local_picks"] = 0LL;
+      out["remote_picks"] = 0LL;
+    }
+    return out;
+  }
+
   /// GET|POST /router/placement. POST {"model": id, "placement":
-  /// "local"|"remote"} or {"all": "local"|"remote"} moves switchable models
-  /// (a local section with a `[remote/<id>]` twin) between the local worker
-  /// and the remote router without a restart. New requests follow at once;
+  /// "local"|"remote"|"pool"} or {"all": ...} moves switchable models
+  /// (a local section with a `[remote/<id>]` twin) between the local worker,
+  /// the remote router and the pool of both without a restart. New requests follow at once;
   /// requests, sockets and jobs already running finish where they started
   /// (never cut off), and a local worker left without local work is
   /// unloaded by the supervision tick. Answers the placements of all
@@ -1180,19 +1558,21 @@ public:
           model.empty() ? all : body.member_str("placement");
       if (!body.is_object() || model.empty() == all.empty()) {
         return Err(400, "Bad Request",
-                   "send {\"model\": id, \"placement\": \"local\"|\"remote\"} "
-                   "or {\"all\": \"local\"|\"remote\"}",
+                   "send {\"model\": id, \"placement\": "
+                   "\"local\"|\"remote\"|\"pool\"} or {\"all\": "
+                   "\"local\"|\"remote\"|\"pool\"}",
                    "invalid_request_error", "invalid_placement");
       }
-      if (target != "local" && target != "remote") {
+      if (target != "local" && target != "remote" && target != "pool") {
         return Err(400, "Bad Request",
-                   "placement takes \"local\" or \"remote\", not \"" + target +
-                       "\"",
+                   "placement takes \"local\", \"remote\" or \"pool\", not \"" +
+                       target + "\"",
                    "invalid_request_error", "invalid_placement");
       }
-      const router::Placement placement = target == "remote"
-                                              ? router::Placement::kRemote
-                                              : router::Placement::kLocal;
+      const router::Placement placement =
+          target == "remote" ? router::Placement::kRemote
+          : target == "pool" ? router::Placement::kPool
+                             : router::Placement::kLocal;
       std::vector<std::string> ids;
       if (!model.empty()) {
         const router::PresetModel* preset = registry.Find(model);
@@ -1236,6 +1616,8 @@ public:
               (placement == router::Placement::kRemote
                    ? "on the remote router (the local worker unloads when "
                      "its work is done)"
+                   : placement == router::Placement::kPool
+                   ? "in the pool (here and on the remote router)"
                    : "here again"));
         }
       }
@@ -1259,6 +1641,8 @@ public:
       entry["remote_reachable"] = reachable;
       if (!reachable)
         entry["remote_error"] = error;
+      if (registry.PlacementOf(preset->id) == router::Placement::kPool)
+        entry["pool"] = PoolStatusLocked(preset->id);
       models[preset->id] = std::move(entry);
     }
     json::Value moved = json::Value::array();
@@ -2138,6 +2522,8 @@ public:
             model["switchable"] = true;
             model["local_status"] = std::string(status);
             model["local_busy"] = registry.Busy(preset->id);
+            if (registry.PlacementOf(preset->id) == router::Placement::kPool)
+              model["pool"] = PoolStatusLocked(preset->id);
           }
           models[preset->id] = std::move(model);
         }
@@ -3115,7 +3501,7 @@ int RunRouter(std::span<const char* const> args) {
     std::vector<std::string> ids;
     for (const auto& model : models) {
       if (!model.remote.has_value() ||
-          (model.switchable && model.placement == router::Placement::kLocal))
+          (model.switchable && model.placement != router::Placement::kRemote))
         ids.push_back(model.id);
     }
     autoloader = std::thread(

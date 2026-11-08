@@ -152,14 +152,15 @@ bool ParseRemoteSection(const Section& section, PresetModel* model,
     std::string url_error;
     if (key == "placement") {
       const std::string_view text = TrimSpaces(value);
-      if (text != "local" && text != "remote") {
+      if (text != "local" && text != "remote" && text != "pool") {
         return SectionError(section,
-                            "placement takes local|remote, not '" + value +
-                                "'",
+                            "placement takes local|remote|pool, not '" +
+                                value + "'",
                             error);
       }
-      model->placement =
-          text == "remote" ? Placement::kRemote : Placement::kLocal;
+      model->placement = text == "remote" ? Placement::kRemote
+                         : text == "pool" ? Placement::kPool
+                                          : Placement::kLocal;
       *placement_given = true;
     } else if (key == "url") {
       if (!ParseRemoteUrl(value, /*allow_path=*/false, &spec.url,

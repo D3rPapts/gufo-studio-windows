@@ -54,11 +54,15 @@ struct RemoteSpec {
   std::size_t max_request_bytes{0};
 };
 
-/// Where a model's requests go: the local worker or the remote router.
-enum class Placement { kLocal, kRemote };
+/// Where a model's requests go: the local worker, the remote router, or
+/// (kPool, switchable models only) per request to whichever of the two is
+/// free; see pool.hpp.
+enum class Placement { kLocal, kRemote, kPool };
 
 [[nodiscard]] inline const char* PlacementName(Placement placement) {
-  return placement == Placement::kRemote ? "remote" : "local";
+  return placement == Placement::kRemote ? "remote"
+         : placement == Placement::kPool ? "pool"
+                                         : "local";
 }
 
 struct PresetModel {
@@ -84,7 +88,7 @@ struct PresetModel {
   /// moves it between the local worker and the remote router at runtime.
   bool switchable{false};
   /// Start placement: kRemote for `[remote/<id>]` alone, kLocal for a local
-  /// section; a twin's `placement = local|remote` key (default local).
+  /// section; a twin's `placement = local|remote|pool` key (default local).
   Placement placement{Placement::kLocal};
 };
 

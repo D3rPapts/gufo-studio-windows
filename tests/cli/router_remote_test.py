@@ -104,6 +104,7 @@ class FakeRemote:
         self.lock = threading.Lock()
         self.log = []  # dicts: path, method, auth, body, start, end
         self.states = {m: "unloaded" for m in models}
+        self.activity = {}  # model -> "activity" object in /v1/models
         self.videos = {}  # id -> status
         self.music = {}  # id -> [status, hold]
         self.load_delay = 0.0
@@ -153,6 +154,9 @@ class FakeRemote:
                         data = [{"id": m, "object": "model", "loaded": s == "loaded",
                                  "status": {"value": s, "args": []}}
                                 for m, s in remote.states.items()]
+                        for model in data:
+                            if model["id"] in remote.activity:
+                                model["activity"] = remote.activity[model["id"]]
                     return self.send(200, {"object": "list", "data": data})
                 self.record()
                 if path.startswith("/v1/previews/") and path.endswith("/events"):
