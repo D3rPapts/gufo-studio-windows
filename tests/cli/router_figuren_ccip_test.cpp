@@ -110,7 +110,7 @@ int main() {
     CHECK(b.name == c.expect_m0003);
     CHECK(a.beste == c.logged[0].name);
     CHECK(a.zweitbeste == c.logged[1].name);
-    CHECK(a.top.size() == 3);
+    CHECK(a.top.size() == sorted.size());  // every figure takes part (kCcipTop)
   }
 
   // Contradiction rule details.

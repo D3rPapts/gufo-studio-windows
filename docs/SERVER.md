@@ -601,7 +601,7 @@ every reference image of every figure (`kopf`, `front`, `bilder`, plus
 (moustache, full beard, glasses, hair) from the head and from each
 `steckbrief`, and a candidate whose features contradict is dropped. A figure
 is named only when its diff is below `ccip_cap` (default 0.05) and the next
-remaining figure is at least `ccip_abstand` (0.01) farther; otherwise the
+remaining figure is at least `ccip_abstand` (default 0.0125) farther; otherwise the
 person is `"unbekannt"`. Each person returns `name`, `box` (face),
 `kopf_box`, `beste`, `zweitbeste`, `abstand`, `diff` per figure, `merkmale`,
 `llm_gefragt` and a German `begruendung`. The models are converted once with
