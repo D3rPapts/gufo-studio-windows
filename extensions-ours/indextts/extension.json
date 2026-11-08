@@ -70,6 +70,13 @@
       ]
     }
   },
+  "packages": [
+    {
+      "pkg_config": "soxr",
+      "nix": "soxr",
+      "windows": "soxr"
+    }
+  ],
   "production_paths": {
     "include": [
       "**/*.cpp",

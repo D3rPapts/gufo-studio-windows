@@ -16,8 +16,8 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_ext_runtime
     gufo_core
-    PkgConfig::SNDFILE
-    PkgConfig::SOXR
+    PkgConfig::sndfile
+    PkgConfig::soxr
 )
 
 if(TARGET gufo_wan22)

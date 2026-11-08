@@ -54,7 +54,7 @@ gufo_extension_target(
     gufo_ext_runtime
     ICU::uc
     ICU::i18n
-    PkgConfig::SOXR
+    PkgConfig::soxr
     Threads::Threads
 )
 
