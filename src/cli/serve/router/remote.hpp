@@ -63,6 +63,18 @@ inline constexpr const char* kForwardedHeader = "X-Gufo-Forwarded";
 /// "host:port" of an endpoint, the key remote routers are known by.
 [[nodiscard]] std::string EndpointKey(const RemoteEndpoint& endpoint);
 
+/// What a router reports per locally served model in GET /v1/models
+/// (`"activity"`, placement = pool reads it from the partner).
+struct RemoteActivity {
+  /// A request, socket or job of this model is in flight there.
+  bool busy{false};
+  /// GPU work runs there (its ComfyUI queue is not empty, or an
+  /// image/video/music model has work in flight).
+  bool gpu_busy{false};
+  /// Anything else is in flight there (another model, the ComfyUI queue).
+  bool others_busy{false};
+};
+
 /// One GET /v1/models against a remote router.
 struct RemoteProbe {
   /// The connection worked and an HTTP answer came back.
@@ -72,7 +84,13 @@ struct RemoteProbe {
   /// Model id -> llama.cpp status value ("loaded", "loading", "unloaded"),
   /// or "remote" for a model the remote router itself relays elsewhere.
   std::map<std::string, std::string> models;
+  /// Model id -> its `"activity"` object, for routers that send one.
+  std::map<std::string, RemoteActivity> activity;
 };
+
+/// Reads a GET /v1/models answer into `probe` (models, activity). Throws
+/// on a body that is not a model list.
+void ParseRemoteModels(const std::string& body, RemoteProbe* probe);
 
 /// Asks `url` for its model list with `key` as bearer token; connect, head
 /// and the whole answer each bounded by `timeout`. Blocking: call it with
@@ -119,6 +137,23 @@ public:
   /// {"<host:port>": {reachable, error, checked_s_ago, models}}.
   [[nodiscard]] json::Value Status() const;
 
+  /// What the last probe said about one model (placement = pool).
+  struct ModelView {
+    /// Reachable and the model was listed (not as relayed on).
+    bool served{false};
+    /// Its status value ("loaded", "loading", "unloaded").
+    std::string status;
+    /// The remote router sent an activity object for it.
+    bool has_activity{false};
+    RemoteActivity activity;
+    /// Another model is loaded or loading there.
+    bool others_loaded{false};
+    /// When the probe ran (Clock epoch when never).
+    Clock::time_point checked_at{};
+  };
+  [[nodiscard]] ModelView View(const RemoteEndpoint& url,
+                               const std::string& id) const;
+
   /// Last answer of a busy-check url ("free", "busy", "unreachable: ...").
   void NoteBusyCheck(const RemoteEndpoint& url, const std::string& result);
   /// {"http://<host:port><path>": {result, checked_s_ago}}.
@@ -134,6 +169,7 @@ private:
     std::string error;
     Clock::time_point checked_at{};
     std::map<std::string, std::string> models;
+    std::map<std::string, RemoteActivity> activity;
     std::vector<std::string> missing;  // last warned set
   };
   mutable std::mutex mutex_;
@@ -178,6 +214,9 @@ public:
   [[nodiscard]] std::shared_ptr<Hold> Acquire(
       const std::string& slot, const std::string& holder,
       std::chrono::milliseconds wait, const std::function<bool()>& cancelled);
+
+  /// True when nobody holds `slot` and nobody waits for it ("" = no slot).
+  [[nodiscard]] bool Idle(const std::string& slot) const;
 
   /// {"<slot>": {held, holder, held_s, waiting}} for the slots ever used.
   [[nodiscard]] json::Value Status() const;

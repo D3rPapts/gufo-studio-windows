@@ -134,6 +134,46 @@ std::string EndpointKey(const RemoteEndpoint& endpoint) {
   return endpoint.host + ":" + std::to_string(endpoint.port);
 }
 
+void ParseRemoteModels(const std::string& body, RemoteProbe* probe) {
+  const json::Value listing = json::parse(body);
+  const json::Value* data = listing.find("data");
+  if (data == nullptr || !data->is_array()) {
+    throw std::runtime_error("no data array");
+  }
+  for (const json::Value& model : data->items()) {
+    const json::Value* id = model.find("id");
+    if (id == nullptr || !id->is_string()) {
+      continue;
+    }
+    std::string status;
+    if (const json::Value* remote = model.find("remote");
+        remote != nullptr && remote->is_object()) {
+      // The other router relays this id on as well: it is not served
+      // there, and relaying to it would only loop back.
+      probe->models[id->str()] = "remote";
+      continue;
+    }
+    if (const json::Value* state = model.find("status");
+        state != nullptr && state->is_object()) {
+      status = state->member_str("value");
+    }
+    if (status.empty()) {
+      const json::Value* loaded = model.find("loaded");
+      status = loaded != nullptr && loaded->as_bool() ? "loaded" : "unloaded";
+    }
+    probe->models[id->str()] = status;
+    if (const json::Value* activity = model.find("activity");
+        activity != nullptr && activity->is_object()) {
+      const auto flag = [activity](const char* key) {
+        const json::Value* value = activity->find(key);
+        return value != nullptr && value->as_bool();
+      };
+      probe->activity[id->str()] = RemoteActivity{
+          flag("busy"), flag("gpu_busy"), flag("others_busy")};
+    }
+  }
+}
+
 RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
                               const std::string& key,
                               std::chrono::milliseconds timeout,
@@ -183,36 +223,7 @@ RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
     return probe;
   }
   try {
-    const json::Value listing = json::parse(body);
-    const json::Value* data = listing.find("data");
-    if (data == nullptr || !data->is_array()) {
-      throw std::runtime_error("no data array");
-    }
-    for (const json::Value& model : data->items()) {
-      const json::Value* id = model.find("id");
-      if (id == nullptr || !id->is_string()) {
-        continue;
-      }
-      std::string status;
-      if (const json::Value* remote = model.find("remote");
-          remote != nullptr && remote->is_object()) {
-        // The other router relays this id on as well: it is not served
-        // there, and relaying to it would only loop back.
-        probe.models[id->str()] = "remote";
-        continue;
-      }
-      if (const json::Value* state = model.find("status");
-          state != nullptr && state->is_object()) {
-        status = state->member_str("value");
-      }
-      if (status.empty()) {
-        const json::Value* loaded = model.find("loaded");
-        status = loaded != nullptr && loaded->as_bool()
-                     ? "loaded"
-                     : "unloaded";
-      }
-      probe.models[id->str()] = status;
-    }
+    ParseRemoteModels(body, &probe);
   } catch (const std::exception& error) {
     probe.error = std::string(complete ? "" : "truncated ") +
                   "model list did not parse: " + error.what();
@@ -261,6 +272,7 @@ std::vector<std::string> RemoteHub::Record(const RemoteEndpoint& url,
     return {};
   }
   info.models = std::move(probe.models);
+  info.activity = std::move(probe.activity);
   std::vector<std::string> missing;
   for (const auto& id : info.ids) {
     const auto model = info.models.find(id);
@@ -334,9 +346,56 @@ json::Value RemoteHub::Status() const {
                                               : model->second;
     }
     entry["models"] = std::move(models);
+    // What a gufo router (placement = pool aware) reports per model.
+    json::Value activity = json::Value::object();
+    for (const auto& id : info.ids) {
+      const auto found = info.activity.find(id);
+      if (found == info.activity.end()) {
+        continue;
+      }
+      json::Value flags = json::Value::object();
+      flags["busy"] = found->second.busy;
+      flags["gpu_busy"] = found->second.gpu_busy;
+      flags["others_busy"] = found->second.others_busy;
+      activity[id] = std::move(flags);
+    }
+    entry["activity"] = std::move(activity);
     out[key] = std::move(entry);
   }
   return out;
+}
+
+RemoteHub::ModelView RemoteHub::View(const RemoteEndpoint& url,
+                                     const std::string& id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  ModelView view;
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end()) {
+    return view;
+  }
+  const RouterInfo& info = it->second;
+  view.checked_at = info.checked_at;
+  if (!info.reachable) {
+    return view;
+  }
+  const auto model = info.models.find(id);
+  if (model == info.models.end() || model->second == "remote") {
+    return view;
+  }
+  view.served = true;
+  view.status = model->second;
+  if (const auto activity = info.activity.find(id);
+      activity != info.activity.end()) {
+    view.has_activity = true;
+    view.activity = activity->second;
+  }
+  for (const auto& [other, status] : info.models) {
+    if (other != id && (status == "loaded" || status == "loading")) {
+      view.others_loaded = true;
+      break;
+    }
+  }
+  return view;
 }
 
 void RemoteHub::NoteBusyCheck(const RemoteEndpoint& url,
@@ -426,6 +485,16 @@ std::shared_ptr<GpuSlots::Hold> GpuSlots::Acquire(
         lock, std::min<Clock::duration>(std::chrono::milliseconds(200),
                                         deadline - Clock::now()));
   }
+}
+
+bool GpuSlots::Idle(const std::string& slot) const {
+  if (slot.empty()) {
+    return true;
+  }
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  const auto it = table_->slots.find(slot);
+  return it == table_->slots.end() ||
+         (!it->second.held && it->second.queue.empty());
 }
 
 json::Value GpuSlots::Status() const {

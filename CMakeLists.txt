@@ -739,6 +739,14 @@ if (BUILD_TESTING)
   set_tests_properties(router_registry_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
 
+  # placement = pool: per-request choice between this machine and the
+  # remote router, the probe's activity flags, GPU slot idle check.
+  add_executable(router_pool_test tests/cli/router_pool_test.cpp)
+  target_link_libraries(router_pool_test PRIVATE gufo_http)
+  add_test(NAME router_pool_test COMMAND router_pool_test)
+  set_tests_properties(router_pool_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
   add_executable(router_memory_test tests/cli/router_memory_test.cpp)
   target_link_libraries(router_memory_test PRIVATE gufo_http)
   add_test(NAME router_memory_test COMMAND router_memory_test)
@@ -977,6 +985,12 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_placement_test.py
       $<TARGET_FILE:gufo>)
   set_tests_properties(router_placement_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 180)
+
+  add_test(NAME router_pool_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_pool_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_pool_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 180)
 
   # Real-model smoke check: gpu-only labels, so the hosted check-pr name

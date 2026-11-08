@@ -293,6 +293,25 @@ void TestSwitchableTwin() {
       "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
       "placement = elsewhere\n",
       "remote/a", "placement");
+  // placement = pool: switchable, served by both machines per request.
+  {
+    const auto pool_file = WriteFixture(
+        "gufo_router_preset_twin_pool.conf",
+        "[llm/a]\nmodel = m\n[remote/a]\nurl = http://10.0.0.2:8081\n"
+        "placement = pool\n");
+    std::vector<PresetModel> pool_models;
+    assert(LoadPreset(pool_file, "/models", &pool_models, &error));
+    assert(pool_models.size() == 1 && pool_models[0].switchable);
+    assert(pool_models[0].placement == Placement::kPool);
+    assert(std::string(gufo::router::PlacementName(Placement::kPool)) ==
+           "pool");
+  }
+  // Pool needs a local twin like any placement key.
+  TestErrorMentionsSectionAndToken(
+      "gufo_router_preset_pool_alone.conf",
+      "[remote/a]\nurl = http://10.0.0.2:8081\nmodality = llm\n"
+      "placement = pool\n",
+      "remote/a", "placement");
   // Two local sections with one id stay a duplicate.
   TestErrorMentionsSectionAndToken(
       "gufo_router_preset_twin_dup_local.conf",

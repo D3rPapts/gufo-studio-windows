@@ -80,6 +80,11 @@ public:
   std::optional<server::HttpResponse> Handle(
       const server::HttpRequest& request);
 
+  /// Prompts running or waiting (ComfyUI's queue_remaining). Lock-free, so
+  /// the router may read it with its state mutex held (placement = pool:
+  /// a non-empty queue keeps pool LLM requests off this machine).
+  [[nodiscard]] int QueueRemaining() const { return queue_remaining_.load(); }
+
   struct Job;
 
 private:
@@ -152,6 +157,8 @@ private:
   std::condition_variable wake_;
   std::deque<std::shared_ptr<Job>> pending_;
   std::shared_ptr<Job> running_;
+  /// QueueRemainingLocked() as of the last EmitStatusLocked().
+  std::atomic<int> queue_remaining_{0};
   std::map<std::string, json::Value> history_;
   std::vector<std::string> history_order_;
   long long next_number_{0};

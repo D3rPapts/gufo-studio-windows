@@ -95,6 +95,17 @@ public:
   [[nodiscard]] bool Busy(std::string_view model_id) const;
   /// True while a relay or job through the remote router is open.
   [[nodiscard]] bool RemoteBusy(std::string_view model_id) const;
+  /// Local requests in flight (placement = pool status and decision).
+  [[nodiscard]] std::size_t LocalRequests(std::string_view model_id) const;
+  /// Relays and jobs through the remote router that are still open.
+  [[nodiscard]] std::size_t RemoteRequests(std::string_view model_id) const;
+  /// When a relay to the remote router last ended (epoch when never): a
+  /// remote probe older than this may still count that relay as busy.
+  [[nodiscard]] Clock::time_point LastRemoteFinished(
+      std::string_view model_id) const;
+  /// True while any model has a local request, socket or job open (nothing
+  /// may be evicted for a new load without cutting work off).
+  [[nodiscard]] bool AnyBusy() const;
   /// Number of loading or ready models.
   [[nodiscard]] std::size_t ActiveCount() const;
 
@@ -121,6 +132,7 @@ private:
     std::size_t open_jobs{0};
     std::size_t open_remote_requests{0};
     std::size_t open_remote_jobs{0};
+    Clock::time_point remote_finished{};
     Placement placement{Placement::kLocal};
     Clock::time_point last_active{};
     bool deadline_armed{false};

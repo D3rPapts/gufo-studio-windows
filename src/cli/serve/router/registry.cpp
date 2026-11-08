@@ -262,6 +262,7 @@ void Registry::RequestFinished(std::string_view model_id, bool remote) {
     if (entry->open_remote_requests > 0) {
       --entry->open_remote_requests;
     }
+    entry->remote_finished = Now();
     return;
   }
   if (entry->open_requests > 0) {
@@ -390,6 +391,33 @@ bool Registry::RemoteBusy(std::string_view model_id) const {
   const Entry* entry = Lookup(model_id);
   return entry != nullptr &&
          (entry->open_remote_requests > 0 || entry->open_remote_jobs > 0);
+}
+
+std::size_t Registry::LocalRequests(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry == nullptr ? 0 : entry->open_requests;
+}
+
+std::size_t Registry::RemoteRequests(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry == nullptr
+             ? 0
+             : entry->open_remote_requests + entry->open_remote_jobs;
+}
+
+Registry::Clock::time_point Registry::LastRemoteFinished(
+    std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry == nullptr ? Clock::time_point{} : entry->remote_finished;
+}
+
+bool Registry::AnyBusy() const {
+  for (const auto& entry : entries_) {
+    if (BusyEntry(entry)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::size_t Registry::ActiveCount() const {

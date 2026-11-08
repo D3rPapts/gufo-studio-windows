@@ -38,6 +38,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/websocket.hpp"
 
 namespace gufo::router::comfy {
@@ -1032,6 +1033,8 @@ HttpResponse Adapter::FilmstudioPreview() {
 }
 
 void Adapter::EmitStatusLocked() {
+  // Every queue change ends here: keep the lock-free copy in step.
+  queue_remaining_.store(QueueRemainingLocked());
   json::Value info = json::Value::object();
   info["queue_remaining"] = QueueRemainingLocked();
   json::Value status = json::Value::object();
@@ -1370,6 +1373,9 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
   if (!content_type.empty())
     request.headers.emplace_back("Content-Type", std::move(content_type));
   request.request_id = "comfy-" + job->id;
+  // placement = pool: the graph's own LLM calls are not held back by the
+  // busy rule its own queue entry triggers.
+  request.headers.emplace_back(kOriginHeader, "comfy");
   request.is_cancelled = [job] { return job->cancel.load(); };
   FetchResult result = options_.fetch(request);
   if (job->cancel.load())
