@@ -59,6 +59,9 @@ struct JobQueue::Job {
   int webhook_last_status{0};
   std::string webhook_last_error;
   std::chrono::steady_clock::time_point webhook_due{};
+  /// Ran once already and was put back after the router found no machine
+  /// for it (remote_unavailable, pool_busy) before any result.
+  bool requeued{false};
   std::atomic<bool> cancel{false};
   /// The cancel came from Stop(), not from a client.
   std::atomic<bool> shutdown{false};
@@ -1308,6 +1311,33 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
       Finish(job, "cancelled", json::Value(), json::Value());
     }
   } catch (const JobFailure& failure) {
+    // The router had no machine for the request (the remote router went
+    // away before it answered, or the pool found none free): no work was
+    // started, so the job goes back to the front of the queue once.
+    if (failure.status == 503 && job->upstream_id.empty() &&
+        (failure.code == "remote_unavailable" ||
+         failure.code == "pool_busy")) {
+      bool requeued = false;
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!job->requeued && !stopping_ && !job->cancel.load()) {
+          job->requeued = true;
+          job->status = "queued";
+          job->started_at = 0;
+          job->progress = -1;
+          job->preview_id.clear();
+          pending_.push_front(job);
+          PersistLocked();
+          requeued = true;
+        }
+      }
+      if (requeued) {
+        Logger::Warn("jobs", "event=job_requeue id=" + job->id + " code=" +
+                                 failure.code);
+        wake_.notify_one();
+        return;
+      }
+    }
     json::Value error = json::Value::object();
     error["message"] = std::string(failure.what());
     error["code"] = failure.code;
