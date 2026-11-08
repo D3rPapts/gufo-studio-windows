@@ -27,8 +27,12 @@ namespace gufo::ext {
 /// RAM always left to the OS and other processes by an explicit cache limit.
 inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
                                                             << 30;
+/// The RAM kept free for the OS: kHostSnapshotHeadroomBytes, or
+/// GUFO_HOST_RESERVE_MIB (512..16384, gufo-studio-windows) for hosts whose
+/// Windows RAM is small next to the GPU carve-out. Read once per process.
+[[nodiscard]] std::uint64_t HostSnapshotHeadroomBytes();
 /// Most an explicit --cache-ram-bytes may claim: available host RAM minus
-/// kHostSnapshotHeadroomBytes.
+/// HostSnapshotHeadroomBytes().
 [[nodiscard]] std::size_t HostSnapshotCeilingBytes();
 
 }  // namespace gufo::ext

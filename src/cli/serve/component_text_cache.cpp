@@ -167,7 +167,7 @@ std::string HostReserveMessage(std::size_t sessions, std::size_t requested,
          (sessions == 1 ? " session leaves " : " sessions leave ") +
          std::to_string(available / kMiB) +
          " MiB for the RAM cache above the " +
-         std::to_string(kHostSnapshotHeadroomBytes / kMiB) +
+         std::to_string(ext::HostSnapshotHeadroomBytes() / kMiB) +
          " MiB host reserve" +
          (requested
               ? " (" + std::to_string(requested / kMiB) + " MiB requested)"
