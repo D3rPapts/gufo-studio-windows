@@ -115,6 +115,8 @@ int main() {
         R"({"prompt":"a","gufo":{"control_image":")" + pose_b64 +
             R"(","control_inpaint":1}})",
         std::string(R"({"prompt":"a","gufo":{"control_strength":0.5}})"),
+        // Inpaint-only control without start image and mask.
+        std::string(R"({"prompt":"a","gufo":{"control_inpaint":true}})"),
         std::string(
             R"({"prompt":"a","gufo":{"control_image":"https://example.com/p.png"}})"),
         std::string(R"({"prompt":"a","gufo":{"control_image":7}})"),
@@ -161,6 +163,22 @@ int main() {
         "multipart control fields");
   // The control image is not a reference.
   Check(seen.images.empty(), "control image is no reference");
+  // Inpaint-only (ComfyUI ZImageFunControlnet without "image"): start image +
+  // mask + gufo.control_inpaint, no control_image part. The control image
+  // stays empty, so the control channels are zero.
+  Check(post(service, multipart({{"init_image", start_png}, {"mask", mask_png}},
+                                {{"prompt", "a dancer"},
+                                 {"gufo.control_strength", "0.9"},
+                                 {"gufo.control_inpaint", "true"}})) == 200,
+        "inpaint-only control 200");
+  Check(seen.control && seen.control->inpaint &&
+            seen.control->strength == 0.9F && seen.control->image.width == 0 &&
+            seen.control->image.rgba.empty() && seen.mask && seen.init_image,
+        "inpaint-only control fields");
+  Check(post(plain, multipart({{"init_image", start_png}, {"mask", mask_png}},
+                              {{"prompt", "a"},
+                               {"gufo.control_inpaint", "true"}})) == 400,
+        "inpaint-only control needs --controlnet");
   // With the start image as a reference (OpenAI mask edit) it is refused.
   Check(post(service, multipart({{"image", start_png},
                                  {"mask", mask_png},

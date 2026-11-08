@@ -739,8 +739,25 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       }
     }
     // Fun ControlNet-Union: a ready structure image (pose skeleton, depth,
-    // canny, lineart ...); gufo does no preprocessing.
-    if (parsed.control_image) {
+    // canny, lineart ...); gufo does no preprocessing. "control_inpaint":
+    // true without a control image runs the inpaint channels alone (control
+    // channels zero, as ComfyUI ZImageFunControlnet without "image").
+    const json::Value* inpaint_only =
+        extension && !parsed.control_image
+            ? extension->find("control_inpaint")
+            : nullptr;
+    if (inpaint_only && inpaint_only->is_bool() && inpaint_only->as_bool()) {
+      if (!service.has_controlnet())
+        throw std::invalid_argument(
+            "gufo.control_inpaint needs a server started with --controlnet");
+      image::ControlInput control;
+      control.inpaint = true;
+      control.strength =
+          static_cast<float>(Real(*extension, "control_strength", 1, 0, 2));
+      control.start = Real(*extension, "control_start", 0, 0, 1);
+      control.end = Real(*extension, "control_end", 1, 0, 1);
+      generation.control = std::move(control);
+    } else if (parsed.control_image) {
       if (!service.has_controlnet())
         throw std::invalid_argument(
             "gufo.control_image needs a server started with --controlnet");
@@ -764,7 +781,8 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
                               "control_end", "control_inpaint"})
         if (extension->contains(key))
           throw std::invalid_argument(std::string("gufo.") + key +
-                                      " needs gufo.control_image");
+                                      " needs gufo.control_image or "
+                                      "gufo.control_inpaint true");
     }
     if (!parsed.region_images.empty() &&
         (!extension || !extension->contains("regions")))

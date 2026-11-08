@@ -228,6 +228,18 @@ void TestInpaint() {
   // inpaint_image without mask is refused.
   other = Replace(text, R"(, "mask": ["c1", 1],)", ",");
   Check(Has(ErrorOf(other), "both"), "inpaint without mask");
+  // Without "image" (optional in ComfyUI): inpaint_image + mask alone, the
+  // control channels stay zero; no control image file is sent.
+  std::string only = Replace(text, R"("image": ["p2", 0], )", "");
+  auto inpaint_only = ImageOf(only);
+  Check(inpaint_only.control && inpaint_only.control->inpaint &&
+            inpaint_only.control->image.name.empty(),
+        "inpaint-only control");
+  Check(comfy::ImageExtension(inpaint_only).find("control_inpaint") != nullptr,
+        "inpaint-only control_inpaint field");
+  // Without image, inpaint_image and mask it is still refused.
+  other = Replace(only, R"(, "inpaint_image": ["c1", 0], "mask": ["c1", 1],)", ",");
+  Check(Has(ErrorOf(other), "control image"), "no image and no inpaint");
 }
 
 }  // namespace

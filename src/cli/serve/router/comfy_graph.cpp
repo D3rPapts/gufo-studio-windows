@@ -1060,20 +1060,25 @@ void ApplyQwenControl(const Graph& graph, const std::string& sampler,
                         "end_percent as fractions of the steps (ComfyUI: of "
                         "the sigma range)");
   const auto image = graph.LinkOf(node, "image");
-  if (!image)
-    throw NodeFailure(node, "required_input_missing",
-                      "gufo needs the control image (pose, depth, canny ...) "
-                      "on input 'image'");
-  const std::string source = graph.Class(image->node);
-  if (source != "LoadImage" && source != "LoadImageOutput")
-    throw NodeFailure(node, "unsupported_link",
-                      "the control image must be a ready image from "
-                      "LoadImage; gufo has no preprocessor node " + source +
-                          " (run the preprocessor elsewhere and load its "
-                          "result)");
-  control.image = ImageFile(graph, node, "image", *image);
   const auto inpaint = graph.LinkOf(node, "inpaint_image");
   const auto mask = graph.LinkOf(node, "mask");
+  // ZImageFunControlnet takes "image" as optional: without it the control
+  // channels stay zero and inpaint_image + mask alone steer (ComfyUI
+  // QwenImage21FunControlPatch). gufo needs at least one of the two.
+  if (!image && !(inpaint && mask))
+    throw NodeFailure(node, "required_input_missing",
+                      "gufo needs the control image (pose, depth, canny ...) "
+                      "on input 'image', or inpaint_image and mask");
+  if (image) {
+    const std::string source = graph.Class(image->node);
+    if (source != "LoadImage" && source != "LoadImageOutput")
+      throw NodeFailure(node, "unsupported_link",
+                        "the control image must be a ready image from "
+                        "LoadImage; gufo has no preprocessor node " + source +
+                            " (run the preprocessor elsewhere and load its "
+                            "result)");
+    control.image = ImageFile(graph, node, "image", *image);
+  }
   if (inpaint || mask) {
     // The checkpoint's inpaint channels: gufo fills them from the masked
     // edit (SetLatentNoiseMask over VAEEncode) and requires the same inputs.

@@ -164,8 +164,18 @@ bool ControlActiveAt(const ControlInput& control, int step, int steps) {
   return at >= control.start * steps - 1e-9 && at < control.end * steps - 1e-9;
 }
 
+bool ControlHasImage(const ControlInput& control) {
+  return !(control.image.width == 0 && control.image.height == 0 &&
+           control.image.rgba.empty());
+}
+
 void ValidateControl(const ControlInput& control, const Request& request) {
-  CheckCanvas(control.image);
+  if (ControlHasImage(control))
+    CheckCanvas(control.image);
+  else if (!control.inpaint)
+    throw std::invalid_argument(
+        "a control without control image needs the inpaint recipe "
+        "(init_image and mask)");
   if (!std::isfinite(control.strength) || control.strength < 0 ||
       control.strength > 2)
     throw std::invalid_argument("control strength must be between 0 and 2");

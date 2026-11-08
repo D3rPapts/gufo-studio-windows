@@ -78,7 +78,10 @@ inline constexpr int kDefaultMaskBlur = 1;
 /// MLSD, scribble or grayscale image, already preprocessed by the caller).
 /// Needs a server started with a control branch (Model::SetControlnet).
 struct ControlInput {
-  /// Resized to the output canvas, alpha dropped, VAE-encoded.
+  /// Resized to the output canvas, alpha dropped, VAE-encoded. Empty (0x0)
+  /// with `inpaint`: no control image, the control channels stay zero and
+  /// only the inpaint channels steer (ComfyUI QwenImage21FunControlPatch with
+  /// image None).
   Image image;
   /// control_context_scale: multiplies every control skip; 0 disables.
   float strength{1};

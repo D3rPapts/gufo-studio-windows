@@ -848,9 +848,19 @@ ControlRun PrepareControl(Runtime& rt, const Weights& weights,
   run.blocks = info.blocks;
   run.stride = info.stride;
   run.strength = input.strength;
-  const auto canvas = ControlCanvas(input.image, request.width, request.height);
-  const auto control = rt.Download(EncodeVae(rt, weights, canvas, cancelled,
-                                             Prefixed(observer, "control.")));
+  // Without a control image the control channels stay zero (ComfyUI
+  // QwenImage21FunControlPatch: torch.zeros when image is None); only the
+  // inpaint channels steer.
+  std::vector<float> control;
+  if (ControlHasImage(input)) {
+    const auto canvas =
+        ControlCanvas(input.image, request.width, request.height);
+    control = rt.Download(EncodeVae(rt, weights, canvas, cancelled,
+                                    Prefixed(observer, "control.")));
+  } else {
+    control.assign(static_cast<std::size_t>(rows) * kControlLatentChannels,
+                   0.0F);
+  }
   std::vector<float> keep, inpaint;
   if (input.inpaint) {
     if (!init_image || !request.mask)

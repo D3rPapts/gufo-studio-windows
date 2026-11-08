@@ -352,7 +352,7 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         if (region.mask_file)
           files->push_back(*region.mask_file);
       }
-      if (image->control)
+      if (image->control && !image->control->image.name.empty())
         files->push_back(image->control->image);
     } else if (const auto* speech = std::get_if<SpeechTask>(&task.spec)) {
       if (speech->reference_audio)
@@ -1422,9 +1422,12 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   if (!spec.mask.name.empty())
     mask = ReadFileRef(spec.mask);
   // Qwen-Image ControlNet: the structure image, a file part on edits and a
-  // data URL (gufo.control_image) on generations.
+  // data URL (gufo.control_image) on generations. Without a control image
+  // (inpaint-only ZImageFunControlnet) only gufo.control_inpaint is sent.
   const std::string control =
-      spec.control ? ReadFileRef(spec.control->image) : std::string();
+      spec.control && !spec.control->image.name.empty()
+          ? ReadFileRef(spec.control->image)
+          : std::string();
   json::Value extension = ImageExtension(spec);
   // Regional prompts: gufo.regions with their references as
   // "region_image[]" parts (in region order) and mask files inline.

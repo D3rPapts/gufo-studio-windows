@@ -278,6 +278,17 @@ void TestValidate() {
   bad = request;
   bad.control->image = Image{3, 3, {}};
   Throws<std::invalid_argument>([&] { ValidateRequest(bad); }, "broken image");
+  // Inpaint-only: no control image (0x0), start image and mask given.
+  auto only = request;
+  only.control->image = Image{};
+  Throws<std::invalid_argument>([&] { ValidateRequest(only); },
+                                "no control image without inpaint");
+  only.control->inpaint = true;
+  only.init_image = Solid(32, 32, 1, 2, 3, 255);
+  only.mask = Solid(32, 32, 255, 255, 255, 255);
+  ValidateRequest(only);
+  Check(!ControlHasImage(*only.control) && ControlHasImage(*request.control),
+        "ControlHasImage");
 }
 
 void TestRealHeader(const std::filesystem::path& file) {

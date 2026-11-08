@@ -82,5 +82,8 @@ bool ControlActiveAt(const ControlInput& control, int step, int steps);
 /// Throws std::invalid_argument for out-of-range control settings.
 void ValidateControl(const ControlInput& control, const Request& request);
 
+/// False for the empty (0x0) image of an inpaint-only control.
+bool ControlHasImage(const ControlInput& control);
+
 }  // namespace gufo::models::qwen_image_21
 #endif
