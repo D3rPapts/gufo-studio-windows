@@ -1194,10 +1194,12 @@ Result Model::Generate(const Request& request,
     if (guided) {
       // The references before the prompt text share their K/V with the
       // positive pass; only the negative text rows get their own cache.
-      negative_context.emplace(
-          PrepareDiffusion(rt, impl_->weights, *negative, height, width,
-                           cancelled, negative_observer, &*context,
-                           SharedConditionTokens(prompt, *negative)));
+      // A controlled pass runs its condition rows jointly on the first
+      // step (no prefill), so it cannot borrow the positive caches.
+      negative_context.emplace(PrepareDiffusion(
+          rt, impl_->weights, *negative, height, width, cancelled,
+          negative_observer, &*context,
+          control_any ? 0 : SharedConditionTokens(prompt, *negative)));
       result.metrics.negative_condition_rows = negative_context->prefix.rows;
     }
     for (auto& pass : regions) {
@@ -1298,8 +1300,9 @@ Result Model::Generate(const Request& request,
       latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
       rt.Observe(observer, "init.latent", latent);
     }
-    // Control requests are text-only (no reference rows), so their first
-    // step fills the caches jointly, with the control skips.
+    // Control requests fill their condition caches (text and reference
+    // rows) jointly on the first step, with the control stream beside them;
+    // that matches a prefill (block-causal, timestep-zero condition rows).
     if (large && !control) {
       // Condition caches in head-major layout, filled chunk by chunk.
       Prefill(rt, *context, sigmas[0], cancelled);

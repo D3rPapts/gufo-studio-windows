@@ -179,11 +179,15 @@ int main() {
                               {{"prompt", "a"},
                                {"gufo.control_inpaint", "true"}})) == 400,
         "inpaint-only control needs --controlnet");
-  // With the start image as a reference (OpenAI mask edit) it is refused.
-  Check(post(service, multipart({{"image", start_png},
+  // Reference images combine with the control since 1.4.7 (zero rows in
+  // the control stream, as ComfyUI does).
+  Check(post(service, multipart({{"init_image", start_png},
                                  {"mask", mask_png},
+                                 {"image", start_png},
                                  {"control_image", pose_png}},
-                                {{"prompt", "a"}})) == 400,
+                                {{"prompt", "a"},
+                                 {"gufo.control_inpaint", "true"}})) == 200 &&
+            seen.control && seen.images.size() == 1,
         "control with a reference image");
   Check(post(service, multipart({{"image", start_png},
                                  {"control_image", pose_png},

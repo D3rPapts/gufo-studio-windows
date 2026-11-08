@@ -183,9 +183,9 @@ void ValidateControl(const ControlInput& control, const Request& request) {
         control.end <= 1 && control.start < control.end))
     throw std::invalid_argument(
         "control start and end must satisfy 0 <= start < end <= 1");
-  if (!request.images.empty())
-    throw std::invalid_argument(
-        "control images do not combine with reference images yet");
+  // Reference images ride along: their rows enter the control stream as
+  // zeros (before_proj bias only), as ComfyUI init_stream does for text and
+  // reference rows; the control latents fill only the target rows.
   // The control branch runs on the full canvas of a text-only pass; regional
   // passes (crops, own references) do not carry it.
   if (!request.regions.empty())

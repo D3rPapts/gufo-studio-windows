@@ -194,10 +194,14 @@ void TestErrors() {
   text = Replace(kControl, "QwenImageDiffsynthControlnet", "ZImageFunControlnet");
   text = Replace(text, R"("image": ["p2", 0], )", "");
   Check(Has(ErrorOf(text), "control image"), "control image required");
-  // Reference images do not combine with the ControlNet.
+  // Reference images combine with the ControlNet (1.4.7).
   text = Replace(kControl, R"("resolution": 1024})",
                  R"("resolution": 1024, "images.image_1": ["p2", 0]})");
-  Check(Has(ErrorOf(text), "text-only"), "references rejected");
+  {
+    const auto with_reference = ImageOf(text);
+    Check(with_reference.control && with_reference.references.size() == 1,
+          "references with the ControlNet");
+  }
 }
 
 void TestInpaint() {

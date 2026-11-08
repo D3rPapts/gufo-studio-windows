@@ -1099,10 +1099,6 @@ void ApplyQwenControl(const Graph& graph, const std::string& sampler,
                         "VAEEncode)");
     control.inpaint = true;
   }
-  if (!task->references.empty())
-    throw NodeFailure(node, "unsupported_value",
-                      "gufo runs the Qwen-Image ControlNet on text-only "
-                      "prompts; remove the reference images");
   if (!task->regions.empty())
     throw NodeFailure(node, "unsupported_value",
                       "gufo runs the Qwen-Image ControlNet without regional "

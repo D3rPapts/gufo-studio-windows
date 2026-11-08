@@ -264,10 +264,10 @@ void TestValidate() {
   bad.control->start = 0.6;
   bad.control->end = 0.5;
   Throws<std::invalid_argument>([&] { ValidateRequest(bad); }, "start > end");
-  bad = request;
-  bad.images.push_back(Solid(32, 32, 1, 2, 3, 255));
-  Throws<std::invalid_argument>([&] { ValidateRequest(bad); },
-                                "control with references");
+  // Reference images combine with the control (zero rows in the stream).
+  auto with_reference = request;
+  with_reference.images.push_back(Solid(32, 32, 1, 2, 3, 255));
+  ValidateRequest(with_reference);
   bad = request;
   bad.control->inpaint = true;
   Throws<std::invalid_argument>([&] { ValidateRequest(bad); },
