@@ -504,6 +504,21 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
     if (!fields.is_object())
       throw std::invalid_argument("request must be a JSON object");
     // As in the other OpenAI-compatible servers, unknown members are ignored.
+    // gufo-studio-windows: name each ignored member in the log, so a typo
+    // (1.4.x answered 400) still shows up.
+    {
+      static constexpr std::string_view kKnown[] = {
+          "prompt", "model", "n", "size", "response_format", "output_format",
+          "quality", "background", "user", "seed", "steps", "stream", "gufo",
+          "loras", "image", "image[]", "mask"};
+      for (const auto& [name, value] : fields.members()) {
+        (void)value;
+        if (std::find(std::begin(kKnown), std::end(kKnown), name) ==
+            std::end(kKnown))
+          Logger::Warn("image", "request=" + request.request_id +
+                                    " event=ignored_parameter name=" + name);
+      }
+    }
     if (!fields.contains("prompt"))
       throw std::invalid_argument("prompt is required");
     const auto model = String(fields, "model", service.model_id().c_str());
