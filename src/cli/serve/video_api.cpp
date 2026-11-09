@@ -460,6 +460,26 @@ std::string StatusReason(int status) {
 // Providers with `prepare_request` parse the whole request themselves
 // (conditioning images, audio, video, provider options); the core only maps
 // the model name and queues the result.
+// "gufo.preview": live preview options of the job (its id is the job id);
+// gufo-studio-windows, as 1.4.9. Returns an error response or nullopt.
+std::optional<HttpResponse> ParseVideoPreview(const json::Value& body,
+                                              PreviewOptions* preview) {
+  const json::Value* extension = body.find("gufo");
+  if (extension == nullptr || !extension->is_object())
+    return std::nullopt;
+  const json::Value* value = extension->find("preview");
+  if (value == nullptr)
+    return std::nullopt;
+  try {
+    if (!ParsePreviewRequest(*value, preview).empty())
+      throw std::invalid_argument(
+          "gufo.preview.id is the job id for videos; leave it out");
+  } catch (const std::invalid_argument& error) {
+    return Error(400, "Bad Request", error.what(), "invalid_preview");
+  }
+  return std::nullopt;
+}
+
 HttpResponse CreatePreparedVideo(const json::Value& body,
                                  const std::vector<ext::VideoAttachment>& files,
                                  VideoPostProcess post,
@@ -475,6 +495,9 @@ HttpResponse CreatePreparedVideo(const json::Value& body,
     return Error(400, "Bad Request", "unsupported video model",
                  "invalid_model");
   }
+  PreviewOptions preview = VideoJobRequest{}.preview;
+  if (auto failed = ParseVideoPreview(body, &preview))
+    return std::move(*failed);
   const std::string body_json = body.dump();
   ext::VideoPreparedRequest prepared;
   ext::VideoRequestError failure;
@@ -505,6 +528,7 @@ HttpResponse CreatePreparedVideo(const json::Value& body,
       .options_json = std::move(prepared.options_json),
       .attachments = std::move(prepared.attachments),
       .post = std::move(post),
+      .preview = preview,
   }));
 }
 

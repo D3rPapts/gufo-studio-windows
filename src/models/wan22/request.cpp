@@ -240,7 +240,7 @@ bool ParseBody(const ext::VideoRequestInput& input, Body* body,
   return true;
 }
 
-// "gufo.preview" (no preview service on 2.0 yet: checked, then ignored).
+// "gufo.preview" (checked here; the host renders the job's live previews).
 // "gufo.interpolate" and "gufo.upscale" never reach the provider (see below).
 bool CheckPostSteps(const json::Value& extension,
                     ext::VideoRequestError* error) {

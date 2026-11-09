@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/cli/serve/media/video_postprocess.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/ext/video.hpp"
 
 namespace gufo::server {
@@ -55,6 +56,11 @@ struct VideoJobRequest {
   /// nothing is generated, the upload is interpolated and/or upscaled. Needs
   /// a post-step; prompt, size and parameters are not used.
   std::vector<std::uint8_t> source_video;
+  /// Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
+  /// every second step by default ("gufo": {"preview": {...}}), for providers
+  /// with `preview_latent` (gufo-studio-windows, as 1.4.9).
+  PreviewOptions preview{
+      .always = false, .every = 2, .dense_up_to = 16, .max_side = 320};
 };
 
 struct VideoJobSnapshot {

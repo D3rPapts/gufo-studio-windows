@@ -31,6 +31,8 @@ public:
       return false;
     if (job.model_root.empty())
       job.model_root = model_root_;
+    // Live preview: the host's sink (changes/0.2/live-previews.md).
+    job.preview = request.preview;
     JobCallbacks callbacks;
     callbacks.progress = [&](const std::string& phase, int done, int total) {
       if (progress != nullptr)

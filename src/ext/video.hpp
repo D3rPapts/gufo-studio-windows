@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 
+#include "src/ext/image.hpp"  // LatentPreview, PreviewSink (live previews)
+
 namespace gufo::ext {
 
 struct VideoParameters {
@@ -51,6 +53,9 @@ struct VideoRequest {
   std::string options_json;
   /// Binary inputs referenced by `options_json` (images, audio, video).
   std::vector<VideoAttachment> attachments;
+  /// Live preview of this job (gufo-studio-windows, changes/0.2/
+  /// live-previews.md); empty when the provider publishes none.
+  PreviewSink preview;
 };
 
 /// One `POST /v1/videos` request as the server received it, for providers
@@ -156,6 +161,11 @@ struct VideoProvider {
   /// Probe order when several providers accept a model directory: the
   /// highest priority wins, ties keep registration order.
   int probe_priority{0};
+  /// Latent space of `VideoRequest::preview` latents for the host's
+  /// latent->RGB map ("wan22": 48 channels, "wan21": 16 channels, "minimax_h3")
+  /// and the preview loop's frame rate. Null: no previews.
+  const char* preview_latent = nullptr;
+  int preview_fps{24};
 };
 
 void RegisterVideoProvider(VideoProvider provider);

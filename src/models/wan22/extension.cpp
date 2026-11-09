@@ -81,6 +81,12 @@ ext::VideoProvider Make(ext::VideoRunnerFactory create) {
       // Above the generic probes (MiniMax H3 accepts any model_index.json,
       // which a Wan 2.2 Diffusers directory also has).
       .probe_priority = 10,
+      // Live previews (gufo-studio-windows): Wan 2.2 VAE (48 channels) or
+      // Wan 2.1 VAE (16 channels); loop speed at the family's frame rate.
+      .preview_latent = F == Family::kWan22 ? "wan22" : "wan21",
+      .preview_fps = F == Family::kWan22       ? 24
+                     : F == Family::kWan21Talk ? 25
+                                               : 16,
   };
 }
 

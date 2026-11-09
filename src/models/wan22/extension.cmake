@@ -92,6 +92,7 @@ gufo_extension_target(
     ${PROJECT_SOURCE_DIR}/src/cli/serve/media/video_postprocess.cpp
   LINK_LIBRARIES
     gufo_wan22
+    gufo_preview
     gufo_logging
     gufo_core
     gufo_cache

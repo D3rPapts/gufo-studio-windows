@@ -1127,7 +1127,7 @@ endfunction()
       src/cli/serve/video_jobs.cpp
       src/cli/serve/media/video_postprocess.cpp
     )
-    target_link_libraries(video_jobs_test PRIVATE gufo_logging gufo_core
+    target_link_libraries(video_jobs_test PRIVATE gufo_preview gufo_logging gufo_core
       ${gufo_minimax_h3_test_libraries} gufo_cache gufo_ext_runtime)
     add_test(NAME video_jobs_test COMMAND video_jobs_test)
     set_tests_properties(video_jobs_test PROPERTIES
@@ -1139,7 +1139,7 @@ endfunction()
       src/cli/serve/video_jobs.cpp
       src/cli/serve/media/video_postprocess.cpp
     )
-    target_link_libraries(video_api_test PRIVATE gufo_logging gufo_core
+    target_link_libraries(video_api_test PRIVATE gufo_preview gufo_logging gufo_core
       ${gufo_minimax_h3_test_libraries} gufo_cache gufo_ext_runtime)
     add_test(NAME video_api_test COMMAND video_api_test)
     set_tests_properties(video_api_test PROPERTIES

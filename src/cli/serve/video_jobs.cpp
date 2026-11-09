@@ -748,6 +748,24 @@ struct VideoJobService::Impl {
         condition.notify_all();
         continue;
       }
+      // Live preview under the job id while someone watches it (1.4.9).
+      std::optional<PreviewHub::Stats> preview_before;
+      if (provider != nullptr && provider->preview_latent != nullptr &&
+          source_video.empty()) {
+        const std::string_view latent = provider->preview_latent;
+        PreviewOptions preview = job->request.preview;
+        if (latent == "wan22")
+          preview.dense_up_to = 0;
+        preview.pixel_frames = job->request.parameters.frames;
+        preview.fps = provider->preview_fps > 0 ? provider->preview_fps : 24;
+        generation.preview = PreviewHub::Global().Begin(
+            job->snapshot.id,
+            latent == "wan22"   ? LatentFormat::kWan22
+            : latent == "wan21" ? LatentFormat::kWan21
+                                : LatentFormat::kMinimaxH3,
+            preview);
+        preview_before = PreviewHub::Global().stats();
+      }
       ProgressContext progress{this, job};
       ext::VideoTelemetry telemetry;
       std::string error;
@@ -775,6 +793,23 @@ struct VideoJobService::Impl {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
+      if (preview_before) {
+        PreviewHub::Global().End(
+            job->snapshot.id,
+            success && !job->cancelled.load(std::memory_order_relaxed));
+        if (const auto stats = PreviewHub::Global().stats();
+            stats.published > preview_before->published) {
+          // Previews handed over during this job (process totals) and their
+          // encode time.
+          std::ostringstream line;
+          line << "job=" << job->snapshot.id << " event=previews published="
+               << stats.published - preview_before->published
+               << " encoded=" << stats.encoded - preview_before->encoded
+               << " encode_ms="
+               << std::lround(stats.encode_ms - preview_before->encode_ms);
+          Logger::Info("video", line.str());
+        }
+      }
       if (!success && !job->cancelled.load(std::memory_order_relaxed)) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);
