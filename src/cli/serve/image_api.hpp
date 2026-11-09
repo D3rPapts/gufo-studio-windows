@@ -46,12 +46,16 @@ public:
   Result Generate(const Request& request, const CancellationCheck& cancelled);
   /// Provider state as JSON text (ext::ImageRunner::Query), empty if none.
   std::string Query(std::string_view topic) const;
+  /// Latent space of the provider's live previews (ImageProvider::
+  /// preview_latent), empty when it publishes none.
+  const std::string& preview_latent() const { return preview_latent_; }
 
 private:
   std::string model_id_;
   std::vector<std::string> model_aliases_;
   Runner runner_;
   std::shared_ptr<ext::ImageRunner> model_;
+  std::string preview_latent_;
   std::timed_mutex gate_;
 };
 

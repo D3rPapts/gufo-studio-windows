@@ -25,7 +25,7 @@ struct ProviderState {
 /// preview; "loras") and the named image parts (init_image, mask,
 /// control_image, region_image[]). Throws std::invalid_argument (HTTP 400)
 /// for what the 1.4.9 image API rejected. Validates with ValidateRequest.
-/// "preview" is accepted and ignored (2.0 serves no live previews yet).
+/// "preview" is read by the host (live previews, changes/0.2/live-previews).
 Request BuildRequest(const ext::ImageRequest& request,
                      const ProviderState& state);
 

@@ -33,6 +33,7 @@
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/media/media_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -2368,6 +2369,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                  "decision_failed");
     }
   }
+  // Live previews (gufo-studio-windows, changes/0.2/live-previews.md).
+  if (IsPreviewPath(req.path) && (images_ || video_jobs_))
+    return HandlePreviewRequest(req, PreviewHub::Global());
   if (req.path == "/sdapi/v1/loras" && images_ != nullptr)
     return HandleImageLorasRequest(req, *images_);
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
