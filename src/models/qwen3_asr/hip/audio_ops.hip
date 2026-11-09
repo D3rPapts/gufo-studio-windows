@@ -20,7 +20,6 @@ constexpr std::size_t kConvChannels = 480;
 constexpr std::size_t kConvFrequency = 16;
 constexpr std::size_t kConvTime = 13;
 constexpr std::size_t kConvFlattened = kConvChannels * kConvFrequency;
-constexpr std::size_t kHidden = 1024;
 
 std::size_t Blocks(std::size_t elements) {
   return (elements + kThreads - 1U) / kThreads;
@@ -79,27 +78,31 @@ __global__ void ConvOutputLayoutKernel(const hip_bfloat16* input,
   output[index] = input[source];
 }
 
-__device__ float Position(std::size_t time, std::size_t column) {
-  constexpr float kLogIncrement = 9.210340371976184F / 511.0F;
-  const std::size_t frequency = column % (kHidden / 2U);
+/// Whisper sinusoid: log(10000) / (hidden / 2 - 1) per frequency step.
+__device__ float Position(std::size_t time, std::size_t column,
+                          std::size_t hidden) {
+  const float log_increment =
+      9.210340371976184F / static_cast<float>(hidden / 2U - 1U);
+  const std::size_t frequency = column % (hidden / 2U);
   const float inverse_timescale =
-      expf(-kLogIncrement * static_cast<float>(frequency));
+      expf(-log_increment * static_cast<float>(frequency));
   const float phase = static_cast<float>(time) * inverse_timescale;
-  return column < kHidden / 2U ? sinf(phase) : cosf(phase);
+  return column < hidden / 2U ? sinf(phase) : cosf(phase);
 }
 
 __global__ void AddPositionAndCompactKernel(const float* projected,
                                             float* compact_output,
                                             std::size_t feature_frames,
                                             std::size_t chunks,
-                                            std::size_t output_tokens) {
+                                            std::size_t output_tokens,
+                                            std::size_t hidden) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= output_tokens * kHidden) {
+  if (index >= output_tokens * hidden) {
     return;
   }
-  const std::size_t column = index % kHidden;
-  const std::size_t output_token = index / kHidden;
+  const std::size_t column = index % hidden;
+  const std::size_t output_token = index / hidden;
 
   std::size_t remaining = output_token;
   std::size_t selected_chunk = 0;
@@ -117,10 +120,10 @@ __global__ void AddPositionAndCompactKernel(const float* projected,
   }
 
   const std::size_t source =
-      (selected_chunk * kConvTime + selected_time) * kHidden + column;
+      (selected_chunk * kConvTime + selected_time) * hidden + column;
   const float linear = static_cast<float>(hip_bfloat16(projected[source]));
   const float position =
-      static_cast<float>(hip_bfloat16(Position(selected_time, column)));
+      static_cast<float>(hip_bfloat16(Position(selected_time, column, hidden)));
   compact_output[index] = static_cast<float>(hip_bfloat16(linear + position));
 }
 
@@ -375,14 +378,14 @@ void LaunchConvOutputLayout(const void* input_bfloat16, void* output_bfloat16,
 
 void LaunchAddPositionAndCompact(const float* projected, float* compact_output,
                                  std::size_t feature_frames, std::size_t chunks,
-                                 hipStream_t stream) {
+                                 hipStream_t stream, std::size_t hidden) {
   const std::size_t tail_frames = feature_frames - (chunks - 1U) * kChunkFrames;
   const std::size_t output_tokens =
       (chunks - 1U) * kConvTime + (tail_frames + 7U) / 8U;
-  const std::size_t elements = output_tokens * kHidden;
+  const std::size_t elements = output_tokens * hidden;
   hipLaunchKernelGGL(AddPositionAndCompactKernel, dim3(Blocks(elements)),
                      dim3(kThreads), 0, stream, projected, compact_output,
-                     feature_frames, chunks, output_tokens);
+                     feature_frames, chunks, output_tokens, hidden);
 }
 
 void LaunchLayerNormToBfloat16(const float* input, const void* weight_bfloat16,

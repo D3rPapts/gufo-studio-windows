@@ -904,6 +904,90 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     hipStream_t  stream);
 
+// Qwen3-Omni (Q4_K_M GGUF): the Q6_K tensors of the mixed K-quant files and
+// the dense vector path for both K-quants. Same contracts as the Q4_K and
+// Q8_0 entries above.
+int ds4_mmq_q6_K_dense(
+    const void  * W_q6_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    hipStream_t  stream);
+
+int ds4_mmq_q6_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_q6_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_q4_K_dense_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    hipStream_t  stream);
+
+int ds4_mmq_q6_K_dense_vec(
+    const void  * W_q6_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    hipStream_t  stream);
+
+// Pre-quantized MMVQ (Qwen3-Omni decode). ds4_mmq_quantize_q8_1 writes
+// `rows` activation rows of K floats as canonical Q8_1 into q8, which must
+// hold ds4_mmq_q8_1_bytes(K, rows) bytes. ds4_mmq_vec_preq multiplies them
+// with W (type_x is the ggml type id): without ids a dense matrix, out
+// [n_cols][M] (n_cols <= 8); with ids [n_cols][n_expert_used] an expert stack,
+// out[(col * n_expert_used + slot) * M + row]; with W_gate as well (one
+// column only) out = (W . x) * silu(W_gate . x).
+size_t ds4_mmq_q8_1_bytes(int K, int rows);
+
+int ds4_mmq_quantize_q8_1(
+    const float * X,
+    void        * q8,
+    int           K,
+    int           rows,
+    hipStream_t  stream);
+
+int ds4_mmq_vec_preq(
+    int             type_x,
+    const void    * W,
+    const void    * W_gate,
+    const void    * q8,
+    const int32_t * ids,
+    float         * out,
+    int             M,
+    int             K,
+    int             n_cols,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
 // Set the thread-local stream that the internal cuda pool uses for
 // hipMallocAsync / hipFreeAsync.  Defaults to hipStreamPerThread.
 // Use the graph capture stream so pool
