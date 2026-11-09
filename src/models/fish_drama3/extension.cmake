@@ -34,6 +34,7 @@ gufo_extension_target(
     hip/codec_runtime.cpp
     hip/synthesis_runtime.cpp
     hip/tower_runtime.cpp
+    provider.cpp
   LINK_LIBRARIES
     gufo_fish_drama3
     hip::host
