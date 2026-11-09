@@ -72,13 +72,14 @@ bool Probe(const std::vector<Tensor>& tensors,
 void CheckExpertFormats() {
   for (const auto* role : {"gate", "up", "down"}) {
     const auto name = std::string("blk.47.ffn_") + role + "_exps.weight";
+    // gufo-studio-windows also loads the IQ experts of unsloth UD-Q3_K_XL.
     for (const auto type : {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
-                            GgmlType::kQ5_1, GgmlType::kQ8_0}) {
+                            GgmlType::kQ5_1, GgmlType::kQ8_0, GgmlType::kIQ3_XXS,
+                            GgmlType::kIQ4_XS, GgmlType::kIQ4_NL}) {
       Require(Probe({{name, type}}), "supported expert format declined");
     }
     for (const auto type :
-         {GgmlType::kIQ3_S, GgmlType::kIQ4_XS, GgmlType::kIQ4_NL,
-          GgmlType::kF16, GgmlType::kQ2_K}) {
+         {GgmlType::kIQ3_S, GgmlType::kF16, GgmlType::kQ2_K}) {
       Require(!Probe({{name, type}}), "unsupported trunk expert claimed");
     }
   }
@@ -101,7 +102,7 @@ void CheckIgnoredTensors() {
         "blk.0.ffn_gate_exps.weight.extra", "blk.0.extra.ffn_gate_exps.weight",
         "per_layer_token_embd.weight"}) {
     auto tensors = trunk;
-    tensors.emplace_back(name, GgmlType::kIQ4_NL);
+    tensors.emplace_back(name, GgmlType::kIQ3_S);
     Require(Probe(tensors), "unused tensor incorrectly declined the trunk");
   }
   Require(Probe({{"blk.47.ffn_up_exps.weight", GgmlType::kIQ3_S}}, 48, 1),
