@@ -149,3 +149,12 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
 endif()
+
+# DSpine draft (tencent/Qwen3.8-27B-DSpine-b16) CPU reference against the numpy
+# oracle from tools/dspine; skips (77) without the converted GGUF.
+add_executable(qwen_dspine_reference_test
+  ${PROJECT_SOURCE_DIR}/tests/models/qwen/dspine_reference_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/dspine_reference.cpp)
+target_link_libraries(qwen_dspine_reference_test PRIVATE gufo_core)
+add_test(NAME qwen_dspine_reference_test COMMAND qwen_dspine_reference_test)
+set_tests_properties(qwen_dspine_reference_test PROPERTIES LABELS "cpu;models;qwen;dspine" SKIP_RETURN_CODE 77)
