@@ -31,11 +31,12 @@ def bf(x):
 
 
 def lin(x, name):
-    return bf(x @ D.tensor(name).T)
+    return bf(x.astype(np.float64) @ D.tensor(name).astype(np.float64).T)
 
 
 def rms(x, w, eps=EPS):
-    return bf(x * (1.0 / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)) * w)
+    ms = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True).astype(np.float32)
+    return bf(x * (np.float32(1.0) / np.sqrt(ms + np.float32(eps))) * w)
 
 
 def rope(x, pos):  # x [L, nh, HD], nicht-traditionell (Haelften)
@@ -58,7 +59,7 @@ t0 = time.time()
 
 # ---------- Draft-Vorwaertsrechnung ----------
 emb = bf(TGT.take_rows("token_embd.weight", block))  # [T, H]
-ctx = rms(bf(ctx_hidden @ D.tensor("fc.weight").T), D.tensor("enc.output_norm.weight"))  # [S, H]
+ctx = rms(bf(ctx_hidden.astype(np.float64) @ D.tensor("fc.weight").astype(np.float64).T), D.tensor("enc.output_norm.weight"))  # [S, H]
 pos_ctx = np.arange(S); pos_blk = np.arange(S, S + T)
 residual = emb
 x_in = rms(emb, D.tensor("blk.0.attn_norm.weight"))
@@ -87,9 +88,9 @@ for i in range(NL):
         mask[t, :S + t + 1] = 0.0
     for h in range(NH):
         kv = h // (NH // NKV)
-        sc = (q[:, h, :] @ k[:, kv, :].T) * (1.0 / math.sqrt(HD)) + mask
+        sc = (q[:, h, :].astype(np.float64) @ k[:, kv, :].astype(np.float64).T) * (1.0 / math.sqrt(HD)) + mask
         sc = sc - sc.max(axis=1, keepdims=True); w = np.exp(sc); w /= w.sum(axis=1, keepdims=True)
-        att[:, h, :] = w @ v[:, kv, :]
+        att[:, h, :] = w @ v[:, kv, :].astype(np.float64)
     att = bf(att).reshape(T, NH * HD)
     hsum = bf(residual + lin(att, p + "attn_output.weight"))
     hn = rms(hsum, D.tensor(p + "ffn_norm.weight"))
@@ -99,24 +100,25 @@ for i in range(NL):
     # Code-Bruecke (bridge.py __call__)
     raw = out
     f = raw.astype(np.float32)
-    rmsv = np.sqrt(np.maximum(np.mean(f * f, axis=-1), TINY))  # [T]
+    rmsv = np.sqrt(np.maximum(np.mean(f.astype(np.float64) ** 2, axis=-1).astype(np.float32), np.float32(TINY)))  # [T]
     normalized = bf(f / (rmsv[:, None] + BEPS))
     rw = read_last if i == NL - 1 else early[i]
-    projected = bf(normalized @ rw.T)
-    pn = np.sqrt(np.sum(projected * projected, axis=-1, keepdims=True))
+    projected = bf(normalized.astype(np.float64) @ rw.astype(np.float64).T)
+    pn = np.sqrt(np.sum(projected.astype(np.float64) ** 2, axis=-1, keepdims=True).astype(np.float32))
     codes = bf(SQC * projected / (pn + BEPS))
     codes[0] = bf(SQC * cb_anchor)
-    packed = bf(codes @ packed_w.T)  # [T, 3R]
+    packed = bf(codes.astype(np.float64) @ packed_w.astype(np.float64).T)  # [T, 3R]
     if i == NL - 1:
         stash = dict(raw=raw.copy(), rms=rmsv.copy(), packed=packed.copy())
     qg, sg, vg = packed[:, :R], packed[:, R:2 * R], packed[:, 2 * R:]
     gate = 1.0 / (1.0 + np.exp(-(qg[1:] + sg[:-1] + gate_b)))
     message = bf(np.concatenate([np.zeros((1, R), np.float32), gate * vg[:-1]], 0))
-    delta = bf(message @ fwrite[i].T)  # [T, H]
+    delta = bf(message.astype(np.float64) @ fwrite[i].astype(np.float64).T)  # [T, H]
     not_anchor = (np.arange(T) != 0).astype(np.float32)[:, None]
     out_w = bf(f + (rmsv[:, None] * delta) * not_anchor)
     nw = D.tensor(f"blk.{i + 1}.attn_norm.weight") if i < NL - 1 else D.tensor("output_norm.weight")
-    y = bf(out_w * (1.0 / np.sqrt(np.mean(out_w * out_w, axis=-1, keepdims=True) + EPS)))
+    ms = np.mean(out_w.astype(np.float64) ** 2, axis=-1, keepdims=True).astype(np.float32)
+    y = bf(out_w * (np.float32(1.0) / np.sqrt(ms + np.float32(EPS))))
     x_in = bf(y * nw)
     residual = out_w
     print(f"Schicht {i} fertig ({time.time() - t0:.0f} s)", flush=True)
@@ -128,30 +130,30 @@ logits = np.empty((n, V), np.float32)
 CH = 8192
 for s0 in range(0, V, CH):
     w = TGT.rows("output.weight", s0, min(CH, V - s0))
-    logits[:, s0:s0 + w.shape[0]] = rows @ w.T
+    logits[:, s0:s0 + w.shape[0]] = rows.astype(np.float64) @ w.astype(np.float64).T
 cand = np.sort(np.argsort(-logits, axis=1, kind="stable")[:, :K], axis=1)  # aufsteigend nach id
 norm_w = D.tensor("output_norm.weight")
 raw_s = stash["raw"][1:]; rms_s = stash["rms"][1:]; q_s = stash["packed"][1:, :R]
 head_rows = np.stack([TGT.take_rows("output.weight", cand[i]) for i in range(n)])  # [n,K,H] (exakt)
 head_rows = bf(head_rows)
-base = np.sum((raw_s[:, None, :] * norm_w) * head_rows, axis=-1)  # [n,K]
+base = np.sum((raw_s[:, None, :] * norm_w).astype(np.float64) * head_rows, axis=-1)  # [n,K]
 write_w = fwrite[-1]  # [H, R]
 pv = packed_w[R:]  # [2R, C]
 
 
 def tg_row(v):
-    return bf(bf(bf(TGT.rows("output.weight", int(v), 1)[0]) * norm_w) @ write_w)
+    return bf(bf(bf(TGT.rows("output.weight", int(v), 1)[0]) * norm_w).astype(np.float64) @ write_w.astype(np.float64))
 
 
 def tsv_row(v):
-    return bf(bf(SQC * D.rows("dspine.bridge.codebook", int(v), 1)[0]) @ pv.T)
+    return bf(bf(SQC * D.rows("dspine.bridge.codebook", int(v), 1)[0]).astype(np.float64) @ pv.astype(np.float64).T)
 
 
 sid = np.concatenate([np.full((1, K), anchor), cand[:-1]], 0)
 tsv = np.stack([[tsv_row(v) for v in r] for r in sid])  # [n,K,2R]
 tg = np.stack([[tg_row(v) for v in r] for r in cand])  # [n,K,R]
 m = (1.0 / (1.0 + np.exp(-(q_s[:, None, :] + tsv[..., :R] + gate_b)))) * tsv[..., R:]
-s = np.einsum("nkr,njr->nkj", m, tg)
+s = np.einsum("nkr,njr->nkj", m.astype(np.float64), tg.astype(np.float64))
 score = base[:, None, :] + rms_s[:, None, None] * s
 idx = np.argmax(score, axis=-1)  # [n, K] (Sender -> bester Empfaenger)
 j = idx[0, 0]; drafts = []
