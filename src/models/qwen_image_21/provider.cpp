@@ -58,7 +58,9 @@ public:
   ext::ImageResult Generate(
       const ext::ImageRequest& request,
       const ext::CancellationCheck& is_cancelled) override {
-    const Request req = BuildRequest(request, state_);
+    Request req = BuildRequest(request, state_);
+    // Live preview (gufo.preview): the host's sink, rendered by the host.
+    req.preview = request.preview;
     Result result;
     try {
       result = model_->Generate(req, is_cancelled);
@@ -160,6 +162,7 @@ void qwen_image_21_provider_register(gufo::ext::Registry& registry) {
       .resolve = &ResolveQwenImage21Artifacts,
       .create = &CreateQwenImage21Runner,
       .create_with_options = &CreateQwenImage21RunnerWithOptions,
+      .preview_latent = "qwen_image_21",
   });
 #endif
 }

@@ -92,6 +92,8 @@ if (WIN32)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+# Animated WebP loops of live video previews (WebPAnimEncoder).
+pkg_check_modules(WEBPMUX REQUIRED IMPORTED_TARGET libwebpmux)
 # Extension-only libraries come from each selected extension's manifest
 # `packages` (gufo_build_discovered_extensions).
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -422,6 +424,12 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_serving PUBLIC gufo_cache_hip hip::host)
 endif()
 
+# Live image/video previews (/v1/previews): latent2rgb, JPEG, animated WebP
+# (gufo-studio-windows, changes/0.2/live-previews.md).
+add_library(gufo_preview STATIC src/cli/serve/preview.cpp)
+target_link_libraries(gufo_preview PUBLIC gufo_core JPEG::JPEG PkgConfig::WEBP
+  PkgConfig::WEBPMUX)
+
 add_library(gufo_http STATIC
   src/cli/serve/audio_buffer.cpp
   src/cli/serve/image_api.cpp
@@ -444,7 +452,7 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_ext_runtime gufo_core gufo_qwen_text PNG::PNG)
+target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_ext_runtime gufo_core gufo_qwen_text PNG::PNG)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -805,6 +813,12 @@ endfunction()
   target_link_libraries(arg_parser_test PRIVATE gufo_core)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
+
+  # Live previews: latent2rgb, encoders, hub, /v1/previews handler (CPU).
+  add_executable(preview_test tests/cli/preview_test.cpp)
+  target_link_libraries(preview_test PRIVATE gufo_preview)
+  add_test(NAME preview_test COMMAND preview_test)
+  set_tests_properties(preview_test PROPERTIES LABELS "cpu;server;preview")
 
   add_executable(transcribe_cli_test
     tests/cli/transcribe_test.cpp
