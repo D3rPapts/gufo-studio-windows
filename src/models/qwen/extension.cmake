@@ -22,6 +22,7 @@ gufo_extension_target(
     generator.cpp
     mtp_reference.cpp
     dflash_weights.cpp
+    dspine_config.cpp
     probe.cpp
     continuation_identity.cpp
     extension.cpp
@@ -63,6 +64,9 @@ gufo_extension_target(
     hip/dflash/executor.cpp
     hip/dflash/batch.cpp
     hip/dflash/backend.cpp
+    hip/dspine/model.cpp
+    hip/dspine/executor.cpp
+    hip/dspine/backend.cpp
     runner.cpp
     drivers.cpp
     provider.cpp
@@ -81,6 +85,7 @@ if(TARGET gufo_qwen_hip)
     SOURCES
       hip/attention.hip
       hip/batched_ssm.hip
+      hip/dspine/kernels.hip
   )
   target_compile_definitions(gufo_qwen_hip PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(gufo_qwen_hip SYSTEM PUBLIC

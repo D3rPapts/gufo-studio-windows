@@ -62,18 +62,6 @@ void Dequant(core::GgmlType type, const void* src, float* dst, std::size_t n) {
   }
 }
 
-std::uint32_t U32(const core::GgufReader& r, std::string_view key) {
-  const auto v = r.GetMetadataUint32(key);
-  if (!v) throw std::runtime_error("dspine: missing " + std::string(key));
-  return *v;
-}
-
-float F32(const core::GgufReader& r, std::string_view key) {
-  const auto v = r.GetMetadataFloat32(key);
-  if (!v) throw std::runtime_error("dspine: missing " + std::string(key));
-  return *v;
-}
-
 /// RMSNorm with one bf16 rounding of the scaled output (mx.fast.rms_norm).
 void RmsNorm(float* x, std::size_t n, const float* w, float eps) {
   double ss = 0;
@@ -103,37 +91,9 @@ std::unique_ptr<DSpineReference> DSpineReference::Open(
   self->reader_ = core::GgufReader::OpenFile(gguf, error);
   if (!self->reader_) return nullptr;
   const auto& r = *self->reader_;
-  try {
-    if (r.GetMetadataString("general.architecture").value_or("") != "dspine")
-      throw std::runtime_error("not a dspine GGUF");
-    auto& c = self->cfg_;
-    c.layers = U32(r, "dspine.block_count");
-    c.hidden = U32(r, "dspine.embedding_length");
-    c.ffn = U32(r, "dspine.feed_forward_length");
-    c.heads = U32(r, "dspine.attention.head_count");
-    c.kv_heads = U32(r, "dspine.attention.head_count_kv");
-    c.head_dim = U32(r, "dspine.attention.key_length");
-    c.block_size = U32(r, "dspine.block_size");
-    c.sliding_window = U32(r, "dspine.attention.sliding_window");
-    c.mask_token = U32(r, "dspine.mask_token_id");
-    c.code_size = U32(r, "dspine.bridge.code_size");
-    c.rank = U32(r, "dspine.bridge.rank");
-    c.head_topk = U32(r, "dspine.second_pass.head_topk");
-    c.vocab = U32(r, "dspine.vocab_size");
-    c.rms_eps = F32(r, "dspine.attention.layer_norm_rms_epsilon");
-    c.bridge_eps = F32(r, "dspine.bridge.eps");
-    c.rope_theta = F32(r, "dspine.rope.freq_base");
-    const auto* tl = r.FindMetadata("dspine.target_layers");
-    if (!tl) throw std::runtime_error("missing dspine.target_layers");
-    if (const auto* u = std::get_if<std::vector<std::uint64_t>>(&tl->value))
-      for (auto x : *u) c.target_layers.push_back(static_cast<std::uint32_t>(x));
-    else if (const auto* s = std::get_if<std::vector<std::int64_t>>(&tl->value))
-      for (auto x : *s) c.target_layers.push_back(static_cast<std::uint32_t>(x));
-    if (c.target_layers.empty()) throw std::runtime_error("empty dspine.target_layers");
-  } catch (const std::exception& e) {
-    if (error) *error = std::string("dspine: ") + e.what();
-    return nullptr;
-  }
+  auto cfg = ReadDSpineConfig(r, error);
+  if (!cfg) return nullptr;
+  self->cfg_ = std::move(*cfg);
   return self;
 }
 

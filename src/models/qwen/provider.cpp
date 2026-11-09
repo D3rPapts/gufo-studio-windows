@@ -40,7 +40,13 @@ void qwen_provider_register(gufo::ext::Registry& registry) {
                                 .max_draft_tokens = 7,
                                 .min_draft_tokens = 1,
                                 .draft_policy = "adaptive",
-                                .draft_policies = {"fixed", "adaptive"}}},
+                                .draft_policies = {"fixed", "adaptive"}},
+                               // DSpine b16: one block = anchor + 15 drafts.
+                               {.backend = "dspine",
+                                .max_draft_tokens = 15,
+                                .min_draft_tokens = 1,
+                                .draft_policy = "fixed",
+                                .draft_policies = {"fixed"}}},
   });
 #endif
 }

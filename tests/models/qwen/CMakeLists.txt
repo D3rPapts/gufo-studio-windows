@@ -148,13 +148,24 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_l2_gpu_integration_test
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
+  # DSpine HIP draft against the CPU reference (needs both GGUFs, slow).
+  add_qwen_hip_test(qwen_dspine_gpu_test
+    tests/models/qwen/dspine_gpu_test.cpp
+    "hip;gpu;qwen;dspine;slow")
+  target_sources(qwen_dspine_gpu_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/dspine_reference.cpp)
+  find_package(OpenMP)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(qwen_dspine_gpu_test PRIVATE OpenMP::OpenMP_CXX)
+  endif()
 endif()
 
 # DSpine draft (tencent/Qwen3.8-27B-DSpine-b16) CPU reference against the numpy
 # oracle from tools/dspine; skips (77) without the converted GGUF.
 add_executable(qwen_dspine_reference_test
   ${PROJECT_SOURCE_DIR}/tests/models/qwen/dspine_reference_test.cpp
-  ${PROJECT_SOURCE_DIR}/src/models/qwen/dspine_reference.cpp)
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/dspine_reference.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/dspine_config.cpp)
 target_link_libraries(qwen_dspine_reference_test PRIVATE gufo_core)
 add_test(NAME qwen_dspine_reference_test COMMAND qwen_dspine_reference_test)
 set_tests_properties(qwen_dspine_reference_test PROPERTIES LABELS "cpu;models;qwen;dspine" SKIP_RETURN_CODE 77)

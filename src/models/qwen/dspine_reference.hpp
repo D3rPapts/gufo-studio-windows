@@ -18,17 +18,9 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/dspine_config.hpp"
 
 namespace gufo::models::qwen {
-
-struct DSpineConfig {
-  std::uint32_t layers{0}, hidden{0}, ffn{0}, heads{0}, kv_heads{0};
-  std::uint32_t head_dim{0}, block_size{0}, sliding_window{0};
-  std::uint32_t mask_token{0}, code_size{0}, rank{0}, head_topk{0};
-  std::uint32_t vocab{0};
-  float rms_eps{1e-6f}, bridge_eps{1e-6f}, rope_theta{1e7f};
-  std::vector<std::uint32_t> target_layers;
-};
 
 /// The target model pieces a draft round needs, all as dense fp32 rows.
 struct DSpineTargetAccess {

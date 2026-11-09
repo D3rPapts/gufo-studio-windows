@@ -32,6 +32,7 @@
 #include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
+#include "src/models/qwen/hip/dspine.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/qwen_speculative_verifier.hpp"
@@ -258,6 +259,19 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     if (draft_backend == nullptr) {
       throw std::runtime_error("Failed to initialize DFlash backend: " + err);
     }
+  } else if (opt.speculative_backend == "dspine") {
+    if (opt.dspine_model_path.empty()) {
+      throw std::invalid_argument("DSpine requires --dspine-model");
+    }
+    hip::QwenDSpineGpuDraftConfig cfg{
+        .max_context = executor.GetMaxContext(),
+        .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
+    };
+    draft_backend = hip::QwenDSpineGpuDraftBackend::CreateFromGguf(
+        opt.dspine_model_path, executor.GetSharedModel(), cfg, &err);
+    if (draft_backend == nullptr) {
+      throw std::runtime_error("Failed to initialize DSpine backend: " + err);
+    }
   } else if (opt.speculative_backend == "mtp") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
@@ -282,7 +296,8 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
   s_opts.max_draft_tokens = opt.draft_tokens;
   s_opts.min_draft_tokens = opt.min_draft_tokens;
   s_opts.initial_draft_tokens = opt.draft_tokens;
-  const bool block_diffusion_draft = opt.speculative_backend == "dflash2";
+  const bool block_diffusion_draft = opt.speculative_backend == "dflash2" ||
+                                     opt.speculative_backend == "dspine";
   s_opts.enable_adaptive_draft_length = !block_diffusion_draft;
   s_opts.use_batched_verification = true;
   return hip::CreateQwenGpuSpeculativeVerifier(
@@ -430,6 +445,25 @@ int RunQwenBenchmarkImpl(
         opt.dflash_model_path, gpu_exec->GetSharedModel(), draft_config, &err);
     if (!draft) {
       throw std::runtime_error("DFlash2 initialization failed: " + err);
+    }
+    speculative::SpeculativeOptions options;
+    options.max_draft_tokens = opt.draft_tokens;
+    options.min_draft_tokens = opt.min_draft_tokens;
+    options.initial_draft_tokens = opt.draft_tokens;
+    options.enable_adaptive_draft_length = false;
+    options.use_batched_verification = true;
+    dflash_verifier = hip::CreateQwenGpuSpeculativeVerifier(
+        *gpu_exec, std::move(draft), options);
+  } else if (opt.speculative_backend == "dspine") {
+    // Same feature capture and verification path as DFlash2 (block draft).
+    hip::QwenDSpineGpuDraftConfig draft_config{
+        .max_context = static_cast<std::uint32_t>(required_context),
+        .max_draft_tokens = opt.draft_tokens,
+    };
+    auto draft = hip::QwenDSpineGpuDraftBackend::CreateFromGguf(
+        opt.dspine_model_path, gpu_exec->GetSharedModel(), draft_config, &err);
+    if (!draft) {
+      throw std::runtime_error("DSpine initialization failed: " + err);
     }
     speculative::SpeculativeOptions options;
     options.max_draft_tokens = opt.draft_tokens;

@@ -141,7 +141,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                    "Workload", &opt.validate_prefill_tokens);
 
   parser.AddCustomOption(
-      "", "--speculative", "none|mtp|dflash2|dspark",
+      "", "--speculative", "none|mtp|dflash2|dspine|dspark",
       "Speculative decoding backend (default: none)", "Speculative",
       [&opt, &speculative_explicit](std::string_view flag, std::string_view val,
                                     std::string* error) -> bool {
@@ -150,7 +150,8 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
           opt.speculative_backend.clear();
           return true;
         }
-        if (val == "mtp" || val == "dflash2" || val == "dspark") {
+        if (val == "mtp" || val == "dflash2" || val == "dspine" ||
+            val == "dspark") {
           opt.speculative_backend = std::string(val);
           return true;
         }
@@ -167,6 +168,10 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to GGUF model containing DFlash draft weights",
                    "Speculative", &opt.dflash_model_path);
+
+  parser.AddOption("", "--dspine-model", "PATH",
+                   "Path to the DSpine draft GGUF (tools/dspine converter)",
+                   "Speculative", &opt.dspine_model_path);
 
   parser.AddOption("", "--draft-policy", "POLICY",
                    "DFlash2 draft length policy: fixed or adaptive "
@@ -286,6 +291,11 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
   } catch (const std::invalid_argument& exception) {
     if (error_msg != nullptr)
       *error_msg = exception.what();
+    return std::nullopt;
+  }
+  if (opt.speculative_backend == "dspine" && opt.dspine_model_path.empty()) {
+    if (error_msg != nullptr)
+      *error_msg = "DSpine requires --dspine-model";
     return std::nullopt;
   }
   if (opt.min_draft_tokens != 1 && opt.speculative_backend == "dflash2") {
