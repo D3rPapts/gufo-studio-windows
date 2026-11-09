@@ -151,6 +151,14 @@ void TestGpuBusyRule() {
         PoolChoice::kWait);
   // GPU work on the remote only: here.
   CHECK(Choose(Cold(), remote) == PoolChoice::kLocal);
+  // GPU work here and the partner gone (paused, restarting): serve here
+  // anyway, never stand still (09.11.: 27B on the .56 beside a Comfy job).
+  CHECK(Choose(local, Unreachable()) == PoolChoice::kLocal);
+  CHECK(Choose(cold_local, Unreachable()) == PoolChoice::kLocal);
+  PoolSide warm_idle_busy_gpu = Warm(true);
+  warm_idle_busy_gpu.gpu_busy = true;
+  warm_idle_busy_gpu.empty = false;
+  CHECK(Choose(warm_idle_busy_gpu, Unreachable()) == PoolChoice::kLocal);
 }
 
 void TestForwardedStaysLocal() {
