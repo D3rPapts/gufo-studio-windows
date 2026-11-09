@@ -93,7 +93,8 @@ for name, e in HDR.items():
     is_vec = len(shape) == 1
     if is_vec:
         ty = F32; nb = n * 4
-    elif MODE == "q8_0" and dims[0] % 32 == 0:
+    elif MODE == "q8_0" and dims[0] % 32 == 0 and not g.startswith("dspine.bridge."):
+        # Wie dspine_mlx.quantize_draft: die Code-Bruecke bleibt BF16 (Nachschaerf-Schritt haengt an ihrer Rundung).
         ty = Q8_0; nb = n // 32 * 34
     else:
         ty = BF16; nb = n * 2
