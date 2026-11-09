@@ -6,6 +6,9 @@ gufo_extension_target(
     image.cpp
     weights.cpp
     tokenizer.cpp
+    lora.cpp
+    control.cpp
+    request.cpp
     extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
@@ -42,7 +45,12 @@ if(TARGET gufo_qwen_image_21_hip)
       hip/convolution.hip
       hip/pipeline.cpp
       hip/blas.cpp
+      hip/memory.cpp
   )
+  if(WIN32)
+    # DXGI reports dedicated and shared GPU memory for the memory check.
+    target_link_libraries(gufo_qwen_image_21_hip PRIVATE dxgi)
+  endif()
   target_compile_definitions(gufo_qwen_image_21_hip PUBLIC ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen_image_21_hip PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)

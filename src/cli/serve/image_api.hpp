@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/ext/image.hpp"
@@ -28,7 +29,9 @@ public:
   explicit ImageService(const std::filesystem::path& model_root,
                         std::string model_id = "Qwen-Image-2.1",
                         Runner runner = {},
-                        std::vector<std::string> model_aliases = {});
+                        std::vector<std::string> model_aliases = {},
+                        std::vector<std::pair<std::string, std::string>>
+                            provider_options = {});
   ~ImageService();
   const std::string& model_id() const { return model_id_; }
   /// True for the primary ID or a configured alias (#957).
@@ -41,6 +44,8 @@ public:
     return model_aliases_;
   }
   Result Generate(const Request& request, const CancellationCheck& cancelled);
+  /// Provider state as JSON text (ext::ImageRunner::Query), empty if none.
+  std::string Query(std::string_view topic) const;
 
 private:
   std::string model_id_;
@@ -52,6 +57,9 @@ private:
 
 HttpResponse HandleImageApiRequest(const HttpRequest& request,
                                    ImageService& service);
+/// `GET /sdapi/v1/loras`: the provider's registered adapters ("loras" query).
+HttpResponse HandleImageLorasRequest(const HttpRequest& request,
+                                     const ImageService& service);
 
 }  // namespace gufo::server
 #endif

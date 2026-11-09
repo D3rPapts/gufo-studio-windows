@@ -3,19 +3,22 @@
 Native implementation of the BF16 inference graph. Python is used only for
 offline evaluation; production loads safetensors directly.
 
-Qwen-Image-2.1-Turbo additionally pins
-[`Qwen/Qwen-Image-2.1-Turbo`](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/tree/fc13ba1986fcb905854dc8de2f52eee395f49b5b)
-at `fc13ba1986fcb905854dc8de2f52eee395f49b5b` and Diffusers at
-`aaf57d03a3edfbd9de457d2872417a92f149a91d` for its reference. Its eight
-checkpoint `sample_sigmas` replace base dynamic shifting; the base pins and
-numerical contracts below are unchanged. See the
-[Turbo quality checks](../../../docs/internal/models/qwen-image-2.1/QUALITY.md#qwen-image-21-turbo).
+The fork's Turbo generation and editing contract additionally pins
+`Qwen/Qwen-Image-2.1-Turbo` at `fc13ba1986fcb905854dc8de2f52eee395f49b5b` and
+Diffusers at `aaf57d03a3edfbd9de457d2872417a92f149a91d` for the independent
+Turbo oracle. Its saved eight-sigma schedule replaces base dynamic shifting;
+see [TURBO.md](../../../docs/models/qwen-image-2.1/TURBO.md). The existing base
+reference pins and numerical contracts below remain unchanged. Editing
+qualification covers a single RGBA reference with matched-input checks and an
+original-plus-mask pair with shared-noise full trajectories; see the
+[editing qualification](../../../docs/models/qwen-image-2.1/artifacts/turbo-editing-qualification.json).
 
 | Source | Pinned revision |
 | --- | --- |
 | [Qwen checkpoint](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | `b3179ad355be050328e483a9dfdd9e60cd62adfa` |
 | [Official model repository](https://github.com/QwenLM/Qwen-Image-2.1/tree/fb7ae1d1f9611cd91524d03c53c5246b36ac8577) | `fb7ae1d1f9611cd91524d03c53c5246b36ac8577` |
 | [Diffusers](https://github.com/huggingface/diffusers/tree/80c7ed262aeffbeb43ef13ae04baeb9b84515a69) | `80c7ed262aeffbeb43ef13ae04baeb9b84515a69` |
+| [ComfyUI](https://github.com/comfyanonymous/ComfyUI/tree/54a4e56ad1cabd17871068f160d0e75a1557db34) | `54a4e56ad1cabd17871068f160d0e75a1557db34`; [LoRA adapter semantics](#lora-adapters) only |
 | [Qwen3-VL implementation](https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | Transformers `v5.17.0`; FP32 vision-position interpolation and the pipeline's pre-final-norm hook |
 | [llama-swap routes](https://github.com/mostlygeek/llama-swap/blob/96e6f94c018b51ae9cfc420b3166cfcace5bf97a/internal/server/server.go) | `96e6f94c018b51ae9cfc420b3166cfcace5bf97a` |
 | [OpenAI image generation](https://github.com/openai/openai-python/blob/main/src/openai/types/image_generate_params.py) / [editing schema](https://github.com/openai/openai-python/blob/main/src/openai/types/image_edit_params.py) | Reviewed 2026-09-20; inference tests use local servers only |
@@ -52,6 +55,27 @@ compare matched block inputs as well as the complete trajectory. Do not change
 weights, remove reference images, reduce precision or skip diffusion steps to
 pass a speed gate.
 
+Guidance and image to image (Gufo extensions, `gufo.*` request fields):
+`guidance` above 1 is the pipeline's `true_cfg_scale`: each step also runs the
+negative prompt (same reference images) and
+combines `negative + guidance * (positive - negative)` with BF16 rounding after
+every tensor operation. Unlike the pipeline, which ignores the scale without a
+negative prompt, an absent negative prompt encodes like an empty prompt, as a
+ComfyUI KSampler with an empty negative conditioning would. `strength` below 1
+follows ComfyUI KSampler `denoise` (the pinned Diffusers revision has no
+Qwen-Image-2.1 image-to-image pipeline): `steps` steps over the last
+`steps + 1` sigmas of an `int(steps / strength)` schedule, starting from
+`sigma * noise + (1 - sigma) * latent` with the posterior-mean VAE latent of the
+start image resized to the output size. Defaults (1 and 1) keep the unguided
+full-schedule path unchanged. The negative prompt reuses the positive prompt's
+condition K/V for its leading reference images: block-causal rows never see
+later tokens, so rows before the first differing prompt token are identical;
+only its own text rows get a cache. Requests above 6144 condition rows (more
+than one 1 MP reference) fill the condition caches before the first step in
+4096-row chunks; condition rows never attend to target rows and use the
+timestep-zero modulation, so this is the joint first step split by rows (not
+checked for bit identity with the joint step).
+
 Gufo's RNG differs from PyTorch's. Compare shared initial noise, not numeric
 seeds alone. Edit RNG seeds also bind the ordered, resized RGBA references:
 reusing a generation seed must not replay the noise that generated the source.
@@ -63,3 +87,62 @@ downloaded weights use the
 [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/b3179ad355be050328e483a9dfdd9e60cd62adfa/LICENSE),
 which limits the granted use to non-commercial purposes; commercial use requires
 a separate license. Gufo's MIT license does not relicense those weights.
+
+## LoRA adapters
+
+Adapter semantics follow
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI/tree/54a4e56ad1cabd17871068f160d0e75a1557db34)
+`54a4e56ad1cabd17871068f160d0e75a1557db34`, the runtime most published
+Qwen-Image-2.1 adapters target. Relevant files under `comfy/`:
+
+- `lora.py` `load_lora` and `model_lora_keys_unet`: per-module `.alpha`,
+  `.dora_scale` and `.diff` tensors; bare, `transformer.`, `diffusion_model.`
+  and kohya `lora_unet_` module names. A fused `img_mlp.gate_up` weight is
+  `[gate_layer; proj]` (`ldm/qwen_image21/model.py` `SwiGLUFeedForward`,
+  `ops.py` `_swiglu_eager`), so a `gate_up` pair's up rows split in that order.
+- `weight_adapter/lora.py` `LoRAAdapter`: accepted pair layouts and
+  `alpha / rank` per pair (rank = rows of the down matrix), 1 without alpha.
+- `weight_adapter/base.py` `weight_decompose`: DoRA on the output axis
+  normalises each row by the norm of the weight **before** the update, plus
+  the FP32 epsilon, then blends with the strength.
+- `model_patcher.py` `patch_weight_to_device`: patches apply in list order to a
+  copy in `lora_compute_dtype` (FP32 on CPU, FP16 on some GPUs) that rounds to
+  BF16 once. Gufo always merges in FP32 from the uploaded BF16 weight.
+
+Gufo additionally reads `lora_alpha`/`use_rslora` from the Diffusers
+`lora_adapter_metadata` JSON when no `.alpha` tensor exists (Diffusers
+`loaders/lora_base.py`), and rejects whatever ComfyUI would skip or apply
+partially. `tools/models/qwen_image_21/lora_reference.py` reimplements these
+rules in FP64 with numpy for qualification; ComfyUI source is GPL-3.0 and is
+not copied.
+
+## Fun ControlNet-Union
+
+[alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union/tree/8a4702014d4dabb5f896fcba917e2ee0a961465f)
+`8a4702014d4dabb5f896fcba917e2ee0a961465f`: one BF16 file (7,550,979,904
+bytes, SHA-256 `65d6b66d734da9e7ff5ef04e7db3a133553a52a3f29a7fcb3e9cce8fa21dcfcd`)
+under the same Qwen Research License. Reference code:
+[VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun/tree/e8c314fbfa494d0429bbef605c9f6112b79a7ead)
+`e8c314fbfa494d0429bbef605c9f6112b79a7ead`
+(`videox_fun/models/qwenimage21_transformer2d_control.py`,
+`videox_fun/pipeline/pipeline_qwenimage21_control.py`,
+`config/qwenimage21/qwenimage21_control.yaml`); ComfyUI node semantics from
+PR #16519 (`3b3939a78878ca0d5c0817d8829df8cbf7308ffd`,
+`comfy_extras/nodes_model_patch.py` `QwenImage21FunControlPatch`).
+
+A VACE-style branch: 16 copies of the base block (shared modulation, same
+RoPE and block-causal mask) start from `before_proj(control_joint) + x`, where
+`control_joint` is zero on condition rows and `control_img_in(context)` on
+target rows; after base block `2i` the base stream adds
+`after_proj(c_i) * control_context_scale` on every row. The context has 129
+channels per target cell: the control image's normalized VAE latent, the keep
+mask (1 keep, 0 regenerate; zero for pure control) and the latent of the start
+image with regenerated pixels at mid-gray (zero for pure control). Condition
+rows of the branch see only condition rows and use timestep zero, so their
+skips are step-independent: Gufo keeps its condition K/V caches (filled with
+the skips, plus 16 branch caches) where the reference pipeline disables its
+cache under control. The branch runs interleaved after base block `2i`, as
+ComfyUI does; the result is the same as running it first. Control requests
+are text-only (no reference images), as in the reference pipeline. `start` /
+`end` select a fraction of the steps; steps outside use separate condition
+caches without the branch. Gufo does not preprocess control images.
