@@ -367,6 +367,19 @@ std::optional<VideoCliOptions> ParseVideoOptions(
 }
 
 int RunVideo(std::span<const char* const> args) {
+  // Internal helper processes of video providers (gufo-studio-windows):
+  // MiniMax H3 encodes vision + text in "video --h3-prompt-child req resp".
+  if (!args.empty() && std::string_view(args[0]) == "--h3-prompt-child") {
+    if (const ext::VideoProvider* provider =
+            ext::FindVideoProvider("minimax-h3");
+        provider != nullptr && provider->child_entry != nullptr) {
+      const int code = provider->child_entry(args);
+      if (code != -1)
+        return code;
+    }
+    std::cerr << "Error: this build has no MiniMax H3 prompt child" << std::endl;
+    return 2;
+  }
   std::string error;
   auto options = ParseVideoOptions(args, &error);
   if (!options.has_value()) {

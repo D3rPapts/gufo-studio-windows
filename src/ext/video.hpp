@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/ext/image.hpp"  // LatentPreview, PreviewSink (live previews)
@@ -135,6 +136,20 @@ using VideoArtifactResolver = bool (*)(std::string_view model_root,
                                        std::string* error);
 using VideoRunnerFactory = std::unique_ptr<VideoRunner> (*)(
     const std::string& model_root, std::string* error);
+/// Provider options of `serve video` (gufo-studio-windows,
+/// changes/0.2/video-provider-options.md): name/value pairs without dashes in
+/// command-line order, possibly repeated (`--lora NAME=PATH` twice).
+struct VideoRunnerOptions {
+  std::string model_root;
+  std::vector<std::pair<std::string, std::string>> options;
+};
+using VideoRunnerOptionsFactory = std::unique_ptr<VideoRunner> (*)(
+    const VideoRunnerOptions& options, std::string* error);
+/// An internal helper process of a provider: `gufo video <args...>` hands
+/// `args` to the provider whose `child_entry` claims `args[0]` (for example
+/// MiniMax H3's "--h3-prompt-child"). Returns the process exit code, or -1
+/// when the provider does not claim the arguments.
+using VideoChildEntry = int (*)(std::span<const char* const> args);
 
 struct VideoProvider {
   std::string id;
@@ -166,6 +181,12 @@ struct VideoProvider {
   /// and the preview loop's frame rate. Null: no previews.
   const char* preview_latent = nullptr;
   int preview_fps{24};
+  /// Preferred over `create` when set; the host passes `serve video`
+  /// provider options only to a provider that sets it and fails startup
+  /// otherwise.
+  VideoRunnerOptionsFactory create_with_options = nullptr;
+  /// Optional helper-process entry (see `VideoChildEntry`).
+  VideoChildEntry child_entry = nullptr;
 };
 
 void RegisterVideoProvider(VideoProvider provider);

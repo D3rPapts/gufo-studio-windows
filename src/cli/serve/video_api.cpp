@@ -491,7 +491,9 @@ HttpResponse CreatePreparedVideo(const json::Value& body,
                  "invalid_parameter_type");
   }
   const std::string model = service.normalize_model(model_value->str());
-  if (model != service.model_id()) {
+  // The provider id, or MiniMax H3's preset-selecting names (minimax-h3-fast
+  // ...), which its prepare_request maps to presets.
+  if (model != service.model_id() && !service.serves_model(model)) {
     return Error(400, "Bad Request", "unsupported video model",
                  "invalid_model");
   }

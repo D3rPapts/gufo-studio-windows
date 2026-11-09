@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -17,7 +18,19 @@ namespace gufo::models::minimax_h3 {
 #if defined(ENGINE_ENABLE_HIP)
 [[nodiscard]] std::unique_ptr<ext::VideoRunner> CreateMinimaxH3Runner(
     const std::string& model_root, std::string* error = nullptr);
+/// gufo-studio-windows: `serve video --lora/--vision-projector` (1.4.9).
+[[nodiscard]] std::unique_ptr<ext::VideoRunner> CreateMinimaxH3RunnerWithOptions(
+    const ext::VideoRunnerOptions& options, std::string* error);
 #endif
+
+/// The 1.4.9 H3 request rules (keyframes, guide frames/clips, audio anchor,
+/// LoRA, steps) as `VideoProvider::prepare_request`.
+bool PrepareMinimaxH3Request(const ext::VideoRequestInput& input,
+                             ext::VideoPreparedRequest* prepared,
+                             ext::VideoRequestError* error);
+/// `gufo video --h3-prompt-child <request> <response>` (vision + text
+/// encoding in a short-lived child process on Windows); -1 for other args.
+int MinimaxH3ChildEntry(std::span<const char* const> args);
 
 [[nodiscard]] std::optional<ext::VideoParameters> ResolvePreset(
     std::string_view name, std::string* error = nullptr);

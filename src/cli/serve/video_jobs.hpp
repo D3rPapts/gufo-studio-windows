@@ -106,6 +106,10 @@ struct VideoJobServiceOptions {
   /// gufo-studio-windows: RIFE / Real-ESRGAN post-steps; empty members
   /// reject requests that ask for them.
   VideoPostProcessors postprocessors;
+  /// gufo-studio-windows: the provider's own `serve video` options in
+  /// command-line order (`--lora`, `--vision-projector` for MiniMax H3),
+  /// passed to `VideoProvider::create_with_options`.
+  std::vector<std::pair<std::string, std::string>> provider_options;
 };
 
 struct VideoJobCreateResult {

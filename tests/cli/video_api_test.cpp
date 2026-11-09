@@ -307,10 +307,12 @@ void TestValidation(const std::filesystem::path& root) {
   const HttpResponse reference = Send(
       service, "POST", "/v1/videos",
       R"({"model":"minimax-h3","prompt":"x","seconds":"1","input_reference":"secret.png"})");
+  // gufo-studio-windows (as 1.4.9): H3 takes FL2VA keyframes; one that is
+  // not an image fails closed.
   Check(reference.status == 400 &&
-            reference.body.find("unsupported_input_reference") !=
+            reference.body.find("invalid_input_reference") !=
                 std::string::npos,
-        "future conditioning inputs fail closed");
+        "keyframes that are not images fail closed");
 
   const HttpResponse bad_output = Send(
       service, "POST", "/v1/videos",
@@ -424,9 +426,9 @@ void TestValidation(const std::filesystem::path& root) {
       Send(service, "POST", "/v1/videos", reference_body, {},
            "multipart/form-data; boundary=gufo-openai-video-boundary");
   Check(multipart_reference.status == 400 &&
-            multipart_reference.body.find("unsupported_input_reference") !=
+            multipart_reference.body.find("invalid_input_reference") !=
                 std::string::npos,
-        "multipart first-frame conditioning remains explicit future work");
+        "multipart keyframe files must decode as images");
 
   const HttpResponse unsupported_media =
       Send(service, "POST", "/v1/videos", "model=minimax-h3", {},
@@ -470,7 +472,8 @@ void TestDurations(const std::filesystem::path& root) {
   Check(runner.latest().parameters.frames == 345,
         "multipart resolves the maximum aligned duration");
 
-  for (const auto seconds : {"0", "4", "14.376", "15", "16"}) {
+  // 1.4.9 (1f3af1ad): every 17k + 5 frame count from 1 s up, so 4 s is legal.
+  for (const auto seconds : {"0", "0.5", "14.376", "15", "16"}) {
     const auto response =
         Send(service, "POST", "/v1/videos",
              "{\"model\":\"minimax-h3\",\"prompt\":\"x\",\"seconds\":\"" +

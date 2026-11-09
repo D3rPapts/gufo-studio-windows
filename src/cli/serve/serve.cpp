@@ -546,6 +546,33 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
 /// Qwen-Image-2.1 provider options of `serve image` (gufo-studio-windows):
 /// --lora NAME=PATH and --lora-default NAME:SCALE (both repeatable) and
 /// --controlnet FILE, forwarded in order as ext::ImageRunnerOptions.
+/// MiniMax H3 provider options of `serve video` (gufo-studio-windows, as
+/// 1.4.9): --lora NAME=PATH[,steps=N][,strength=S] (repeatable) and
+/// --vision-projector GGUF, forwarded in order as ext::VideoRunnerOptions.
+void AddVideoProviderOptions(
+    ArgParser& parser,
+    std::vector<std::pair<std::string, std::string>>* options) {
+  for (const auto& [name, metavar, help] :
+       {std::tuple{"lora", "NAME=PATH[,steps=N][,strength=S]",
+                   "Register a transformer LoRA for requests "
+                   "(\"gufo\":{\"lora\":NAME}); repeatable"},
+        std::tuple{"vision-projector", "GGUF",
+                   "Qwen3-VL vision tower for keyframe prompt blocks"}}) {
+    const std::string option = name;
+    parser.AddCustomOption(
+        "", "--" + option, metavar, help, "Model",
+        [options, option](std::string_view, std::string_view value,
+                          std::string* err) {
+          if (value.empty()) {
+            *err = "--" + option + " needs a value";
+            return false;
+          }
+          options->emplace_back(option, std::string(value));
+          return true;
+        });
+  }
+}
+
 void AddImageProviderOptions(
     ArgParser& parser,
     std::vector<std::pair<std::string, std::string>>* options) {
@@ -679,6 +706,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Storage", &video_ttl_seconds);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(parser, &video_names);
+    std::vector<std::pair<std::string, std::string>> provider_options;
+    AddVideoProviderOptions(parser, &provider_options);
     server::VideoPostProcessArgs post_args;
     server::AddVideoPostProcessOptions(parser, &post_args);
     ServerOptionHelpTargets server_help;
@@ -1281,6 +1310,8 @@ int RunServe(std::span<const char* const> args) {
                            &video_ttl_seconds);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(video_parser, &video_names);
+    std::vector<std::pair<std::string, std::string>> video_provider_options;
+    AddVideoProviderOptions(video_parser, &video_provider_options);
     // gufo-studio-windows RIFE / Real-ESRGAN post-steps.
     server::VideoPostProcessArgs post_args;
     server::AddVideoPostProcessOptions(video_parser, &post_args);
@@ -1337,6 +1368,7 @@ int RunServe(std::span<const char* const> args) {
             .now = {},
             .runner = {},
             .postprocessors = std::move(postprocessors),
+            .provider_options = std::move(video_provider_options),
         });
     if (!video_jobs->ready()) {
       std::cerr << "Error enabling video service: "

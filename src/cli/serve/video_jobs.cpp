@@ -92,9 +92,15 @@ bool IsPreparedProvider(const ext::VideoProvider* provider) {
   return provider != nullptr && provider->prepare_request != nullptr;
 }
 
+// MiniMax H3 keeps its preset-selecting model names, PPM diagnostics and
+// "exact-WxH" canvases even with its own prepare_request
+// (gufo-studio-windows, as 1.4.9).
+bool UsesH3Contract(const ext::VideoProvider* provider) {
+  return !IsPreparedProvider(provider) || provider->id == "minimax-h3";
+}
+
 bool IsServedModel(const ext::VideoProvider* provider, std::string_view model) {
-  return IsPreparedProvider(provider) ? model == provider->id
-                                      : IsH3Model(model);
+  return UsesH3Contract(provider) ? IsH3Model(model) : model == provider->id;
 }
 
 bool ParseSize(std::string_view size, int* width, int* height) {
@@ -113,7 +119,7 @@ bool ParseSize(std::string_view size, int* width, int* height) {
 bool MatchesOutputContract(const ext::VideoProvider* provider,
                            const VideoJobRequest& request) {
   const auto& parameters = request.parameters;
-  if (IsPreparedProvider(provider)) {
+  if (!UsesH3Contract(provider)) {
     int width = 0;
     int height = 0;
     return request.output_format == "mp4" &&
@@ -136,8 +142,21 @@ bool MatchesOutputContract(const ext::VideoProvider* provider,
         parameters.internal_width == 1344 &&
         parameters.internal_height == 768 && parameters.output_width == 1344 &&
         parameters.output_height == 768;
-    return (square || released_full_resolution) && parameters.mux &&
-           parameters.decode_audio && parameters.selected_frames.empty();
+    // "exact-WxH" at any accepted canvas (e.g. FilmStudio's 832x512),
+    // rendered natively (gufo-studio-windows, as 1.4.9).
+    int canvas_width = 0;
+    int canvas_height = 0;
+    const bool exact_canvas =
+        ParseSize(request.size, &canvas_width, &canvas_height) &&
+        parameters.preset == "exact-" + request.size &&
+        parameters.internal_width == canvas_width &&
+        parameters.internal_height == canvas_height &&
+        parameters.output_width == canvas_width &&
+        parameters.output_height == canvas_height &&
+        (request.model == "minimax-h3" || request.model == "minimax-h3-exact");
+    return (square || released_full_resolution || exact_canvas) &&
+           parameters.mux && parameters.decode_audio &&
+           parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
          parameters.preset == "development-256" &&
@@ -382,10 +401,28 @@ struct VideoJobService::Impl {
       return;
     }
     if (!options.runner) {
-      if (provider->create) {
+      if (!options.provider_options.empty() &&
+          provider->create_with_options == nullptr) {
+        initialization_error = "video provider '" + provider->id +
+                               "' takes no provider options (--" +
+                               options.provider_options.front().first + ")";
+        return;
+      }
+      if (provider->create_with_options || provider->create) {
         std::string create_err;
         auto video_runner =
-            provider->create(options.model_root.string(), &create_err);
+            provider->create_with_options
+                ? provider->create_with_options(
+                      {.model_root = options.model_root.string(),
+                       .options = options.provider_options},
+                      &create_err)
+                : provider->create(options.model_root.string(), &create_err);
+        if (!video_runner && provider->create_with_options) {
+          initialization_error = create_err.empty()
+                                     ? "cannot create the video runner"
+                                     : create_err;
+          return;
+        }
         if (video_runner) {
           std::shared_ptr<ext::VideoRunner> shared_runner =
               std::move(video_runner);
@@ -540,13 +577,14 @@ struct VideoJobService::Impl {
         int recovered_width = 0;
         int recovered_height = 0;
         const bool valid_output =
-            IsPreparedProvider(provider)
+            !UsesH3Contract(provider)
                 ? job->snapshot.output_format == "mp4" &&
                       ParseSize(job->snapshot.size, &recovered_width,
                                 &recovered_height)
                 : (job->snapshot.output_format == "mp4" &&
-                                   (job->snapshot.size == "512x512" ||
-                                    job->snapshot.size == "1344x768")) ||
+                                   ParseSize(job->snapshot.size,
+                                             &recovered_width,
+                                             &recovered_height)) ||
                                   (job->snapshot.output_format == "ppm" &&
                                    job->snapshot.size == "256x256");
         const bool valid_numbers =
@@ -964,7 +1002,7 @@ const ext::VideoProvider* VideoJobService::provider() const noexcept {
 
 std::string VideoJobService::model_id() const {
   const auto* video = provider();
-  return IsPreparedProvider(video) ? video->id : std::string("minimax-h3");
+  return UsesH3Contract(video) ? std::string("minimax-h3") : video->id;
 }
 
 bool VideoJobService::serves_model(std::string_view name) const {
@@ -1004,7 +1042,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   } else if (!IsServedModel(video, request.model) ||
              // Prepared providers decide whether a prompt is required (an
              // empty prompt is legal for image- or audio-driven video).
-             (request.prompt.empty() && !IsPreparedProvider(video)) ||
+             (request.prompt.empty() && UsesH3Contract(video)) ||
              request.prompt.find('\0') != std::string::npos ||
              (request.output_format != "mp4" &&
               request.output_format != "ppm") ||

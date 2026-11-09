@@ -7,6 +7,8 @@
 
 #include "src/models/minimax_h3/generation.hpp"
 #include "src/models/minimax_h3/probe.hpp"
+#include "src/models/minimax_h3/prompt_vision.hpp"
+#include "src/models/minimax_h3/request.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 
 namespace gufo::models::minimax_h3 {
@@ -136,6 +138,18 @@ std::string TelemetryJson(const ext::VideoTelemetry& telemetry) {
   return "{}";
 }
 
+bool PrepareMinimaxH3Request(const ext::VideoRequestInput& input,
+                             ext::VideoPreparedRequest* prepared,
+                             ext::VideoRequestError* error) {
+  return gufo::minimax_h3::PrepareRequest(input, prepared, error);
+}
+
+int MinimaxH3ChildEntry(std::span<const char* const> args) {
+  if (args.size() == 3 && std::string_view(args[0]) == "--h3-prompt-child")
+    return gufo::minimax_h3::RunPromptChild(args[1], args[2]);
+  return -1;
+}
+
 }  // namespace gufo::models::minimax_h3
 
 void minimax_h3_register(gufo::ext::Registry& registry) {
@@ -150,8 +164,10 @@ void minimax_h3_register(gufo::ext::Registry& registry) {
       .validate_parameters = &ValidateParameters,
       .parameters_json = &ParametersJson,
       .telemetry_json = &TelemetryJson,
+      .prepare_request = &PrepareMinimaxH3Request,
       // Live previews (gufo-studio-windows): H3 video latents, 24 fps.
       .preview_latent = "minimax_h3",
       .preview_fps = 24,
+      .child_entry = &MinimaxH3ChildEntry,
   });
 }

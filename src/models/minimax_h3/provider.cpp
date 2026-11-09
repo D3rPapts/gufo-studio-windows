@@ -7,19 +7,22 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 
 #include "src/models/minimax_h3/generation.hpp"
 #include "src/models/minimax_h3/probe.hpp"
+#include "src/models/minimax_h3/request.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 
 namespace gufo::models::minimax_h3 {
 
 class MinimaxH3RunnerImpl : public gufo::ext::VideoRunner {
 public:
-  explicit MinimaxH3RunnerImpl(std::filesystem::path model_root)
-      : model_root_(std::move(model_root)) {}
+  MinimaxH3RunnerImpl(std::filesystem::path model_root,
+                      gufo::minimax_h3::ProviderOptions options)
+      : model_root_(std::move(model_root)), options_(std::move(options)) {}
 
   bool Generate(const gufo::ext::VideoRequest& request,
                 const gufo::ext::CancellationCheck& is_cancelled,
@@ -53,9 +56,20 @@ public:
                 .mux = request.parameters.mux,
                 .selected_frames = request.parameters.selected_frames,
             },
-        // Live preview: the host's sink (changes/0.2/live-previews.md).
-        .preview = request.preview,
     };
+    // Live preview: the host's sink (changes/0.2/live-previews.md).
+    req.preview = request.preview;
+    // Keyframes, guide frames/clips, audio anchor, LoRA and the vision
+    // projector (gufo-studio-windows, as 1.4.9); guide clips are decoded with
+    // FFmpeg next to the output.
+    const std::filesystem::path work =
+        request.output_path.empty()
+            ? std::filesystem::temp_directory_path() / "gufo-h3-guides"
+            : request.output_path.parent_path();
+    if (!gufo::minimax_h3::DecodePreparedRequest(request, options_, work, &req,
+                                                 error)) {
+      return false;
+    }
     gufo::minimax_h3::CancellationToken token;
     std::jthread watcher;
     if (is_cancelled) {
@@ -111,12 +125,31 @@ public:
 
 private:
   std::filesystem::path model_root_;
+  gufo::minimax_h3::ProviderOptions options_;
 };
 
 #if defined(ENGINE_ENABLE_HIP)
 std::unique_ptr<ext::VideoRunner> CreateMinimaxH3Runner(
     const std::string& model_root, std::string*) {
-  return std::make_unique<MinimaxH3RunnerImpl>(model_root);
+  gufo::minimax_h3::SetActiveProviderOptions({});
+  return std::make_unique<MinimaxH3RunnerImpl>(
+      model_root, gufo::minimax_h3::ProviderOptions{});
+}
+
+std::unique_ptr<ext::VideoRunner> CreateMinimaxH3RunnerWithOptions(
+    const ext::VideoRunnerOptions& options, std::string* error) {
+  gufo::minimax_h3::ProviderOptions parsed;
+  std::string parse_error;
+  if (!gufo::minimax_h3::ParseProviderOptions(options.options, &parsed,
+                                               &parse_error)) {
+    if (error != nullptr)
+      *error = std::move(parse_error);
+    return nullptr;
+  }
+  // prepare_request checks LoRA names and default steps against these.
+  gufo::minimax_h3::SetActiveProviderOptions(parsed);
+  return std::make_unique<MinimaxH3RunnerImpl>(options.model_root,
+                                               std::move(parsed));
 }
 #endif
 
@@ -127,6 +160,8 @@ void minimax_h3_provider_register(gufo::ext::Registry& registry) {
       gufo::ext::generated::extension_minimax_h3::kProvider_minimax_h3);
 #if defined(ENGINE_ENABLE_HIP)
   using namespace gufo::models::minimax_h3;
+  // Replaces the CPU registration of extension.cpp, so it repeats every
+  // member (preview, prepare_request, child entry).
   registry.AddVideoProvider({
       .id = "minimax-h3",
       .probe = &ProbeMinimaxH3,
@@ -137,6 +172,11 @@ void minimax_h3_provider_register(gufo::ext::Registry& registry) {
       .validate_parameters = &ValidateParameters,
       .parameters_json = &ParametersJson,
       .telemetry_json = &TelemetryJson,
+      .prepare_request = &PrepareMinimaxH3Request,
+      .preview_latent = "minimax_h3",
+      .preview_fps = 24,
+      .create_with_options = &CreateMinimaxH3RunnerWithOptions,
+      .child_entry = &MinimaxH3ChildEntry,
   });
 #endif
 }
