@@ -3,22 +3,32 @@
 gufo_extension_target(
   NAME gufo_minimax_h3
   SOURCES
+    audio_input.cpp
     audio_vae.cpp
     denoiser.cpp
     dit.cpp
     generation.cpp
     json.cpp
+    lora.cpp
     media.cpp
     prompt_encoder.cpp
+    prompt_vision.cpp
+    request.cpp
     runtime.cpp
     sampling.cpp
     sha256.cpp
+    stage_cache.cpp
     tokenizer.cpp
     video_vae.cpp
+    video_vae_encoder.cpp
     extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     gufo_core
+    gufo_qwen_vision
+    gufo_rife
+    PkgConfig::sndfile
+    PkgConfig::soxr
 )
 
 if(TARGET gufo_minimax_h3)
@@ -51,6 +61,8 @@ if(TARGET gufo_minimax_h3_hip)
       prompt_encoder.hip
       sampling.hip
       video_vae.hip
+      video_vae_encoder.hip
+      lora.hip
       attention.hip
   )
   target_compile_definitions(gufo_minimax_h3_hip PUBLIC ENGINE_ENABLE_HIP=1)

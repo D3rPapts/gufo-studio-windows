@@ -9,11 +9,13 @@
 #include <string>
 #include <vector>
 
-#include "src/models/minimax_h3/preview_hook.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
+#include "src/models/minimax_h3/preview_hook.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
 namespace gufo::minimax_h3 {
+
+class LoraAdapter;
 
 inline constexpr std::size_t kH3TextConditionWidth = 5120;
 inline constexpr std::size_t kH3VideoLatentChannels = 24;
@@ -28,11 +30,34 @@ struct DenoiserOptions {
   int active_blocks{50};
   int reuse_interval{1};
   bool row_parallel_attention{true};
+  // Merged into the token refiner and DiT projections at load; must outlive
+  // the session's creation.
+  const LoraAdapter* lora{nullptr};
+};
+
+/// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE
+/// posterior mean `[32][2][latent_frames]` that starts at pixel frame
+/// `frame` of the target video. It is held clean for every step.
+struct AudioGuideLatent {
+  int frame{0};
+  int latent_frames{0};
+  std::vector<float> latent;
 };
 
 struct DenoiserConditioning {
   std::span<const std::uint16_t> layer50;
   std::span<const std::uint8_t> tags;
+  // Image guides (FL2VA keyframes and intermediate guide frames): one
+  // normalized, noise-augmented latent frame (24 x latent_height x
+  // latent_width) per guide, in packed order, and the pixel frame each one
+  // is anchored at.
+  std::span<const std::vector<float>> keyframe_latents;
+  std::span<const int> keyframe_frames;
+  // Latent frames per image guide (empty: one each). A guide clip
+  // (MiniMaxH3AddGuide with a 17k + 5 frame batch) has 5k + 2, and its
+  // latent is [24][latent frames][latent_height][latent_width].
+  std::span<const int> keyframe_latent_frames;
+  std::span<const AudioGuideLatent> audio_guides;
 };
 
 struct DenoiserVelocity {
@@ -51,11 +76,13 @@ struct DenoiserTelemetry {
   double setup_ms{0.0};
   double text_refiner_ms{0.0};
   double adaln_precompute_ms{0.0};
+  // The AdaLN modulations came from the stage cache (GUFO_H3_CACHE_DIR).
+  bool adaln_cache_hit{false};
   double core_load_ms{0.0};
   std::vector<double> forward_ms;
   double sampler_ms{0.0};
   // Live preview read-backs: count and time spent in the denoiser loop
-  // (gufo-studio-windows).
+  // (device->host copy, x0 estimate, unpatchify, hand-over).
   double preview_ms{0.0};
   int previews{0};
   std::uint64_t core_weight_bytes{0};
@@ -113,7 +140,7 @@ public:
                                          std::string* error = nullptr);
 
   /// Live preview of the denoised video estimate before each Euler update
-  /// (gufo-studio-windows); empty: none.
+  /// (channel-major [24][latent frames][height][width]); reads only.
   void SetPreview(models::PreviewHook preview);
 
   [[nodiscard]] const GenerationGeometry& geometry() const noexcept;

@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <gufo/ext/platform/mapped_file.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -13,6 +12,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::minimax_h3 {
 
@@ -184,6 +185,9 @@ private:
 
 [[nodiscard]] std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
     std::string* error = nullptr);
+
+// GUFO_H3_TRACE=1: prints the stage and the device's free memory to stderr.
+void TraceStage(const char* stage);
 [[nodiscard]] constexpr ResidencyMode DefaultResidencyMode() noexcept {
   return ResidencyMode::kDeviceCopy;
 }

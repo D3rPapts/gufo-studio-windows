@@ -1356,6 +1356,21 @@ endfunction()
   set_tests_properties(minimax_h3_sampling_test PROPERTIES
     LABELS "cpu;models;minimax-h3;layout;schedule;rng;quality")
 
+  add_executable(minimax_h3_request_test
+    tests/models/minimax_h3_request_test.cpp)
+  target_link_libraries(minimax_h3_request_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})
+  add_test(NAME minimax_h3_request_test COMMAND minimax_h3_request_test)
+  set_tests_properties(minimax_h3_request_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;api;quality")
+
+  add_executable(minimax_h3_stage_cache_test
+    tests/models/minimax_h3_stage_cache_test.cpp)
+  target_link_libraries(minimax_h3_stage_cache_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})
+  add_test(NAME minimax_h3_stage_cache_test
+    COMMAND minimax_h3_stage_cache_test)
+  set_tests_properties(minimax_h3_stage_cache_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;cache;quality")
+
   add_executable(minimax_h3_generation_test
     tests/models/minimax_h3_generation_test.cpp)
   target_link_libraries(minimax_h3_generation_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})

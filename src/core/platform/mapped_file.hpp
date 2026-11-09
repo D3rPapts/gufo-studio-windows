@@ -110,6 +110,15 @@ void CloseFile(PlatformFile file) noexcept;
 /// Reads up to `bytes` at `offset`; returns bytes read, 0 on failure/EOF.
 std::size_t ReadFileAt(PlatformFile file, void* output, std::size_t bytes,
                        std::uint64_t offset) noexcept;
+/// Reads `bytes` at `offset` with `readers` threads. When `offset` and
+/// `output` are 4096-byte aligned, whole sectors go through unbuffered
+/// handles in 8 MiB pieces (several requests in flight, no cache copy, no
+/// standby pages); the unaligned tail and any failed piece use `file`.
+/// Returns the bytes read: less than `bytes` only at end of file or on
+/// failure.
+std::size_t ReadFileParallel(PlatformFile file, void* output, std::size_t bytes,
+                             std::uint64_t offset,
+                             unsigned readers = 4) noexcept;
 /// Total file size, or nullopt when it cannot be determined.
 std::optional<std::uint64_t> FileSizeBytes(PlatformFile file) noexcept;
 

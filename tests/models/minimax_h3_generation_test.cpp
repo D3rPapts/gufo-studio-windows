@@ -106,7 +106,12 @@ void TestDurations() {
                                                      {"12", 294},
                                                      {"13", 328},
                                                      {"14", 345},
-                                                     {"14.375", 345}}) {
+                                                     {"14.375", 345},
+                                                     // Short FilmStudio shots: any 17k + 5.
+                                                     {"1.5", 39},
+                                                     {"2", 56},
+                                                     {"4.125", 107},
+                                                     {"4.99", 124}}) {
     Check(h3::ResolveDurationFrames(seconds) == frames,
           "duration uses the official 24-fps VAE grid");
     auto parameters = h3::ResolveGenerationPreset("exact-1344x768");
@@ -115,7 +120,7 @@ void TestDurations() {
     Check(h3::ValidateGenerationParameters(*parameters, &error), error);
   }
   for (const auto seconds :
-       {"", "0", "2", "4.99", "14.376", "15", "16", "nan", "inf", "5x"}) {
+       {"", "0", "0.5", "14.376", "15", "16", "nan", "inf", "5x"}) {
     Check(!h3::ResolveDurationFrames(seconds),
           "invalid or over-limit aligned duration is rejected");
   }
@@ -248,6 +253,20 @@ void TestPresetsAndReports() {
       "telemetry identifies the active attention kernel");
   Check(telemetry_json.find("\"first_preview_ms\": 8.000") != std::string::npos,
         "telemetry records preview latency");
+  Check(telemetry_json.find("\"prompt_cache_hit\": false") !=
+                std::string::npos &&
+            telemetry_json.find("\"denoiser_adaln_cache_hit\": false") !=
+                std::string::npos,
+        "telemetry reports stage cache misses");
+  telemetry.prompt_cache_hit = true;
+  telemetry.denoiser.adaln_cache_hit = true;
+  const std::string cached_json = h3::GenerationTelemetryJson(telemetry);
+  Check(h3::json::Parse(cached_json).IsObject() &&
+            cached_json.find("\"prompt_cache_hit\": true") !=
+                std::string::npos &&
+            cached_json.find("\"denoiser_adaln_cache_hit\": true") !=
+                std::string::npos,
+        "telemetry reports stage cache hits");
 }
 
 void TestAtomicFrames() {

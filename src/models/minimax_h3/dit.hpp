@@ -12,6 +12,8 @@
 
 namespace gufo::minimax_h3 {
 
+class LoraAdapter;
+
 inline constexpr std::size_t kDitBlocks = 50;
 inline constexpr std::size_t kDitHiddenSize = 5376;
 inline constexpr std::size_t kDitAttentionHeads = 56;
@@ -60,6 +62,8 @@ struct DitBlockOptions {
   std::size_t modulation_rows{0};
   bool row_parallel_attention{true};
   bool validate_gemm_plans{true};
+  // Merged into the projection weights at load; must outlive Create.
+  const LoraAdapter* lora{nullptr};
 };
 
 struct DitBlockInput {

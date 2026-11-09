@@ -8,22 +8,30 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-#include <gufo/ext/platform/mapped_file.hpp>
-#include <gufo/ext/platform/os_info.hpp>
+#include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/denoiser.hpp"
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
+#include "src/models/minimax_h3/lora.hpp"
+#include "src/models/minimax_h3/stage_cache.hpp"
+#include "src/models/minimax_h3/stage_profile.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -31,6 +39,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
+constexpr std::size_t kTensorSector = 4096;
+constexpr std::size_t kTensorStagingSlack = 2U * kTensorSector;
 constexpr std::size_t kTimeInputWidth = 256;
 constexpr std::size_t kTimeHiddenWidth = 5376;
 constexpr std::size_t kTimeOutputWidth = 2688;
@@ -52,6 +62,11 @@ void SetError(std::string* error, std::string message) {
 
 bool IsCancelled(const CancellationToken* cancellation) {
   return cancellation != nullptr && cancellation->IsCancelled();
+}
+
+// GUFO_H3_TRACE=1 prints denoiser setup stages to stderr.
+void Trace(const char* stage) {
+  TraceStage(stage);
 }
 
 double Milliseconds(Clock::time_point begin, Clock::time_point end) {
@@ -223,6 +238,29 @@ bool LoadTensor(const ModelInventory& inventory,
     }
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
     std::size_t read_bytes = 0;
+    std::size_t lead = 0;
+    // Each chunk is read as its sector-aligned superset with unbuffered
+    // parallel readers (the staging buffer has kTensorStagingSlack spare
+    // bytes). GUFO_H3_PARALLEL_TENSOR_READ=0 keeps one buffered stream.
+    static const bool parallel_read = [] {
+      const char* value = std::getenv("GUFO_H3_PARALLEL_TENSOR_READ");
+      return value == nullptr || std::atoi(value) != 0;
+    }();
+    if (parallel_read) {
+      const std::uint64_t position = descriptor.file_offset + copied;
+      const std::uint64_t aligned = position / kTensorSector * kTensorSector;
+      lead = static_cast<std::size_t>(position - aligned);
+      const std::size_t span =
+          (lead + chunk + kTensorSector - 1U) / kTensorSector * kTensorSector;
+      if (platform::ReadFileParallel(file, staging, span, aligned) <
+          lead + chunk) {
+        SetError(error,
+                 "short read loading MiniMax H3 tensor " + descriptor.name);
+        success = false;
+        break;
+      }
+      read_bytes = chunk;
+    }
     while (read_bytes < chunk) {
       const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
@@ -241,7 +279,8 @@ bool LoadTensor(const ModelInventory& inventory,
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess) {
       status = hipMemcpyAsync(static_cast<std::byte*>(output->data()) + copied,
-                              staging, chunk, hipMemcpyHostToDevice, stream);
+                              static_cast<const std::byte*>(staging) + lead,
+                              chunk, hipMemcpyHostToDevice, stream);
     }
     if (status == hipSuccess) {
       status = hipStreamSynchronize(stream);
@@ -538,8 +577,8 @@ struct RefinerWeights {
 bool LoadRefinerBlock(const ModelInventory& inventory, std::size_t block,
                       int device, hipStream_t stream, void* staging,
                       const CancellationToken* cancellation,
-                      RefinerWeights* weights, std::uint64_t* loaded_bytes,
-                      std::string* error) {
+                      const LoraAdapter* lora, RefinerWeights* weights,
+                      std::uint64_t* loaded_bytes, std::string* error) {
   const std::string prefix =
       "token_refiner.blocks." + std::to_string(block) + ".";
   const std::array<const TensorDescriptor*, 8> tensors = {
@@ -578,7 +617,16 @@ bool LoadRefinerBlock(const ModelInventory& inventory, std::size_t block,
     }
     *loaded_bytes += tensors[index]->payload_bytes;
   }
-  return true;
+  return MergeLoraModule(lora, prefix + "attn.qkv_proj", weights->qkv.data(),
+                         kDitAttentionWidth * 3U, kDitHiddenSize, stream,
+                         error) &&
+         MergeLoraModule(lora, prefix + "attn.out_proj", weights->output.data(),
+                         kDitHiddenSize, kDitAttentionWidth, stream, error) &&
+         MergeLoraModule(lora, prefix + "mlp.fc1", weights->fc1.data(),
+                         kDitFeedForwardSize * 2U, kDitHiddenSize, stream,
+                         error) &&
+         MergeLoraModule(lora, prefix + "mlp.fc2", weights->fc2.data(),
+                         kDitHiddenSize, kDitFeedForwardSize, stream, error);
 }
 
 bool IsFinite(std::span<const float> values, std::string_view name,
@@ -597,7 +645,6 @@ bool IsFinite(std::span<const float> values, std::string_view name,
 struct DenoiserSession::Impl {
   const ModelInventory* inventory{nullptr};
   GenerationGeometry geometry;
-  models::PreviewHook preview;
   PackedLayout layout;
   SigmaSchedule schedule;
   TimeRowSchedule time_rows;
@@ -609,6 +656,10 @@ struct DenoiserSession::Impl {
   std::vector<std::uint16_t> final_modulation_host;
   std::vector<float> video_rows_host;
   std::vector<float> audio_rows_host;
+  std::vector<float> condition_rows_host;
+  models::PreviewHook preview;
+  std::vector<float> audio_condition_rows_host;
+  const LoraAdapter* lora{nullptr};
   std::vector<std::unique_ptr<DitBlockSession>> blocks;
   std::vector<double> forward_history;
 
@@ -631,6 +682,8 @@ struct DenoiserSession::Impl {
 
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
+  DeviceBuffer condition_sample;
+  DeviceBuffer audio_condition_sample;
   DeviceBuffer projection_scratch_f32;
   DeviceBuffer hidden_device;
   DeviceBuffer block_row_map;
@@ -640,6 +693,11 @@ struct DenoiserSession::Impl {
   DeviceBuffer previous_audio_velocity_f32;
 
   DenoiserTelemetry base_telemetry;
+  std::optional<StageCacheOptions> stage_cache;
+  std::string adaln_cache_key;
+  std::vector<std::vector<std::uint16_t>> adaln_cached;
+  std::vector<std::vector<std::uint16_t>> adaln_recorded;
+  bool adaln_cache_hit{false};
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
@@ -767,7 +825,8 @@ struct DenoiserSession::Impl {
       RefinerWeights weights;
       std::uint64_t loaded_bytes = 0;
       if (!LoadRefinerBlock(*inventory, block, device, stream, staging,
-                            cancellation, &weights, &loaded_bytes, error)) {
+                            cancellation, lora, &weights, &loaded_bytes,
+                            error)) {
         return false;
       }
       base_telemetry.cumulative_allocation_bytes += loaded_bytes;
@@ -924,6 +983,124 @@ struct DenoiserSession::Impl {
     return true;
   }
 
+  // Diffusion time of every timestep row (the only per-job input of the
+  // AdaLN modulations).
+  std::vector<float> TimeValues() const {
+    std::vector<float> times(time_rows.time_rows, 0.0F);
+    for (int step = 0; step < schedule.evaluations(); ++step) {
+      const std::size_t index = static_cast<std::size_t>(step);
+      times[time_rows.video_rows[index]] = 1.0F - schedule.video[index];
+      times[time_rows.audio_rows[index]] = 1.0F - schedule.audio[index];
+    }
+    if (time_rows.condition_row != TimeRowSchedule::kNoConditionRow) {
+      times[time_rows.condition_row] = kH3ConditionTime;
+    }
+    if (time_rows.audio_condition_row != TimeRowSchedule::kNoConditionRow) {
+      times[time_rows.audio_condition_row] = kH3AudioConditionTime;
+    }
+    return times;
+  }
+
+  // AdaLN cache (GUFO_H3_CACHE_DIR). Each block's and the final layer's
+  // modulation is a function of the timestep rows, the time embedder and
+  // AdaLN weights and the BF16 GEMM backend only. The prompt, the canvas,
+  // the guides and the LoRA (ComputeModulation loads adaln_proj without
+  // it) do not enter. A hit replays the bytes an earlier miss read back
+  // from the device and skips reading the ~24 GiB of AdaLN weights.
+  std::string AdaLnCacheKey() const {
+    StageCacheKey key("gufo.minimax-h3.adaln.v1");
+    key.AddText("backend", ComputeBackendIdentity());
+    key.AddInteger("pinned_solution", static_cast<std::uint32_t>(
+                                          kGfx1151RocblasBf16Solution));
+    key.AddInteger("blocks", kDitBlocks);
+    key.AddInteger("block_width", kBlockModulationWidth);
+    key.AddInteger("final_width", kFinalModulationWidth);
+    key.AddInteger("time_input_width", kTimeInputWidth);
+    key.AddInteger("time_output_width", kTimeOutputWidth);
+    key.AddInteger("time_rows", time_rows.time_rows);
+    const std::vector<float> times = TimeValues();
+    key.AddValues("times", std::span<const float>(times));
+    key.AddInventoryPhase(*inventory, Phase::kAdaLnPrecompute);
+    return key.Hex();
+  }
+
+  void PrepareAdaLnCache() {
+    stage_cache = StageCacheFromEnvironment();
+    if (!stage_cache.has_value()) {
+      return;
+    }
+    adaln_cache_key = AdaLnCacheKey();
+    const std::size_t block_elements =
+        static_cast<std::size_t>(time_rows.time_rows) * kBlockModulationWidth;
+    const std::size_t final_elements =
+        static_cast<std::size_t>(time_rows.time_rows) * kFinalModulationWidth;
+    std::string cache_error;
+    auto loaded =
+        LoadStageArrays(*stage_cache, "adaln", adaln_cache_key, &cache_error);
+    if (!cache_error.empty()) {
+      Trace(cache_error.c_str());
+    }
+    if (loaded.has_value() && loaded->size() == kDitBlocks + 1U &&
+        std::all_of(loaded->begin(), loaded->begin() + kDitBlocks,
+                    [block_elements](const auto& values) {
+                      return values.size() == block_elements;
+                    }) &&
+        loaded->back().size() == final_elements) {
+      adaln_cached = std::move(*loaded);
+      adaln_cache_hit = true;
+      base_telemetry.adaln_cache_hit = true;
+      Trace("AdaLN cache hit");
+      return;
+    }
+    const std::uint64_t entry_bytes =
+        (static_cast<std::uint64_t>(block_elements) * kDitBlocks +
+         final_elements) *
+        sizeof(std::uint16_t);
+    if (entry_bytes <= stage_cache->max_bytes / 2U) {
+      adaln_recorded.resize(kDitBlocks + 1U);
+    }
+  }
+
+  // Publishes a complete miss (called after BuildBlocks succeeded) and
+  // releases the host copies either way.
+  void StoreAdaLnCache() {
+    if (stage_cache.has_value() && !adaln_cache_hit &&
+        !adaln_recorded.empty() &&
+        std::ranges::all_of(adaln_recorded, [](const auto& values) {
+          return !values.empty() && AllFiniteBf16(values);
+        })) {
+      std::string cache_error;
+      if (!StoreStageArrays(*stage_cache, "adaln", adaln_cache_key,
+                            adaln_recorded, &cache_error)) {
+        Trace(cache_error.c_str());
+      } else {
+        Trace("AdaLN cache stored");
+      }
+    }
+    std::vector<std::vector<std::uint16_t>>().swap(adaln_recorded);
+    std::vector<std::vector<std::uint16_t>>().swap(adaln_cached);
+  }
+
+  // Modulation of `slot` (a block index, or kDitBlocks for the final
+  // layer): from the cache on a hit, otherwise computed and recorded.
+  bool Modulation(std::size_t slot, std::string_view prefix,
+                  std::size_t output_width, const DeviceBuffer& time_embedding,
+                  bool select_plan, const CancellationToken* cancellation,
+                  std::vector<std::uint16_t>* host_output, std::string* error) {
+    if (adaln_cache_hit) {
+      *host_output = adaln_cached[slot];
+      return true;
+    }
+    if (!ComputeModulation(prefix, output_width, time_embedding, select_plan,
+                           cancellation, host_output, error)) {
+      return false;
+    }
+    if (!adaln_recorded.empty()) {
+      adaln_recorded[slot] = *host_output;
+    }
+    return true;
+  }
+
   bool BuildTimeEmbedding(DeviceBuffer* output,
                           const CancellationToken* cancellation,
                           std::string* error) {
@@ -943,12 +1120,7 @@ struct DenoiserSession::Impl {
         output_weight == nullptr || output_bias == nullptr) {
       return false;
     }
-    std::vector<float> times(time_rows.time_rows, 0.0F);
-    for (int step = 0; step < schedule.evaluations(); ++step) {
-      const std::size_t index = static_cast<std::size_t>(step);
-      times[time_rows.video_rows[index]] = 1.0F - schedule.video[index];
-      times[time_rows.audio_rows[index]] = 1.0F - schedule.audio[index];
-    }
+    const std::vector<float> times = TimeValues();
     std::vector<float> features(time_rows.time_rows * kTimeInputWidth);
     for (std::size_t row = 0; row < time_rows.time_rows; ++row) {
       for (std::size_t index = 0; index < kTimeInputWidth / 2U; ++index) {
@@ -1080,10 +1252,14 @@ struct DenoiserSession::Impl {
   }
 
   bool BuildBlocks(const CancellationToken* cancellation, std::string* error) {
+    PrepareAdaLnCache();
     DeviceBuffer time_embedding;
-    if (!BuildTimeEmbedding(&time_embedding, cancellation, error)) {
+    Trace("time embedding");
+    if (!adaln_cache_hit &&
+        !BuildTimeEmbedding(&time_embedding, cancellation, error)) {
       return false;
     }
+    Trace("rope");
     std::vector<std::uint16_t> rope_cos;
     std::vector<std::uint16_t> rope_sin;
     if (!BuildRope(&rope_cos, &rope_sin, error)) {
@@ -1125,8 +1301,8 @@ struct DenoiserSession::Impl {
         const std::string prefix =
             "blocks." + std::to_string(block) + ".adaln_proj";
         const auto modulation_begin = Clock::now();
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               block == 2, cancellation, &modulation, error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        block == 2, cancellation, &modulation, error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
@@ -1208,7 +1384,8 @@ struct DenoiserSession::Impl {
                  .rows = rows,
                  .modulation_rows = modulation_rows,
                  .row_parallel_attention = row_parallel_attention,
-                 .validate_gemm_plans = block == 0},
+                 .validate_gemm_plans = block == 0,
+                 .lora = lora},
                 block_workspace, cancellation, &worker_result.error);
             if (session == nullptr) {
               break;
@@ -1223,9 +1400,20 @@ struct DenoiserSession::Impl {
           }
           return worker_result;
         };
-        auto second_worker = std::async(std::launch::async, worker);
-        WorkerResult first = worker();
-        WorkerResult second = second_worker.get();
+        // Four block loaders beside the AdaLN precompute keep the disk busy
+        // (GUFO_H3_LOAD_WORKERS overrides, 1..8).
+        const char* workers_value = std::getenv("GUFO_H3_LOAD_WORKERS");
+        const int worker_count = std::clamp(
+            workers_value == nullptr ? 4 : std::atoi(workers_value), 1, 8);
+        std::vector<std::future<WorkerResult>> others;
+        for (int index = 1; index < worker_count; ++index) {
+          others.push_back(std::async(std::launch::async, worker));
+        }
+        std::vector<WorkerResult> workers;
+        workers.push_back(worker());
+        for (auto& other : others) {
+          workers.push_back(other.get());
+        }
         result.sessions.resize(kDitBlocks);
         const auto merge = [&](WorkerResult* worker_result) {
           if (result.error.empty() && !worker_result->error.empty()) {
@@ -1240,8 +1428,9 @@ struct DenoiserSession::Impl {
             result.sessions[block] = std::move(session);
           }
         };
-        merge(&first);
-        merge(&second);
+        for (WorkerResult& worker_result : workers) {
+          merge(&worker_result);
+        }
         result.load_ms = Milliseconds(load_begin, Clock::now());
         return result;
       });
@@ -1255,25 +1444,28 @@ struct DenoiserSession::Impl {
         const std::string prefix =
             "blocks." + std::to_string(block) + ".adaln_proj";
         const auto modulation_begin = Clock::now();
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               block == 0, cancellation,
-                               &ranked_modulations[block], error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        block == 0, cancellation, &ranked_modulations[block],
+                        error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
             Milliseconds(modulation_begin, Clock::now());
       }
+      Trace("block modulations computed");
       block0_modulation_host = ranked_modulations[0];
       const auto final_begin = Clock::now();
-      if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
-                             time_embedding, true, cancellation,
-                             &final_modulation_host, error)) {
+      if (!Modulation(kDitBlocks, "final_layer.adaln_proj",
+                      kFinalModulationWidth, time_embedding, true,
+                      cancellation, &final_modulation_host, error)) {
         return false;
       }
       base_telemetry.adaln_precompute_ms +=
           Milliseconds(final_begin, Clock::now());
 
+      Trace("final modulation computed; waiting for core load");
       CoreLoadResult loaded = core_future.get();
+      Trace(loaded.error.empty() ? "core loaded" : loaded.error.c_str());
       const bool missing_block = std::ranges::any_of(
           loaded.sessions,
           [](const auto& session) { return session == nullptr; });
@@ -1295,6 +1487,7 @@ struct DenoiserSession::Impl {
         if (!blocks[index]->PrepareConstants(ranked_modulations[index],
                                              rope_cos, rope_sin, cancellation,
                                              error)) {
+          Trace("prepare constants failed");
           return false;
         }
         base_telemetry.core_load_ms +=
@@ -1318,8 +1511,8 @@ struct DenoiserSession::Impl {
         const auto modulation_begin = Clock::now();
         const bool select_plan =
             active_blocks == static_cast<int>(kDitBlocks) && block == 0;
-        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
-                               select_plan, cancellation, &modulation, error)) {
+        if (!Modulation(block, prefix, kBlockModulationWidth, time_embedding,
+                        select_plan, cancellation, &modulation, error)) {
           return false;
         }
         base_telemetry.adaln_precompute_ms +=
@@ -1336,7 +1529,8 @@ struct DenoiserSession::Impl {
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
            .row_parallel_attention = row_parallel_attention,
-           .validate_gemm_plans = blocks.empty()},
+           .validate_gemm_plans = blocks.empty(),
+           .lora = lora},
           block_workspace, cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,
@@ -1353,9 +1547,9 @@ struct DenoiserSession::Impl {
       blocks.push_back(std::move(session));
     }
     const auto final_begin = Clock::now();
-    if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
-                           time_embedding, true, cancellation,
-                           &final_modulation_host, error)) {
+    if (!Modulation(kDitBlocks, "final_layer.adaln_proj",
+                    kFinalModulationWidth, time_embedding, true, cancellation,
+                    &final_modulation_host, error)) {
       return false;
     }
     base_telemetry.adaln_precompute_ms +=
@@ -1441,7 +1635,8 @@ struct DenoiserSession::Impl {
     const std::size_t audio_rows = layout.audio_target_rows;
     const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
     const std::size_t maximum_projection_rows =
-        std::max(video_rows, audio_rows);
+        std::max({video_rows, audio_rows, layout.condition_rows,
+                  layout.audio_condition_rows});
     const auto bf16 = [](std::size_t elements) {
       return elements * sizeof(std::uint16_t);
     };
@@ -1459,6 +1654,42 @@ struct DenoiserSession::Impl {
                                     audio_elements * sizeof(float), error)))) {
       return false;
     }
+    if (layout.condition_rows != 0) {
+      if (condition_rows_host.size() !=
+              layout.condition_rows * kH3VideoPatchWidth ||
+          !condition_sample.Allocate(condition_rows_host.size() * sizeof(float),
+                                     error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 keyframe rows differ from the layout";
+        }
+        return false;
+      }
+      const hipError_t status =
+          hipMemcpy(condition_sample.data(), condition_rows_host.data(),
+                    condition_sample.bytes(), hipMemcpyHostToDevice);
+      if (status != hipSuccess) {
+        SetError(error, HipError("copy H3 keyframe rows", status));
+        return false;
+      }
+    }
+    if (layout.audio_condition_rows != 0) {
+      if (audio_condition_rows_host.size() !=
+              layout.audio_condition_rows * kH3AudioLatentChannels ||
+          !audio_condition_sample.Allocate(
+              audio_condition_rows_host.size() * sizeof(float), error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 audio guide rows differ from the layout";
+        }
+        return false;
+      }
+      const hipError_t status = hipMemcpy(
+          audio_condition_sample.data(), audio_condition_rows_host.data(),
+          audio_condition_sample.bytes(), hipMemcpyHostToDevice);
+      if (status != hipSuccess) {
+        SetError(error, HipError("copy H3 audio guide rows", status));
+        return false;
+      }
+    }
     video_rows_host.resize(video_elements);
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
@@ -1474,7 +1705,9 @@ struct DenoiserSession::Impl {
         &previous_video_velocity_f32,
         &previous_audio_velocity_f32,
     };
-    std::uint64_t bytes = projection_gemm.workspace_bytes();
+    std::uint64_t bytes = projection_gemm.workspace_bytes() +
+                          condition_sample.bytes() +
+                          audio_condition_sample.bytes();
     for (const DeviceBuffer* buffer : buffers) {
       bytes += buffer->bytes();
     }
@@ -1530,9 +1763,45 @@ struct DenoiserSession::Impl {
       return false;
     }
     const auto begin = Clock::now();
-    const std::size_t audio_offset = layout.text_rows * kDitHiddenSize;
+    stage_profile::Begin(step, stream);
+    const std::size_t condition_offset = layout.text_rows * kDitHiddenSize;
+    const std::size_t audio_condition_offset =
+        (layout.text_rows + layout.condition_rows) * kDitHiddenSize;
+    const std::size_t audio_offset = (layout.text_rows + layout.condition_rows +
+                                      layout.audio_condition_rows) *
+                                     kDitHiddenSize;
     const std::size_t video_offset =
-        (layout.text_rows + layout.audio_target_rows) * kDitHiddenSize;
+        audio_offset + layout.audio_target_rows * kDitHiddenSize;
+    if (layout.condition_rows != 0) {
+      // The keyframe rows never change, but the trunk is carried in place,
+      // so their projection is rebuilt with the other inputs every step.
+      if (!projection_gemm.Run(
+              video_patch_weight.As<float>(), condition_sample.As<float>(),
+              projection_scratch_f32.As<float>(), layout.condition_rows,
+              kDitHiddenSize, kH3VideoPatchWidth, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), video_patch_bias.As<float>(),
+          hidden_device.As<std::uint16_t>() + condition_offset,
+          static_cast<std::uint32_t>(layout.condition_rows), kDitHiddenSize,
+          stream);
+    }
+    if (layout.audio_condition_rows != 0) {
+      // Audio guide rows: the audio patch projection of the clean guide.
+      if (!projection_gemm.Run(audio_patch_weight.As<float>(),
+                               audio_condition_sample.As<float>(),
+                               projection_scratch_f32.As<float>(),
+                               layout.audio_condition_rows, kDitHiddenSize,
+                               kH3AudioLatentChannels, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
+          hidden_device.As<std::uint16_t>() + audio_condition_offset,
+          static_cast<std::uint32_t>(layout.audio_condition_rows),
+          kDitHiddenSize, stream);
+    }
     // Compose the token sequence directly in its first trunk input buffer.
     // Separate projected-token allocations and D2D copies serve no purpose.
     if (!projection_gemm.Run(
@@ -1569,6 +1838,7 @@ struct DenoiserSession::Impl {
       return false;
     }
 
+    stage_profile::Mark("patch_projections", stream);
     std::uint64_t block_dispatches = 0;
     // A block consumes its input before producing the final gated residual;
     // carry the trunk in place instead of reserving a second full hidden state.
@@ -1627,6 +1897,7 @@ struct DenoiserSession::Impl {
     if (!CheckLaunch("H3 final velocity heads", error)) {
       return false;
     }
+    stage_profile::Mark("final_heads", stream);
     if (read_velocity) {
       if (velocity == nullptr ||
           velocity->video.size() !=
@@ -1650,6 +1921,7 @@ struct DenoiserSession::Impl {
       SetError(error, HipError("synchronize H3 full forward", status));
       return false;
     }
+    stage_profile::End();
     if (read_velocity && (!IsFinite(velocity->video, "video_velocity",
                                     &base_telemetry.first_non_finite) ||
                           !IsFinite(velocity->audio, "audio_velocity",
@@ -1696,11 +1968,45 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
           options.text_rows * kH3TextConditionWidth ||
       (!conditioning.tags.empty() &&
        conditioning.tags.size() != options.text_rows) ||
+      conditioning.keyframe_latents.size() !=
+          conditioning.keyframe_frames.size() ||
       IsCancelled(cancellation)) {
     SetError(error, "invalid MiniMax H3 denoiser creation arguments");
     return nullptr;
   }
-  auto layout = BuildTextOnlyLayout(options.text_rows, options.geometry, error);
+  if (!conditioning.keyframe_latent_frames.empty() &&
+      conditioning.keyframe_latent_frames.size() !=
+          conditioning.keyframe_frames.size()) {
+    SetError(error, "invalid MiniMax H3 denoiser guide clip arguments");
+    return nullptr;
+  }
+  std::vector<ImageGuidePlacement> image_placements;
+  for (std::size_t index = 0; index < conditioning.keyframe_frames.size();
+       ++index) {
+    const int latent_frames = conditioning.keyframe_latent_frames.empty()
+                                  ? 1
+                                  : conditioning.keyframe_latent_frames[index];
+    // 5k + 2 latent frames come from 17k + 5 pixel frames.
+    const int pixel_frames =
+        latent_frames <= 1 ? 1 : ((latent_frames - 2) / 5) * 17 + 5;
+    image_placements.push_back({.frame = conditioning.keyframe_frames[index],
+                                .latent_frames = latent_frames,
+                                .pixel_frames = pixel_frames});
+  }
+  std::vector<AudioGuidePlacement> audio_placements;
+  for (const AudioGuideLatent& guide : conditioning.audio_guides) {
+    if (guide.latent_frames < 1 ||
+        guide.latent.size() != static_cast<std::size_t>(guide.latent_frames) *
+                                   kH3AudioLatentChannels * kH3AudioTracks) {
+      SetError(error, "MiniMax H3 audio guide latent has an invalid shape");
+      return nullptr;
+    }
+    audio_placements.push_back(
+        {.frame = guide.frame, .latent_frames = guide.latent_frames});
+  }
+  auto layout =
+      BuildImageGuideLayout(options.text_rows, options.geometry,
+                            image_placements, audio_placements, error);
   auto schedule = BuildServingSchedule(options.evaluations, error);
   if (!layout || !schedule) {
     return nullptr;
@@ -1708,6 +2014,12 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   auto time_rows = BuildTimeRowSchedule(*schedule, error);
   if (!time_rows) {
     return nullptr;
+  }
+  if (!conditioning.keyframe_frames.empty()) {
+    AppendConditionTimeRow(&*time_rows);
+  }
+  if (!conditioning.audio_guides.empty()) {
+    AppendAudioConditionTimeRow(&*time_rows);
   }
   auto euler_plan = BuildEulerPlan(*schedule, options.reuse_interval, error);
   if (!euler_plan) {
@@ -1724,6 +2036,59 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   impl->reuse_interval = options.reuse_interval;
   impl->row_parallel_attention = options.row_parallel_attention;
   impl->base_telemetry.row_parallel_attention = options.row_parallel_attention;
+  impl->lora = options.lora;
+  const std::size_t keyframe_elements =
+      kH3VideoLatentChannels *
+      static_cast<std::size_t>(options.geometry.latent_height) *
+      static_cast<std::size_t>(options.geometry.latent_width);
+  // Guide clips span several latent frames: [24][latent frames][h][w],
+  // patchified frame by frame like the target video.
+  impl->condition_rows_host.resize(impl->layout.condition_rows *
+                                   kH3VideoPatchWidth);
+  {
+    std::size_t offset = 0;
+    for (std::size_t index = 0; index < conditioning.keyframe_latents.size();
+         ++index) {
+      const std::vector<float>& latent = conditioning.keyframe_latents[index];
+      const int latent_frames = image_placements[index].latent_frames;
+      const std::size_t elements =
+          keyframe_elements * static_cast<std::size_t>(latent_frames);
+      if (latent.size() != elements ||
+          offset + elements > impl->condition_rows_host.size() ||
+          !PatchifyVideo(latent, kH3VideoLatentChannels, latent_frames,
+                         options.geometry.latent_height,
+                         options.geometry.latent_width,
+                         std::span(impl->condition_rows_host)
+                             .subspan(offset, elements),
+                         error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 keyframe latent differs from the canvas";
+        }
+        return nullptr;
+      }
+      offset += elements;
+    }
+  }
+  // Audio guide rows in the target audio packing (stereo track major).
+  impl->audio_condition_rows_host.resize(impl->layout.audio_condition_rows *
+                                         kH3AudioLatentChannels);
+  {
+    std::size_t offset = 0;
+    for (const AudioGuideLatent& guide : conditioning.audio_guides) {
+      const std::size_t elements = guide.latent.size();
+      if (offset + elements > impl->audio_condition_rows_host.size() ||
+          !PackAudio(guide.latent, kH3AudioLatentChannels, guide.latent_frames,
+                     std::span(impl->audio_condition_rows_host)
+                         .subspan(offset, elements),
+                     error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 audio guide differs from the layout";
+        }
+        return nullptr;
+      }
+      offset += elements;
+    }
+  }
   impl->text_tags.assign(conditioning.tags.begin(), conditioning.tags.end());
   if (impl->text_tags.empty()) {
     impl->text_tags.assign(options.text_rows, 1);
@@ -1743,16 +2108,42 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   hipError_t status =
       hipStreamCreateWithFlags(&impl->stream, hipStreamNonBlocking);
   if (status == hipSuccess) {
-    status = hipHostMalloc(&impl->staging, kWeightStagingBytes,
-                           hipHostMallocDefault);
+    status =
+        hipHostMalloc(&impl->staging, kWeightStagingBytes + kTensorStagingSlack,
+                      hipHostMallocDefault);
   }
   if (status != hipSuccess) {
     SetError(error, HipError("create MiniMax H3 denoiser resources", status));
     return nullptr;
   }
-  if (!impl->RefineText(conditioning.layer50, cancellation, error) ||
-      !impl->BuildBlocks(cancellation, error) ||
-      !impl->LoadHeads(cancellation, error) || !impl->AllocateIo(error)) {
+  Trace("refine text");
+  if (!impl->RefineText(conditioning.layer50, cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  if (std::getenv("GUFO_H3_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "h3 trace: rows=%zu text=%zu keyframe=%zu audio_guide=%zu "
+                 "audio=%zu video=%zu time_rows=%u\n",
+                 impl->layout.rows(), impl->layout.text_rows,
+                 impl->layout.condition_rows, impl->layout.audio_condition_rows,
+                 impl->layout.audio_target_rows, impl->layout.video_target_rows,
+                 impl->time_rows.time_rows);
+  }
+  Trace("build blocks");
+  if (!impl->BuildBlocks(cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  impl->StoreAdaLnCache();
+  Trace("load heads");
+  if (!impl->LoadHeads(cancellation, error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
+    return nullptr;
+  }
+  Trace("allocate io");
+  if (!impl->AllocateIo(error)) {
+    Trace(error != nullptr ? error->c_str() : "denoiser stage failed");
     return nullptr;
   }
   // Text refinement and modulation precomputation are complete. Inference

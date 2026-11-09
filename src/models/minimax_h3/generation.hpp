@@ -3,10 +3,12 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/models/minimax_h3/audio_vae.hpp"
@@ -15,6 +17,7 @@
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
+#include "src/models/minimax_h3/video_vae_encoder.hpp"
 
 namespace gufo::minimax_h3 {
 
@@ -37,6 +40,10 @@ struct GenerationParameters {
   std::vector<int> selected_frames;
 };
 
+/// "WxH" canvas of the "exact-WxH" preset: multiples of 32, 256..1344 per
+/// side and at most 768*1344 pixels (e.g. 832x512).
+[[nodiscard]] std::optional<std::pair<int, int>> ParseCanvasSize(
+    std::string_view size);
 [[nodiscard]] std::optional<GenerationParameters> ResolveGenerationPreset(
     std::string_view name, std::string* error = nullptr);
 /// HTTP duration at 24 fps, snapped upward to the official VAE frame grid.
@@ -61,6 +68,49 @@ struct GenerationParameters {
     std::span<const float> video, std::span<const float> audio,
     const CancellationToken* cancellation, std::string* error = nullptr);
 
+/// `GenerationKeyframe::frame` value that places the keyframe by its anchor.
+inline constexpr int kKeyframeAtAnchor = std::numeric_limits<int>::min();
+
+/// An FL2VA keyframe or guide frame as decoded RGB8 at its own size;
+/// generation fits it to the canvas (cover and centre crop).
+struct GenerationKeyframe {
+  KeyframeAnchor anchor{KeyframeAnchor::kFirst};
+  int width{0};
+  int height{0};
+  std::vector<std::uint8_t> rgb;
+  // Pixel frame the image is anchored at (MiniMaxH3AddGuide frame_idx);
+  // negative values count from the end (-1 = last frame). kKeyframeAtAnchor
+  // uses `anchor` (first or last frame).
+  int frame{kKeyframeAtAnchor};
+  // Also shown to the text encoder as a "<Picture i>" block when a vision
+  // projector is configured (MiniMaxH3ImageToVideo first/last frames). Guide
+  // frames of MiniMaxH3AddGuide condition the latents only.
+  bool vision{true};
+};
+
+/// An audio guide (MiniMaxH3AddGuide audio): 32 kHz stereo PCM anchored at a
+/// pixel frame and cropped to the video's remaining audio track.
+struct GenerationAudioGuide {
+  int frame{0};
+  AudioWaveform waveform;
+};
+
+/// A guide clip (MiniMaxH3AddGuide with a multi-frame image batch, e.g. the
+/// last frames of the previous part fed through LoadVideo and
+/// GetVideoComponents): decoded RGB8 frames at their own size, frame-major.
+/// As in the reference, generation keeps the first 17k + 5 frames (below 5
+/// frames only the first one, as a single guide image), centre-crops each to
+/// the canvas and encodes them as one causal clip; the clip must end inside
+/// the video. Its soundtrack is a separate GenerationAudioGuide.
+struct GenerationVideoGuide {
+  // Pixel frame of the clip's first frame; negative counts from the end.
+  int frame{0};
+  int width{0};
+  int height{0};
+  int frames{0};
+  std::vector<std::uint8_t> rgb;
+};
+
 struct GenerationRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -70,7 +120,44 @@ struct GenerationRequest {
   std::string prompt;
   std::uint64_t seed{0};
   GenerationParameters parameters;
-  // Live preview of the denoised latents (gufo-studio-windows).
+  // FL2VA keyframes and guide frames (at most kH3MaximumKeyframes, one per
+  // pixel frame). Empty: text-to-video.
+  std::vector<GenerationKeyframe> keyframes;
+  // Audio guides (at most kH3MaximumAudioGuides).
+  std::vector<GenerationAudioGuide> audio_guides;
+  // Guide clips; each counts as one of the kH3MaximumKeyframes image guides.
+  std::vector<GenerationVideoGuide> video_guides;
+  // Optional transformer LoRA (original/ComfyUI layout), merged at load.
+  std::filesystem::path lora_path;
+  float lora_strength{1.0F};
+  // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
+  // blocks in the prompt. Empty: keyframes condition the latents only.
+  std::filesystem::path vision_projector;
+  // Wan 2.2 runner only (MiniMax H3 ignores them): image-to-video first
+  // frame as RGB8 at its own size (empty: text-to-video), negative prompt
+  // and classifier-free guidance scale.
+  int first_frame_width{0};
+  int first_frame_height{0};
+  std::vector<std::uint8_t> first_frame;
+  std::string negative_prompt;
+  float guidance{5.0F};
+  // Wan 2.1 camera runner only: "gufo.camera" JSON and an uploaded guide
+  // video file.
+  std::string camera_json;
+  std::filesystem::path guide_video_path;
+  // Wan 2.1 VACE runner only: "gufo.vace" options as JSON (strength,
+  // mask_channel, sampler, shift), the mask file (MP4 video or a binary PPM
+  // still for every frame); the control video is `guide_video_path`, the
+  // reference images are `keyframes`, the negative prompt and guidance as
+  // above.
+  std::string vace_json;
+  std::filesystem::path mask_path;
+  // Wan 2.1 InfiniteTalk runner only: "gufo.talk" JSON and the speaker
+  // masks (RGB8 at their own size, one per audio guide when there are two);
+  // the audio guides are the speakers (frame = speaker index).
+  std::string talk_json;
+  std::vector<GenerationKeyframe> speaker_masks;
+  // Live preview of the denoised latents (MiniMax H3 and Wan 2.2).
   models::PreviewHook preview;
 };
 
@@ -78,6 +165,17 @@ struct GenerationTelemetry {
   double inventory_ms{0.0};
   double tokenizer_ms{0.0};
   double prompt_ms{0.0};
+  // The prompt embedding came from the stage cache (GUFO_H3_CACHE_DIR).
+  bool prompt_cache_hit{false};
+  double keyframe_ms{0.0};
+  double audio_guide_ms{0.0};
+  std::size_t audio_guides{0};
+  std::size_t audio_guide_frames{0};
+  double guide_clip_ms{0.0};
+  std::size_t guide_clips{0};
+  std::size_t guide_clip_latent_frames{0};
+  double vision_ms{0.0};
+  std::size_t vision_tokens{0};
   double denoiser_ms{0.0};
   double video_vae_ms{0.0};
   double first_preview_ms{0.0};
@@ -87,6 +185,9 @@ struct GenerationTelemetry {
   std::size_t prompt_tokens{0};
   InspectionTelemetry inventory;
   PromptEncoderTelemetry prompt_encoder;
+  VideoVaeEncoderTelemetry keyframe_encoder;
+  std::size_t keyframes{0};
+  std::size_t lora_modules{0};
   DenoiserTelemetry denoiser;
   VideoVaeTelemetry video_vae;
   AudioVaeTelemetry audio_vae;
