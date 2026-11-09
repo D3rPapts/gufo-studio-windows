@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/minimax_h3/preview_hook.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
@@ -53,6 +54,10 @@ struct DenoiserTelemetry {
   double core_load_ms{0.0};
   std::vector<double> forward_ms;
   double sampler_ms{0.0};
+  // Live preview read-backs: count and time spent in the denoiser loop
+  // (gufo-studio-windows).
+  double preview_ms{0.0};
+  int previews{0};
   std::uint64_t core_weight_bytes{0};
   std::uint64_t persistent_bytes{0};
   std::uint64_t scratch_bytes{0};
@@ -106,6 +111,10 @@ public:
                                          void* progress_opaque,
                                          DenoiserTelemetry* telemetry,
                                          std::string* error = nullptr);
+
+  /// Live preview of the denoised video estimate before each Euler update
+  /// (gufo-studio-windows); empty: none.
+  void SetPreview(models::PreviewHook preview);
 
   [[nodiscard]] const GenerationGeometry& geometry() const noexcept;
   [[nodiscard]] const PackedLayout& layout() const noexcept;

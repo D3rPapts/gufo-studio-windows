@@ -686,6 +686,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   if (denoiser == nullptr) {
     return false;
   }
+  denoiser->SetPreview(request.preview);
   ProgressBridge denoiser_progress{progress, progress_opaque, "denoiser"};
   begin = Clock::now();
   if (!denoiser->DenoiseWithProgress(
@@ -855,6 +856,9 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << "  \"denoiser_core_load_ms\": " << telemetry.denoiser.core_load_ms
          << ",\n"
          << "  \"denoiser_sampler_ms\": " << telemetry.denoiser.sampler_ms
+         << ",\n"
+         << "  \"denoiser_previews\": " << telemetry.denoiser.previews << ",\n"
+         << "  \"denoiser_preview_ms\": " << telemetry.denoiser.preview_ms
          << ",\n"
          << "  \"denoiser_evaluations\": "
          << telemetry.denoiser.forward_ms.size() << ",\n"

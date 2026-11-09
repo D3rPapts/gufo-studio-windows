@@ -53,6 +53,8 @@ public:
                 .mux = request.parameters.mux,
                 .selected_frames = request.parameters.selected_frames,
             },
+        // Live preview: the host's sink (changes/0.2/live-previews.md).
+        .preview = request.preview,
     };
     gufo::minimax_h3::CancellationToken token;
     std::jthread watcher;

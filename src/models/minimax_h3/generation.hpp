@@ -70,6 +70,8 @@ struct GenerationRequest {
   std::string prompt;
   std::uint64_t seed{0};
   GenerationParameters parameters;
+  // Live preview of the denoised latents (gufo-studio-windows).
+  models::PreviewHook preview;
 };
 
 struct GenerationTelemetry {

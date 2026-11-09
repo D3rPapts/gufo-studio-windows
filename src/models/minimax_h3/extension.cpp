@@ -150,5 +150,8 @@ void minimax_h3_register(gufo::ext::Registry& registry) {
       .validate_parameters = &ValidateParameters,
       .parameters_json = &ParametersJson,
       .telemetry_json = &TelemetryJson,
+      // Live previews (gufo-studio-windows): H3 video latents, 24 fps.
+      .preview_latent = "minimax_h3",
+      .preview_fps = 24,
   });
 }

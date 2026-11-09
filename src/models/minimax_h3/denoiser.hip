@@ -597,6 +597,7 @@ bool IsFinite(std::span<const float> values, std::string_view name,
 struct DenoiserSession::Impl {
   const ModelInventory* inventory{nullptr};
   GenerationGeometry geometry;
+  models::PreviewHook preview;
   PackedLayout layout;
   SigmaSchedule schedule;
   TimeRowSchedule time_rows;
@@ -1828,6 +1829,8 @@ bool DenoiserSession::DenoiseWithProgress(
     return false;
   }
   double sampler_ms = 0.0;
+  double preview_ms = 0.0;
+  int previews = 0;
   bool have_velocity = false;
   for (int step = 0; step < impl_->schedule.evaluations(); ++step) {
     const EulerStepPlan& plan =
@@ -1870,6 +1873,47 @@ bool DenoiserSession::DenoiseWithProgress(
     const void* previous_audio = impl_->reuse_interval > 1
                                      ? impl_->previous_audio_velocity_f32.data()
                                      : impl_->audio_velocity_f32.data();
+    // A reused step (no new velocity) would show the previous estimate again.
+    if (plan.evaluate &&
+        impl_->preview.Wants(step + 1, impl_->schedule.evaluations()) &&
+        impl_->video_velocity_f32.bytes() == impl_->video_sample.bytes()) {
+      // Denoised estimate as the Euler kernel forms it (without the
+      // velocity extrapolation of reused steps), read before the update.
+      const auto preview_begin = Clock::now();
+      const std::size_t count = impl_->video_sample.bytes() / sizeof(float);
+      std::vector<float> sample(count), velocity(count), latent(count);
+      if (!impl_->CopyAsync(sample.data(), impl_->video_sample.data(),
+                            impl_->video_sample.bytes(), hipMemcpyDeviceToHost,
+                            "read H3 preview sample", error) ||
+          !impl_->CopyAsync(velocity.data(), impl_->video_velocity_f32.data(),
+                            impl_->video_velocity_f32.bytes(),
+                            hipMemcpyDeviceToHost, "read H3 preview velocity",
+                            error)) {
+        return false;
+      }
+      const hipError_t read = hipStreamSynchronize(impl_->stream);
+      if (read != hipSuccess) {
+        SetError(error, HipError("synchronize H3 preview read", read));
+        return false;
+      }
+      for (std::size_t i = 0; i < count; ++i)
+        sample[i] += plan.video_sigma_from_timestep * velocity[i];
+      const auto& g = impl_->geometry;
+      if (UnpatchifyVideo(sample, kH3VideoLatentChannels,
+                          g.temporal.video_latent_frames, g.latent_height,
+                          g.latent_width, latent, nullptr))
+        impl_->preview.publish(
+            {.step = step + 1,
+             .steps = impl_->schedule.evaluations(),
+             .frames = g.temporal.video_latent_frames,
+             .height = g.latent_height,
+             .width = g.latent_width,
+             .channels = static_cast<int>(kH3VideoLatentChannels),
+             .channel_major = true,
+             .data = latent});
+      preview_ms += Milliseconds(preview_begin, Clock::now());
+      ++previews;
+    }
     const auto sampler_begin = Clock::now();
     if (!HipEulerUpdate(impl_->video_sample.data(),
                         impl_->video_sample.bytes() / sizeof(float), 0,
@@ -1933,6 +1977,8 @@ bool DenoiserSession::DenoiseWithProgress(
     return false;
   }
   impl_->base_telemetry.sampler_ms = sampler_ms;
+  impl_->base_telemetry.preview_ms = preview_ms;
+  impl_->base_telemetry.previews = previews;
   const Faults faults_after = ReadFaults();
   impl_->base_telemetry.minor_page_faults +=
       faults_after.minor - faults_before.minor;
@@ -1942,6 +1988,11 @@ bool DenoiserSession::DenoiseWithProgress(
       std::max(impl_->base_telemetry.swap_bytes, ReadSwapBytes());
   impl_->PublishTelemetry(telemetry);
   return true;
+}
+
+void DenoiserSession::SetPreview(models::PreviewHook preview) {
+  if (impl_ != nullptr)
+    impl_->preview = std::move(preview);
 }
 
 const GenerationGeometry& DenoiserSession::geometry() const noexcept {
