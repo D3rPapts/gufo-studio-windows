@@ -2368,6 +2368,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                  "decision_failed");
     }
   }
+  if (req.path == "/sdapi/v1/loras" && images_ != nullptr)
+    return HandleImageLorasRequest(req, *images_);
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
       return Err(503, "Service Unavailable", "image service is not configured",

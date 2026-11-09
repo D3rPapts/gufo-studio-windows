@@ -155,14 +155,18 @@ int main(int argc, char** argv) {
     assert(rejected);
   }
   int calls = 0;
+  // The 2.0 host runs on ext types (the extension owns its 1.4 types).
+  const gufo::ext::ImageBuffer ext_image{image.width, image.height,
+                                         image.rgba};
   gufo::server::ImageService service(
       {}, "image-test",
-      [&](const Request& request, const CancellationCheck&) {
+      [&](const gufo::ext::ImageRequest& request,
+          const gufo::ext::CancellationCheck&) {
         ++calls;
         assert(request.prompt == "a red cube");
         assert(request.width == 256 && request.height == 256);
         assert(request.seed == static_cast<std::uint64_t>(calls + 40));
-        return Result{.image = image, .metrics = {}};
+        return gufo::ext::ImageResult{.image = ext_image, .metrics = {}};
       },
       {"image-alias"});
   gufo::server::HttpRequest http;
@@ -217,16 +221,18 @@ int main(int argc, char** argv) {
   http.body.resize(http.body.size() - 8);
   assert(gufo::server::HandleImageApiRequest(http, service).status == 400);
   int turbo_calls = 0;
-  std::vector<Request> turbo_requests;
+  std::vector<gufo::ext::ImageRequest> turbo_requests;
   gufo::server::ImageService turbo_service(
-      {}, "turbo-test", [&](const Request& request, const CancellationCheck&) {
+      {}, "turbo-test",
+      [&](const gufo::ext::ImageRequest& request,
+          const gufo::ext::CancellationCheck&) {
         // The runner owns checkpoint defaults and step validation.
         auto resolved = request;
         resolved.steps = turbo.ResolveSteps(request.steps);
         assert(resolved.steps == 8);
         turbo_requests.push_back(std::move(resolved));
         ++turbo_calls;
-        return Result{image, {}};
+        return gufo::ext::ImageResult{ext_image, {}};
       });
   http.path = "/v1/images/generations";
   http.headers = {{"Content-Type", "application/json"}};

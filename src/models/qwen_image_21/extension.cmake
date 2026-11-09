@@ -8,6 +8,7 @@ gufo_extension_target(
     tokenizer.cpp
     lora.cpp
     control.cpp
+    request.cpp
     extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime

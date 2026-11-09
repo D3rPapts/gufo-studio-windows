@@ -244,7 +244,27 @@ void ValidateRequest(const ext::ImageRequest& request) {
 struct Parsed {
   json::Value fields = json::Value::object();
   std::vector<ext::ImageBuffer> images;
+  /// Multipart image parts for the provider (ext::ImageRequest::named_images).
+  std::vector<std::pair<std::string, ext::ImageBuffer>> named_images;
 };
+
+/// The "gufo" field carries regional masks; other text fields stay small.
+constexpr std::size_t kMaxGufoFieldBytes = 8U << 20U;
+
+// Form fields "gufo.<name>" whose value is JSON (numbers, booleans, objects);
+// the others are strings. Keys are the Qwen-Image-2.1 extension's.
+bool JsonFormField(std::string_view key) {
+  return key == "guidance" || key == "strength" || key == "preview" ||
+         key == "mask_composite" || key == "mask_feather" ||
+         key == "mask_blur" || key == "regions" || key == "base_strength" ||
+         key == "control_strength" || key == "control_start" ||
+         key == "control_end" || key == "control_inpaint";
+}
+
+bool NamedImagePart(std::string_view name) {
+  return name == "init_image" || name == "mask" || name == "control_image" ||
+         name == "region_image[]";
+}
 
 Parsed Multipart(const HttpRequest& request) {
   const auto content_type = request.header("content-type");
@@ -318,35 +338,60 @@ Parsed Multipart(const HttpRequest& request) {
     body.remove_prefix(end + delimiter.size());
     if (++fields > 32)
       throw std::invalid_argument("too many multipart fields");
-    if (name == "image" || name == "image[]") {
-      if (parsed.images.size() == 10 ||
+    if (name == "image" || name == "image[]" || NamedImagePart(name)) {
+      const bool reference = name == "image" || name == "image[]";
+      if (!reference && name != "region_image[]")
+        for (const auto& [part, image] : parsed.named_images) {
+          (void)image;
+          if (part == name)
+            throw std::invalid_argument("duplicate field " + name);
+        }
+      std::size_t references = parsed.images.size();
+      for (const auto& [part, image] : parsed.named_images) {
+        (void)image;
+        references += part == "region_image[]";
+      }
+      if ((reference && parsed.images.size() == 10) ||
+          (name == "region_image[]" && references >= 20) ||
           data.size() > core::kMaxEncodedImageBytes - image_bytes)
-        throw std::invalid_argument("image inputs exceed 10 images or 20 MiB");
+        throw std::invalid_argument(
+            "image inputs exceed 10 images (20 with regions) or 20 MiB");
       image_bytes += data.size();
-      parsed.images.push_back(DecodeImage(std::span(
-          reinterpret_cast<const std::uint8_t*>(data.data()), data.size())));
-      const auto& decoded = parsed.images.back();
+      auto decoded = DecodeImage(std::span(
+          reinterpret_cast<const std::uint8_t*>(data.data()), data.size()));
       image_pixels += static_cast<std::size_t>(decoded.width) * decoded.height;
       if (image_pixels > core::kMaxImagePixels)
         throw std::invalid_argument(
             "reference images exceed 32 megapixels combined");
+      if (reference)
+        parsed.images.push_back(std::move(decoded));
+      else
+        parsed.named_images.emplace_back(name, std::move(decoded));
     } else {
-      if (name == "mask")
-        throw std::invalid_argument(
-            "mask uploads are unsupported; provide annotated reference images");
       if (parsed.fields.contains(name))
         throw std::invalid_argument("duplicate field " + name);
-      if (data.size() > (64U << 10U))
+      if (data.size() > (name == "gufo" ? kMaxGufoFieldBytes : (64U << 10U)))
         throw std::invalid_argument("multipart field too large");
-      if (name == "n" || name == "seed" || name == "steps" ||
-          name == "stream") {
+      if (name.starts_with("gufo.")) {
+        // Form fields "gufo.<name>" fill the same extension object as the
+        // JSON body's "gufo": {...}.
+        const auto key = name.substr(5);
+        if (!parsed.fields.contains("gufo"))
+          parsed.fields["gufo"] = json::Value::object();
+        auto& extension = parsed.fields["gufo"];
+        if (!extension.is_object() || extension.contains(key))
+          throw std::invalid_argument("duplicate field " + name);
+        extension[key] = JsonFormField(key) ? ParseJson(data)
+                                            : json::Value(std::string(data));
+      } else if (name == "gufo" || name == "n" || name == "seed" ||
+                 name == "steps" || name == "stream" || name == "loras") {
         parsed.fields[name] = ParseJson(data);
       } else {
         parsed.fields[name] = std::string(data);
       }
     }
   }
-  if (parsed.images.empty())
+  if (parsed.images.empty() && parsed.named_images.empty())
     throw std::invalid_argument("image edit requires an image");
   return parsed;
 }
@@ -379,7 +424,9 @@ std::string String(const json::Value& fields, const char* name,
 
 ImageService::ImageService(const std::filesystem::path& root,
                            std::string model_id, Runner runner,
-                           std::vector<std::string> model_aliases)
+                           std::vector<std::string> model_aliases,
+                           std::vector<std::pair<std::string, std::string>>
+                               provider_options)
     : model_id_(std::move(model_id)),
       model_aliases_(std::move(model_aliases)),
       runner_(std::move(runner)) {
@@ -397,7 +444,18 @@ ImageService::ImageService(const std::filesystem::path& root,
       throw std::runtime_error("extension 'qwen_image_21' is not registered");
     }
     std::string create_error;
-    model_ = provider->create(root.string(), &create_error);
+    if (provider->create_with_options) {
+      model_ = provider->create_with_options(
+          ext::ImageRunnerOptions{.model_root = root.string(),
+                                  .options = std::move(provider_options)},
+          &create_error);
+    } else {
+      if (!provider_options.empty())
+        throw std::invalid_argument(
+            "image provider '" + provider->id + "' takes no option --" +
+            provider_options.front().first);
+      model_ = provider->create(root.string(), &create_error);
+    }
     if (!model_) {
       throw std::runtime_error(
           "failed to create runner for " + root.string() +
@@ -421,6 +479,10 @@ ImageService::Result ImageService::Generate(
   if (cancelled && cancelled())
     throw std::runtime_error("image request cancelled");
   return runner_(request, cancelled);
+}
+
+std::string ImageService::Query(std::string_view topic) const {
+  return model_ ? model_->Query(topic) : std::string();
 }
 
 HttpResponse HandleImageApiRequest(const HttpRequest& request,
@@ -472,7 +534,19 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
           "This is an RGBA image with transparency. " + generation.prompt +
           " The image has alpha channel and the background is transparent.";
     generation.images = std::move(parsed.images);
+    // Provider extension (changes/0.2/image-request-extension): "gufo" and
+    // "loras" pass through as JSON text, image parts as named images.
+    {
+      auto extension = json::Value::object();
+      for (const char* member : {"gufo", "loras"})
+        if (const auto* value = fields.find(member))
+          extension[member] = *value;
+      if (extension.size() > 0)
+        generation.extension_json = extension.dump();
+    }
+    generation.named_images = std::move(parsed.named_images);
     const auto size = String(fields, "size", "auto");
+    generation.size_auto = size == "auto";
     if (size == "auto") {
       if (!generation.images.empty()) {
         const auto& last = generation.images.back();
@@ -545,9 +619,24 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
             .headers = {{"Content-Type", "application/json"}}};
   } catch (const std::invalid_argument& error) {
     return Error(400, error.what(), "invalid_request");
+  } catch (const ext::ImageResourceError& error) {
+    return Error(503, error.what(), "insufficient_gpu_memory");
   } catch (const std::exception& error) {
     return Error(500, error.what(), "image_generation_failed");
   }
+}
+
+HttpResponse HandleImageLorasRequest(const HttpRequest& request,
+                                     const ImageService& service) {
+  if (request.method != "GET")
+    return Error(400, "/sdapi/v1/loras requires GET", "invalid_method");
+  auto body = service.Query("loras");
+  if (body.empty())
+    body = "[]";
+  return {.status = 200,
+          .reason = "OK",
+          .body = std::move(body),
+          .headers = {{"Content-Type", "application/json"}}};
 }
 
 }  // namespace gufo::server
