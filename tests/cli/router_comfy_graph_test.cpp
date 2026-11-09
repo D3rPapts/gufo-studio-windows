@@ -1616,6 +1616,189 @@ void TestInfiniteTalk() {
   assert(snapped.warnings.size() == 1);
 }
 
+void TestInfiniteTalkVideoToVideo() {
+  // The film studio's lip-sync pass: the silent motion video
+  // (LoadVideo -> GetVideoComponents -> VAEEncode) is the sampler's latent,
+  // WanInfiniteTalkToVideo gives model / positive / negative, denoise 0.5.
+  std::string v2v = Replace(
+      kTalk, " \"30\": {",
+      " \"60\": {\"class_type\": \"LoadVideo\", \"inputs\": {\"file\": "
+      "\"anna_motion.mp4\"}},\n \"61\": {\"class_type\": "
+      "\"GetVideoComponents\", \"inputs\": {\"video\": [\"60\", 0]}},\n "
+      "\"62\": {\"class_type\": \"VAEEncode\", \"inputs\": {\"pixels\": "
+      "[\"61\", 0], \"vae\": [\"4\", 0]}},\n \"30\": {");
+  v2v = Replace(v2v, "\"latent_image\": [\"20\", 3]",
+                "\"latent_image\": [\"62\", 0]");
+  v2v = Replace(v2v, "\"denoise\": 1.0", "\"denoise\": 0.5");
+  const comfy::Plan plan = PlanOf(v2v.c_str());
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "30");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kTalk);
+  assert(video.frames == 81 && video.steps == 4 && video.seed == 7);
+  assert((video.first_frame == comfy::FileRef{"anna_portrait.png", "input"}));
+  assert((video.talk_video == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(video.talk_denoise && *video.talk_denoise == 0.5);
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  const json::Value* talk = body.find("gufo")->find("talk");
+  assert(talk->find("denoise")->as_double() == 0.5);
+  // The executor adds the video itself.
+  assert(talk->find("video") == nullptr);
+  // Today's graph sends no denoise and no video.
+  const comfy::Plan plain_plan = PlanOf(kTalk);
+  const auto& plain = std::get<comfy::VideoTask>(plain_plan.tasks[0].spec);
+  assert(!plain.talk_video && !plain.talk_denoise);
+  assert(comfy::VideoRequestBody(plain).find("gufo")->find("talk")->find(
+             "denoise") == nullptr);
+
+  // VHS_LoadVideo works too.
+  std::string vhs = Replace(
+      v2v, "\"pixels\": [\"61\", 0]", "\"pixels\": [\"63\", 0]");
+  vhs = Replace(vhs, " \"30\": {",
+                " \"63\": {\"class_type\": \"VHS_LoadVideo\", \"inputs\": "
+                "{\"video\": \"anna_vhs.mp4\", \"force_rate\": 0, "
+                "\"skip_first_frames\": 0, \"select_every_nth\": 1}},\n "
+                "\"30\": {");
+  const comfy::Plan vhs_plan = PlanOf(vhs.c_str());
+  const auto& from_vhs = std::get<comfy::VideoTask>(vhs_plan.tasks[0].spec);
+  assert((from_vhs.talk_video == comfy::FileRef{"anna_vhs.mp4", "input"}));
+
+  // KSamplerAdvanced from step 2 of 4: 2 steps of the 4-step schedule.
+  const std::string ksampler =
+      "\"30\": {\"class_type\": \"KSampler\", \"inputs\": {\"model\": "
+      "[\"16\", 0], \"positive\": [\"20\", 1], \"negative\": [\"20\", 2], "
+      "\"latent_image\": [\"62\", 0], \"seed\": 7, \"steps\": 4, \"cfg\": "
+      "1.0, \"sampler_name\": \"lcm\", \"scheduler\": \"simple\", "
+      "\"denoise\": 0.5}}";
+  const std::string advanced = Replace(
+      v2v, ksampler,
+      "\"30\": {\"class_type\": \"KSamplerAdvanced\", \"inputs\": "
+      "{\"model\": [\"16\", 0], \"positive\": [\"20\", 1], \"negative\": "
+      "[\"20\", 2], \"latent_image\": [\"62\", 0], \"add_noise\": "
+      "\"enable\", \"noise_seed\": 7, \"steps\": 4, \"cfg\": 1.0, "
+      "\"sampler_name\": \"lcm\", \"scheduler\": \"simple\", "
+      "\"start_at_step\": 2, \"end_at_step\": 10000, "
+      "\"return_with_leftover_noise\": \"disable\"}}");
+  const comfy::Plan late_plan = PlanOf(advanced.c_str());
+  const auto& late = std::get<comfy::VideoTask>(late_plan.tasks[0].spec);
+  assert(late.steps == 2 && late.talk_denoise && *late.talk_denoise == 0.5);
+  assert(late.seed == 7 && late.talk_video);
+  assert(ErrorOf(Replace(advanced, "\"add_noise\": \"enable\"",
+                         "\"add_noise\": \"disable\""))
+             .message.find("add_noise") != std::string::npos);
+  assert(ErrorOf(Replace(advanced, "\"end_at_step\": 10000",
+                         "\"end_at_step\": 3"))
+             .message.find("end_at_step") != std::string::npos);
+
+  // SamplerCustomAdvanced with BasicScheduler (4 steps) -> SplitSigmas
+  // (step 2) low_sigmas: the same 2 steps.
+  const std::string custom = Replace(
+      v2v, ksampler,
+      "\"70\": {\"class_type\": \"RandomNoise\", \"inputs\": "
+      "{\"noise_seed\": 7}},\n \"71\": {\"class_type\": \"KSamplerSelect\", "
+      "\"inputs\": {\"sampler_name\": \"lcm\"}},\n \"72\": {\"class_type\": "
+      "\"BasicScheduler\", \"inputs\": {\"model\": [\"16\", 0], "
+      "\"scheduler\": \"simple\", \"steps\": 4, \"denoise\": 1.0}},\n "
+      "\"73\": {\"class_type\": \"SplitSigmas\", \"inputs\": {\"sigmas\": "
+      "[\"72\", 0], \"step\": 2}},\n \"74\": {\"class_type\": "
+      "\"CFGGuider\", \"inputs\": {\"model\": [\"16\", 0], \"positive\": "
+      "[\"20\", 1], \"negative\": [\"20\", 2], \"cfg\": 1.0}},\n \"30\": "
+      "{\"class_type\": \"SamplerCustomAdvanced\", \"inputs\": {\"noise\": "
+      "[\"70\", 0], \"guider\": [\"74\", 0], \"sampler\": [\"71\", 0], "
+      "\"sigmas\": [\"73\", 1], \"latent_image\": [\"62\", 0]}}");
+  const comfy::Plan custom_plan = PlanOf(custom.c_str());
+  const auto& split = std::get<comfy::VideoTask>(custom_plan.tasks[0].spec);
+  assert(split.steps == 2 && split.talk_denoise &&
+         *split.talk_denoise == 0.5);
+  assert((split.talk_video == comfy::FileRef{"anna_motion.mp4", "input"}));
+  // BasicScheduler denoise 0.5 (the last 4 of 8 steps) split at 1: the
+  // last 3 steps of 8.
+  const comfy::Plan deeper_plan =
+      PlanOf(Replace(Replace(custom, "\"steps\": 4, \"denoise\": 1.0",
+                             "\"steps\": 4, \"denoise\": 0.5"),
+                     "\"step\": 2", "\"step\": 1")
+                 .c_str());
+  const auto& deeper = std::get<comfy::VideoTask>(deeper_plan.tasks[0].spec);
+  assert(deeper.steps == 3 && *deeper.talk_denoise == 3.0 / 8.0);
+  // Only low_sigmas, and a step inside the schedule.
+  assert(ErrorOf(Replace(custom, "\"sigmas\": [\"73\", 1]",
+                         "\"sigmas\": [\"73\", 0]"))
+             .message.find("low_sigmas") != std::string::npos);
+  assert(ErrorOf(Replace(custom, "\"step\": 2", "\"step\": 4"))
+             .message.find("SplitSigmas step") != std::string::npos);
+  const auto& classes = comfy::SupportedClassTypes();
+  assert(std::find(classes.begin(), classes.end(), "SplitSigmas") !=
+         classes.end());
+
+  // denoise 1 ignores the video (warning, nothing sent).
+  const comfy::Plan full_plan =
+      PlanOf(Replace(v2v, "\"denoise\": 0.5", "\"denoise\": 1.0").c_str());
+  const auto& full = std::get<comfy::VideoTask>(full_plan.tasks[0].spec);
+  assert(!full.talk_video && !full.talk_denoise);
+  assert(full_plan.warnings.size() == 1 &&
+         full_plan.warnings[0].find("pure noise") != std::string::npos);
+
+  // Errors: denoise < 1 on the empty InfiniteTalk latent, a still image as
+  // the video, a previous_frames chain.
+  assert(ErrorOf(Replace(kTalk, "\"denoise\": 1.0", "\"denoise\": 0.5"))
+             .message.find("VAEEncode") != std::string::npos);
+  assert(ErrorOf(Replace(v2v, "\"pixels\": [\"61\", 0]",
+                         "\"pixels\": [\"10\", 0]"))
+             .message.find("LoadVideo") != std::string::npos);
+  std::string chained = Replace(
+      v2v, " \"30\": {",
+      " \"80\": {\"class_type\": \"WanInfiniteTalkToVideo\", \"inputs\": "
+      "{\"mode\": \"single_speaker\", \"model\": [\"2\", 0], "
+      "\"model_patch\": [\"6\", 0], \"positive\": [\"12\", 0], "
+      "\"negative\": [\"13\", 0], \"vae\": [\"4\", 0], \"width\": 832, "
+      "\"height\": 480, \"length\": 81, \"clip_vision_output\": [\"11\", 0], "
+      "\"start_image\": [\"10\", 0], \"audio_encoder_output_1\": [\"9\", 0], "
+      "\"motion_frame_count\": 9, \"audio_scale\": 1.0}},\n \"81\": "
+      "{\"class_type\": \"VAEDecode\", \"inputs\": {\"samples\": [\"80\", 3], "
+      "\"vae\": [\"4\", 0]}},\n \"30\": {");
+  chained = Replace(chained, "\"audio_scale\": 1.0}},\n \"60\"",
+                    "\"audio_scale\": 1.0, \"previous_frames\": [\"81\", "
+                    "0]}},\n \"60\"");
+  assert(ErrorOf(chained).message.find("previous_frames") !=
+         std::string::npos);
+
+  // The start image as frame 0 of the motion video: ImageFromBatch
+  // (length 1) over GetVideoComponents <- LoadVideo; the executor extracts
+  // the frame with ffmpeg.
+  std::string from_frame = Replace(
+      v2v, "\"start_image\": [\"10\", 0]", "\"start_image\": [\"64\", 0]");
+  from_frame = Replace(
+      from_frame, " \"30\": {",
+      " \"64\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+      "{\"image\": [\"61\", 0], \"batch_index\": 0, \"length\": 1}},\n "
+      "\"30\": {");
+  const comfy::Plan frame_plan = PlanOf(from_frame.c_str());
+  const auto& framed = std::get<comfy::VideoTask>(frame_plan.tasks[0].spec);
+  assert((framed.first_frame == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(framed.first_frame_index && *framed.first_frame_index == 0);
+  assert((framed.talk_video == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(frame_plan.warnings.empty());
+  assert(!video.first_frame_index);
+  // Frame 12 of a VHS_LoadVideo.
+  const comfy::Plan vhs_frame_plan = PlanOf(
+      Replace(Replace(from_frame, "\"image\": [\"61\", 0], \"batch_index\": 0",
+                      "\"image\": [\"65\", 0], \"batch_index\": 12"),
+              " \"30\": {",
+              " \"65\": {\"class_type\": \"VHS_LoadVideo\", \"inputs\": "
+              "{\"video\": \"anna_vhs.mp4\"}},\n \"30\": {")
+          .c_str());
+  const auto& vhs_frame =
+      std::get<comfy::VideoTask>(vhs_frame_plan.tasks[0].spec);
+  assert((vhs_frame.first_frame == comfy::FileRef{"anna_vhs.mp4", "input"}));
+  assert(*vhs_frame.first_frame_index == 12);
+  // Only one frame, from a video.
+  assert(ErrorOf(Replace(from_frame, "\"length\": 1}", "\"length\": 2}"))
+             .message.find("length 1") != std::string::npos);
+  assert(ErrorOf(Replace(from_frame, "\"image\": [\"61\", 0], \"batch_index\"",
+                         "\"image\": [\"10\", 0], \"batch_index\""))
+             .message.find("LoadVideo") != std::string::npos);
+}
+
 void TestWanFunCamera() {
   // ComfyUI's Wan Fun Camera form: WanCameraEmbedding -> WanCameraImageToVideo.
   std::string text = Replace(
@@ -2052,6 +2235,7 @@ int main() {
   TestWanFunCamera();
   TestVace();
   TestInfiniteTalk();
+  TestInfiniteTalkVideoToVideo();
   TestDelivery();
   TestWavJoin();
   TestHelpers();
