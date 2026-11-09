@@ -4,11 +4,12 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <gufo/ext/mapped_prefetch.hpp>
-#include <gufo/ext/platform/mapped_file.hpp>
 #include <limits>
 #include <set>
 #include <stdexcept>
+
+#include "src/core/mapped_prefetch.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::qwen_image_21 {
 namespace {
@@ -260,6 +261,15 @@ Weights::Weights(const std::filesystem::path& root) {
   Load(root / "vae/diffusion_pytorch_model.safetensors", "vae.");
 }
 
+Weights Weights::FromFiles(std::span<const SafetensorsSource> files,
+                           json::Value vae_config) {
+  Weights weights;
+  for (const auto& file : files)
+    weights.Load(file.path, file.prefix);
+  weights.vae_config_ = std::move(vae_config);
+  return weights;
+}
+
 void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
   std::string open_error;
@@ -290,6 +300,19 @@ void Weights::Load(const std::filesystem::path& path,
     if (name == "__metadata__")
       continue;
     const auto dtype = entry.member_str("dtype");
+    if (dtype == "I64") {
+      // Integer bookkeeping such as BatchNorm's num_batches_tracked is never
+      // read; keep its extent for the contiguity check.
+      const auto* offsets = entry.find("data_offsets");
+      if (!offsets || !offsets->is_array() || offsets->size() != 2)
+        throw std::runtime_error("invalid tensor layout " + name);
+      const auto begin = Integer(offsets->items()[0]);
+      const auto end = Integer(offsets->items()[1]);
+      if (begin > end || end > payload_size)
+        throw std::runtime_error("invalid tensor extent " + name);
+      ranges.emplace_back(begin, end);
+      continue;
+    }
     if (dtype != "BF16" && dtype != "F32")
       throw std::runtime_error("unsupported Qwen-Image weight dtype " + dtype);
     const auto* shape = entry.find("shape");

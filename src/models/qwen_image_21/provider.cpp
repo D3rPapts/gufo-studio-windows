@@ -25,9 +25,12 @@ public:
     };
     req.images.reserve(request.images.size());
     for (const auto& img : request.images) {
-      req.images.push_back(Image{img.width, img.height, img.rgba});
+      req.images.push_back(Image{.width = img.width,
+                                 .height = img.height,
+                                 .rgba = img.rgba});
     }
     auto result = model_->Generate(req, is_cancelled);
+    // 1.4 model types (gufo-studio-windows): own Image/Request/Metrics.
     return ext::ImageResult{
         .image =
             ext::ImageBuffer{
