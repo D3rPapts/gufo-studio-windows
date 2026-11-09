@@ -222,6 +222,19 @@ public:
   [[nodiscard]] speculative::DraftProposal Propose(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens) override;
+  /// Sampled requests get the greedy block as a deterministic proposal: each
+  /// row is the point mass on its draft token (q = 1), which is an exact
+  /// proposal distribution for lossless rejection sampling. The verifier
+  /// accepts with the target probability of the token and otherwise samples
+  /// the target residual. The reference's sampled refinement table
+  /// (propose.py sampled_table) would raise acceptance and is not ported yet.
+  [[nodiscard]] speculative::DraftProposal ProposeSampled(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+      std::uint64_t* rng_state) override;
+  [[nodiscard]] bool SupportsSampledProposals() const noexcept override {
+    return true;
+  }
   void AcceptFeedback(std::span<const tokenization::TokenId> accepted,
                       tokenization::TokenId correction_token) override;
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const override;

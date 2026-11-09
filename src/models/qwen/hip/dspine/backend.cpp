@@ -125,6 +125,17 @@ speculative::DraftProposal QwenDSpineGpuDraftBackend::Propose(
   return proposal;
 }
 
+speculative::DraftProposal QwenDSpineGpuDraftBackend::ProposeSampled(
+    std::span<const tokenization::TokenId> prompt_tokens, std::uint32_t current_pos,
+    std::uint32_t max_tokens, float, std::uint64_t*) {
+  speculative::DraftProposal proposal =
+      Propose(prompt_tokens, current_pos, max_tokens);
+  proposal.candidates_per_token = 1;
+  proposal.candidate_ids = proposal.tokens;
+  proposal.candidate_probabilities.assign(proposal.tokens.size(), 1.0F);
+  return proposal;
+}
+
 void QwenDSpineGpuDraftBackend::AcceptFeedback(
     std::span<const tokenization::TokenId> accepted, tokenization::TokenId) {
   if (!proposal_active_ || accepted.size() > proposed_)
