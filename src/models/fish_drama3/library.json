@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "fish_drama3",
+  "target": "gufo_fish_drama3",
+  "kind": "static",
+  "purpose": "Fish Audio Drama-3 speech model (gufo-studio-windows): config, safetensors/pth loader, prompt and tokenizer.",
+  "consumers": [],
+  "checks": [
+    "fish_drama3_config_test",
+    "fish_drama3_test"
+  ]
+}
