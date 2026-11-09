@@ -1396,9 +1396,9 @@ public:
     for (;;) {
       const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - began);
-      const router::PoolDecision decision =
-          router::ChoosePool(PoolInputLocked(preset, forwarded, from_comfy,
-                                             remote_failed, waited));
+      const router::PoolInput pool_input =
+          PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited);
+      const router::PoolDecision decision = router::ChoosePool(pool_input);
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
@@ -1459,7 +1459,12 @@ public:
         }
         return response;
       }
-      if (local_failure.has_value()) {
+      // The local load failed (e.g. 507: memory held outside the router).
+      // While the partner is reachable, wait for it (up to the queue
+      // timeout) instead of answering with the local failure at once: it may
+      // just be busy for a moment (09.11.: hemmingway beside the 27B).
+      if (local_failure.has_value() &&
+          (forwarded || remote_failed || !pool_input.remote.available)) {
         stop_waiting();
         return std::move(*local_failure);
       }
@@ -1472,6 +1477,8 @@ public:
       if (gone || std::chrono::steady_clock::now() >= deadline ||
           stop_requested.load()) {
         stop_waiting();
+        if (local_failure.has_value() && !gone)
+          return std::move(*local_failure);
         Logger::Warn("router", "event=pool_busy model=" + model_id +
                                    " waited_ms=" +
                                    std::to_string(waited.count()) +
