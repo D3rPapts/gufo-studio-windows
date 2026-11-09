@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "gufo/ext/registry.hpp"
 #include "src/cli/arg_parser.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
@@ -367,6 +368,14 @@ std::optional<VideoCliOptions> ParseVideoOptions(
 }
 
 int RunVideo(std::span<const char* const> args) {
+  // The video command does not go through serve: register the built-in
+  // extensions here, or FindVideoProvider("minimax-h3") finds nothing.
+  static const bool registered = [] {
+    static ext::Registry registry;
+    ext::RegisterBuiltExtensions(registry);
+    return true;
+  }();
+  (void)registered;
   // Internal helper processes of video providers (gufo-studio-windows):
   // MiniMax H3 encodes vision + text in "video --h3-prompt-child req resp".
   if (!args.empty() && std::string_view(args[0]) == "--h3-prompt-child") {
