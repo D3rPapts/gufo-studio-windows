@@ -19,6 +19,7 @@
 #include "src/cli/serve/media/foley_api.hpp"
 #include "src/cli/serve/media/media_serve.hpp"
 #include "src/cli/serve/media/music_api.hpp"
+#include "src/cli/serve/media/omni_service.hpp"
 #include "src/cli/serve/media/upscale_api.hpp"
 #include "src/cli/serve/media/video_postprocess.hpp"
 #include "src/core/image.hpp"
@@ -161,6 +162,75 @@ void TestMusicAndFoleyStartup(const std::filesystem::path& root) {
          !foley.HandlesPath("/v1/audio/foleys"));
 }
 
+// gufo serve omni (2.0 media service): options, and the 1.4.9 Chat
+// Completions contract through a fake captioner (no model, no GPU).
+void TestOmni() {
+  assert(server::IsMediaServeCommand("omni"));
+  assert(server::MediaServeCommandsHelp().find("omni") != std::string::npos);
+  server::MediaServeArgs args;
+  gufo::cli::ArgParser parser("gufo serve omni");
+  server::AddMediaServeOptions("omni", parser, &args);
+  assert(args.name == "qwen3-omni-captioner" && args.context == 8192 &&
+         args.max_tokens == 1024);
+  std::string error;
+  assert(!server::ValidateMediaServeArgs("omni", &args, &error) &&
+         error.find("--mmproj") != std::string::npos);
+  const char* argv[] = {"-m", "text.gguf", "--mmproj", "proj.gguf", "-c",
+                        "32"};
+  assert(parser.Parse(argv, &error));
+  assert(!server::ValidateMediaServeArgs("omni", &args, &error) &&
+         error.find("--context") != std::string::npos);
+
+  std::size_t calls = 0;
+  std::size_t seen_bytes = 0;
+  auto omni = std::make_shared<server::OmniService>(server::OmniServiceOptions{
+      .model_id = "qwen3-omni-captioner",
+      .context_tokens = 8192,
+      .max_tokens = 64,
+      .runner =
+          [&](const gufo::models::qwen3_omni::CaptionRequest& request,
+              const gufo::models::qwen3_omni::CancellationCheck&,
+              gufo::models::qwen3_omni::CaptionResult* result, std::string*) {
+            ++calls;
+            seen_bytes = request.wav.size();
+            assert(request.max_tokens == 64);  // capped by the service
+            result->text = "rain on a roof";
+            result->finish_reason = "stop";
+            result->completion_tokens = 4;
+            return true;
+          },
+  });
+  server::OmniMediaService service(omni);
+  assert(service.ready() && service.capability() == "audio_caption" &&
+         service.model_id() == "qwen3-omni-captioner");
+  assert(service.HandlesPath("/v1/chat/completions") &&
+         !service.HandlesPath("/v1/completions"));
+  json::Value entry = json::Value::object();
+  service.Describe(&entry, false);
+  assert(entry.member_size("context_length", 0) == 8192);
+
+  // "RIFF" + 8 bytes, canonical base64.
+  server::HttpRequest request;
+  request.method = "POST";
+  request.path = "/v1/chat/completions";
+  request.request_id = "t1";
+  request.body =
+      R"({"model":"qwen3-omni-captioner","max_tokens":500,"messages":[)"
+      R"({"role":"user","content":[{"type":"input_audio","input_audio":)"
+      R"({"data":"UklGRgAAAABXQVZF","format":"wav"}}]}]})";
+  const server::HttpResponse ok = service.Handle(request);
+  assert(ok.status == 200 && calls == 1 && seen_bytes == 12);
+  const json::Value reply = json::parse(ok.body);
+  const json::Value* choices = reply.find("choices");
+  assert(choices != nullptr && choices->size() == 1);
+  const json::Value* message = choices->items().front().find("message");
+  assert(message != nullptr &&
+         message->member_str("content") == "rain on a roof");
+
+  request.body = R"({"messages":[{"role":"user","content":"hi"}]})";
+  assert(service.Handle(request).status == 400 && calls == 1);
+}
+
 void TestServeOptions(const std::filesystem::path& root) {
   assert(server::IsMediaServeCommand("music") &&
          server::IsMediaServeCommand("foley") &&
@@ -292,6 +362,7 @@ int main() {
   TestUpscaleService();
   TestMusicAndFoleyStartup(root);
   TestServeOptions(root);
+  TestOmni();
   TestPostProcessParser();
   std::filesystem::remove_all(root, ignored);
   std::cout << "media services tests passed\n";

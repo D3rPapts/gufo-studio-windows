@@ -8,6 +8,7 @@
 
 #include "src/cli/serve/media/foley_api.hpp"
 #include "src/cli/serve/media/music_api.hpp"
+#include "src/cli/serve/media/omni_service.hpp"
 #include "src/cli/serve/media/video_rife.hpp"
 #include "src/cli/serve/media/video_upscale.hpp"
 
@@ -15,7 +16,7 @@ namespace gufo::server {
 
 bool IsMediaServeCommand(std::string_view subcommand) {
   return subcommand == "music" || subcommand == "foley" ||
-         subcommand == "upscale";
+         subcommand == "upscale" || subcommand == "omni";
 }
 
 std::string MediaServeCommandsHelp() {
@@ -24,7 +25,9 @@ std::string MediaServeCommandsHelp() {
          "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
          "(/v1/audio/foley)\n"
          "  upscale   Serve Real-ESRGAN image upscaling on the NPU, GPU or "
-         "CPU (/v1/images/upscale)\n";
+         "CPU (/v1/images/upscale)\n"
+         "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
+         "(/v1/chat/completions, input_audio)\n";
 }
 
 std::string MediaServeDescription(std::string_view subcommand) {
@@ -32,6 +35,8 @@ std::string MediaServeDescription(std::string_view subcommand) {
     return "Serve ACE-Step 1.5 XL turbo text-to-music.";
   if (subcommand == "foley")
     return "Serve MMAudio large_44k_v2 video/text-to-audio.";
+  if (subcommand == "omni")
+    return "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.";
   return "Serve Real-ESRGAN image upscaling (POST /v1/images/upscale) on the "
          "AMD NPU (ONNX Runtime + VitisAI from Windows ML), the GPU (HIP) or "
          "the CPU (ONNX Runtime).";
@@ -59,6 +64,26 @@ void AddMediaServeOptions(std::string_view subcommand, cli::ArgParser& parser,
                      "bigvgan_v2_44khz_128band_512x.safetensors, tokenizer/)",
                      "Model", &args->model);
     parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
+                     "Model", &args->name);
+    return;
+  }
+  if (subcommand == "omni") {
+    args->name = "qwen3-omni-captioner";
+    parser.AddOption("-m", "--model", "PATH",
+                     "Qwen3-Omni-30B-A3B-Captioner text GGUF", "Model",
+                     &args->model);
+    parser.AddOption("", "--mmproj", "PATH",
+                     "Matching projector GGUF (audio tower)", "Model",
+                     &args->mmproj);
+    parser.AddOption("-c", "--context", "N",
+                     "Context capacity: audio tokens plus caption (default: "
+                     "8192)",
+                     "Model", &args->context);
+    parser.AddOption("-n", "--max-tokens", "N",
+                     "Caption length limit and default (default: 1024)",
+                     "Model", &args->max_tokens);
+    parser.AddOption("", "--served-model-name", "NAME",
+                     "Public API model ID (default: qwen3-omni-captioner)",
                      "Model", &args->name);
     return;
   }
@@ -125,6 +150,18 @@ bool ValidateMediaServeArgs(std::string_view subcommand, MediaServeArgs* args,
     }
     return true;
   }
+  if (subcommand == "omni") {
+    if (args->model.empty() || args->mmproj.empty()) {
+      *error = "--model <PATH> and --mmproj <PATH> are required for omni "
+               "server";
+      return false;
+    }
+    if (args->context < 64U || args->max_tokens == 0U) {
+      *error = "--context must be at least 64 and --max-tokens positive";
+      return false;
+    }
+    return true;
+  }
   UpscaleServeOptions& options = args->upscale;
   if (options.device != "npu" && options.device != "gpu" &&
       options.device != "cpu") {
@@ -177,6 +214,41 @@ std::shared_ptr<MediaService> LoadMediaService(std::string_view subcommand,
     }
     *details = "model=" + args.name;
     return foley;
+  }
+  if (subcommand == "omni") {
+#if defined(GUFO_HAVE_QWEN3_OMNI)
+    std::string load_error;
+    std::shared_ptr<models::qwen3_omni::Captioner> captioner =
+        models::qwen3_omni::Captioner::Create(
+            {.model = args.model.string(),
+             .mmproj = args.mmproj.string(),
+             .backend = "gpu",
+             .context = args.context,
+             .threads = 0},
+            &load_error);
+    if (captioner == nullptr) {
+      *error = "Error loading Qwen3-Omni captioner: " + load_error;
+      return nullptr;
+    }
+    auto omni = std::make_shared<OmniService>(OmniServiceOptions{
+        .model_id = args.name,
+        .context_tokens = args.context,
+        .max_tokens = args.max_tokens,
+        .runner =
+            [captioner](const models::qwen3_omni::CaptionRequest& request,
+                        const models::qwen3_omni::CancellationCheck& cancelled,
+                        models::qwen3_omni::CaptionResult* result,
+                        std::string* failure) {
+              return captioner->Caption(request, cancelled, result, failure);
+            },
+    });
+    *details = "model=" + args.name +
+               " sessions=1 context_tokens=" + std::to_string(args.context);
+    return std::make_shared<OmniMediaService>(std::move(omni));
+#else
+    *error = "this gufo build has no Qwen3-Omni support (needs HIP)";
+    return nullptr;
+#endif
   }
   std::string engine_error;
   std::unique_ptr<UpscaleEngine> engine =

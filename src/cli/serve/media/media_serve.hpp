@@ -6,6 +6,7 @@
 #ifndef GUFO_SERVER_MEDIA_MEDIA_SERVE_HPP_
 #define GUFO_SERVER_MEDIA_MEDIA_SERVE_HPP_
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -20,7 +21,7 @@
 
 namespace gufo::server {
 
-/// "music", "foley" or "upscale".
+/// "music", "foley", "upscale" or "omni".
 [[nodiscard]] bool IsMediaServeCommand(std::string_view subcommand);
 /// Help lines for `gufo serve --help` (one per command, newline-terminated).
 [[nodiscard]] std::string MediaServeCommandsHelp();
@@ -28,9 +29,13 @@ namespace gufo::server {
 [[nodiscard]] std::string MediaServeDescription(std::string_view subcommand);
 
 struct MediaServeArgs {
-  std::filesystem::path model;  // music / foley directory
+  std::filesystem::path model;  // music / foley directory, omni text GGUF
   std::string name;             // --served-model-name
   UpscaleServeOptions upscale;  // upscale
+  // omni (Qwen3-Omni-30B-A3B-Captioner): projector GGUF and limits.
+  std::filesystem::path mmproj;
+  std::size_t context{8192};
+  std::size_t max_tokens{1024};
 };
 
 /// Registers the model options of `gufo serve <subcommand>`.

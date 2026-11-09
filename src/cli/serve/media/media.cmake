@@ -6,6 +6,9 @@
 #   - Real-ESRGAN             `gufo serve upscale` /v1/images/upscale and the
 #                             "gufo.upscale" post-step of video jobs
 #   - RIFE 4.7                the "gufo.interpolate" post-step of video jobs
+#   - Qwen3-Omni Captioner    `gufo serve omni`    /v1/chat/completions with
+#                             one input_audio part (no upstream capability
+#                             takes audio into text generation yet)
 # The post-step core (video_postprocess.cpp) is part of gufo_http, because
 # video_jobs runs it after any provider. Included once from the top
 # CMakeLists.txt after the `gufo` executable is defined.
@@ -27,11 +30,14 @@ add_subdirectory(src/models/rife)
 add_subdirectory(src/models/ace_step)
 add_subdirectory(src/models/mmaudio)
 add_subdirectory(src/models/realesrgan)
+# Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
+add_subdirectory(src/models/qwen3_omni)
 
 add_library(gufo_media STATIC
   src/cli/serve/media/media_serve.cpp
   src/cli/serve/media/music_api.cpp
   src/cli/serve/media/foley_api.cpp
+  src/cli/serve/media/omni_api.cpp
   src/cli/serve/media/upscale_api.cpp
   src/cli/serve/media/video_rife.cpp
   src/cli/serve/media/video_upscale.cpp
@@ -43,6 +49,10 @@ if (ENGINE_ENABLE_HIP)
   # `gufo video-interpolate` / `gufo video-upscale` (HIP only).
   target_sources(gufo PRIVATE src/cli/video/video_interpolate.cpp
                               src/cli/video/video_upscale.cpp)
+endif()
+if (TARGET gufo_qwen3_omni)
+  target_link_libraries(gufo_media PUBLIC gufo_qwen3_omni)
+  target_compile_definitions(gufo_media PRIVATE GUFO_HAVE_QWEN3_OMNI=1)
 endif()
 target_link_libraries(gufo PRIVATE gufo_media)
 
