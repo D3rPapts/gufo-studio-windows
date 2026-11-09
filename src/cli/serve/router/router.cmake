@@ -60,7 +60,7 @@ if (BUILD_TESTING)
   foreach (router_test IN ITEMS
       router_preset_test router_registry_test router_memory_test
       router_names_test router_figuren_test router_proxy_remote_test
-      router_jobs_test)
+      router_jobs_test router_pool_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
