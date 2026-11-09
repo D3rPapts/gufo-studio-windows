@@ -389,10 +389,15 @@ bool RunCapture(const char* program, std::span<const std::string> arguments_in,
                         WindowsMessage(GetLastError()));
     return false;
   }
+  // RunCapture callers pass a full argv (argv[0] is the program name), which
+  // the POSIX side hands to posix_spawnp unchanged. Spawn() already writes the
+  // program name first, so skip argv[0] here; otherwise ffprobe receives
+  // "ffprobe" as an input file and exits with status 1.
   std::vector<std::wstring> arguments;
   arguments.reserve(arguments_in.size());
-  for (const std::string& arg : arguments_in) {
-    arguments.push_back(Widen(arg));
+  for (std::size_t index = arguments_in.empty() ? 0 : 1;
+       index < arguments_in.size(); ++index) {
+    arguments.push_back(Widen(arguments_in[index]));
   }
   Handle child;
   if (!Spawn(program, program, arguments, write_pipe.get(), &child, error)) {
