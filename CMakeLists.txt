@@ -1288,6 +1288,26 @@ endfunction()
   set_tests_properties(qwen3_tts_config_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;config;quality")
 
+  # Fish Audio Drama-3 (gufo-studio-windows extension src/models/fish_drama3).
+  if (TARGET gufo_fish_drama3)
+    add_executable(fish_drama3_config_test
+      tests/models/fish_drama3/config_test.cpp)
+    target_link_libraries(fish_drama3_config_test PRIVATE gufo_fish_drama3)
+    add_test(NAME fish_drama3_config_test COMMAND fish_drama3_config_test)
+    set_tests_properties(fish_drama3_config_test PROPERTIES
+      LABELS "cpu;models;fish-drama3;config;quality")
+  endif()
+  if (TARGET gufo_fish_drama3_hip AND TARGET gufo_qwen3_tts)
+    add_executable(fish_drama3_test
+      tests/models/fish_drama3/fish_drama3_test.cpp)
+    target_link_libraries(fish_drama3_test PRIVATE gufo_fish_drama3_hip
+      gufo_fish_drama3 gufo_qwen3_tts)
+    add_test(NAME fish_drama3_test COMMAND fish_drama3_test)
+    set_tests_properties(fish_drama3_test PROPERTIES
+      LABELS "gpu;models;fish-drama3;quality;external-model"
+      SKIP_RETURN_CODE 77)
+  endif()
+
   add_executable(qwen3_tts_prompt_test
     tests/models/qwen3_tts/prompt_test.cpp)
   target_link_libraries(qwen3_tts_prompt_test PRIVATE gufo_qwen3_tts)
