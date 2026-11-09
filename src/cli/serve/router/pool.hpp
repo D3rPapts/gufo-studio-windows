@@ -102,8 +102,14 @@ struct PoolDecision {
     }
     return {PoolChoice::kLocal, "forwarded"};
   }
-  const auto usable = [](const PoolSide& side) {
-    return side.available && !side.gpu_busy;
+  // GPU work on a machine keeps pool requests off it only while the other
+  // machine can take them: with the partner gone (pause, restart, cable),
+  // this machine serves despite its GPU work instead of waiting forever
+  // (09.11.: the 27B on the .56 stood still beside a ComfyUI job while the
+  // .198 was paused).
+  const auto usable = [&in](const PoolSide& side) {
+    const PoolSide& other = &side == &in.local ? in.remote : in.local;
+    return side.available && (!side.gpu_busy || !other.available);
   };
   // 1. Warm and free, this machine first.
   if (usable(in.local) && in.local.warm && in.local.free) {
