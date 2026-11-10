@@ -1439,9 +1439,17 @@ public:
             DispatchRemoteLocked(req, model_id, *preset.remote, lock);
         if (!lock.owns_lock())
           lock.lock();
+        // 507 from the partner: it could not load the model (memory held
+        // outside its router). This machine may still fit it after evicting
+        // its own idle residents, so it tries once itself instead of handing
+        // the 507 to the client (10.11.: hemmingway 507 on .198 for an hour
+        // while .56 kept an idle flash-next-q3 loaded).
+        const bool remote_refused_memory =
+            response.status == 507 && !forwarded;
         if (may_retry && !remote_failed && !response.streaming_body &&
-            response.status == 503 &&
-            response.log_details.starts_with("remote_unavailable")) {
+            (remote_refused_memory ||
+             (response.status == 503 &&
+              response.log_details.starts_with("remote_unavailable")))) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
