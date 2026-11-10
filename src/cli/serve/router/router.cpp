@@ -1446,9 +1446,12 @@ public:
         // while .56 kept an idle flash-next-q3 loaded).
         const bool remote_refused_memory =
             response.status == 507 && !forwarded;
-        if (may_retry && !remote_failed && !response.streaming_body &&
+        // A relayed 507 arrives with a lazy streaming body; nothing has
+        // reached the client until it is written, so it can be dropped
+        // (10.11. 07:31: the first 1.4.12 skipped the retry for this reason).
+        if (may_retry && !remote_failed &&
             (remote_refused_memory ||
-             (response.status == 503 &&
+             (!response.streaming_body && response.status == 503 &&
               response.log_details.starts_with("remote_unavailable")))) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
@@ -1706,7 +1709,10 @@ public:
       }
     }
     HttpResponse response = RelayRemote(model_id, spec, req);
-    if (response.status == 503 && !response.streaming_body) {
+    if ((response.status == 503 && !response.streaming_body) ||
+        response.status == 507) {
+      // 507: the pool may drop this answer and try locally, so the remote
+      // slot must not stay held by an unread streamed body.
       hold->Release();
       return response;
     }
