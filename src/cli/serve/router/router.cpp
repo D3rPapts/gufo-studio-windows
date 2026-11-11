@@ -45,10 +45,6 @@
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
 
-#ifndef GUFO_RELEASE_VERSION
-#define GUFO_RELEASE_VERSION "development"
-#endif
-
 namespace gufo::cli {
 namespace {
 
@@ -2620,7 +2616,6 @@ public:
     }
     json::Value out = json::Value::object();
     out["router_id"] = router_id;
-    out["version"] = std::string(GUFO_RELEASE_VERSION);
     out["self"] = self_name;
     out["partner"] = partner_name.empty() ? json::Value()
                                           : json::Value(partner_name);

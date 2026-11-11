@@ -683,7 +683,7 @@ move to the partner, the oldest job of both routers runs first, and a
 job only goes to a machine that can run it.
 
 **Capabilities.** `GET /router/capabilities` answers what this router
-can run: `{"router_id", "version", "self", "partner", "models": {"<id>":
+can run: `{"router_id", "self", "partner", "models": {"<id>":
 {"modality", "placement": "local|remote|pool", "switchable", "status",
 "loaded", "loras": ["winkel", ...]}}}`. The LoRA names come from the
 preset (`lora = name=path[,...]` lines of the section), the placement
