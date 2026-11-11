@@ -3501,8 +3501,7 @@ int RunRouter(std::span<const char* const> args) {
       else
         std::cerr << "Warning: --comfy-ffmpeg: no ffprobe next to "
                   << comfy_ffmpeg.string()
-                  << "; POST /v1/videos/concat answers concat_failed
-";
+                  << "; POST /v1/videos/concat answers concat_failed\n";
     }
     try {
       state->jobs =
