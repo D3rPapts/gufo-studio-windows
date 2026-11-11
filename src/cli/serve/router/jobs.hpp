@@ -77,6 +77,10 @@
 //    local one. Answer {"job": id, ...} or {"job": null}. A partner that
 //    answers 404 (older than 1.4.20) pauses pulling for pull_hold, logged
 //    once; an unreachable partner means "as before".
+//  - View: every job carries "request.loras" and "running_on" ("local",
+//    the partner's url while it runs there, null when not running);
+//    scope=pool items add "position" (1 = the oldest queued job of both
+//    routers). /router/status gets "pool_queue".
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -411,6 +415,10 @@ public:
   /// Removes relay-cache folders (thumbs of the partner's jobs) untouched
   /// for a day; runs with the expiry pass.
   void ExpireRelayCache();
+  /// /router/status "pool_queue": {"local": queued here, "partner": queued
+  /// there (null when unknown), "pulled": jobs this router fetched from the
+  /// partner, "pushed": jobs handed to the partner, ...}.
+  json::Value PoolQueueStatus();
 
   struct Job;
 

@@ -116,7 +116,7 @@ constexpr std::string_view kPresetGrammar =
     "    can run it (X-Gufo-Pool: local|remote, 400 no_capable_router when\n"
     "    neither can), a free runner pulls the partner's older queued job\n"
     "    (POST /router/pool/pull) and runs it on its worker while the owner\n"
-    "    keeps files and result.\n"
+    "    keeps files and result; /router/status shows pool_queue.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
     "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
 
@@ -2758,6 +2758,11 @@ public:
       }
       remote["jobs"] = std::move(jobs_held);
       body["remote"] = std::move(remote);
+    }
+    if (jobs != nullptr) {
+      // Shared queue: queued here and on the partner, jobs pulled from it
+      // and handed to it.
+      body["pool_queue"] = jobs->PoolQueueStatus();
     }
     return HttpResponse{.status = 200,
                         .reason = "OK",

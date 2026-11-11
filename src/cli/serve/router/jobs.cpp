@@ -2142,11 +2142,48 @@ HttpResponse JobQueue::PoolList(const HttpRequest& request) {
                                options_.partner_name + " error=" + why);
     }
   }
+  // "running_on" from this router's point of view: the partner's "local"
+  // is the partner, and a job the partner runs here (pulled) is local.
+  std::string me;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    me = self_name_.empty() ? options_.self_name : self_name_;
+  }
+  for (json::Value& job : merged) {
+    if (job.member_str("owner") == "local")
+      continue;
+    const std::string running_on = job.member_str("running_on");
+    if (running_on == "local")
+      job["running_on"] = options_.partner_name;
+    else if (!running_on.empty() &&
+             (running_on == me || running_on == options_.self_name))
+      job["running_on"] = "local";
+  }
   std::stable_sort(merged.begin(), merged.end(),
                    [](const json::Value& a, const json::Value& b) {
                      return a.member_double("created_at") >
                             b.member_double("created_at");
                    });
+  // "position": rank among the queued jobs of both routers, oldest = 1
+  // (the order the shared queue runs them in); null for the others.
+  {
+    // Within one router the submit order holds for jobs of the same second
+    // (the lists come newest first, so walk them backwards).
+    std::vector<std::size_t> queued;
+    for (std::size_t i = merged.size(); i-- > 0;)
+      if (merged[i].member_str("status") == "queued")
+        queued.push_back(i);
+    std::stable_sort(queued.begin(), queued.end(),
+                     [&merged](std::size_t a, std::size_t b) {
+                       return merged[a].member_double("created_at") <
+                              merged[b].member_double("created_at");
+                     });
+    for (json::Value& job : merged)
+      job["position"] = nullptr;
+    long long position = 0;
+    for (const std::size_t i : queued)
+      merged[i]["position"] = ++position;
+  }
   if (merged.size() > limit)
     merged.resize(limit);
   json::Value data = json::Value::array();
@@ -2277,6 +2314,11 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
     loras.push_back(name);
   request["loras"] = std::move(loras);
   view["request"] = std::move(request);
+  // Where the work runs: here, or on the partner's worker (pulled).
+  if (job.status != "in_progress")
+    view["running_on"] = nullptr;
+  else
+    view["running_on"] = job.pulled_by.empty() ? "local" : job.pulled_by;
   view["created_at"] = job.created_at;
   view["started_at"] =
       job.started_at > 0 ? json::Value(job.started_at) : json::Value();
@@ -2871,6 +2913,39 @@ void JobQueue::ReapPulledLocked() {
       ++it;
     }
   }
+}
+
+json::Value JobQueue::PoolQueueStatus() {
+  json::Value out = json::Value::object();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  out["local"] = static_cast<long long>(pending_.size());
+  out["partner"] = partner_queued_.has_value()
+                       ? json::Value(static_cast<long long>(
+                             partner_queued_->size()))
+                       : json::Value();
+  out["pulled"] = pulled_;
+  out["pushed"] = pushed_;
+  json::Value pulling = json::Value::array();
+  for (const std::string& id : pulling_)
+    pulling.push_back(id);
+  out["pulling"] = std::move(pulling);
+  json::Value pushed = json::Value::array();
+  for (const auto& job : order_)
+    if (job->status == "in_progress" && !job->pulled_by.empty())
+      pushed.push_back(job->id);
+  out["pushed_active"] = std::move(pushed);
+  const auto now = std::chrono::steady_clock::now();
+  if (now < pull_hold_until_)
+    out["pull_hold_s"] = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(pull_hold_until_ -
+                                                         now)
+            .count());
+  out["partner_name"] = options_.partner_name.empty()
+                            ? json::Value()
+                            : json::Value(options_.partner_name);
+  out["enabled"] = static_cast<bool>(options_.relay) &&
+                   static_cast<bool>(options_.capabilities);
+  return out;
 }
 
 FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
