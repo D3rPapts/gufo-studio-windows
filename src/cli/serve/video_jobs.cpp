@@ -1068,6 +1068,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
 
   auto job = std::make_shared<Impl::Job>();
   job->request = request;
+
   job->snapshot.id = impl_->options.id_factory();
   job->snapshot.status = VideoJobStatus::kQueued;
   job->snapshot.created_at = impl_->options.now();

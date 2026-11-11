@@ -36,6 +36,7 @@ add_subdirectory(src/models/qwen3_omni)
 add_library(gufo_media STATIC
   src/cli/serve/media/media_serve.cpp
   src/cli/serve/media/music_api.cpp
+  src/cli/serve/music_encode.cpp
   src/cli/serve/media/foley_api.cpp
   src/cli/serve/media/omni_api.cpp
   src/cli/serve/media/upscale_api.cpp
@@ -44,6 +45,9 @@ add_library(gufo_media STATIC
 )
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
   gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG)
+# mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
+target_compile_definitions(gufo_media PRIVATE
+  GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_media PUBLIC gufo_realesrgan)
   # `gufo video-interpolate` / `gufo video-upscale` (HIP only).
@@ -73,4 +77,17 @@ if (BUILD_TESTING)
   add_test(NAME media_services_test COMMAND media_services_test)
   set_tests_properties(media_services_test PROPERTIES
     LABELS "cpu;server;media" TIMEOUT 60)
+
+  # /v1/audio/music response_format / bitrate_kbps parsing, the FFmpeg
+  # argument list and a real mp3 transcode of a tiny WAV (skips without
+  # ffmpeg); no model.
+  add_executable(music_encode_test tests/cli/music_encode_test.cpp
+    src/cli/serve/music_encode.cpp)
+  target_include_directories(music_encode_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(music_encode_test PRIVATE cxx_std_20)
+  target_compile_definitions(music_encode_test PRIVATE
+    GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
+  add_test(NAME music_encode_test COMMAND music_encode_test)
+  set_tests_properties(music_encode_test PROPERTIES
+    LABELS "cpu;server;api;music" TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()

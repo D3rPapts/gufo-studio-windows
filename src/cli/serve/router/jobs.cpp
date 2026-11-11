@@ -2,6 +2,12 @@
 
 #include "src/core/platform/net.hpp"
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#endif
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -9,6 +15,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <fstream>
@@ -62,6 +69,10 @@ struct JobQueue::Job {
   /// Ran once already and was put back after the router found no machine
   /// for it (remote_unavailable, pool_busy) before any result.
   bool requeued{false};
+  /// PATCH {"keep": true}: the result files never expire.
+  bool keep{false};
+  /// When the result media were deleted (expiry); 0 = still there.
+  long long expired_at{0};
   std::atomic<bool> cancel{false};
   /// The cancel came from Stop(), not from a client.
   std::atomic<bool> shutdown{false};
@@ -96,7 +107,15 @@ constexpr std::string_view kJobPaths[] = {
     "/v1/audio/music",        "/v1/audio/transcriptions",
     "/v1/chat/completions",   "/v1/completions",
     "/v1/responses",          "/v1/messages",
-    "/v1/audio/foley"};
+    "/v1/audio/foley",        "/v1/images/upscale",
+    "/v1/videos/upscale",     "/v1/audio/convert",
+    "/v1/audio/separate",     "/v1/videos/concat"};
+
+/// Answered by the job store itself (ffmpeg), not by a worker.
+constexpr std::string_view kConcatPath = "/v1/videos/concat";
+constexpr std::size_t kConcatMinInputs = 2;
+constexpr std::size_t kConcatMaxInputs = 20;
+constexpr std::size_t kConcatMaxDataUrl = 64 * 1024 * 1024;
 
 long long NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -274,6 +293,8 @@ std::string ExtensionFor(std::string_view content_type) {
     return "wav";
   if (type == "audio/mpeg")
     return "mp3";
+  if (type == "audio/mp4" || type == "audio/aac")
+    return "m4a";
   if (type == "audio/flac")
     return "flac";
   if (type == "audio/ogg")
@@ -307,6 +328,8 @@ std::string ContentTypeFor(std::string_view name) {
     return "audio/wav";
   if (ext == "mp3")
     return "audio/mpeg";
+  if (ext == "m4a")
+    return "audio/mp4";
   if (ext == "flac")
     return "audio/flac";
   if (ext == "ogg")
@@ -342,7 +365,520 @@ bool IsJsonType(std::string_view content_type) {
   return type == "application/json" || type.ends_with("+json");
 }
 
+bool Finished(std::string_view status) {
+  return status == "completed" || status == "failed" ||
+         status == "cancelled" || status == "expired";
+}
+
+/// The small text files the expiry keeps; everything else in a job folder
+/// is result media.
+bool IsKeptFile(std::string_view name) {
+  return name == "request.body" || name == "response.json";
+}
+
+/// Result names are ours ([a-z0-9._-]); request.body is never served.
+bool ValidFileName(std::string_view name) {
+  return !name.empty() && name.size() <= 64 && name != "request.body" &&
+         name.front() != '.' &&
+         std::all_of(name.begin(), name.end(), [](char c) {
+           return std::islower(static_cast<unsigned char>(c)) ||
+                  std::isdigit(static_cast<unsigned char>(c)) || c == '.' ||
+                  c == '-' || c == '_';
+         });
+}
+
+/// The last `limit` bytes of `text`, cut at a line start, for error texts.
+std::string TailOf(std::string_view text, std::size_t limit) {
+  while (!text.empty() &&
+         (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+    text.remove_suffix(1);
+  if (text.size() > limit) {
+    text.remove_prefix(text.size() - limit);
+    if (const auto nl = text.find('\n'); nl != std::string_view::npos)
+      text.remove_prefix(nl + 1);
+  }
+  return std::string(text);
+}
+
+#if defined(_WIN32)
+/// Appends one argument to a CreateProcess command line (MS quoting rules).
+void AppendArgumentW(std::wstring& command, const std::wstring& arg) {
+  if (!command.empty())
+    command.push_back(L' ');
+  const bool plain =
+      !arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos;
+  if (plain) {
+    command += arg;
+    return;
+  }
+  command.push_back(L'"');
+  std::size_t backslashes = 0;
+  for (const wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'"') {
+      command.append(backslashes * 2 + 1, L'\\');
+    } else {
+      command.append(backslashes, L'\\');
+    }
+    backslashes = 0;
+    command.push_back(c);
+  }
+  command.append(backslashes * 2, L'\\');
+  command.push_back(L'"');
+}
+
+HANDLE OpenInheritable(const fs::path& path, bool write) {
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+  return CreateFileW(path.wstring().c_str(),
+                     write ? GENERIC_WRITE : GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes,
+                     write ? CREATE_ALWAYS : OPEN_EXISTING,
+                     FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+/// Runs `exe` with `args` (never through a shell), stdout and stderr into
+/// the two files, stdin from NUL. Exit code, or -1 with *error when the
+/// process could not start, timed out or was cancelled.
+int RunCaptured(const fs::path& exe, const std::vector<fs::path>& args,
+                std::chrono::minutes timeout, const fs::path& stdout_file,
+                const fs::path& stderr_file, std::atomic<bool>* cancel,
+                std::string* error) {
+  std::wstring command;
+  AppendArgumentW(command, exe.wstring());
+  for (const fs::path& arg : args)
+    AppendArgumentW(command, arg.wstring());
+  HANDLE in = OpenInheritable("NUL", false);
+  HANDLE out = OpenInheritable(stdout_file, true);
+  HANDLE err = OpenInheritable(stderr_file, true);
+  const auto close_all = [&] {
+    for (HANDLE handle : {in, out, err})
+      if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+  };
+  if (out == INVALID_HANDLE_VALUE || err == INVALID_HANDLE_VALUE) {
+    close_all();
+    *error = "cannot open the output files for " + exe.filename().string();
+    return -1;
+  }
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = in;
+  startup.hStdOutput = out;
+  startup.hStdError = err;
+  PROCESS_INFORMATION process{};
+  const BOOL started =
+      CreateProcessW(exe.wstring().c_str(), command.data(), nullptr, nullptr,
+                     TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                     &process);
+  const DWORD start_error = GetLastError();
+  close_all();
+  if (!started) {
+    *error = "cannot start " + exe.string() + " (error " +
+             std::to_string(start_error) + ")";
+    return -1;
+  }
+  CloseHandle(process.hThread);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const DWORD waited = WaitForSingleObject(process.hProcess, 200);
+    if (waited == WAIT_OBJECT_0)
+      break;
+    const bool cancelled = cancel != nullptr && cancel->load();
+    if (cancelled || std::chrono::steady_clock::now() > deadline) {
+      TerminateProcess(process.hProcess, 1);
+      WaitForSingleObject(process.hProcess, 5000);
+      CloseHandle(process.hProcess);
+      *error = cancelled ? "cancelled" : exe.filename().string() + " timed out";
+      return -1;
+    }
+  }
+  DWORD code = 1;
+  GetExitCodeProcess(process.hProcess, &code);
+  CloseHandle(process.hProcess);
+  return static_cast<int>(code);
+}
+#else
+int RunCaptured(const fs::path& exe, const std::vector<fs::path>& args,
+                std::chrono::minutes timeout, const fs::path& stdout_file,
+                const fs::path& stderr_file, std::atomic<bool>* cancel,
+                std::string* error) {
+  std::vector<std::string> storage{exe.string()};
+  for (const fs::path& arg : args)
+    storage.push_back(arg.string());
+  std::vector<char*> argv;
+  for (std::string& item : storage)
+    argv.push_back(item.data());
+  argv.push_back(nullptr);
+  const int out = open(stdout_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const int err = open(stderr_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const int in = open("/dev/null", O_RDONLY);
+  if (out < 0 || err < 0 || in < 0) {
+    for (const int fd : {out, err, in})
+      if (fd >= 0)
+        close(fd);
+    *error = "cannot open the output files for " + exe.filename().string();
+    return -1;
+  }
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(out);
+    close(err);
+    close(in);
+    *error = "fork failed";
+    return -1;
+  }
+  if (pid == 0) {
+    dup2(in, STDIN_FILENO);
+    dup2(out, STDOUT_FILENO);
+    dup2(err, STDERR_FILENO);
+    execv(argv[0], argv.data());
+    _exit(127);
+  }
+  close(out);
+  close(err);
+  close(in);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    int status = 0;
+    const pid_t done = waitpid(pid, &status, WNOHANG);
+    if (done == pid) {
+      if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+      *error = exe.filename().string() + " was killed";
+      return -1;
+    }
+    const bool cancelled = cancel != nullptr && cancel->load();
+    if (cancelled || std::chrono::steady_clock::now() > deadline) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      *error = cancelled ? "cancelled" : exe.filename().string() + " timed out";
+      return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+#endif
+
+std::string ReadIfThere(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return "";
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+/// Removes the concat work folder however the work ends.
+struct TempDir {
+  fs::path path;
+  ~TempDir() {
+    std::error_code ec;
+    fs::remove_all(path, ec);
+  }
+};
+
+/// ffprobe prints numbers as strings ("48000") or as numbers; both count.
+double NumberOf(const json::Value& object, const std::string& key) {
+  const json::Value* value = object.find(key);
+  if (value == nullptr)
+    return 0;
+  if (value->is_number())
+    return value->as_double();
+  if (value->is_string()) {
+    const std::string& text = value->str();
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    return end != text.c_str() && std::isfinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+std::string DurationKey(std::string_view path, std::string_view model) {
+  return std::string(path) + " " + std::string(model);
+}
+
+bool AllDigits(std::string_view text) {
+  return !text.empty() && std::all_of(text.begin(), text.end(), [](char c) {
+    return c >= '0' && c <= '9';
+  });
+}
+
+/// GET /v1/jobs and DELETE /v1/jobs filters from the query; false with
+/// *error for a value that cannot be read.
+bool ParseFilter(const HttpRequest& request, Filter* filter,
+                 std::string* error) {
+  filter->status = request.query_param("status");
+  filter->q = Lower(request.query_param("q"));
+  filter->seite = request.query_param("seite");
+  filter->geraet = request.query_param("geraet");
+  filter->kind = Lower(request.query_param("kind"));
+  if (filter->kind == "bild")
+    filter->kind = "image";
+  else if (filter->kind == "musik")
+    filter->kind = "music";
+  else if (filter->kind == "stimme")
+    filter->kind = "speech";
+  else if (filter->kind == "sonstiges")
+    filter->kind = "other";
+  if (!filter->kind.empty() && filter->kind != "image" &&
+      filter->kind != "music" && filter->kind != "speech" &&
+      filter->kind != "video" && filter->kind != "other") {
+    *error = "kind must be one of image, music, speech, video, other";
+    return false;
+  }
+  const long long now = NowSeconds();
+  for (const std::string_view name : {"since", "before", "older_than"}) {
+    const std::string text = request.query_param(std::string(name));
+    if (text.empty())
+      continue;
+    const auto value = ParseCutoff(text, now);
+    if (!value || *value <= 0) {
+      *error = std::string(name) +
+               " must be unix seconds, an age in seconds or ISO 8601";
+      return false;
+    }
+    if (name == "since")
+      filter->since = *value;
+    else if (name == "before")
+      filter->before = *value;
+    else
+      filter->older_than = *value;
+  }
+  return true;
+}
+
 }  // namespace
+
+std::string KindOf(std::string_view path) {
+  if (path.starts_with("/v1/images"))
+    return "image";
+  if (path.starts_with("/v1/audio/music"))
+    return "music";
+  if (path.starts_with("/v1/audio/speech"))
+    return "speech";
+  if (path.starts_with("/v1/videos"))
+    return "video";
+  return "other";
+}
+
+std::optional<JobFileRef> ParseJobFileUrl(std::string_view url) {
+  std::string_view path = url;
+  if (const auto scheme = path.find("://"); scheme != std::string_view::npos) {
+    // Only http(s) URLs carry a path we read; the host is not checked (the
+    // job must exist here anyway).
+    const std::string name = Lower(path.substr(0, scheme));
+    if (name != "http" && name != "https")
+      return std::nullopt;
+    const auto slash = path.find('/', scheme + 3);
+    if (slash == std::string_view::npos)
+      return std::nullopt;
+    path = path.substr(slash);
+  }
+  if (const auto cut = path.find_first_of("?#"); cut != std::string_view::npos)
+    path = path.substr(0, cut);
+  constexpr std::string_view kPrefix = "/v1/jobs/";
+  if (!path.starts_with(kPrefix))
+    return std::nullopt;
+  path.remove_prefix(kPrefix.size());
+  const auto slash = path.find('/');
+  if (slash == std::string_view::npos)
+    return std::nullopt;
+  JobFileRef ref;
+  ref.id = std::string(path.substr(0, slash));
+  const std::string_view rest = path.substr(slash);
+  constexpr std::string_view kFiles = "/files/";
+  if (!rest.starts_with(kFiles))
+    return std::nullopt;
+  ref.name = std::string(rest.substr(kFiles.size()));
+  if (!ValidJobId(ref.id) || !ValidFileName(ref.name) ||
+      IsKeptFile(ref.name))
+    return std::nullopt;
+  return ref;
+}
+
+std::optional<std::string> ParseDataUrl(std::string_view url,
+                                        std::string* media_type) {
+  if (!url.starts_with("data:"))
+    return std::nullopt;
+  const auto comma = url.find(',');
+  if (comma == std::string_view::npos)
+    return std::nullopt;
+  const std::string_view header = url.substr(5, comma - 5);
+  bool base64 = false;
+  std::string type;
+  std::size_t start = 0;
+  while (start <= header.size()) {
+    const auto end = std::min(header.find(';', start), header.size());
+    const std::string_view part = header.substr(start, end - start);
+    if (start == 0)
+      type = Lower(part);
+    else if (part == "base64")
+      base64 = true;
+    start = end + 1;
+  }
+  if (!base64)
+    return std::nullopt;
+  auto bytes = comfy::Base64Decode(url.substr(comma + 1));
+  if (!bytes)
+    return std::nullopt;
+  if (media_type != nullptr)
+    *media_type = type;
+  return bytes;
+}
+
+double FrameRateValue(std::string_view text) {
+  const std::string copy(text);
+  char* end = nullptr;
+  const double numerator = std::strtod(copy.c_str(), &end);
+  if (end == copy.c_str() || !std::isfinite(numerator) || numerator <= 0)
+    return 0;
+  if (*end == '\0')
+    return numerator;
+  if (*end != '/')
+    return 0;
+  char* end2 = nullptr;
+  const double denominator = std::strtod(end + 1, &end2);
+  if (end2 == end + 1 || *end2 != '\0' || !std::isfinite(denominator) ||
+      denominator <= 0)
+    return 0;
+  return numerator / denominator;
+}
+
+bool ParseProbe(std::string_view text, ProbeInfo* out, std::string* error) {
+  json::Value parsed;
+  try {
+    parsed = json::parse(std::string(text));
+  } catch (const std::exception& failure) {
+    *error = std::string("ffprobe output is not JSON: ") + failure.what();
+    return false;
+  }
+  ProbeInfo info;
+  bool video = false;
+  double stream_duration = 0;
+  if (const json::Value* streams = parsed.find("streams");
+      streams != nullptr && streams->is_array()) {
+    for (const json::Value& stream : streams->items()) {
+      if (!stream.is_object())
+        continue;
+      const std::string type = stream.member_str("codec_type");
+      if (type == "video" && !video) {
+        video = true;
+        info.video_codec = stream.member_str("codec_name");
+        info.width = static_cast<int>(NumberOf(stream, "width"));
+        info.height = static_cast<int>(NumberOf(stream, "height"));
+        info.frame_rate = stream.member_str("r_frame_rate");
+        if (FrameRateValue(info.frame_rate) <= 0)
+          info.frame_rate = stream.member_str("avg_frame_rate");
+        info.pix_fmt = stream.member_str("pix_fmt");
+        stream_duration = NumberOf(stream, "duration");
+      } else if (type == "audio" && !info.has_audio) {
+        info.has_audio = true;
+        info.audio_codec = stream.member_str("codec_name");
+        info.sample_rate = static_cast<int>(NumberOf(stream, "sample_rate"));
+        info.channels = static_cast<int>(NumberOf(stream, "channels"));
+      }
+    }
+  }
+  if (!video) {
+    *error = "no video stream";
+    return false;
+  }
+  if (info.width <= 0 || info.height <= 0 ||
+      FrameRateValue(info.frame_rate) <= 0) {
+    *error = "video stream without size or frame rate";
+    return false;
+  }
+  if (const json::Value* format = parsed.find("format");
+      format != nullptr && format->is_object())
+    info.duration = NumberOf(*format, "duration");
+  if (info.duration <= 0)
+    info.duration = stream_duration;
+  info.video_duration = stream_duration;
+  *out = std::move(info);
+  return true;
+}
+
+std::string ConcatMode(const std::vector<ProbeInfo>& inputs, bool reencode) {
+  if (reencode || inputs.empty())
+    return "reencode";
+  const ProbeInfo& first = inputs.front();
+  const double fps = FrameRateValue(first.frame_rate);
+  for (const ProbeInfo& input : inputs) {
+    const bool same_video =
+        input.video_codec == first.video_codec && input.width == first.width &&
+        input.height == first.height && input.pix_fmt == first.pix_fmt &&
+        std::fabs(FrameRateValue(input.frame_rate) - fps) < 1e-3;
+    const bool same_audio =
+        input.has_audio == first.has_audio &&
+        (!first.has_audio || (input.audio_codec == first.audio_codec &&
+                              input.sample_rate == first.sample_rate &&
+                              input.channels == first.channels));
+    if (!same_video || !same_audio)
+      return "reencode";
+  }
+  return "copy";
+}
+
+std::optional<long long> ParseCutoff(std::string_view text, long long now) {
+  while (!text.empty() && text.front() == ' ')
+    text.remove_prefix(1);
+  while (!text.empty() && text.back() == ' ')
+    text.remove_suffix(1);
+  if (text.empty() || text.size() > 32)
+    return std::nullopt;
+  if (AllDigits(text)) {
+    const long long value =
+        std::strtoll(std::string(text).c_str(), nullptr, 10);
+    // Ages are far below any unix time of this century (10^8 s = 3 years).
+    return value < 100000000LL ? now - value : value;
+  }
+  // ISO 8601: YYYY-MM-DD[(T| )HH:MM[:SS]][Z]
+  std::tm parts{};
+  int consumed = 0;
+  if (std::sscanf(std::string(text).c_str(), "%4d-%2d-%2d%n", &parts.tm_year,
+                  &parts.tm_mon, &parts.tm_mday, &consumed) != 3 ||
+      consumed != 10)
+    return std::nullopt;
+  std::string_view rest = text.substr(10);
+  if (!rest.empty() && (rest.front() == 'T' || rest.front() == ' ')) {
+    rest.remove_prefix(1);
+    const int fields =
+        std::sscanf(std::string(rest).c_str(), "%2d:%2d:%2d%n",
+                    &parts.tm_hour, &parts.tm_min, &parts.tm_sec, &consumed);
+    if (fields < 2)
+      return std::nullopt;
+    if (fields == 2) {
+      parts.tm_sec = 0;
+      consumed = 5;
+    }
+    if (rest.size() < static_cast<std::size_t>(consumed))
+      return std::nullopt;
+    rest.remove_prefix(static_cast<std::size_t>(consumed));
+  }
+  if (rest == "Z")
+    rest = {};
+  if (!rest.empty())
+    return std::nullopt;
+  if (parts.tm_year < 1970 || parts.tm_mon < 1 || parts.tm_mon > 12 ||
+      parts.tm_mday < 1 || parts.tm_mday > 31 || parts.tm_hour > 23 ||
+      parts.tm_min > 59 || parts.tm_sec > 60)
+    return std::nullopt;
+  parts.tm_year -= 1900;
+  parts.tm_mon -= 1;
+#if defined(_WIN32)
+  const std::time_t seconds = _mkgmtime(&parts);
+#else
+  const std::time_t seconds = timegm(&parts);
+#endif
+  if (seconds < 0)
+    return std::nullopt;
+  return static_cast<long long>(seconds);
+}
 
 // ---------------------------------------------------------------- targets
 
@@ -644,6 +1180,7 @@ JobQueue::JobQueue(Options options) : options_(std::move(options)) {
   if (!options_.deliver)
     options_.deliver = DeliverHttp;
   fs::create_directories(options_.root);
+  next_expiry_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   Load();
 }
 
@@ -688,15 +1225,29 @@ fs::path JobQueue::JobDir(const std::string& id) const {
 
 std::optional<HttpResponse> JobQueue::Handle(const HttpRequest& request) {
   const std::string_view path = request.path;
+  const std::string& method = request.method;
+  if (path == kConcatPath) {
+    if (method != "POST")
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "method_not_allowed");
+    try {
+      return Concat(request);
+    } catch (const std::exception& error) {
+      Logger::Warn("jobs", std::string("event=request_failed path=") +
+                               request.path + " error=" + error.what());
+      return Err(500, "Internal Server Error", error.what(), "concat_failed");
+    }
+  }
   if (path != "/v1/jobs" && !path.starts_with("/v1/jobs/"))
     return std::nullopt;
-  const std::string& method = request.method;
   try {
     if (path == "/v1/jobs") {
       if (method == "POST")
         return Submit(request);
       if (method == "GET")
         return List(request);
+      if (method == "DELETE")
+        return BulkDelete(request);
       return Err(405, "Method Not Allowed", "method is not allowed",
                  "method_not_allowed");
     }
@@ -711,9 +1262,17 @@ std::optional<HttpResponse> JobQueue::Handle(const HttpRequest& request) {
       if (method == "GET")
         return Get(id);
       if (method == "DELETE")
-        return Cancel(id);
+        return Delete(id);
+      if (method == "PATCH")
+        return Keep(id, request.body);
       return Err(405, "Method Not Allowed", "method is not allowed",
                  "method_not_allowed");
+    }
+    if (tail == "/keep") {
+      if (method != "POST")
+        return Err(405, "Method Not Allowed", "method is not allowed",
+                   "method_not_allowed");
+      return Keep(id, request.body);
     }
     if (tail == "/cancel") {
       if (method != "POST")
@@ -820,10 +1379,12 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       }
     }
   }
-  if (job->model.empty())
+  // The video concat runs on the router itself (ffmpeg), without a model.
+  const bool needs_model = job->path != kConcatPath;
+  if (needs_model && job->model.empty())
     return Err(400, "Bad Request", "missing 'model' in the wrapped request",
                "missing_model");
-  if (!options_.models.empty() &&
+  if (needs_model && !options_.models.empty() &&
       std::find(options_.models.begin(), options_.models.end(), job->model) ==
           options_.models.end())
     return Err(404, "Not Found", "unknown model '" + job->model + "'",
@@ -911,12 +1472,16 @@ HttpResponse JobQueue::List(const HttpRequest& request) {
   if (const std::string text = request.query_param("limit"); !text.empty())
     limit = std::clamp<std::size_t>(std::strtoull(text.c_str(), nullptr, 10),
                                     1, 1000);
-  const std::string status = request.query_param("status");
+  Filter filter;
+  std::string error;
+  if (!ParseFilter(request, &filter, &error))
+    return Err(400, "Bad Request", error, "invalid_filter");
   json::Value data = json::Value::array();
   const std::lock_guard<std::mutex> lock(mutex_);
+  // Newest first: order_ is the submit order.
   for (auto it = order_.rbegin(); it != order_.rend() && data.size() < limit;
        ++it) {
-    if (!status.empty() && (*it)->status != status)
+    if (!MatchesLocked(**it, filter))
       continue;
     data.push_back(ViewLocked(**it));
   }
@@ -924,6 +1489,38 @@ HttpResponse JobQueue::List(const HttpRequest& request) {
   body["object"] = "list";
   body["data"] = std::move(data);
   return JsonResponse(200, "OK", body);
+}
+
+bool JobQueue::MatchesLocked(const Job& job, const Filter& filter) const {
+  if (!filter.status.empty() && job.status != filter.status)
+    return false;
+  if (!filter.kind.empty() && KindOf(job.path) != filter.kind)
+    return false;
+  if (!filter.seite.empty() &&
+      job.metadata.member_str("seite") != filter.seite)
+    return false;
+  if (!filter.geraet.empty() &&
+      job.metadata.member_str("geraet") != filter.geraet)
+    return false;
+  if (filter.since > 0 && job.created_at < filter.since)
+    return false;
+  if (filter.before > 0 && job.created_at >= filter.before)
+    return false;
+  if (filter.older_than > 0) {
+    const long long at =
+        job.completed_at > 0 ? job.completed_at : job.created_at;
+    if (at >= filter.older_than)
+      return false;
+  }
+  if (!filter.q.empty()) {
+    const std::string text =
+        Lower(job.metadata.member_str("titel") + "\n" +
+              job.metadata.member_str("prompt") + "\n" + job.model + "\n" +
+              job.id);
+    if (text.find(filter.q) == std::string::npos)
+      return false;
+  }
+  return true;
 }
 
 HttpResponse JobQueue::Get(const std::string& id) {
@@ -968,23 +1565,141 @@ HttpResponse JobQueue::Cancel(const std::string& id) {
   return Get(id);
 }
 
+HttpResponse JobQueue::Keep(const std::string& id, const std::string& body) {
+  bool keep = true;
+  if (!body.empty()) {
+    json::Value parsed;
+    try {
+      parsed = json::parse(body);
+    } catch (const std::exception& error) {
+      return Err(400, "Bad Request",
+                 std::string("request body must be JSON: ") + error.what(),
+                 "invalid_json");
+    }
+    const json::Value* flag = parsed.find("keep");
+    if (!parsed.is_object() || flag == nullptr || !flag->is_bool())
+      return Err(400, "Bad Request", "body must be {\"keep\": true|false}",
+                 "invalid_request");
+    keep = flag->as_bool();
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = jobs_.find(id);
+  if (found == jobs_.end())
+    return Err(404, "Not Found", "job not found", "job_not_found");
+  if (found->second->keep != keep) {
+    found->second->keep = keep;
+    PersistLocked();
+    Logger::Info("jobs", "event=job_keep id=" + id +
+                             " keep=" + (keep ? "true" : "false"));
+  }
+  return JsonResponse(200, "OK", ViewLocked(*found->second));
+}
+
+void JobQueue::ForgetLocked(const std::shared_ptr<Job>& job) {
+  jobs_.erase(job->id);
+  std::erase(order_, job);
+  std::erase(pending_, job);
+  if (!job->idempotency_key.empty()) {
+    const auto key = idempotency_.find(job->idempotency_key);
+    if (key != idempotency_.end() && key->second == job->id)
+      idempotency_.erase(key);
+  }
+}
+
+HttpResponse JobQueue::Delete(const std::string& id) {
+  std::shared_ptr<Job> job;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = jobs_.find(id);
+    if (found == jobs_.end())
+      return Err(404, "Not Found", "job not found", "job_not_found");
+    job = found->second;
+    if (!Finished(job->status)) {
+      job = nullptr;
+    } else {
+      ForgetLocked(job);
+      PersistLocked();
+    }
+  }
+  if (job == nullptr)
+    return Cancel(id);  // queued or running: DELETE cancels, as before
+  std::error_code ec;
+  fs::remove_all(JobDir(id), ec);
+  if (ec)
+    Logger::Warn("jobs", "event=job_delete_files_failed id=" + id +
+                             " error=" + ec.message());
+  Logger::Info("jobs",
+               "event=job_deleted id=" + id + " status=" + job->status);
+  json::Value body = json::Value::object();
+  body["id"] = id;
+  body["object"] = "job";
+  body["deleted"] = true;
+  return JsonResponse(200, "OK", body);
+}
+
+HttpResponse JobQueue::BulkDelete(const HttpRequest& request) {
+  Filter filter;
+  std::string error;
+  if (!ParseFilter(request, &filter, &error))
+    return Err(400, "Bad Request", error, "invalid_filter");
+  if (!filter.any())
+    return Err(400, "Bad Request",
+               "bulk delete needs at least one filter: older_than, q, seite, "
+               "geraet, status, kind, since or before",
+               "filter_required");
+  const auto flag = [&](const char* name) {
+    const std::string value = Lower(request.query_param(name));
+    return value == "1" || value == "true" || value == "yes";
+  };
+  const bool dry_run = flag("dry_run");
+  const bool include_kept = flag("include_kept");
+  std::vector<std::shared_ptr<Job>> gone;
+  json::Value ids = json::Value::array();
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& job : order_) {
+      if (!Finished(job->status) || (job->keep && !include_kept) ||
+          !MatchesLocked(*job, filter))
+        continue;
+      gone.push_back(job);
+      ids.push_back(job->id);
+    }
+    if (!dry_run && !gone.empty()) {
+      for (const auto& job : gone)
+        ForgetLocked(job);
+      PersistLocked();
+    }
+  }
+  if (!dry_run) {
+    for (const auto& job : gone) {
+      std::error_code ec;
+      fs::remove_all(JobDir(job->id), ec);
+      if (ec)
+        Logger::Warn("jobs", "event=job_delete_files_failed id=" + job->id +
+                                 " error=" + ec.message());
+    }
+    Logger::Info("jobs", "event=jobs_deleted count=" +
+                             std::to_string(gone.size()) +
+                             " query=" + request.query);
+  }
+  json::Value body = json::Value::object();
+  body["object"] = "list";
+  body["dry_run"] = dry_run;
+  body["matched"] = static_cast<long long>(gone.size());
+  body["deleted"] = static_cast<long long>(dry_run ? 0 : gone.size());
+  body["ids"] = std::move(ids);
+  return JsonResponse(200, "OK", body);
+}
+
 HttpResponse JobQueue::File(const std::string& id, const std::string& name) {
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (!jobs_.contains(id))
       return Err(404, "Not Found", "job not found", "job_not_found");
   }
-  // Result names are ours ([a-z0-9.-]); request.body is not served.
-  const bool ok = !name.empty() && name.size() <= 64 &&
-                  name != "request.body" && name.front() != '.' &&
-                  std::all_of(name.begin(), name.end(), [](char c) {
-                    return std::islower(static_cast<unsigned char>(c)) ||
-                           std::isdigit(static_cast<unsigned char>(c)) ||
-                           c == '.' || c == '-' || c == '_';
-                  });
   const fs::path file = JobDir(id) / name;
   std::error_code ec;
-  if (!ok || !fs::is_regular_file(file, ec))
+  if (!ValidFileName(name) || !fs::is_regular_file(file, ec))
     return Err(404, "Not Found", "file not found", "file_not_found");
   return HttpResponse{.status = 200,
                       .reason = "OK",
@@ -1008,16 +1723,46 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
       job.started_at > 0 ? json::Value(job.started_at) : json::Value();
   view["completed_at"] =
       job.completed_at > 0 ? json::Value(job.completed_at) : json::Value();
-  view["progress"] = job.progress >= 0 ? json::Value(job.progress)
-                                       : json::Value();
+  // Without a live source (preview step, video or music job) a running
+  // job's progress is estimated from the learned duration of its path and
+  // model: elapsed / expected, at most 95 until the result is stored.
+  double progress = job.progress;
+  bool estimated = false;
+  // Video and music jobs report real progress once the worker accepted them;
+  // before that they are usually waiting in the pool for a free GPU, and an
+  // estimate would show "62 %" for a job that has not started (11.11.).
+  const bool live_source = job.path.starts_with("/v1/videos") ||
+                           job.path == "/v1/audio/music";
+  if (job.status == "in_progress" && progress < 0 && job.started_at > 0 &&
+      !live_source && job.preview_id.empty() && job.upstream_id.empty()) {
+    const auto learned = durations_.find(DurationKey(job.path, job.model));
+    if (learned != durations_.end() && learned->second > 0) {
+      const double elapsed =
+          static_cast<double>(std::max(0LL, NowSeconds() - job.started_at));
+      progress =
+          std::min(95.0, std::floor(100.0 * elapsed / learned->second));
+      estimated = true;
+    }
+  }
+  view["progress"] = progress >= 0 ? json::Value(progress) : json::Value();
+  view["progress_estimated"] = estimated;
+  view["keep"] = job.keep;
+  view["expired_at"] =
+      job.expired_at > 0 ? json::Value(job.expired_at) : json::Value();
   if (job.status == "in_progress" && !job.preview_id.empty())
     view["preview_url"] =
         "/v1/previews/" + job.preview_id +
         (job.path == "/v1/videos" ? std::string() : "?model=" + job.model);
+  else if (job.status == "in_progress" && job.path == "/v1/audio/music" &&
+           !job.upstream_id.empty())
+    // Music previews (D3) live on the worker's own endpoint; the router
+    // relays it by the music id (MusicJobId handles "/preview").
+    view["preview_url"] = "/v1/audio/music/" + job.upstream_id + "/preview";
   else
     view["preview_url"] = nullptr;
   if (!job.upstream_id.empty())
-    view["video_id"] = job.upstream_id;
+    view[job.path == "/v1/audio/music" ? "music_id" : "video_id"] =
+        job.upstream_id;
   view["metadata"] = job.metadata;
   view["result"] = job.result;
   view["error"] = job.error;
@@ -1062,6 +1807,8 @@ json::Value JobQueue::RecordLocked(const Job& job) const {
   record["webhook_attempts"] = job.webhook_attempts;
   record["webhook_last_status"] = job.webhook_last_status;
   record["webhook_last_error"] = job.webhook_last_error;
+  record["keep"] = job.keep;
+  record["expired_at"] = job.expired_at;
   return record;
 }
 
@@ -1071,6 +1818,10 @@ void JobQueue::PersistLocked() {
     all.push_back(RecordLocked(*job));
   json::Value file = json::Value::object();
   file["jobs"] = std::move(all);
+  json::Value durations = json::Value::object();
+  for (const auto& [key, seconds] : durations_)
+    durations[key] = seconds;
+  file["durations"] = std::move(durations);
   const fs::path path = options_.root / "jobs.json";
   const fs::path temp = options_.root / "jobs.json.tmp";
   try {
@@ -1099,6 +1850,12 @@ void JobQueue::Load() {
                  std::string("event=jobs_load_failed error=") + error.what());
     fs::rename(path, options_.root / "jobs.json.broken", ec);
     return;
+  }
+  if (const json::Value* durations = file.find("durations");
+      durations != nullptr && durations->is_object()) {
+    for (const auto& [key, seconds] : durations->members())
+      if (seconds.is_number() && seconds.as_double() > 0)
+        durations_[key] = seconds.as_double();
   }
   const json::Value* all = file.find("jobs");
   if (all == nullptr || !all->is_array())
@@ -1137,6 +1894,10 @@ void JobQueue::Load() {
     job->webhook_last_status =
         static_cast<int>(record.member_double("webhook_last_status", 0));
     job->webhook_last_error = record.member_str("webhook_last_error");
+    if (const json::Value* keep = record.find("keep"))
+      job->keep = keep->as_bool();
+    job->expired_at =
+        static_cast<long long>(record.member_double("expired_at", 0));
     if (job->status == "queued") {
       pending_.push_back(job);
       ++requeued;
@@ -1249,8 +2010,32 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
   const auto started = std::chrono::steady_clock::now();
   Logger::Info("jobs", "event=job_start id=" + job->id + " path=" + job->path +
                            " model=" + job->model);
+  struct DoneLog {
+    const std::shared_ptr<Job>& job;
+    std::mutex& mutex;
+    std::chrono::steady_clock::time_point started;
+    ~DoneLog() {
+      const double seconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count();
+      std::string status;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        status = job->status;
+      }
+      if (status == "queued")
+        return;  // requeued: job_start comes again
+      Logger::Info("jobs", "event=job_done id=" + job->id +
+                               " status=" + status +
+                               " seconds=" + std::to_string(seconds));
+    }
+  } done_log{job, mutex_, started};
   try {
     std::string payload = ReadAll(JobDir(job->id) / "request.body");
+    if (job->path == kConcatPath) {
+      RunConcat(job, payload);
+      return;
+    }
     // Image progress: the live preview's step, polled under the job id. A
     // request that brings its own preview id keeps it (and no progress).
     std::string with_preview;
@@ -1270,8 +2055,26 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
         // The worker answers the malformed body itself.
       }
     }
+    // Music progress: the worker's async music job (202 + id), polled like
+    // a video job. A worker that answers the audio at once is fine too.
+    std::string as_async;
+    if (job->path == "/v1/audio/music" && IsJsonType(job->content_type)) {
+      try {
+        json::Value body = json::parse(payload);
+        body["async"] = true;
+        as_async = body.dump();
+      } catch (const std::exception&) {
+        // The worker answers the malformed body itself.
+      }
+    }
     FetchResult result;
-    if (!with_preview.empty()) {
+    if (!as_async.empty()) {
+      result = Call(job, "POST", job->path, "", as_async, job->content_type);
+      if (result.status == 202 && IsJsonType(result.content_type)) {
+        RunMusic(job, result);
+        return;
+      }
+    } else if (!with_preview.empty()) {
       {
         const std::lock_guard<std::mutex> lock(mutex_);
         job->preview_id = job->id;
@@ -1297,8 +2100,8 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     }
     if (result.status < 200 || result.status >= 300)
       throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status);
-    if (job->path == "/v1/videos")
-      RunVideo(job, result);
+    if (job->path == "/v1/videos" || job->path == "/v1/videos/upscale")
+      RunVideo(job, result);  // both answer 202 with a worker video job
     else
       Finish(job, "completed", StoreResult(*job, result), json::Value());
   } catch (const Cancelled&) {
@@ -1349,16 +2152,6 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     error["code"] = "job_error";
     Finish(job, "failed", json::Value(), std::move(error));
   }
-  const double seconds =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
-          .count();
-  std::string status;
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    status = job->status;
-  }
-  Logger::Info("jobs", "event=job_done id=" + job->id + " status=" + status +
-                           " seconds=" + std::to_string(seconds));
 }
 
 void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
@@ -1457,6 +2250,441 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
   Finish(job, "completed", std::move(result), json::Value());
 }
 
+void JobQueue::RunMusic(const std::shared_ptr<Job>& job,
+                        const FetchResult& created) {
+  std::string music_id;
+  try {
+    music_id = json::parse(created.body).member_str("id");
+  } catch (const std::exception&) {
+  }
+  if (music_id.empty())
+    throw JobFailure("the music response has no id", "upstream_error",
+                     created.status);
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    job->upstream_id = music_id;
+    job->progress = 0;
+    PersistLocked();
+  }
+  // The worker has no cancel for music jobs: a cancelled job stops polling
+  // and the worker finishes the piece on its own.
+  const std::string query = "model=" + job->model;
+  json::Value final_status;
+  for (;;) {
+    const auto until = std::chrono::steady_clock::now() + options_.video_poll;
+    while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (job->cancel.load())
+      throw Cancelled();
+    HttpRequest poll;
+    poll.method = "GET";
+    poll.path = "/v1/audio/music/" + music_id;
+    poll.query = query;
+    poll.request_id = job->id;
+    const FetchResult state = options_.fetch(poll);
+    if (state.status != 200 && state.status != 202)
+      throw JobFailure("music status failed: " + ErrorMessage(state),
+                       ErrorCode(state), state.status);
+    json::Value parsed = json::parse(state.body);
+    const std::string status = parsed.member_str("status");
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      job->progress =
+          std::min(99.0, std::max(0.0, parsed.member_double("progress", 0)));
+    }
+    if (status == "completed") {
+      final_status = std::move(parsed);
+      break;
+    }
+    if (status == "failed" || status == "cancelled") {
+      const std::string message = parsed.member_str("error");
+      throw JobFailure("music " + status +
+                           (message.empty() ? std::string() : ": " + message),
+                       "music_" + status, 200);
+    }
+  }
+  const FetchResult content = Call(
+      job, "GET", "/v1/audio/music/" + music_id + "/content", query, "", "");
+  if (content.status != 200 || content.body.empty())
+    throw JobFailure("music content failed: " + ErrorMessage(content),
+                     ErrorCode(content), content.status);
+  const std::string name =
+      "output." + (content.content_type.empty()
+                       ? std::string("wav")
+                       : ExtensionFor(content.content_type));
+  WriteAll(JobDir(job->id) / name, content.body);
+  const std::string status_text = final_status.dump();
+  WriteAll(JobDir(job->id) / "response.json", status_text);
+  const std::string base = "/v1/jobs/" + job->id + "/files/";
+  json::Value files = json::Value::array();
+  json::Value audio = json::Value::object();
+  audio["name"] = name;
+  audio["url"] = base + name;
+  audio["content_type"] = ContentTypeFor(name);
+  audio["bytes"] = static_cast<long long>(content.body.size());
+  files.push_back(std::move(audio));
+  json::Value status_file = json::Value::object();
+  status_file["name"] = "response.json";
+  status_file["url"] = base + "response.json";
+  status_file["content_type"] = "application/json";
+  status_file["bytes"] = static_cast<long long>(status_text.size());
+  files.push_back(std::move(status_file));
+  json::Value result = json::Value::object();
+  result["status_code"] = created.status;
+  result["content_type"] = ContentTypeFor(name);
+  result["files"] = std::move(files);
+  result["response"] = std::move(final_status);
+  Finish(job, "completed", std::move(result), json::Value());
+}
+
+// ----------------------------------------------------------- video concat
+
+void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
+                            std::atomic<bool>* cancel, json::Value* summary) {
+  const auto invalid = [](const std::string& message) {
+    return JobFailure(message, "invalid_input", 400);
+  };
+  const auto failed = [](const std::string& message) {
+    return JobFailure(message, "concat_failed", 500);
+  };
+  const auto check_cancel = [&] {
+    if (cancel != nullptr && cancel->load())
+      throw Cancelled();
+  };
+  if (!body.is_object())
+    throw invalid("request body must be a JSON object");
+  const json::Value* videos = body.find("videos");
+  if (videos == nullptr || !videos->is_array())
+    throw invalid("'videos' must be an array of job file URLs or data URLs");
+  if (videos->size() < kConcatMinInputs || videos->size() > kConcatMaxInputs)
+    throw invalid("'videos' needs " + std::to_string(kConcatMinInputs) +
+                  " to " + std::to_string(kConcatMaxInputs) + " entries");
+  if (const json::Value* format = body.find("output_format");
+      format != nullptr && !format->is_null() &&
+      (!format->is_string() || Lower(format->str()) != "mp4"))
+    throw invalid("'output_format' must be \"mp4\"");
+  bool reencode = false;
+  if (const json::Value* flag = body.find("reencode");
+      flag != nullptr && !flag->is_null()) {
+    if (!flag->is_bool())
+      throw invalid("'reencode' must be true or false");
+    reencode = flag->as_bool();
+  }
+
+  // Inputs: a result file of a finished job here, or a data URL. Each is
+  // resolved first so a bad list fails before any ffmpeg call.
+  struct Input {
+    fs::path source;  // empty for data URLs
+    std::string bytes;
+    std::string label;
+  };
+  std::vector<Input> inputs;
+  int index = 0;
+  for (const json::Value& item : videos->items()) {
+    ++index;
+    const std::string where = "videos[" + std::to_string(index - 1) + "]";
+    if (!item.is_string())
+      throw invalid(where + " must be a string");
+    const std::string& text = item.str();
+    Input input;
+    if (text.starts_with("data:")) {
+      std::string type;
+      auto bytes = ParseDataUrl(text, &type);
+      if (!bytes)
+        throw invalid(where + " is not a base64 data URL");
+      if (bytes->size() > kConcatMaxDataUrl)
+        throw invalid(where + " exceeds " +
+                      std::to_string(kConcatMaxDataUrl / (1024 * 1024)) +
+                      " MiB");
+      if (!type.empty() && !type.starts_with("video/") &&
+          type != "application/octet-stream")
+        throw invalid(where + " has media type " + type + ", not video/*");
+      input.bytes = std::move(*bytes);
+      input.label = "data URL " + std::to_string(input.bytes.size()) + " bytes";
+    } else {
+      const auto ref = ParseJobFileUrl(text);
+      if (!ref)
+        throw invalid(where + " must be /v1/jobs/{id}/files/{name} of this "
+                              "router or a data URL");
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = jobs_.find(ref->id);
+        if (it == jobs_.end())
+          throw invalid(where + ": job " + ref->id + " is not on this router");
+        if (it->second->status != "completed")
+          throw invalid(where + ": job " + ref->id + " is " +
+                        it->second->status + ", not completed");
+        if (it->second->expired_at != 0)
+          throw invalid(where + ": the files of job " + ref->id +
+                        " have expired");
+      }
+      input.source = JobDir(ref->id) / ref->name;
+      std::error_code ec;
+      if (!fs::is_regular_file(input.source, ec))
+        throw invalid(where + ": job " + ref->id + " has no file " +
+                      ref->name);
+      input.label = "/v1/jobs/" + ref->id + "/files/" + ref->name;
+    }
+    inputs.push_back(std::move(input));
+  }
+  check_cancel();
+
+  if (options_.ffmpeg.empty() || options_.ffprobe.empty())
+    throw failed("video concat needs ffmpeg and ffprobe (--comfy-ffmpeg)");
+
+  // Work folder: the clips under short names (the concat list needs no
+  // quoting then), probes, the list and ffmpeg's output.
+  TempDir work{options_.root / "temp" /
+               ("concat-" + NewJobId().substr(4, 12))};
+  std::error_code ec;
+  fs::create_directories(work.path, ec);
+  if (ec)
+    throw failed("cannot create " + work.path.string() + ": " + ec.message());
+  std::vector<fs::path> clips;
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const fs::path clip = work.path / ("in-" + std::to_string(i + 1) + ".mp4");
+    if (inputs[i].source.empty()) {
+      WriteAll(clip, inputs[i].bytes);
+      inputs[i].bytes.clear();
+    } else {
+      fs::create_hard_link(inputs[i].source, clip, ec);
+      if (ec) {
+        ec.clear();
+        fs::copy_file(inputs[i].source, clip, ec);
+        if (ec)
+          throw failed("cannot copy " + inputs[i].label + ": " + ec.message());
+      }
+    }
+    clips.push_back(clip);
+  }
+
+  // Probe every clip.
+  std::vector<ProbeInfo> infos;
+  for (std::size_t i = 0; i < clips.size(); ++i) {
+    check_cancel();
+    const fs::path out =
+        work.path / ("probe-" + std::to_string(i + 1) + ".json");
+    const fs::path err =
+        work.path / ("probe-" + std::to_string(i + 1) + ".err");
+    std::string error;
+    const int code = RunCaptured(
+        options_.ffprobe,
+        {"-v", "error", "-print_format", "json", "-show_streams",
+         "-show_format", clips[i]},
+        std::chrono::minutes(2), out, err, cancel, &error);
+    if (error == "cancelled")
+      throw Cancelled();
+    if (code != 0)
+      throw invalid("videos[" + std::to_string(i) + "] (" + inputs[i].label +
+                    ") is not a readable video: " +
+                    (error.empty() ? TailOf(ReadIfThere(err), 600) : error));
+    ProbeInfo info;
+    if (!ParseProbe(ReadIfThere(out), &info, &error))
+      throw invalid("videos[" + std::to_string(i) + "] (" + inputs[i].label +
+                    "): " + error);
+    infos.push_back(std::move(info));
+  }
+  const std::string mode = ConcatMode(infos, reencode);
+  check_cancel();
+
+  std::vector<fs::path> args = {"-hide_banner", "-loglevel", "error",
+                                "-nostdin", "-y"};
+  if (mode == "copy") {
+    std::string list;
+    for (std::size_t i = 0; i < clips.size(); ++i) {
+      list += "file '" + clips[i].filename().string() + "'\n";
+      // Offset the next clip by this one's video length, not by its
+      // (slightly longer) audio: keeps the frame timing regular across
+      // the seam (11.11.: r_frame_rate 120/1 from a 30 ms gap).
+      if (infos[i].video_duration > 0) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.6f", infos[i].video_duration);
+        list += std::string("duration ") + buf + "\n";
+      }
+    }
+    const fs::path list_file = work.path / "list.txt";
+    WriteAll(list_file, list);
+    for (const char* arg : {"-f", "concat", "-safe", "0", "-i"})
+      args.emplace_back(arg);
+    args.push_back(list_file);
+    for (const char* arg : {"-c", "copy", "-movflags", "+faststart"})
+      args.emplace_back(arg);
+  } else {
+    // Every clip is scaled and padded to the first one's size, brought to
+    // its frame rate and yuv420p; audio is resampled to 48 kHz stereo, a
+    // clip without audio gets silence of its length so the concat filter
+    // sees the same streams everywhere.
+    const ProbeInfo& first = infos.front();
+    const bool any_audio =
+        std::any_of(infos.begin(), infos.end(),
+                    [](const ProbeInfo& info) { return info.has_audio; });
+    const std::string size =
+        std::to_string(first.width) + ":" + std::to_string(first.height);
+    std::string filter;
+    std::string joined;
+    for (std::size_t i = 0; i < clips.size(); ++i) {
+      args.emplace_back("-i");
+      args.push_back(clips[i]);
+      const std::string n = std::to_string(i);
+      filter += "[" + n + ":v:0]scale=" + size +
+                ":force_original_aspect_ratio=decrease,pad=" + size +
+                ":(ow-iw)/2:(oh-ih)/2,setsar=1,fps=" + first.frame_rate +
+                ",format=yuv420p[v" + n + "];";
+      joined += "[v" + n + "]";
+      if (any_audio) {
+        if (infos[i].has_audio) {
+          filter += "[" + n +
+                    ":a:0]aresample=48000,aformat=sample_fmts=fltp:"
+                    "channel_layouts=stereo[a" +
+                    n + "];";
+        } else {
+          if (infos[i].duration <= 0)
+            throw invalid("videos[" + n + "] (" + inputs[i].label +
+                          ") has no audio and no known duration");
+          char seconds[32];
+          std::snprintf(seconds, sizeof(seconds), "%.3f", infos[i].duration);
+          filter += "anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    "atrim=0:" +
+                    std::string(seconds) + "[a" + n + "];";
+        }
+        joined += "[a" + n + "]";
+      }
+    }
+    filter += joined + "concat=n=" + std::to_string(clips.size()) +
+              ":v=1:a=" + (any_audio ? "1" : "0") + "[v]" +
+              (any_audio ? "[a]" : "");
+    args.emplace_back("-filter_complex");
+    args.emplace_back(filter);
+    for (const char* arg : {"-map", "[v]"})
+      args.emplace_back(arg);
+    if (any_audio)
+      for (const char* arg : {"-map", "[a]"})
+        args.emplace_back(arg);
+    for (const char* arg :
+         {"-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt",
+          "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"})
+      args.emplace_back(arg);
+  }
+  const fs::path stitched = work.path / "video.mp4";
+  args.push_back(stitched);
+  const fs::path out = work.path / "ffmpeg.out";
+  const fs::path err = work.path / "ffmpeg.err";
+  std::string error;
+  const int code = RunCaptured(options_.ffmpeg, args, std::chrono::minutes(30),
+                               out, err, cancel, &error);
+  if (error == "cancelled")
+    throw Cancelled();
+  if (code != 0)
+    throw failed("ffmpeg (" + mode + ") failed: " +
+                 (error.empty() ? TailOf(ReadIfThere(err), 800) : error));
+  if (!fs::is_regular_file(stitched, ec) || fs::file_size(stitched, ec) == 0)
+    throw failed("ffmpeg (" + mode + ") wrote no output");
+  fs::create_directories(output.parent_path(), ec);
+  fs::remove(output, ec);
+  ec.clear();
+  fs::rename(stitched, output, ec);
+  if (ec) {
+    ec.clear();
+    fs::copy_file(stitched, output, fs::copy_options::overwrite_existing, ec);
+    if (ec)
+      throw failed("cannot store the result: " + ec.message());
+  }
+  if (summary != nullptr) {
+    json::Value result = json::Value::object();
+    result["mode"] = mode;
+    result["reencode"] = mode == "reencode";
+    json::Value list = json::Value::array();
+    double total = 0;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      json::Value entry = json::Value::object();
+      entry["input"] = inputs[i].label;
+      entry["codec"] = infos[i].video_codec;
+      entry["width"] = static_cast<double>(infos[i].width);
+      entry["height"] = static_cast<double>(infos[i].height);
+      entry["frame_rate"] = infos[i].frame_rate;
+      entry["audio"] = infos[i].has_audio;
+      entry["duration"] = infos[i].duration;
+      total += infos[i].duration;
+      list.push_back(std::move(entry));
+    }
+    result["inputs"] = std::move(list);
+    result["duration"] = total;
+    result["bytes"] = static_cast<double>(fs::file_size(output, ec));
+    *summary = std::move(result);
+  }
+}
+
+HttpResponse JobQueue::Concat(const HttpRequest& request) {
+  json::Value body;
+  try {
+    body = json::parse(request.body);
+  } catch (const std::exception& error) {
+    return Err(400, "Bad Request",
+               std::string("request body must be JSON: ") + error.what(),
+               "invalid_input");
+  }
+  TempDir out{options_.root / "temp" /
+              ("concat-out-" + NewJobId().substr(4, 12))};
+  const fs::path file = out.path / "video.mp4";
+  std::atomic<bool> cancel{false};
+  try {
+    ConcatVideos(body, file, &cancel, nullptr);
+  } catch (const JobFailure& failure) {
+    Logger::Warn("jobs", "event=concat_failed code=" + failure.code +
+                             " error=" + failure.what());
+    return Err(failure.status,
+               failure.status >= 500 ? "Internal Server Error" : "Bad Request",
+               failure.what(), failure.code);
+  }
+  std::string bytes = ReadAll(file);
+  Logger::Info("jobs",
+               "event=concat_done bytes=" + std::to_string(bytes.size()));
+  return HttpResponse{
+      .status = 200,
+      .reason = "OK",
+      .body = std::move(bytes),
+      .headers = {{"Content-Type", "video/mp4"},
+                  {"Content-Disposition", "attachment; filename=\"video.mp4\""},
+                  {"Cache-Control", "no-store"}}};
+}
+
+void JobQueue::RunConcat(const std::shared_ptr<Job>& job,
+                         const std::string& payload) {
+  json::Value body;
+  try {
+    body = json::parse(payload);
+  } catch (const std::exception& error) {
+    throw JobFailure(std::string("request body must be JSON: ") + error.what(),
+                     "invalid_input", 400);
+  }
+  const fs::path dir = JobDir(job->id);
+  json::Value summary;
+  ConcatVideos(body, dir / "video.mp4", &job->cancel, &summary);
+  const std::string summary_text = summary.dump();
+  WriteAll(dir / "response.json", summary_text);
+  const std::string base = "/v1/jobs/" + job->id + "/files/";
+  std::error_code ec;
+  json::Value files = json::Value::array();
+  json::Value video = json::Value::object();
+  video["name"] = "video.mp4";
+  video["url"] = base + "video.mp4";
+  video["content_type"] = "video/mp4";
+  video["bytes"] = static_cast<double>(fs::file_size(dir / "video.mp4", ec));
+  files.push_back(std::move(video));
+  json::Value status_file = json::Value::object();
+  status_file["name"] = "response.json";
+  status_file["url"] = base + "response.json";
+  status_file["content_type"] = "application/json";
+  status_file["bytes"] = static_cast<double>(summary_text.size());
+  files.push_back(std::move(status_file));
+  json::Value result = json::Value::object();
+  result["status_code"] = 200;
+  result["content_type"] = "video/mp4";
+  result["files"] = std::move(files);
+  result["response"] = std::move(summary);
+  Finish(job, "completed", std::move(result), json::Value());
+}
+
 json::Value JobQueue::StoreResult(Job& job, const FetchResult& result) {
   const fs::path dir = JobDir(job.id);
   const std::string base = "/v1/jobs/" + job.id + "/files/";
@@ -1532,8 +2760,17 @@ void JobQueue::Finish(const std::shared_ptr<Job>& job, std::string status,
     job->result = std::move(result);
     job->error = std::move(error);
     job->preview_id.clear();
-    if (job->status == "completed")
+    if (job->status == "completed") {
       job->progress = 100;
+      if (job->started_at > 0) {
+        // Learned duration for the estimated progress: half old, half new,
+        // at least one second (the timestamps are whole seconds).
+        const double seconds = static_cast<double>(
+            std::max(1LL, job->completed_at - job->started_at));
+        double& learned = durations_[DurationKey(job->path, job->model)];
+        learned = learned > 0 ? 0.5 * learned + 0.5 * seconds : seconds;
+      }
+    }
     if (!job->webhook_url.empty()) {
       job->webhook_state = "pending";
       job->webhook_due = std::chrono::steady_clock::now();
@@ -1541,6 +2778,77 @@ void JobQueue::Finish(const std::shared_ptr<Job>& job, std::string status,
     PersistLocked();
   }
   webhook_wake_.notify_all();
+}
+
+// ---------------------------------------------------------------- expiry
+
+void JobQueue::Tick() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now < next_expiry_)
+    return;
+  next_expiry_ = now + std::chrono::seconds(60);
+  try {
+    ExpireFiles(NowSeconds());
+  } catch (const std::exception& error) {
+    Logger::Warn("jobs", std::string("event=jobs_expire_failed error=") +
+                             error.what());
+  }
+}
+
+std::size_t JobQueue::ExpireFiles(long long now) {
+  const long long after = options_.expire_after.count();
+  if (after <= 0)
+    return 0;
+  std::size_t expired = 0;
+  // The files go under the lock, so a PATCH keep that arrives meanwhile
+  // either comes first (nothing is deleted) or finds the job expired.
+  const std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& job : order_) {
+    if (!Finished(job->status) || job->keep || job->expired_at != 0 ||
+        job->completed_at <= 0 || now - job->completed_at < after)
+      continue;
+    std::size_t files = 0;
+    unsigned long long bytes = 0;
+    std::error_code ec;
+    std::vector<fs::path> media;
+    for (const auto& entry : fs::directory_iterator(JobDir(job->id), ec)) {
+      if (!IsKeptFile(entry.path().filename().string()) &&
+          entry.is_regular_file(ec))
+        media.push_back(entry.path());
+    }
+    for (const fs::path& file : media) {
+      const auto size = fs::file_size(file, ec);
+      if (!ec)
+        bytes += size;
+      if (fs::remove(file, ec))
+        ++files;
+      else if (ec)
+        Logger::Warn("jobs", "event=job_expire_file_failed id=" + job->id +
+                                 " file=" + file.filename().string() +
+                                 " error=" + ec.message());
+    }
+    if (job->result.is_object()) {
+      if (const json::Value* listed = job->result.find("files");
+          listed != nullptr && listed->is_array()) {
+        json::Value left = json::Value::array();
+        for (const json::Value& file : listed->items())
+          if (IsKeptFile(file.member_str("name")))
+            left.push_back(file);
+        job->result["files"] = std::move(left);
+      }
+    }
+    job->expired_at = now;
+    ++expired;
+    Logger::Info("jobs", "event=job_expired id=" + job->id +
+                             " status=" + job->status +
+                             " files=" + std::to_string(files) +
+                             " bytes=" + std::to_string(bytes) +
+                             " age_hours=" +
+                             std::to_string((now - job->completed_at) / 3600));
+  }
+  if (expired > 0)
+    PersistLocked();
+  return expired;
 }
 
 // ---------------------------------------------------------------- webhooks

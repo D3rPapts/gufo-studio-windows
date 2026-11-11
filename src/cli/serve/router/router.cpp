@@ -441,7 +441,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // MMAudio (gufo serve foley); synchronous through the router.
       "/v1/audio/foley",
       // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
-      "/v1/images/upscale"};
+      "/v1/images/upscale",
+      // Voice conversion / stem separation (gufo serve voice, D5).
+      "/v1/audio/convert", "/v1/audio/separate"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
@@ -492,9 +494,13 @@ std::string MusicJobId(const std::string& path) {
     return "";
   }
   remainder.remove_prefix(prefix.size());
-  constexpr std::string_view suffix = "/content";
-  if (remainder.ends_with(suffix)) {
-    remainder.remove_suffix(suffix.size());
+  // Status, the finished audio and the live preview (D3) all belong to the
+  // worker that owns the job.
+  for (std::string_view suffix : {"/content", "/preview"}) {
+    if (remainder.ends_with(suffix)) {
+      remainder.remove_suffix(suffix.size());
+      break;
+    }
   }
   if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
     return "";
@@ -1445,9 +1451,20 @@ public:
             DispatchRemoteLocked(req, model_id, *preset.remote, lock);
         if (!lock.owns_lock())
           lock.lock();
-        if (may_retry && !remote_failed && !response.streaming_body &&
-            response.status == 503 &&
-            response.log_details.starts_with("remote_unavailable")) {
+        // 507 from the partner: it could not load the model (memory held
+        // outside its router). This machine may still fit it after evicting
+        // its own idle residents, so it tries once itself instead of handing
+        // the 507 to the client (10.11.: hemmingway 507 on .198 for an hour
+        // while .56 kept an idle flash-next-q3 loaded).
+        const bool remote_refused_memory =
+            response.status == 507 && !forwarded;
+        // A relayed 507 arrives with a lazy streaming body; nothing has
+        // reached the client until it is written, so it can be dropped
+        // (10.11. 07:31: the first 1.4.12 skipped the retry for this reason).
+        if (may_retry && !remote_failed &&
+            (remote_refused_memory ||
+             (!response.streaming_body && response.status == 503 &&
+              response.log_details.starts_with("remote_unavailable")))) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
@@ -1704,7 +1721,10 @@ public:
       }
     }
     HttpResponse response = RelayRemote(model_id, spec, req);
-    if (response.status == 503 && !response.streaming_body) {
+    if ((response.status == 503 && !response.streaming_body) ||
+        response.status == 507) {
+      // 507: the pool may drop this answer and try locally, so the remote
+      // slot must not stay held by an unread streamed body.
       hold->Release();
       return response;
     }
@@ -3096,6 +3116,7 @@ int RunRouter(std::span<const char* const> args) {
   std::string jobs_webhook_secret;
   std::string jobs_webhook_retry = "5,30,120,600";
   std::size_t jobs_webhook_timeout_seconds = 10;
+  std::size_t jobs_expire_hours = 12;
   std::size_t models_max = 2;
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
@@ -3138,7 +3159,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &comfy_dir);
   parser.AddOption("", "--comfy-ffmpeg", "FILE",
                    "ffmpeg for the ComfyUI API: FLAC audio, PNG frames from "
-                   "videos, non-WAV voice references",
+                   "videos, non-WAV voice references; also POST "
+                   "/v1/videos/concat (ffprobe is expected next to it)",
                    "Router", &comfy_ffmpeg);
   parser.AddOption("", "--jobs-dir", "DIR",
                    "Serve the job API (/v1/jobs): wrapped image, video, "
@@ -3182,6 +3204,12 @@ int RunRouter(std::span<const char* const> args) {
   parser.AddOption("", "--jobs-webhook-timeout-seconds", "SEC",
                    "Time one webhook attempt may take (default: 10)", "Jobs",
                    &jobs_webhook_timeout_seconds);
+  parser.AddOption("", "--jobs-expire-hours", "N",
+                   "Delete the result media of a finished job N hours after "
+                   "it finished unless it is kept (PATCH /v1/jobs/{id} "
+                   "{\"keep\": true}); the record, request.body and "
+                   "response.json stay. 0 = never (default: 12)",
+                   "Jobs", &jobs_expire_hours);
   parser.AddOption("", "--remote-allow", "LIST",
                    "Remote routers [remote/<id>] sections may name, comma "
                    "separated: IPv4 addresses or a.b.c.d/n ranges, each "
@@ -3462,6 +3490,21 @@ int RunRouter(std::span<const char* const> args) {
                                       webhook_retry_delays.end());
     jobs_options.webhook_timeout = std::chrono::seconds(
         std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
+    jobs_options.expire_after = std::chrono::hours(jobs_expire_hours);
+    if (!comfy_ffmpeg.empty()) {
+      // POST /v1/videos/concat: ffprobe lives next to ffmpeg.
+      jobs_options.ffmpeg = comfy_ffmpeg;
+      std::filesystem::path probe = comfy_ffmpeg;
+      probe.replace_filename(std::filesystem::path("ffprobe") +=
+                             comfy_ffmpeg.extension());
+      std::error_code probe_ec;
+      if (std::filesystem::is_regular_file(probe, probe_ec))
+        jobs_options.ffprobe = probe;
+      else
+        std::cerr << "Warning: --comfy-ffmpeg: no ffprobe next to "
+                  << comfy_ffmpeg.string()
+                  << "; POST /v1/videos/concat answers concat_failed\n";
+    }
     try {
       state->jobs =
           std::make_unique<router::jobs::JobQueue>(std::move(jobs_options));
@@ -3515,11 +3558,16 @@ int RunRouter(std::span<const char* const> args) {
                                " webhooks=" +
                                (jobs_webhook_allow.empty()
                                     ? std::string("off")
-                                    : jobs_webhook_allow));
+                                    : jobs_webhook_allow) +
+                               " expire_hours=" +
+                               std::to_string(jobs_expire_hours));
   }
   std::thread supervision([&state] {
     while (!state->stop_requested.load()) {
       state->SuperviseOnce();
+      // Result expiry runs here, outside the state mutex.
+      if (state->jobs != nullptr)
+        state->jobs->Tick();
       std::this_thread::sleep_for(kSupervisionTick);
     }
   });

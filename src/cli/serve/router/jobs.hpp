@@ -10,10 +10,62 @@
 //                                       "metadata": {...}} -> 202 + the job
 //                                      (Idempotency-Key: a repeated submit
 //                                      returns the first job)
-//   GET    /v1/jobs[?limit=N&status=S] newest first
+//   GET    /v1/jobs[?limit=N&status=S] newest first; filters q (text over
+//                                      metadata.titel/.prompt, model, id),
+//                                      seite, geraet, kind (image|music|
+//                                      speech|video|other), since/before
+//                                      (unix seconds, created_at)
 //   GET    /v1/jobs/{id}               status, progress, result links
-//   DELETE /v1/jobs/{id}               cancel (also POST /v1/jobs/{id}/cancel)
+//   PATCH  /v1/jobs/{id}               {"keep": true|false}: a kept job's
+//                                      files never expire (also POST
+//                                      /v1/jobs/{id}/keep)
+//   DELETE /v1/jobs/{id}               queued/running: cancel (also POST
+//                                      /v1/jobs/{id}/cancel); finished:
+//                                      remove the record and its files
+//   DELETE /v1/jobs?older_than=..&..   remove every finished job matching
+//                                      all given filters (older_than: age in
+//                                      seconds, unix seconds or ISO 8601;
+//                                      plus the list filters); at least one
+//                                      filter; dry_run=1 only counts;
+//                                      kept jobs need include_kept=1
 //   GET    /v1/jobs/{id}/files/{name}  one result file
+//   POST   /v1/videos/concat           {"videos": [2..20 result files of
+//                                      finished jobs of this router, as
+//                                      "/v1/jobs/{id}/files/video.mp4" or
+//                                      the same with scheme and host, or
+//                                      data: URLs of at most 64 MiB],
+//                                      "output_format": "mp4",
+//                                      "reencode": false} -> the stitched
+//                                      mp4 (Content-Disposition video.mp4).
+//                                      Needs ffmpeg + ffprobe (Options).
+//                                      Wrapped in a job the result file is
+//                                      video.mp4. Every input is probed;
+//                                      with the same codec, size, frame
+//                                      rate, pixel format and audio layout
+//                                      the clips are joined without
+//                                      re-encoding (concat demuxer, -c
+//                                      copy), otherwise (or with
+//                                      "reencode": true) they are scaled to
+//                                      the first clip and re-encoded with
+//                                      libx264 -crf 18 and AAC; audio is
+//                                      kept, clips without audio get
+//                                      silence. Errors: 400 invalid_input,
+//                                      500 concat_failed with ffmpeg's last
+//                                      stderr lines. Temp files live under
+//                                      DIR/temp/ and are removed.
+//
+// Expiry (--jobs-expire-hours, default 12, 0 = never): the result media of a
+// finished job that is not kept is deleted that long after completed_at;
+// the small text files (request.body, response.json) and the record itself
+// (prompt, metadata, timestamps) stay, result.files drops the deleted
+// entries and the job shows "expired_at".
+//
+// Progress: image jobs read the live preview's step, video and music jobs
+// poll the worker's job (music runs with "async": true). Any other job
+// (speech, foley, transcriptions, chat) reports an estimate once a job of
+// the same path and model has completed: elapsed / learned duration, at
+// most 95, flagged "progress_estimated": true. The learned durations live
+// in jobs.json ("durations").
 //
 // Jobs run through the router's own API, like the ComfyUI adapter's prompts:
 // a /v1/videos job creates the worker's video job and polls it (progress,
@@ -145,7 +197,97 @@ struct Options {
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
   /// Preview poll for the progress of image jobs.
   std::chrono::milliseconds progress_poll{std::chrono::seconds(1)};
+  /// Result media of finished, not kept jobs are deleted this long after
+  /// completed_at; zero = never.
+  std::chrono::seconds expire_after{std::chrono::hours(12)};
+  /// ffmpeg and ffprobe for POST /v1/videos/concat; empty = the endpoint
+  /// answers 500 concat_failed.
+  std::filesystem::path ffmpeg;
+  std::filesystem::path ffprobe;
 };
+
+// ------------------------------------------------- video concat helpers
+
+/// One input of POST /v1/videos/concat: a result file of a job.
+struct JobFileRef {
+  std::string id;
+  std::string name;
+};
+
+/// "/v1/jobs/{id}/files/{name}", with or without scheme and host in front
+/// ("http://192.168.178.198:8081/v1/jobs/job_.../files/video.mp4"); a query
+/// or fragment is dropped. nullopt for anything else (another path, a bad
+/// id, a name the file API would not serve).
+std::optional<JobFileRef> ParseJobFileUrl(std::string_view url);
+
+/// "data:<type>;base64,<payload>" -> the decoded bytes and the media type
+/// (lower case, without parameters). nullopt when the text is no data URL
+/// or the payload is not base64.
+std::optional<std::string> ParseDataUrl(std::string_view url,
+                                        std::string* media_type);
+
+/// What ffprobe reports about one input (-show_streams -show_format).
+struct ProbeInfo {
+  std::string video_codec;
+  int width{0};
+  int height{0};
+  /// r_frame_rate as ffprobe prints it ("30/1", "30000/1001").
+  std::string frame_rate;
+  std::string pix_fmt;
+  bool has_audio{false};
+  std::string audio_codec;
+  int sample_rate{0};
+  int channels{0};
+  /// Seconds (format.duration, else the video stream's); 0 = unknown.
+  double duration{0};
+  /// Seconds of the video stream alone; 0 = unknown. The concat demuxer
+  /// offsets the next clip by the longer (audio) stream otherwise, which
+  /// leaves an uneven gap at the seam and a bogus r_frame_rate.
+  double video_duration{0};
+};
+
+/// Parses ffprobe's JSON (-print_format json); false with *error when there
+/// is no video stream.
+bool ParseProbe(std::string_view text, ProbeInfo* out, std::string* error);
+
+/// "a/b" -> a / b as double; 0 when the text is no positive fraction.
+double FrameRateValue(std::string_view text);
+
+/// "copy" when `reencode` is false and every input shares the video codec,
+/// size, frame rate, pixel format and audio layout (none, or the same codec,
+/// sample rate and channels); "reencode" otherwise.
+std::string ConcatMode(const std::vector<ProbeInfo>& inputs, bool reencode);
+
+/// GET /v1/jobs and DELETE /v1/jobs filters (empty = not set).
+struct Filter {
+  std::string status;
+  /// Case-insensitive text over metadata.titel, metadata.prompt, model, id.
+  std::string q;
+  std::string seite;
+  std::string geraet;
+  /// image, music, speech, video, other (German names accepted too).
+  std::string kind;
+  /// created_at >= since, created_at < before (unix seconds).
+  long long since{0};
+  long long before{0};
+  /// Finished before this unix second (bulk delete).
+  long long older_than{0};
+
+  bool any() const {
+    return !status.empty() || !q.empty() || !seite.empty() ||
+           !geraet.empty() || !kind.empty() || since > 0 || before > 0 ||
+           older_than > 0;
+  }
+};
+
+/// The job kind the pages derive from request.path: image, music, speech,
+/// video or other.
+std::string KindOf(std::string_view path);
+
+/// "3600" (an age in seconds), "1762800000" (unix seconds) or ISO 8601
+/// ("2026-11-10T08:00:00Z", "2026-11-10 08:00", "2026-11-10"): the cutoff
+/// as unix seconds; nullopt for anything else.
+std::optional<long long> ParseCutoff(std::string_view text, long long now);
 
 class JobQueue {
 public:
@@ -163,6 +305,14 @@ public:
   std::optional<server::HttpResponse> Handle(
       const server::HttpRequest& request);
 
+  /// Called from the router's supervision loop: runs the expiry about once
+  /// a minute (the first pass shortly after the start).
+  void Tick();
+  /// Deletes the result media of finished, not kept jobs whose completed_at
+  /// is at least `expire_after` before `now` (unix seconds); the number of
+  /// jobs that expired. Never touches kept or younger jobs.
+  std::size_t ExpireFiles(long long now);
+
   struct Job;
 
 private:
@@ -170,11 +320,27 @@ private:
   server::HttpResponse List(const server::HttpRequest& request);
   server::HttpResponse Get(const std::string& id);
   server::HttpResponse Cancel(const std::string& id);
+  server::HttpResponse Keep(const std::string& id, const std::string& body);
+  server::HttpResponse Delete(const std::string& id);
+  server::HttpResponse BulkDelete(const server::HttpRequest& request);
   server::HttpResponse File(const std::string& id, const std::string& name);
+  /// POST /v1/videos/concat answered at once: the mp4 bytes.
+  server::HttpResponse Concat(const server::HttpRequest& request);
+  /// Stitches the clips named by `body` into `output` (the job's temp
+  /// folder is made under root/temp and removed again). Throws JobFailure
+  /// (400 invalid_input, 500 concat_failed) or Cancelled.
+  void ConcatVideos(const json::Value& body, const std::filesystem::path& output,
+                    std::atomic<bool>* cancel, json::Value* summary);
+  /// Drops the job from every index (mutex held); the caller removes its
+  /// folder after unlocking.
+  void ForgetLocked(const std::shared_ptr<Job>& job);
+  bool MatchesLocked(const Job& job, const Filter& filter) const;
 
   void RunnerMain();
   void Execute(const std::shared_ptr<Job>& job);
   void RunVideo(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunMusic(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunConcat(const std::shared_ptr<Job>& job, const std::string& payload);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string query, std::string body,
                    std::string content_type);
@@ -201,6 +367,10 @@ private:
   std::map<std::string, std::shared_ptr<Job>> jobs_;
   std::map<std::string, std::string> idempotency_;
   std::deque<std::shared_ptr<Job>> pending_;
+  /// Learned seconds per "<path> <model>" for the estimated progress.
+  std::map<std::string, double> durations_;
+  /// Next expiry pass (supervision thread only).
+  std::chrono::steady_clock::time_point next_expiry_{};
   bool stopping_{false};
   std::vector<std::thread> runners_;
   std::thread webhook_thread_;

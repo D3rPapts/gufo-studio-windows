@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/music_encode.hpp"
 #include "src/core/json.hpp"
 #include "src/models/ace_step/vae.hpp"
 
@@ -64,7 +66,8 @@ struct MusicService::Job {
   std::string status{"queued"};
   double progress{0};
   std::string error;
-  std::string wav;
+  MusicOutputFormat format;
+  std::string output;  // the WAV, or its mp3 / m4a transcode
   ace::MusicTelemetry telemetry;
   std::int64_t created_at{0};
   std::int64_t completed_at{0};
@@ -148,15 +151,23 @@ void MusicService::Worker() {
     // Not reached: without HIP the service never becomes ready.
     const bool ok = false;
 #endif
-    std::string wav;
-    if (ok)
-      wav = ace::EncodeStereoWav(audio, ace::kSampleRate);
+    std::string output;
+    bool encoded = ok;
+    if (ok) {
+      const std::string wav = ace::EncodeStereoWav(audio, ace::kSampleRate);
+      // mp3 / m4a run through FFmpeg; a missing or failing FFmpeg fails the
+      // job (HTTP 500 on the content read) and keeps the WAV on disk.
+      encoded = EncodeMusic(wav, job->format, &output, &error);
+      if (!encoded)
+        Logger::Error("music", "job=" + job->id + " format=" +
+                                   job->format.name + " " + error);
+    }
     {
       std::lock_guard lock(mutex_);
       job->telemetry = telemetry;
-      job->status = ok ? "completed" : "failed";
+      job->status = encoded ? "completed" : "failed";
       job->error = error;
-      job->wav = std::move(wav);
+      job->output = std::move(output);
       job->progress = 1.0;
       job->completed_at = Now();
       job->done = true;
@@ -231,10 +242,11 @@ HttpResponse MusicService::Submit(const HttpRequest& request) {
   r.lm_temperature = static_cast<float>(
       body.member_double("lm_temperature", r.lm_temperature));
   r.lm_top_p = static_cast<float>(body.member_double("lm_top_p", r.lm_top_p));
-  const std::string format = body.member_str("response_format", "wav");
-  if (format != "wav")
-    return Error(400, "Bad Request", "response_format must be wav",
-                 "unsupported_format");
+  {
+    std::string message, code;
+    if (!ParseMusicOutputFormat(body, &job->format, &message, &code))
+      return Error(400, "Bad Request", std::move(message), std::move(code));
+  }
   if (!(r.duration >= 1.0 && r.duration <= 600.0))
     return Error(400, "Bad Request", "duration must be 1..600 seconds",
                  "invalid_duration");
@@ -280,9 +292,11 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
     if (!job.done)
       return Error(409, "Conflict", "music job is not finished", "not_ready");
     HttpResponse response;
-    response.body = job.wav;
+    response.body = job.output;
     response.headers = {
-        {"Content-Type", "audio/wav"},
+        {"Content-Type", job.format.content_type},
+        {"Content-Disposition",
+         "attachment; filename=\"" + job.format.filename + "\""},
         {"X-Gufo-Music-Id", job.id},
         {"X-Gufo-Seed", std::to_string(job.request.seed)},
         {"X-Gufo-Generation-Seconds",
@@ -303,6 +317,9 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
     body["completed_at"] = static_cast<double>(job.completed_at);
   body["duration"] = job.request.duration;
   body["seed"] = std::to_string(job.request.seed);
+  body["response_format"] = job.format.name;
+  if (job.format.needs_ffmpeg())
+    body["bitrate_kbps"] = static_cast<double>(job.format.bitrate_kbps);
   if (!job.error.empty())
     body["error"] = job.error;
   return Json(job.done || job.status != "queued" ? 200 : 202,

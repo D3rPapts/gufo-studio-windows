@@ -459,8 +459,16 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
       return Fail(error, "invalid_video_request",
                   "unknown LoRA '" + lora +
                       "'; the server registers LoRAs with --lora NAME=PATH");
-    if (!steps.has_value() && found->second.steps != 0)
+    if (!steps.has_value() && found->second.steps != 0) {
       parameters->evaluations = found->second.steps;
+      // A step-distilled LoRA (turbo, 8 steps) cannot afford the fast/
+      // aggressive presets' step reuse and block skipping: with 8 steps
+      // half of them would be extrapolated and 5-10 blocks dropped, which
+      // produced jumping video and broken audio (11.11.). Run every step on
+      // every block; the preset's internal resolution stays as chosen.
+      parameters->reuse_interval = 1;
+      parameters->active_blocks = 50;
+    }
   }
 
   json::Value options = json::Value::object();
