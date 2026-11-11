@@ -5,7 +5,7 @@
 #
 # CPU: tokenizer, prompts, noise, WAV and the model file layout (prompt.cpp),
 # enough for request handling and the token oracle test.
-add_library(gufo_ace_step STATIC EXCLUDE_FROM_ALL tokenizer.cpp prompt.cpp)
+add_library(gufo_ace_step STATIC EXCLUDE_FROM_ALL tokenizer.cpp prompt.cpp preview.cpp)
 target_include_directories(gufo_ace_step PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_ace_step PUBLIC gufo_core gufo_qwen_text ICU::i18n)
 

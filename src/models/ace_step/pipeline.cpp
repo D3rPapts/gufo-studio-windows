@@ -96,11 +96,58 @@ std::unique_ptr<MusicPipeline> MusicPipeline::Load(const ModelPaths& paths,
   return std::unique_ptr<MusicPipeline>(new MusicPipeline(std::move(impl)));
 }
 
+namespace {
+
+// Decodes the preview window of the clean estimate x0 = x - t * v (see
+// MusicCleanEstimate) and hands the mono WAV to the sink. A failed decode
+// only drops this preview; the generation itself goes on.
+void PublishPreview(VaeDecoder& vae, const MusicPreviewSink& sink,
+                    std::span<const float> x, std::span<const float> v,
+                    float t, int frames, int step, int steps) {
+  const auto start = std::chrono::steady_clock::now();
+  const PreviewWindow window =
+      MusicPreviewWindow(frames, sink.window_seconds, kPreviewMarginFrames);
+  if (window.decode_count <= 0)
+    return;
+  const std::size_t offset =
+      std::size_t(window.decode_first) * kLatentChannels;
+  const std::size_t length =
+      std::size_t(window.decode_count) * kLatentChannels;
+  std::vector<float> x0;
+  MusicCleanEstimate(x.subspan(offset, length), v.subspan(offset, length), t,
+                     &x0);
+  std::vector<float> audio;
+  std::string error;
+  if (!vae.Decode(x0, window.decode_count, &audio, &error))
+    return;
+  // Cut the margin: the decoded slice is planar [2][decode_count * 1920].
+  const std::size_t decoded = audio.size() / 2;
+  const auto skip = std::size_t(window.skip_samples());
+  const auto keep = std::size_t(window.samples());
+  if (skip + keep > decoded)
+    return;
+  std::vector<float> planar(2 * keep);
+  std::copy_n(audio.begin() + skip, keep, planar.begin());
+  std::copy_n(audio.begin() + decoded + skip, keep, planar.begin() + keep);
+  MusicPreview preview;
+  preview.step = step;
+  preview.steps = steps;
+  preview.start_seconds = window.start_seconds();
+  preview.window_seconds = window.seconds();
+  preview.wav = EncodePreviewWav(planar);
+  preview.decode_ms = Since(start) * 1000.0;
+  if (sink.publish)
+    sink.publish(std::move(preview));
+}
+
+}  // namespace
+
 bool MusicPipeline::Generate(const MusicRequest& request,
                              std::vector<float>* audio,
                              MusicTelemetry* telemetry,
                              const MusicProgress& progress,
-                             std::string* error) {
+                             std::string* error,
+                             const MusicPreviewSink* preview) {
   Impl& m = *impl_;
   MusicTelemetry local;
   MusicTelemetry& tm = telemetry != nullptr ? *telemetry : local;
@@ -203,11 +250,31 @@ bool MusicPipeline::Generate(const MusicRequest& request,
   auto x = MusicNoise(request.seed, std::size_t(frames) * kLatentChannels);
   const auto times = TurboTimesteps(request.steps, request.shift);
   std::vector<float> v;
+  // Live preview: the clean estimate of the current step is decoded (a short
+  // window only) when the step is a candidate, someone wants it and the
+  // previous preview is old enough; its time counts as diffusion time.
+  const auto preview_interval =
+      preview != nullptr
+          ? std::chrono::duration<double>(preview->min_interval_seconds)
+          : std::chrono::duration<double>(0);
+  bool had_preview = false;
+  auto last_preview = std::chrono::steady_clock::now();
   for (std::size_t s = 0; s < times.size(); ++s) {
     if (!report(0.5 + 0.35 * double(s) / times.size(), "diffusion"))
       return Fail(error, "cancelled");
     if (!m.dit->Velocity(x, times[s], &v, nullptr, error))
       return false;
+    const int step = static_cast<int>(s) + 1;
+    const int steps = static_cast<int>(times.size());
+    if (preview != nullptr && preview->wanted &&
+        MusicPreviewStep(step, steps, preview->every) &&
+        (!had_preview ||
+         std::chrono::steady_clock::now() - last_preview >= preview_interval) &&
+        preview->wanted()) {
+      PublishPreview(*m.vae, *preview, x, v, times[s], frames, step, steps);
+      had_preview = true;
+      last_preview = std::chrono::steady_clock::now();
+    }
     const float dt = s + 1 < times.size() ? times[s] - times[s + 1] : times[s];
     for (std::size_t i = 0; i < x.size(); ++i)
       x[i] -= v[i] * dt;

@@ -1063,6 +1063,29 @@ error line is logged and the temporary WAV is left in the temp directory
 (its path is in the message). The job status JSON reports `response_format`
 and, for `mp3` / `aac`, `bitrate_kbps`.
 
+Live preview of a running music job: `GET /v1/audio/music/<id>/preview`
+answers the newest preview as `audio/wav` (mono 24 kHz 16-bit, about 6 s
+around the middle of the song, or the whole song when shorter) with the
+headers `X-Gufo-Preview-Step` / `X-Gufo-Preview-Steps` (the diffusion step
+it was decoded from), `X-Gufo-Preview-Seconds` (where the window starts in
+the song) and `X-Gufo-Preview-Window` (its length); 204 while there is none
+yet, 404 for an unknown job. The status JSON carries `preview_url` (relative,
+`/v1/audio/music/<id>/preview`, `null` before the job runs) and
+`preview_step` / `preview_steps` / `preview_seconds` / `preview_window` /
+`preview_at` once a preview exists (`preview_step` is `null` before). The
+preview is the sampler's clean estimate `x0 = x_t - t * v` of the current
+step (the same point the final Euler step reaches) decoded by the VAE for
+the window only, so it sounds rough early on and like the result on the last
+step. Previews cost nothing unless wanted: the request opts in with
+`"preview": true` (also `"always"`, `{"always": true, "every": N}` or the
+image form `"gufo": {"preview": {...}}`; `every` 1..50, default 2 = every
+second step plus the last), or a client fetches `/preview`, which keeps
+previews on for 10 s. A preview never renders while the previous one is
+younger than 3 s; each one logs `preview step=... decode_ms=...`. The
+router does not relay `/preview` yet (its music job reads know only the
+status and `/content` paths), so ask the music worker directly; a router job
+of a music request shows the worker's id as `music_id`.
+
 `GET /v1/audio/speech/stream` upgrades to the vLLM-Omni incremental-text
 WebSocket protocol. [TTS streaming examples](../models/qwen3-tts.md#sampling)
 cover per-session configuration, audio events and optional sentence/clause

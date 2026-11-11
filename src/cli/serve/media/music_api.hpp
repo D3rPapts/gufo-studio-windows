@@ -3,6 +3,7 @@
 #ifndef GUFO_SERVER_MEDIA_MUSIC_API_HPP_
 #define GUFO_SERVER_MEDIA_MUSIC_API_HPP_
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -31,14 +32,23 @@ inline constexpr std::string_view kMusicApiPath = "/v1/audio/music";
 ///        bitrate_kbps (96..320, default 192) and fail the job with
 ///        "<format> encoding needs ffmpeg" when FFmpeg is missing
 ///        (async: 202 + job JSON)
-///   GET  /v1/audio/music/{id}          job status
+///   GET  /v1/audio/music/{id}          job status (with preview_url and
+///        preview_step while a live preview exists)
 ///   GET  /v1/audio/music/{id}/content  the audio in the requested format
+///   GET  /v1/audio/music/{id}/preview  newest live preview: mono 24 kHz
+///        audio/wav of ~6 s around the middle of the song decoded from the
+///        sampler's clean estimate (X-Gufo-Preview-Step / -Steps /
+///        -Seconds / -Window headers), 204 before the first one
+/// Previews are rendered every 2nd diffusion step (request "preview":
+/// {"every": N}) while the request asked for them ("preview": true) or a
+/// client fetched the preview within the last kPreviewWatchWindow.
 /// One worker generates jobs in order; finished audio is kept for an hour
 /// (at most kKeptJobs results).
 class MusicService final : public MediaService {
 public:
   static constexpr std::size_t kQueueCapacity = 8;
   static constexpr std::size_t kKeptJobs = 16;
+  static constexpr std::chrono::seconds kPreviewWatchWindow{10};
 
   MusicService(const std::filesystem::path& model_root, std::string model_id);
   ~MusicService();
@@ -70,6 +80,7 @@ private:
   struct Job;
   HttpResponse Submit(const HttpRequest& request);
   HttpResponse Status(const std::string& id, bool content);
+  HttpResponse Preview(const std::string& id);
   void Worker();
   void ExpireLocked();
 

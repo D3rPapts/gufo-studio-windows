@@ -90,4 +90,17 @@ if (BUILD_TESTING)
   add_test(NAME music_encode_test COMMAND music_encode_test)
   set_tests_properties(music_encode_test PROPERTIES
     LABELS "cpu;server;api;music" TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+  # Live music preview helpers (/v1/audio/music/<id>/preview): the clean
+  # estimate x0 = x_t - t * v, the window around the middle of the song,
+  # the step rule and the mono 24 kHz WAV; no model, no GPU.
+  add_executable(ace_step_preview_test tests/models/ace_step_preview_test.cpp
+    src/models/ace_step/preview.cpp)
+  target_include_directories(ace_step_preview_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  target_compile_features(ace_step_preview_test PRIVATE cxx_std_20)
+  target_compile_options(ace_step_preview_test PRIVATE ${gufo_media_test_undebug})
+  add_test(NAME ace_step_preview_test COMMAND ace_step_preview_test)
+  set_tests_properties(ace_step_preview_test PROPERTIES
+    LABELS "cpu;server;api;music;preview" TIMEOUT 30)
 endif()

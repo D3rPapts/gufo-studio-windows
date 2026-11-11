@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/ace_step/preview.hpp"
+
 namespace gufo::models::ace_step {
 
 /// Files of one ACE-Step 1.5 XL turbo installation.
@@ -79,9 +81,14 @@ public:
   MusicPipeline& operator=(const MusicPipeline&) = delete;
 
   /// Planar stereo audio [2][samples] at 48 kHz, peak-normalized to <= 1.
+  /// With a `preview` sink, every `preview->every`-th diffusion step (and
+  /// the last one) decodes a short window of the clean estimate x0 (see
+  /// MusicCleanEstimate) while `preview->wanted()` is true and the previous
+  /// preview is at least `min_interval_seconds` old.
   bool Generate(const MusicRequest& request, std::vector<float>* audio,
                 MusicTelemetry* telemetry, const MusicProgress& progress,
-                std::string* error);
+                std::string* error,
+                const MusicPreviewSink* preview = nullptr);
 
 private:
   struct Impl;

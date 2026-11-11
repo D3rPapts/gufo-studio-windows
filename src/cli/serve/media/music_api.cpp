@@ -72,7 +72,60 @@ struct MusicService::Job {
   std::int64_t created_at{0};
   std::int64_t completed_at{0};
   bool done{false};
+  // Live preview: requested explicitly ("preview": true) or watched (a GET
+  // of /preview within kPreviewWatchWindow); the newest preview is kept.
+  bool preview_always{false};
+  int preview_every{2};
+  bool preview_watched{false};
+  std::chrono::steady_clock::time_point preview_watched_at{};
+  ace::MusicPreview preview;  // wav empty before the first one
+  std::int64_t preview_at{0};
 };
+
+namespace {
+
+// "preview": true | false | "always" | {"always": bool, "every": 1..50},
+// also as "gufo": {"preview": {...}} (the form the pages use for images; an
+// "id" there is ignored, the preview lives under the music job id). Returns
+// an error message (empty when fine).
+std::string ParseMusicPreview(const json::Value& body, bool* always,
+                              int* every) {
+  const json::Value* value = body.find("preview");
+  if (value == nullptr) {
+    if (const json::Value* gufo = body.find("gufo");
+        gufo != nullptr && gufo->is_object())
+      value = gufo->find("preview");
+  }
+  if (value == nullptr || value->is_null())
+    return {};
+  if (value->is_bool()) {
+    *always = value->as_bool();
+    return {};
+  }
+  if (value->is_string()) {
+    if (value->str() == "always") {
+      *always = true;
+      return {};
+    }
+    return "preview must be true, false, \"always\" or an object";
+  }
+  if (!value->is_object())
+    return "preview must be true, false, \"always\" or an object";
+  if (const json::Value* flag = value->find("always"); flag != nullptr) {
+    if (!flag->is_bool())
+      return "preview.always must be a boolean";
+    *always = flag->as_bool();
+  }
+  if (const json::Value* n = value->find("every"); n != nullptr) {
+    if (!n->is_number() || n->as_double() < 1 || n->as_double() > 50 ||
+        n->as_double() != std::floor(n->as_double()))
+      return "preview.every must be an integer 1..50";
+    *every = static_cast<int>(n->as_double());
+  }
+  return {};
+}
+
+}  // namespace
 
 bool IsMusicApiPath(std::string_view path) noexcept {
   return path == kMusicApiPath || (path.size() > kMusicApiPath.size() &&
@@ -139,6 +192,28 @@ void MusicService::Worker() {
     std::string error;
     ace::MusicTelemetry telemetry;
 #if defined(ENGINE_ENABLE_HIP)
+    ace::MusicPreviewSink sink;
+    sink.every = job->preview_every;
+    sink.wanted = [this, job] {
+      std::lock_guard lock(mutex_);
+      return job->preview_always ||
+             (job->preview_watched &&
+              std::chrono::steady_clock::now() - job->preview_watched_at <=
+                  kPreviewWatchWindow);
+    };
+    sink.publish = [this, job](ace::MusicPreview preview) {
+      Logger::Info("music",
+                   "job=" + job->id + " preview step=" +
+                       std::to_string(preview.step) + "/" +
+                       std::to_string(preview.steps) + " window=" +
+                       std::to_string(preview.start_seconds) + "s+" +
+                       std::to_string(preview.window_seconds) + "s bytes=" +
+                       std::to_string(preview.wav.size()) + " decode_ms=" +
+                       std::to_string(std::lround(preview.decode_ms)));
+      std::lock_guard lock(mutex_);
+      job->preview = std::move(preview);
+      job->preview_at = Now();
+    };
     const bool ok = pipeline_->Generate(
         job->request, &audio, &telemetry,
         [this, job](double fraction, std::string_view) {
@@ -146,7 +221,7 @@ void MusicService::Worker() {
           job->progress = fraction;
           return !stop_;
         },
-        &error);
+        &error, &sink);
 #else
     // Not reached: without HIP the service never becomes ready.
     const bool ok = false;
@@ -187,10 +262,13 @@ HttpResponse MusicService::Handle(const HttpRequest& request) {
   std::string rest(request.path.substr(kMusicApiPath.size() + 1));
   bool content = false;
   if (const auto slash = rest.find('/'); slash != std::string::npos) {
-    if (rest.substr(slash) != "/content")
+    const std::string verb = rest.substr(slash);
+    rest.resize(slash);
+    if (verb == "/preview")
+      return Preview(rest);
+    if (verb != "/content")
       return Error(404, "Not Found", "unknown music path", "not_found");
     content = true;
-    rest.resize(slash);
   }
   return Status(rest, content);
 }
@@ -247,6 +325,10 @@ HttpResponse MusicService::Submit(const HttpRequest& request) {
     if (!ParseMusicOutputFormat(body, &job->format, &message, &code))
       return Error(400, "Bad Request", std::move(message), std::move(code));
   }
+  if (std::string message =
+          ParseMusicPreview(body, &job->preview_always, &job->preview_every);
+      !message.empty())
+    return Error(400, "Bad Request", std::move(message), "invalid_preview");
   if (!(r.duration >= 1.0 && r.duration <= 600.0))
     return Error(400, "Bad Request", "duration must be 1..600 seconds",
                  "invalid_duration");
@@ -322,8 +404,59 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
     body["bitrate_kbps"] = static_cast<double>(job.format.bitrate_kbps);
   if (!job.error.empty())
     body["error"] = job.error;
+  // Live preview (relative, like a router job's preview_url): offered while
+  // the job runs and, once there is one, until the job is forgotten.
+  if (job.status == "in_progress" || !job.preview.wav.empty())
+    body["preview_url"] = "/v1/audio/music/" + job.id + "/preview";
+  else
+    body["preview_url"] = nullptr;
+  if (!job.preview.wav.empty()) {
+    body["preview_step"] = static_cast<double>(job.preview.step);
+    body["preview_steps"] = static_cast<double>(job.preview.steps);
+    body["preview_seconds"] = job.preview.start_seconds;
+    body["preview_window"] = job.preview.window_seconds;
+    body["preview_at"] = static_cast<double>(job.preview_at);
+  } else {
+    body["preview_step"] = nullptr;
+  }
   return Json(job.done || job.status != "queued" ? 200 : 202,
               job.done ? "OK" : "Accepted", body);
+}
+
+HttpResponse MusicService::Preview(const std::string& id) {
+  std::lock_guard lock(mutex_);
+  const auto it = jobs_.find(id);
+  if (it == jobs_.end())
+    return Error(404, "Not Found", "unknown music job " + id, "not_found");
+  Job& job = *it->second;
+  // A fetch counts as watching: the worker renders the next previews.
+  job.preview_watched = true;
+  job.preview_watched_at = std::chrono::steady_clock::now();
+  HttpResponse response;
+  response.headers = {
+      {"Cache-Control", "no-store"},
+      {"X-Gufo-Music-Id", job.id},
+      {"X-Gufo-Preview-State",
+       job.done ? (job.status == "failed" ? "failed" : "done")
+                : (job.status == "queued" ? "pending" : "running")}};
+  if (job.preview.wav.empty()) {
+    response.status = 204;
+    response.reason = "No Content";
+    return response;
+  }
+  response.status = 200;
+  response.reason = "OK";
+  response.body = job.preview.wav;
+  response.headers.emplace_back("Content-Type", "audio/wav");
+  response.headers.emplace_back("X-Gufo-Preview-Step",
+                                std::to_string(job.preview.step));
+  response.headers.emplace_back("X-Gufo-Preview-Steps",
+                                std::to_string(job.preview.steps));
+  response.headers.emplace_back("X-Gufo-Preview-Seconds",
+                                std::to_string(job.preview.start_seconds));
+  response.headers.emplace_back("X-Gufo-Preview-Window",
+                                std::to_string(job.preview.window_seconds));
+  return response;
 }
 
 }  // namespace gufo::server
