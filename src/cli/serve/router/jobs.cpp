@@ -279,6 +279,8 @@ std::string ExtensionFor(std::string_view content_type) {
     return "wav";
   if (type == "audio/mpeg")
     return "mp3";
+  if (type == "audio/mp4" || type == "audio/aac")
+    return "m4a";
   if (type == "audio/flac")
     return "flac";
   if (type == "audio/ogg")
@@ -312,6 +314,8 @@ std::string ContentTypeFor(std::string_view name) {
     return "audio/wav";
   if (ext == "mp3")
     return "audio/mpeg";
+  if (ext == "m4a")
+    return "audio/mp4";
   if (ext == "flac")
     return "audio/flac";
   if (ext == "ogg")
@@ -1344,6 +1348,11 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
     view["preview_url"] =
         "/v1/previews/" + job.preview_id +
         (job.path == "/v1/videos" ? std::string() : "?model=" + job.model);
+  else if (job.status == "in_progress" && job.path == "/v1/audio/music" &&
+           !job.upstream_id.empty())
+    // Music previews (D3) live on the worker's own endpoint; the router
+    // relays it by the music id (MusicJobId handles "/preview").
+    view["preview_url"] = "/v1/audio/music/" + job.upstream_id + "/preview";
   else
     view["preview_url"] = nullptr;
   if (!job.upstream_id.empty())

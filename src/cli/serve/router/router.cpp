@@ -492,9 +492,13 @@ std::string MusicJobId(const std::string& path) {
     return "";
   }
   remainder.remove_prefix(prefix.size());
-  constexpr std::string_view suffix = "/content";
-  if (remainder.ends_with(suffix)) {
-    remainder.remove_suffix(suffix.size());
+  // Status, the finished audio and the live preview (D3) all belong to the
+  // worker that owns the job.
+  for (std::string_view suffix : {"/content", "/preview"}) {
+    if (remainder.ends_with(suffix)) {
+      remainder.remove_suffix(suffix.size());
+      break;
+    }
   }
   if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
     return "";

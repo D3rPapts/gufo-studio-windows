@@ -326,6 +326,10 @@ std::string BuildResponseHead(const HttpResponse& resp,
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\n";
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
+  // Pages on the partner machine read the preview and job headers (C7).
+  out += "Access-Control-Expose-Headers: Content-Disposition, Content-Length, "
+         "X-Gufo-Preview-Step, X-Gufo-Preview-Steps, X-Gufo-Preview-Seconds, "
+         "X-Gufo-Preview-Window, X-Gufo-Preview-State\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
