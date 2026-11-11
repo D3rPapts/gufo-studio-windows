@@ -943,6 +943,8 @@ ids that `changed`. Errors: 400 `invalid_placement`, 404
 | `GET` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
+| `POST` | `/v1/images/upscale` | `gufo serve upscale` (Real-ESRGAN on the NPU, GPU or CPU); sync, or `"async": true` for a job read at `/v1/images/upscale/{id}[/content]` |
+| `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
 
 As in llama.cpp, vLLM, TEI and Ollama, these routes ignore request fields they
 do not know, so a client that adds one still works. Known fields whose behavior

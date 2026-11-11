@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/models/realesrgan/tile_plan.hpp"
 #include "src/models/realesrgan/upscaler.hpp"
 
 // Layout: every tensor is channels-last [height, width, channels]. A tile of
@@ -34,7 +35,7 @@ using Acc8 = __attribute__((ext_vector_type(8))) float;
 
 constexpr int kThreads = 256;
 constexpr int kInputChannels = 16;  // RGB padded for the WMMA loads
-constexpr std::size_t kDefaultTilePixels = 512 * 1024;
+// kDefaultTilePixels: tile_plan.hpp
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr)
@@ -718,26 +719,12 @@ struct Upscaler::Impl {
 
   // Runs the network over the frame in frame24 into picture.
   bool Network(int w, int h, std::string* error) {
-    const int halo = static_cast<int>(convs.size());
-    // Fewest tiles whose padded size fits the tile budget: split the longer
-    // tile side until it fits (or the halo dominates).
-    const auto tile_size = [&](int n, int size) {
-      const int core = (size + n - 1) / n;
-      return std::min(size, core + (n > 1 ? 2 * halo : 0));
-    };
-    int nx = 1, ny = 1;
-    while (static_cast<std::size_t>(tile_size(nx, w)) * tile_size(ny, h) >
-               tile_pixels &&
-           (nx < w || ny < h)) {
-      if ((tile_size(nx, w) >= tile_size(ny, h) && nx < w) || ny >= h)
-        ++nx;
-      else
-        ++ny;
-      if (nx > 64 || ny > 64)
-        break;
-    }
-    const std::size_t max_tile =
-        static_cast<std::size_t>(tile_size(nx, w)) * tile_size(ny, h);
+    // Fewest tiles whose padded size fits the tile budget (tile_plan.hpp):
+    // the halo is one pixel per convolution, so tiles reproduce the whole-
+    // frame result.
+    const TileGrid grid =
+        PlanTileGrid(w, h, static_cast<int>(convs.size()), tile_pixels);
+    const std::size_t max_tile = grid.max_tile_pixels;
     const std::size_t abytes = ActivationBytes();
     const int last_rows = convs.back().rows;
     if (!tile_in.Reserve(max_tile * kInputChannels * abytes, error) ||
@@ -748,16 +735,15 @@ struct Upscaler::Impl {
                              sizeof(float),
                          error))
       return false;
-    const int core_w = (w + nx - 1) / nx, core_h = (h + ny - 1) / ny;
-    for (int ty = 0; ty < ny; ++ty) {
-      for (int tx = 0; tx < nx; ++tx) {
-        const int cx0 = tx * core_w, cx1 = std::min(w, cx0 + core_w);
-        const int cy0 = ty * core_h, cy1 = std::min(h, cy0 + core_h);
-        if (cx0 >= cx1 || cy0 >= cy1)
+    for (int ty = 0; ty < grid.ny; ++ty) {
+      for (int tx = 0; tx < grid.nx; ++tx) {
+        const TileRect tile = TileAt(grid, tx, ty);
+        if (tile.empty())
           continue;
-        const int x0 = std::max(0, cx0 - halo), x1 = std::min(w, cx1 + halo);
-        const int y0 = std::max(0, cy0 - halo), y1 = std::min(h, cy1 + halo);
-        const int tw = x1 - x0, th = y1 - y0;
+        const int cx0 = tile.cx0, cx1 = tile.cx1;
+        const int cy0 = tile.cy0, cy1 = tile.cy1;
+        const int x0 = tile.x0, y0 = tile.y0;
+        const int tw = tile.width(), th = tile.height();
         const std::size_t pixels = static_cast<std::size_t>(tw) * th;
         if (precision == Precision::kFp16)
           PrepareTileKernel<Half><<<Grid(pixels), kThreads>>>(

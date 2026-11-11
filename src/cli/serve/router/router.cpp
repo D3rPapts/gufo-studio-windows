@@ -494,14 +494,25 @@ bool IsModelQueryGet(const HttpRequest& req) {
 }
 
 /// Job id from `/v1/audio/music/<id>` or `/v1/audio/music/<id>/content`,
-/// the async music reads music_api.cpp serves; empty for anything else.
+/// the async music reads music_api.cpp serves, and likewise from
+/// `/v1/images/upscale/<id>[/content]`, the async image reads of
+/// upscale_api.cpp (same bookkeeping: the create POST records the id, the
+/// content read releases it); empty for anything else.
 std::string MusicJobId(const std::string& path) {
-  constexpr std::string_view prefix = "/v1/audio/music/";
+  constexpr std::string_view kPrefixes[] = {"/v1/audio/music/",
+                                            "/v1/images/upscale/"};
   std::string_view remainder(path);
-  if (!remainder.starts_with(prefix)) {
+  bool matched = false;
+  for (std::string_view prefix : kPrefixes) {
+    if (remainder.starts_with(prefix)) {
+      remainder.remove_prefix(prefix.size());
+      matched = true;
+      break;
+    }
+  }
+  if (!matched) {
     return "";
   }
-  remainder.remove_prefix(prefix.size());
   // Status, the finished audio and the live preview (D3) all belong to the
   // worker that owns the job.
   for (std::string_view suffix : {"/content", "/preview"}) {
@@ -714,8 +725,12 @@ struct RemoteJob {
   std::shared_ptr<router::GpuSlots::Hold> slot;
 };
 
+/// A video job create: `POST /v1/videos` (generation) or `POST
+/// /v1/videos/upscale` (gufo serve upscale); both answer a job object
+/// whose id is read at `/v1/videos/<id>`.
 bool IsVideoCreate(const HttpRequest& req) {
-  return req.method == "POST" && req.path == "/v1/videos";
+  return req.method == "POST" &&
+         (req.path == "/v1/videos" || req.path == "/v1/videos/upscale");
 }
 
 bool IsMusicCreate(const HttpRequest& req) {
@@ -1035,7 +1050,7 @@ public:
       return *front;
     }
     if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
-        req.method != "DELETE") {
+        req.method != "DELETE" && !IsVideoCreate(req)) {
       // Job subpaths have no verbs beyond the status/content reads the
       // front's video API answers: everything else is 405 regardless of job
       // state or body, mirroring HandleVideoApiRequest's precedence.
