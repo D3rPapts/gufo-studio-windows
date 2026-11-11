@@ -2491,8 +2491,17 @@ void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
                                 "-nostdin", "-y"};
   if (mode == "copy") {
     std::string list;
-    for (const fs::path& clip : clips)
-      list += "file '" + clip.filename().string() + "'\n";
+    for (std::size_t i = 0; i < clips.size(); ++i) {
+      list += "file '" + clips[i].filename().string() + "'\n";
+      // Offset the next clip by this one's video length, not by its
+      // (slightly longer) audio: keeps the frame timing regular across
+      // the seam (11.11.: r_frame_rate 120/1 from a 30 ms gap).
+      if (infos[i].video_duration > 0) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.6f", infos[i].video_duration);
+        list += std::string("duration ") + buf + "\n";
+      }
+    }
     const fs::path list_file = work.path / "list.txt";
     WriteAll(list_file, list);
     for (const char* arg : {"-f", "concat", "-safe", "0", "-i"})

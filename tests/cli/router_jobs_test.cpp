@@ -1169,7 +1169,8 @@ void TestConcatHelpers() {
   CHECK(a.video_codec == "h264" && a.width == 832 && a.height == 480 &&
         a.frame_rate == "24/1" && a.pix_fmt == "yuv420p" && a.has_audio &&
         a.audio_codec == "aac" && a.sample_rate == 48000 && a.channels == 2 &&
-        std::fabs(a.duration - 5.04) < 1e-6);
+        std::fabs(a.duration - 5.04) < 1e-6 &&
+        std::fabs(a.video_duration - 5.0) < 1e-6);
   jobs::ProbeInfo silent;
   CHECK(jobs::ParseProbe(
       R"({"streams":[{"codec_type":"video","codec_name":"h264","width":832,)"
