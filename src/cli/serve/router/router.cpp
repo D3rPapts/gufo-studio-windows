@@ -114,7 +114,9 @@ constexpr std::string_view kPresetGrammar =
     "    /router/capabilities lists what each router can run (LoRA names\n"
     "    from the preset's lora = lines); a job goes only to a machine that\n"
     "    can run it (X-Gufo-Pool: local|remote, 400 no_capable_router when\n"
-    "    neither can).\n"
+    "    neither can), a free runner pulls the partner's older queued job\n"
+    "    (POST /router/pool/pull) and runs it on its worker while the owner\n"
+    "    keeps files and result.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
     "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
 
@@ -3666,8 +3668,8 @@ int RunRouter(std::span<const char* const> args) {
   }
   // Pool partner: the remote twin of the pool presets, else of the first
   // switchable or remote one. It answers GET /v1/jobs?scope=pool and every
-  // job id this router does not know and tells its capabilities (LoRA
-  // names).
+  // job id this router does not know, hands out and takes over queued
+  // jobs (shared queue) and tells its capabilities (LoRA names).
   {
     const router::PresetModel* partner = nullptr;
     int partner_rank = -1;
