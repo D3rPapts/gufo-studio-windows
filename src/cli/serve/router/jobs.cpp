@@ -101,7 +101,9 @@ constexpr std::string_view kJobPaths[] = {
     "/v1/audio/music",        "/v1/audio/transcriptions",
     "/v1/chat/completions",   "/v1/completions",
     "/v1/responses",          "/v1/messages",
-    "/v1/audio/foley"};
+    "/v1/audio/foley",        "/v1/images/upscale",
+    "/v1/videos/upscale",     "/v1/audio/convert",
+    "/v1/audio/separate"};
 
 long long NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -1691,8 +1693,8 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     }
     if (result.status < 200 || result.status >= 300)
       throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status);
-    if (job->path == "/v1/videos")
-      RunVideo(job, result);
+    if (job->path == "/v1/videos" || job->path == "/v1/videos/upscale")
+      RunVideo(job, result);  // both answer 202 with a worker video job
     else
       Finish(job, "completed", StoreResult(*job, result), json::Value());
   } catch (const Cancelled&) {

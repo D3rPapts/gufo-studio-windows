@@ -441,7 +441,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // MMAudio (gufo serve foley); synchronous through the router.
       "/v1/audio/foley",
       // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
-      "/v1/images/upscale"};
+      "/v1/images/upscale",
+      // Voice conversion / stem separation (gufo serve voice, D5).
+      "/v1/audio/convert", "/v1/audio/separate"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
