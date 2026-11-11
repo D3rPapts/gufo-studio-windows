@@ -278,6 +278,14 @@ struct Observer {
 };
 
 void ValidateRequest(const Request& request);
+/// Model prompt for the caller's prompt and background intent. Transparent
+/// requests receive the RGBA framing Qwen-Image-2.1 needs for alpha output;
+/// auto and opaque requests keep the prompt unchanged.
+std::string ConditionPrompt(std::string_view prompt,
+                            ext::ImageBackground background);
+/// Qwen-Image-2.1 accepts reference images and transparent backgrounds.
+inline constexpr ext::ImageCapabilities kCapabilities{
+    .edits = true, .transparent_background = true};
 std::vector<float> FlowSigmas(int steps, int image_tokens);
 /// `steps` + 1 sigmas: FlowSigmas for full strength, otherwise the last
 /// `steps` + 1 of FlowSigmas(int(steps / strength)) as in ComfyUI KSampler.

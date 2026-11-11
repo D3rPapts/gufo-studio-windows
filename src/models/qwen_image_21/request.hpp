@@ -29,14 +29,17 @@ struct ProviderState {
 Request BuildRequest(const ext::ImageRequest& request,
                      const ProviderState& state);
 
-/// Converts the `serve image` provider options to the 1.4.9 startup inputs.
+/// Converts the provider's `serve image` manifest options (extension.json,
+/// delivered as ext::ParsedOptions) to the 1.4.9 startup inputs:
+/// --lora NAME=PATH[;NAME=PATH...], --lora-default NAME:SCALE[;...] and
+/// --controlnet FILE. The lists are ';'-separated because a manifest option
+/// cannot repeat. Throws std::invalid_argument.
 struct StartupOptions {
   std::vector<std::pair<std::string, std::string>> loras;  // name, path
   std::vector<Lora> default_loras;
   std::string controlnet;
 };
-StartupOptions ParseStartupOptions(
-    const std::vector<std::pair<std::string, std::string>>& options);
+StartupOptions ParseStartupOptions(const ext::ParsedOptions& options);
 
 /// `GET /sdapi/v1/loras` body of the 1.4.9 image API.
 std::string LorasJson(

@@ -25,6 +25,41 @@
       "entry": "qwen_image_21_provider_register"
     }
   ],
+  "options": [
+    {
+      "name": "--lora",
+      "type": "string",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "LoRA adapters NAME=PATH for the transformer, several separated by ';'; requests select them by name (loras)"
+    },
+    {
+      "name": "--lora-default",
+      "type": "string",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Registered LoRAs NAME:SCALE, several separated by ';', applied to requests that omit loras"
+    },
+    {
+      "name": "--controlnet",
+      "type": "path",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Qwen-Image-2.1 Fun ControlNet-Union safetensors file; enables gufo.control_image (pose, depth, canny, lineart, ...)"
+    }
+  ],
   "targets": {
     "gufo_qwen_image_21": {
       "requires": []

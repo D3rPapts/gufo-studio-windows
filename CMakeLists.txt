@@ -309,7 +309,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_subdirectory(src/core/platform)
-add_subdirectory(src/core/png_decode)
+add_subdirectory(src/core/rust)
 
 add_library(gufo_core STATIC
   src/core/image.cpp
@@ -324,10 +324,11 @@ add_library(gufo_core STATIC
   src/core/hip/hipblaslt_plan_database.cpp
   src/core/quant/ggml_dequant.cpp
   src/core/quant/ggml_gemm.cpp
+  src/core/wav.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
-  Threads::Threads gufo_png_decode JPEG::JPEG PkgConfig::WEBP CURL::libcurl
+  Threads::Threads gufo_rust JPEG::JPEG PkgConfig::WEBP CURL::libcurl
   OpenSSL::Crypto)
 
 # Family libraries come before the model that needs them; they may depend on
@@ -850,10 +851,22 @@ endfunction()
   add_test(NAME png_decode_test COMMAND png_decode_test)
   set_tests_properties(png_decode_test PROPERTIES LABELS "cpu;image;correctness")
 
+  add_executable(wav_decode_test
+    tests/core/wav_decode_test.cpp
+    tests/core/wav_reference.cpp)
+  target_link_libraries(wav_decode_test PRIVATE gufo_core)
+  add_test(NAME wav_decode_test COMMAND wav_decode_test)
+  set_tests_properties(wav_decode_test PROPERTIES LABELS "cpu;audio;correctness")
+
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
   set_tests_properties(heap_placement_test PROPERTIES LABELS "cpu;hip;core")
+
+  add_executable(admission_memory_test tests/core/admission_memory_test.cpp)
+  target_link_libraries(admission_memory_test PRIVATE gufo_core)
+  add_test(NAME admission_memory_test COMMAND admission_memory_test)
+  set_tests_properties(admission_memory_test PROPERTIES LABELS "cpu;hip;core")
 
   add_executable(sampling_test tests/core/sampling_test.cpp)
   target_link_libraries(sampling_test PRIVATE gufo_core)
@@ -881,6 +894,13 @@ endfunction()
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)
   add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
   set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
+
+  # Image provider startup options and request capabilities with fake
+  # providers; no sockets, so it runs on every host.
+  add_executable(image_api_test tests/cli/image_api_test.cpp)
+  target_link_libraries(image_api_test PRIVATE gufo_http gufo_llm_cli)
+  add_test(NAME image_api_test COMMAND image_api_test)
+  set_tests_properties(image_api_test PROPERTIES LABELS "cpu;server;api;image")
 
   # the trace suite simulates RLIMIT_FSIZE
   if (NOT WIN32)

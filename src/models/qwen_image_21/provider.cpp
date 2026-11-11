@@ -23,9 +23,10 @@ void Log(const std::string& line) {
 }  // namespace
 
 /// The 1.4.9 Qwen-Image-2.1 service on the 2.0 image extension API:
-/// startup options --lora / --lora-default / --controlnet
-/// (ext::ImageRunnerOptions) and the request extension ("gufo", "loras",
-/// named image parts) turned into the model's Request by BuildRequest.
+/// startup options --lora / --lora-default / --controlnet (declared in
+/// extension.json, delivered as ext::ImageRunnerOptions::options) and the
+/// request extension ("gufo", "loras", named image parts) turned into the
+/// model's Request by BuildRequest.
 class QwenImage21RunnerImpl : public ext::ImageRunner {
 public:
   QwenImage21RunnerImpl(std::unique_ptr<Model> model, StartupOptions startup)
@@ -59,6 +60,9 @@ public:
       const ext::ImageRequest& request,
       const ext::CancellationCheck& is_cancelled) override {
     Request req = BuildRequest(request, state_);
+    // Background intent (#974): only transparent requests receive the RGBA
+    // framing, inside this provider; auto and opaque keep the prompt.
+    req.prompt = ConditionPrompt(req.prompt, request.background);
     // Live preview (gufo.preview): the host's sink, rendered by the host.
     req.preview = request.preview;
     Result result;
@@ -114,13 +118,16 @@ public:
     };
   }
 
+  std::optional<ext::ImageCapabilities> Capabilities() const override {
+    return kCapabilities;
+  }
+
   std::string Query(std::string_view topic) const override {
     if (topic != "loras")
       return {};
     return LorasJson(startup_.loras, infos_, startup_.default_loras,
                      model_->ActiveLoras());
   }
-
 private:
   std::unique_ptr<Model> model_;
   StartupOptions startup_;

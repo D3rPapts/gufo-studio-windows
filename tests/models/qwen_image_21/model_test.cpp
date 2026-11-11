@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <memory>
 
 #include "src/core/json.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
@@ -154,21 +155,33 @@ int main(int argc, char** argv) {
     }
     assert(rejected);
   }
+  // Background intent reaches the provider unchanged; only transparent
+  // requests receive Qwen-Image's RGBA framing, inside the provider (#974).
+  assert(ConditionPrompt("cube", gufo::ext::ImageBackground::kAuto) == "cube");
+  assert(ConditionPrompt("cube", gufo::ext::ImageBackground::kOpaque) ==
+         "cube");
+  assert(ConditionPrompt("cube", gufo::ext::ImageBackground::kTransparent) ==
+         "This is an RGBA image with transparency. cube The image has alpha "
+         "channel and the background is transparent.");
+  static_assert(kCapabilities.edits && kCapabilities.transparent_background);
+  const auto qwen_runner = [](auto callback) {
+    return std::make_shared<gufo::server::CallbackImageRunner>(
+        std::move(callback), kCapabilities);
+  };
   int calls = 0;
   // The 2.0 host runs on ext types (the extension owns its 1.4 types).
   const gufo::ext::ImageBuffer ext_image{image.width, image.height,
                                          image.rgba};
   gufo::server::ImageService service(
-      {}, "image-test",
-      [&](const gufo::ext::ImageRequest& request,
-          const gufo::ext::CancellationCheck&) {
+      qwen_runner([&](const gufo::ext::ImageRequest& request,
+                      const gufo::ext::CancellationCheck&) {
         ++calls;
         assert(request.prompt == "a red cube");
         assert(request.width == 256 && request.height == 256);
         assert(request.seed == static_cast<std::uint64_t>(calls + 40));
         return gufo::ext::ImageResult{.image = ext_image, .metrics = {}};
-      },
-      {"image-alias"});
+      }),
+      "image-test", {"image-alias"});
   gufo::server::HttpRequest http;
   http.method = "POST";
   http.path = "/v1/images/generations";
@@ -223,9 +236,8 @@ int main(int argc, char** argv) {
   int turbo_calls = 0;
   std::vector<gufo::ext::ImageRequest> turbo_requests;
   gufo::server::ImageService turbo_service(
-      {}, "turbo-test",
-      [&](const gufo::ext::ImageRequest& request,
-          const gufo::ext::CancellationCheck&) {
+      qwen_runner([&](const gufo::ext::ImageRequest& request,
+                      const gufo::ext::CancellationCheck&) {
         // The runner owns checkpoint defaults and step validation.
         auto resolved = request;
         resolved.steps = turbo.ResolveSteps(request.steps);
@@ -233,7 +245,8 @@ int main(int argc, char** argv) {
         turbo_requests.push_back(std::move(resolved));
         ++turbo_calls;
         return gufo::ext::ImageResult{ext_image, {}};
-      });
+      }),
+      "turbo-test");
   http.path = "/v1/images/generations";
   http.headers = {{"Content-Type", "application/json"}};
   for (const auto* body : {R"({"prompt":"cube","size":"256x256"})",
@@ -298,14 +311,16 @@ int main(int argc, char** argv) {
       assert(captured.images[0].rgba == image.rgba);
       assert(captured.images[1].rgba == mask.rgba);
       assert(captured.seed == 77 + i % 2);
-      assert(captured.prompt.find("RGBA image with transparency") !=
-             std::string::npos);
+      assert(captured.prompt == "edit image one using image two");
+      assert(captured.background == gufo::ext::ImageBackground::kTransparent);
     }
   }
   http.body = edit_body(std::vector<Image>(10, image), 8, "opaque", 1);
   assert(gufo::server::HandleImageApiRequest(http, turbo_service).status ==
          200);
   assert(turbo_requests.back().images.size() == 10);
+  assert(turbo_requests.back().background ==
+         gufo::ext::ImageBackground::kOpaque);
   const auto accepted = turbo_calls;
   for (const int steps : {0, 7, 9, 40}) {
     http.body = edit_body({image}, steps, "auto", 1);

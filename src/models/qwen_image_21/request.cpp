@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <variant>
 
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -418,36 +419,62 @@ Request BuildRequest(const ext::ImageRequest& in, const ProviderState& state) {
   return generation;
 }
 
-StartupOptions ParseStartupOptions(
-    const std::vector<std::pair<std::string, std::string>>& options) {
+namespace {
+
+// "a;b" -> {"a", "b"}; empty items are skipped.
+std::vector<std::string> SplitList(const std::string& text) {
+  std::vector<std::string> items;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const auto end = text.find(';', start);
+    const auto item =
+        text.substr(start, end == std::string::npos ? std::string::npos
+                                                    : end - start);
+    if (!item.empty())
+      items.push_back(item);
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  return items;
+}
+
+}  // namespace
+
+StartupOptions ParseStartupOptions(const ext::ParsedOptions& options) {
   StartupOptions out;
   for (const auto& [name, value] : options) {
-    if (name == "lora") {
-      const auto separator = value.find('=');
-      if (separator == std::string::npos || separator == 0 ||
-          separator + 1 == value.size())
-        throw std::invalid_argument("--lora expects NAME=PATH");
-      out.loras.emplace_back(value.substr(0, separator),
-                             value.substr(separator + 1));
-    } else if (name == "lora-default") {
-      const std::size_t separator = value.rfind(':');
-      float scale = 0;
-      if (separator == std::string::npos || separator == 0)
-        throw std::invalid_argument("--lora-default expects NAME:SCALE");
-      const std::string_view text(value.data() + separator + 1,
-                                  value.size() - separator - 1);
-      const auto [end, ec] =
-          std::from_chars(text.data(), text.data() + text.size(), scale);
-      if (text.empty() || ec != std::errc{} ||
-          end != text.data() + text.size())
-        throw std::invalid_argument("--lora-default expects NAME:SCALE");
-      out.default_loras.push_back({value.substr(0, separator), scale});
-    } else if (name == "controlnet") {
-      if (!out.controlnet.empty())
-        throw std::invalid_argument("--controlnet given twice");
-      out.controlnet = value;
+    if (name == "--lora") {
+      for (const auto& item : SplitList(std::get<std::string>(value))) {
+        const auto separator = item.find('=');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 == item.size())
+          throw std::invalid_argument(
+              "--lora expects NAME=PATH[;NAME=PATH...]");
+        out.loras.emplace_back(item.substr(0, separator),
+                               item.substr(separator + 1));
+      }
+    } else if (name == "--lora-default") {
+      for (const auto& item : SplitList(std::get<std::string>(value))) {
+        const std::size_t separator = item.rfind(':');
+        float scale = 0;
+        if (separator == std::string::npos || separator == 0)
+          throw std::invalid_argument(
+              "--lora-default expects NAME:SCALE[;NAME:SCALE...]");
+        const std::string_view text(item.data() + separator + 1,
+                                    item.size() - separator - 1);
+        const auto [end, ec] =
+            std::from_chars(text.data(), text.data() + text.size(), scale);
+        if (text.empty() || ec != std::errc{} ||
+            end != text.data() + text.size())
+          throw std::invalid_argument(
+              "--lora-default expects NAME:SCALE[;NAME:SCALE...]");
+        out.default_loras.push_back({item.substr(0, separator), scale});
+      }
+    } else if (name == "--controlnet") {
+      out.controlnet = std::get<std::string>(value);
     } else {
-      throw std::invalid_argument("Qwen-Image-2.1 has no option --" + name);
+      throw std::invalid_argument("Qwen-Image-2.1 has no option " + name);
     }
   }
   std::set<std::string, std::less<>> names;

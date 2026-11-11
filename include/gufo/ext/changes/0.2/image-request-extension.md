@@ -19,12 +19,10 @@ instead of 500.
 `ImageRunner::Query(topic)` returns provider state as JSON text for host
 endpoints, empty for unknown topics. `"loras"` serves `GET /sdapi/v1/loras`.
 
-`ImageRunnerOptions`, `ImageRunnerOptionsFactory` and
-`ImageProvider::create_with_options` (preferred over `create`) pass the
-provider's own `serve image` options, in command-line order and possibly
-repeated (`--lora NAME=PATH` twice), as name/value pairs without dashes. The
-host forwards them only to a provider that sets `create_with_options` and
-fails startup otherwise. Unlike the manifest options of text providers these
-are not declared in `extension.json` yet: repeated options do not fit
-`ParsedOptions`. Qwen-Image-2.1 accepts `lora`, `lora-default` and
-`controlnet`.
+Startup options reach the provider through the upstream mechanism of
+`image-provider-options.md`: `ImageRunnerOptions::options` is the
+`ParsedOptions` of the options declared in `extension.json` for `serve image`
+(keys with dashes, typed values). A manifest option cannot repeat, so
+Qwen-Image-2.1 declares `--lora NAME=PATH[;NAME=PATH...]`,
+`--lora-default NAME:SCALE[;...]` (string, `;`-separated lists) and
+`--controlnet FILE` (path).

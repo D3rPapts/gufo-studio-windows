@@ -542,10 +542,6 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
       });
 }
 
-
-/// Qwen-Image-2.1 provider options of `serve image` (gufo-studio-windows):
-/// --lora NAME=PATH and --lora-default NAME:SCALE (both repeatable) and
-/// --controlnet FILE, forwarded in order as ext::ImageRunnerOptions.
 /// MiniMax H3 provider options of `serve video` (gufo-studio-windows, as
 /// 1.4.9): --lora NAME=PATH[,steps=N][,strength=S] (repeatable) and
 /// --vision-projector GGUF, forwarded in order as ext::VideoRunnerOptions.
@@ -558,35 +554,6 @@ void AddVideoProviderOptions(
                    "(\"gufo\":{\"lora\":NAME}); repeatable"},
         std::tuple{"vision-projector", "GGUF",
                    "Qwen3-VL vision tower for keyframe prompt blocks"}}) {
-    const std::string option = name;
-    parser.AddCustomOption(
-        "", "--" + option, metavar, help, "Model",
-        [options, option](std::string_view, std::string_view value,
-                          std::string* err) {
-          if (value.empty()) {
-            *err = "--" + option + " needs a value";
-            return false;
-          }
-          options->emplace_back(option, std::string(value));
-          return true;
-        });
-  }
-}
-
-void AddImageProviderOptions(
-    ArgParser& parser,
-    std::vector<std::pair<std::string, std::string>>* options) {
-  for (const auto& [name, metavar, help] :
-       {std::tuple{"lora", "NAME=PATH",
-                   "Register a LoRA adapter for the Qwen-Image-2.1 "
-                   "transformer; requests select it by name (repeatable)"},
-        std::tuple{"lora-default", "NAME:SCALE",
-                   "Apply a registered --lora to requests that omit 'loras' "
-                   "(repeatable)"},
-        std::tuple{"controlnet", "SAFETENSORS",
-                   "Qwen-Image-2.1 Fun ControlNet-Union file; enables "
-                   "\"gufo\":{\"control_image\":...} (pose, depth, canny, "
-                   "lineart, ...)"}}) {
     const std::string option = name;
     parser.AddCustomOption(
         "", "--" + option, metavar, help, "Model",
@@ -648,14 +615,20 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path model;
     std::vector<std::string> names;
     ArgParser parser(std::string(program_name) + " serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve image generation and editing (Qwen-Image-2.1 or "
+                     "an image extension provider).");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Image model directory (Diffusers layout)", "Model",
+                     &model);
     AddServedModelNamesOption(parser, &names);
-    std::vector<std::pair<std::string, std::string>> provider_options;
-    AddImageProviderOptions(parser, &provider_options);
+    ext::Registry registry;
+    ext::RegisterBuiltExtensions(registry);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
+    ProviderOptions provider_options(registry,
+                                     std::string(ext::kImageServeCommand),
+                                     ext::Capability::kImageGeneration);
+    provider_options.Register(parser);
     parser.PrintHelp();
     return;
   }
@@ -1255,13 +1228,17 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path model;
     std::vector<std::string> names;
     ArgParser parser("gufo serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve image generation and editing (Qwen-Image-2.1 or "
+                     "an image extension provider).");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Image model directory (Diffusers layout)", "Model",
+                     &model);
     AddServedModelNamesOption(parser, &names);
-    std::vector<std::pair<std::string, std::string>> provider_options;
-    AddImageProviderOptions(parser, &provider_options);
     add_server_options(parser, false);
+    ProviderOptions declared_options(registry,
+                                     std::string(ext::kImageServeCommand),
+                                     ext::Capability::kImageGeneration);
+    declared_options.Register(parser);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
       return 2;
@@ -1270,24 +1247,52 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "image");
       return 0;
     }
+    ext::ParsedOptions provider_options;
+    try {
+      provider_options = declared_options.Parse();
+    } catch (const std::invalid_argument& error) {
+      std::cerr << "Error: " << error.what() << '\n';
+      return 2;
+    }
     if (!prepare_server_options())
       return 2;
     if (model.empty()) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
-    ModelLoadLog load_log("qwen_image_21", model);
+    // Selection reads only the probe's metadata, so option errors (another
+    // provider's option, a missing sidecar path) stop before any weights load.
+    const ext::ImageProvider* provider = nullptr;
     try {
-      images = std::make_shared<server::ImageService>(
-          model, names.empty() ? "Qwen-Image-2.1" : names.front(),
-          server::ImageService::Runner{}, ModelAliases(names),
-          std::move(provider_options));
+      provider =
+          &server::SelectImageProvider(registry, model, provider_options);
+    } catch (const std::invalid_argument& error) {
+      std::cerr << "Error: " << error.what() << '\n';
+      return 2;
     } catch (const std::exception& error) {
-      std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
+      std::cerr << "Error loading image model: " << error.what() << '\n';
       return 1;
     }
-    load_log.Complete("model=" + images->model_id() +
-                      " weights=mapped upload=on_demand");
+    std::string kind = provider->id;
+    std::ranges::replace(kind, '-', '_');
+    ModelLoadLog load_log(kind, model);
+    try {
+      images = std::make_shared<server::ImageService>(
+          server::CreateImageRunner(*provider, model, provider_options),
+          names.empty() ? (provider->id == "qwen-image-21" ||
+                                   provider->id == "qwen-image-2.1"
+                               ? "Qwen-Image-2.1"
+                               : provider->id)
+                        : names.front(),
+          ModelAliases(names),
+          provider->preview_latent ? provider->preview_latent : "");
+    } catch (const std::exception& error) {
+      std::cerr << "Error loading image model " << provider->id << ": "
+                << error.what() << '\n';
+      return 1;
+    }
+    load_log.Complete("model=" + images->model_id() + " provider=" +
+                      provider->id + " weights=mapped upload=on_demand");
   } else if (subcommand == "video") {
     std::filesystem::path video_model;
     std::filesystem::path video_root = "video-jobs";
