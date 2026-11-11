@@ -54,6 +54,16 @@
 // relayed thumbs are cached under DIR/relay-cache/<id>/ for a day. Every
 // relayed request carries X-Gufo-Relay: 1 and a request with that header
 // (or X-Gufo-Forwarded) is never relayed on.
+//
+// Shared queue (1.4.20, Options::capabilities + relay): the router that
+// took a job stays its owner (files, result, progress, webhook); only the
+// execution may move to the partner.
+//  - Needs: a job needs its model and the LoRA names of its body
+//    ("loras"[].name, "gufo"."lora"). Submit answers 400 no_capable_router
+//    when neither router can run it (message names what each has); at
+//    dispatch the job's request carries X-Gufo-Pool: local|remote when
+//    only one side can run it, and the router's pool decision keeps to
+//    that side (waits there when it is busy).
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -240,10 +250,36 @@ struct Options {
   Relay relay;
   /// "http://host:port" of the partner, as /router/status names it.
   std::string partner_name;
+  /// What this router can run, as GET /router/capabilities answers it
+  /// ({"router_id", "partner", "models": {id: {"loras", "placement",
+  /// ...}}}); empty = no capability checks, no pulling. Called without the
+  /// queue's lock held.
+  std::function<json::Value()> capabilities;
+  /// The partner's answer to GET /router/capabilities (cached by the
+  /// caller), nullopt while unknown (unreachable, older version).
+  std::function<std::optional<json::Value>()> partner_capabilities;
+  /// "http://host:port" this router is reached under: sent as "from" on a
+  /// pull; the partner's capabilities name it more exactly ("partner").
+  std::string self_name;
 };
 
 /// Set on every request relayed to the partner; never relayed on.
 inline constexpr const char* kRelayHeader = "X-Gufo-Relay";
+/// Set on a job's request when only one side of the pool can run it
+/// ("local" | "remote"); the router's pool decision keeps to that side.
+inline constexpr const char* kPoolSideHeader = "X-Gufo-Pool";
+
+/// The LoRA names a request body asks for: "loras"[].name (images) and
+/// "gufo"."lora" (videos, a string); empty for anything else.
+std::vector<std::string> LoraNames(const json::Value& body);
+
+/// Whether a router with these capabilities (the "models" object of
+/// /router/capabilities, or the whole answer) can run a job: the model is
+/// served there, not placed remote, and every LoRA is registered. *why
+/// (optional) gets the reason ("no model 'x'", "no LoRA 'winkel'").
+bool CanRun(const json::Value& capabilities, const std::string& model,
+            const std::vector<std::string>& loras,
+            std::string* why = nullptr);
 
 // ------------------------------------------------- video concat helpers
 
@@ -374,6 +410,10 @@ private:
   /// A job this router does not know: the same request to the partner.
   server::HttpResponse RelayJob(const std::string& id, std::string_view tail,
                                 const server::HttpRequest& request);
+  /// Which side of the pool must run `job` ("local", "remote", "" = any),
+  /// from the capabilities; `*refusal` gets the error of a job neither
+  /// router can run (then "" is returned).
+  std::string SideFor(const Job& job, json::Value* refusal);
   /// POST /v1/videos/concat answered at once: the mp4 bytes.
   server::HttpResponse Concat(const server::HttpRequest& request);
   /// Stitches the clips named by `body` into `output` (the job's temp
@@ -419,6 +459,8 @@ private:
   std::deque<std::shared_ptr<Job>> pending_;
   /// Learned seconds per "<path> <model>" for the estimated progress.
   std::map<std::string, double> durations_;
+  /// How the partner names this router (its capabilities' "partner").
+  std::string self_name_;
   /// Next expiry pass (supervision thread only).
   std::chrono::steady_clock::time_point next_expiry_{};
   /// One ffmpeg thumbnail at a time.

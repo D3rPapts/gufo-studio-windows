@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -43,6 +44,10 @@
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
+
+#ifndef GUFO_RELEASE_VERSION
+#define GUFO_RELEASE_VERSION "development"
+#endif
 
 namespace gufo::cli {
 namespace {
@@ -105,6 +110,11 @@ constexpr std::string_view kPresetGrammar =
     "    answer from it is retried here once. After a machine held the model\n"
     "    the other one loads it only once a request waited 10 s. Job reads\n"
     "    follow their job; relayed requests (X-Gufo-Forwarded) stay here.\n"
+    "    With --jobs-dir the two queues act as one (1.4.20): GET\n"
+    "    /router/capabilities lists what each router can run (LoRA names\n"
+    "    from the preset's lora = lines); a job goes only to a machine that\n"
+    "    can run it (X-Gufo-Pool: local|remote, 400 no_capable_router when\n"
+    "    neither can).\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
     "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
 
@@ -714,6 +724,20 @@ bool IsMusicCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/audio/music";
 }
 
+/// A POST with a JSON object body (Content-Type application/json, or no
+/// type and a body that starts with '{'): the pool reads its LoRA names.
+bool IsJsonBody(const HttpRequest& req) {
+  if (req.method != "POST" || req.body.empty())
+    return false;
+  std::string type = req.header("Content-Type");
+  std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (type.starts_with("application/json"))
+    return true;
+  return type.empty() && req.body.front() == '{';
+}
+
 /// Job id of the status resource `/v1/videos/<id>`; empty for `/content` or
 /// any deeper path.
 std::string VideoStatusJobId(const std::string& path) {
@@ -867,6 +891,21 @@ public:
   std::string router_id = router::NewRouterId();
   /// Remote GPU slots (preset gpu-slot).
   router::GpuSlots gpu_slots;
+  /// The pool partner (the remote twin of the pool presets, else of the
+  /// first switchable or remote one): job relay, shared queue and
+  /// capabilities. Set once at start.
+  std::optional<router::RemoteSpec> partner_spec;
+  std::string partner_name;
+  /// "http://host:port" this router listens on (the partner's
+  /// capabilities name it more exactly).
+  std::string self_name;
+  /// GET /router/capabilities of the partner, cached kPartnerCapsTtl (own
+  /// mutex, never nested inside the state mutex).
+  static constexpr auto kPartnerCapsTtl = std::chrono::seconds(30);
+  std::mutex partner_caps_mutex_;
+  std::optional<json::Value> partner_caps_;
+  std::chrono::steady_clock::time_point partner_caps_at_{};
+  bool partner_caps_old_logged_{false};
   /// Remote jobs holding a GPU slot, by job id (own mutex, never nested
   /// inside the state mutex).
   std::mutex remote_jobs_mutex_;
@@ -919,6 +958,8 @@ public:
       return RouterStatus();
     if (req.path == "/router/placement")
       return PlacementControl(req);
+    if (req.method == "GET" && req.path == "/router/capabilities")
+      return JsonOk(Capabilities());
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);
@@ -1380,7 +1421,57 @@ public:
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
     const bool from_comfy =
         !forwarded && req.header(router::kOriginHeader) == "comfy";
-    const bool may_retry = !IsVideoCreate(req) && !IsMusicCreate(req);
+    // The side the request must run on: the job store sets X-Gufo-Pool
+    // when only one router can run a job; a direct request's LoRA names
+    // are checked here against this preset and the partner's
+    // capabilities (neither: 400, both: as before).
+    std::string forced =
+        router::PoolSideOf(req.header(router::jobs::kPoolSideHeader));
+    if (!forwarded && IsJsonBody(req)) {
+      std::vector<std::string> needs;
+      try {
+        needs = router::jobs::LoraNames(json::parse(req.body));
+      } catch (const std::exception&) {
+        // The worker answers a malformed body itself.
+      }
+      if (!needs.empty()) {
+        const std::vector<std::string> have = router::LoraNamesOf(preset);
+        std::string missing;
+        for (const std::string& need : needs)
+          if (std::find(have.begin(), have.end(), need) == have.end()) {
+            missing = need;
+            break;
+          }
+        const bool local_ok = missing.empty();
+        bool partner_ok = true;
+        std::string why_partner;
+        lock.unlock();
+        const std::optional<json::Value> caps = PartnerCapabilities();
+        lock.lock();
+        if (caps.has_value())
+          partner_ok =
+              router::jobs::CanRun(*caps, model_id, needs, &why_partner);
+        if (!local_ok && !partner_ok) {
+          std::string registered;
+          for (const std::string& name : have)
+            registered += (registered.empty() ? "" : ", ") + name;
+          return Err(400, "Bad Request",
+                     "no router can run this request: this router has no "
+                     "LoRA '" + missing + "' for model '" + model_id + "'" +
+                         (registered.empty()
+                              ? " (none registered)"
+                              : " (registered: " + registered + ")") +
+                         "; partner " + partner_name + " " + why_partner,
+                     "invalid_request_error", "no_capable_router");
+        }
+        if (!local_ok)
+          forced = "remote";
+        else if (!partner_ok)
+          forced = "local";
+      }
+    }
+    const bool may_retry =
+        !IsVideoCreate(req) && !IsMusicCreate(req) && forced != "remote";
     const auto began = std::chrono::steady_clock::now();
     const auto deadline =
         began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
@@ -1396,8 +1487,13 @@ public:
     for (;;) {
       const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - began);
-      const router::PoolInput pool_input =
+      router::PoolInput pool_input =
           PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited);
+      // One side only (capabilities): the other is out, even when free.
+      if (forced == "remote")
+        pool_input.local.available = false;
+      else if (forced == "local")
+        pool_input.remote.available = false;
       const router::PoolDecision decision = router::ChoosePool(pool_input);
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
@@ -2498,6 +2594,99 @@ public:
     }
   }
 
+  /// GET /router/capabilities: what this router can run, for the partner's
+  /// pool decision and shared queue: per model its modality, placement,
+  /// state and the LoRA names of its preset (`lora = name=path` lines).
+  json::Value Capabilities() {
+    json::Value models = json::Value::object();
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      for (const auto& [preset, status] : registry.Statuses()) {
+        json::Value model = json::Value::object();
+        model["modality"] = preset->modality;
+        model["placement"] =
+            router::PlacementName(registry.PlacementOf(preset->id));
+        model["switchable"] = preset->switchable;
+        model["status"] = std::string(status);
+        model["loaded"] = status == "loaded";
+        json::Value loras = json::Value::array();
+        for (const std::string& name : router::LoraNamesOf(*preset))
+          loras.push_back(name);
+        model["loras"] = std::move(loras);
+        models[preset->id] = std::move(model);
+      }
+    }
+    json::Value out = json::Value::object();
+    out["router_id"] = router_id;
+    out["version"] = std::string(GUFO_RELEASE_VERSION);
+    out["self"] = self_name;
+    out["partner"] = partner_name.empty() ? json::Value()
+                                          : json::Value(partner_name);
+    out["models"] = std::move(models);
+    return out;
+  }
+
+  static HttpResponse JsonOk(const json::Value& body) {
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = body.dump(),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-cache"}}};
+  }
+
+  /// The partner's GET /router/capabilities, cached kPartnerCapsTtl;
+  /// nullopt without a partner, while it cannot be reached or when it
+  /// runs an older version without the route (logged once). Blocking (3
+  /// s): never call it with the state mutex held.
+  std::optional<json::Value> PartnerCapabilities() {
+    if (!partner_spec.has_value())
+      return std::nullopt;
+    const auto now = std::chrono::steady_clock::now();
+    {
+      const std::lock_guard<std::mutex> lock(partner_caps_mutex_);
+      if (partner_caps_at_ != std::chrono::steady_clock::time_point{} &&
+          now - partner_caps_at_ < kPartnerCapsTtl)
+        return partner_caps_;
+    }
+    router::UpstreamTarget target =
+        router::RemoteTarget(*partner_spec, router_id);
+    target.connect_timeout = std::chrono::seconds(3);
+    target.head_timeout = std::chrono::seconds(3);
+    HttpRequest probe;
+    probe.method = "GET";
+    probe.path = "/router/capabilities";
+    probe.headers.emplace_back(router::jobs::kRelayHeader, "1");
+    const auto deadline = now + std::chrono::seconds(3);
+    probe.is_cancelled = [deadline] {
+      return std::chrono::steady_clock::now() >= deadline;
+    };
+    const router::comfy::FetchResult answer =
+        CollectResponse(router::ProxyToWorker(target, probe));
+    std::optional<json::Value> caps;
+    if (answer.status == 200) {
+      try {
+        json::Value parsed = json::parse(answer.body);
+        if (const json::Value* models = parsed.find("models");
+            models != nullptr && models->is_object())
+          caps = std::move(parsed);
+      } catch (const std::exception&) {
+        // Not a capabilities answer: unknown.
+      }
+    }
+    const std::lock_guard<std::mutex> lock(partner_caps_mutex_);
+    if (answer.status == 404 && !partner_caps_old_logged_) {
+      partner_caps_old_logged_ = true;
+      Logger::Warn("router",
+                   "event=partner_capabilities_unsupported partner=" +
+                       partner_name +
+                       " detail=\"no /router/capabilities (older version); "
+                       "LoRA needs are not checked against it\"");
+    }
+    partner_caps_ = caps;
+    partner_caps_at_ = std::chrono::steady_clock::now();
+    return caps;
+  }
+
   /// GET /router/status: live memory, resident workers with their usage and
   /// idle timers, and the last residency decisions.
   HttpResponse RouterStatus() {
@@ -3475,23 +3664,11 @@ int RunRouter(std::span<const char* const> args) {
       return 2;
     }
   }
-  if (!jobs_dir.empty()) {
-    router::jobs::Options jobs_options;
-    jobs_options.root = jobs_dir;
-    jobs_options.fetch = self_fetch;
-    for (const auto& model : models)
-      jobs_options.models.push_back(model.id);
-    jobs_options.parallel = jobs_parallel;
-    jobs_options.webhook_allow = std::move(webhook_allow);
-    jobs_options.webhook_secret = jobs_webhook_secret;
-    jobs_options.webhook_retry.assign(webhook_retry_delays.begin(),
-                                      webhook_retry_delays.end());
-    jobs_options.webhook_timeout = std::chrono::seconds(
-        std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
-    jobs_options.expire_after = std::chrono::hours(jobs_expire_hours);
-    // Pool relay: the partner router (the remote twin of the pool presets,
-    // else of the first switchable or remote one) answers GET
-    // /v1/jobs?scope=pool and every job id this router does not know.
+  // Pool partner: the remote twin of the pool presets, else of the first
+  // switchable or remote one. It answers GET /v1/jobs?scope=pool and every
+  // job id this router does not know and tells its capabilities (LoRA
+  // names).
+  {
     const router::PresetModel* partner = nullptr;
     int partner_rank = -1;
     for (const auto& model : models) {
@@ -3505,9 +3682,37 @@ int RunRouter(std::span<const char* const> args) {
       }
     }
     if (partner != nullptr) {
-      const router::RemoteSpec spec = *partner->remote;
+      state->partner_spec = *partner->remote;
+      state->partner_name =
+          "http://" + router::EndpointKey(partner->remote->url);
+    }
+    state->self_name = "http://" + host + ":" + std::to_string(port);
+  }
+  if (!jobs_dir.empty()) {
+    router::jobs::Options jobs_options;
+    jobs_options.root = jobs_dir;
+    jobs_options.fetch = self_fetch;
+    jobs_options.capabilities = [raw] { return raw->Capabilities(); };
+    jobs_options.partner_capabilities = [raw] {
+      return raw->PartnerCapabilities();
+    };
+    jobs_options.self_name = state->self_name;
+    for (const auto& model : models)
+      jobs_options.models.push_back(model.id);
+    jobs_options.parallel = jobs_parallel;
+    jobs_options.webhook_allow = std::move(webhook_allow);
+    jobs_options.webhook_secret = jobs_webhook_secret;
+    jobs_options.webhook_retry.assign(webhook_retry_delays.begin(),
+                                      webhook_retry_delays.end());
+    jobs_options.webhook_timeout = std::chrono::seconds(
+        std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
+    jobs_options.expire_after = std::chrono::hours(jobs_expire_hours);
+    // Pool relay: the partner router answers GET /v1/jobs?scope=pool and
+    // every job id this router does not know.
+    if (state->partner_spec.has_value()) {
+      const router::RemoteSpec spec = *state->partner_spec;
       const std::string relay_id = state->router_id;
-      jobs_options.partner_name = "http://" + router::EndpointKey(spec.url);
+      jobs_options.partner_name = state->partner_name;
       jobs_options.relay =
           [spec, relay_id](const HttpRequest& req,
                            std::chrono::milliseconds head_timeout,

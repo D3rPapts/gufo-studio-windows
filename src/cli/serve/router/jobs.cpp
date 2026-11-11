@@ -73,6 +73,10 @@ struct JobQueue::Job {
   bool keep{false};
   /// When the result media were deleted (expiry); 0 = still there.
   long long expired_at{0};
+  /// LoRA names the wrapped request asks for (capability check).
+  std::vector<std::string> loras;
+  /// X-Gufo-Pool for the job's requests ("local", "remote", "" = any).
+  std::string side;
   std::atomic<bool> cancel{false};
   /// The cancel came from Stop(), not from a client.
   std::atomic<bool> shutdown{false};
@@ -1269,6 +1273,70 @@ int DeliverHttp(std::uint32_t address, const WebhookUrl& url,
 
 // ---------------------------------------------------------------- queue
 
+std::vector<std::string> LoraNames(const json::Value& body) {
+  std::vector<std::string> names;
+  const auto add = [&names](const std::string& name) {
+    if (!name.empty() &&
+        std::find(names.begin(), names.end(), name) == names.end())
+      names.push_back(name);
+  };
+  if (const json::Value* loras = body.find("loras");
+      loras != nullptr && loras->is_array()) {
+    for (const json::Value& entry : loras->items()) {
+      if (entry.is_object())
+        add(entry.member_str("name"));
+      else if (entry.is_string())
+        add(entry.str());
+    }
+  }
+  if (const json::Value* gufo = body.find("gufo");
+      gufo != nullptr && gufo->is_object()) {
+    if (const json::Value* lora = gufo->find("lora");
+        lora != nullptr && lora->is_string())
+      add(lora->str());
+  }
+  return names;
+}
+
+bool CanRun(const json::Value& capabilities, const std::string& model,
+            const std::vector<std::string>& loras, std::string* why) {
+  const json::Value* models = capabilities.find("models");
+  if (models == nullptr || !models->is_object())
+    models = &capabilities;
+  const json::Value* entry = models->find(model);
+  if (entry == nullptr || !entry->is_object()) {
+    if (why != nullptr)
+      *why = "does not serve model '" + model + "'";
+    return false;
+  }
+  if (entry->member_str("placement") == "remote") {
+    if (why != nullptr)
+      *why = "has model '" + model + "' placed remote";
+    return false;
+  }
+  const json::Value* have = entry->find("loras");
+  for (const std::string& need : loras) {
+    bool found = false;
+    std::string registered;
+    if (have != nullptr && have->is_array()) {
+      for (const json::Value& name : have->items()) {
+        if (!name.is_string())
+          continue;
+        found = found || name.str() == need;
+        registered += (registered.empty() ? "" : ", ") + name.str();
+      }
+    }
+    if (!found) {
+      if (why != nullptr)
+        *why = "has no LoRA '" + need + "' for model '" + model + "'" +
+               (registered.empty() ? " (none registered)"
+                                   : " (registered: " + registered + ")");
+      return false;
+    }
+  }
+  return true;
+}
+
 JobQueue::JobQueue(Options options) : options_(std::move(options)) {
   if (options_.parallel == 0)
     options_.parallel = 1;
@@ -1454,6 +1522,7 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
                  "stream_unsupported");
     job->content_type = "application/json";
     job->model = json_body->member_str("model");
+    job->loras = LoraNames(*json_body);
     payload = json_body->dump();
   } else {
     job->content_type = inner->member_str("content_type");
@@ -1475,6 +1544,16 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       for (const auto& part : parts) {
         if (part.name == "model")
           job->model = part.data;
+        if (part.name == "loras") {
+          // The ComfyUI adapter sends the LoRA list as a JSON part.
+          try {
+            json::Value wrapped = json::Value::object();
+            wrapped["loras"] = json::parse(part.data);
+            job->loras = LoraNames(wrapped);
+          } catch (const std::exception&) {
+            // The worker answers the malformed part itself.
+          }
+        }
         if (part.name == "stream" && (part.data == "true" || part.data == "1"))
           return Err(400, "Bad Request",
                      "streaming responses cannot run as a job; drop 'stream'",
@@ -1482,7 +1561,9 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       }
     } else if (IsJsonType(job->content_type)) {
       try {
-        job->model = json::parse(payload).member_str("model");
+        const json::Value parsed = json::parse(payload);
+        job->model = parsed.member_str("model");
+        job->loras = LoraNames(parsed);
       } catch (const std::exception&) {
         return Err(400, "Bad Request", "request body is not valid JSON",
                    "invalid_json");
@@ -1499,6 +1580,15 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
           options_.models.end())
     return Err(404, "Not Found", "unknown model '" + job->model + "'",
                "model_not_found");
+  if (needs_model) {
+    // Neither router can run it (model placed remote on both, a LoRA no
+    // machine has): say so now instead of failing the job later.
+    json::Value refusal;
+    SideFor(*job, &refusal);
+    if (!refusal.is_null())
+      return Err(400, "Bad Request", refusal.member_str("message"),
+                 refusal.member_str("code"));
+  }
   if (const json::Value* metadata = body.find("metadata");
       metadata != nullptr && !metadata->is_null()) {
     if (!metadata->is_object() || metadata->dump().size() > kMaxMetadata)
@@ -2159,6 +2249,10 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   request["method"] = "POST";
   request["path"] = job.path;
   request["model"] = job.model;
+  json::Value loras = json::Value::array();
+  for (const std::string& name : job.loras)
+    loras.push_back(name);
+  request["loras"] = std::move(loras);
   view["request"] = std::move(request);
   view["created_at"] = job.created_at;
   view["started_at"] =
@@ -2256,6 +2350,10 @@ json::Value JobQueue::RecordLocked(const Job& job) const {
   record["webhook_last_error"] = job.webhook_last_error;
   record["keep"] = job.keep;
   record["expired_at"] = job.expired_at;
+  json::Value loras = json::Value::array();
+  for (const std::string& name : job.loras)
+    loras.push_back(name);
+  record["loras"] = std::move(loras);
   return record;
 }
 
@@ -2345,6 +2443,11 @@ void JobQueue::Load() {
       job->keep = keep->as_bool();
     job->expired_at =
         static_cast<long long>(record.member_double("expired_at", 0));
+    if (const json::Value* loras = record.find("loras");
+        loras != nullptr && loras->is_array())
+      for (const json::Value& name : loras->items())
+        if (name.is_string() && !name.str().empty())
+          job->loras.push_back(name.str());
     if (job->status == "queued") {
       pending_.push_back(job);
       ++requeued;
@@ -2394,6 +2497,48 @@ void JobQueue::RunnerMain() {
   }
 }
 
+// ----------------------------------------------------------- shared queue
+
+std::string JobQueue::SideFor(const Job& job, json::Value* refusal) {
+  if (!options_.capabilities || job.path == kConcatPath)
+    return "";
+  const json::Value mine = options_.capabilities();
+  std::string why_local;
+  std::string why_partner;
+  const bool local_ok = CanRun(mine, job.model, job.loras, &why_local);
+  const bool has_partner = static_cast<bool>(options_.relay);
+  std::optional<json::Value> partner;
+  if (has_partner && options_.partner_capabilities)
+    partner = options_.partner_capabilities();
+  // Unknown partner capabilities (unreachable, older version): it may.
+  bool partner_ok = has_partner;
+  if (partner.has_value()) {
+    partner_ok = CanRun(*partner, job.model, job.loras, &why_partner);
+    const std::string me = partner->member_str("partner");
+    if (!me.empty()) {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      self_name_ = me;
+    }
+  }
+  if (local_ok && (partner_ok || !has_partner))
+    return "";  // any side (or the only one)
+  if (local_ok)
+    return "local";
+  if (partner_ok)
+    return "remote";
+  if (refusal != nullptr) {
+    std::string message = "no router can run this job: this router " +
+                          why_local;
+    if (has_partner)
+      message += "; partner " + options_.partner_name + " " + why_partner;
+    json::Value error = json::Value::object();
+    error["message"] = message;
+    error["code"] = "no_capable_router";
+    *refusal = std::move(error);
+  }
+  return "";
+}
+
 FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
                            std::string path, std::string query,
                            std::string body, std::string content_type) {
@@ -2404,6 +2549,11 @@ FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
   request.body = std::move(body);
   if (!content_type.empty())
     request.headers.emplace_back("Content-Type", std::move(content_type));
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!job->side.empty())
+      request.headers.emplace_back(kPoolSideHeader, job->side);
+  }
   request.request_id = job->id;
   request.is_cancelled = [job] { return job->cancel.load(); };
   FetchResult result = options_.fetch(request);
@@ -2477,6 +2627,24 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
                                " seconds=" + std::to_string(seconds));
     }
   } done_log{job, mutex_, started};
+  {
+    // Which side of the pool must run it (a pulled job is already set).
+    bool decide = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      decide = job->side.empty();
+    }
+    if (decide) {
+      json::Value refusal;
+      const std::string side = SideFor(*job, &refusal);
+      if (!refusal.is_null()) {
+        Finish(job, "failed", json::Value(), std::move(refusal));
+        return;
+      }
+      const std::lock_guard<std::mutex> lock(mutex_);
+      job->side = side;
+    }
+  }
   try {
     std::string payload = ReadAll(JobDir(job->id) / "request.body");
     if (job->path == kConcatPath) {
@@ -2576,6 +2744,7 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->started_at = 0;
           job->progress = -1;
           job->preview_id.clear();
+          job->side.clear();
           pending_.push_front(job);
           PersistLocked();
           requeued = true;
