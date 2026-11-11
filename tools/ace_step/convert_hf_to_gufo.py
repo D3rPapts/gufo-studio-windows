@@ -271,6 +271,10 @@ def main() -> None:
         metadata["model_version"] = variant
         print(f"DiT {variant}: {len(tensors)} tensors", file=sys.stderr)
     else:
+        # acestep-5Hz-lm-1.7B ships its Qwen3 tensors without the "model." prefix
+        # (embed_tokens.weight, layers.N.*); the 0.6B and 4B have it. Normalise.
+        tensors = [((n if n.startswith(("model.", "lm_head.")) else "model." + n), s, e, o)
+                   for n, s, e, o in tensors]
         size = lm_size(tensors, args.src)
         metadata["gufo.model"] = f"ace-step-5hz-lm-{size.lower()}"
         metadata["gufo.lm"] = size
