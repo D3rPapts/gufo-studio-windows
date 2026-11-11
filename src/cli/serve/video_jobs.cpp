@@ -1577,6 +1577,13 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
     }
     if (!request.steps_explicit && lora->second.steps != 0) {
       job->request.parameters.evaluations = lora->second.steps;
+      // A step-distilled LoRA (turbo, 8 steps) cannot afford the fast/
+      // aggressive presets' step reuse and block skipping: with 8 steps
+      // half of them would be extrapolated and 5-10 blocks dropped, which
+      // produced jumping video and broken audio (11.11.). Run every step on
+      // every block; the preset's internal resolution stays as chosen.
+      job->request.parameters.reuse_interval = 1;
+      job->request.parameters.active_blocks = 50;
     }
   }
   job->snapshot.id = impl_->options.id_factory();
