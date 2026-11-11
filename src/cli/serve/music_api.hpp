@@ -22,10 +22,15 @@ inline constexpr std::string_view kMusicApiPath = "/v1/audio/music";
 /// ACE-Step 1.5 text-to-music behind /v1/audio/music:
 ///   POST /v1/audio/music               {prompt|tags, lyrics, duration, seed,
 ///        steps, bpm, keyscale, timesignature, language, audio_codes,
-///        lm_cfg, lm_temperature, lm_top_p, async} -> audio/wav
+///        lm_cfg, lm_temperature, lm_top_p, response_format, bitrate_kbps,
+///        async} -> audio/wav (response_format "wav", default), audio/mpeg
+///        ("mp3") or audio/mp4 ("aac" / "m4a"), with Content-Disposition
+///        output.{wav,mp3,m4a}; mp3 / m4a are FFmpeg transcodes at
+///        bitrate_kbps (96..320, default 192) and fail the job with
+///        "<format> encoding needs ffmpeg" when FFmpeg is missing
 ///        (async: 202 + job JSON)
 ///   GET  /v1/audio/music/{id}          job status
-///   GET  /v1/audio/music/{id}/content  audio/wav
+///   GET  /v1/audio/music/{id}/content  the audio in the requested format
 /// One worker generates jobs in order; finished audio is kept for an hour
 /// (at most kKeptJobs results).
 class MusicService {

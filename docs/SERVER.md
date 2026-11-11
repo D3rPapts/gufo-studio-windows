@@ -578,7 +578,7 @@ reloads that worker if it died, answering from the persisted `--root`
 job state.
 Async music job ids (`POST /v1/audio/music` with `"async": true`) are
 recorded the same way and keep their worker busy until a status read
-reports `completed` or `failed` or the WAV is downloaded. Music jobs live
+reports `completed` or `failed` or the audio is downloaded. Music jobs live
 only in the worker's memory, so a read for a job whose worker is no longer
 loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
@@ -903,6 +903,27 @@ without changing pitch; 1.0 keeps the model's own speaking rate, which varies
 noticeably with the seed. Streaming `pcm` requires
 `speed` 1.0. Input is capped at 16384 UTF-8 bytes and
 `max_new_tokens` at 8192 (default 3000). Output is 24 kHz mono 16-bit PCM.
+
+`POST /v1/audio/music` (`gufo serve music`, ACE-Step 1.5) accepts `prompt`
+(or `tags`), `lyrics`, `duration` (1--600 s, default 30), `seed`, `steps`
+(1--50, default 8), `bpm`, `keyscale`, `timesignature`, `language`,
+`audio_codes`, `lm_cfg`, `lm_temperature`, `lm_top_p`, `response_format`,
+`bitrate_kbps` and `async`. `response_format` is `wav` (default, 48 kHz
+stereo 16-bit PCM, `audio/wav`), `mp3` (`audio/mpeg`) or `aac` (alias `m4a`,
+`audio/mp4`); anything else is a 400 `unsupported_format`. `mp3` and `aac`
+are transcoded from the finished WAV by FFmpeg (`ffmpeg` on the PATH or
+`GUFO_FFMPEG`, started directly without a shell) at the constant bitrate
+`bitrate_kbps` (integer 96--320, default 192; `-codec:a libmp3lame` or
+`aac`, `-b:a <kbps>k`). The answer, and `GET /v1/audio/music/<id>/content`
+in async mode, carries the format's `Content-Type` and
+`Content-Disposition: attachment; filename="output.<wav|mp3|m4a>"`, so a
+router job stores it as `output.mp3` (router jobs name the file from the
+content type; `audio/mp4` is not mapped there yet and lands as
+`output.bin`). When FFmpeg is missing or fails the job ends `failed` with
+`"<format> encoding needs ffmpeg: ..."` (HTTP 500 on the content read), one
+error line is logged and the temporary WAV is left in the temp directory
+(its path is in the message). The job status JSON reports `response_format`
+and, for `mp3` / `aac`, `bitrate_kbps`.
 
 `GET /v1/audio/speech/stream` upgrades to the vLLM-Omni incremental-text
 WebSocket protocol. [TTS streaming examples](models/qwen3-tts/README.md#sampling-and-streaming)

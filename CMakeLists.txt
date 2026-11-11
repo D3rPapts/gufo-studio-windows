@@ -491,6 +491,7 @@ add_library(gufo_http STATIC
   src/cli/serve/video_wan22.cpp
   src/cli/serve/video_rife.cpp
   src/cli/serve/music_api.cpp
+  src/cli/serve/music_encode.cpp
   src/cli/serve/foley_api.cpp
   src/cli/serve/upscale_api.cpp
   src/cli/serve/video_upscale.cpp
@@ -515,6 +516,9 @@ else()
 endif()
 # Real-ESRGAN on the NPU / CPU (ONNX Runtime) behind `gufo serve upscale`.
 target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
+# mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
+target_compile_definitions(gufo_http PRIVATE
+  GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
 # CCIP figure check ("verfahren": "ccip" in POST /v1/figuren), CPU only.
 target_link_libraries(gufo_http PUBLIC gufo_ccip)
 target_link_libraries(gufo_http PUBLIC gufo_preview gufo_logging gufo_core gufo_qwen3_tts gufo_fish_drama3 gufo_ming_tts gufo_voxcpm2 gufo_indextts gufo_qwen3_asr gufo_qwen_image_21 gufo_moss_image gufo_embedding_gemma2)
@@ -811,6 +815,19 @@ if (BUILD_TESTING)
   add_test(NAME router_jobs_test COMMAND router_jobs_test)
   set_tests_properties(router_jobs_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 60)
+
+  # /v1/audio/music response_format / bitrate_kbps parsing, the FFmpeg
+  # argument list and a real mp3 transcode of a tiny WAV (skips without
+  # ffmpeg); no model.
+  add_executable(music_encode_test tests/cli/music_encode_test.cpp
+    src/cli/serve/music_encode.cpp)
+  target_include_directories(music_encode_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(music_encode_test PRIVATE cxx_std_20)
+  target_compile_definitions(music_encode_test PRIVATE
+    GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
+  add_test(NAME music_encode_test COMMAND music_encode_test)
+  set_tests_properties(music_encode_test PROPERTIES
+    LABELS "cpu;server;api;music" TIMEOUT 120 SKIP_RETURN_CODE 77)
 
   add_executable(router_comfy_graph_test tests/cli/router_comfy_graph_test.cpp
     src/cli/serve/router/comfy_graph.cpp)
