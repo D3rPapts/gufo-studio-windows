@@ -1330,8 +1330,13 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   // model: elapsed / expected, at most 95 until the result is stored.
   double progress = job.progress;
   bool estimated = false;
+  // Video and music jobs report real progress once the worker accepted them;
+  // before that they are usually waiting in the pool for a free GPU, and an
+  // estimate would show "62 %" for a job that has not started (11.11.).
+  const bool live_source = job.path.starts_with("/v1/videos") ||
+                           job.path == "/v1/audio/music";
   if (job.status == "in_progress" && progress < 0 && job.started_at > 0 &&
-      job.preview_id.empty() && job.upstream_id.empty()) {
+      !live_source && job.preview_id.empty() && job.upstream_id.empty()) {
     const auto learned = durations_.find(DurationKey(job.path, job.model));
     if (learned != durations_.end() && learned->second > 0) {
       const double elapsed =
