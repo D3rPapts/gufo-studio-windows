@@ -1370,7 +1370,10 @@ void TestPoolRelay() {
         HttpResponse response;
         response.status = status;
         response.body = body;
-        response.headers = {{"Content-Type", "application/json"}};
+        // What the partner's HTTP layer adds; must not come through twice.
+        response.headers = {{"Content-Type", "application/json"},
+                            {"Access-Control-Allow-Origin", "*"},
+                            {"X-Request-ID", "r99"}};
         return response;
       };
       if (request.path == "/v1/jobs")
@@ -1437,6 +1440,22 @@ void TestPoolRelay() {
     CHECK(answer.status == 200 &&
           json::parse(answer.body).member_str("id") == partner_id);
     CHECK(seen->size() == 2 && seen->back().method == "GET");
+    for (const auto& [name, value] : answer.headers)
+      CHECK(name != "Access-Control-Allow-Origin" && name != "X-Request-ID");
+    // Local jobs stay local with a partner configured: the list, the job,
+    // its files and its thumb never go to the partner.
+    CHECK(h.Call("GET", "/v1/jobs/" + id + "/files/image-1.png").status == 200);
+    answer = h.Call("GET", "/v1/jobs/" + id + "/thumb");
+    CHECK(answer.status == 501 &&
+          json::parse(answer.body).find("error")->member_str("code") ==
+              "thumb_unavailable");
+    {
+      std::ofstream out(h.dir / id / "thumb-256.jpg", std::ios::binary);
+      out << "local jpeg";
+    }
+    answer = h.Call("GET", "/v1/jobs/" + id + "/thumb");
+    CHECK(answer.status == 200 && answer.body == "local jpeg");
+    CHECK(seen->size() == 2);
     CHECK(h.Call("POST", "/v1/jobs/" + partner_id + "/keep").status == 200);
     CHECK(seen->size() == 3 && seen->back().method == "POST" &&
           seen->back().path == "/v1/jobs/" + partner_id + "/keep");

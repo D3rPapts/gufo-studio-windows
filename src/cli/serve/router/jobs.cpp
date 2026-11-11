@@ -468,6 +468,15 @@ std::string CollectBody(HttpResponse& response) {
   return body;
 }
 
+/// Drops what the partner's HTTP layer added and ours adds again (CORS,
+/// request id), so a relayed answer does not carry them twice.
+void StripTransportHeaders(HttpResponse& response) {
+  std::erase_if(response.headers, [](const auto& header) {
+    const std::string name = Lower(header.first);
+    return name.starts_with("access-control-") || name == "x-request-id";
+  });
+}
+
 std::string ResponseContentType(const HttpResponse& response) {
   for (const auto& [name, value] : response.headers)
     if (name.size() == 12 && Lower(name) == "content-type")
@@ -2081,8 +2090,10 @@ HttpResponse JobQueue::RelayJob(const std::string& id, std::string_view tail,
                                  std::chrono::minutes(10), &why);
     if (!answer)
       return unreachable(why);
-    if (answer->status != 200)
+    if (answer->status != 200) {
+      StripTransportHeaders(*answer);
       return std::move(*answer);
+    }
     const std::string type = MediaType(ResponseContentType(*answer));
     const std::string body = CollectBody(*answer);
     const std::string ext = type == "image/png" ? "png" : "jpg";
@@ -2105,6 +2116,7 @@ HttpResponse JobQueue::RelayJob(const std::string& id, std::string_view tail,
                                          std::chrono::seconds(10), &why);
   if (!answer)
     return unreachable(why);
+  StripTransportHeaders(*answer);
   return std::move(*answer);
 }
 
