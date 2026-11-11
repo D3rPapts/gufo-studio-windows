@@ -324,7 +324,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
     out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
   }
   out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out += "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\n";
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;

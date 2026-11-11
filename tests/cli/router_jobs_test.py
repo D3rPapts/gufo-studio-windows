@@ -219,8 +219,12 @@ def check_cancel(router):
     code, answer = router.json("POST", "/v1/jobs/%s/cancel" % job["id"])
     assert code == 200, answer
     router.wait(job["id"], "cancelled")
+    # DELETE on a finished job removes the record and its folder.
     code, again = router.json("DELETE", "/v1/jobs/" + job["id"])
-    assert code == 409, again
+    assert code == 200 and again.get("deleted") is True, again
+    code, gone = router.json("GET", "/v1/jobs/" + job["id"])
+    assert code == 404, gone
+    assert not os.path.isdir(os.path.join(router.tmp, "jobs", job["id"]))
 
 
 def check_rejections(router, receiver):

@@ -10,10 +10,38 @@
 //                                       "metadata": {...}} -> 202 + the job
 //                                      (Idempotency-Key: a repeated submit
 //                                      returns the first job)
-//   GET    /v1/jobs[?limit=N&status=S] newest first
+//   GET    /v1/jobs[?limit=N&status=S] newest first; filters q (text over
+//                                      metadata.titel/.prompt, model, id),
+//                                      seite, geraet, kind (image|music|
+//                                      speech|video|other), since/before
+//                                      (unix seconds, created_at)
 //   GET    /v1/jobs/{id}               status, progress, result links
-//   DELETE /v1/jobs/{id}               cancel (also POST /v1/jobs/{id}/cancel)
+//   PATCH  /v1/jobs/{id}               {"keep": true|false}: a kept job's
+//                                      files never expire (also POST
+//                                      /v1/jobs/{id}/keep)
+//   DELETE /v1/jobs/{id}               queued/running: cancel (also POST
+//                                      /v1/jobs/{id}/cancel); finished:
+//                                      remove the record and its files
+//   DELETE /v1/jobs?older_than=..&..   remove every finished job matching
+//                                      all given filters (older_than: age in
+//                                      seconds, unix seconds or ISO 8601;
+//                                      plus the list filters); at least one
+//                                      filter; dry_run=1 only counts;
+//                                      kept jobs need include_kept=1
 //   GET    /v1/jobs/{id}/files/{name}  one result file
+//
+// Expiry (--jobs-expire-hours, default 12, 0 = never): the result media of a
+// finished job that is not kept is deleted that long after completed_at;
+// the small text files (request.body, response.json) and the record itself
+// (prompt, metadata, timestamps) stay, result.files drops the deleted
+// entries and the job shows "expired_at".
+//
+// Progress: image jobs read the live preview's step, video and music jobs
+// poll the worker's job (music runs with "async": true). Any other job
+// (speech, foley, transcriptions, chat) reports an estimate once a job of
+// the same path and model has completed: elapsed / learned duration, at
+// most 95, flagged "progress_estimated": true. The learned durations live
+// in jobs.json ("durations").
 //
 // Jobs run through the router's own API, like the ComfyUI adapter's prompts:
 // a /v1/videos job creates the worker's video job and polls it (progress,
@@ -145,7 +173,41 @@ struct Options {
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
   /// Preview poll for the progress of image jobs.
   std::chrono::milliseconds progress_poll{std::chrono::seconds(1)};
+  /// Result media of finished, not kept jobs are deleted this long after
+  /// completed_at; zero = never.
+  std::chrono::seconds expire_after{std::chrono::hours(12)};
 };
+
+/// GET /v1/jobs and DELETE /v1/jobs filters (empty = not set).
+struct Filter {
+  std::string status;
+  /// Case-insensitive text over metadata.titel, metadata.prompt, model, id.
+  std::string q;
+  std::string seite;
+  std::string geraet;
+  /// image, music, speech, video, other (German names accepted too).
+  std::string kind;
+  /// created_at >= since, created_at < before (unix seconds).
+  long long since{0};
+  long long before{0};
+  /// Finished before this unix second (bulk delete).
+  long long older_than{0};
+
+  bool any() const {
+    return !status.empty() || !q.empty() || !seite.empty() ||
+           !geraet.empty() || !kind.empty() || since > 0 || before > 0 ||
+           older_than > 0;
+  }
+};
+
+/// The job kind the pages derive from request.path: image, music, speech,
+/// video or other.
+std::string KindOf(std::string_view path);
+
+/// "3600" (an age in seconds), "1762800000" (unix seconds) or ISO 8601
+/// ("2026-11-10T08:00:00Z", "2026-11-10 08:00", "2026-11-10"): the cutoff
+/// as unix seconds; nullopt for anything else.
+std::optional<long long> ParseCutoff(std::string_view text, long long now);
 
 class JobQueue {
 public:
@@ -163,6 +225,14 @@ public:
   std::optional<server::HttpResponse> Handle(
       const server::HttpRequest& request);
 
+  /// Called from the router's supervision loop: runs the expiry about once
+  /// a minute (the first pass shortly after the start).
+  void Tick();
+  /// Deletes the result media of finished, not kept jobs whose completed_at
+  /// is at least `expire_after` before `now` (unix seconds); the number of
+  /// jobs that expired. Never touches kept or younger jobs.
+  std::size_t ExpireFiles(long long now);
+
   struct Job;
 
 private:
@@ -170,11 +240,19 @@ private:
   server::HttpResponse List(const server::HttpRequest& request);
   server::HttpResponse Get(const std::string& id);
   server::HttpResponse Cancel(const std::string& id);
+  server::HttpResponse Keep(const std::string& id, const std::string& body);
+  server::HttpResponse Delete(const std::string& id);
+  server::HttpResponse BulkDelete(const server::HttpRequest& request);
   server::HttpResponse File(const std::string& id, const std::string& name);
+  /// Drops the job from every index (mutex held); the caller removes its
+  /// folder after unlocking.
+  void ForgetLocked(const std::shared_ptr<Job>& job);
+  bool MatchesLocked(const Job& job, const Filter& filter) const;
 
   void RunnerMain();
   void Execute(const std::shared_ptr<Job>& job);
   void RunVideo(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunMusic(const std::shared_ptr<Job>& job, const FetchResult& created);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string query, std::string body,
                    std::string content_type);
@@ -201,6 +279,10 @@ private:
   std::map<std::string, std::shared_ptr<Job>> jobs_;
   std::map<std::string, std::string> idempotency_;
   std::deque<std::shared_ptr<Job>> pending_;
+  /// Learned seconds per "<path> <model>" for the estimated progress.
+  std::map<std::string, double> durations_;
+  /// Next expiry pass (supervision thread only).
+  std::chrono::steady_clock::time_point next_expiry_{};
   bool stopping_{false};
   std::vector<std::thread> runners_;
   std::thread webhook_thread_;
