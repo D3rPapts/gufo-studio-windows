@@ -29,6 +29,19 @@
 //                                      filter; dry_run=1 only counts;
 //                                      kept jobs need include_kept=1
 //   GET    /v1/jobs/{id}/files/{name}  one result file
+//   GET    /v1/jobs/{id}/thumb         a small preview of the job's first
+//          [?w=256&file=name]          image, video or audio file: JPEG of
+//                                      width w (64..1024) for images and
+//                                      videos (frame at 10 % of the
+//                                      length), a waveform PNG (w x w/3)
+//                                      for audio. Made with ffmpeg
+//                                      (--comfy-ffmpeg; without it 501
+//                                      thumb_unavailable), cached next to
+//                                      the job's files as thumb-<w>.jpg/
+//                                      .png and served with Cache-Control
+//                                      public, max-age=86400. The job JSON
+//                                      carries "thumb_url" when it has
+//                                      such a file.
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -324,6 +337,9 @@ private:
   server::HttpResponse Delete(const std::string& id);
   server::HttpResponse BulkDelete(const server::HttpRequest& request);
   server::HttpResponse File(const std::string& id, const std::string& name);
+  /// GET /v1/jobs/{id}/thumb: the cached preview, or made with ffmpeg.
+  server::HttpResponse Thumb(const std::string& id,
+                             const server::HttpRequest& request);
   /// POST /v1/videos/concat answered at once: the mp4 bytes.
   server::HttpResponse Concat(const server::HttpRequest& request);
   /// Stitches the clips named by `body` into `output` (the job's temp
@@ -371,6 +387,8 @@ private:
   std::map<std::string, double> durations_;
   /// Next expiry pass (supervision thread only).
   std::chrono::steady_clock::time_point next_expiry_{};
+  /// One ffmpeg thumbnail at a time.
+  std::mutex thumb_mutex_;
   bool stopping_{false};
   std::vector<std::thread> runners_;
   std::thread webhook_thread_;

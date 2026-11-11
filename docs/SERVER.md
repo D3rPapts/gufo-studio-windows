@@ -634,6 +634,26 @@ inputs. Errors: `400 invalid_input` (bad list, unknown job, unreadable
 clip), `500 concat_failed` with ffmpeg's last stderr lines. Temporary files
 live under `<jobs-dir>/temp/` and are removed after every call.
 
+### Job thumbnails (`GET /v1/jobs/{id}/thumb`)
+
+A small preview of a job's result so a gallery page does not download the
+full image or video for every card. `?w=` sets the width (64..1024, default
+256), `?file=` picks another of the job's files than the first image, video
+or audio file. Images and videos answer a JPEG of that width with the aspect
+kept (a video gives the frame at 10 % of its length, or at 0.5 s when the
+length is unknown); audio answers a waveform PNG of w x w/3 (ffmpeg
+`showwavespic`, colour `#5b4fc4`, transparent background). The picture is
+made with the ffmpeg from `--comfy-ffmpeg` and kept next to the job's files
+as `thumb-<w>.jpg` / `.png` (`thumb-<w>-<name>` for `?file=`), so every
+later call is served from disk (`X-Gufo-Thumb: cached` instead of
+`generated`), with `Cache-Control: public, max-age=86400`. The thumbs
+expire with the job's media (`--jobs-expire-hours`). Without ffmpeg the
+route answers `501 thumb_unavailable`; an unknown job or file `404`, a
+file that is no image, video or audio `400 thumb_unsupported`, an ffmpeg
+failure `500 thumb_failed`. The job JSON (`GET /v1/jobs`, `GET
+/v1/jobs/{id}`) carries `"thumb_url": "/v1/jobs/{id}/thumb"` when the job
+has such a file and `null` otherwise.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

@@ -1276,6 +1276,56 @@ void TestConcatEndpoint() {
   CHECK(found);
 }
 
+void TestThumb() {
+  Harness h("thumb");
+  const std::string id = h.Submit(ImageJob("a cat")).member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_str("thumb_url") == "/v1/jobs/" + id + "/thumb");
+  // The route exists; the harness has no ffmpeg, so a fresh thumb is 501.
+  HttpResponse answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?w=128");
+  CHECK(answer.status == 501 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "thumb_unavailable");
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?file=image-2.png");
+  CHECK(answer.status == 501);
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?file=missing.png");
+  CHECK(answer.status == 404 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "file_not_found");
+  CHECK(h.Call("GET", "/v1/jobs/" + id + "/thumb?file=response.json").status ==
+        404);
+  CHECK(h.Call("POST", "/v1/jobs/" + id + "/thumb").status == 405);
+  answer = h.Call("GET", "/v1/jobs/job_0123456789abcdef01234567/thumb");
+  CHECK(answer.status == 404 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "job_not_found");
+  // A cached thumb next to the job's files is served without ffmpeg.
+  const std::string bytes = "\xFF\xD8\xFF\xE0 fake jpeg";
+  {
+    std::ofstream out(h.dir / id / "thumb-128.jpg", std::ios::binary);
+    out << bytes;
+  }
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?w=128");
+  CHECK(answer.status == 200 && answer.body == bytes);
+  bool jpeg = false;
+  bool cacheable = false;
+  for (const auto& [name, value] : answer.headers) {
+    jpeg = jpeg || (name == "Content-Type" && value == "image/jpeg");
+    cacheable = cacheable || (name == "Cache-Control" &&
+                              value == "public, max-age=86400");
+  }
+  CHECK(jpeg && cacheable);
+  // Another width is another cache file: still 501 here.
+  CHECK(h.Call("GET", "/v1/jobs/" + id + "/thumb").status == 501);
+  // A job without media has no thumb_url.
+  const std::string chat =
+      h.Submit(R"({"request":{"path":"/v1/chat/completions","body":{"model":"qwen-image","messages":[]}}})")
+          .member_str("id");
+  const json::Value chat_done = json::parse(h.Call("GET", "/v1/jobs/" + chat).body);
+  CHECK(chat_done.find("thumb_url") != nullptr &&
+        chat_done.find("thumb_url")->is_null());
+}
+
 }  // namespace
 
 int main() {
@@ -1304,6 +1354,7 @@ int main() {
   TestMusic();
   TestConcatHelpers();
   TestConcatEndpoint();
+  TestThumb();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;
