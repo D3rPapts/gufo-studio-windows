@@ -42,6 +42,18 @@
 //                                      public, max-age=86400. The job JSON
 //                                      carries "thumb_url" when it has
 //                                      such a file.
+//
+// Pool relay (placement = pool, Options::relay): GET /v1/jobs?scope=pool
+// (or pool=1) merges this router's list with the partner router's (same
+// filters, 3 s), newest first, every job with "owner": "local" or the
+// partner's "http://host:port"; the answer's "partner" names the partner,
+// "unreachable" when it did not answer, "none" without a partner. A job id
+// this router does not know is asked from the partner for GET /v1/jobs/{id},
+// its files and thumb, PATCH/DELETE and POST keep/cancel (10 s for JSON,
+// 10 min for files; 502 partner_unreachable when it cannot be reached);
+// relayed thumbs are cached under DIR/relay-cache/<id>/ for a day. Every
+// relayed request carries X-Gufo-Relay: 1 and a request with that header
+// (or X-Gufo-Forwarded) is never relayed on.
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -217,7 +229,21 @@ struct Options {
   /// answers 500 concat_failed.
   std::filesystem::path ffmpeg;
   std::filesystem::path ffprobe;
+  /// One request to the pool partner router (see the pool relay above):
+  /// its answer, streamed as the proxy gives it, with the response head
+  /// bounded by `head_timeout` and the whole transfer by `total_timeout`;
+  /// nullopt with *error when the partner cannot be reached. Empty = no
+  /// partner.
+  using Relay = std::function<std::optional<server::HttpResponse>(
+      const server::HttpRequest& request, std::chrono::milliseconds head_timeout,
+      std::chrono::milliseconds total_timeout, std::string* error)>;
+  Relay relay;
+  /// "http://host:port" of the partner, as /router/status names it.
+  std::string partner_name;
 };
+
+/// Set on every request relayed to the partner; never relayed on.
+inline constexpr const char* kRelayHeader = "X-Gufo-Relay";
 
 // ------------------------------------------------- video concat helpers
 
@@ -325,6 +351,9 @@ public:
   /// is at least `expire_after` before `now` (unix seconds); the number of
   /// jobs that expired. Never touches kept or younger jobs.
   std::size_t ExpireFiles(long long now);
+  /// Removes relay-cache folders (thumbs of the partner's jobs) untouched
+  /// for a day; runs with the expiry pass.
+  void ExpireRelayCache();
 
   struct Job;
 
@@ -340,6 +369,11 @@ private:
   /// GET /v1/jobs/{id}/thumb: the cached preview, or made with ffmpeg.
   server::HttpResponse Thumb(const std::string& id,
                              const server::HttpRequest& request);
+  /// GET /v1/jobs?scope=pool: this list merged with the partner's.
+  server::HttpResponse PoolList(const server::HttpRequest& request);
+  /// A job this router does not know: the same request to the partner.
+  server::HttpResponse RelayJob(const std::string& id, std::string_view tail,
+                                const server::HttpRequest& request);
   /// POST /v1/videos/concat answered at once: the mp4 bytes.
   server::HttpResponse Concat(const server::HttpRequest& request);
   /// Stitches the clips named by `body` into `output` (the job's temp

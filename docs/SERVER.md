@@ -654,6 +654,26 @@ failure `500 thumb_failed`. The job JSON (`GET /v1/jobs`, `GET
 /v1/jobs/{id}`) carries `"thumb_url": "/v1/jobs/{id}/thumb"` when the job
 has such a file and `null` otherwise.
 
+### Pool relay (`GET /v1/jobs?scope=pool`)
+
+With placement = pool the two routers hold separate job stores; one page
+reads both through either router. `GET /v1/jobs?scope=pool` (or `pool=1`)
+merges this router's list with the partner's (the remote twin of the pool
+presets, asked with the same filters and a 3 s limit), newest first, each
+job with `"owner": "local"` or the partner's `"http://host:port"` as
+`/router/status` names it; the answer's `"partner"` field is that address,
+`"unreachable"` when the partner did not answer (the local jobs still
+come), or `"none"` without a partner. A job id this router does not know
+is asked from the partner for `GET /v1/jobs/{id}`, `GET
+/v1/jobs/{id}/files/{name}`, `GET /v1/jobs/{id}/thumb`, `PATCH`/`DELETE
+/v1/jobs/{id}` and `POST /v1/jobs/{id}/keep|cancel`; the answer streams
+through with its headers (10 s for JSON, 10 min for files), a partner that
+cannot be reached is `502 partner_unreachable`. Relayed thumbs are kept
+under `<jobs-dir>/relay-cache/<id>/` and removed a day after their last
+use. Every relayed request carries `X-Gufo-Relay: 1`; a request with that
+header (or `X-Gufo-Forwarded`) is answered locally and never relayed on,
+so the two routers cannot loop.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
