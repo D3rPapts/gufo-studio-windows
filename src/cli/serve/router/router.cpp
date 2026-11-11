@@ -3154,7 +3154,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &comfy_dir);
   parser.AddOption("", "--comfy-ffmpeg", "FILE",
                    "ffmpeg for the ComfyUI API: FLAC audio, PNG frames from "
-                   "videos, non-WAV voice references",
+                   "videos, non-WAV voice references; also POST "
+                   "/v1/videos/concat (ffprobe is expected next to it)",
                    "Router", &comfy_ffmpeg);
   parser.AddOption("", "--jobs-dir", "DIR",
                    "Serve the job API (/v1/jobs): wrapped image, video, "
@@ -3488,6 +3489,21 @@ int RunRouter(std::span<const char* const> args) {
     jobs_options.webhook_timeout = std::chrono::seconds(
         std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
     jobs_options.expire_after = std::chrono::hours(jobs_expire_hours);
+    if (!comfy_ffmpeg.empty()) {
+      // POST /v1/videos/concat: ffprobe lives next to ffmpeg.
+      jobs_options.ffmpeg = comfy_ffmpeg;
+      std::filesystem::path probe = comfy_ffmpeg;
+      probe.replace_filename(std::filesystem::path("ffprobe") +=
+                             comfy_ffmpeg.extension());
+      std::error_code probe_ec;
+      if (std::filesystem::is_regular_file(probe, probe_ec))
+        jobs_options.ffprobe = probe;
+      else
+        std::cerr << "Warning: --comfy-ffmpeg: no ffprobe next to "
+                  << comfy_ffmpeg.string()
+                  << "; POST /v1/videos/concat answers concat_failed
+";
+    }
     try {
       state->jobs =
           std::make_unique<router::jobs::JobQueue>(std::move(jobs_options));

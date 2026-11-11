@@ -2,10 +2,12 @@
 // target checks (SSRF), Standard Webhooks signatures, the job life cycle
 // against a fake router API and a fake webhook receiver, and the result
 // store: keep flag, expiry, delete (single and bulk), list filters, music
-// progress and the estimated progress.
+// progress, the estimated progress and the video concat helpers (URL to
+// job file, ffprobe parsing, copy vs re-encode; no ffmpeg runs here).
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -1115,6 +1117,164 @@ void TestMusic() {
   CHECK(polled && content);
 }
 
+void TestConcatHelpers() {
+  // URL -> job file: relative, absolute (any host), query/fragment dropped.
+  auto ref = jobs::ParseJobFileUrl(
+      "/v1/jobs/job_0123456789abcdef01234567/files/video.mp4");
+  CHECK(ref && ref->id == "job_0123456789abcdef01234567" &&
+        ref->name == "video.mp4");
+  ref = jobs::ParseJobFileUrl(
+      "http://192.168.178.198:8081/v1/jobs/job_abc/files/video.mp4?x=1");
+  CHECK(ref && ref->id == "job_abc" && ref->name == "video.mp4");
+  ref = jobs::ParseJobFileUrl("https://host/v1/jobs/job_abc/files/clip-2.mp4#t");
+  CHECK(ref && ref->name == "clip-2.mp4");
+  for (const char* bad :
+       {"/v1/jobs/job_abc", "/v1/jobs/job_abc/files/",
+        "/v1/jobs/job_abc/files/request.body",
+        "/v1/jobs/job_abc/files/response.json",
+        "/v1/jobs/job_abc/files/../x", "/v1/jobs/job_abc/files/Video.MP4",
+        "/v1/jobs/nope/files/video.mp4", "/v1/jobs//files/video.mp4",
+        "ftp://h/v1/jobs/job_abc/files/video.mp4", "/v1/videos/x",
+        "http://host", "", "data:video/mp4;base64,AAAA"}) {
+    if (jobs::ParseJobFileUrl(bad)) {
+      std::cerr << "accepted bad job file url: " << bad << "\n";
+      ++failures;
+    }
+  }
+  // Data URLs: base64 only, media type without parameters.
+  std::string type;
+  auto data = jobs::ParseDataUrl("data:video/mp4;base64,RkFLRQ==", &type);
+  CHECK(data && *data == "FAKE" && type == "video/mp4");
+  data = jobs::ParseDataUrl("data:Video/MP4;charset=x;base64,RkFLRQ==", &type);
+  CHECK(data && type == "video/mp4");
+  CHECK(!jobs::ParseDataUrl("data:video/mp4,plain", &type));
+  CHECK(!jobs::ParseDataUrl("data:video/mp4;base64,***", &type));
+  CHECK(!jobs::ParseDataUrl("/v1/jobs/job_abc/files/video.mp4", &type));
+  // Frame rates.
+  CHECK(std::fabs(jobs::FrameRateValue("30000/1001") - 29.97) < 0.001);
+  CHECK(jobs::FrameRateValue("25") == 25);
+  CHECK(jobs::FrameRateValue("0/0") == 0);
+  CHECK(jobs::FrameRateValue("abc") == 0);
+  CHECK(jobs::FrameRateValue("24/") == 0);
+  // ffprobe JSON (numbers as strings, as ffprobe prints them).
+  const char* probe =
+      R"({"streams":[{"codec_type":"video","codec_name":"h264","width":832,)"
+      R"("height":480,"r_frame_rate":"24/1","avg_frame_rate":"24/1",)"
+      R"("pix_fmt":"yuv420p","duration":"5.000000"},{"codec_type":"audio",)"
+      R"("codec_name":"aac","sample_rate":"48000","channels":2}],)"
+      R"("format":{"duration":"5.040000"}})";
+  jobs::ProbeInfo a;
+  std::string error;
+  CHECK(jobs::ParseProbe(probe, &a, &error));
+  CHECK(a.video_codec == "h264" && a.width == 832 && a.height == 480 &&
+        a.frame_rate == "24/1" && a.pix_fmt == "yuv420p" && a.has_audio &&
+        a.audio_codec == "aac" && a.sample_rate == 48000 && a.channels == 2 &&
+        std::fabs(a.duration - 5.04) < 1e-6);
+  jobs::ProbeInfo silent;
+  CHECK(jobs::ParseProbe(
+      R"({"streams":[{"codec_type":"video","codec_name":"h264","width":832,)"
+      R"("height":480,"r_frame_rate":"24/1","pix_fmt":"yuv420p",)"
+      R"("duration":"3.5"}]})",
+      &silent, &error));
+  CHECK(!silent.has_audio && std::fabs(silent.duration - 3.5) < 1e-6);
+  jobs::ProbeInfo none;
+  CHECK(!jobs::ParseProbe(R"({"streams":[{"codec_type":"audio"}]})", &none,
+                          &error) &&
+        error == "no video stream");
+  CHECK(!jobs::ParseProbe("not json", &none, &error));
+  CHECK(!jobs::ParseProbe(
+      R"({"streams":[{"codec_type":"video","width":0,"height":0}]})", &none,
+      &error));
+  // Same parameters -> copy; anything else, or reencode=true -> reencode.
+  jobs::ProbeInfo b = a;
+  CHECK(jobs::ConcatMode({a, b}, false) == "copy");
+  CHECK(jobs::ConcatMode({a, b}, true) == "reencode");
+  b.frame_rate = "48/2";
+  CHECK(jobs::ConcatMode({a, b}, false) == "copy");
+  b = a;
+  b.width = 1280;
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.frame_rate = "25/1";
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.video_codec = "hevc";
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.pix_fmt = "yuv444p";
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.has_audio = false;
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.sample_rate = 44100;
+  CHECK(jobs::ConcatMode({a, b}, false) == "reencode");
+  b = a;
+  b.channels = 1;
+  CHECK(jobs::ConcatMode({a, a, b}, false) == "reencode");
+  CHECK(jobs::ConcatMode({silent, silent}, false) == "copy");
+  CHECK(jobs::ConcatMode({}, false) == "reencode");
+}
+
+void TestConcatEndpoint() {
+  Harness h("concat");
+  // The input list is checked before any ffmpeg call (none is configured).
+  HttpResponse answer = h.Call("GET", "/v1/videos/concat");
+  CHECK(answer.status == 405);
+  answer = h.Call("POST", "/v1/videos/concat", "nope");
+  CHECK(answer.status == 400);
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":["/v1/jobs/job_abc/files/video.mp4"]})");
+  CHECK(answer.status == 400 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "invalid_input");
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":["/v1/jobs/job_abc/files/video.mp4",)"
+                  R"("/v1/jobs/job_def/files/video.mp4"]})");
+  CHECK(answer.status == 400 &&
+        answer.body.find("not on this router") != std::string::npos);
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":["/v1/jobs/job_abc/files/video.mp4",)"
+                  R"("/v1/jobs/job_def/files/video.mp4"],"output_format":"webm"})");
+  CHECK(answer.status == 400 &&
+        answer.body.find("output_format") != std::string::npos);
+  // A finished video job of this router resolves; then ffmpeg is missing.
+  const std::string video =
+      h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")
+          .member_str("id");
+  h.WaitFor(video, "completed");
+  const std::string file = "/v1/jobs/" + video + "/files/video.mp4";
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":[")" + file + R"(","http://127.0.0.1:8081)" +
+                      file + R"("]})");
+  CHECK(answer.status == 500 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "concat_failed" &&
+        answer.body.find("ffmpeg") != std::string::npos);
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":[")" + file + R"(","/v1/jobs/)" + video +
+                      R"(/files/missing.mp4"]})");
+  CHECK(answer.status == 400 &&
+        answer.body.find("has no file") != std::string::npos);
+  // As a job: no model, lands in the store as kind video, fails like the
+  // direct call.
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/videos/concat","body":{"videos":[")" +
+               file + R"(","/v1/jobs/job_abc/files/video.mp4"]}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "failed");
+  const json::Value* error = done.find("error");
+  CHECK(error != nullptr && error->member_str("code") == "invalid_input");
+  CHECK(error->member_double("status_code") == 400);
+  CHECK(done.find("request")->member_str("path") == "/v1/videos/concat");
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?kind=video").body);
+  bool found = false;
+  for (const json::Value& job : listed.find("data")->items())
+    found = found || job.member_str("id") == id;
+  CHECK(found);
+}
+
 }  // namespace
 
 int main() {
@@ -1141,6 +1301,8 @@ int main() {
   TestListFilters();
   TestEstimatedProgress();
   TestMusic();
+  TestConcatHelpers();
+  TestConcatEndpoint();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;

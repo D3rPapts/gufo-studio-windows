@@ -612,6 +612,28 @@ person is `"unbekannt"`. Each person returns `name`, `box` (face),
 ccip request (~165 MB host RAM) and answers 503 `ccip_unavailable` when they
 are missing. `--ccip-threads` (default 8) bounds the CPU threads.
 
+### Video concat (`POST /v1/videos/concat`)
+
+The front joins several finished clips into one mp4 itself, with the ffmpeg
+given by `--comfy-ffmpeg` (ffprobe is expected next to it). The body names
+2 to 20 inputs: `{"videos": ["/v1/jobs/{id}/files/video.mp4", ...],
+"output_format": "mp4", "reencode": false}`. Each input is a result file of
+a completed job of this router (the path, or the same URL with scheme and
+host; the job id is resolved locally and anything else is `400
+invalid_input`) or a `data:video/mp4;base64,...` URL of at most 64 MiB
+(the request body still has to pass `--max-request-bytes`). The front
+probes every clip; when all share codec, size, frame rate, pixel format and
+audio layout they are joined without re-encoding (concat demuxer, `-c
+copy`), otherwise, or with `"reencode": true`, every clip is scaled and
+padded to the first one, re-encoded with libx264 (`-crf 18`) and AAC, and a
+clip without audio gets silence so the sound of the others is kept. The
+direct call answers the mp4 (`Content-Disposition: attachment;
+filename="video.mp4"`); wrapped in `POST /v1/jobs` (no `model` needed) the
+result file is `video.mp4` and `response.json` lists the mode and the probed
+inputs. Errors: `400 invalid_input` (bad list, unknown job, unreadable
+clip), `500 concat_failed` with ffmpeg's last stderr lines. Temporary files
+live under `<jobs-dir>/temp/` and are removed after every call.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

@@ -2,6 +2,12 @@
 
 #include "src/core/platform/net.hpp"
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#endif
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -103,7 +109,13 @@ constexpr std::string_view kJobPaths[] = {
     "/v1/responses",          "/v1/messages",
     "/v1/audio/foley",        "/v1/images/upscale",
     "/v1/videos/upscale",     "/v1/audio/convert",
-    "/v1/audio/separate"};
+    "/v1/audio/separate",     "/v1/videos/concat"};
+
+/// Answered by the job store itself (ffmpeg), not by a worker.
+constexpr std::string_view kConcatPath = "/v1/videos/concat";
+constexpr std::size_t kConcatMinInputs = 2;
+constexpr std::size_t kConcatMaxInputs = 20;
+constexpr std::size_t kConcatMaxDataUrl = 64 * 1024 * 1024;
 
 long long NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -364,6 +376,228 @@ bool IsKeptFile(std::string_view name) {
   return name == "request.body" || name == "response.json";
 }
 
+/// Result names are ours ([a-z0-9._-]); request.body is never served.
+bool ValidFileName(std::string_view name) {
+  return !name.empty() && name.size() <= 64 && name != "request.body" &&
+         name.front() != '.' &&
+         std::all_of(name.begin(), name.end(), [](char c) {
+           return std::islower(static_cast<unsigned char>(c)) ||
+                  std::isdigit(static_cast<unsigned char>(c)) || c == '.' ||
+                  c == '-' || c == '_';
+         });
+}
+
+/// The last `limit` bytes of `text`, cut at a line start, for error texts.
+std::string TailOf(std::string_view text, std::size_t limit) {
+  while (!text.empty() &&
+         (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+    text.remove_suffix(1);
+  if (text.size() > limit) {
+    text.remove_prefix(text.size() - limit);
+    if (const auto nl = text.find('\n'); nl != std::string_view::npos)
+      text.remove_prefix(nl + 1);
+  }
+  return std::string(text);
+}
+
+#if defined(_WIN32)
+/// Appends one argument to a CreateProcess command line (MS quoting rules).
+void AppendArgumentW(std::wstring& command, const std::wstring& arg) {
+  if (!command.empty())
+    command.push_back(L' ');
+  const bool plain =
+      !arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos;
+  if (plain) {
+    command += arg;
+    return;
+  }
+  command.push_back(L'"');
+  std::size_t backslashes = 0;
+  for (const wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'"') {
+      command.append(backslashes * 2 + 1, L'\\');
+    } else {
+      command.append(backslashes, L'\\');
+    }
+    backslashes = 0;
+    command.push_back(c);
+  }
+  command.append(backslashes * 2, L'\\');
+  command.push_back(L'"');
+}
+
+HANDLE OpenInheritable(const fs::path& path, bool write) {
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+  return CreateFileW(path.wstring().c_str(),
+                     write ? GENERIC_WRITE : GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes,
+                     write ? CREATE_ALWAYS : OPEN_EXISTING,
+                     FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+/// Runs `exe` with `args` (never through a shell), stdout and stderr into
+/// the two files, stdin from NUL. Exit code, or -1 with *error when the
+/// process could not start, timed out or was cancelled.
+int RunCaptured(const fs::path& exe, const std::vector<fs::path>& args,
+                std::chrono::minutes timeout, const fs::path& stdout_file,
+                const fs::path& stderr_file, std::atomic<bool>* cancel,
+                std::string* error) {
+  std::wstring command;
+  AppendArgumentW(command, exe.wstring());
+  for (const fs::path& arg : args)
+    AppendArgumentW(command, arg.wstring());
+  HANDLE in = OpenInheritable("NUL", false);
+  HANDLE out = OpenInheritable(stdout_file, true);
+  HANDLE err = OpenInheritable(stderr_file, true);
+  const auto close_all = [&] {
+    for (HANDLE handle : {in, out, err})
+      if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+  };
+  if (out == INVALID_HANDLE_VALUE || err == INVALID_HANDLE_VALUE) {
+    close_all();
+    *error = "cannot open the output files for " + exe.filename().string();
+    return -1;
+  }
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = in;
+  startup.hStdOutput = out;
+  startup.hStdError = err;
+  PROCESS_INFORMATION process{};
+  const BOOL started =
+      CreateProcessW(exe.wstring().c_str(), command.data(), nullptr, nullptr,
+                     TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                     &process);
+  const DWORD start_error = GetLastError();
+  close_all();
+  if (!started) {
+    *error = "cannot start " + exe.string() + " (error " +
+             std::to_string(start_error) + ")";
+    return -1;
+  }
+  CloseHandle(process.hThread);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const DWORD waited = WaitForSingleObject(process.hProcess, 200);
+    if (waited == WAIT_OBJECT_0)
+      break;
+    const bool cancelled = cancel != nullptr && cancel->load();
+    if (cancelled || std::chrono::steady_clock::now() > deadline) {
+      TerminateProcess(process.hProcess, 1);
+      WaitForSingleObject(process.hProcess, 5000);
+      CloseHandle(process.hProcess);
+      *error = cancelled ? "cancelled" : exe.filename().string() + " timed out";
+      return -1;
+    }
+  }
+  DWORD code = 1;
+  GetExitCodeProcess(process.hProcess, &code);
+  CloseHandle(process.hProcess);
+  return static_cast<int>(code);
+}
+#else
+int RunCaptured(const fs::path& exe, const std::vector<fs::path>& args,
+                std::chrono::minutes timeout, const fs::path& stdout_file,
+                const fs::path& stderr_file, std::atomic<bool>* cancel,
+                std::string* error) {
+  std::vector<std::string> storage{exe.string()};
+  for (const fs::path& arg : args)
+    storage.push_back(arg.string());
+  std::vector<char*> argv;
+  for (std::string& item : storage)
+    argv.push_back(item.data());
+  argv.push_back(nullptr);
+  const int out = open(stdout_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const int err = open(stderr_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const int in = open("/dev/null", O_RDONLY);
+  if (out < 0 || err < 0 || in < 0) {
+    for (const int fd : {out, err, in})
+      if (fd >= 0)
+        close(fd);
+    *error = "cannot open the output files for " + exe.filename().string();
+    return -1;
+  }
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(out);
+    close(err);
+    close(in);
+    *error = "fork failed";
+    return -1;
+  }
+  if (pid == 0) {
+    dup2(in, STDIN_FILENO);
+    dup2(out, STDOUT_FILENO);
+    dup2(err, STDERR_FILENO);
+    execv(argv[0], argv.data());
+    _exit(127);
+  }
+  close(out);
+  close(err);
+  close(in);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    int status = 0;
+    const pid_t done = waitpid(pid, &status, WNOHANG);
+    if (done == pid) {
+      if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+      *error = exe.filename().string() + " was killed";
+      return -1;
+    }
+    const bool cancelled = cancel != nullptr && cancel->load();
+    if (cancelled || std::chrono::steady_clock::now() > deadline) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      *error = cancelled ? "cancelled" : exe.filename().string() + " timed out";
+      return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+#endif
+
+std::string ReadIfThere(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return "";
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+/// Removes the concat work folder however the work ends.
+struct TempDir {
+  fs::path path;
+  ~TempDir() {
+    std::error_code ec;
+    fs::remove_all(path, ec);
+  }
+};
+
+/// ffprobe prints numbers as strings ("48000") or as numbers; both count.
+double NumberOf(const json::Value& object, const std::string& key) {
+  const json::Value* value = object.find(key);
+  if (value == nullptr)
+    return 0;
+  if (value->is_number())
+    return value->as_double();
+  if (value->is_string()) {
+    const std::string& text = value->str();
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    return end != text.c_str() && std::isfinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
 std::string DurationKey(std::string_view path, std::string_view model) {
   return std::string(path) + " " + std::string(model);
 }
@@ -430,6 +664,163 @@ std::string KindOf(std::string_view path) {
   if (path.starts_with("/v1/videos"))
     return "video";
   return "other";
+}
+
+std::optional<JobFileRef> ParseJobFileUrl(std::string_view url) {
+  std::string_view path = url;
+  if (const auto scheme = path.find("://"); scheme != std::string_view::npos) {
+    // Only http(s) URLs carry a path we read; the host is not checked (the
+    // job must exist here anyway).
+    const std::string name = Lower(path.substr(0, scheme));
+    if (name != "http" && name != "https")
+      return std::nullopt;
+    const auto slash = path.find('/', scheme + 3);
+    if (slash == std::string_view::npos)
+      return std::nullopt;
+    path = path.substr(slash);
+  }
+  if (const auto cut = path.find_first_of("?#"); cut != std::string_view::npos)
+    path = path.substr(0, cut);
+  constexpr std::string_view kPrefix = "/v1/jobs/";
+  if (!path.starts_with(kPrefix))
+    return std::nullopt;
+  path.remove_prefix(kPrefix.size());
+  const auto slash = path.find('/');
+  if (slash == std::string_view::npos)
+    return std::nullopt;
+  JobFileRef ref;
+  ref.id = std::string(path.substr(0, slash));
+  const std::string_view rest = path.substr(slash);
+  constexpr std::string_view kFiles = "/files/";
+  if (!rest.starts_with(kFiles))
+    return std::nullopt;
+  ref.name = std::string(rest.substr(kFiles.size()));
+  if (!ValidJobId(ref.id) || !ValidFileName(ref.name) ||
+      IsKeptFile(ref.name))
+    return std::nullopt;
+  return ref;
+}
+
+std::optional<std::string> ParseDataUrl(std::string_view url,
+                                        std::string* media_type) {
+  if (!url.starts_with("data:"))
+    return std::nullopt;
+  const auto comma = url.find(',');
+  if (comma == std::string_view::npos)
+    return std::nullopt;
+  const std::string_view header = url.substr(5, comma - 5);
+  bool base64 = false;
+  std::string type;
+  std::size_t start = 0;
+  while (start <= header.size()) {
+    const auto end = std::min(header.find(';', start), header.size());
+    const std::string_view part = header.substr(start, end - start);
+    if (start == 0)
+      type = Lower(part);
+    else if (part == "base64")
+      base64 = true;
+    start = end + 1;
+  }
+  if (!base64)
+    return std::nullopt;
+  auto bytes = comfy::Base64Decode(url.substr(comma + 1));
+  if (!bytes)
+    return std::nullopt;
+  if (media_type != nullptr)
+    *media_type = type;
+  return bytes;
+}
+
+double FrameRateValue(std::string_view text) {
+  const std::string copy(text);
+  char* end = nullptr;
+  const double numerator = std::strtod(copy.c_str(), &end);
+  if (end == copy.c_str() || !std::isfinite(numerator) || numerator <= 0)
+    return 0;
+  if (*end == '\0')
+    return numerator;
+  if (*end != '/')
+    return 0;
+  char* end2 = nullptr;
+  const double denominator = std::strtod(end + 1, &end2);
+  if (end2 == end + 1 || *end2 != '\0' || !std::isfinite(denominator) ||
+      denominator <= 0)
+    return 0;
+  return numerator / denominator;
+}
+
+bool ParseProbe(std::string_view text, ProbeInfo* out, std::string* error) {
+  json::Value parsed;
+  try {
+    parsed = json::parse(std::string(text));
+  } catch (const std::exception& failure) {
+    *error = std::string("ffprobe output is not JSON: ") + failure.what();
+    return false;
+  }
+  ProbeInfo info;
+  bool video = false;
+  double stream_duration = 0;
+  if (const json::Value* streams = parsed.find("streams");
+      streams != nullptr && streams->is_array()) {
+    for (const json::Value& stream : streams->items()) {
+      if (!stream.is_object())
+        continue;
+      const std::string type = stream.member_str("codec_type");
+      if (type == "video" && !video) {
+        video = true;
+        info.video_codec = stream.member_str("codec_name");
+        info.width = static_cast<int>(NumberOf(stream, "width"));
+        info.height = static_cast<int>(NumberOf(stream, "height"));
+        info.frame_rate = stream.member_str("r_frame_rate");
+        if (FrameRateValue(info.frame_rate) <= 0)
+          info.frame_rate = stream.member_str("avg_frame_rate");
+        info.pix_fmt = stream.member_str("pix_fmt");
+        stream_duration = NumberOf(stream, "duration");
+      } else if (type == "audio" && !info.has_audio) {
+        info.has_audio = true;
+        info.audio_codec = stream.member_str("codec_name");
+        info.sample_rate = static_cast<int>(NumberOf(stream, "sample_rate"));
+        info.channels = static_cast<int>(NumberOf(stream, "channels"));
+      }
+    }
+  }
+  if (!video) {
+    *error = "no video stream";
+    return false;
+  }
+  if (info.width <= 0 || info.height <= 0 ||
+      FrameRateValue(info.frame_rate) <= 0) {
+    *error = "video stream without size or frame rate";
+    return false;
+  }
+  if (const json::Value* format = parsed.find("format");
+      format != nullptr && format->is_object())
+    info.duration = NumberOf(*format, "duration");
+  if (info.duration <= 0)
+    info.duration = stream_duration;
+  *out = std::move(info);
+  return true;
+}
+
+std::string ConcatMode(const std::vector<ProbeInfo>& inputs, bool reencode) {
+  if (reencode || inputs.empty())
+    return "reencode";
+  const ProbeInfo& first = inputs.front();
+  const double fps = FrameRateValue(first.frame_rate);
+  for (const ProbeInfo& input : inputs) {
+    const bool same_video =
+        input.video_codec == first.video_codec && input.width == first.width &&
+        input.height == first.height && input.pix_fmt == first.pix_fmt &&
+        std::fabs(FrameRateValue(input.frame_rate) - fps) < 1e-3;
+    const bool same_audio =
+        input.has_audio == first.has_audio &&
+        (!first.has_audio || (input.audio_codec == first.audio_codec &&
+                              input.sample_rate == first.sample_rate &&
+                              input.channels == first.channels));
+    if (!same_video || !same_audio)
+      return "reencode";
+  }
+  return "copy";
 }
 
 std::optional<long long> ParseCutoff(std::string_view text, long long now) {
@@ -833,9 +1224,21 @@ fs::path JobQueue::JobDir(const std::string& id) const {
 
 std::optional<HttpResponse> JobQueue::Handle(const HttpRequest& request) {
   const std::string_view path = request.path;
+  const std::string& method = request.method;
+  if (path == kConcatPath) {
+    if (method != "POST")
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "method_not_allowed");
+    try {
+      return Concat(request);
+    } catch (const std::exception& error) {
+      Logger::Warn("jobs", std::string("event=request_failed path=") +
+                               request.path + " error=" + error.what());
+      return Err(500, "Internal Server Error", error.what(), "concat_failed");
+    }
+  }
   if (path != "/v1/jobs" && !path.starts_with("/v1/jobs/"))
     return std::nullopt;
-  const std::string& method = request.method;
   try {
     if (path == "/v1/jobs") {
       if (method == "POST")
@@ -975,10 +1378,12 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       }
     }
   }
-  if (job->model.empty())
+  // The video concat runs on the router itself (ffmpeg), without a model.
+  const bool needs_model = job->path != kConcatPath;
+  if (needs_model && job->model.empty())
     return Err(400, "Bad Request", "missing 'model' in the wrapped request",
                "missing_model");
-  if (!options_.models.empty() &&
+  if (needs_model && !options_.models.empty() &&
       std::find(options_.models.begin(), options_.models.end(), job->model) ==
           options_.models.end())
     return Err(404, "Not Found", "unknown model '" + job->model + "'",
@@ -1291,17 +1696,9 @@ HttpResponse JobQueue::File(const std::string& id, const std::string& name) {
     if (!jobs_.contains(id))
       return Err(404, "Not Found", "job not found", "job_not_found");
   }
-  // Result names are ours ([a-z0-9.-]); request.body is not served.
-  const bool ok = !name.empty() && name.size() <= 64 &&
-                  name != "request.body" && name.front() != '.' &&
-                  std::all_of(name.begin(), name.end(), [](char c) {
-                    return std::islower(static_cast<unsigned char>(c)) ||
-                           std::isdigit(static_cast<unsigned char>(c)) ||
-                           c == '.' || c == '-' || c == '_';
-                  });
   const fs::path file = JobDir(id) / name;
   std::error_code ec;
-  if (!ok || !fs::is_regular_file(file, ec))
+  if (!ValidFileName(name) || !fs::is_regular_file(file, ec))
     return Err(404, "Not Found", "file not found", "file_not_found");
   return HttpResponse{.status = 200,
                       .reason = "OK",
@@ -1634,6 +2031,10 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
   } done_log{job, mutex_, started};
   try {
     std::string payload = ReadAll(JobDir(job->id) / "request.body");
+    if (job->path == kConcatPath) {
+      RunConcat(job, payload);
+      return;
+    }
     // Image progress: the live preview's step, polled under the job id. A
     // request that brings its own preview id keeps it (and no progress).
     std::string with_preview;
@@ -1932,6 +2333,345 @@ void JobQueue::RunMusic(const std::shared_ptr<Job>& job,
   result["content_type"] = ContentTypeFor(name);
   result["files"] = std::move(files);
   result["response"] = std::move(final_status);
+  Finish(job, "completed", std::move(result), json::Value());
+}
+
+// ----------------------------------------------------------- video concat
+
+void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
+                            std::atomic<bool>* cancel, json::Value* summary) {
+  const auto invalid = [](const std::string& message) {
+    return JobFailure(message, "invalid_input", 400);
+  };
+  const auto failed = [](const std::string& message) {
+    return JobFailure(message, "concat_failed", 500);
+  };
+  const auto check_cancel = [&] {
+    if (cancel != nullptr && cancel->load())
+      throw Cancelled();
+  };
+  if (!body.is_object())
+    throw invalid("request body must be a JSON object");
+  const json::Value* videos = body.find("videos");
+  if (videos == nullptr || !videos->is_array())
+    throw invalid("'videos' must be an array of job file URLs or data URLs");
+  if (videos->size() < kConcatMinInputs || videos->size() > kConcatMaxInputs)
+    throw invalid("'videos' needs " + std::to_string(kConcatMinInputs) +
+                  " to " + std::to_string(kConcatMaxInputs) + " entries");
+  if (const json::Value* format = body.find("output_format");
+      format != nullptr && !format->is_null() &&
+      (!format->is_string() || Lower(format->str()) != "mp4"))
+    throw invalid("'output_format' must be \"mp4\"");
+  bool reencode = false;
+  if (const json::Value* flag = body.find("reencode");
+      flag != nullptr && !flag->is_null()) {
+    if (!flag->is_bool())
+      throw invalid("'reencode' must be true or false");
+    reencode = flag->as_bool();
+  }
+
+  // Inputs: a result file of a finished job here, or a data URL. Each is
+  // resolved first so a bad list fails before any ffmpeg call.
+  struct Input {
+    fs::path source;  // empty for data URLs
+    std::string bytes;
+    std::string label;
+  };
+  std::vector<Input> inputs;
+  int index = 0;
+  for (const json::Value& item : videos->items()) {
+    ++index;
+    const std::string where = "videos[" + std::to_string(index - 1) + "]";
+    if (!item.is_string())
+      throw invalid(where + " must be a string");
+    const std::string& text = item.str();
+    Input input;
+    if (text.starts_with("data:")) {
+      std::string type;
+      auto bytes = ParseDataUrl(text, &type);
+      if (!bytes)
+        throw invalid(where + " is not a base64 data URL");
+      if (bytes->size() > kConcatMaxDataUrl)
+        throw invalid(where + " exceeds " +
+                      std::to_string(kConcatMaxDataUrl / (1024 * 1024)) +
+                      " MiB");
+      if (!type.empty() && !type.starts_with("video/") &&
+          type != "application/octet-stream")
+        throw invalid(where + " has media type " + type + ", not video/*");
+      input.bytes = std::move(*bytes);
+      input.label = "data URL " + std::to_string(input.bytes.size()) + " bytes";
+    } else {
+      const auto ref = ParseJobFileUrl(text);
+      if (!ref)
+        throw invalid(where + " must be /v1/jobs/{id}/files/{name} of this "
+                              "router or a data URL");
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = jobs_.find(ref->id);
+        if (it == jobs_.end())
+          throw invalid(where + ": job " + ref->id + " is not on this router");
+        if (it->second->status != "completed")
+          throw invalid(where + ": job " + ref->id + " is " +
+                        it->second->status + ", not completed");
+        if (it->second->expired_at != 0)
+          throw invalid(where + ": the files of job " + ref->id +
+                        " have expired");
+      }
+      input.source = JobDir(ref->id) / ref->name;
+      std::error_code ec;
+      if (!fs::is_regular_file(input.source, ec))
+        throw invalid(where + ": job " + ref->id + " has no file " +
+                      ref->name);
+      input.label = "/v1/jobs/" + ref->id + "/files/" + ref->name;
+    }
+    inputs.push_back(std::move(input));
+  }
+  check_cancel();
+
+  if (options_.ffmpeg.empty() || options_.ffprobe.empty())
+    throw failed("video concat needs ffmpeg and ffprobe (--comfy-ffmpeg)");
+
+  // Work folder: the clips under short names (the concat list needs no
+  // quoting then), probes, the list and ffmpeg's output.
+  TempDir work{options_.root / "temp" /
+               ("concat-" + NewJobId().substr(4, 12))};
+  std::error_code ec;
+  fs::create_directories(work.path, ec);
+  if (ec)
+    throw failed("cannot create " + work.path.string() + ": " + ec.message());
+  std::vector<fs::path> clips;
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const fs::path clip = work.path / ("in-" + std::to_string(i + 1) + ".mp4");
+    if (inputs[i].source.empty()) {
+      WriteAll(clip, inputs[i].bytes);
+      inputs[i].bytes.clear();
+    } else {
+      fs::create_hard_link(inputs[i].source, clip, ec);
+      if (ec) {
+        ec.clear();
+        fs::copy_file(inputs[i].source, clip, ec);
+        if (ec)
+          throw failed("cannot copy " + inputs[i].label + ": " + ec.message());
+      }
+    }
+    clips.push_back(clip);
+  }
+
+  // Probe every clip.
+  std::vector<ProbeInfo> infos;
+  for (std::size_t i = 0; i < clips.size(); ++i) {
+    check_cancel();
+    const fs::path out =
+        work.path / ("probe-" + std::to_string(i + 1) + ".json");
+    const fs::path err =
+        work.path / ("probe-" + std::to_string(i + 1) + ".err");
+    std::string error;
+    const int code = RunCaptured(
+        options_.ffprobe,
+        {"-v", "error", "-print_format", "json", "-show_streams",
+         "-show_format", clips[i]},
+        std::chrono::minutes(2), out, err, cancel, &error);
+    if (error == "cancelled")
+      throw Cancelled();
+    if (code != 0)
+      throw invalid("videos[" + std::to_string(i) + "] (" + inputs[i].label +
+                    ") is not a readable video: " +
+                    (error.empty() ? TailOf(ReadIfThere(err), 600) : error));
+    ProbeInfo info;
+    if (!ParseProbe(ReadIfThere(out), &info, &error))
+      throw invalid("videos[" + std::to_string(i) + "] (" + inputs[i].label +
+                    "): " + error);
+    infos.push_back(std::move(info));
+  }
+  const std::string mode = ConcatMode(infos, reencode);
+  check_cancel();
+
+  std::vector<fs::path> args = {"-hide_banner", "-loglevel", "error",
+                                "-nostdin", "-y"};
+  if (mode == "copy") {
+    std::string list;
+    for (const fs::path& clip : clips)
+      list += "file '" + clip.filename().string() + "'\n";
+    const fs::path list_file = work.path / "list.txt";
+    WriteAll(list_file, list);
+    for (const char* arg : {"-f", "concat", "-safe", "0", "-i"})
+      args.emplace_back(arg);
+    args.push_back(list_file);
+    for (const char* arg : {"-c", "copy", "-movflags", "+faststart"})
+      args.emplace_back(arg);
+  } else {
+    // Every clip is scaled and padded to the first one's size, brought to
+    // its frame rate and yuv420p; audio is resampled to 48 kHz stereo, a
+    // clip without audio gets silence of its length so the concat filter
+    // sees the same streams everywhere.
+    const ProbeInfo& first = infos.front();
+    const bool any_audio =
+        std::any_of(infos.begin(), infos.end(),
+                    [](const ProbeInfo& info) { return info.has_audio; });
+    const std::string size =
+        std::to_string(first.width) + ":" + std::to_string(first.height);
+    std::string filter;
+    std::string joined;
+    for (std::size_t i = 0; i < clips.size(); ++i) {
+      args.emplace_back("-i");
+      args.push_back(clips[i]);
+      const std::string n = std::to_string(i);
+      filter += "[" + n + ":v:0]scale=" + size +
+                ":force_original_aspect_ratio=decrease,pad=" + size +
+                ":(ow-iw)/2:(oh-ih)/2,setsar=1,fps=" + first.frame_rate +
+                ",format=yuv420p[v" + n + "];";
+      joined += "[v" + n + "]";
+      if (any_audio) {
+        if (infos[i].has_audio) {
+          filter += "[" + n +
+                    ":a:0]aresample=48000,aformat=sample_fmts=fltp:"
+                    "channel_layouts=stereo[a" +
+                    n + "];";
+        } else {
+          if (infos[i].duration <= 0)
+            throw invalid("videos[" + n + "] (" + inputs[i].label +
+                          ") has no audio and no known duration");
+          char seconds[32];
+          std::snprintf(seconds, sizeof(seconds), "%.3f", infos[i].duration);
+          filter += "anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    "atrim=0:" +
+                    std::string(seconds) + "[a" + n + "];";
+        }
+        joined += "[a" + n + "]";
+      }
+    }
+    filter += joined + "concat=n=" + std::to_string(clips.size()) +
+              ":v=1:a=" + (any_audio ? "1" : "0") + "[v]" +
+              (any_audio ? "[a]" : "");
+    args.emplace_back("-filter_complex");
+    args.emplace_back(filter);
+    for (const char* arg : {"-map", "[v]"})
+      args.emplace_back(arg);
+    if (any_audio)
+      for (const char* arg : {"-map", "[a]"})
+        args.emplace_back(arg);
+    for (const char* arg :
+         {"-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt",
+          "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"})
+      args.emplace_back(arg);
+  }
+  const fs::path stitched = work.path / "video.mp4";
+  args.push_back(stitched);
+  const fs::path out = work.path / "ffmpeg.out";
+  const fs::path err = work.path / "ffmpeg.err";
+  std::string error;
+  const int code = RunCaptured(options_.ffmpeg, args, std::chrono::minutes(30),
+                               out, err, cancel, &error);
+  if (error == "cancelled")
+    throw Cancelled();
+  if (code != 0)
+    throw failed("ffmpeg (" + mode + ") failed: " +
+                 (error.empty() ? TailOf(ReadIfThere(err), 800) : error));
+  if (!fs::is_regular_file(stitched, ec) || fs::file_size(stitched, ec) == 0)
+    throw failed("ffmpeg (" + mode + ") wrote no output");
+  fs::create_directories(output.parent_path(), ec);
+  fs::remove(output, ec);
+  ec.clear();
+  fs::rename(stitched, output, ec);
+  if (ec) {
+    ec.clear();
+    fs::copy_file(stitched, output, fs::copy_options::overwrite_existing, ec);
+    if (ec)
+      throw failed("cannot store the result: " + ec.message());
+  }
+  if (summary != nullptr) {
+    json::Value result = json::Value::object();
+    result["mode"] = mode;
+    result["reencode"] = mode == "reencode";
+    json::Value list = json::Value::array();
+    double total = 0;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      json::Value entry = json::Value::object();
+      entry["input"] = inputs[i].label;
+      entry["codec"] = infos[i].video_codec;
+      entry["width"] = static_cast<double>(infos[i].width);
+      entry["height"] = static_cast<double>(infos[i].height);
+      entry["frame_rate"] = infos[i].frame_rate;
+      entry["audio"] = infos[i].has_audio;
+      entry["duration"] = infos[i].duration;
+      total += infos[i].duration;
+      list.push_back(std::move(entry));
+    }
+    result["inputs"] = std::move(list);
+    result["duration"] = total;
+    result["bytes"] = static_cast<double>(fs::file_size(output, ec));
+    *summary = std::move(result);
+  }
+}
+
+HttpResponse JobQueue::Concat(const HttpRequest& request) {
+  json::Value body;
+  try {
+    body = json::parse(request.body);
+  } catch (const std::exception& error) {
+    return Err(400, "Bad Request",
+               std::string("request body must be JSON: ") + error.what(),
+               "invalid_input");
+  }
+  TempDir out{options_.root / "temp" /
+              ("concat-out-" + NewJobId().substr(4, 12))};
+  const fs::path file = out.path / "video.mp4";
+  std::atomic<bool> cancel{false};
+  try {
+    ConcatVideos(body, file, &cancel, nullptr);
+  } catch (const JobFailure& failure) {
+    Logger::Warn("jobs", "event=concat_failed code=" + failure.code +
+                             " error=" + failure.what());
+    return Err(failure.status,
+               failure.status >= 500 ? "Internal Server Error" : "Bad Request",
+               failure.what(), failure.code);
+  }
+  std::string bytes = ReadAll(file);
+  Logger::Info("jobs",
+               "event=concat_done bytes=" + std::to_string(bytes.size()));
+  return HttpResponse{
+      .status = 200,
+      .reason = "OK",
+      .body = std::move(bytes),
+      .headers = {{"Content-Type", "video/mp4"},
+                  {"Content-Disposition", "attachment; filename=\"video.mp4\""},
+                  {"Cache-Control", "no-store"}}};
+}
+
+void JobQueue::RunConcat(const std::shared_ptr<Job>& job,
+                         const std::string& payload) {
+  json::Value body;
+  try {
+    body = json::parse(payload);
+  } catch (const std::exception& error) {
+    throw JobFailure(std::string("request body must be JSON: ") + error.what(),
+                     "invalid_input", 400);
+  }
+  const fs::path dir = JobDir(job->id);
+  json::Value summary;
+  ConcatVideos(body, dir / "video.mp4", &job->cancel, &summary);
+  const std::string summary_text = summary.dump();
+  WriteAll(dir / "response.json", summary_text);
+  const std::string base = "/v1/jobs/" + job->id + "/files/";
+  std::error_code ec;
+  json::Value files = json::Value::array();
+  json::Value video = json::Value::object();
+  video["name"] = "video.mp4";
+  video["url"] = base + "video.mp4";
+  video["content_type"] = "video/mp4";
+  video["bytes"] = static_cast<double>(fs::file_size(dir / "video.mp4", ec));
+  files.push_back(std::move(video));
+  json::Value status_file = json::Value::object();
+  status_file["name"] = "response.json";
+  status_file["url"] = base + "response.json";
+  status_file["content_type"] = "application/json";
+  status_file["bytes"] = static_cast<double>(summary_text.size());
+  files.push_back(std::move(status_file));
+  json::Value result = json::Value::object();
+  result["status_code"] = 200;
+  result["content_type"] = "video/mp4";
+  result["files"] = std::move(files);
+  result["response"] = std::move(summary);
   Finish(job, "completed", std::move(result), json::Value());
 }
 

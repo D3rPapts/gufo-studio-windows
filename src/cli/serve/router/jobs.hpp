@@ -29,6 +29,30 @@
 //                                      filter; dry_run=1 only counts;
 //                                      kept jobs need include_kept=1
 //   GET    /v1/jobs/{id}/files/{name}  one result file
+//   POST   /v1/videos/concat           {"videos": [2..20 result files of
+//                                      finished jobs of this router, as
+//                                      "/v1/jobs/{id}/files/video.mp4" or
+//                                      the same with scheme and host, or
+//                                      data: URLs of at most 64 MiB],
+//                                      "output_format": "mp4",
+//                                      "reencode": false} -> the stitched
+//                                      mp4 (Content-Disposition video.mp4).
+//                                      Needs ffmpeg + ffprobe (Options).
+//                                      Wrapped in a job the result file is
+//                                      video.mp4. Every input is probed;
+//                                      with the same codec, size, frame
+//                                      rate, pixel format and audio layout
+//                                      the clips are joined without
+//                                      re-encoding (concat demuxer, -c
+//                                      copy), otherwise (or with
+//                                      "reencode": true) they are scaled to
+//                                      the first clip and re-encoded with
+//                                      libx264 -crf 18 and AAC; audio is
+//                                      kept, clips without audio get
+//                                      silence. Errors: 400 invalid_input,
+//                                      500 concat_failed with ffmpeg's last
+//                                      stderr lines. Temp files live under
+//                                      DIR/temp/ and are removed.
 //
 // Expiry (--jobs-expire-hours, default 12, 0 = never): the result media of a
 // finished job that is not kept is deleted that long after completed_at;
@@ -176,7 +200,59 @@ struct Options {
   /// Result media of finished, not kept jobs are deleted this long after
   /// completed_at; zero = never.
   std::chrono::seconds expire_after{std::chrono::hours(12)};
+  /// ffmpeg and ffprobe for POST /v1/videos/concat; empty = the endpoint
+  /// answers 500 concat_failed.
+  std::filesystem::path ffmpeg;
+  std::filesystem::path ffprobe;
 };
+
+// ------------------------------------------------- video concat helpers
+
+/// One input of POST /v1/videos/concat: a result file of a job.
+struct JobFileRef {
+  std::string id;
+  std::string name;
+};
+
+/// "/v1/jobs/{id}/files/{name}", with or without scheme and host in front
+/// ("http://192.168.178.198:8081/v1/jobs/job_.../files/video.mp4"); a query
+/// or fragment is dropped. nullopt for anything else (another path, a bad
+/// id, a name the file API would not serve).
+std::optional<JobFileRef> ParseJobFileUrl(std::string_view url);
+
+/// "data:<type>;base64,<payload>" -> the decoded bytes and the media type
+/// (lower case, without parameters). nullopt when the text is no data URL
+/// or the payload is not base64.
+std::optional<std::string> ParseDataUrl(std::string_view url,
+                                        std::string* media_type);
+
+/// What ffprobe reports about one input (-show_streams -show_format).
+struct ProbeInfo {
+  std::string video_codec;
+  int width{0};
+  int height{0};
+  /// r_frame_rate as ffprobe prints it ("30/1", "30000/1001").
+  std::string frame_rate;
+  std::string pix_fmt;
+  bool has_audio{false};
+  std::string audio_codec;
+  int sample_rate{0};
+  int channels{0};
+  /// Seconds (format.duration, else the video stream's); 0 = unknown.
+  double duration{0};
+};
+
+/// Parses ffprobe's JSON (-print_format json); false with *error when there
+/// is no video stream.
+bool ParseProbe(std::string_view text, ProbeInfo* out, std::string* error);
+
+/// "a/b" -> a / b as double; 0 when the text is no positive fraction.
+double FrameRateValue(std::string_view text);
+
+/// "copy" when `reencode` is false and every input shares the video codec,
+/// size, frame rate, pixel format and audio layout (none, or the same codec,
+/// sample rate and channels); "reencode" otherwise.
+std::string ConcatMode(const std::vector<ProbeInfo>& inputs, bool reencode);
 
 /// GET /v1/jobs and DELETE /v1/jobs filters (empty = not set).
 struct Filter {
@@ -244,6 +320,13 @@ private:
   server::HttpResponse Delete(const std::string& id);
   server::HttpResponse BulkDelete(const server::HttpRequest& request);
   server::HttpResponse File(const std::string& id, const std::string& name);
+  /// POST /v1/videos/concat answered at once: the mp4 bytes.
+  server::HttpResponse Concat(const server::HttpRequest& request);
+  /// Stitches the clips named by `body` into `output` (the job's temp
+  /// folder is made under root/temp and removed again). Throws JobFailure
+  /// (400 invalid_input, 500 concat_failed) or Cancelled.
+  void ConcatVideos(const json::Value& body, const std::filesystem::path& output,
+                    std::atomic<bool>* cancel, json::Value* summary);
   /// Drops the job from every index (mutex held); the caller removes its
   /// folder after unlocking.
   void ForgetLocked(const std::shared_ptr<Job>& job);
@@ -253,6 +336,7 @@ private:
   void Execute(const std::shared_ptr<Job>& job);
   void RunVideo(const std::shared_ptr<Job>& job, const FetchResult& created);
   void RunMusic(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunConcat(const std::shared_ptr<Job>& job, const std::string& payload);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string query, std::string body,
                    std::string content_type);
