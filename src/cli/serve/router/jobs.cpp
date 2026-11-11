@@ -798,6 +798,7 @@ bool ParseProbe(std::string_view text, ProbeInfo* out, std::string* error) {
     info.duration = NumberOf(*format, "duration");
   if (info.duration <= 0)
     info.duration = stream_duration;
+  info.video_duration = stream_duration;
   *out = std::move(info);
   return true;
 }

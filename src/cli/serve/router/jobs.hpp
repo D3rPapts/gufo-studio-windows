@@ -240,6 +240,10 @@ struct ProbeInfo {
   int channels{0};
   /// Seconds (format.duration, else the video stream's); 0 = unknown.
   double duration{0};
+  /// Seconds of the video stream alone; 0 = unknown. The concat demuxer
+  /// offsets the next clip by the longer (audio) stream otherwise, which
+  /// leaves an uneven gap at the seam and a bogus r_frame_rate.
+  double video_duration{0};
 };
 
 /// Parses ffprobe's JSON (-print_format json); false with *error when there
