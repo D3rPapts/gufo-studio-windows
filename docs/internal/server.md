@@ -450,6 +450,367 @@ scheduler owns request state and serializes model execution. Model runners own
 weights, tokenization, prefill/decode, speculative verification and complete
 cache snapshots. HTTP handlers do not implement model kernels.
 
+## Model router
+
+`gufo router` exposes one OpenAI-compatible front door for several preset
+models across the five `serve` modalities. It spawns `gufo serve
+<modality>` workers on loopback on demand, reverse-proxies HTTP, SSE,
+WebSocket and multipart traffic to them, and unloads workers that have
+been idle or are displaced by `--models-max`.
+
+```text
+gufo router --models-preset <FILE>
+            [--models-dir <DIR>]
+            [--models-max N]            default 2; 0 = unlimited
+            [--sleep-idle-seconds SEC]  default 900; 0 disables idle unload
+            [--load-timeout-seconds S]  default 600; 0 = unlimited wait
+            [--autoload]                preload preset models at startup
+            [--remote-allow LIST]       routers [remote/<id>] may name
+            [--host IP] [--port N] [--api-key KEY]
+            [--max-connections N] [--max-request-bytes N]
+            [--log-level LEVEL] [-v]
+```
+
+Front server options use the same names and defaults as `serve`, including
+the `HOST`, `PORT`, `GUFO_HOST` and `GUFO_PORT` environment fallbacks. The
+router injects `GUFO_HOST=127.0.0.1` and a reserved loopback `GUFO_PORT`
+into every child, so workers bind loopback and run keyless; the front
+enforces `--api-key` and never forwards a client `Authorization` header.
+`gufo router --help` prints the preset grammar plus, per modality, the
+accepted keys generated from the same option registrations that render
+`gufo serve <modality> --help`.
+
+### Preset file
+
+Plain UTF-8 text. Full-line `#` comments and blank lines are ignored; a
+value runs to the end of the line (no inline comments, no escapes).
+Each model is one section:
+
+```ini
+# Full-line comments only (leading '#'). Blank lines ignored.
+
+[llm/qwen3.8-27b]
+model        = /models/llm/Qwen3.8-27B-UD-Q4_K_XL.gguf
+speculative  = dflash2
+dflash-model = /models/llm/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+sessions     = 2
+cache-disk   = /var/cache/gufo/qwen27b
+
+[asr/qwen3-asr]
+model = /models/qwen3-asr
+```
+
+- The section header is `[<modality>/<model-id>]` with modality in
+  `llm|image|video|tts|asr`. `model-id` is the routing key, must be unique
+  across the file, and becomes the worker's `--served-model-name` default
+  except for `video`, whose server has no such option.
+- A body line `key = value` maps to worker argv `--key value` verbatim.
+  Boolean flags use `key = true|false`: `true` passes the bare flag,
+  `false` omits it. Keys are validated against that modality's registered
+  long options only, so a new `gufo serve` option becomes available in the
+  preset file without any router change.
+- `host`, `port` and `api-key` are router-managed and rejected in
+  sections.
+- Relative path values resolve against `--models-dir`, or against the
+  router's working directory when it is unset.
+- Startup validation feeds every section through the modality's real
+  argument parser; unknown keys, bad values, empty bodies and duplicate
+  ids abort with the same message `gufo serve <modality>` would print,
+  prefixed with the section name. `--models-max` must be `0` or at least
+  `1`; with `--autoload`, presets beyond the limit are not an error: the
+  first `--models-max` sections preload in section order and the rest load
+  on demand.
+
+### Routing and proxying
+
+| Endpoint | Model source |
+| --- | --- |
+| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template` | JSON `model` field |
+| `/v1/audio/transcriptions` (multipart) | `model` form field |
+| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter |
+| `GET /v1/audio/voices`, `GET /props`, `GET /sdapi/v1/loras` | `model` query parameter (loads the model) |
+| `/v1/videos/<id>` status/content | router job table |
+| `GET /v1/audio/music/<id>` status/content (`"async": true`) | `model` query parameter, else router job table |
+
+A missing model field or query parameter returns 400
+`invalid_request_error` naming the missing field; an unknown model id
+returns 404 `model_not_found` listing the preset ids. The front answers
+`GET /health` and `GET /ready` (with the `/healthz`, `/readyz` and
+`/v1/...` aliases) once preset validation passed and the listener is up,
+independent of workers. `GET /v1/models` lists every preset model in
+OpenAI list shape with the extension field `"loaded": true|false`.
+`GET /v1/slots` and `GET /v1/metrics` require `?model=<id>`: they proxy to
+that worker when loaded and return 409 `model_not_loaded` otherwise.
+Unknown paths return 404 `not_found`, and video routes keep `serve`'s verb
+and job-id precedence (405 `method_not_allowed`, 404 `video_not_found`).
+
+Response bodies relay without re-serialization: SSE bytes pass through
+verbatim, WebSocket upgrades complete against the worker and frames relay
+in both directions until either side closes, and multipart bodies stream
+to the worker under the front's `--max-request-bytes` bound. Closing the
+front connection closes the worker connection, propagating cancellation.
+Video job ids returned by `POST /v1/videos` are recorded with their
+model: while a tracked job is non-terminal its worker is exempt from
+eviction and idle unload, and a status or content read for a recorded job
+reloads that worker if it died, answering from the persisted `--root`
+job state.
+Async music job ids (`POST /v1/audio/music` with `"async": true`) are
+recorded the same way and keep their worker busy until a status read
+reports `completed` or `failed` or the audio is downloaded. Music jobs live
+only in the worker's memory, so a read for a job whose worker is no longer
+loaded returns 404 `not_found` instead of starting the model. With
+`--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
+/embeddings` goes to the embedding model named in its body.
+
+### Figure check (`POST /v1/figuren`)
+
+The front answers `POST /v1/figuren` itself and asks the vision model
+through its own `/v1/chat/completions` (default `qwen3.8-27b`, `"modell"`
+overrides). The default method lists the people of a frame with the model,
+assigns them by badge or position and rates each head against the figure's
+reference (request and answer fields: header comment of
+`src/cli/serve/router/figuren.hpp`).
+
+`"verfahren": "ccip"` (1.4.5, opt-in) assigns by appearance instead and never
+by position or badge: the anime face detector (YOLOv8n) finds the heads,
+CCIP (deepghs CAFormer character fingerprints, CPU) compares each head with
+every reference image of every figure (`kopf`, `front`, `bilder`, plus
+`galerie` crops from other shots), the 27B only reads hard features
+(moustache, full beard, glasses, hair) from the head and from each
+`steckbrief`, and a candidate whose features contradict is dropped. A figure
+is named only when its diff is below `ccip_cap` (default 0.05) and the next
+remaining figure is at least `ccip_abstand` (default 0.0125) farther; otherwise the
+person is `"unbekannt"`. Each person returns `name`, `box` (face),
+`kopf_box`, `beste`, `zweitbeste`, `abstand`, `diff` per figure, `merkmale`,
+`llm_gefragt` and a German `begruendung`. The models are converted once with
+`src/models/ccip/reference/convert_weights.py`; the router finds them through
+`--ccip-model-dir` and `--ccip-face-dir` (Windows defaults
+`D:\llm-modelle\deepghs\ccip_onnx\gufo` and
+`D:\llm-modelle\deepghs\anime_face_detection\gufo`), loads them on the first
+ccip request (~165 MB host RAM) and answers 503 `ccip_unavailable` when they
+are missing. `--ccip-threads` (default 8) bounds the CPU threads.
+
+### Video concat (`POST /v1/videos/concat`)
+
+The front joins several finished clips into one mp4 itself, with the ffmpeg
+given by `--comfy-ffmpeg` (ffprobe is expected next to it). The body names
+2 to 20 inputs: `{"videos": ["/v1/jobs/{id}/files/video.mp4", ...],
+"output_format": "mp4", "reencode": false}`. Each input is a result file of
+a completed job of this router (the path, or the same URL with scheme and
+host; the job id is resolved locally and anything else is `400
+invalid_input`) or a `data:video/mp4;base64,...` URL of at most 64 MiB
+(the request body still has to pass `--max-request-bytes`). The front
+probes every clip; when all share codec, size, frame rate, pixel format and
+audio layout they are joined without re-encoding (concat demuxer, `-c
+copy`), otherwise, or with `"reencode": true`, every clip is scaled and
+padded to the first one, re-encoded with libx264 (`-crf 18`) and AAC, and a
+clip without audio gets silence so the sound of the others is kept. The
+direct call answers the mp4 (`Content-Disposition: attachment;
+filename="video.mp4"`); wrapped in `POST /v1/jobs` (no `model` needed) the
+result file is `video.mp4` and `response.json` lists the mode and the probed
+inputs. Errors: `400 invalid_input` (bad list, unknown job, unreadable
+clip), `500 concat_failed` with ffmpeg's last stderr lines. Temporary files
+live under `<jobs-dir>/temp/` and are removed after every call.
+
+### Job thumbnails (`GET /v1/jobs/{id}/thumb`)
+
+A small preview of a job's result so a gallery page does not download the
+full image or video for every card. `?w=` sets the width (64..1024, default
+256), `?file=` picks another of the job's files than the first image, video
+or audio file. Images and videos answer a JPEG of that width with the aspect
+kept (a video gives the frame at 10 % of its length, or at 0.5 s when the
+length is unknown); audio answers a waveform PNG of w x w/3 (ffmpeg
+`showwavespic`, colour `#5b4fc4`, transparent background). The picture is
+made with the ffmpeg from `--comfy-ffmpeg` and kept next to the job's files
+as `thumb-<w>.jpg` / `.png` (`thumb-<w>-<name>` for `?file=`), so every
+later call is served from disk (`X-Gufo-Thumb: cached` instead of
+`generated`), with `Cache-Control: public, max-age=86400`. The thumbs
+expire with the job's media (`--jobs-expire-hours`). Without ffmpeg the
+route answers `501 thumb_unavailable`; an unknown job or file `404`, a
+file that is no image, video or audio `400 thumb_unsupported`, an ffmpeg
+failure `500 thumb_failed`. The job JSON (`GET /v1/jobs`, `GET
+/v1/jobs/{id}`) carries `"thumb_url": "/v1/jobs/{id}/thumb"` when the job
+has such a file and `null` otherwise.
+
+### Pool relay (`GET /v1/jobs?scope=pool`)
+
+With placement = pool the two routers hold separate job stores; one page
+reads both through either router. `GET /v1/jobs?scope=pool` (or `pool=1`)
+merges this router's list with the partner's (the remote twin of the pool
+presets, asked with the same filters and a 3 s limit), newest first, each
+job with `"owner": "local"` or the partner's `"http://host:port"` as
+`/router/status` names it; the answer's `"partner"` field is that address,
+`"unreachable"` when the partner did not answer (the local jobs still
+come), or `"none"` without a partner. A job id this router does not know
+is asked from the partner for `GET /v1/jobs/{id}`, `GET
+/v1/jobs/{id}/files/{name}`, `GET /v1/jobs/{id}/thumb`, `PATCH`/`DELETE
+/v1/jobs/{id}` and `POST /v1/jobs/{id}/keep|cancel`; the answer streams
+through with its headers (10 s for JSON, 10 min for files), a partner that
+cannot be reached is `502 partner_unreachable`. Relayed thumbs are kept
+under `<jobs-dir>/relay-cache/<id>/` and removed a day after their last
+use. Every relayed request carries `X-Gufo-Relay: 1`; a request with that
+header (or `X-Gufo-Forwarded`) is answered locally and never relayed on,
+so the two routers cannot loop.
+
+### Lifecycle
+
+A worker spawns on the first request for its model; requests for the same
+model queue behind readiness, which is the worker's `/health` answering
+200 (anything else, including a refused connection, means still loading). A
+worker becomes unloadable
+`--sleep-idle-seconds` after its last activity, measured from both
+request start and request end, including full SSE streams and open
+WebSocket sessions; unload is SIGTERM followed by SIGKILL after a 10
+second grace. At `--models-max` the least-recently-active unloadable
+worker is evicted for a new load; when every worker is busy, the
+new-model request waits in a FIFO queue for the next freed slot instead
+of being refused. Workers set `PR_SET_PDEATHSIG`, so they die with the
+router even after an unclean exit.
+
+| Condition | Behavior |
+| --- | --- |
+| Bad preset (unknown key, bad value, duplicate id, reserved key) | Startup abort, exit 2, section-prefixed parser message |
+| Worker load fails (non-zero exit) | Held requests 502 `upstream_unavailable`, model unloaded, next request retries |
+| Worker dies mid-request | Streams close as with today's `serve` crash; model unloaded |
+| `--models-max` reached, nothing unloadable | New-model requests queued FIFO for the next freed slot |
+| Cold load (queue + spawn + readiness) exceeds `--load-timeout-seconds` | Held and queued requests 504 `load_timeout`, worker killed, model unloaded, next request retries |
+| Idle timeout / eviction | Drain-then-kill; no in-flight request is ever cut |
+| GPU `device_lost` in a worker | Existing worker exit path; the router treats it as death |
+
+On `SIGINT`/`SIGTERM` the front stops accepting, refuses new loads, keeps
+proxying loaded models while in-flight work drains for up to 10 seconds,
+then terminates every worker and exits 0.
+
+### Remote models
+
+A `[remote/<model-id>]` section names a model that another gufo router
+(1.2 or newer, for the async music routes) serves under the same id, for
+example a second machine on a direct cable. The local router starts
+nothing for it: it relays the requests and leaves loading, unloading and
+memory to the remote router.
+
+```ini
+[remote/qwen-image-2.1]
+url = http://192.168.100.56:8081
+modality = image
+api-key-env = GUFO_REMOTE56_KEY
+connect-timeout-seconds = 3
+gpu-slot = studio56
+busy-check-url = http://192.168.100.56:8085/queue
+queue-timeout-seconds = 900
+max-request-bytes = 67108864
+```
+
+| Key | Meaning |
+| --- | --- |
+| `url` | `http://<IPv4>:<port>` of the remote router; no host names, https or path. Required |
+| `modality` | `llm`, `image`, `video`, `tts`, `asr`, `embedding` or `omni`, as `/v1/models` lists it. Required |
+| `api-key-env` | Environment variable holding the remote router's `--api-key`; sent as `Authorization: Bearer`. Unset variable: exit 2 |
+| `connect-timeout-seconds` | Connect bound (default 3, 1..300) |
+| `head-timeout-seconds` | Response-head deadline after the request is sent (default 0 = none) |
+| `gpu-slot` | Remote models sharing the name run one GPU-starting request at a time |
+| `queue-timeout-seconds` | Longest wait for the slot and the busy check (default 900) |
+| `busy-check-url` | Optional `http://<IPv4>:<port>/path` (a ComfyUI `/queue`); wait while it reports running or pending work |
+| `max-request-bytes` | 413 `request_too_large` above this body size |
+
+The router refuses to start (exit 2) unless `--remote-allow` covers every
+`url` and `busy-check-url`: comma-separated IPv4 addresses or
+`a.b.c.d/n` ranges, each with an optional `:port`, or `*`; the default is
+empty. Router hints (`router-*`), worker options, `api-key` and
+`remote-model`/`served-model-name` are rejected in remote sections; the
+id must be the same on both routers.
+
+- Requests resolve to the model as in the table above and relay with the
+  body unchanged; the client's `Authorization` is never forwarded. Video
+  and async music job ids are recorded, so status, content and DELETE
+  reads route back. Previews (`/v1/previews/...`) and `/models/load|unload`
+  go to the remote router; the ComfyUI API and the job API use remote
+  models like local ones. ComfyUI `/free` stays local.
+- A remote model is always `unloaded` locally: it never counts for
+  `--models-max`, LRU, idle unload, the memory guard or `memory.json`, and
+  `--autoload` skips it. `/v1/models` lists it with `"remote": {"url",
+  "reachable"}`, empty args and the state the remote last listed.
+- A background probe asks every remote router for `GET /v1/models` every
+  5 s (2 s bound). A failed connect or probe answers further requests
+  with 503 `remote_unavailable` and `Retry-After: 30` at once until a probe
+  works again; nothing local restarts.
+- With `gpu-slot`, every POST (and `/models/load`) waits for the slot in
+  arrival order; a video or async music job keeps it until it ends (the
+  probe polls its status). After `queue-timeout-seconds` the answer is 503
+  `remote_busy`. With `busy-check-url` the request also waits while that
+  queue is busy; an unreachable check counts as free.
+- WebSocket routes (`/v1/realtime`, `/v1/audio/speech/stream`) answer 501
+  `remote_websocket_unsupported`.
+- Two routers may name each other (load sharing both ways). Every relay
+  (requests, previews, `/models/load|unload`, probes, job polls) carries
+  `X-Gufo-Forwarded: <router id>` (random per process, shown as
+  `remote.router_id` in `/router/status`). A request that arrives with this
+  header and names a model that is remote here as well is not relayed again:
+  it gets 508 `remote_loop`; local models serve it normally. A client that
+  sets the header itself only refuses its own relay. Probes mark ids the
+  other router lists as remote: `/v1/models` shows them unloaded with
+  `"remote": {"loop": true}` and `/router/status` lists them as `remote`.
+- `GET /router/status` adds a `remote` block: routers (reachable, error,
+  last check, model states), models (url, busy, gpu slot, placement),
+  relays in flight, gpu slots (holder, waiting), jobs holding a slot and
+  the last busy-check answers.
+
+#### Switching a model between local and remote
+
+A local section and a `[remote/<id>]` section with the same id make the
+model *switchable*: it can run here or on the other router, and
+`POST /router/placement` moves it while the router keeps running. In the
+remote section `modality` may be left out (it must match the local one
+when given) and `placement` sets the start value:
+
+```ini
+[llm/qwen3.8-27b]
+model = models/qwen3.8-27b.gguf
+
+[remote/qwen3.8-27b]
+url = http://192.168.100.56:8081
+api-key-env = GUFO_REMOTE56_KEY
+gpu-slot = studio56
+placement = local        # local (default) | remote
+```
+
+```sh
+curl -X POST http://127.0.0.1:8081/router/placement \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.8-27b", "placement": "remote"}'
+curl -X POST http://127.0.0.1:8081/router/placement -d '{"all": "local"}'
+curl http://127.0.0.1:8081/router/placement      # current placements
+```
+
+The answer lists every switchable model (`placement`, `local_status`,
+`local_busy`, `remote_busy`, `remote_url`, `remote_reachable`) and the
+ids that `changed`. Errors: 400 `invalid_placement`, 404
+`model_not_found`, 409 `not_switchable`. The endpoint is protected like
+`/models/load`: by the router's `--api-key` when one is set.
+
+- New requests follow the placement at once. Nothing running is cut off:
+  local requests, WebSockets and jobs finish on the local worker, relays
+  finish on the remote router.
+- Moved to `remote`: once no local request, socket or job has been open
+  for 2 s, the supervision tick unloads the local worker (a worker that
+  is still loading finishes its load first). Relays to the other router
+  never count as local work.
+- Moved to `local`: the model loads on the next request as usual
+  (`--autoload` only loads switchable models that start `local`).
+- Video and async music job reads (status, content, DELETE) and job
+  previews follow the job to where it was created, whatever the
+  placement is now.
+- While a model is `remote`, everything above applies: gpu slot, busy
+  check, 503 `remote_unavailable`, 508 `remote_loop` (a relayed request
+  for a model that is `remote` here as well). `/v1/models` shows
+  `"switchable": true`, `"placement"` and `"remote_url"`; the `remote`
+  block (which other routers read as "relayed here") appears only while
+  the placement is `remote`.
+- Switchable models count for the memory guard and `memory.json` like
+  local ones. The placement is not saved: after a restart the preset's
+  `placement` applies again.
+
+
 ## Endpoint Set
 
 ### Text endpoints
@@ -472,6 +833,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `POST` | `/embeddings`, `/embedding` | llama.cpp's non-OpenAI embeddings form, on the same `gufo serve embedding` process; other servers answer 404 |
 | `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
 | `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
+| `POST` | `/v1/audio/music` | ACE-Step 1.5 music serving is configured with `gufo serve music` |
 | `GET` | `/v1/realtime` | `serve asr`: transcription sessions, and spoken conversations for models that hear and speak |
 | `GET` | `/voice` | `serve asr` with a conversational model: a browser client of `/v1/realtime` |
 | `POST` | `/v1/systemone` | A decision model is configured with `gufo serve decision` |
@@ -579,6 +941,27 @@ streaming `pcm`; `stream_format: "sse"` emits OpenAI audio events with base64
 PCM. `speed` supports `1.0` only; input is capped at 16384 UTF-8 bytes and
 `max_new_tokens` at 8192 (default 3000). Output is mono 16-bit PCM at the
 model's output sample rate (24 kHz for Qwen3-TTS).
+
+`POST /v1/audio/music` (`gufo serve music`, ACE-Step 1.5) accepts `prompt`
+(or `tags`), `lyrics`, `duration` (1--600 s, default 30), `seed`, `steps`
+(1--50, default 8), `bpm`, `keyscale`, `timesignature`, `language`,
+`audio_codes`, `lm_cfg`, `lm_temperature`, `lm_top_p`, `response_format`,
+`bitrate_kbps` and `async`. `response_format` is `wav` (default, 48 kHz
+stereo 16-bit PCM, `audio/wav`), `mp3` (`audio/mpeg`) or `aac` (alias `m4a`,
+`audio/mp4`); anything else is a 400 `unsupported_format`. `mp3` and `aac`
+are transcoded from the finished WAV by FFmpeg (`ffmpeg` on the PATH or
+`GUFO_FFMPEG`, started directly without a shell) at the constant bitrate
+`bitrate_kbps` (integer 96--320, default 192; `-codec:a libmp3lame` or
+`aac`, `-b:a <kbps>k`). The answer, and `GET /v1/audio/music/<id>/content`
+in async mode, carries the format's `Content-Type` and
+`Content-Disposition: attachment; filename="output.<wav|mp3|m4a>"`, so a
+router job stores it as `output.mp3` (router jobs name the file from the
+content type; `audio/mp4` is not mapped there yet and lands as
+`output.bin`). When FFmpeg is missing or fails the job ends `failed` with
+`"<format> encoding needs ffmpeg: ..."` (HTTP 500 on the content read), one
+error line is logged and the temporary WAV is left in the temp directory
+(its path is in the message). The job status JSON reports `response_format`
+and, for `mp3` / `aac`, `bitrate_kbps`.
 
 `GET /v1/audio/speech/stream` upgrades to the vLLM-Omni incremental-text
 WebSocket protocol. [TTS streaming examples](../models/qwen3-tts.md#sampling)
