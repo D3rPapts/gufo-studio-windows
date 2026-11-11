@@ -3,8 +3,11 @@
 // against a fake router API and a fake webhook receiver, and the result
 // store: keep flag, expiry, delete (single and bulk), list filters, music
 // progress, the estimated progress and the video concat helpers (URL to
-// job file, ffprobe parsing, copy vs re-encode; no ffmpeg runs here).
+// job file, ffprobe parsing, copy vs re-encode; no ffmpeg runs here), the
+// pool relay and the shared queue (capabilities, pull) against a fake
+// partner.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -12,9 +15,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -192,12 +198,31 @@ struct FakeApi {
   std::atomic<bool> music_hold{false};
   bool music_async{false};
   int music_polls{0};
+  /// X-Gufo-Pool of every POST, by image prompt / speech input.
+  std::map<std::string, std::string> sides;
+
+  std::string SideOf(const std::string& prompt) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto it = sides.find(prompt);
+    return it == sides.end() ? "(none)" : it->second;
+  }
 
   jobs::FetchResult operator()(const HttpRequest& request) {
     {
       const std::lock_guard<std::mutex> lock(mutex);
       calls.push_back(request.method + " " + request.path +
                       (request.query.empty() ? "" : "?" + request.query));
+      if (request.method == "POST") {
+        try {
+          const json::Value body = json::parse(request.body);
+          const std::string key = body.member_str("prompt").empty()
+                                      ? body.member_str("input")
+                                      : body.member_str("prompt");
+          if (!key.empty())
+            sides[key] = request.header(jobs::kPoolSideHeader);
+        } catch (const std::exception&) {
+        }
+      }
     }
     jobs::FetchResult result;
     result.status = 200;
@@ -362,6 +387,11 @@ struct Harness {
   /// Set before Open(true) to give the queue a (fake) pool partner.
   jobs::Options::Relay relay;
   std::string partner_name;
+  /// Set before Open(true): capabilities (shared queue, LoRA routing).
+  std::function<json::Value()> capabilities;
+  std::function<std::optional<json::Value>()> partner_capabilities;
+  std::string self_name;
+  std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -398,6 +428,11 @@ struct Harness {
     options.progress_poll = std::chrono::milliseconds(10);
     options.relay = relay;
     options.partner_name = partner_name;
+    options.capabilities = capabilities;
+    options.partner_capabilities = partner_capabilities;
+    options.self_name = self_name;
+    options.pull_poll = std::chrono::milliseconds(20);
+    options.pull_hold = pull_hold;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -1502,6 +1537,468 @@ void TestPoolRelay() {
   }
 }
 
+// ---------------------------------------------------------- shared queue
+
+/// An image job with one LoRA.
+std::string LoraImageJob(const std::string& prompt, const std::string& lora) {
+  return R"({"request":{"path":"/v1/images/generations","body":{"model":"qwen-image","prompt":")" +
+         prompt + R"(","size":"64x64","loras":[{"name":")" + lora +
+         R"(","scale":0.8}]}}})";
+}
+
+/// Capabilities of router A (here): qwen-image with the anime LoRA in the
+/// pool, minimax-h3 in the pool, qwen3-tts local, ace-step placed remote.
+json::Value CapsA() {
+  return json::parse(
+      R"({"router_id":"ra","partner":"http://10.0.0.2:8081","models":{)"
+      R"("qwen-image":{"placement":"pool","loras":["anime"]},)"
+      R"("minimax-h3":{"placement":"pool","loras":[]},)"
+      R"("qwen3-tts":{"placement":"local","loras":[]},)"
+      R"("ace-step":{"placement":"remote","loras":[]}}})");
+}
+
+/// Capabilities of router B (the partner): qwen-image with the winkel
+/// LoRA, qwen3-tts placed remote (= here), ace-step local there only.
+json::Value CapsB() {
+  return json::parse(
+      R"({"router_id":"rb","partner":"http://10.0.0.1:8081","models":{)"
+      R"("qwen-image":{"placement":"pool","loras":["winkel"]},)"
+      R"("minimax-h3":{"placement":"pool","loras":[]},)"
+      R"("qwen3-tts":{"placement":"remote","loras":[]},)"
+      R"("ace-step":{"placement":"local","loras":[]}}})");
+}
+
+HttpResponse JsonAnswer(int status, const std::string& body) {
+  HttpResponse response;
+  response.status = status;
+  response.body = body;
+  response.headers = {{"Content-Type", "application/json"}};
+  return response;
+}
+
+std::string ErrorCodeOf(const HttpResponse& response) {
+  try {
+    return json::parse(response.body).find("error")->member_str("code");
+  } catch (const std::exception&) {
+    return "";
+  }
+}
+
+std::string ErrorMessageOf(const HttpResponse& response) {
+  try {
+    return json::parse(response.body).find("error")->member_str("message");
+  } catch (const std::exception&) {
+    return "";
+  }
+}
+
+void TestLoraNamesAndCanRun() {
+  json::Value body = json::parse(
+      R"({"loras":[{"name":"winkel","scale":1},{"name":"anime"},"plain",{"name":"winkel"}],)"
+      R"("gufo":{"lora":"turbo"}})");
+  const auto names = jobs::LoraNames(body);
+  CHECK(names.size() == 4);
+  CHECK(names[0] == "winkel" && names[1] == "anime" && names[2] == "plain" &&
+        names[3] == "turbo");
+  CHECK(jobs::LoraNames(json::parse(R"({"prompt":"x"})")).empty());
+  std::string why;
+  CHECK(jobs::CanRun(CapsA(), "qwen-image", {"anime"}, &why));
+  CHECK(jobs::CanRun(CapsA(), "qwen-image", {}, &why));
+  CHECK(!jobs::CanRun(CapsA(), "qwen-image", {"winkel"}, &why));
+  CHECK(why.find("no LoRA 'winkel'") != std::string::npos &&
+        why.find("registered: anime") != std::string::npos);
+  CHECK(!jobs::CanRun(CapsA(), "ace-step", {}, &why));
+  CHECK(why.find("placed remote") != std::string::npos);
+  CHECK(!jobs::CanRun(CapsA(), "nope", {}, &why));
+  CHECK(why.find("does not serve model 'nope'") != std::string::npos);
+  CHECK(!jobs::CanRun(CapsB(), "minimax-h3", {"turbo"}, &why));
+  CHECK(why.find("none registered") != std::string::npos);
+  // The "models" object alone works too.
+  CHECK(jobs::CanRun(*CapsB().find("models"), "qwen-image", {"winkel"}));
+}
+
+void TestCapabilityRouting() {
+  // A job needing a LoRA only the partner has goes there (X-Gufo-Pool:
+  // remote), one only this router has stays here (local), one both can
+  // run carries no side; a job neither can run is refused at submit.
+  Harness h("caps", false);
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  h.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  h.relay = [](const HttpRequest&, std::chrono::milliseconds,
+               std::chrono::milliseconds,
+               std::string*) -> std::optional<HttpResponse> {
+    // An old partner: no queue to pull from, no pull route.
+    return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
+  };
+  h.Open(true);
+  const std::string remote =
+      h.Submit(LoraImageJob("needs winkel", "winkel")).member_str("id");
+  const json::Value done = h.WaitFor(remote, "completed");
+  CHECK(h.api->SideOf("needs winkel") == "remote");
+  CHECK(done.find("request")->find("loras")->items().size() == 1 &&
+        done.find("request")->find("loras")->items()[0].str() == "winkel");
+  CHECK(done.find("running_on") != nullptr &&
+        done.find("running_on")->is_null());
+  const std::string local =
+      h.Submit(LoraImageJob("needs anime", "anime")).member_str("id");
+  h.WaitFor(local, "completed");
+  CHECK(h.api->SideOf("needs anime") == "local");
+  const std::string any = h.Submit(ImageJob("plain")).member_str("id");
+  h.WaitFor(any, "completed");
+  CHECK(h.api->SideOf("plain").empty());
+  // qwen3-tts is placed remote on the partner: only here.
+  const std::string speech =
+      h.Submit(R"({"request":{"path":"/v1/audio/speech","body":{"model":"qwen3-tts","input":"hallo"}}})")
+          .member_str("id");
+  h.WaitFor(speech, "completed");
+  CHECK(h.api->SideOf("hallo") == "local");
+  // ace-step is remote here and local there: only the partner.
+  const std::string music =
+      h.Submit(R"({"request":{"path":"/v1/audio/music","body":{"model":"ace-step","prompt":"lied"}}})")
+          .member_str("id");
+  h.WaitFor(music, "completed");
+  CHECK(h.api->SideOf("lied") == "remote");
+  // Neither: 400 naming what each router has.
+  const HttpResponse refused =
+      h.Call("POST", "/v1/jobs", LoraImageJob("needs nix", "nix"));
+  CHECK(refused.status == 400);
+  CHECK(ErrorCodeOf(refused) == "no_capable_router");
+  const std::string message = ErrorMessageOf(refused);
+  CHECK(message.find("this router has no LoRA 'nix'") != std::string::npos);
+  CHECK(message.find("registered: anime") != std::string::npos);
+  CHECK(message.find("partner http://10.0.0.2:8081 has no LoRA 'nix'") !=
+        std::string::npos);
+  CHECK(message.find("registered: winkel") != std::string::npos);
+  CHECK(h.Call("GET", "/v1/jobs").status == 200);
+  // Partner capabilities unknown (unreachable): the partner may have it.
+  h.queue->Stop();
+  h.partner_capabilities = [] { return std::optional<json::Value>(); };
+  h.Open(true);
+  const std::string maybe =
+      h.Submit(LoraImageJob("maybe there", "nix")).member_str("id");
+  h.WaitFor(maybe, "completed");
+  CHECK(h.api->SideOf("maybe there") == "remote");
+  // Without any partner a LoRA this router lacks is refused too.
+  h.queue->Stop();
+  h.relay = nullptr;
+  h.partner_name.clear();
+  h.Open(true);
+  CHECK(h.Call("POST", "/v1/jobs", LoraImageJob("alone", "nix")).status ==
+        400);
+  const std::string alone =
+      h.Submit(LoraImageJob("alone anime", "anime")).member_str("id");
+  h.WaitFor(alone, "completed");
+  CHECK(h.api->SideOf("alone anime").empty());
+}
+
+/// The fake partner of the pull tests (router B as seen from A).
+struct FakePartner {
+  std::mutex mutex;
+  /// Its queued list (newest first, as /v1/jobs answers).
+  std::string queued;
+  /// Answer to POST /router/pool/pull.
+  std::string pull_answer = R"({"job":"job_bbbbbbbbbbbbbbbbbbbbbbb2"})";
+  int pull_status{200};
+  int pulls{0};
+  std::vector<HttpRequest> pull_requests;
+  /// Polls of the pulled job before it completes.
+  int polls_until_done{2};
+  int polls{0};
+  bool pulled{false};
+  std::shared_ptr<FakeApi> api;
+
+  std::optional<HttpResponse> operator()(const HttpRequest& request,
+                                         std::chrono::milliseconds,
+                                         std::chrono::milliseconds,
+                                         std::string* error) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (request.header(jobs::kRelayHeader) != "1") {
+      *error = "no relay header";
+      return std::nullopt;
+    }
+    if (request.method == "GET" && request.path == "/v1/jobs" &&
+        request.query.find("status=queued") != std::string::npos)
+      return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
+                                    : queued);
+    if (request.method == "GET" && request.path == "/v1/jobs")
+      return JsonAnswer(
+          200,
+          R"({"object":"list","data":[)"
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb1","status":"queued","created_at":1000,"running_on":null},)"
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb3","status":"in_progress","created_at":1002,"running_on":"local"},)"
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb4","status":"in_progress","created_at":1003,"running_on":"http://10.0.0.1:8081"}]})");
+    if (request.method == "POST" && request.path == jobs::kPullPath) {
+      ++pulls;
+      pull_requests.push_back(request);
+      if (pull_status == 200) {
+        pulled = true;
+        if (api != nullptr) {
+          const std::lock_guard<std::mutex> api_lock(api->mutex);
+          api->calls.push_back("PULL");
+        }
+      }
+      return JsonAnswer(pull_status,
+                        pull_status == 200
+                            ? pull_answer
+                            : R"({"error":{"code":"not_found"}})");
+    }
+    if (request.method == "GET" &&
+        request.path == "/v1/jobs/job_bbbbbbbbbbbbbbbbbbbbbbb2") {
+      ++polls;
+      if (polls < polls_until_done)
+        return JsonAnswer(
+            200,
+            R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"in_progress","running_on":"http://10.0.0.1:8081"})");
+      if (api != nullptr) {
+        const std::lock_guard<std::mutex> api_lock(api->mutex);
+        api->calls.push_back("PULLED DONE");
+      }
+      return JsonAnswer(
+          200,
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"completed","running_on":null})");
+    }
+    return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
+  }
+};
+
+void TestPoolPullRequester() {
+  // Router A: a free runner pulls the partner's oldest queued job it can
+  // run (not the one needing the winkel LoRA) before its own newer job,
+  // waits for it, and pulls nothing twice.
+  auto partner = std::make_shared<FakePartner>();
+  partner->queued =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":1001,"request":{"model":"qwen-image","loras":[]}},)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb1","status":"queued","created_at":1000,"request":{"model":"qwen-image","loras":["winkel"]}}]})";
+  Harness h("pull-requester", false);
+  partner->api = h.api;
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  h.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  const std::string mine = h.Submit(ImageJob("after the pull")).member_str("id");
+  h.WaitFor(mine, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 1);
+    CHECK(partner->polls >= partner->polls_until_done);
+    if (!partner->pull_requests.empty()) {
+      const json::Value body = json::parse(partner->pull_requests[0].body);
+      CHECK(body.member_str("from") == "http://10.0.0.1:8081");
+      CHECK(body.member_str("router_id") == "ra");
+      CHECK(body.member_str("job") == "job_bbbbbbbbbbbbbbbbbbbbbbb2");
+      CHECK(body.find("capabilities") != nullptr &&
+            body.find("capabilities")->find("models") != nullptr);
+      CHECK(partner->pull_requests[0].header("Content-Type") ==
+            "application/json");
+    }
+  }
+  // Order: the pull and its completion came before our own job ran.
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const auto& calls = h.api->calls;
+    const auto at = [&calls](const std::string& what) {
+      return std::find(calls.begin(), calls.end(), what) - calls.begin();
+    };
+    CHECK(at("PULL") < at("PULLED DONE"));
+    CHECK(at("PULLED DONE") < at("POST /v1/images/generations"));
+    CHECK(at("POST /v1/images/generations") <
+          static_cast<std::ptrdiff_t>(calls.size()));
+  }
+  const json::Value status = h.queue->PoolQueueStatus();
+  CHECK(status.member_double("pulled") == 1);
+  CHECK(status.member_double("pushed") == 0);
+  CHECK(status.member_double("local") == 0);
+  CHECK(status.member_str("partner_name") == "http://10.0.0.2:8081");
+  CHECK(status.find("enabled")->as_bool());
+  // The pool view: positions over both routers' queued jobs, running_on
+  // from this router's point of view.
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  const auto& data = listed.find("data")->items();
+  CHECK(data.size() == 4);
+  for (const json::Value& job : data) {
+    const std::string id = job.member_str("id");
+    if (id == "job_bbbbbbbbbbbbbbbbbbbbbbb1") {
+      CHECK(job.member_double("position") == 1);
+      CHECK(job.find("running_on")->is_null());
+    } else if (id == "job_bbbbbbbbbbbbbbbbbbbbbbb3") {
+      CHECK(job.find("position")->is_null());
+      CHECK(job.member_str("running_on") == "http://10.0.0.2:8081");
+    } else if (id == "job_bbbbbbbbbbbbbbbbbbbbbbb4") {
+      CHECK(job.member_str("running_on") == "local");
+    } else {
+      CHECK(id == mine);
+      CHECK(job.find("position")->is_null());
+      CHECK(job.find("running_on")->is_null());
+    }
+  }
+}
+
+void TestPoolPullOldPartner() {
+  // The partner answers 404 on the pull route (older version): pulling
+  // pauses for pull_hold, the local job runs as before, and a later
+  // attempt follows after the hold.
+  auto partner = std::make_shared<FakePartner>();
+  partner->pull_status = 404;
+  partner->queued =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":1001,"request":{"model":"qwen-image","loras":[]}}]})";
+  Harness h("pull-old", false);
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  h.pull_hold = std::chrono::milliseconds(600);
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  const std::string mine = h.Submit(ImageJob("as before")).member_str("id");
+  h.WaitFor(mine, "completed");
+  CHECK(h.api->SideOf("as before").empty());
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 1);
+  }
+  CHECK(h.queue->PoolQueueStatus().member_double("pulled") == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls >= 2);
+  }
+  // An unreachable partner: no pull, the job runs here.
+  h.queue->Stop();
+  h.relay = [](const HttpRequest&, std::chrono::milliseconds,
+               std::chrono::milliseconds,
+               std::string* error) -> std::optional<HttpResponse> {
+    *error = "connect refused";
+    return std::nullopt;
+  };
+  h.Open(true);
+  const std::string again = h.Submit(ImageJob("partner gone")).member_str("id");
+  h.WaitFor(again, "completed");
+  CHECK(h.queue->PoolQueueStatus().find("partner")->is_null());
+}
+
+void TestPoolPullOwner() {
+  // Router B: POST /router/pool/pull hands out the oldest queued job the
+  // requester can run, never one a runner took, never twice, not one
+  // needing a LoRA the requester lacks; the job runs with X-Gufo-Pool:
+  // remote and shows the requester as running_on.
+  Harness h("pull-owner", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string second =
+      h.Submit(ImageJob("SLOW second")).member_str("id");
+  const std::string third =
+      h.Submit(LoraImageJob("third winkel", "winkel")).member_str("id");
+  const std::string fourth = h.Submit(ImageJob("fourth")).member_str("id");
+  const auto pull = [&h](const std::string& capabilities) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body = R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":)" +
+                   capabilities + "}";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  // A requester without the model gets nothing.
+  CHECK(pull(R"({"models":{"minimax-h3":{"placement":"pool","loras":[]}}})")
+            .find("job")
+            ->is_null());
+  // Without the winkel LoRA: the second job (the first is running).
+  json::Value handed =
+      pull(R"({"models":{"qwen-image":{"placement":"pool","loras":[]}}})");
+  CHECK(handed.member_str("job") == second);
+  CHECK(handed.member_str("model") == "qwen-image");
+  CHECK(handed.member_double("queued") == 2);
+  json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + second).body);
+  CHECK(view.member_str("status") == "in_progress");
+  CHECK(view.member_str("running_on") == "http://10.0.0.1:8081");
+  view = json::parse(h.Call("GET", "/v1/jobs/" + first).body);
+  CHECK(view.member_str("running_on") == "local");
+  // Pool view without a partner: positions of the queued jobs.
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  CHECK(listed.member_str("partner") == "none");
+  for (const json::Value& job : listed.find("data")->items()) {
+    const std::string id = job.member_str("id");
+    if (id == third)
+      CHECK(job.member_double("position") == 1);
+    else if (id == fourth)
+      CHECK(job.member_double("position") == 2);
+    else
+      CHECK(job.find("position")->is_null());
+  }
+  json::Value status = h.queue->PoolQueueStatus();
+  CHECK(status.member_double("pushed") == 1);
+  CHECK(status.member_double("local") == 2);
+  CHECK(status.find("pushed_active")->items().size() == 1 &&
+        status.find("pushed_active")->items()[0].str() == second);
+  // The same requester again: the fourth (third needs winkel).
+  handed = pull(R"({"models":{"qwen-image":{"placement":"pool","loras":[]}}})");
+  CHECK(handed.member_str("job") == fourth);
+  h.WaitFor(fourth, "completed");
+  CHECK(h.api->SideOf("fourth") == "remote");
+  // With winkel: the third; then nothing is left.
+  handed = pull(R"({"models":{"qwen-image":{"placement":"pool","loras":["winkel"]}}})");
+  CHECK(handed.member_str("job") == third);
+  h.WaitFor(third, "completed");
+  CHECK(h.api->SideOf("third winkel") == "remote");
+  handed = pull(R"({"models":{"qwen-image":{"placement":"pool","loras":["winkel"]}}})");
+  CHECK(handed.find("job")->is_null());
+  CHECK(handed.member_double("queued") == 0);
+  // A model this router has not in the pool (ace-step: local only) is
+  // never handed out, whatever the requester can run.
+  const std::string music =
+      h.Submit(R"({"request":{"path":"/v1/audio/music","body":{"model":"ace-step","prompt":"lied2"}}})")
+          .member_str("id");
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + music).body)
+            .member_str("status") == "queued");
+  handed = pull(R"({"models":{"ace-step":{"placement":"pool","loras":[]}}})");
+  CHECK(handed.find("job")->is_null());
+  h.api->release.store(true);
+  h.WaitFor(first, "completed");
+  h.WaitFor(second, "completed");
+  h.WaitFor(music, "completed");
+  CHECK(h.api->SideOf("SLOW first").empty());
+  CHECK(h.api->SideOf("SLOW second") == "remote");
+  CHECK(h.api->SideOf("lied2").empty());
+  status = h.queue->PoolQueueStatus();
+  CHECK(status.member_double("pushed") == 3);
+  CHECK(status.find("pushed_active")->items().empty());
+  // Bad requests.
+  HttpRequest bad;
+  bad.method = "POST";
+  bad.path = jobs::kPullPath;
+  bad.body = R"({"from":"x"})";
+  CHECK(h.queue->Handle(bad)->status == 400);
+  bad.method = "GET";
+  CHECK(h.queue->Handle(bad)->status == 405);
+  // Without capabilities the route does not exist (as before 1.4.20).
+  h.queue->Stop();
+  h.capabilities = nullptr;
+  h.Open(true);
+  bad.method = "POST";
+  bad.body = R"({"from":"http://10.0.0.1:8081","capabilities":{"models":{}}})";
+  CHECK(h.queue->Handle(bad)->status == 404);
+}
+
 }  // namespace
 
 int main() {
@@ -1532,6 +2029,11 @@ int main() {
   TestConcatEndpoint();
   TestThumb();
   TestPoolRelay();
+  TestLoraNamesAndCanRun();
+  TestCapabilityRouting();
+  TestPoolPullRequester();
+  TestPoolPullOldPartner();
+  TestPoolPullOwner();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;

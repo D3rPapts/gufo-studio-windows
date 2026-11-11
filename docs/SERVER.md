@@ -674,6 +674,77 @@ use. Every relayed request carries `X-Gufo-Relay: 1`; a request with that
 header (or `X-Gufo-Forwarded`) is answered locally and never relayed on,
 so the two routers cannot loop.
 
+### Shared queue (placement = pool, 1.4.20)
+
+The two routers still hold separate job stores, and the router a job was
+submitted to stays its owner (files, result, progress, webhook, relay);
+since 1.4.20 the two queues behave as one: the execution of a job may
+move to the partner, the oldest job of both routers runs first, and a
+job only goes to a machine that can run it.
+
+**Capabilities.** `GET /router/capabilities` answers what this router
+can run: `{"router_id", "version", "self", "partner", "models": {"<id>":
+{"modality", "placement": "local|remote|pool", "switchable", "status",
+"loaded", "loras": ["winkel", ...]}}}`. The LoRA names come from the
+preset (`lora = name=path[,...]` lines of the section), the placement
+follows `POST /router/placement`. A job needs its model and the LoRA
+names of its body (`loras[].name` for images, `gufo.lora` for videos);
+the router reads the partner's capabilities through the same route
+(cached 30 s, 3 s limit). When only one router can run a job, the
+job's request carries `X-Gufo-Pool: local` or `remote` and the pool
+decision keeps to that side (it waits there when that machine is busy
+instead of taking the other); when neither can, `POST /v1/jobs` answers
+`400 no_capable_router` with a message naming what each router has
+(`this router has no LoRA 'nix' for model 'qwen-image' (registered:
+anime); partner http://192.168.100.56:8081 has no LoRA 'nix' ...`). A
+direct request (not a job) to a pool model is checked the same way. A
+partner whose capabilities cannot be read (unreachable, older version)
+counts as "may have it".
+
+**Order.** A free runner (a job slot of `--jobs-parallel`) compares its
+oldest queued job with the partner's (`GET /v1/jobs?status=queued`,
+cached 2 s). When the partner's is older and this machine can run it,
+the runner calls `POST <partner>/router/pool/pull` with `{"from":
+"http://host:port", "router_id", "job": <the id it wants>,
+"capabilities": <its own>}`. The partner, under its lock, hands out its
+oldest queued job the requester can run (never a job a runner already
+took, never a concat job, only models the partner has in the pool),
+answers `{"job": id, "model", "created_at", "queued": n}` or `{"job":
+null, "queued": n}`, and executes the job on a thread of its own with
+`X-Gufo-Pool: remote`, so its pool decision relays the request to the
+requester, whose worker does the work; the owner keeps files, result,
+progress and webhook as for any job. The requester's runner waits for
+that job (polling the owner every 2 s) before it takes the next local
+job. A pulled job that finds no machine (`503 pool_busy`,
+`remote_unavailable`) goes back to the owner's queue once, like any
+job. Every pull and poll carries `X-Gufo-Relay: 1`. A partner that
+answers `404` on the pull route (older than 1.4.20) pauses pulling for
+60 s (logged once, `event=pool_pull_unsupported`); an unreachable
+partner means "as before" (local jobs run locally). Log events:
+`pool_pulled` (requester), `pool_pushed` (owner), `pool_pull_failed`,
+`pool_pull_lost`.
+
+**View.** Every job carries `"request": {"loras": [...]}` and
+`"running_on"`: `"local"` while it runs on the owner's worker, the
+partner's `http://host:port` while the partner's worker runs it (pulled),
+`null` when it is not running. `GET /v1/jobs?scope=pool` adds
+`"position"`: the rank among the queued jobs of both routers by
+`created_at` (1 = next to run), `null` for jobs that are not queued; the
+partner's `running_on` is translated to this router's point of view.
+`GET /router/status` gets `"pool_queue": {"local": queued here,
+"partner": queued there (null while unknown), "pulled": jobs this
+router fetched from the partner, "pushed": jobs handed to the partner,
+"pulling": [ids being run here for the partner], "pushed_active": [ids
+the partner runs for this router], "pull_hold_s" (only while pulling is
+paused), "partner_name", "enabled"}`.
+
+Limits: the pool has exactly one partner; `running_on` names the
+requester as it named itself (`http://<--host>:<port>`, or how the
+partner's `[remote/...]` section names it once its capabilities were
+read); the image preview of a pulled job runs on the requester's
+worker, so the owner shows no live step for it; a job with a multipart
+body states its LoRAs only through a `loras` JSON part.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
