@@ -3491,6 +3491,52 @@ int RunRouter(std::span<const char* const> args) {
     jobs_options.webhook_timeout = std::chrono::seconds(
         std::max<std::size_t>(1, jobs_webhook_timeout_seconds));
     jobs_options.expire_after = std::chrono::hours(jobs_expire_hours);
+    // Pool relay: the partner router (the remote twin of the pool presets,
+    // else of the first switchable or remote one) answers GET
+    // /v1/jobs?scope=pool and every job id this router does not know.
+    const router::PresetModel* partner = nullptr;
+    int partner_rank = -1;
+    for (const auto& model : models) {
+      if (!model.remote.has_value())
+        continue;
+      const int rank = (model.placement == router::Placement::kPool ? 2 : 0) +
+                       (model.switchable ? 1 : 0);
+      if (rank > partner_rank) {
+        partner = &model;
+        partner_rank = rank;
+      }
+    }
+    if (partner != nullptr) {
+      const router::RemoteSpec spec = *partner->remote;
+      const std::string relay_id = state->router_id;
+      jobs_options.partner_name = "http://" + router::EndpointKey(spec.url);
+      jobs_options.relay =
+          [spec, relay_id](const HttpRequest& req,
+                           std::chrono::milliseconds head_timeout,
+                           std::chrono::milliseconds total_timeout,
+                           std::string* error) -> std::optional<HttpResponse> {
+        router::UpstreamTarget target = router::RemoteTarget(spec, relay_id);
+        target.connect_timeout = std::chrono::seconds(3);
+        target.head_timeout = head_timeout;
+        HttpRequest copy = req;
+        const auto deadline = std::chrono::steady_clock::now() + total_timeout;
+        const auto inner = req.is_cancelled;
+        copy.is_cancelled = [inner, deadline] {
+          return (inner && inner()) ||
+                 std::chrono::steady_clock::now() >= deadline;
+        };
+        HttpResponse response = router::ProxyToWorker(target, copy);
+        constexpr std::string_view kPrefix = "upstream_unavailable detail=";
+        if (response.status == 502 && !response.streaming_body &&
+            std::string_view(response.log_details).starts_with(kPrefix)) {
+          *error = response.log_details.substr(kPrefix.size());
+          return std::nullopt;
+        }
+        return response;
+      };
+      Logger::Info("router", "event=jobs_pool_relay partner=" +
+                                 jobs_options.partner_name);
+    }
     if (!comfy_ffmpeg.empty()) {
       // POST /v1/videos/concat: ffprobe lives next to ffmpeg.
       jobs_options.ffmpeg = comfy_ffmpeg;

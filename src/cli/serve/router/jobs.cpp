@@ -387,6 +387,103 @@ bool ValidFileName(std::string_view name) {
          });
 }
 
+/// image, video or audio by the file name's type; "" for anything else.
+std::string MediaKindOf(std::string_view name) {
+  const std::string type = ContentTypeFor(name);
+  if (type.starts_with("image/"))
+    return "image";
+  if (type.starts_with("video/"))
+    return "video";
+  if (type.starts_with("audio/"))
+    return "audio";
+  return "";
+}
+
+/// The first image, video or audio file in a result's "files" list, in
+/// the order the page shows them; "" without one.
+std::string FirstMediaFile(const json::Value& result) {
+  if (!result.is_object())
+    return "";
+  const json::Value* files = result.find("files");
+  if (files == nullptr || !files->is_array())
+    return "";
+  for (const json::Value& file : files->items()) {
+    const std::string name = file.member_str("name");
+    if (!IsKeptFile(name) && !MediaKindOf(name).empty())
+      return name;
+  }
+  return "";
+}
+
+std::string ThumbContentType(const std::string& ext) {
+  return ext == "png" ? "image/png" : "image/jpeg";
+}
+
+/// ?w=: 64..1024, default 256.
+int ThumbWidth(const HttpRequest& request) {
+  int width = 256;
+  if (const std::string text = request.query_param("w"); !text.empty())
+    width = std::clamp(
+        static_cast<int>(std::strtol(text.c_str(), nullptr, 10)), 64, 1024);
+  return width;
+}
+
+/// thumb-<w>.<ext> for the job's first media file, thumb-<w>-<stem>.<ext>
+/// for any other file named with ?file=.
+std::string ThumbName(int width, const std::string& file,
+                      const std::string& first, const std::string& ext) {
+  std::string name = "thumb-" + std::to_string(width);
+  if (!file.empty() && file != first) {
+    std::string stem = file.substr(0, file.rfind('.'));
+    std::replace(stem.begin(), stem.end(), '.', '_');
+    name += "-" + stem;
+  }
+  return name + "." + ext;
+}
+
+/// The request came from the partner (or another router): never relay it.
+bool IsRelayed(const HttpRequest& request) {
+  return !request.header(kRelayHeader).empty() ||
+         !request.header("X-Gufo-Forwarded").empty();
+}
+
+bool WantsPool(const HttpRequest& request) {
+  const std::string pool = Lower(request.query_param("pool"));
+  return Lower(request.query_param("scope")) == "pool" || pool == "1" ||
+         pool == "true" || pool == "yes";
+}
+
+/// Reads a streamed answer into its body (the relay streams through).
+std::string CollectBody(HttpResponse& response) {
+  std::string body;
+  if (response.streaming_body) {
+    response.streaming_body([&body](std::string_view chunk) {
+      body.append(chunk);
+      return true;
+    });
+    response.streaming_body = nullptr;
+  } else {
+    body = std::move(response.body);
+  }
+  return body;
+}
+
+/// Drops what the partner's HTTP layer added and ours adds again (CORS,
+/// request id), so a relayed answer does not carry them twice.
+void StripTransportHeaders(HttpResponse& response) {
+  std::erase_if(response.headers, [](const auto& header) {
+    const std::string name = Lower(header.first);
+    return name.starts_with("access-control-") || name == "x-request-id";
+  });
+}
+
+std::string ResponseContentType(const HttpResponse& response) {
+  for (const auto& [name, value] : response.headers)
+    if (name.size() == 12 && Lower(name) == "content-type")
+      return value;
+  return "";
+}
+
 /// The last `limit` bytes of `text`, cut at a line start, for error texts.
 std::string TailOf(std::string_view text, std::size_t limit) {
   while (!text.empty() &&
@@ -1258,6 +1355,13 @@ std::optional<HttpResponse> JobQueue::Handle(const HttpRequest& request) {
         slash == std::string_view::npos ? "" : rest.substr(slash);
     if (!ValidJobId(id))
       return Err(404, "Not Found", "job not found", "job_not_found");
+    bool known = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      known = jobs_.contains(id);
+    }
+    if (!known && options_.relay && !IsRelayed(request))
+      return RelayJob(id, tail, request);
     if (tail.empty()) {
       if (method == "GET")
         return Get(id);
@@ -1285,6 +1389,12 @@ std::optional<HttpResponse> JobQueue::Handle(const HttpRequest& request) {
         return Err(405, "Method Not Allowed", "method is not allowed",
                    "method_not_allowed");
       return File(id, std::string(tail.substr(7)));
+    }
+    if (tail == "/thumb") {
+      if (method != "GET")
+        return Err(405, "Method Not Allowed", "method is not allowed",
+                   "method_not_allowed");
+      return Thumb(id, request);
     }
     return Err(404, "Not Found", "no route for this path", "not_found");
   } catch (const std::exception& error) {
@@ -1468,6 +1578,8 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
 }
 
 HttpResponse JobQueue::List(const HttpRequest& request) {
+  if (WantsPool(request) && !IsRelayed(request))
+    return PoolList(request);
   std::size_t limit = 100;
   if (const std::string text = request.query_param("limit"); !text.empty())
     limit = std::clamp<std::size_t>(std::strtoull(text.c_str(), nullptr, 10),
@@ -1708,6 +1820,336 @@ HttpResponse JobQueue::File(const std::string& id, const std::string& name) {
                                   {"Cache-Control", "no-cache"}}};
 }
 
+HttpResponse JobQueue::Thumb(const std::string& id,
+                             const HttpRequest& request) {
+  const int width = ThumbWidth(request);
+  const std::string requested = request.query_param("file");
+  std::string first;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = jobs_.find(id);
+    if (found == jobs_.end())
+      return Err(404, "Not Found", "job not found", "job_not_found");
+    first = FirstMediaFile(found->second->result);
+  }
+  const std::string name = requested.empty() ? first : requested;
+  if (name.empty())
+    return Err(404, "Not Found", "job has no image, video or audio file",
+               "file_not_found");
+  if (!ValidFileName(name) || IsKeptFile(name))
+    return Err(404, "Not Found", "file not found", "file_not_found");
+  const fs::path source = JobDir(id) / name;
+  std::error_code ec;
+  if (!fs::is_regular_file(source, ec))
+    return Err(404, "Not Found", "file not found", "file_not_found");
+  const std::string kind = MediaKindOf(name);
+  if (kind.empty())
+    return Err(400, "Bad Request",
+               name + " is not an image, video or audio file",
+               "thumb_unsupported");
+  const std::string ext = kind == "audio" ? "png" : "jpg";
+  const fs::path cache = JobDir(id) / ThumbName(width, requested, first, ext);
+  const auto serve = [&](const char* how) {
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = ReadAll(cache),
+                        .headers = {{"Content-Type", ThumbContentType(ext)},
+                                    {"Cache-Control", "public, max-age=86400"},
+                                    {"X-Gufo-Thumb", how}}};
+  };
+  if (fs::is_regular_file(cache, ec))
+    return serve("cached");
+  if (options_.ffmpeg.empty())
+    return Err(501, "Not Implemented",
+               "thumbnails need ffmpeg (--comfy-ffmpeg)", "thumb_unavailable");
+  const std::lock_guard<std::mutex> thumb_lock(thumb_mutex_);
+  if (fs::is_regular_file(cache, ec))
+    return serve("cached");  // made while waiting for the lock
+  const auto started = std::chrono::steady_clock::now();
+  TempDir work{options_.root / "temp" / ("thumb-" + id)};
+  fs::create_directories(work.path, ec);
+  if (ec)
+    return Err(500, "Internal Server Error",
+               "cannot create " + work.path.string() + ": " + ec.message(),
+               "thumb_failed");
+  const fs::path out = work.path / ("thumb." + ext);
+  const fs::path log_out = work.path / "ffmpeg.out";
+  const fs::path log_err = work.path / "ffmpeg.err";
+  const std::string scale =
+      "scale=" + std::to_string(width) + ":-2,format=yuvj420p";
+  double at = 0;
+  if (kind == "video") {
+    // A frame at 10 % of the length, 0.5 s when the length is unknown.
+    at = 0.5;
+    if (!options_.ffprobe.empty()) {
+      const fs::path probe_out = work.path / "probe.json";
+      const fs::path probe_err = work.path / "probe.err";
+      std::string error;
+      const int code = RunCaptured(
+          options_.ffprobe,
+          {"-v", "error", "-print_format", "json", "-show_streams",
+           "-show_format", source},
+          std::chrono::minutes(2), probe_out, probe_err, nullptr, &error);
+      ProbeInfo info;
+      if (code == 0 && ParseProbe(ReadIfThere(probe_out), &info, &error) &&
+          info.duration > 0)
+        at = info.duration * 0.1;
+    }
+  }
+  const auto run = [&](double seek) {
+    std::vector<fs::path> args = {"-hide_banner", "-loglevel", "error",
+                                  "-nostdin", "-y"};
+    if (kind == "video") {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.3f", seek);
+      args.emplace_back("-ss");
+      args.emplace_back(buf);
+    }
+    args.emplace_back("-i");
+    args.push_back(source);
+    if (kind == "audio") {
+      args.emplace_back("-filter_complex");
+      args.emplace_back("showwavespic=s=" + std::to_string(width) + "x" +
+                        std::to_string(std::max(1, width / 3)) +
+                        ":colors=#5b4fc4");
+      args.emplace_back("-frames:v");
+      args.emplace_back("1");
+    } else {
+      args.emplace_back("-frames:v");
+      args.emplace_back("1");
+      args.emplace_back("-vf");
+      args.emplace_back(scale);
+      args.emplace_back("-q:v");
+      args.emplace_back("3");
+    }
+    args.push_back(out);
+    std::string error;
+    const int code = RunCaptured(options_.ffmpeg, args, std::chrono::minutes(2),
+                                 log_out, log_err, nullptr, &error);
+    std::error_code exists_ec;
+    if (code == 0 && fs::is_regular_file(out, exists_ec))
+      return std::string();
+    if (!error.empty())
+      return error;
+    return "ffmpeg exit " + std::to_string(code) + ": " +
+           TailOf(ReadIfThere(log_err), 600);
+  };
+  std::string failure = run(at);
+  if (!failure.empty() && kind == "video" && at > 0)
+    failure = run(0);  // the seek point lay past the last frame
+  if (!failure.empty()) {
+    Logger::Warn("jobs", "event=thumb_failed id=" + id + " file=" + name +
+                             " error=" + failure);
+    return Err(500, "Internal Server Error",
+               "thumbnail of " + name + " failed: " + failure, "thumb_failed");
+  }
+  fs::rename(out, cache, ec);
+  if (ec) {
+    ec.clear();
+    fs::copy_file(out, cache, fs::copy_options::overwrite_existing, ec);
+    if (ec)
+      return Err(500, "Internal Server Error",
+                 "cannot store " + cache.string() + ": " + ec.message(),
+                 "thumb_failed");
+  }
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  Logger::Info("jobs", "event=thumb id=" + id + " file=" + name +
+                           " kind=" + kind + " w=" + std::to_string(width) +
+                           " ms=" + std::to_string(took.count()));
+  return serve("generated");
+}
+
+HttpResponse JobQueue::PoolList(const HttpRequest& request) {
+  std::size_t limit = 100;
+  if (const std::string text = request.query_param("limit"); !text.empty())
+    limit = std::clamp<std::size_t>(std::strtoull(text.c_str(), nullptr, 10),
+                                    1, 1000);
+  Filter filter;
+  std::string error;
+  if (!ParseFilter(request, &filter, &error))
+    return Err(400, "Bad Request", error, "invalid_filter");
+  std::vector<json::Value> merged;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = order_.rbegin(); it != order_.rend() && merged.size() < limit;
+         ++it) {
+      if (!MatchesLocked(**it, filter))
+        continue;
+      json::Value view = ViewLocked(**it);
+      view["owner"] = "local";
+      merged.push_back(std::move(view));
+    }
+  }
+  std::string partner = "none";
+  if (options_.relay) {
+    // The partner answers its own list (the relay header keeps it from
+    // asking us back); its jobs get its address as owner.
+    HttpRequest copy;
+    copy.method = "GET";
+    copy.path = "/v1/jobs";
+    copy.query = request.query;
+    copy.request_id = request.request_id;
+    copy.headers.emplace_back(kRelayHeader, "1");
+    bool ok = false;
+    std::string why;
+    auto answer = options_.relay(copy, std::chrono::seconds(3),
+                                 std::chrono::seconds(3), &why);
+    if (answer) {
+      const std::string body = CollectBody(*answer);
+      if (answer->status == 200) {
+        try {
+          const json::Value parsed = json::parse(body);
+          if (const json::Value* data = parsed.find("data");
+              data != nullptr && data->is_array()) {
+            for (const json::Value& item : data->items()) {
+              if (!item.is_object())
+                continue;
+              json::Value job = item;
+              job["owner"] = options_.partner_name;
+              merged.push_back(std::move(job));
+            }
+            ok = true;
+          } else {
+            why = "no job list in the answer";
+          }
+        } catch (const std::exception& failure) {
+          why = std::string("answer is not JSON: ") + failure.what();
+        }
+      } else {
+        why = "HTTP " + std::to_string(answer->status) + " " +
+              TailOf(body, 200);
+      }
+    }
+    if (ok) {
+      partner = options_.partner_name;
+    } else {
+      partner = "unreachable";
+      Logger::Warn("jobs", "event=pool_list_partner_failed partner=" +
+                               options_.partner_name + " error=" + why);
+    }
+  }
+  std::stable_sort(merged.begin(), merged.end(),
+                   [](const json::Value& a, const json::Value& b) {
+                     return a.member_double("created_at") >
+                            b.member_double("created_at");
+                   });
+  if (merged.size() > limit)
+    merged.resize(limit);
+  json::Value data = json::Value::array();
+  for (json::Value& job : merged)
+    data.push_back(std::move(job));
+  json::Value body = json::Value::object();
+  body["object"] = "list";
+  body["scope"] = "pool";
+  body["partner"] = partner;
+  body["data"] = std::move(data);
+  return JsonResponse(200, "OK", body);
+}
+
+HttpResponse JobQueue::RelayJob(const std::string& id, std::string_view tail,
+                                const HttpRequest& request) {
+  const bool is_file = tail.starts_with("/files/");
+  const bool is_thumb = tail == "/thumb";
+  if (!(tail.empty() || tail == "/keep" || tail == "/cancel" || is_file ||
+        is_thumb))
+    return Err(404, "Not Found", "no route for this path", "not_found");
+  HttpRequest copy = request;
+  copy.headers.emplace_back(kRelayHeader, "1");
+  const auto unreachable = [&](const std::string& why) {
+    Logger::Warn("jobs", "event=relay_failed id=" + id + " partner=" +
+                             options_.partner_name + " error=" + why);
+    return Err(502, "Bad Gateway",
+               "partner router " + options_.partner_name +
+                   " not reachable: " + why,
+               "partner_unreachable");
+  };
+  std::string why;
+  if (is_thumb) {
+    // Cached under relay-cache/<id>/, removed a day after the last use.
+    const std::string file = request.query_param("file");
+    if (!file.empty() && (!ValidFileName(file) || IsKeptFile(file)))
+      return Err(404, "Not Found", "file not found", "file_not_found");
+    const int width = ThumbWidth(request);
+    const fs::path dir = options_.root / "relay-cache" / id;
+    for (const char* ext : {"jpg", "png"}) {
+      const fs::path cached = dir / ThumbName(width, file, "", ext);
+      std::error_code ec;
+      if (fs::is_regular_file(cached, ec)) {
+        fs::last_write_time(cached, fs::file_time_type::clock::now(), ec);
+        return HttpResponse{
+            .status = 200,
+            .reason = "OK",
+            .body = ReadAll(cached),
+            .headers = {{"Content-Type", ThumbContentType(ext)},
+                        {"Cache-Control", "public, max-age=86400"},
+                        {"X-Gufo-Thumb", "relay-cached"}}};
+      }
+    }
+    auto answer = options_.relay(copy, std::chrono::seconds(60),
+                                 std::chrono::minutes(10), &why);
+    if (!answer)
+      return unreachable(why);
+    if (answer->status != 200) {
+      StripTransportHeaders(*answer);
+      return std::move(*answer);
+    }
+    const std::string type = MediaType(ResponseContentType(*answer));
+    const std::string body = CollectBody(*answer);
+    const std::string ext = type == "image/png" ? "png" : "jpg";
+    try {
+      WriteAll(dir / ThumbName(width, file, "", ext), body);
+    } catch (const std::exception& failure) {
+      Logger::Warn("jobs", std::string("event=relay_cache_write_failed id=") +
+                               id + " error=" + failure.what());
+    }
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = body,
+                        .headers = {{"Content-Type", ThumbContentType(ext)},
+                                    {"Cache-Control", "public, max-age=86400"},
+                                    {"X-Gufo-Thumb", "relayed"}}};
+  }
+  auto answer = is_file ? options_.relay(copy, std::chrono::seconds(60),
+                                         std::chrono::minutes(10), &why)
+                        : options_.relay(copy, std::chrono::seconds(10),
+                                         std::chrono::seconds(10), &why);
+  if (!answer)
+    return unreachable(why);
+  StripTransportHeaders(*answer);
+  return std::move(*answer);
+}
+
+void JobQueue::ExpireRelayCache() {
+  const fs::path root = options_.root / "relay-cache";
+  std::error_code ec;
+  if (!fs::is_directory(root, ec))
+    return;
+  const auto cutoff =
+      fs::file_time_type::clock::now() - std::chrono::hours(24);
+  std::vector<fs::path> stale;
+  for (const auto& entry : fs::directory_iterator(root, ec)) {
+    if (!entry.is_directory(ec))
+      continue;
+    bool fresh = false;
+    for (const auto& file : fs::directory_iterator(entry.path(), ec)) {
+      const auto written = fs::last_write_time(file.path(), ec);
+      if (!ec && written > cutoff) {
+        fresh = true;
+        break;
+      }
+    }
+    if (!fresh)
+      stale.push_back(entry.path());
+  }
+  for (const fs::path& dir : stale) {
+    fs::remove_all(dir, ec);
+    if (!ec)
+      Logger::Info("jobs", "event=relay_cache_expired id=" +
+                               dir.filename().string());
+  }
+}
+
 json::Value JobQueue::ViewLocked(const Job& job) const {
   json::Value view = json::Value::object();
   view["id"] = job.id;
@@ -1765,6 +2207,11 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
         job.upstream_id;
   view["metadata"] = job.metadata;
   view["result"] = job.result;
+  const std::string media = job.expired_at == 0 ? FirstMediaFile(job.result)
+                                                : std::string();
+  view["thumb_url"] = media.empty()
+                          ? json::Value()
+                          : json::Value("/v1/jobs/" + job.id + "/thumb");
   view["error"] = job.error;
   if (!job.webhook_url.empty()) {
     json::Value webhook = json::Value::object();
@@ -2789,6 +3236,7 @@ void JobQueue::Tick() {
   next_expiry_ = now + std::chrono::seconds(60);
   try {
     ExpireFiles(NowSeconds());
+    ExpireRelayCache();
   } catch (const std::exception& error) {
     Logger::Warn("jobs", std::string("event=jobs_expire_failed error=") +
                              error.what());

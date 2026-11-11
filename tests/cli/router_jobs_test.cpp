@@ -359,6 +359,9 @@ struct Harness {
   std::shared_ptr<FakeReceiver> receiver = std::make_shared<FakeReceiver>();
   std::unique_ptr<jobs::JobQueue> queue;
   std::chrono::seconds expire_after{std::chrono::hours(12)};
+  /// Set before Open(true) to give the queue a (fake) pool partner.
+  jobs::Options::Relay relay;
+  std::string partner_name;
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -393,6 +396,8 @@ struct Harness {
     };
     options.video_poll = std::chrono::milliseconds(10);
     options.progress_poll = std::chrono::milliseconds(10);
+    options.relay = relay;
+    options.partner_name = partner_name;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -1276,6 +1281,227 @@ void TestConcatEndpoint() {
   CHECK(found);
 }
 
+void TestThumb() {
+  Harness h("thumb");
+  const std::string id = h.Submit(ImageJob("a cat")).member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_str("thumb_url") == "/v1/jobs/" + id + "/thumb");
+  // The route exists; the harness has no ffmpeg, so a fresh thumb is 501.
+  HttpResponse answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?w=128");
+  CHECK(answer.status == 501 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "thumb_unavailable");
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?file=image-2.png");
+  CHECK(answer.status == 501);
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?file=missing.png");
+  CHECK(answer.status == 404 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "file_not_found");
+  CHECK(h.Call("GET", "/v1/jobs/" + id + "/thumb?file=response.json").status ==
+        404);
+  CHECK(h.Call("POST", "/v1/jobs/" + id + "/thumb").status == 405);
+  answer = h.Call("GET", "/v1/jobs/job_0123456789abcdef01234567/thumb");
+  CHECK(answer.status == 404 &&
+        json::parse(answer.body).find("error")->member_str("code") ==
+            "job_not_found");
+  // A cached thumb next to the job's files is served without ffmpeg.
+  const std::string bytes = "\xFF\xD8\xFF\xE0 fake jpeg";
+  {
+    std::ofstream out(h.dir / id / "thumb-128.jpg", std::ios::binary);
+    out << bytes;
+  }
+  answer = h.Call("GET", "/v1/jobs/" + id + "/thumb?w=128");
+  CHECK(answer.status == 200 && answer.body == bytes);
+  bool jpeg = false;
+  bool cacheable = false;
+  for (const auto& [name, value] : answer.headers) {
+    jpeg = jpeg || (name == "Content-Type" && value == "image/jpeg");
+    cacheable = cacheable || (name == "Cache-Control" &&
+                              value == "public, max-age=86400");
+  }
+  CHECK(jpeg && cacheable);
+  // Another width is another cache file: still 501 here.
+  CHECK(h.Call("GET", "/v1/jobs/" + id + "/thumb").status == 501);
+  // A job without media has no thumb_url.
+  const std::string chat =
+      h.Submit(R"({"request":{"path":"/v1/chat/completions","body":{"model":"qwen-image","messages":[]}}})")
+          .member_str("id");
+  const json::Value chat_done = json::parse(h.Call("GET", "/v1/jobs/" + chat).body);
+  CHECK(chat_done.find("thumb_url") != nullptr &&
+        chat_done.find("thumb_url")->is_null());
+}
+
+void TestPoolRelay() {
+  // Without a partner: scope=pool is the local list with partner "none",
+  // and an unknown id stays 404.
+  {
+    Harness h("pool-none");
+    const std::string id = h.Submit(ImageJob("a cat")).member_str("id");
+    h.WaitFor(id, "completed");
+    const json::Value listed =
+        json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+    CHECK(listed.member_str("partner") == "none");
+    CHECK(listed.find("data")->items().size() == 1);
+    CHECK(listed.find("data")->items()[0].member_str("owner") == "local");
+    CHECK(listed.find("data")->items()[0].member_str("id") == id);
+    const std::string other = "job_0123456789abcdef01234567";
+    HttpResponse answer = h.Call("GET", "/v1/jobs/" + other);
+    CHECK(answer.status == 404 &&
+          json::parse(answer.body).find("error")->member_str("code") ==
+              "job_not_found");
+    CHECK(h.Call("GET", "/v1/jobs/" + other + "/files/video.mp4").status == 404);
+    CHECK(h.Call("GET", "/v1/jobs/" + other + "/thumb").status == 404);
+    CHECK(h.Call("DELETE", "/v1/jobs/" + other).status == 404);
+  }
+  // With a (fake) partner: its jobs merge in newest first with its address
+  // as owner, unknown ids go to it, relayed requests never go on.
+  {
+    const std::string partner_id = "job_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const std::string gone_id = "job_bbbbbbbbbbbbbbbbbbbbbbbb";
+    auto seen = std::make_shared<std::vector<HttpRequest>>();
+    Harness h("pool-partner", false);
+    h.partner_name = "http://10.0.0.2:8081";
+    h.relay = [seen, partner_id, gone_id](
+                  const HttpRequest& request, std::chrono::milliseconds,
+                  std::chrono::milliseconds,
+                  std::string* error) -> std::optional<HttpResponse> {
+      seen->push_back(request);
+      const auto json_answer = [](int status, const std::string& body) {
+        HttpResponse response;
+        response.status = status;
+        response.body = body;
+        // What the partner's HTTP layer adds; must not come through twice.
+        response.headers = {{"Content-Type", "application/json"},
+                            {"Access-Control-Allow-Origin", "*"},
+                            {"X-Request-ID", "r99"}};
+        return response;
+      };
+      if (request.path == "/v1/jobs")
+        return json_answer(
+            200, R"({"object":"list","data":[{"id":")" + partner_id +
+                     R"(","status":"completed","created_at":4102444800,)"
+                     R"("thumb_url":"/v1/jobs/)" + partner_id + R"(/thumb"}]})");
+      if (request.path == "/v1/jobs/" + partner_id ||
+          request.path == "/v1/jobs/" + partner_id + "/keep")
+        return json_answer(200, R"({"id":")" + partner_id + R"(","keep":true})");
+      if (request.path == "/v1/jobs/" + partner_id + "/thumb") {
+        HttpResponse response;
+        response.status = 200;
+        response.headers = {{"Content-Type", "image/jpeg"}};
+        // Streamed like the proxy does it.
+        response.streaming_body = [](const HttpResponse::BodyWriter& write) {
+          write("\xFF\xD8");
+          write("partner jpeg");
+        };
+        return response;
+      }
+      if (request.path.starts_with("/v1/jobs/" + gone_id)) {
+        *error = "connect refused";
+        return std::nullopt;
+      }
+      return json_answer(404, R"({"error":{"code":"job_not_found"}})");
+    };
+    h.Open(true);
+    const std::string id = h.Submit(ImageJob("a dog")).member_str("id");
+    h.WaitFor(id, "completed");
+    const json::Value listed =
+        json::parse(h.Call("GET", "/v1/jobs?scope=pool&limit=10").body);
+    CHECK(listed.member_str("partner") == "http://10.0.0.2:8081");
+    CHECK(listed.member_str("scope") == "pool");
+    const auto& data = listed.find("data")->items();
+    CHECK(data.size() == 2);
+    CHECK(data[0].member_str("id") == partner_id);
+    CHECK(data[0].member_str("owner") == "http://10.0.0.2:8081");
+    CHECK(data[1].member_str("id") == id);
+    CHECK(data[1].member_str("owner") == "local");
+    CHECK(seen->size() == 1 && seen->back().path == "/v1/jobs" &&
+          seen->back().query == "scope=pool&limit=10" &&
+          seen->back().header(jobs::kRelayHeader) == "1");
+    // The plain list stays local and unmarked.
+    const json::Value plain = json::parse(h.Call("GET", "/v1/jobs").body);
+    CHECK(plain.find("partner") == nullptr &&
+          plain.find("data")->items().size() == 1 &&
+          plain.find("data")->items()[0].find("owner") == nullptr);
+    CHECK(seen->size() == 1);
+    // A relayed pool request (from the partner) is answered locally.
+    {
+      HttpRequest request;
+      request.method = "GET";
+      request.path = "/v1/jobs";
+      request.query = "scope=pool";
+      request.headers.emplace_back(jobs::kRelayHeader, "1");
+      const auto answer = h.queue->Handle(request);
+      CHECK(answer && answer->status == 200);
+      CHECK(json::parse(answer->body).find("partner") == nullptr);
+      CHECK(seen->size() == 1);
+    }
+    // Unknown ids go to the partner; a local id never does.
+    HttpResponse answer = h.Call("GET", "/v1/jobs/" + partner_id);
+    CHECK(answer.status == 200 &&
+          json::parse(answer.body).member_str("id") == partner_id);
+    CHECK(seen->size() == 2 && seen->back().method == "GET");
+    for (const auto& [name, value] : answer.headers)
+      CHECK(name != "Access-Control-Allow-Origin" && name != "X-Request-ID");
+    // Local jobs stay local with a partner configured: the list, the job,
+    // its files and its thumb never go to the partner.
+    CHECK(h.Call("GET", "/v1/jobs/" + id + "/files/image-1.png").status == 200);
+    answer = h.Call("GET", "/v1/jobs/" + id + "/thumb");
+    CHECK(answer.status == 501 &&
+          json::parse(answer.body).find("error")->member_str("code") ==
+              "thumb_unavailable");
+    {
+      std::ofstream out(h.dir / id / "thumb-256.jpg", std::ios::binary);
+      out << "local jpeg";
+    }
+    answer = h.Call("GET", "/v1/jobs/" + id + "/thumb");
+    CHECK(answer.status == 200 && answer.body == "local jpeg");
+    CHECK(seen->size() == 2);
+    CHECK(h.Call("POST", "/v1/jobs/" + partner_id + "/keep").status == 200);
+    CHECK(seen->size() == 3 && seen->back().method == "POST" &&
+          seen->back().path == "/v1/jobs/" + partner_id + "/keep");
+    CHECK(h.Call("GET", "/v1/jobs/" + id).status == 200);
+    CHECK(seen->size() == 3);
+    CHECK(h.Call("GET", "/v1/jobs/" + partner_id + "/nothing").status == 404);
+    CHECK(seen->size() == 3);
+    answer = h.Call("GET", "/v1/jobs/" + gone_id);
+    CHECK(answer.status == 502 &&
+          json::parse(answer.body).find("error")->member_str("code") ==
+              "partner_unreachable");
+    // A relayed request for an unknown id is not relayed on: 404.
+    {
+      HttpRequest request;
+      request.method = "GET";
+      request.path = "/v1/jobs/" + partner_id;
+      request.headers.emplace_back("X-Gufo-Forwarded", "other-router");
+      const auto loop = h.queue->Handle(request);
+      CHECK(loop && loop->status == 404);
+    }
+    // A partner thumb is streamed through once, then served from the
+    // relay cache.
+    const std::size_t before = seen->size();
+    answer = h.Call("GET", "/v1/jobs/" + partner_id + "/thumb");
+    CHECK(answer.status == 200 && answer.body == "\xFF\xD8partner jpeg");
+    CHECK(seen->size() == before + 1);
+    const std::filesystem::path cached =
+        h.dir / "relay-cache" / partner_id / "thumb-256.jpg";
+    CHECK(std::filesystem::is_regular_file(cached));
+    answer = h.Call("GET", "/v1/jobs/" + partner_id + "/thumb");
+    CHECK(answer.status == 200 && answer.body == "\xFF\xD8partner jpeg");
+    CHECK(seen->size() == before + 1);
+    bool relay_cached = false;
+    for (const auto& [name, value] : answer.headers)
+      relay_cached = relay_cached ||
+                     (name == "X-Gufo-Thumb" && value == "relay-cached");
+    CHECK(relay_cached);
+    // Untouched for a day, the cache folder goes with the expiry pass.
+    std::filesystem::last_write_time(
+        cached, std::filesystem::file_time_type::clock::now() -
+                    std::chrono::hours(25));
+    h.queue->ExpireRelayCache();
+    CHECK(!std::filesystem::exists(cached.parent_path()));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1304,6 +1530,8 @@ int main() {
   TestMusic();
   TestConcatHelpers();
   TestConcatEndpoint();
+  TestThumb();
+  TestPoolRelay();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;
