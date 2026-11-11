@@ -22,11 +22,28 @@ namespace gufo::server {
 
 inline constexpr std::string_view kMusicApiPath = "/v1/audio/music";
 
-/// ACE-Step 1.5 text-to-music behind /v1/audio/music:
+/// How `gufo serve music` finds its files (see
+/// models::ace_step::ModelPaths::Resolve): the directory, the DiT choice
+/// ("" / "turbo" / "sft" / "base" / file), the LM choice ("" / "none" /
+/// "0.6b" / "1.7b" / "4b" / file), the variant override and the public
+/// model id ("" = "ace-step-1.5-xl-<variant>").
+struct MusicServiceOptions {
+  std::filesystem::path model_root;
+  std::string dit;
+  std::string lm;
+  std::string variant;
+  std::string model_id;
+};
+
+/// ACE-Step 1.5 music behind /v1/audio/music:
 ///   POST /v1/audio/music               {prompt|tags, lyrics, duration, seed,
-///        steps, bpm, keyscale, timesignature, language, audio_codes,
-///        lm_cfg, lm_temperature, lm_top_p, response_format, bitrate_kbps,
-///        async} -> audio/wav (response_format "wav", default), audio/mpeg
+///        steps, shift, guidance_scale, cfg_interval_start/end, bpm,
+///        keyscale, timesignature, language, audio_codes, lm_cfg,
+///        lm_temperature, lm_top_p, task, source_audio, reference_audio,
+///        repaint_start, repaint_end, repaint_mode, repaint_strength,
+///        cover_strength, cover_noise_strength, track, track_classes,
+///        vae_sample, response_format, bitrate_kbps, async}
+///        -> audio/wav (response_format "wav", default), audio/mpeg
 ///        ("mp3") or audio/mp4 ("aac" / "m4a"), with Content-Disposition
 ///        output.{wav,mp3,m4a}; mp3 / m4a are FFmpeg transcodes at
 ///        bitrate_kbps (96..320, default 192) and fail the job with
@@ -39,6 +56,11 @@ inline constexpr std::string_view kMusicApiPath = "/v1/audio/music";
 ///        audio/wav of ~6 s around the middle of the song decoded from the
 ///        sampler's clean estimate (X-Gufo-Preview-Step / -Steps /
 ///        -Seconds / -Window headers), 204 before the first one
+/// `task` is text2music (default), repaint, cover, cover-nofsq (every
+/// model) or extract, lego, complete (base model only; 400
+/// `unsupported_task` elsewhere). Every task but text2music needs
+/// `source_audio` (data URL, raw base64 or https; WAV directly, other
+/// formats through FFmpeg); `reference_audio` gives the timbre.
 /// Previews are rendered every 2nd diffusion step (request "preview":
 /// {"every": N}) while the request asked for them ("preview": true) or a
 /// client fetched the preview within the last kPreviewWatchWindow.
@@ -49,8 +71,11 @@ public:
   static constexpr std::size_t kQueueCapacity = 8;
   static constexpr std::size_t kKeptJobs = 16;
   static constexpr std::chrono::seconds kPreviewWatchWindow{10};
+  /// Largest encoded source / reference audio accepted (a 10 minute 48 kHz
+  /// stereo 16-bit WAV is 115 MB).
+  static constexpr std::size_t kMaxAudioBytes = 256U << 20U;
 
-  MusicService(const std::filesystem::path& model_root, std::string model_id);
+  explicit MusicService(const MusicServiceOptions& options);
   ~MusicService();
   MusicService(const MusicService&) = delete;
   MusicService& operator=(const MusicService&) = delete;
@@ -73,10 +98,13 @@ public:
   [[nodiscard]] std::string_view unavailable_code() const override {
     return "music_service_unavailable";
   }
+  [[nodiscard]] std::string variant() const;
 
   HttpResponse Handle(const HttpRequest& request) override;
 
 private:
+  /// The loaded DiT variant (turbo without a pipeline).
+  [[nodiscard]] models::ace_step::DitVariant dit_variant() const;
   struct Job;
   HttpResponse Submit(const HttpRequest& request);
   HttpResponse Status(const std::string& id, bool content);

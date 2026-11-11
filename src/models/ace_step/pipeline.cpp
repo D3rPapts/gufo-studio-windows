@@ -1,10 +1,14 @@
 #include "src/models/ace_step/pipeline.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "src/models/ace_step/model.hpp"
@@ -19,6 +23,7 @@ constexpr int kMaxTextTokens = 256;
 constexpr int kMaxLyricTokens = 2048;
 constexpr std::uint32_t kEndOfText = 151643;
 constexpr double kMaxSeconds = 600.0;
+constexpr int kMaxSteps = 200;
 
 double Since(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
@@ -27,14 +32,115 @@ double Since(std::chrono::steady_clock::time_point start) {
 
 }  // namespace
 
-// The host side (paths, prompts, noise, WAV) is in prompt.cpp.
+// The host side (paths, prompts, noise, WAV) is in prompt.cpp; the file
+// resolution below reads safetensors metadata (weights.hip), so it stays in
+// the HIP build.
+
+namespace {
+
+bool Fail(std::string* error, std::string message) {
+  if (error != nullptr)
+    *error = std::move(message);
+  return false;
+}
+
+std::string Lower(std::string_view text) {
+  std::string out(text);
+  for (char& c : out)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
+bool Exists(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(path, ec);
+}
+
+// The variant written by tools/ace_step/convert_hf_to_gufo.py
+// (`gufo.variant`), the Hugging Face `model_version`, else the file name.
+DitVariant DetectVariant(const std::filesystem::path& dit) {
+  DitVariant variant = DitVariant::kTurbo;
+  SafetensorsFile file;
+  std::string ignored;
+  if (file.Open(dit, nullptr, &ignored)) {
+    const auto& metadata = file.metadata();
+    for (const char* key : {"gufo.variant", "model_version"}) {
+      const auto it = metadata.find(key);
+      if (it != metadata.end() && GuessDitVariant(it->second, &variant))
+        return variant;
+    }
+  }
+  if (GuessDitVariant(dit.filename().string(), &variant))
+    return variant;
+  return DitVariant::kTurbo;
+}
+
+}  // namespace
+
+bool ModelPaths::Resolve(const std::filesystem::path& root,
+                         std::string_view dit, std::string_view lm,
+                         std::string_view variant, ModelPaths* paths,
+                         std::string* error) {
+  paths->text = root / "text_encoder.safetensors";
+  paths->vae = root / "vae.safetensors";
+  paths->tokenizer = root / "tokenizer.json";
+  paths->silence = root / "silence_latent.safetensors";
+  // DiT: default, variant short name or a path.
+  DitVariant named;
+  if (dit.empty()) {
+    paths->dit = root / "dit.safetensors";
+  } else if (ParseDitVariant(dit, &named)) {
+    paths->dit = root / ("dit-" + std::string(DitVariantName(named)) +
+                         ".safetensors");
+    if (named == DitVariant::kTurbo && !Exists(paths->dit))
+      paths->dit = root / "dit.safetensors";
+  } else {
+    paths->dit = std::filesystem::path(dit);
+    if (paths->dit.is_relative() && !Exists(paths->dit) &&
+        Exists(root / paths->dit))
+      paths->dit = root / paths->dit;
+  }
+  for (const auto* path : {&paths->dit, &paths->text, &paths->vae,
+                           &paths->tokenizer, &paths->silence})
+    if (!Exists(*path))
+      return Fail(error, "ACE-Step model file missing: " + path->string());
+  // LM: default (when present), "none", a size or a path.
+  const std::string lm_key = Lower(lm);
+  paths->lm.clear();
+  if (lm.empty()) {
+    if (Exists(root / "lm.safetensors"))
+      paths->lm = root / "lm.safetensors";
+  } else if (lm_key == "none" || lm_key == "off" || lm_key == "no") {
+    paths->lm.clear();
+  } else if (lm_key == "0.6b" || lm_key == "1.7b" || lm_key == "4b") {
+    paths->lm = root / ("lm-" + lm_key + ".safetensors");
+    if (!Exists(paths->lm))
+      return Fail(error, "ACE-Step LM file missing: " + paths->lm.string());
+  } else {
+    paths->lm = std::filesystem::path(lm);
+    if (paths->lm.is_relative() && !Exists(paths->lm) &&
+        Exists(root / paths->lm))
+      paths->lm = root / paths->lm;
+    if (!Exists(paths->lm))
+      return Fail(error, "ACE-Step LM file missing: " + paths->lm.string());
+  }
+  if (variant.empty()) {
+    paths->variant = DetectVariant(paths->dit);
+  } else if (!ParseDitVariant(variant, &paths->variant)) {
+    return Fail(error, "ACE-Step variant must be turbo, sft or base, not " +
+                           std::string(variant));
+  }
+  return true;
+}
 
 struct MusicPipeline::Impl {
   std::unique_ptr<Tokenizer> tokenizer;
   std::unique_ptr<TextEncoder> text;
   std::unique_ptr<Dit> dit;
   std::unique_ptr<VaeDecoder> vae;
-  std::filesystem::path lm_path, dit_path;
+  std::unique_ptr<VaeEncoder> encoder;  // loaded on the first source task
+  std::filesystem::path lm_path, dit_path, vae_path;
+  DitVariant variant{DitVariant::kTurbo};
   std::vector<float> silence;  // [frames, 64]
   int silence_frames{0};
 
@@ -49,11 +155,40 @@ struct MusicPipeline::Impl {
     }
     return out;
   }
+
+  bool EnsureEncoder(std::string* error) {
+    if (encoder)
+      return true;
+    encoder = VaeEncoder::Load(vae_path, error);
+    return encoder != nullptr;
+  }
+
+  // Tokenizes a prompt with the <|endoftext|> the Qwen3-Embedding tokenizer
+  // appends after truncation.
+  bool Encode(const std::string& prompt, int limit,
+              std::vector<std::uint32_t>* ids, std::string* error) {
+    try {
+      *ids = tokenizer->Encode(prompt);
+    } catch (const std::exception& e) {
+      return Fail(error, std::string("ACE-Step tokenizer: ") + e.what());
+    }
+    if (ids->size() > std::size_t(limit - 1))
+      ids->resize(std::size_t(limit - 1));
+    ids->push_back(kEndOfText);
+    return true;
+  }
 };
 
 MusicPipeline::MusicPipeline(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 MusicPipeline::~MusicPipeline() = default;
+
+DitVariant MusicPipeline::variant() const {
+  return impl_->variant;
+}
+bool MusicPipeline::has_lm() const {
+  return !impl_->lm_path.empty();
+}
 
 std::unique_ptr<MusicPipeline> MusicPipeline::Load(const ModelPaths& paths,
                                                    std::string* error) {
@@ -89,10 +224,12 @@ std::unique_ptr<MusicPipeline> MusicPipeline::Load(const ModelPaths& paths,
   impl->vae = VaeDecoder::Load(paths.vae, error);
   if (!impl->vae)
     return nullptr;
-  // The 8.4 GB LM is loaded per request and released before the DiT runs,
-  // so only one large model holds device memory at a time.
+  // The LM is loaded per request and released before the DiT runs, so
+  // only one large model holds device memory at a time.
   impl->lm_path = paths.lm;
   impl->dit_path = paths.dit;
+  impl->vae_path = paths.vae;
+  impl->variant = paths.variant;
   return std::unique_ptr<MusicPipeline>(new MusicPipeline(std::move(impl)));
 }
 
@@ -140,6 +277,34 @@ void PublishPreview(VaeDecoder& vae, const MusicPreviewSink& sink,
     sink.publish(std::move(preview));
 }
 
+// Planar stereo audio padded with `left` / `right` zero samples per channel.
+std::vector<float> PadPlanar(std::span<const float> planar, std::size_t left,
+                             std::size_t right) {
+  const std::size_t samples = planar.size() / 2;
+  const std::size_t total = left + samples + right;
+  std::vector<float> out(2 * total, 0.0F);
+  for (int ch = 0; ch < 2; ++ch)
+    std::copy_n(planar.begin() + std::ptrdiff_t(std::size_t(ch) * samples),
+                samples,
+                out.begin() + std::ptrdiff_t(std::size_t(ch) * total + left));
+  return out;
+}
+
+// Context latents [frames, 128]: source latents | chunk mask (per frame).
+std::vector<float> MakeContext(std::span<const float> source,
+                               std::span<const float> chunk_mask, int frames) {
+  std::vector<float> context(std::size_t(frames) * 2 * kLatentChannels);
+  for (int f = 0; f < frames; ++f) {
+    std::copy_n(source.begin() + std::size_t(f) * kLatentChannels,
+                kLatentChannels,
+                context.begin() + std::size_t(f) * 2 * kLatentChannels);
+    std::fill_n(context.begin() + std::size_t(f) * 2 * kLatentChannels +
+                    kLatentChannels,
+                kLatentChannels, chunk_mask[std::size_t(f)]);
+  }
+  return context;
+}
+
 }  // namespace
 
 bool MusicPipeline::Generate(const MusicRequest& request,
@@ -151,45 +316,152 @@ bool MusicPipeline::Generate(const MusicRequest& request,
   Impl& m = *impl_;
   MusicTelemetry local;
   MusicTelemetry& tm = telemetry != nullptr ? *telemetry : local;
-  if (!(request.duration >= 1.0 && request.duration <= kMaxSeconds))
+  const MusicTask task = request.task;
+  const SamplerDefaults defaults = DefaultSampler(m.variant);
+  const int steps = request.steps > 0 ? request.steps : defaults.steps;
+  const float shift = request.shift > 0.0F ? request.shift : defaults.shift;
+  // Turbo bakes its guidance into the distillation: the official pipeline
+  // forces guidance 1 there.
+  const float guidance =
+      m.variant == DitVariant::kTurbo
+          ? 1.0F
+          : (request.guidance_scale > 0.0F ? request.guidance_scale
+                                           : defaults.guidance_scale);
+  if (steps < 1 || steps > kMaxSteps)
+    return Fail(error, "steps must be 1.." + std::to_string(kMaxSteps));
+  if (const std::string reason = TaskUnsupportedReason(task, m.variant);
+      !reason.empty())
+    return Fail(error, reason);
+  const bool has_source = !request.source_audio.empty();
+  if (TaskNeedsSource(task) && !has_source)
+    return Fail(error, "task " + std::string(MusicTaskName(task)) +
+                           " requires source_audio");
+  if (!TaskNeedsSource(task) &&
+      !(request.duration >= 1.0 && request.duration <= kMaxSeconds))
     return Fail(error, "duration must be 1..600 seconds");
-  if (request.steps < 1 || request.steps > 50)
-    return Fail(error, "steps must be 1..50");
   auto report = [&](double fraction, std::string_view phase) {
     return !progress || progress(fraction, phase);
   };
+
+  // Source audio -> latents. Repaint / lego may extend the source in front
+  // (negative start) or behind (end beyond the source): the audio is zero
+  // padded and the span moves by the front padding, as the official
+  // prepare_padding_info does. The duration of every source task is the
+  // (padded) source length; a remainder below one latent frame is dropped.
   auto start = std::chrono::steady_clock::now();
-  std::vector<std::uint32_t> text_ids, lyric_ids;
-  try {
-    text_ids = m.tokenizer->Encode(MusicTextPrompt(request));
-    lyric_ids = m.tokenizer->Encode(MusicLyricPrompt(request));
-  } catch (const std::exception& e) {
-    return Fail(error, std::string("ACE-Step tokenizer: ") + e.what());
+  std::vector<float> source_audio, source_latents, clean_latents;
+  double repaint_start = request.repaint_start;
+  double repaint_end = request.repaint_end;
+  int frames = 0;
+  double duration = request.duration;
+  if (TaskNeedsSource(task)) {
+    std::size_t samples = request.source_audio.size() / 2;
+    if (samples < std::size_t(kSamplesPerFrame))
+      return Fail(error, "source_audio is shorter than one latent frame");
+    std::size_t left = 0, right = 0;
+    if (TaskRepaints(task)) {
+      const double source_seconds = double(samples) / kSampleRate;
+      const double actual_end =
+          repaint_end < 0.0 ? source_seconds : repaint_end;
+      const double left_seconds = std::max(0.0, -repaint_start);
+      const double right_seconds = std::max(0.0, actual_end - source_seconds);
+      if (actual_end <= repaint_start)
+        return Fail(error, "repaint_end must be greater than repaint_start");
+      if (actual_end + left_seconds > kMaxSeconds)
+        return Fail(error, "repaint span exceeds 600 seconds");
+      left = static_cast<std::size_t>(left_seconds * kSampleRate);
+      right = static_cast<std::size_t>(right_seconds * kSampleRate);
+      repaint_start += left_seconds;
+      repaint_end = actual_end + left_seconds;
+    }
+    source_audio = PadPlanar(request.source_audio, left, right);
+    samples = source_audio.size() / 2;
+    frames = static_cast<int>(samples / kSamplesPerFrame);
+    if (frames < 1)
+      return Fail(error, "source_audio is shorter than one latent frame");
+    if (frames > static_cast<int>(kMaxSeconds * kLatentFramesPerSecond))
+      return Fail(error, "source_audio is longer than 600 seconds");
+    if (!report(0.01, "encode"))
+      return Fail(error, "cancelled");
+    if (!m.EnsureEncoder(error))
+      return false;
+    int encoded = 0;
+    if (!m.encoder->Encode(source_audio, &source_latents, &encoded,
+                           request.vae_sample, request.seed ^ 0x5ACE5EEDULL,
+                           error))
+      return false;
+    frames = encoded;
+    duration = double(frames) / kLatentFramesPerSecond;
+    clean_latents = source_latents;
+  } else {
+    frames = static_cast<int>(
+        std::lround(request.duration * kSampleRate / kSamplesPerFrame));
   }
-  // The Qwen3-Embedding tokenizer appends <|endoftext|> after truncation.
-  if (text_ids.size() > kMaxTextTokens - 1)
-    text_ids.resize(kMaxTextTokens - 1);
-  if (lyric_ids.size() > kMaxLyricTokens - 1)
-    lyric_ids.resize(kMaxLyricTokens - 1);
-  text_ids.push_back(kEndOfText);
-  lyric_ids.push_back(kEndOfText);
+  tm.frames = frames;
+  tm.steps = steps;
+  // Timbre reference: the official 3 x 10 s excerpt, VAE-encoded (750
+  // frames); silence without a reference.
+  std::vector<float> timbre;
+  if (!request.reference_audio.empty()) {
+    StereoAudio reference;
+    reference.sample_rate = kSampleRate;
+    reference.samples = request.reference_audio.size() / 2;
+    reference.planar = request.reference_audio;
+    if (reference.samples == 0 || IsSilentAudio(reference.planar))
+      return Fail(error, "reference_audio is empty or silent");
+    const auto excerpt = ReferenceExcerpt(reference, request.seed);
+    int reference_frames = 0;
+    if (!m.EnsureEncoder(error) ||
+        !m.encoder->Encode(excerpt, &timbre, &reference_frames,
+                           request.vae_sample, request.seed ^ 0x7E4B2EULL,
+                           error))
+      return false;
+    if (reference_frames != kTimbreFrames)
+      return Fail(error, "reference excerpt did not encode to 750 frames");
+  } else {
+    timbre = m.Silence(kTimbreFrames);
+  }
+  tm.encode_seconds = Since(start);
+
+  start = std::chrono::steady_clock::now();
+  const std::string instruction =
+      MusicInstruction(task, request.track, request.track_classes);
+  std::vector<std::uint32_t> text_ids, lyric_ids;
+  if (!m.Encode(MusicTextPrompt(request, instruction, duration),
+                kMaxTextTokens, &text_ids, error) ||
+      !m.Encode(MusicLyricPrompt(request), kMaxLyricTokens, &lyric_ids, error))
+    return false;
   tm.text_tokens = static_cast<int>(text_ids.size());
   tm.lyric_tokens = static_cast<int>(lyric_ids.size());
   std::vector<float> text, lyric, conditions;
   if (!m.text->Encode(text_ids, &text, error) ||
       !m.text->Embed(lyric_ids, &lyric, error))
     return false;
+  // The non-cover branch of audio_cover_strength < 1: default instruction,
+  // silence context.
+  const float cover_strength =
+      task == MusicTask::kText2Music
+          ? 1.0F
+          : std::clamp(request.cover_strength, 0.0F, 1.0F);
+  std::vector<float> text_plain;
+  if (cover_strength < 1.0F) {
+    std::vector<std::uint32_t> plain_ids;
+    if (!m.Encode(MusicTextPrompt(request, DefaultMusicInstruction(), duration),
+                  kMaxTextTokens, &plain_ids, error) ||
+        !m.text->Encode(plain_ids, &text_plain, error))
+      return false;
+  }
   tm.text_seconds = Since(start);
   if (!report(0.05, "conditions"))
     return Fail(error, "cancelled");
-  const int frames = static_cast<int>(
-      std::lround(request.duration * kSampleRate / kSamplesPerFrame));
-  tm.frames = frames;
-  // Source latents: the 5 Hz LM's planned audio codes through the
-  // detokenizer, or silence (plain text-to-music); all-ones chunk mask.
-  // The LM and the DiT never hold device memory at the same time.
+
+  // Source latents of the context: the 5 Hz LM's planned audio codes
+  // through the detokenizer (text2music with the LM), the encoded source
+  // (source tasks) or silence; all-ones chunk mask unless repainting. The
+  // LM and the DiT never hold device memory at the same time.
   std::vector<int> codes;
-  const bool plan = !m.lm_path.empty() && request.audio_codes;
+  const bool plan = task == MusicTask::kText2Music && !m.lm_path.empty() &&
+                    request.audio_codes;
   if (plan) {
     const auto lm_start = std::chrono::steady_clock::now();
     m.dit.reset();
@@ -226,30 +498,75 @@ bool MusicPipeline::Generate(const MusicRequest& request,
     if (!m.dit)
       return false;
   }
-  const auto timbre = m.Silence(kTimbreFrames);
-  if (!m.dit->EncodeConditions(text, tm.text_tokens, lyric, tm.lyric_tokens,
-                               timbre, kTimbreFrames, &conditions, error))
-    return false;
   std::vector<float> source;
   if (plan) {
     if (!m.dit->CodeHints(codes, frames, &source, error))
       return false;
+  } else if (has_source) {
+    source = source_latents;
   } else {
     source = m.Silence(frames);
   }
-  std::vector<float> context(std::size_t(frames) * 2 * kLatentChannels, 1.0F);
-  for (int f = 0; f < frames; ++f)
-    std::copy_n(source.begin() + std::size_t(f) * kLatentChannels,
-                kLatentChannels,
-                context.begin() + std::size_t(f) * 2 * kLatentChannels);
-  const int rows = static_cast<int>(conditions.size() / kConditionWidth);
-  if (!m.dit->SetConditions(conditions, rows, context, frames, error))
+  std::vector<float> chunk_mask(std::size_t(frames), 1.0F);
+  std::vector<std::uint8_t> repaint_mask;
+  if (TaskRepaints(task)) {
+    const FrameRange range = RepaintFrames(repaint_start, repaint_end, frames);
+    BuildRepaintContext(range, frames, task == MusicTask::kLego,
+                        m.Silence(frames), &source, &chunk_mask,
+                        &repaint_mask);
+  }
+  // The renoised cover start uses the source before the FSQ round trip.
+  const std::vector<float> source_pre_fsq = source;
+  if (TaskIsCover(task)) {
+    if (!m.dit->Tokenize(source, frames, m.Silence(5), &codes, error) ||
+        !m.dit->CodeHints(codes, frames, &source, error))
+      return false;
+    tm.codes = static_cast<int>(codes.size());
+  }
+  if (!m.dit->EncodeConditions(text, tm.text_tokens, lyric, tm.lyric_tokens,
+                               timbre, kTimbreFrames, &conditions, error))
     return false;
+  const int rows = static_cast<int>(conditions.size() / kConditionWidth);
+  if (!m.dit->SetConditions(conditions, rows,
+                            MakeContext(source, chunk_mask, frames), frames,
+                            error))
+    return false;
+  std::vector<float> conditions_plain, context_plain;
+  if (cover_strength < 1.0F) {
+    if (!m.dit->EncodeConditions(text_plain, tm.text_tokens, lyric,
+                                 tm.lyric_tokens, timbre, kTimbreFrames,
+                                 &conditions_plain, error))
+      return false;
+    context_plain = MakeContext(m.Silence(frames), chunk_mask, frames);
+  }
   tm.condition_seconds = Since(start);
+
+  // Schedule, noise and the optional renoised cover start.
   start = std::chrono::steady_clock::now();
-  auto x = MusicNoise(request.seed, std::size_t(frames) * kLatentChannels);
-  const auto times = TurboTimesteps(request.steps, request.shift);
-  std::vector<float> v;
+  std::vector<float> times = MusicTimesteps(steps, shift);
+  const auto noise = MusicNoise(request.seed, std::size_t(frames) * kLatentChannels);
+  std::vector<float> x = noise;
+  const float cover_noise =
+      task == MusicTask::kText2Music
+          ? 0.0F
+          : std::clamp(request.cover_noise_strength, 0.0F, 1.0F);
+  if (cover_noise > 0.0F) {
+    const int first = CoverNoiseStartIndex(times, cover_noise);
+    const float t0 = times[std::size_t(first)];
+    for (std::size_t i = 0; i < x.size(); ++i)
+      x[i] = t0 * noise[i] + (1.0F - t0) * source_pre_fsq[i];
+    times.erase(times.begin(), times.begin() + first);
+  }
+  const int infer_steps = static_cast<int>(times.size()) - 1;
+  const int cover_steps = static_cast<int>(infer_steps * cover_strength);
+  const RepaintConfig repaint =
+      ResolveRepaintConfig(request.repaint_mode, request.repaint_strength);
+  const int injection_cutoff = static_cast<int>(
+      std::nearbyint(repaint.injection_ratio * infer_steps));
+  const bool guided = guidance > 1.0F;
+  tm.guided = guided;
+  ApgGuidance apg;
+  std::vector<float> v, v_cond, v_uncond;
   // Live preview: the clean estimate of the current step is decoded (a short
   // window only) when the step is a candidate, someone wants it and the
   // previous preview is old enough; its time counts as diffusion time.
@@ -257,34 +574,61 @@ bool MusicPipeline::Generate(const MusicRequest& request,
       preview != nullptr
           ? std::chrono::duration<double>(preview->min_interval_seconds)
           : std::chrono::duration<double>(0);
-  bool had_preview = false;
+  bool had_preview = false, switched = false;
   auto last_preview = std::chrono::steady_clock::now();
-  for (std::size_t s = 0; s < times.size(); ++s) {
-    if (!report(0.5 + 0.35 * double(s) / times.size(), "diffusion"))
+  for (int s = 0; s < infer_steps; ++s) {
+    if (!report(0.5 + 0.35 * double(s) / infer_steps, "diffusion"))
       return Fail(error, "cancelled");
-    if (!m.dit->Velocity(x, times[s], &v, nullptr, error))
+    if (cover_strength < 1.0F && s >= cover_steps && !switched) {
+      switched = true;
+      const int plain_rows =
+          static_cast<int>(conditions_plain.size() / kConditionWidth);
+      if (!m.dit->SetConditions(conditions_plain, plain_rows, context_plain,
+                                frames, error))
+        return false;
+    }
+    const float t = times[std::size_t(s)];
+    const float t_next = times[std::size_t(s) + 1];
+    if (!m.dit->Velocity(x, t, &v_cond, nullptr, error))
       return false;
-    const int step = static_cast<int>(s) + 1;
-    const int steps = static_cast<int>(times.size());
+    const bool apply_guidance = guided && t >= request.cfg_interval_start &&
+                                t <= request.cfg_interval_end;
+    if (apply_guidance) {
+      if (!m.dit->Velocity(x, t, &v_uncond, nullptr, error, true))
+        return false;
+      apg.Apply(v_cond, v_uncond, guidance, frames, &v);
+    } else {
+      v = v_cond;
+    }
+    const int step = s + 1;
     if (preview != nullptr && preview->wanted &&
-        MusicPreviewStep(step, steps, preview->every) &&
+        MusicPreviewStep(step, infer_steps, preview->every) &&
         (!had_preview ||
          std::chrono::steady_clock::now() - last_preview >= preview_interval) &&
         preview->wanted()) {
-      PublishPreview(*m.vae, *preview, x, v, times[s], frames, step, steps);
+      PublishPreview(*m.vae, *preview, x, v, t, frames, step, infer_steps);
       had_preview = true;
       last_preview = std::chrono::steady_clock::now();
     }
-    const float dt = s + 1 < times.size() ? times[s] - times[s + 1] : times[s];
+    const float dt = t - t_next;
     for (std::size_t i = 0; i < x.size(); ++i)
       x[i] -= v[i] * dt;
+    if (!repaint_mask.empty() && s < injection_cutoff)
+      RepaintInjection(x, clean_latents, repaint_mask, t_next, noise);
   }
+  if (!repaint_mask.empty() && repaint.crossfade_frames > 0)
+    RepaintBoundaryBlend(x, clean_latents, repaint_mask,
+                         repaint.crossfade_frames);
   tm.diffusion_seconds = Since(start);
   if (!report(0.85, "vae"))
     return Fail(error, "cancelled");
   start = std::chrono::steady_clock::now();
   if (!m.vae->Decode(x, frames, audio, error))
     return false;
+  // Repaint: the untouched parts come from the original waveform.
+  if (TaskRepaints(task) && Lower(request.repaint_mode) != "aggressive")
+    RepaintWaveformSplice(audio, source_audio, repaint_start, repaint_end,
+                          kSampleRate, repaint.wav_crossfade_seconds);
   float peak = 0;
   for (float value : *audio)
     peak = std::max(peak, std::fabs(value));

@@ -1,13 +1,17 @@
 #include "src/cli/serve/media/music_api.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <exception>
 #include <utility>
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/music_encode.hpp"
+#include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/models/ace_step/vae.hpp"
 
@@ -58,6 +62,88 @@ std::string Text(const json::Value& body, const char* key) {
   return {};
 }
 
+// A number in [low, high], else a message.
+bool Number(const json::Value& body, const char* key, double low, double high,
+            double* out, std::string* message) {
+  const json::Value* value = body.find(key);
+  if (value == nullptr || value->is_null())
+    return true;
+  if (!value->is_number() || value->as_double() < low ||
+      value->as_double() > high) {
+    *message = std::string(key) + " must be a number " +
+               std::to_string(low) + ".." + std::to_string(high);
+    return false;
+  }
+  *out = value->as_double();
+  return true;
+}
+
+// Decodes `source_audio` / `reference_audio` (data URL, raw base64 or a
+// public https URL; WAV directly, anything else through FFmpeg) into planar
+// stereo 48 kHz audio. Returns a client message and code on failure.
+bool ReadInputAudio(const json::Value& body, const char* key,
+                    std::vector<float>* planar, std::string* message,
+                    std::string* code) {
+  const json::Value* value = body.find(key);
+  if (value == nullptr || value->is_null())
+    return true;
+  if (!value->is_string() || value->str().empty()) {
+    *message = std::string(key) + " must be a data URL or base64 audio";
+    *code = "invalid_audio";
+    return false;
+  }
+  std::vector<std::uint8_t> bytes;
+  try {
+    core::ImageReadBudget budget;
+    budget.remaining_bytes = MusicService::kMaxAudioBytes;
+    budget.deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    bytes = core::ReadAudioUrl(value->str(), budget);
+  } catch (const std::exception& failure) {
+    *message = std::string(key) + ": " + failure.what();
+    *code = "invalid_audio";
+    return false;
+  }
+  if (bytes.size() < 12) {
+    *message = std::string(key) + " is empty";
+    *code = "invalid_audio";
+    return false;
+  }
+  ace::StereoAudio audio;
+  std::string detail;
+  const bool wav = std::memcmp(bytes.data(), "RIFF", 4) == 0;
+  if (!wav) {
+    std::string decoded;
+    if (!DecodeAudioWithFfmpeg(
+            std::string(reinterpret_cast<const char*>(bytes.data()),
+                        bytes.size()),
+            &decoded, &detail)) {
+      *message = std::string(key) + ": " + detail;
+      *code = "invalid_audio";
+      return false;
+    }
+    bytes.assign(decoded.begin(), decoded.end());
+  }
+  if (!ace::DecodeWavStereo(bytes, &audio, &detail)) {
+    *message = std::string(key) + ": " + detail;
+    *code = "invalid_audio";
+    return false;
+  }
+  ace::NormalizeStereo48k(&audio);
+  if (audio.samples > std::size_t(601) * ace::kSampleRate) {
+    *message = std::string(key) + " is longer than 600 seconds";
+    *code = "invalid_audio";
+    return false;
+  }
+  if (ace::IsSilentAudio(audio.planar)) {
+    *message = std::string(key) + " is silent";
+    *code = "invalid_audio";
+    return false;
+  }
+  *planar = std::move(audio.planar);
+  return true;
+}
+
 }  // namespace
 
 struct MusicService::Job {
@@ -72,6 +158,8 @@ struct MusicService::Job {
   std::int64_t created_at{0};
   std::int64_t completed_at{0};
   bool done{false};
+  std::size_t source_samples{0};
+  bool has_reference{false};
   // Live preview: requested explicitly ("preview": true) or watched (a GET
   // of /preview within kPreviewWatchWindow); the newest preview is kept.
   bool preview_always{false};
@@ -137,13 +225,17 @@ bool MusicService::HandlesPath(std::string_view path) const {
   return IsMusicApiPath(path);
 }
 
-MusicService::MusicService(const std::filesystem::path& model_root,
-                           std::string model_id)
-    : model_id_(std::move(model_id)) {
-  ace::ModelPaths paths;
-  if (!ace::ModelPaths::FromRoot(model_root, &paths, &init_error_))
-    return;
+MusicService::MusicService(const MusicServiceOptions& options)
+    : model_id_(options.model_id) {
 #if defined(ENGINE_ENABLE_HIP)
+  // The file resolution reads safetensors metadata (HIP build only).
+  ace::ModelPaths paths;
+  if (!ace::ModelPaths::Resolve(options.model_root, options.dit, options.lm,
+                                options.variant, &paths, &init_error_))
+    return;
+  if (model_id_.empty())
+    model_id_ =
+        "ace-step-1.5-xl-" + std::string(ace::DitVariantName(paths.variant));
   pipeline_ = ace::MusicPipeline::Load(paths, &init_error_);
   if (pipeline_)
     worker_ = std::thread([this] { Worker(); });
@@ -160,6 +252,19 @@ MusicService::~MusicService() {
   changed_.notify_all();
   if (worker_.joinable())
     worker_.join();
+}
+
+ace::DitVariant MusicService::dit_variant() const {
+#if defined(ENGINE_ENABLE_HIP)
+  if (pipeline_)
+    return pipeline_->variant();
+#endif
+  return ace::DitVariant::kTurbo;
+}
+
+std::string MusicService::variant() const {
+  return pipeline_ ? std::string(ace::DitVariantName(dit_variant()))
+                   : std::string();
 }
 
 void MusicService::ExpireLocked() {
@@ -246,6 +351,11 @@ void MusicService::Worker() {
       job->progress = 1.0;
       job->completed_at = Now();
       job->done = true;
+      // The decoded inputs are not needed any more.
+      job->request.source_audio.clear();
+      job->request.source_audio.shrink_to_fit();
+      job->request.reference_audio.clear();
+      job->request.reference_audio.shrink_to_fit();
     }
     changed_.notify_all();
   }
@@ -312,10 +422,86 @@ HttpResponse MusicService::Submit(const HttpRequest& request) {
   else
     r.seed = static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
-  r.steps = static_cast<int>(body.member_double("steps", 8));
+  // Task and model variant.
+  const std::string task_name = body.member_str("task", "text2music");
+  if (!ace::ParseMusicTask(task_name, &r.task))
+    return Error(400, "Bad Request",
+                 "task must be text2music, repaint, cover, cover-nofsq, "
+                 "extract, lego or complete",
+                 "invalid_task");
+  if (const std::string reason =
+          ace::TaskUnsupportedReason(r.task, dit_variant());
+      !reason.empty())
+    return Error(400, "Bad Request", reason, "unsupported_task");
+  // Sampler: 0 means the variant's default.
+  {
+    std::string message;
+    double steps = 0, shift = 0, guidance = 0, cfg_start = 0, cfg_end = 1;
+    double repaint_start = 0, repaint_end = -1, repaint_strength = 0.5;
+    double cover_strength = 1, cover_noise = 0;
+    if (!Number(body, "steps", 1, 200, &steps, &message))
+      return Error(400, "Bad Request", message, "invalid_steps");
+    if (!Number(body, "shift", 1, 5, &shift, &message))
+      return Error(400, "Bad Request", message, "invalid_shift");
+    if (!Number(body, "guidance_scale", 1, 15, &guidance, &message))
+      return Error(400, "Bad Request", message, "invalid_guidance");
+    if (!Number(body, "cfg_interval_start", 0, 1, &cfg_start, &message) ||
+        !Number(body, "cfg_interval_end", 0, 1, &cfg_end, &message))
+      return Error(400, "Bad Request", message, "invalid_cfg_interval");
+    if (!Number(body, "repaint_start", -600, 600, &repaint_start, &message) ||
+        !Number(body, "repaint_end", -1, 1200, &repaint_end, &message))
+      return Error(400, "Bad Request", message, "invalid_repaint_range");
+    if (!Number(body, "repaint_strength", 0, 1, &repaint_strength, &message))
+      return Error(400, "Bad Request", message, "invalid_repaint_strength");
+    if (!Number(body, "cover_strength", 0, 1, &cover_strength, &message) ||
+        !Number(body, "cover_noise_strength", 0, 1, &cover_noise, &message))
+      return Error(400, "Bad Request", message, "invalid_cover_strength");
+    if (steps != std::floor(steps))
+      return Error(400, "Bad Request", "steps must be an integer",
+                   "invalid_steps");
+    r.steps = static_cast<int>(steps);
+    r.shift = static_cast<float>(shift);
+    r.guidance_scale = static_cast<float>(guidance);
+    r.cfg_interval_start = static_cast<float>(cfg_start);
+    r.cfg_interval_end = static_cast<float>(cfg_end);
+    r.repaint_start = repaint_start;
+    r.repaint_end = repaint_end;
+    r.repaint_strength = static_cast<float>(repaint_strength);
+    r.cover_strength = static_cast<float>(cover_strength);
+    r.cover_noise_strength = static_cast<float>(cover_noise);
+  }
+  r.repaint_mode = body.member_str("repaint_mode", "balanced");
+  {
+    std::string mode = r.repaint_mode;
+    for (char& c : mode)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (mode != "balanced" && mode != "conservative" && mode != "aggressive")
+      return Error(400, "Bad Request",
+                   "repaint_mode must be conservative, balanced or aggressive",
+                   "invalid_repaint_mode");
+    r.repaint_mode = mode;
+  }
+  r.track = body.member_str("track");
+  if (const json::Value* classes = body.find("track_classes");
+      classes != nullptr && !classes->is_null()) {
+    if (classes->is_string()) {
+      r.track_classes.push_back(classes->str());
+    } else if (classes->is_array()) {
+      for (const json::Value& item : classes->items())
+        if (item.is_string() && !item.str().empty())
+          r.track_classes.push_back(item.str());
+    } else {
+      return Error(400, "Bad Request",
+                   "track_classes must be a string or an array of strings",
+                   "invalid_track_classes");
+    }
+  }
   if (const json::Value* codes = body.find("audio_codes");
       codes != nullptr && codes->is_bool())
     r.audio_codes = codes->as_bool();
+  if (const json::Value* sample = body.find("vae_sample");
+      sample != nullptr && sample->is_bool())
+    r.vae_sample = sample->as_bool();
   r.lm_cfg = static_cast<float>(body.member_double("lm_cfg", r.lm_cfg));
   r.lm_temperature = static_cast<float>(
       body.member_double("lm_temperature", r.lm_temperature));
@@ -329,11 +515,33 @@ HttpResponse MusicService::Submit(const HttpRequest& request) {
           ParseMusicPreview(body, &job->preview_always, &job->preview_every);
       !message.empty())
     return Error(400, "Bad Request", std::move(message), "invalid_preview");
-  if (!(r.duration >= 1.0 && r.duration <= 600.0))
+  if (!ace::TaskNeedsSource(r.task) &&
+      !(r.duration >= 1.0 && r.duration <= 600.0))
     return Error(400, "Bad Request", "duration must be 1..600 seconds",
                  "invalid_duration");
-  if (r.steps < 1 || r.steps > 50)
-    return Error(400, "Bad Request", "steps must be 1..50", "invalid_steps");
+  // Source and reference audio (decoded here, before the job queues).
+  {
+    std::string message, code;
+    if (!ReadInputAudio(body, "source_audio", &r.source_audio, &message,
+                        &code) ||
+        !ReadInputAudio(body, "reference_audio", &r.reference_audio, &message,
+                        &code))
+      return Error(400, "Bad Request", std::move(message), std::move(code));
+  }
+  if (ace::TaskNeedsSource(r.task) && r.source_audio.empty())
+    return Error(400, "Bad Request",
+                 "task " + std::string(ace::MusicTaskName(r.task)) +
+                     " requires source_audio",
+                 "missing_source_audio");
+  if (!ace::TaskNeedsSource(r.task) && !r.source_audio.empty())
+    r.source_audio.clear();  // text2music ignores it, as the official code
+  if (ace::TaskRepaints(r.task) && r.repaint_end >= 0.0 &&
+      r.repaint_end <= r.repaint_start)
+    return Error(400, "Bad Request",
+                 "repaint_end must be greater than repaint_start",
+                 "invalid_repaint_range");
+  job->source_samples = r.source_audio.size() / 2;
+  job->has_reference = !r.reference_audio.empty();
   const json::Value* async_value = body.find("async");
   const bool async = async_value != nullptr && async_value->as_bool();
   {
@@ -383,6 +591,7 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
         {"X-Gufo-Seed", std::to_string(job.request.seed)},
         {"X-Gufo-Generation-Seconds",
          std::to_string(job.telemetry.lm_seconds + job.telemetry.text_seconds +
+                        job.telemetry.encode_seconds +
                         job.telemetry.condition_seconds +
                         job.telemetry.diffusion_seconds +
                         job.telemetry.vae_seconds)}};
@@ -392,13 +601,40 @@ HttpResponse MusicService::Status(const std::string& id, bool content) {
   body["id"] = job.id;
   body["object"] = "audio.music";
   body["model"] = model_id_;
+  body["variant"] = variant();
   body["status"] = job.status;
   body["progress"] = static_cast<double>(std::lround(job.progress * 100));
   body["created_at"] = static_cast<double>(job.created_at);
   if (job.done)
     body["completed_at"] = static_cast<double>(job.completed_at);
-  body["duration"] = job.request.duration;
+  body["task"] = std::string(ace::MusicTaskName(job.request.task));
+  if (job.source_samples > 0)
+    body["source_seconds"] =
+        static_cast<double>(job.source_samples) / ace::kSampleRate;
+  body["reference_audio"] = job.has_reference;
+  if (ace::TaskRepaints(job.request.task)) {
+    body["repaint_start"] = job.request.repaint_start;
+    body["repaint_end"] = job.request.repaint_end;
+    body["repaint_mode"] = job.request.repaint_mode;
+  }
+  body["duration"] = job.telemetry.frames > 0
+                         ? static_cast<double>(job.telemetry.frames) /
+                               ace::kLatentFramesPerSecond
+                         : job.request.duration;
   body["seed"] = std::to_string(job.request.seed);
+  {
+    const ace::SamplerDefaults defaults =
+        ace::DefaultSampler(dit_variant());
+    body["steps"] = static_cast<double>(
+        job.request.steps > 0 ? job.request.steps : defaults.steps);
+    body["shift"] = static_cast<double>(
+        job.request.shift > 0.0F ? job.request.shift : defaults.shift);
+    body["guidance_scale"] = static_cast<double>(
+        dit_variant() == ace::DitVariant::kTurbo
+            ? 1.0F
+            : (job.request.guidance_scale > 0.0F ? job.request.guidance_scale
+                                                 : defaults.guidance_scale));
+  }
   body["response_format"] = job.format.name;
   if (job.format.needs_ffmpeg())
     body["bitrate_kbps"] = static_cast<double>(job.format.bitrate_kbps);

@@ -103,4 +103,18 @@ if (BUILD_TESTING)
   add_test(NAME ace_step_preview_test COMMAND ace_step_preview_test)
   set_tests_properties(ace_step_preview_test PROPERTIES
     LABELS "cpu;server;api;music;preview" TIMEOUT 30)
+
+  # ACE-Step sampler mathematics (src/models/ace_step/sampler, audio_io):
+  # timestep schedule, APG / CFG guidance, repaint masks, injection, blends,
+  # waveform splice, task rules, WAV decoding and resampling; no model, no
+  # GPU.
+  add_executable(ace_step_sampler_test tests/models/ace_step_sampler_test.cpp
+    src/models/ace_step/sampler.cpp src/models/ace_step/audio_io.cpp)
+  target_include_directories(ace_step_sampler_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  target_compile_features(ace_step_sampler_test PRIVATE cxx_std_20)
+  target_compile_options(ace_step_sampler_test PRIVATE ${gufo_media_test_undebug})
+  add_test(NAME ace_step_sampler_test COMMAND ace_step_sampler_test)
+  set_tests_properties(ace_step_sampler_test PROPERTIES
+    LABELS "cpu;server;api;music" TIMEOUT 60)
 endif()

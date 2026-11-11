@@ -1044,11 +1044,21 @@ PCM. `speed` supports `1.0` only; input is capped at 16384 UTF-8 bytes and
 `max_new_tokens` at 8192 (default 3000). Output is mono 16-bit PCM at the
 model's output sample rate (24 kHz for Qwen3-TTS).
 
-`POST /v1/audio/music` (`gufo serve music`, ACE-Step 1.5) accepts `prompt`
-(or `tags`), `lyrics`, `duration` (1--600 s, default 30), `seed`, `steps`
-(1--50, default 8), `bpm`, `keyscale`, `timesignature`, `language`,
-`audio_codes`, `lm_cfg`, `lm_temperature`, `lm_top_p`, `response_format`,
-`bitrate_kbps` and `async`. `response_format` is `wav` (default, 48 kHz
+`POST /v1/audio/music` (`gufo serve music`, ACE-Step 1.5 XL) accepts `prompt`
+(or `tags`), `lyrics`, `duration` (1--600 s, default 30; source tasks take
+the source length instead), `seed`, `steps` (1--200), `shift` (1--5),
+`guidance_scale` (1--15), `cfg_interval_start` / `cfg_interval_end` (0--1),
+`bpm`, `keyscale`, `timesignature`, `language`, `audio_codes`, `lm_cfg`,
+`lm_temperature`, `lm_top_p`, `task`, `source_audio`, `reference_audio`,
+`repaint_start`, `repaint_end`, `repaint_mode`, `repaint_strength`,
+`cover_strength`, `cover_noise_strength`, `track`, `track_classes`,
+`vae_sample`, `response_format`, `bitrate_kbps` and `async`. `steps`,
+`shift` and `guidance_scale` default to the loaded variant's official
+values: turbo 8 steps, shift 3, no guidance (guidance is always 1 on turbo,
+as the official pipeline forces it); sft 50 steps and base 32 steps, both
+shift 3 and APG guidance 7 (two DiT passes per step, so about twice the
+time per step). The status JSON reports `variant`, `task`, `steps`,
+`shift`, `guidance_scale` and `duration` as used. `response_format` is `wav` (default, 48 kHz
 stereo 16-bit PCM, `audio/wav`), `mp3` (`audio/mpeg`) or `aac` (alias `m4a`,
 `audio/mp4`); anything else is a 400 `unsupported_format`. `mp3` and `aac`
 are transcoded from the finished WAV by FFmpeg (`ffmpeg` on the PATH or
@@ -1064,6 +1074,63 @@ content type; `audio/mp4` is not mapped there yet and lands as
 error line is logged and the temporary WAV is left in the temp directory
 (its path is in the message). The job status JSON reports `response_format`
 and, for `mp3` / `aac`, `bitrate_kbps`.
+
+Model variants and files: `gufo serve music --model DIR` reads
+`DIR/dit.safetensors` (the ComfyUI `acestep_v1.5_xl_turbo_bf16` file or a
+converted one), `text_encoder.safetensors`, `vae.safetensors` (the Diffusers
+Oobleck file, encoder and decoder), `tokenizer.json`,
+`silence_latent.safetensors` and, when present, `lm.safetensors`. `--dit
+sft` / `--dit base` select `DIR/dit-sft.safetensors` /
+`DIR/dit-base.safetensors`, `--dit FILE` any file; `--lm none|0.6b|1.7b|4b|FILE`
+picks the 5 Hz planner (`DIR/lm-<size>.safetensors`). The sampler variant
+comes from the DiT file's `gufo.variant` / `model_version` metadata, else
+from its file name, else `--variant turbo|sft|base`; the default model id
+is `ace-step-1.5-xl-<variant>`. `tools/ace_step/convert_hf_to_gufo.py dit
+HF_DIR DIR/dit-sft.safetensors` merges the Hugging Face shards (F32) into
+one BF16 file with that metadata; `... lm HF_LM_DIR DIR/lm-1.7b.safetensors`
+does the same for the planners (0.6B, 1.7B, 4B; the geometry is read from
+the weights). One worker serves one variant; expose three model ids with
+three presets (`--dit turbo|sft|base` and `--served-model-name`).
+
+Tasks (`task`, the official ACE-Step task types): `text2music` (default),
+`repaint`, `cover` and `cover-nofsq` run on every variant; `extract`,
+`lego` and `complete` need the base model (400 `unsupported_task`
+elsewhere, sft included, as the official UI restricts them). Every task but
+text2music needs `source_audio` (a data URL, raw base64 or a public https
+URL, up to 256 MB and 600 s; WAV of any PCM / float depth and channel count
+is decoded directly, other formats through FFmpeg, then resampled to 48 kHz
+stereo like the official `_normalize_audio_to_stereo_48k`; 400
+`missing_source_audio` / `invalid_audio`). The source is VAE-encoded
+(`vae_sample`, default true, draws `latent_dist.sample()` from the seed
+like the official pipeline; false uses the mean) and sets the duration (a
+remainder below one 40 ms latent frame is dropped). `cover` quantizes the
+source latents through the FSQ audio tokenizer and the detokenizer (the
+official `is_covers` round trip), `cover-nofsq` conditions on the raw
+latents; `cover_strength` (0--1, default 1) switches to the plain
+text2music conditions after that fraction of the steps and
+`cover_noise_strength` (0--1, default 0) starts from the renoised source at
+the nearest schedule value. `repaint` regenerates `repaint_start` ..
+`repaint_end` seconds (`repaint_end` < 0 = the end of the source; a start
+below 0 or an end past the source extend the song with silence, i.e.
+outpainting) with the explicit 0/1 chunk mask, silence in the span, the
+official step injection, latent crossfade and waveform splice:
+`repaint_mode` `conservative` / `balanced` (default, with
+`repaint_strength` 0--1, default 0.5) / `aggressive`. `lego` keeps the
+source inside the span and adds the `track` stem there (`repaint_start` /
+`repaint_end` as for repaint, default the whole song); `extract` pulls the
+`track` stem (`vocals`, `drums`, `bass`, `guitar`, `keyboard`, `strings`,
+`synth`, `brass`, `woodwinds`, `percussion`, `fx`, `backing_vocals`) out of
+the source; `complete` adds `track_classes` (array of stem names) to the
+source. `reference_audio` (same forms as `source_audio`) gives the timbre:
+three 10 s excerpts (chosen from the seed) are VAE-encoded for the timbre
+encoder, as the official `process_reference_audio` does. The 5 Hz planner
+runs for text2music only (the official pipeline skips it for cover,
+repaint and extract; its lego / complete planning is not ported).
+Differences from the official sampler: Euler only (no Heun, SDE, DCW
+correction, velocity clamp / EMA, retake or flow-edit), APG guidance as
+`apg_forward` (momentum -0.75, norm threshold 2.5), and one audio
+tokenizer codebook convention (ComfyUI's symmetric FSQ, which gufo's
+detokenizer already used).
 
 Live preview of a running music job: `GET /v1/audio/music/<id>/preview`
 answers the newest preview as `audio/wav` (mono 24 kHz 16-bit, about 6 s

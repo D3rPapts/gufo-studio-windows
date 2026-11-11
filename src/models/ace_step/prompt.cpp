@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <string_view>
 #include <system_error>
 
 namespace gufo::models::ace_step {
@@ -54,15 +55,19 @@ bool ModelPaths::FromRoot(const std::filesystem::path& root, ModelPaths* paths,
   return true;
 }
 
-std::string MusicTextPrompt(const MusicRequest& r) {
+std::string MusicTextPrompt(const MusicRequest& r, std::string_view instruction,
+                            double duration) {
   const std::string metas =
       "- bpm: " + OrNa(r.bpm) + "\n- timesignature: " + OrNa(r.timesignature) +
       "\n- keyscale: " + OrNa(r.keyscale) +
-      "\n- duration: " + std::to_string(static_cast<int>(r.duration)) +
+      "\n- duration: " + std::to_string(static_cast<int>(duration)) +
       " seconds\n";
-  return "# Instruction\nFill the audio semantic mask based on the given "
-         "conditions:\n\n# Caption\n" +
+  return "# Instruction\n" + std::string(instruction) + "\n\n# Caption\n" +
          r.caption + "\n\n# Metas\n" + metas + "<|endoftext|>\n";
+}
+
+std::string MusicTextPrompt(const MusicRequest& r) {
+  return MusicTextPrompt(r, DefaultMusicInstruction(), r.duration);
 }
 
 std::string MusicLyricPrompt(const MusicRequest& r) {

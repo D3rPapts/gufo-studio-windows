@@ -20,38 +20,59 @@ bool IsMediaServeCommand(std::string_view subcommand) {
 }
 
 std::string MediaServeCommandsHelp() {
-  return "  music     Serve ACE-Step 1.5 XL turbo text-to-music "
+  return "  music     Serve ACE-Step 1.5 XL turbo / sft / base music "
          "(/v1/audio/music)\n"
          "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
          "(/v1/audio/foley)\n"
-         "  upscale   Serve Real-ESRGAN image upscaling on the NPU, GPU or "
-         "CPU (/v1/images/upscale)\n"
+         "  upscale   Serve Real-ESRGAN image and video upscaling on the "
+         "NPU, GPU or CPU (/v1/images/upscale, /v1/videos/upscale)\n"
          "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
          "(/v1/chat/completions, input_audio)\n";
 }
 
 std::string MediaServeDescription(std::string_view subcommand) {
   if (subcommand == "music")
-    return "Serve ACE-Step 1.5 XL turbo text-to-music.";
+    return "Serve ACE-Step 1.5 XL (turbo / sft / base) music: text2music, "
+           "repaint, cover, extract, lego, complete.";
   if (subcommand == "foley")
     return "Serve MMAudio large_44k_v2 video/text-to-audio.";
   if (subcommand == "omni")
     return "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.";
-  return "Serve Real-ESRGAN image upscaling (POST /v1/images/upscale) on the "
-         "AMD NPU (ONNX Runtime + VitisAI from Windows ML), the GPU (HIP) or "
-         "the CPU (ONNX Runtime).";
+  return "Serve Real-ESRGAN image upscaling (POST /v1/images/upscale, sync or "
+         "async) and video upscaling (POST /v1/videos/upscale, async job; "
+         "frames through FFmpeg, audio copied) on the AMD NPU (ONNX Runtime "
+         "+ VitisAI from Windows ML), the GPU (HIP) or the CPU (ONNX "
+         "Runtime). The three Real-ESRGAN v3 files are told apart by the "
+         "request field variant (general | wdn | anime, from the file name).";
 }
 
 void AddMediaServeOptions(std::string_view subcommand, cli::ArgParser& parser,
                           MediaServeArgs* args) {
   if (subcommand == "music") {
-    args->name = "ace-step-1.5-xl-turbo";
     parser.AddOption("-m", "--model", "DIR",
                      "ACE-Step directory (dit.safetensors, "
                      "text_encoder.safetensors, vae.safetensors, "
-                     "tokenizer.json, silence_latent.safetensors)",
+                     "tokenizer.json, silence_latent.safetensors, optional "
+                     "lm.safetensors / dit-sft.safetensors / "
+                     "dit-base.safetensors)",
                      "Model", &args->model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
+    parser.AddOption("", "--dit", "FILE|turbo|sft|base",
+                     "DiT checkpoint: a file, or the variant name selecting "
+                     "DIR/dit-<variant>.safetensors (default "
+                     "DIR/dit.safetensors)",
+                     "Model", &args->music_dit);
+    parser.AddOption("", "--lm", "FILE|none|0.6b|1.7b|4b",
+                     "5 Hz planner LM: a file, none, or the size selecting "
+                     "DIR/lm-<size>.safetensors (default DIR/lm.safetensors "
+                     "when present)",
+                     "Model", &args->music_lm);
+    parser.AddOption("", "--variant", "turbo|sft|base",
+                     "Sampler variant when the DiT file carries no "
+                     "gufo.variant / model_version metadata and its name "
+                     "does not tell",
+                     "Model", &args->music_variant);
+    parser.AddOption("", "--served-model-name", "NAME",
+                     "Public API model ID (default ace-step-1.5-xl-<variant>)",
                      "Model", &args->name);
     return;
   }
@@ -95,9 +116,11 @@ void AddMediaServeOptions(std::string_view subcommand, cli::ArgParser& parser,
       "-m", "--model", "[NAME=]FILE",
       "npu/cpu: Real-ESRGAN body ONNX with a fixed input size (e.g. "
       "realesr-animevideov3=body896q_h288_h3.onnx); gpu: converted "
-      "safetensors. Repeatable; one name may have one file per frame "
-      "width; the first name is the default. Without NAME: "
-      "--served-model-name, else the file stem",
+      "safetensors (realesr-general-x4v3, realesr-general-wdn-x4v3, "
+      "realesr-animevideov3; the variant comes from the file name). "
+      "Repeatable; one name may have one file per frame width (npu/cpu) "
+      "or per variant (gpu); the first name is the default. Without "
+      "NAME: --served-model-name, else the file stem",
       "Model",
       [&options](std::string_view, std::string_view value,
                  std::string* error) {
@@ -198,12 +221,18 @@ std::shared_ptr<MediaService> LoadMediaService(std::string_view subcommand,
                                                std::string* details,
                                                std::string* error) {
   if (subcommand == "music") {
-    auto music = std::make_shared<MusicService>(args.model, args.name);
+    MusicServiceOptions options;
+    options.model_root = args.model;
+    options.model_id = args.name;
+    options.dit = args.music_dit;
+    options.lm = args.music_lm;
+    options.variant = args.music_variant;
+    auto music = std::make_shared<MusicService>(options);
     if (!music->ready()) {
       *error = "Error loading ACE-Step: " + music->initialization_error();
       return nullptr;
     }
-    *details = "model=" + args.name;
+    *details = "model=" + music->model_id() + " variant=" + music->variant();
     return music;
   }
   if (subcommand == "foley") {

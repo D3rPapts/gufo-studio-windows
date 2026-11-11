@@ -31,6 +31,8 @@ namespace gufo::server {
 struct MediaServeArgs {
   std::filesystem::path model;  // music / foley directory, omni text GGUF
   std::string name;             // --served-model-name
+  // music: --dit FILE|turbo|sft|base, --lm FILE|none|0.6b|1.7b|4b, --variant.
+  std::string music_dit, music_lm, music_variant;
   UpscaleServeOptions upscale;  // upscale
   // omni (Qwen3-Omni-30B-A3B-Captioner): projector GGUF and limits.
   std::filesystem::path mmproj;

@@ -1,11 +1,14 @@
-# ACE-Step 1.5 XL turbo (music): Qwen3 tokenizer and 0.6B text encoder,
-# condition encoder, DiT decoder, Oobleck VAE decoder and the text-to-music
-# pipeline. gufo-studio-windows only (no upstream capability); added from
+# ACE-Step 1.5 XL (turbo / sft / base, music): Qwen3 tokenizer and 0.6B
+# text encoder, condition encoder, DiT decoder with APG guidance, Oobleck VAE
+# decoder and encoder, the sampler mathematics (CPU) and the music pipeline
+# with the official tasks (text2music, repaint, cover, cover-nofsq, extract,
+# lego, complete). gufo-studio-windows only (no upstream capability); added from
 # src/cli/serve/media/media.cmake.
 #
 # CPU: tokenizer, prompts, noise, WAV and the model file layout (prompt.cpp),
 # enough for request handling and the token oracle test.
-add_library(gufo_ace_step STATIC EXCLUDE_FROM_ALL tokenizer.cpp prompt.cpp preview.cpp)
+add_library(gufo_ace_step STATIC EXCLUDE_FROM_ALL tokenizer.cpp prompt.cpp preview.cpp
+  sampler.cpp audio_io.cpp)
 target_include_directories(gufo_ace_step PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_ace_step PUBLIC gufo_core gufo_qwen_text ICU::i18n)
 

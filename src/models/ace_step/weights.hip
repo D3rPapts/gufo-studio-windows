@@ -145,9 +145,15 @@ bool SafetensorsFile::Open(const std::filesystem::path& path,
     return Fail(error, path.string() + ": " + e.what());
   }
   const std::uint64_t payload = 8 + header_size;
+  metadata_.clear();
   for (const auto& [name, entry] : header.members()) {
-    if (name == "__metadata__")
+    if (name == "__metadata__") {
+      if (entry.is_object())
+        for (const auto& [key, value] : entry.members())
+          if (value.is_string())
+            metadata_[key] = value.str();
       continue;
+    }
     const json::Value* shape = entry.find("shape");
     const json::Value* offsets = entry.find("data_offsets");
     const std::string dtype = entry.member_str("dtype");
