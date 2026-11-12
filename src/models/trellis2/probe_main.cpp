@@ -579,6 +579,12 @@ int run_shapedec(const std::string& weights, const std::string& dumps, const std
     const auto rgb = tr::render_preview(mesh, po, &pw, &ph);
     if (!tr::write_png_rgb(std::filesystem::path(out) / "preview.png", rgb.data(), pw, ph, &error)) { std::cerr << error << '\n'; return 1; }
     std::cout << "  wrote preview.png " << pw << "x" << ph << '\n';
+    // TRELLIS.2 objects are z-up; the preview camera assumes y-up -> second view with (x, z, -y).
+    tr::Mesh zup = mesh;
+    for (auto& v : zup.vertices) v = {v.x, v.z, -v.y};
+    const auto rgb2 = tr::render_preview(zup, po, &pw, &ph);
+    if (!tr::write_png_rgb(std::filesystem::path(out) / "preview-zup.png", rgb2.data(), pw, ph, &error)) { std::cerr << error << '\n'; return 1; }
+    std::cout << "  wrote preview-zup.png\n";
     return 0;
 }
 

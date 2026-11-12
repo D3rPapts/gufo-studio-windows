@@ -14,6 +14,7 @@
 
 #include "src/core/json.hpp"
 #include "src/models/trellis2/glb_writer.hpp"
+#include "src/models/trellis2/mesh_preview.hpp"
 
 namespace tp = gufo::trellis2;
 
