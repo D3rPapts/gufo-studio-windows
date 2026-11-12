@@ -502,7 +502,8 @@ struct Harness {
     options.fetch = [api_ref](const HttpRequest& request) {
       return (*api_ref)(request);
     };
-    options.models = {"qwen-image", "minimax-h3", "qwen3-tts", "ace-step"};
+    options.models = {"qwen-image", "minimax-h3", "qwen3-tts", "ace-step",
+                      "triposg"};
     options.expire_after = expire_after;
     std::string error;
     jobs::ParseAllowList("192.168.1.0/24", &options.webhook_allow, &error);
