@@ -86,7 +86,7 @@ int main() {
     tr::apply_rope(vec, zero);
     Expect(vec[5] == 5.f && vec[127] == 127.f, "zero angles leave the vector");
     float ninety[64] = {};
-    ninety[0] = static_cast<float>(M_PI / 2);
+    ninety[0] = 1.5707963267948966f;  // pi / 2
     float w[128] = {1.f, 0.f};
     tr::apply_rope(w, ninety);
     Expect(Near(w[0], 0.f) && Near(w[1], 1.f), "pair (x0, x1) rotates by the angle");
