@@ -720,6 +720,7 @@ for presets whose command line is `serve objekt`, so the pages can tell
 which router runs the worker.
 
 1.4.23c: status, content, preview reads and the cancel on `/v1/3d/generations/<id>` resolve the worker by the `model` query or, without it, by the recorded job owner (the router used to know that only for music jobs and answered 404).
+1.4.24 (2.0.1): the router records the job owner of a direct `POST /v1/3d/generations` like a video job: reads without `?model=` find the worker, the open job keeps the worker busy (not stopped for another model while it computes), the job sweep asks the 3D status path, and a 3D job stays on the machine it runs on when the placement changes. The job store's polls carry the job and pool-side headers, tolerate up to 5 transient answers in a row (5xx, connection error, no JSON) and give up after 30 minutes (`objekt_timeout`, the worker job is cancelled).
 
 **Waiting jobs (1.4.21).** With `--jobs-parallel 2` a job is
 `in_progress` at once, and its request may then wait in the router's

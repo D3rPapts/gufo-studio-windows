@@ -171,14 +171,15 @@ struct PoolDecision {
 }
 
 /// Whether a local model counts as GPU work for the pool's busy rule:
-/// modality image or video, or an external `args = serve image|video|music`.
+/// modality image or video, or an external
+/// `args = serve image|video|music|objekt`.
 [[nodiscard]] inline bool IsGpuWorkModel(const PresetModel& preset) {
   if (preset.modality == "image" || preset.modality == "video") {
     return true;
   }
   return preset.argv.size() >= 2 && preset.argv[0] == "serve" &&
          (preset.argv[1] == "image" || preset.argv[1] == "video" ||
-          preset.argv[1] == "music");
+          preset.argv[1] == "music" || preset.argv[1] == "objekt");
 }
 
 }  // namespace gufo::router

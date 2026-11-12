@@ -80,7 +80,7 @@ class Router:
         preset = os.path.join(tmp, "jobs.preset")
         python = os.environ.get("COMFY_TEST_PYTHON") or sys.executable
         sections = []
-        for model in ("qwen-image-2.1", "minimax-h3", "qwen3-tts"):
+        for model in ("qwen-image-2.1", "minimax-h3", "qwen3-tts", "triposg"):
             sections.append("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
                             "served-model-name = %s\n" % (model, python, FAKE, model))
         with open(preset, "w") as handle:
@@ -208,6 +208,80 @@ def check_speech(router):
     assert code == 200 and wav[:4] == b"RIFF", wav[:8]
 
 
+def model_busy(router, model):
+    code, listing = router.json("GET", "/v1/models")
+    assert code == 200, listing
+    for entry in listing["data"]:
+        if entry["id"] == model:
+            return entry["activity"]["busy"]
+    raise AssertionError("no model %s in %s" % (model, listing))
+
+
+def wait_until(predicate, what, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError("timed out: " + what)
+
+
+def check_objekt_direct(router):
+    # 1.4.24 (H1): 3D jobs through the real router dispatcher. The create
+    # records the job owner, reads and the cancel without ?model= reach that
+    # worker, and the open job keeps it busy between polls (so it is not
+    # stopped for another model while it computes).
+    code, created = router.json("POST", "/v1/3d/generations", {
+        "model": "triposg", "image": "AAAA", "fake_seconds": 120})
+    assert code == 202, created
+    running = created["id"]
+    code, status = router.json("GET", "/v1/3d/generations/" + running)
+    assert code == 200 and status["model"] == "triposg", status
+    assert status["status"] == "in_progress", status
+    assert model_busy(router, "triposg")
+    # The job sweep (every 10 s) asks the 3D status path; before 1.4.24 it
+    # asked /v1/videos/<id>, got 404 and released the running job.
+    time.sleep(11)
+    assert model_busy(router, "triposg")
+    code, gone = router.json("DELETE", "/v1/3d/generations/" + running)
+    assert code == 200 and gone["deleted"] is True, gone
+    wait_until(lambda: not model_busy(router, "triposg"), "busy after DELETE")
+    code, status = router.json("GET", "/v1/3d/generations/" + running)
+    assert code == 200 and status["status"] == "cancelled", status
+    # A short job: busy until its terminal status is read, then content and
+    # preview without ?model=.
+    code, created = router.json("POST", "/v1/3d/generations", {
+        "model": "triposg", "image": "AAAA", "fake_seconds": 0.5})
+    assert code == 202, created
+    short = created["id"]
+    assert model_busy(router, "triposg")
+    wait_until(lambda: router.json("GET", "/v1/3d/generations/" + short)[1]
+               ["status"] == "completed", "3D job completed")
+    wait_until(lambda: not model_busy(router, "triposg"), "busy after completed")
+    code, glb = router.request("GET", "/v1/3d/generations/%s/content" % short)
+    assert code == 200 and glb == b"glTF-fake-triposg", glb
+    code, png = router.request("GET", "/v1/3d/generations/%s/preview" % short)
+    assert code == 200 and png[:4] == b"\x89PNG", png[:8]
+    code, unknown = router.json("GET", "/v1/3d/generations/obj_" + "0" * 24)
+    assert code == 404, unknown
+
+
+def check_objekt_job(router):
+    # 1.4.24 (M1): the job store tolerates a few 503 status answers (a
+    # reloading worker) and stores model.glb, preview.png, response.json.
+    code, job = router.json("POST", "/v1/jobs", {"request": {
+        "path": "/v1/3d/generations",
+        "body": {"model": "triposg", "image": "AAAA", "fake_seconds": 0.3,
+                 "fake_flaky": 2}}})
+    assert code == 202, job
+    done = router.wait(job["id"], "completed")
+    names = [f["name"] for f in done["result"]["files"]]
+    assert names == ["model.glb", "preview.png", "response.json"], names
+    code, glb = router.request("GET", done["result"]["files"][0]["url"])
+    assert code == 200 and glb == b"glTF-fake-triposg", glb
+    wait_until(lambda: not model_busy(router, "triposg"), "busy after job")
+
+
 def check_cancel(router):
     # The fake worker sleeps 2 s for SLOW prompts.
     code, job = router.json("POST", "/v1/jobs", image_job("SLOW cat"))
@@ -265,6 +339,8 @@ def main():
         first = check_image_with_webhook(router, receiver)
         check_video(router)
         check_speech(router)
+        check_objekt_direct(router)
+        check_objekt_job(router)
         check_cancel(router)
         check_rejections(router, receiver)
         check_idempotency(router)
