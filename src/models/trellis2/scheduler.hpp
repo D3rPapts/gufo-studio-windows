@@ -93,20 +93,21 @@ inline std::vector<float> timestep_embedding(float t, int dim = DitConfig::time_
 // RoPE angles for one token at integer coordinates (x, y, z): 64 pairs, pair i rotates
 // (q[2i], q[2i+1]) by angle[i]; i < 63: axis i / 21, j = i % 21, angle = c_axis / 10000^(j/21);
 // i = 63: angle 0 (padding).
-inline void rope_angles(int x, int y, int z, float* angles) {
+// head_dim may differ from 128 in tests: per_axis = head_dim / 2 / 3, pairs = head_dim / 2.
+inline void rope_angles(int x, int y, int z, float* angles, int head_dim = DitConfig::head_dim) {
     const int c[3] = {x, y, z};
-    constexpr int per_axis = DitConfig::rope_freqs_per_axis;
-    for (int i = 0; i < DitConfig::rope_pairs; ++i) {
+    const int per_axis = head_dim / 2 / 3, pairs = head_dim / 2;
+    for (int i = 0; i < pairs; ++i) {
         if (i >= 3 * per_axis) { angles[i] = 0.f; continue; }
         const int axis = i / per_axis, j = i % per_axis;
-        const float freq = 1.f / std::pow(DitConfig::rope_base, static_cast<float>(j) / per_axis);
+        const float freq = 1.f / std::pow(DitConfig::rope_base, static_cast<float>(j) / static_cast<float>(per_axis));
         angles[i] = static_cast<float>(c[axis]) * freq;
     }
 }
 
-// In-place rotation of one head vector [128] by the 64 angles (complex multiply per pair).
-inline void apply_rope(float* v, const float* angles) {
-    for (int i = 0; i < DitConfig::rope_pairs; ++i) {
+// In-place rotation of one head vector [head_dim] by the head_dim/2 angles (complex multiply per pair).
+inline void apply_rope(float* v, const float* angles, int head_dim = DitConfig::head_dim) {
+    for (int i = 0; i < head_dim / 2; ++i) {
         const float c = std::cos(angles[i]), s = std::sin(angles[i]);
         const float a = v[2 * i], b = v[2 * i + 1];
         v[2 * i] = a * c - b * s;
