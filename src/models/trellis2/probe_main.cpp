@@ -26,6 +26,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -271,6 +272,7 @@ int run_ss(const SsRun& o) {
             std::cerr << error << '\n';
             return 1;
         }
+        std::cout << std::defaultfloat << std::setprecision(6);   // the HIP runtime leaves cout in fixed(2)
         std::cout << "cpu check (" << (o.layers > 0 ? o.layers : 30) << " layers): " << ms_since(t0) << " ms\n";
         for (const auto& [layer, h] : taps_cpu)
             if (taps.count(layer)) std::cout << "  block " << layer << ": rel RMS " << rel_rms(taps[layer], h) << " cosine " << cosine(taps[layer], h) << '\n';
@@ -336,6 +338,7 @@ int run_ssdec(const std::string& weights, const std::string& dumps, const std::s
         std::vector<float> cpu;
         t0 = Clock::now();
         if (!tr::ss_dec_forward_cpu(w, latent.data(), &cpu, &error)) { std::cerr << error << '\n'; return 1; }
+        std::cout << std::defaultfloat << std::setprecision(6);
         std::cout << "cpu check: " << ms_since(t0) << " ms, rel RMS " << rel_rms(logits, cpu) << " cosine " << cosine(logits, cpu);
         std::size_t agree = 0;
         for (std::size_t i = 0; i < cpu.size(); ++i) agree += (cpu[i] > 0) == (logits[i] > 0);
@@ -360,6 +363,7 @@ int run_ssdec(const std::string& weights, const std::string& dumps, const std::s
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
     std::string stage, weights, image, out, dumps, device = "gpu";
     int image_size = 512, layers = 0, seed = 42, steps = 12;
     bool selftest = false, zero_cond = false, cpu_check = false;
