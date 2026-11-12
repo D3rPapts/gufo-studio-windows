@@ -702,8 +702,9 @@ partner whose capabilities cannot be read (unreachable, older version)
 counts as "may have it".
 
 **Order.** A free runner (a job slot of `--jobs-parallel`) compares its
-oldest queued job with the partner's (`GET /v1/jobs?status=queued`,
-cached 2 s). When the partner's is older and this machine can run it,
+oldest queued job with the partner's (`GET /v1/jobs?status=queued` and
+`?status=in_progress` for the waiting ones, cached 2 s). When the
+partner's is older and this machine can run it,
 the runner calls `POST <partner>/router/pool/pull` with `{"from":
 "http://host:port", "router_id", "job": <the id it wants>,
 "capabilities": <its own>}`. The partner, under its lock, hands out its
@@ -724,19 +725,36 @@ partner means "as before" (local jobs run locally). Log events:
 `pool_pulled` (requester), `pool_pushed` (owner), `pool_pull_failed`,
 `pool_pull_lost`.
 
-**View.** Every job carries `"request": {"loras": [...]}` and
-`"running_on"`: `"local"` while it runs on the owner's worker, the
-partner's `http://host:port` while the partner's worker runs it (pulled),
-`null` when it is not running. `GET /v1/jobs?scope=pool` adds
-`"position"`: the rank among the queued jobs of both routers by
-`created_at` (1 = next to run), `null` for jobs that are not queued; the
-partner's `running_on` is translated to this router's point of view.
-`GET /router/status` gets `"pool_queue": {"local": queued here,
-"partner": queued there (null while unknown), "pulled": jobs this
-router fetched from the partner, "pushed": jobs handed to the partner,
-"pulling": [ids being run here for the partner], "pushed_active": [ids
-the partner runs for this router], "pull_hold_s" (only while pulling is
-paused), "partner_name", "enabled"}`.
+**Waiting jobs (1.4.21).** With `--jobs-parallel 2` a job is
+`in_progress` at once, and its request may then wait in the router's
+pool for a free machine (`event=pool ... choice=wait reason="both
+busy"`), so the queue alone would rarely hold anything to pull. Every
+request of a job carries `X-Gufo-Job: <id>`, and the pool records per
+job where the request went: `wait` (nothing started), `local` or
+`remote`. A waiting job counts as queued for the shared queue (position,
+`pool_queue`), shows `"running_on": null` and `"pool_wait": true`, and
+is a pull candidate: the owner marks it, the pool loop answers the
+waiting request `503 pool_redirected` instead of taking a machine
+(`event=pool_redirected`), and the owner's runner sends the same request
+again with `X-Gufo-Pool: remote` (`event=job_redirected`). A request
+that already reached a worker is never redirected, so nothing runs
+twice. The pull answer says `"was_waiting": true|false`.
+
+**View.** Every job carries `"request": {"loras": [...]}`,
+`"pool_wait"` and `"running_on"`: `"local"` while it runs on the owner's
+worker, the partner's `http://host:port` while the partner's worker runs
+it (pulled, or the pool sent the request there), `null` while it waits
+in the pool or is not running. `GET /v1/jobs?scope=pool` adds
+`"position"`: the rank among the queued and waiting jobs of both routers
+by `created_at` (1 = next to run), `null` for the others; the partner's
+`running_on` is translated to this router's point of view. `GET
+/router/status` gets `"pool_queue": {"local": queued or waiting here,
+"local_waiting": of those waiting in the pool, "partner": queued or
+waiting there (null while unknown), "pulled": jobs this router fetched
+from the partner, "pushed": jobs handed to the partner, "pulling": [ids
+being run here for the partner], "pushed_active": [ids the partner runs
+for this router], "pull_hold_s" (only while pulling is paused),
+"partner_name", "enabled"}`.
 
 Limits: the pool has exactly one partner; `running_on` names the
 requester as it named itself (`http://<--host>:<port>`, or how the

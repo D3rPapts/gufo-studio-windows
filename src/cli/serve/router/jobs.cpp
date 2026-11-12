@@ -2164,15 +2164,20 @@ HttpResponse JobQueue::PoolList(const HttpRequest& request) {
                      return a.member_double("created_at") >
                             b.member_double("created_at");
                    });
-  // "position": rank among the queued jobs of both routers, oldest = 1
-  // (the order the shared queue runs them in); null for the others.
+  // "position": rank among the queued (or waiting in the pool) jobs of
+  // both routers, oldest = 1 (the order the shared queue runs them in);
+  // null for the others.
   {
     // Within one router the submit order holds for jobs of the same second
     // (the lists come newest first, so walk them backwards).
     std::vector<std::size_t> queued;
-    for (std::size_t i = merged.size(); i-- > 0;)
-      if (merged[i].member_str("status") == "queued")
+    for (std::size_t i = merged.size(); i-- > 0;) {
+      const json::Value* wait = merged[i].find("pool_wait");
+      if (merged[i].member_str("status") == "queued" ||
+          (merged[i].member_str("status") == "in_progress" &&
+           wait != nullptr && wait->as_bool()))
         queued.push_back(i);
+    }
     std::stable_sort(queued.begin(), queued.end(),
                      [&merged](std::size_t a, std::size_t b) {
                        return merged[a].member_double("created_at") <
@@ -2314,11 +2319,19 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
     loras.push_back(name);
   request["loras"] = std::move(loras);
   view["request"] = std::move(request);
-  // Where the work runs: here, or on the partner's worker (pulled).
-  if (job.status != "in_progress")
+  // Where the work runs: here, on the partner's worker (pulled, or the
+  // pool sent it there), or nowhere yet (waiting in the pool).
+  const std::string pool_state =
+      job.status == "in_progress" ? PoolStateOf(job) : std::string();
+  if (job.status != "in_progress" || pool_state == "wait")
     view["running_on"] = nullptr;
+  else if (!job.pulled_by.empty())
+    view["running_on"] = job.pulled_by;
+  else if (pool_state == "remote" && !options_.partner_name.empty())
+    view["running_on"] = options_.partner_name;
   else
-    view["running_on"] = job.pulled_by.empty() ? "local" : job.pulled_by;
+    view["running_on"] = "local";
+  view["pool_wait"] = pool_state == "wait";
   view["created_at"] = job.created_at;
   view["started_at"] =
       job.started_at > 0 ? json::Value(job.started_at) : json::Value();
@@ -2594,50 +2607,75 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
         now - partner_queued_at_ < options_.pull_poll)
       return partner_queued_;
   }
-  HttpRequest copy;
-  copy.method = "GET";
-  copy.path = "/v1/jobs";
-  copy.query = "status=queued&limit=1000";
-  copy.headers.emplace_back(kRelayHeader, "1");
-  std::string why;
-  std::optional<std::vector<PartnerJob>> result;
-  auto answer = options_.relay(copy, std::chrono::seconds(3),
-                               std::chrono::seconds(3), &why);
-  if (answer) {
-    const std::string body = CollectBody(*answer);
-    if (answer->status == 200) {
-      try {
-        const json::Value parsed = json::parse(body);
-        if (const json::Value* data = parsed.find("data");
-            data != nullptr && data->is_array()) {
-          std::vector<PartnerJob> list;
-          for (const json::Value& item : data->items()) {
-            if (!item.is_object() || item.member_str("status") != "queued")
-              continue;
-            PartnerJob job;
-            job.id = item.member_str("id");
-            job.created_at =
-                static_cast<long long>(item.member_double("created_at", 0));
-            if (const json::Value* request = item.find("request");
-                request != nullptr && request->is_object()) {
-              job.model = request->member_str("model");
-              if (const json::Value* loras = request->find("loras");
-                  loras != nullptr && loras->is_array())
-                for (const json::Value& name : loras->items())
-                  if (name.is_string())
-                    job.loras.push_back(name.str());
-            }
-            if (ValidJobId(job.id) && !job.model.empty())
-              list.push_back(std::move(job));
-          }
-          // The list is newest first; the shared queue wants the oldest.
-          std::reverse(list.begin(), list.end());
-          result = std::move(list);
-        }
-      } catch (const std::exception&) {
-        // Not a job list: unknown.
-      }
+  // Queued jobs, and in_progress jobs whose request waits in the
+  // partner's pool ("pool_wait": nothing started there yet).
+  std::vector<PartnerJob> list;
+  bool ok = true;
+  for (const char* status : {"queued", "in_progress"}) {
+    HttpRequest copy;
+    copy.method = "GET";
+    copy.path = "/v1/jobs";
+    copy.query = std::string("status=") + status + "&limit=1000";
+    copy.headers.emplace_back(kRelayHeader, "1");
+    std::string why;
+    auto answer = options_.relay(copy, std::chrono::seconds(3),
+                                 std::chrono::seconds(3), &why);
+    if (!answer || answer->status != 200) {
+      if (answer)
+        CollectBody(*answer);
+      ok = false;
+      break;
     }
+    const std::string body = CollectBody(*answer);
+    try {
+      const json::Value parsed = json::parse(body);
+      const json::Value* data = parsed.find("data");
+      if (data == nullptr || !data->is_array()) {
+        ok = false;
+        break;
+      }
+      for (const json::Value& item : data->items()) {
+        if (!item.is_object())
+          continue;
+        const bool waiting = item.member_str("status") == "in_progress";
+        if (waiting) {
+          const json::Value* wait = item.find("pool_wait");
+          if (wait == nullptr || !wait->as_bool())
+            continue;
+        } else if (item.member_str("status") != "queued") {
+          continue;
+        }
+        PartnerJob job;
+        job.id = item.member_str("id");
+        job.waiting = waiting;
+        job.created_at =
+            static_cast<long long>(item.member_double("created_at", 0));
+        if (const json::Value* request = item.find("request");
+            request != nullptr && request->is_object()) {
+          job.model = request->member_str("model");
+          if (const json::Value* loras = request->find("loras");
+              loras != nullptr && loras->is_array())
+            for (const json::Value& name : loras->items())
+              if (name.is_string())
+                job.loras.push_back(name.str());
+        }
+        if (ValidJobId(job.id) && !job.model.empty())
+          list.push_back(std::move(job));
+      }
+    } catch (const std::exception&) {
+      ok = false;  // not a job list: unknown
+      break;
+    }
+  }
+  std::optional<std::vector<PartnerJob>> result;
+  if (ok) {
+    // The lists come newest first; the shared queue wants the oldest.
+    std::reverse(list.begin(), list.end());
+    std::stable_sort(list.begin(), list.end(),
+                     [](const PartnerJob& a, const PartnerJob& b) {
+                       return a.created_at < b.created_at;
+                     });
+    result = std::move(list);
   }
   const std::lock_guard<std::mutex> lock(mutex_);
   partner_queued_at_ = now;
@@ -2809,6 +2847,7 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
   if (models == nullptr || !models->is_object())
     models = &mine;
   std::shared_ptr<Job> picked;
+  bool picked_waiting = false;
   std::size_t queued = 0;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -2816,9 +2855,25 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
       return Err(503, "Service Unavailable", "router is shutting down",
                  "shutting_down");
     ReapPulledLocked();
-    // Oldest first; a job a runner already took is not in pending_.
-    for (auto it = pending_.begin(); it != pending_.end(); ++it) {
-      const std::shared_ptr<Job>& job = *it;
+    // Candidates, oldest first: queued jobs (a job a runner already took
+    // is not in pending_) and in_progress jobs whose request still waits
+    // in the pool for a machine (nothing started yet).
+    std::vector<std::pair<std::shared_ptr<Job>, bool>> candidates;
+    for (const auto& job : pending_)
+      candidates.emplace_back(job, false);
+    std::size_t waiting_count = 0;
+    for (const auto& job : order_) {
+      if (job->status == "in_progress" && job->pulled_by.empty() &&
+          PoolStateOf(*job) == "wait") {
+        candidates.emplace_back(job, true);
+        ++waiting_count;
+      }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const auto& a, const auto& b) {
+                       return a.first->created_at < b.first->created_at;
+                     });
+    for (const auto& [job, waiting] : candidates) {
       if (job->path == kConcatPath || job->cancel.load())
         continue;  // runs on this router's ffmpeg
       // Only a model this router has in the pool can be moved: the
@@ -2829,24 +2884,36 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
         continue;
       if (!CanRun(*caps, job->model, job->loras))
         continue;
-      picked = job;
-      pending_.erase(it);
+      if (waiting) {
+        // The router redirects the waiting request (503 pool_redirected)
+        // only while nothing has started; otherwise the job stays.
+        if (!options_.redirect_waiting || !options_.redirect_waiting(job->id))
+          continue;
+        picked = job;
+        picked_waiting = true;
+        --waiting_count;
+      } else {
+        picked = job;
+        std::erase(pending_, job);
+      }
       break;
     }
-    queued = pending_.size();
+    queued = pending_.size() + waiting_count;
     if (picked != nullptr) {
-      picked->status = "in_progress";
-      picked->started_at = NowSeconds();
       picked->pulled_by = from;
       picked->side = "remote";
       ++pushed_;
+      if (!picked_waiting) {
+        picked->status = "in_progress";
+        picked->started_at = NowSeconds();
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::thread thread([this, picked, done] {
+          Execute(picked);
+          done->store(true);
+        });
+        pulled_threads_.push_back({std::move(thread), done});
+      }
       PersistLocked();
-      auto done = std::make_shared<std::atomic<bool>>(false);
-      std::thread thread([this, picked, done] {
-        Execute(picked);
-        done->store(true);
-      });
-      pulled_threads_.push_back({std::move(thread), done});
     }
   }
   json::Value out = json::Value::object();
@@ -2854,8 +2921,10 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     out["job"] = picked->id;
     out["model"] = picked->model;
     out["created_at"] = picked->created_at;
+    out["was_waiting"] = picked_waiting;
     Logger::Info("jobs", "event=pool_pushed id=" + picked->id + " model=" +
-                             picked->model + " to=" + from);
+                             picked->model + " to=" + from +
+                             (picked_waiting ? " was=waiting" : " was=queued"));
   } else {
     out["job"] = nullptr;
   }
@@ -2915,10 +2984,45 @@ void JobQueue::ReapPulledLocked() {
   }
 }
 
+std::string JobQueue::PoolStateOf(const Job& job) const {
+  if (!options_.pool_states || job.status != "in_progress" ||
+      !job.upstream_id.empty())
+    return "";
+  const std::map<std::string, std::string> states = options_.pool_states();
+  const auto it = states.find(job.id);
+  return it == states.end() ? std::string() : it->second;
+}
+
+FetchResult JobQueue::Post(const std::shared_ptr<Job>& job,
+                           const std::string& body) {
+  for (int attempt = 0;; ++attempt) {
+    FetchResult result =
+        Call(job, "POST", job->path, "", body, job->content_type);
+    if (result.status == 503 && ErrorCode(result) == kPoolRedirected &&
+        attempt < 3) {
+      // Handed to the partner while it waited: the same request again,
+      // now with X-Gufo-Pool: remote (Call reads the side).
+      std::string to;
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        to = job->pulled_by;
+      }
+      Logger::Info("jobs", "event=job_redirected id=" + job->id + " to=" + to);
+      continue;
+    }
+    return result;
+  }
+}
+
 json::Value JobQueue::PoolQueueStatus() {
   json::Value out = json::Value::object();
   const std::lock_guard<std::mutex> lock(mutex_);
-  out["local"] = static_cast<long long>(pending_.size());
+  long long waiting = 0;
+  for (const auto& job : order_)
+    if (PoolStateOf(*job) == "wait")
+      ++waiting;
+  out["local"] = static_cast<long long>(pending_.size()) + waiting;
+  out["local_waiting"] = waiting;
   out["partner"] = partner_queued_.has_value()
                        ? json::Value(static_cast<long long>(
                              partner_queued_->size()))
@@ -2958,6 +3062,7 @@ FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
   request.body = std::move(body);
   if (!content_type.empty())
     request.headers.emplace_back("Content-Type", std::move(content_type));
+  request.headers.emplace_back(kJobHeader, job->id);
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (!job->side.empty())
@@ -3093,7 +3198,7 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     }
     FetchResult result;
     if (!as_async.empty()) {
-      result = Call(job, "POST", job->path, "", as_async, job->content_type);
+      result = Post(job, as_async);
       if (result.status == 202 && IsJsonType(result.content_type)) {
         RunMusic(job, result);
         return;
@@ -3106,8 +3211,7 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
       std::jthread progress([&](std::stop_token stop) {
         PollPreview(job, job->model, stop);
       });
-      result = Call(job, "POST", job->path, "", with_preview,
-                    job->content_type);
+      result = Post(job, with_preview);
       progress.request_stop();
       progress.join();
       if (result.status == 400 &&
@@ -3117,10 +3221,10 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           const std::lock_guard<std::mutex> lock(mutex_);
           job->preview_id.clear();
         }
-        result = Call(job, "POST", job->path, "", payload, job->content_type);
+        result = Post(job, payload);
       }
     } else {
-      result = Call(job, "POST", job->path, "", payload, job->content_type);
+      result = Post(job, payload);
     }
     if (result.status < 200 || result.status >= 300)
       throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status);
