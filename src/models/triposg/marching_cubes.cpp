@@ -308,7 +308,7 @@ inline EdgeKey make_edge_key(std::size_t ix, std::size_t iy, std::size_t iz, int
 
 Mesh marching_cubes(const ScalarGrid& grid, const MarchingCubesOptions& options) {
     Mesh mesh;
-    if (grid.values == nullptr || grid.nx < 2 || grid.ny < 2 || grid.nz < 2) return mesh;
+    if ((grid.values == nullptr && grid.half_values == nullptr) || grid.nx < 2 || grid.ny < 2 || grid.nz < 2) return mesh;
 
     const float iso = options.iso_level;
     // Bourke's table assumes bit i set when corner i is "inside" (value below iso).

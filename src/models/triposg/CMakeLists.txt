@@ -16,7 +16,9 @@ add_library(gufo_triposg_cpu STATIC
   dinov2_cpu.cpp
   dit_cpu.cpp
   vae_cpu.cpp
-  mesh_preview.cpp)
+  mesh_preview.cpp
+  sdf_grid.cpp
+  mesh_decimate.cpp)
 target_include_directories(gufo_triposg_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_triposg_cpu PUBLIC cxx_std_20)
 target_link_libraries(gufo_triposg_cpu PUBLIC gufo_platform)
@@ -50,7 +52,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (BUILD_TESTING)
-  foreach(name marching_cubes glb_writer preprocess dinov2_cpu dit_cpu vae_cpu)
+  foreach(name marching_cubes glb_writer preprocess dinov2_cpu dit_cpu vae_cpu sdf_grid)
     add_executable(triposg_${name}_test
       ${PROJECT_SOURCE_DIR}/tests/models/triposg/${name}_test.cpp)
     target_link_libraries(triposg_${name}_test PRIVATE gufo_triposg_cpu)
