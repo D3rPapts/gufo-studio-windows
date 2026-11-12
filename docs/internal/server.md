@@ -561,6 +561,13 @@ only in the worker's memory, so a read for a job whose worker is no longer
 loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
 /embeddings` goes to the embedding model named in its body.
+A ComfyUI graph that loads a video (`LoadVideo` -> `RIFE VFI`) takes
+the RIFE rate from the file's probed frame rate (ffprobe next to
+`--comfy-ffmpeg`; 24 fps assumed when it is missing): x5 of a 12 fps shot
+is 60 fps, so a `CreateVideo` at 60 fps and a `SaveImage` of the same
+graph name one output. Outputs of one video job must share the RIFE
+multiplier and the upscale; target frame rates only have to agree with
+each other within 0.5 % (59.94 ~ 60), and the error names what differs.
 
 ### Figure check (`POST /v1/figuren`)
 
@@ -734,10 +741,14 @@ being run here for the partner], "pushed_active": [ids the partner runs
 for this router], "pull_hold_s" (only while pulling is paused),
 "partner_name", "enabled"}`.
 
-Limits: the pool has exactly one partner; `running_on` names the
-requester as it named itself (`http://<--host>:<port>`, or how the
-partner's `[remote/...]` section names it once its capabilities were
-read); the image preview of a pulled job runs on the requester's
+**Self URL (1.4.22).** A pull's `"from"` and `/router/capabilities`
+`"self"` never name `0.0.0.0`: a router bound to all interfaces names
+the local address of the route toward the partner (else the computer's
+name), and the pull owner replaces an unreachable `"from"` with the
+partner URL it knows from its `[remote/...]` section (`running_on`,
+log).
+
+Limits: the pool has exactly one partner; the image preview of a pulled job runs on the requester's
 worker, so the owner shows no live step for it; a job with a multipart
 body states its LoRAs only through a `loras` JSON part.
 
