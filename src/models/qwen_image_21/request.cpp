@@ -16,8 +16,8 @@
 #include <stdexcept>
 #include <variant>
 
-#include "src/core/image.hpp"
-#include "src/core/json.hpp"
+#include <gufo/ext/image.hpp>
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::qwen_image_21 {
 namespace {

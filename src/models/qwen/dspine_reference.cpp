@@ -6,7 +6,7 @@
 #include <numeric>
 #include <stdexcept>
 
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 
 namespace gufo::models::qwen {
 namespace {

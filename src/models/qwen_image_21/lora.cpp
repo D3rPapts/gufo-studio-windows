@@ -22,9 +22,9 @@
 #include <set>
 #include <stdexcept>
 
-#include "src/core/json.hpp"
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/json.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 
 namespace gufo::models::qwen_image_21 {
 namespace {

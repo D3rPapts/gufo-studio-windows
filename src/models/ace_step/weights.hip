@@ -4,7 +4,7 @@
 #include <cstring>
 #include <utility>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/ace_step/weights.hpp"
 
 namespace gufo::models::ace_step {

@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
 
 namespace gufo::models::wan22 {
 

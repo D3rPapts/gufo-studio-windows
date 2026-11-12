@@ -1,4 +1,4 @@
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 
 #include <png.h>
 
@@ -10,7 +10,7 @@
 #include <numbers>
 #include <stdexcept>
 
-#include "src/core/crypto/sha256.hpp"
+#include <gufo/ext/sha256.hpp>
 #include "src/models/qwen_image_21/control.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 

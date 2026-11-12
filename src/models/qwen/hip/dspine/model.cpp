@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/qwen/hip/dspine.hpp"
 #include "src/models/qwen/hip/dspine/kernels.hpp"

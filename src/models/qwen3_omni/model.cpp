@@ -6,8 +6,8 @@
 #include <string_view>
 #include <utility>
 
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include "src/models/qwen3_omni/parallel_read.hpp"
 
 namespace gufo::models::qwen3_omni {

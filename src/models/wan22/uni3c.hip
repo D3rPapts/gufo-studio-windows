@@ -8,8 +8,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/json.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include "src/models/wan22/attention.hip.hpp"
 #include "src/models/wan22/gemm.hpp"
 #include "src/models/wan22/uni3c.hpp"

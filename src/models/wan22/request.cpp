@@ -22,7 +22,7 @@
 #include <system_error>
 #include <utility>
 
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 
 namespace gufo::models::wan22 {
 namespace {

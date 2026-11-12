@@ -14,7 +14,7 @@
 #include <utility>
 
 #include "ds4_mmq.h"
-#include "src/core/hip/weight_upload.hpp"
+#include <gufo/ext/experimental/weight_upload.hpp>
 #include "src/models/qwen3_omni/hip/device_buffer.hpp"
 #include "src/models/qwen3_omni/hip/thinker_kernels.hpp"
 

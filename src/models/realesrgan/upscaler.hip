@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/realesrgan/tile_plan.hpp"
 #include "src/models/realesrgan/upscaler.hpp"
 

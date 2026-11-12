@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <exception>
 
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 #include "src/families/qwen/vision/encoder.hpp"
 #endif
 

@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/utf8.hpp"
+#include <gufo/ext/utf8.hpp>
 #include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen3_asr/audio.hpp"
 #include "src/models/qwen3_omni/hip/audio_encoder.hpp"

@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 #include "src/models/mmaudio/pipeline.hpp"
 #include "src/models/mmaudio/clip.hpp"
 #include "src/models/mmaudio/network.hpp"

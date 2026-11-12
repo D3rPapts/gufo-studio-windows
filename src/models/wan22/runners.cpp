@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/pipeline21.hpp"
 #include "src/models/wan22/pipeline_vace.hpp"

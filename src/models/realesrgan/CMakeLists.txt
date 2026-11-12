@@ -67,7 +67,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_realesrgan PUBLIC gufo_rife hip::host)
 
   # Standalone driver with the same options as `gufo video-upscale`.
-  add_executable(gufo-upscale EXCLUDE_FROM_ALL upscale_main.cpp
+  add_executable(gufo-upscale EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/src/cli/video/upscale_main.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/video/video_upscale.cpp)
   set_target_properties(gufo-upscale PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

@@ -9,7 +9,7 @@
 #include "model.hpp"
 #include "probe.hpp"
 #include "request.hpp"
-#include "src/core/logging/logging.hpp"
+#include <gufo/ext/host.hpp>
 
 namespace gufo::models::qwen_image_21 {
 

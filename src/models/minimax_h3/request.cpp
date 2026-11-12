@@ -13,8 +13,8 @@
 #include <stdexcept>
 #include <system_error>
 
-#include "src/core/image.hpp"
-#include "src/core/json.hpp"
+#include <gufo/ext/image.hpp>
+#include <gufo/ext/json.hpp>
 #include "src/models/minimax_h3/audio_input.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/rife/video_io.hpp"

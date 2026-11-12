@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/rife/ifnet.hpp"
 
 // Layout: every tensor is channels-last [height, width, channels] for a single
