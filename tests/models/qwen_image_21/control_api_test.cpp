@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,8 +74,14 @@ int main() {
                     .rgba = pixels.rgba}};
     };
   };
-  gufo::server::ImageService service({}, "image-test", runner_for(true));
-  gufo::server::ImageService plain({}, "image-test", runner_for(false));
+  // 2.0: the service takes an ext::ImageRunner; the callback is wrapped with
+  // the provider's capabilities (edits for /v1/images/edits).
+  const auto runner = [&](bool controlnet) {
+    return std::make_shared<gufo::server::CallbackImageRunner>(
+        runner_for(controlnet), kCapabilities);
+  };
+  gufo::server::ImageService service(runner(true), "image-test");
+  gufo::server::ImageService plain(runner(false), "image-test");
 
   gufo::server::HttpRequest http;
   http.method = "POST";
