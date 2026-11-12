@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
@@ -29,6 +30,16 @@ HttpResponse Error(int status, std::string reason, std::string message, std::str
   error["code"] = std::move(code);
   root["error"] = std::move(error);
   return {.status = status, .reason = std::move(reason), .body = root.dump(), .headers = {}, .streaming_body = {}};
+}
+
+// A JSON number read as an int only inside [lo, hi]: the double is checked
+// first, because converting an out-of-range double (e.g. 1e300) to int is
+// undefined behaviour that a range check after the cast cannot catch.
+bool IntInRange(const json::Value& body, const char* name, double fallback, double lo, double hi, int* out) {
+  const double value = body.member_double(name, fallback);
+  if (!std::isfinite(value) || value < lo || value > hi) return false;
+  *out = static_cast<int>(value);
+  return true;
 }
 
 std::optional<std::vector<std::uint8_t>> DecodeBase64(std::string_view text) {
@@ -320,7 +331,8 @@ struct ObjektService::Impl {
       const bool ok = options.runner->Run(job->request, progress, &job->cancel, &result, &error);
       std::string write_error;
       bool written = false;
-      if (ok) {
+      // A job cancelled or deleted while it ran writes no result files.
+      if (ok && !job->cancel.load()) {
         std::error_code ec;
         std::filesystem::create_directories(job->directory, ec);
         written = WriteAll(job->directory / "model.glb", result.glb.data(), result.glb.size(), &write_error);
@@ -349,7 +361,14 @@ struct ObjektService::Impl {
           job->error_code = ok ? "io_error" : "generation_failed";
           job->error_message = ok ? write_error : error;
         }
-        if (!job->deleted) PersistLocked(*job);
+        if (job->deleted) {
+          // DELETE while it ran: the job is already gone from `jobs`, so no
+          // sweep would ever remove its directory.
+          std::error_code ec;
+          std::filesystem::remove_all(job->directory, ec);
+        } else {
+          PersistLocked(*job);
+        }
         active.reset();
       }
     }
@@ -408,16 +427,19 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     } catch (const std::exception& e) {
       return Error(400, "Bad Request", std::string("cannot decode image: ") + e.what(), "invalid_image");
     }
-    job->request.steps = static_cast<int>(body.member_double("steps", 50));
-    job->request.guidance = static_cast<float>(body.member_double("guidance", 7.0));
-    job->request.seed = static_cast<std::uint64_t>(body.member_double("seed", 42));
-    job->request.resolution = static_cast<int>(body.member_double("resolution", 512));
-    job->request.max_faces = static_cast<int>(body.member_double("max_faces", 200000));
+    // Numbers are range-checked as doubles before any conversion.
+    if (!IntInRange(body, "steps", 50, 1, 200, &job->request.steps)) return Error(400, "Bad Request", "steps must be 1..200", "invalid_steps");
+    const double guidance = body.member_double("guidance", 7.0);
+    if (!(guidance >= 0.0 && guidance <= 30.0)) return Error(400, "Bad Request", "guidance must be 0..30", "invalid_guidance");
+    job->request.guidance = static_cast<float>(guidance);
+    const double seed = body.member_double("seed", 42);
+    if (!(seed >= 0.0 && seed < 18446744073709551616.0)) return Error(400, "Bad Request", "seed must be 0..2^64-1", "invalid_seed");
+    job->request.seed = static_cast<std::uint64_t>(seed);
+    if (!IntInRange(body, "resolution", 512, 256, 512, &job->request.resolution) ||
+        (job->request.resolution != 256 && job->request.resolution != 512))
+      return Error(400, "Bad Request", "resolution must be 256 or 512", "invalid_resolution");
+    if (!IntInRange(body, "max_faces", 200000, 0, 5000000, &job->request.max_faces)) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
     if (const json::Value* p = body.find("preview"); p && p->is_bool()) job->request.preview = p->as_bool();
-    if (job->request.steps < 1 || job->request.steps > 200) return Error(400, "Bad Request", "steps must be 1..200", "invalid_steps");
-    if (job->request.guidance < 0.f || job->request.guidance > 30.f) return Error(400, "Bad Request", "guidance must be 0..30", "invalid_guidance");
-    if (job->request.resolution != 256 && job->request.resolution != 512) return Error(400, "Bad Request", "resolution must be 256 or 512", "invalid_resolution");
-    if (job->request.max_faces < 0 || job->request.max_faces > 5000000) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
     job->model = body.member_str("model", m.options.model_id);
     job->created_at = UnixNow();
     {

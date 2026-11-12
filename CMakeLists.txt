@@ -819,6 +819,17 @@ if (BUILD_TESTING)
   set_tests_properties(router_proxy_remote_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
 
+  # gufo serve objekt with a fake runner: number range checks, DELETE while
+  # a job runs (no model, no GPU).
+  # Built from objekt_service.cpp itself (not gufo_http), so the test runs
+  # in a CPU build even where other parts of gufo_http need HIP headers.
+  add_executable(objekt_service_test tests/cli/objekt_service_test.cpp
+    src/cli/serve/objekt_service.cpp)
+  target_link_libraries(objekt_service_test PRIVATE gufo_qwen_image_21)
+  add_test(NAME objekt_service_test COMMAND objekt_service_test)
+  set_tests_properties(objekt_service_test PROPERTIES LABELS "cpu;server"
+    TIMEOUT 60)
+
   add_executable(router_jobs_test tests/cli/router_jobs_test.cpp)
   target_link_libraries(router_jobs_test PRIVATE gufo_http)
   add_test(NAME router_jobs_test COMMAND router_jobs_test)
