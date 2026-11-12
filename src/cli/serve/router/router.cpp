@@ -451,7 +451,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
       "/v1/images/upscale",
       // Voice conversion / stem separation (gufo serve voice, D5).
-      "/v1/audio/convert", "/v1/audio/separate"};
+      "/v1/audio/convert", "/v1/audio/separate",
+      // TripoSG image-to-3D jobs (gufo serve objekt), async via /v1/jobs.
+      "/v1/3d/generations"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
@@ -2705,6 +2707,11 @@ public:
         for (const std::string& name : router::LoraNamesOf(*preset))
           loras.push_back(name);
         model["loras"] = std::move(loras);
+        // External workers with a known capability: `serve objekt` answers
+        // POST /v1/3d/generations (image -> GLB). Pages route by this field.
+        const std::string capability = router::CapabilityOf(*preset);
+        if (!capability.empty())
+          model["capability"] = capability;
         models[preset->id] = std::move(model);
       }
     }

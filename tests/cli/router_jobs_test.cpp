@@ -194,6 +194,8 @@ struct FakeApi {
   std::atomic<bool> release{false};
   int video_polls{0};
   bool video_deleted{false};
+  bool objekt_deleted = false;
+  int objekt_polls = 0;
   int unreachable_calls{0};
   /// Music: the async job stays in_progress while set.
   std::atomic<bool> music_hold{false};
@@ -396,6 +398,37 @@ struct FakeApi {
     if (request.path == "/v1/videos/video_1/content") {
       result.content_type = "video/mp4";
       result.body = "FAKEMP4";
+      return result;
+    }
+    // gufo serve objekt (TripoSG): 202, two polls, then GLB + preview.
+    if (request.method == "POST" && request.path == "/v1/3d/generations") {
+      result.status = 202;
+      result.body = R"({"id":"obj_1","object":"3d.generation","status":"queued","progress":0})";
+      return result;
+    }
+    if (request.method == "DELETE" && request.path == "/v1/3d/generations/obj_1") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      objekt_deleted = true;
+      result.body = R"({"id":"obj_1","deleted":true})";
+      return result;
+    }
+    if (request.method == "GET" && request.path == "/v1/3d/generations/obj_1") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++objekt_polls;
+      result.body =
+          release.load() || objekt_polls < 3
+              ? R"({"id":"obj_1","status":"in_progress","progress":55,"phase":"decode"})"
+              : R"({"id":"obj_1","status":"completed","progress":100,"phase":"done","data":[{"format":"glb","vertices":4,"faces":4,"closed":true}]})";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/content") {
+      result.content_type = "model/gltf-binary";
+      result.body = "glTFfake";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/preview") {
+      result.content_type = "image/png";
+      result.body = "PNGfake";
       return result;
     }
     result.status = 404;
@@ -732,6 +765,47 @@ void TestVideo() {
   CHECK(h.Call("GET", files[0].member_str("url")).body == "FAKEMP4");
   CHECK(done.find("result")->find("response")->member_str("status") ==
         "completed");
+}
+
+// /v1/3d/generations (gufo serve objekt): 202 + polling like videos, result
+// files model.glb (model/gltf-binary), preview.png and response.json.
+void TestObjekt() {
+  Harness h("objekt");
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"data:image/png;base64,AAAA","steps":50}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_double("progress") == 100);
+  const auto& files = done.find("result")->find("files")->items();
+  CHECK(files.size() == 3);
+  CHECK(files[0].member_str("name") == "model.glb");
+  CHECK(files[0].member_str("content_type") == "model/gltf-binary");
+  CHECK(h.Call("GET", files[0].member_str("url")).body == "glTFfake");
+  CHECK(files[1].member_str("name") == "preview.png");
+  CHECK(h.Call("GET", files[1].member_str("url")).body == "PNGfake");
+  CHECK(files[2].member_str("name") == "response.json");
+  CHECK(done.find("result")->member_str("content_type") == "model/gltf-binary");
+  const json::Value* response = done.find("result")->find("response");
+  CHECK(response->member_str("status") == "completed");
+  CHECK(response->find("data")->items()[0].member_double("faces") == 4);
+}
+
+void TestObjektCancel() {
+  Harness h("objekt-cancel");
+  h.api->release.store(true);  // the fake 3D job never completes
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  for (int i = 0; i < 400; ++i) {
+    const json::Value job = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+    if (job.member_double("progress", -1) == 55)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  h.Call("DELETE", "/v1/jobs/" + id);
+  h.WaitFor(id, "cancelled");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->objekt_deleted);
 }
 
 void TestVideoCancel() {
@@ -2253,6 +2327,8 @@ int main() {
   TestCancel();
   TestVideo();
   TestVideoCancel();
+  TestObjekt();
+  TestObjektCancel();
   TestWebhook();
   TestWebhookGivesUp();
   TestIdempotency();

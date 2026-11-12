@@ -576,4 +576,12 @@ bool LoadPreset(const std::filesystem::path& file,
   return true;
 }
 
+std::string CapabilityOf(const PresetModel& preset) {
+  for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
+    if (preset.argv[i] == "serve" && preset.argv[i + 1] == "objekt")
+      return "image_to_3d";
+  }
+  return "";
+}
+
 }  // namespace gufo::router
