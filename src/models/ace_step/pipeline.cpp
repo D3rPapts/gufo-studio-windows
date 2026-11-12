@@ -32,6 +32,13 @@ double Since(std::chrono::steady_clock::time_point start) {
       .count();
 }
 
+std::string Lower(std::string_view text) {
+  std::string out(text);
+  for (char& c : out)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
 }  // namespace
 
 // The host side (paths, prompts, noise, WAV, file resolution) is in prompt.cpp.
