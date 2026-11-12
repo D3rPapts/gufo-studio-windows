@@ -215,15 +215,20 @@ def plan_component(plan, prefix, src, heads, with_encoder):
                 continue
             q, k, v = (f"{block}.attn1.to_{c}.weight" for c in "qkv")
             if q in names:
-                def self_qkv(q=q, k=k, v=v):
-                    return deinterleave_self(src.read(q), src.read(k), src.read(v), heads)
+                def self_qkv(q=q, k=k, v=v, cache=[None]):
+                    # One-entry cache: the three output tensors are produced in a row.
+                    if cache[0] is None:
+                        cache[0] = deinterleave_self(src.read(q), src.read(k), src.read(v), heads)
+                    return cache[0]
                 for i, n in enumerate((q, k, v)):
                     plan.add(prefix + "." + n, src.shape(n), lambda i=i, f=self_qkv: f()[i])
                     done.add(n)
             k2, v2 = (f"{block}.attn2.to_{c}.weight" for c in "kv")
             if k2 in names:
-                def cross_kv(k=k2, v=v2):
-                    return deinterleave_cross(src.read(k), src.read(v), heads)
+                def cross_kv(k=k2, v=v2, cache=[None]):
+                    if cache[0] is None:
+                        cache[0] = deinterleave_cross(src.read(k), src.read(v), heads)
+                    return cache[0]
                 for i, n in enumerate((k2, v2)):
                     plan.add(prefix + "." + n, src.shape(n), lambda i=i, f=cross_kv: f()[i])
                     done.add(n)
@@ -282,6 +287,8 @@ def write_safetensors(path, plan, metadata):
                 raise SystemExit(f"{name}: produced shape {arr.shape} != planned {shape}")
             data = to_bf16(arr) if dtype == "BF16" else arr
             f.write(data.tobytes())
+            del arr, data
+            plan.entries[i] = (name, shape, dtype, None)  # drop the producer (and its cache)
             if i % 50 == 0 or i + 1 == len(plan.entries):
                 print(f"  {i + 1}/{len(plan.entries)} {name}", file=sys.stderr)
     os.replace(tmp, path)
