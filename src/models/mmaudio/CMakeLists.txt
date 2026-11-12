@@ -20,18 +20,19 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_mmaudio PUBLIC gufo_platform hip::host
     roc::rocblas)
 
-  foreach(tool mmaudio mmaudio-check)
-    if (tool STREQUAL "mmaudio")
-      set(source foley_main.cpp)
-    else()
-      set(source check_main.cpp)
-    endif()
-    add_executable(gufo-${tool} EXCLUDE_FROM_ALL ${source})
-    set_target_properties(gufo-${tool} PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-    target_link_libraries(gufo-${tool} PRIVATE gufo_mmaudio)
-    gufo_stage_hip_runtime(gufo-${tool})
-  endforeach()
+  # Spelled out (no foreach over the name) so the target ownership audit can
+  # attribute both drivers to this directory.
+  add_executable(gufo-mmaudio EXCLUDE_FROM_ALL foley_main.cpp)
+  set_target_properties(gufo-mmaudio PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  target_link_libraries(gufo-mmaudio PRIVATE gufo_mmaudio)
+  gufo_stage_hip_runtime(gufo-mmaudio)
+
+  add_executable(gufo-mmaudio-check EXCLUDE_FROM_ALL check_main.cpp)
+  set_target_properties(gufo-mmaudio-check PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  target_link_libraries(gufo-mmaudio-check PRIVATE gufo_mmaudio)
+  gufo_stage_hip_runtime(gufo-mmaudio-check)
 endif()
 
 if (BUILD_TESTING)
