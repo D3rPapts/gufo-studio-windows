@@ -59,7 +59,7 @@ if (BUILD_TESTING)
   add_test(NAME gufo_router_help COMMAND gufo router --help)
   set_tests_properties(gufo_router_help PROPERTIES
     LABELS "cpu;server;cli"
-    PASS_REGULAR_EXPRESSION "\[llm/<model-id>\]")
+    PASS_REGULAR_EXPRESSION "\\[llm/<model-id>\\]")
 
   # Portable router unit tests (no model, no GPU).
   foreach (router_test IN ITEMS
