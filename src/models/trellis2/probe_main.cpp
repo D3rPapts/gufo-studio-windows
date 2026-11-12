@@ -46,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,7 @@
 #include "src/models/trellis2/dit.hpp"
 #include "src/models/trellis2/dual_grid_mesh.hpp"
 #include "src/models/trellis2/glb_writer.hpp"
+#include "src/models/trellis2/mesh_post.hpp"
 #include "src/models/trellis2/mesh_preview.hpp"
 #include "src/models/trellis2/npy.hpp"
 #include "src/models/trellis2/pipeline.hpp"
@@ -688,6 +690,85 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
 #endif
 }
 
+// ---------------------------------------------------------------- mesh analysis (CPU, from dumps)
+int run_mesh(const std::string& dumps, float hole_perimeter) {
+    std::string error;
+    std::vector<float> out7;
+    std::vector<std::size_t> shape;
+    if (!tr::npy::read_f32(std::filesystem::path(dumps) / "shape_dec_out.npy", &out7, &shape, &error) || shape.size() != 2 || shape[1] != 7) {
+        std::cerr << "shape_dec_out.npy: " << error << '\n';
+        return 1;
+    }
+    const std::vector<tr::Coord> coords = read_coords((std::filesystem::path(dumps) / "shape_dec_coords.npy").string(), &error);
+    if (coords.size() != shape[0]) { std::cerr << "shape_dec_coords.npy: " << error << '\n'; return 1; }
+    std::vector<float> dual, wgt;
+    std::vector<std::uint8_t> inter;
+    tr::decode_shape_outputs(out7.data(), coords.size(), &dual, &inter, &wgt);
+    tr::DualGridInput in;
+    in.coords = &coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
+    in.resolution = 512;
+    tr::DualGridStats st;
+    tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles, " << st.quads << " quads, " << st.skipped_edges
+              << " skipped edges, " << st.open_edges << " open edges\n";
+    // Edge multiplicities: undirected count and directed duplicates.
+    std::vector<std::uint64_t> und, dir;
+    und.reserve(mesh.faces.size() * 3);
+    dir.reserve(mesh.faces.size() * 3);
+    for (const auto& f : mesh.faces)
+        for (int e = 0; e < 3; ++e) {
+            const std::uint32_t a = f[static_cast<std::size_t>(e)], b = f[static_cast<std::size_t>((e + 1) % 3)];
+            und.push_back((static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b));
+            dir.push_back((static_cast<std::uint64_t>(a) << 32) | b);
+        }
+    std::sort(und.begin(), und.end());
+    std::sort(dir.begin(), dir.end());
+    std::size_t m1 = 0, m2 = 0, m3 = 0, dirdup = 0;
+    for (std::size_t i = 0; i < und.size();) {
+        std::size_t j = i + 1;
+        while (j < und.size() && und[j] == und[i]) ++j;
+        if (j - i == 1) ++m1; else if (j - i == 2) ++m2; else ++m3;
+        i = j;
+    }
+    for (std::size_t i = 0; i < dir.size();) {
+        std::size_t j = i + 1;
+        while (j < dir.size() && dir[j] == dir[i]) ++j;
+        if (j - i > 1) ++dirdup;
+        i = j;
+    }
+    std::cout << "edges: single " << m1 << ", double " << m2 << ", triple+ " << m3 << ", same-direction duplicates " << dirdup << '\n';
+    // Degenerate / duplicate faces.
+    std::size_t degenerate = 0;
+    for (const auto& f : mesh.faces) degenerate += (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]);
+    std::cout << "degenerate faces: " << degenerate << '\n';
+    tr::Mesh filled = mesh;
+    const tr::HoleFillStats hf = tr::fill_holes(&filled, hole_perimeter);
+    std::cout << "fill_holes(" << hole_perimeter << "): loops " << hf.loops << ", filled " << hf.filled << ", skipped large " << hf.skipped_large
+              << ", not closed / tiny " << hf.skipped_nonmanifold << " -> open edges " << tr::count_boundary_edges(filled) << '\n';
+    if (!hf.skipped_perimeters.empty()) {
+        std::cout << "  largest skipped:";
+        for (std::size_t i = 0; i < hf.skipped_perimeters.size() && i < 8; ++i) std::cout << ' ' << hf.skipped_perimeters[i];
+        std::cout << '\n';
+    }
+    // Boundary vertices with more than one outgoing / incoming boundary edge (pinches).
+    std::unordered_map<std::uint32_t, int> out_deg, in_deg;
+    for (std::size_t i = 0; i < dir.size();) {
+        std::size_t j = i + 1;
+        while (j < dir.size() && dir[j] == dir[i]) ++j;
+        if (j - i == 1) {
+            const std::uint32_t a = static_cast<std::uint32_t>(dir[i] >> 32), b = static_cast<std::uint32_t>(dir[i] & 0xFFFFFFFFu);
+            if (!std::binary_search(dir.begin(), dir.end(), (static_cast<std::uint64_t>(b) << 32) | a)) { ++out_deg[b]; ++in_deg[a]; }
+        }
+        i = j;
+    }
+    std::size_t pinch = 0, dangling = 0;
+    for (const auto& [v, d] : out_deg) { if (d > 1) ++pinch; if (!in_deg.count(v)) ++dangling; }
+    for (const auto& [v, d] : in_deg) if (!out_deg.count(v)) ++dangling;
+    std::cout << "boundary vertices: " << out_deg.size() << ", pinch (>1 outgoing) " << pinch << ", dangling (in != out) " << dangling << '\n';
+    return 0;
+}
+
 // ---------------------------------------------------------------- full pipeline (HIP)
 int run_full(const std::string& weights_dir, const std::string& image, const std::string& out, const std::string& name,
              int steps, int seed, int max_faces, bool texture) {
@@ -802,6 +883,10 @@ int main(int argc, char** argv) {
     if (stage == "tex") {
         if (weights.empty() || weights_dir.empty() || dumps.empty() || out.empty()) return usage();
         return run_tex(weights, weights_dir, dumps, out, seed, steps);
+    }
+    if (stage == "mesh") {
+        if (dumps.empty()) return usage();
+        return run_mesh(dumps, 0.03f);
     }
     if (stage == "full") {
         if (weights_dir.empty() || image.empty() || out.empty()) return usage();
