@@ -27,43 +27,44 @@ HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
         for (int e = 0; e < 3; ++e) directed.push_back(key(f[static_cast<std::size_t>(e)], f[static_cast<std::size_t>((e + 1) % 3)]));
     std::sort(directed.begin(), directed.end());
     auto present = [&](std::uint64_t k) { return std::binary_search(directed.begin(), directed.end(), k); };
-    std::unordered_map<std::uint32_t, std::uint32_t> next;
-    std::unordered_map<std::uint32_t, int> out_degree;
+    // Outgoing boundary edges per vertex (several at pinch vertices): loops are walked by
+    // taking the first unused outgoing edge; a loop that touches itself is still filled
+    // (fan from the centroid) so that small pinched holes close like CuMesh does.
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> next;
     for (std::size_t i = 0; i < directed.size();) {
         std::size_t j = i + 1;
         while (j < directed.size() && directed[j] == directed[i]) ++j;
         if (j - i == 1) {
             const std::uint32_t a = static_cast<std::uint32_t>(directed[i] >> 32), b = static_cast<std::uint32_t>(directed[i] & 0xFFFFFFFFu);
-            if (!present(key(b, a))) {
-                next[b] = a;
-                ++out_degree[b];
-            }
+            if (!present(key(b, a))) next[b].push_back(a);
         }
         i = j;
     }
-    std::unordered_map<std::uint32_t, bool> visited;
-    for (const auto& [start, _] : next) {
-        if (visited[start]) continue;
-        std::vector<std::uint32_t> loop;
-        std::uint32_t v = start;
-        bool manifold = true;
-        while (!visited[v]) {
-            visited[v] = true;
-            if (out_degree[v] != 1) manifold = false;
-            loop.push_back(v);
-            auto it = next.find(v);
-            if (it == next.end()) { manifold = false; break; }
-            v = it->second;
-        }
-        if (v != start) manifold = false;
-        ++st.loops;
-        if (!manifold || loop.size() < 3) { ++st.skipped_nonmanifold; continue; }
-        double perimeter = 0;
-        for (std::size_t i = 0; i < loop.size(); ++i) {
-            const MeshVertex& p = mesh->vertices[loop[i]];
-            const MeshVertex& q = mesh->vertices[loop[(i + 1) % loop.size()]];
-            perimeter += std::sqrt(static_cast<double>(p.x - q.x) * (p.x - q.x) + static_cast<double>(p.y - q.y) * (p.y - q.y) + static_cast<double>(p.z - q.z) * (p.z - q.z));
-        }
+    std::unordered_map<std::uint32_t, std::size_t> used;   // outgoing edges consumed per vertex
+    std::vector<std::uint32_t> starts;
+    starts.reserve(next.size());
+    for (const auto& [v, _] : next) starts.push_back(v);
+    for (std::uint32_t start : starts) {
+        while (used[start] < next[start].size()) {
+            std::vector<std::uint32_t> loop;
+            std::uint32_t v = start;
+            bool closed = false;
+            for (std::size_t guard = 0; guard < next.size() + 1; ++guard) {
+                auto it = next.find(v);
+                if (it == next.end() || used[v] >= it->second.size()) break;
+                loop.push_back(v);
+                const std::uint32_t w = it->second[used[v]++];
+                if (w == start) { closed = true; break; }
+                v = w;
+            }
+            ++st.loops;
+            if (!closed || loop.size() < 3) { ++st.skipped_nonmanifold; continue; }
+            double perimeter = 0;
+            for (std::size_t i = 0; i < loop.size(); ++i) {
+                const MeshVertex& p = mesh->vertices[loop[i]];
+                const MeshVertex& q = mesh->vertices[loop[(i + 1) % loop.size()]];
+                perimeter += std::sqrt(static_cast<double>(p.x - q.x) * (p.x - q.x) + static_cast<double>(p.y - q.y) * (p.y - q.y) + static_cast<double>(p.z - q.z) * (p.z - q.z));
+            }
         if (perimeter > max_perimeter) { ++st.skipped_large; st.skipped_perimeters.push_back(static_cast<float>(perimeter)); continue; }
         if (loop.size() == 3) {
             // loop runs b->a... (opposite to the face side): the triangle (l0, l1, l2) closes it.
@@ -76,7 +77,8 @@ HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
             mesh->vertices.push_back(c);
             for (std::size_t i = 0; i < loop.size(); ++i) mesh->faces.push_back({loop[i], loop[(i + 1) % loop.size()], ci});
         }
-        ++st.filled;
+            ++st.filled;
+        }
     }
     std::sort(st.skipped_perimeters.begin(), st.skipped_perimeters.end(), std::greater<float>());
     return st;
