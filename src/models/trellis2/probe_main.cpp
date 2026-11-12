@@ -24,6 +24,10 @@
 //       [--device cpu|gpu] [--cpu-check] [--cpu-levels 2]
 //     DIR holds shape_latent_final.npy + shape_coords.npy; writes shape_dec_out.npy [M,7], shape_dec_coords.npy,
 //     shape_subdiv_{0..3}.npy, mesh.glb (dual grid, 512^3) and preview.png.
+//   gufo-trellis2-probe --stage tex --weights trellis2-tex_flow_512.safetensors --weights-dir trellis2-tex_dec.safetensors
+//       --dumps DIR --out DIR [--seed 42] [--steps 12]
+//     DIR holds dino_tokens_512, shape_latent_final, shape_coords, shape_subdiv_0..3; writes tex_noise.npy,
+//     tex_v_step00_cond.npy, tex_latent_final.npy [N,32] and tex_dec_out.npy [M,6] (* 0.5 + 0.5).
 //   gufo-trellis2-probe --stage full --weights-dir DIR --image bild.png --out DIR --name tasse
 //       [--steps 12] [--seed 42] [--max-faces 500000] [--texture]
 //     whole pipeline (HIP): writes <name>-trellis2.glb (y-up, holes filled, decimated) and <name>-trellis2-vorschau.png.
@@ -592,6 +596,111 @@ int run_shapedec(const std::string& weights, const std::string& dumps, const std
     return 0;
 }
 
+// ---------------------------------------------------------------- texture flow + decoder (dumps)
+int run_tex(const std::string& flow_weights, const std::string& dec_weights, const std::string& dumps, const std::string& out,
+            int seed, int steps) {
+#if GUFO_TRELLIS2_HIP
+    std::string error;
+    std::filesystem::create_directories(out);
+    const int M = tr::DinoV3Config::tokens_512, C = 32;
+    std::vector<float> cond, slat;
+    std::vector<std::size_t> shape;
+    if (!tr::npy::read_f32(std::filesystem::path(dumps) / "dino_tokens_512.npy", &cond, &shape, &error) || cond.size() != static_cast<std::size_t>(M) * 1024) {
+        std::cerr << "dino_tokens_512.npy: " << error << '
+';
+        return 1;
+    }
+    if (!tr::npy::read_f32(std::filesystem::path(dumps) / "shape_latent_final.npy", &slat, &shape, &error) || shape.size() != 2 || shape[1] != 32) {
+        std::cerr << "shape_latent_final.npy: " << error << '
+';
+        return 1;
+    }
+    const std::vector<tr::Coord> coords = read_coords((std::filesystem::path(dumps) / "shape_coords.npy").string(), &error);
+    if (coords.size() != shape[0]) { std::cerr << "shape_coords.npy: " << error << '
+'; return 1; }
+    const int N = static_cast<int>(coords.size());
+    // normalised shape latent as the extra 32 input channels
+    std::vector<float> slat_norm(slat.size());
+    for (int i = 0; i < N; ++i)
+        for (int c = 0; c < C; ++c) slat_norm[static_cast<std::size_t>(i) * C + c] = (slat[static_cast<std::size_t>(i) * C + c] - tr::kShapeMean[c]) / tr::kShapeStd[c];
+    std::vector<float> x;
+    if (tr::npy::read_f32(std::filesystem::path(dumps) / "tex_noise.npy", &x, &shape, &error) && x.size() == static_cast<std::size_t>(N) * C) {
+        std::cout << "noise: tex_noise.npy from the dumps
+";
+    } else {
+        std::mt19937_64 rng(static_cast<std::uint64_t>(seed) + 2);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        x.resize(static_cast<std::size_t>(N) * C);
+        for (auto& v : x) v = nd(rng);
+        if (!save(out, "tex_noise.npy", x, {static_cast<std::size_t>(N), 32})) return 1;
+    }
+    tr::DitShape ds;
+    ds.in_channels = 64; ds.out_channels = 32;
+    auto dit = tr::DitHip::Create(flow_weights, ds, &error);
+    if (!dit) { std::cerr << error << '
+'; return 1; }
+    const tr::SamplerParams p = tr::kTexSampler;
+    const std::vector<float> times = tr::flow_times(steps, p.rescale_t);
+    std::vector<float> input(static_cast<std::size_t>(N) * 64);
+    auto t0 = Clock::now();
+    for (int i = 0; i < steps; ++i) {
+        for (int r = 0; r < N; ++r) {
+            std::copy(x.begin() + static_cast<std::ptrdiff_t>(r) * C, x.begin() + static_cast<std::ptrdiff_t>(r + 1) * C, input.begin() + static_cast<std::ptrdiff_t>(r) * 64);
+            std::copy(slat_norm.begin() + static_cast<std::ptrdiff_t>(r) * C, slat_norm.begin() + static_cast<std::ptrdiff_t>(r + 1) * C, input.begin() + static_cast<std::ptrdiff_t>(r) * 64 + C);
+        }
+        std::vector<float> v;
+        if (!dit->Forward(input.data(), coords, cond.data(), M, tr::model_timestep(times[static_cast<std::size_t>(i)]), &v, nullptr, &error)) { std::cerr << error << '
+'; return 1; }
+        if (i == 0 && !save(out, "tex_v_step00_cond.npy", v, {static_cast<std::size_t>(N), 32})) return 1;
+        tr::euler_step(x, v, times[static_cast<std::size_t>(i)], times[static_cast<std::size_t>(i) + 1]);   // guidance 1: no CFG pass
+    }
+    std::cout << "texture flow: " << N << " tokens, " << steps << " steps in " << ms_since(t0) << " ms
+";
+    for (int i = 0; i < N; ++i)
+        for (int c = 0; c < C; ++c) x[static_cast<std::size_t>(i) * C + c] = x[static_cast<std::size_t>(i) * C + c] * tr::kTexStd[c] + tr::kTexMean[c];
+    if (!save(out, "tex_latent_final.npy", x, {static_cast<std::size_t>(N), 32})) return 1;
+    // decoder guided by the shape masks
+    std::vector<std::vector<std::uint8_t>> masks;
+    for (int l = 0; l < 4; ++l) {
+        std::vector<float> mf;
+        if (!tr::npy::read_f32(std::filesystem::path(dumps) / ("shape_subdiv_" + std::to_string(l) + ".npy"), &mf, &shape, &error)) {
+            std::cerr << "shape_subdiv_" << l << ".npy: " << error << '
+';
+            return 1;
+        }
+        masks.emplace_back(mf.begin(), mf.end());
+    }
+    tr::SparseDecShape dshape;
+    dshape.outputs = 6;
+    dshape.pred_subdiv = false;
+    auto dec = tr::SparseDecHip::Create(dec_weights, dshape, &error);
+    if (!dec) { std::cerr << error << '
+'; return 1; }
+    tr::SparseDecOptions opts;
+    opts.guide_masks = &masks;
+    tr::SparseDecResult res;
+    t0 = Clock::now();
+    if (!dec->Forward(x.data(), coords, &res, &error, opts)) { std::cerr << error << '
+'; return 1; }
+    std::cout << "texture decoder: " << res.coords.size() << " voxels in " << ms_since(t0) << " ms
+";
+    for (auto& v : res.outputs) v = v * 0.5f + 0.5f;
+    double mean[6] = {0, 0, 0, 0, 0, 0};
+    for (std::size_t i = 0; i < res.coords.size(); ++i)
+        for (int c = 0; c < 6; ++c) mean[c] += res.outputs[i * 6 + static_cast<std::size_t>(c)];
+    std::cout << std::defaultfloat << std::setprecision(4) << "  mean base colour " << mean[0] / res.coords.size() << " " << mean[1] / res.coords.size() << " "
+              << mean[2] / res.coords.size() << " metallic " << mean[3] / res.coords.size() << " roughness " << mean[4] / res.coords.size()
+              << " alpha " << mean[5] / res.coords.size() << '
+';
+    return save(out, "tex_dec_out.npy", res.outputs, {res.coords.size(), 6}) ? 0 : 1;
+#else
+    (void)flow_weights; (void)dec_weights; (void)dumps; (void)out; (void)seed; (void)steps;
+    std::cerr << "no HIP build
+";
+    return 1;
+#endif
+}
+
 // ---------------------------------------------------------------- full pipeline (HIP)
 int run_full(const std::string& weights_dir, const std::string& image, const std::string& out, const std::string& name,
              int steps, int seed, int max_faces, bool texture) {
@@ -706,6 +815,10 @@ int main(int argc, char** argv) {
     if (stage == "shapedec") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
         return run_shapedec(weights, dumps, out, device, cpu_check, cpu_levels);
+    }
+    if (stage == "tex") {
+        if (weights.empty() || weights_dir.empty() || dumps.empty() || out.empty()) return usage();
+        return run_tex(weights, weights_dir, dumps, out, seed, steps);
     }
     if (stage == "full") {
         if (weights_dir.empty() || image.empty() || out.empty()) return usage();
