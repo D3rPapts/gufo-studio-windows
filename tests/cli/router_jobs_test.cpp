@@ -406,6 +406,14 @@ struct FakeApi {
       result.body = R"({"id":"obj_1","object":"3d.generation","status":"queued","progress":0})";
       return result;
     }
+    // The router can only route these by the model query (no body): a
+    // missing query is the 1.4.23 bug ("no route for this path").
+    if (request.path.starts_with("/v1/3d/generations/obj_1") &&
+        request.query != "model=triposg") {
+      result.status = 404;
+      result.body = R"({"error":{"message":"no route for this path","code":"not_found"}})";
+      return result;
+    }
     if (request.method == "DELETE" && request.path == "/v1/3d/generations/obj_1") {
       const std::lock_guard<std::mutex> lock(mutex);
       objekt_deleted = true;

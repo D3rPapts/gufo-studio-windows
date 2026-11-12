@@ -3535,6 +3535,10 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     throw JobFailure("the 3D response has no id", "upstream_error",
                      created.status);
   const std::string base_path = "/v1/3d/generations/" + objekt_id;
+  // Status, content and cancel carry no model in the body: the router routes
+  // them to the worker by the `model` query (like the music jobs), otherwise
+  // it answers "no route for this path" (12.11., 1.4.23b).
+  const std::string query = "model=" + job->model;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     job->upstream_id = objekt_id;
@@ -3550,6 +3554,7 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
       HttpRequest cancel;
       cancel.method = "DELETE";
       cancel.path = base_path;
+      cancel.query = query;
       cancel.request_id = job->id;
       try {
         (void)options_.fetch(cancel);
@@ -3560,6 +3565,7 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     HttpRequest poll;
     poll.method = "GET";
     poll.path = base_path;
+    poll.query = query;
     poll.request_id = job->id;
     const FetchResult state = options_.fetch(poll);
     if (state.status != 200)
@@ -3587,7 +3593,7 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     }
   }
   const FetchResult content =
-      Call(job, "GET", base_path + "/content", "", "", "");
+      Call(job, "GET", base_path + "/content", query, "", "");
   if (content.status != 200 || content.body.empty())
     throw JobFailure("3D content failed: " + ErrorMessage(content),
                      ErrorCode(content), content.status);
@@ -3606,7 +3612,7 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
   add_file("model.glb", content.body, "model/gltf-binary");
   try {
     const FetchResult preview =
-        Call(job, "GET", base_path + "/preview", "", "", "");
+        Call(job, "GET", base_path + "/preview", query, "", "");
     if (preview.status == 200 && !preview.body.empty())
       add_file("preview.png", preview.body, "image/png");
   } catch (const std::exception&) {
