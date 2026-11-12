@@ -17,6 +17,16 @@ struct HoleFillStats {
     std::vector<float> skipped_perimeters;   // perimeters of the loops left open (sorted descending)
 };
 
+struct UnifyStats {
+    std::size_t components = 0, flipped_faces = 0, global_flip = 0;
+};
+// Makes the winding consistent across every edge-connected component (BFS over shared
+// edges: neighbours must traverse the shared edge in opposite directions) and flips the whole
+// mesh when its signed volume is negative. The dual grid emits quads in a fixed vertex order,
+// so half of the surface comes out inverted (the original relies on CuMesh
+// unify_face_orientations at export time).
+UnifyStats unify_orientation(Mesh* mesh);
+
 // Fills boundary loops whose perimeter is below `max_perimeter` (object units). Returns stats.
 HoleFillStats fill_holes(Mesh* mesh, float max_perimeter = 0.03f);
 

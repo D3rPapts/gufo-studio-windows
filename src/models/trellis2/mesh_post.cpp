@@ -15,6 +15,64 @@
 
 namespace gufo::trellis2 {
 
+
+UnifyStats unify_orientation(Mesh* mesh) {
+    UnifyStats st;
+    const std::size_t F = mesh->faces.size();
+    // (undirected edge key, face) sorted by key -> faces sharing an edge are adjacent.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> edges;
+    edges.reserve(F * 3);
+    for (std::uint32_t f = 0; f < F; ++f)
+        for (int e = 0; e < 3; ++e) {
+            const std::uint32_t a = mesh->faces[f][static_cast<std::size_t>(e)], b = mesh->faces[f][static_cast<std::size_t>((e + 1) % 3)];
+            edges.emplace_back((static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b), f);
+        }
+    std::sort(edges.begin(), edges.end());
+    // CSR of face -> (offset into edges) for the three edges of each face: find ranges by key.
+    auto range = [&](std::uint64_t k) {
+        auto lo = std::lower_bound(edges.begin(), edges.end(), std::make_pair(k, std::uint32_t{0}));
+        auto hi = std::upper_bound(edges.begin(), edges.end(), std::make_pair(k, std::numeric_limits<std::uint32_t>::max()));
+        return std::make_pair(lo, hi);
+    };
+    auto has_directed = [&](std::uint32_t f, std::uint32_t a, std::uint32_t b) {
+        const auto& t = mesh->faces[f];
+        return (t[0] == a && t[1] == b) || (t[1] == a && t[2] == b) || (t[2] == a && t[0] == b);
+    };
+    std::vector<std::uint8_t> visited(F, 0);
+    std::vector<std::uint32_t> stack;
+    for (std::uint32_t seed = 0; seed < F; ++seed) {
+        if (visited[seed]) continue;
+        ++st.components;
+        visited[seed] = 1;
+        stack.push_back(seed);
+        while (!stack.empty()) {
+            const std::uint32_t f = stack.back();
+            stack.pop_back();
+            for (int e = 0; e < 3; ++e) {
+                const std::uint32_t a = mesh->faces[f][static_cast<std::size_t>(e)], b = mesh->faces[f][static_cast<std::size_t>((e + 1) % 3)];
+                const auto [lo, hi] = range((static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b));
+                if (hi - lo != 2) continue;   // boundary or non-manifold edge: no orientation constraint
+                for (auto it = lo; it != hi; ++it) {
+                    const std::uint32_t n = it->second;
+                    if (n == f || visited[n]) continue;
+                    // f traverses a->b; a consistent neighbour traverses b->a.
+                    if (has_directed(n, a, b)) {
+                        std::swap(mesh->faces[n][1], mesh->faces[n][2]);
+                        ++st.flipped_faces;
+                    }
+                    visited[n] = 1;
+                    stack.push_back(n);
+                }
+            }
+        }
+    }
+    if (mesh_stats(*mesh).volume < 0) {
+        for (auto& t : mesh->faces) std::swap(t[1], t[2]);
+        st.global_flip = 1;
+    }
+    return st;
+}
+
 HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
     HoleFillStats st;
     // Directed edges a->b of the faces, sorted; an edge is a boundary edge when it occurs once

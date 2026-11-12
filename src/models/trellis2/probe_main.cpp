@@ -743,6 +743,10 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     for (const auto& f : mesh.faces) degenerate += (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]);
     std::cout << "degenerate faces: " << degenerate << '\n';
     tr::Mesh filled = mesh;
+    const tr::UnifyStats un = tr::unify_orientation(&filled);
+    std::cout << "unify_orientation: " << un.components << " components, " << un.flipped_faces << " faces flipped, global flip " << un.global_flip
+              << " -> open edges " << tr::count_boundary_edges(filled) << ", volume " << tr::mesh_stats(filled).volume << '
+';
     const tr::HoleFillStats hf = tr::fill_holes(&filled, hole_perimeter);
     std::cout << "fill_holes(" << hole_perimeter << "): loops " << hf.loops << ", filled " << hf.filled << ", skipped large " << hf.skipped_large
               << ", not closed / tiny " << hf.skipped_nonmanifold << " -> open edges " << tr::count_boundary_edges(filled) << '\n';

@@ -40,6 +40,18 @@ tr::Mesh Cube(float s, bool without_top) {
 }  // namespace
 
 int main() {
+    // orientation: flip two faces of a closed cube and invert the whole mesh -> unify restores it
+    {
+        tr::Mesh c = Cube(0.1f, false);
+        std::swap(c.faces[3][1], c.faces[3][2]);
+        std::swap(c.faces[8][1], c.faces[8][2]);
+        Expect(tr::mesh_stats(c).volume < 0.001 - 1e-6, "flipped faces break the volume");
+        tr::UnifyStats un = tr::unify_orientation(&c);
+        Expect(un.components == 1 && un.flipped_faces >= 2 && std::fabs(tr::mesh_stats(c).volume - 0.001) < 1e-6, "unify repairs two flipped faces (" + std::to_string(un.flipped_faces) + ")");
+        for (auto& f : c.faces) std::swap(f[1], f[2]);   // whole mesh inside out
+        un = tr::unify_orientation(&c);
+        Expect(un.global_flip == 1 && std::fabs(tr::mesh_stats(c).volume - 0.001) < 1e-6, "negative volume -> global flip");
+    }
     tr::Mesh closed = Cube(0.1f, false);
     tr::MeshStats st = tr::mesh_stats(closed);
     Expect(st.closed && std::fabs(st.volume - 0.001) < 1e-6 && st.bbox_max[2] == 0.1f, "closed cube: volume s^3, bbox");
