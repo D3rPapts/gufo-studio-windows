@@ -159,11 +159,16 @@ def main() -> int:
     for index, length in enumerate(chunks):
         if args.max_chunks and index >= args.max_chunks:
             break
-        x = mel[:, begin:begin + length][None, :, :]  # [1, 128, length]
+        # The reference pads every chunk of a batch to the batch's longest chunk
+        # (400 when a full chunk is present) before the convolutions.
+        padded = max(chunks[:64]) if len(chunks) > 1 else length
+        x = np.zeros((1, MEL_BINS, padded), dtype=np.float32)
+        x[0, :, :length] = mel[:, begin:begin + length]
         x = gelu(conv3x3_s2(x, w1, b1))
         x = gelu(conv3x3_s2(x, w2, b2))
         x = gelu(conv3x3_s2(x, w3, b3))  # [480, 16, t]
-        t = x.shape[2]
+        t = conv_len(conv_len(conv_len(length)))
+        x = x[:, :, :t]
         features = x.transpose(2, 0, 1).reshape(t, CHANNELS * x.shape[1])  # [t, c*16+f]
         out = features @ wp.T + bp + positions[:t]
         ref = gufo[row:row + t]

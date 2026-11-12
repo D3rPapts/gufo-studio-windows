@@ -266,52 +266,65 @@ std::vector<float> CpuReference::EncodeFrontend(std::span<const float> log_mel,
   std::vector<float> tokens;
   tokens.reserve(AudioTokenCount(static_cast<std::uint32_t>(frames), config) *
                  hidden);
+  // The reference batches conv_chunksize chunks and zero-pads every chunk of
+  // a batch to the batch's longest chunk before the convolutions; the padded
+  // region feeds gelu(bias) into the edge of the tail's valid outputs, so the
+  // tail is computed at the padded length (400 when a full chunk shares its
+  // batch) and only its StemOutLength(length) rows are kept.
+  const std::vector<std::uint32_t> chunks =
+      ChunkFrameCounts(static_cast<std::uint32_t>(frames), config);
+  const std::size_t batch_size = std::max<std::size_t>(config.conv_chunksize, 1);
   std::size_t begin = 0;
-  for (const std::uint32_t length :
-       ChunkFrameCounts(static_cast<std::uint32_t>(frames), config)) {
-    // One chunk [1][mel][length]; the reference pads chunks of a batch to a
-    // common length, which changes nothing inside the valid frames because
-    // padded outputs are dropped before the layers.
-    std::vector<float> input(mel * length);
-    for (std::size_t bin = 0; bin < mel; ++bin) {
-      for (std::size_t frame = 0; frame < length; ++frame) {
-        input[bin * length + frame] = log_mel[bin * frames + begin + frame];
-      }
-    }
-    std::vector<float> first;
-    std::vector<float> second;
-    std::size_t h = mel;
-    std::size_t w = length;
-    ConvGelu(*pool_, stem.conv1_weight, stem.conv1_bias, input, 1, h, w, &first,
-             &h, &w);
-    ConvGelu(*pool_, stem.conv2_weight, stem.conv2_bias, first,
-             config.conv_channels, h, w, &second, &h, &w);
-    ConvGelu(*pool_, stem.conv3_weight, stem.conv3_bias, second,
-             config.conv_channels, h, w, &first, &h, &w);
-    // [C, F, T] -> [T, C * F]
-    const std::size_t flattened = config.conv_channels * h;
-    std::vector<float> features(w * flattened);
-    for (std::size_t time = 0; time < w; ++time) {
-      for (std::size_t channel = 0; channel < config.conv_channels; ++channel) {
-        for (std::size_t frequency = 0; frequency < h; ++frequency) {
-          features[time * flattened + channel * h + frequency] =
-              first[(channel * h + frequency) * w + time];
+  for (std::size_t first = 0; first < chunks.size(); first += batch_size) {
+    const std::size_t last = std::min(first + batch_size, chunks.size());
+    const std::size_t padded =
+        *std::max_element(chunks.begin() + static_cast<std::ptrdiff_t>(first),
+                          chunks.begin() + static_cast<std::ptrdiff_t>(last));
+    for (std::size_t index = first; index < last; ++index) {
+      const std::uint32_t length = chunks[index];
+      std::vector<float> input(mel * padded, 0.0F);
+      for (std::size_t bin = 0; bin < mel; ++bin) {
+        for (std::size_t frame = 0; frame < length; ++frame) {
+          input[bin * padded + frame] = log_mel[bin * frames + begin + frame];
         }
       }
-    }
-    std::vector<float> projected(w * hidden);
-    MatMul(*pool_, stem.proj_weight, features.data(), w, projected.data(),
-           stem.proj_bias.F32());
-    if (w != StemOutLength(length)) {
-      throw std::runtime_error("MOSS-Music stem length mismatch");
-    }
-    for (std::size_t time = 0; time < w; ++time) {
-      for (std::size_t column = 0; column < hidden; ++column) {
-        tokens.push_back(projected[time * hidden + column] +
-                         positions[time * hidden + column]);
+      std::vector<float> first_out;
+      std::vector<float> second;
+      std::size_t h = mel;
+      std::size_t w = padded;
+      ConvGelu(*pool_, stem.conv1_weight, stem.conv1_bias, input, 1, h, w,
+               &first_out, &h, &w);
+      ConvGelu(*pool_, stem.conv2_weight, stem.conv2_bias, first_out,
+               config.conv_channels, h, w, &second, &h, &w);
+      ConvGelu(*pool_, stem.conv3_weight, stem.conv3_bias, second,
+               config.conv_channels, h, w, &first_out, &h, &w);
+      // [C, F, T] -> [T, C * F]
+      const std::size_t flattened = config.conv_channels * h;
+      std::vector<float> features(w * flattened);
+      for (std::size_t time = 0; time < w; ++time) {
+        for (std::size_t channel = 0; channel < config.conv_channels;
+             ++channel) {
+          for (std::size_t frequency = 0; frequency < h; ++frequency) {
+            features[time * flattened + channel * h + frequency] =
+                first_out[(channel * h + frequency) * w + time];
+          }
+        }
       }
+      std::vector<float> projected(w * hidden);
+      MatMul(*pool_, stem.proj_weight, features.data(), w, projected.data(),
+             stem.proj_bias.F32());
+      const std::size_t valid = StemOutLength(length);
+      if (valid > w) {
+        throw std::runtime_error("MOSS-Music stem length mismatch");
+      }
+      for (std::size_t time = 0; time < valid; ++time) {
+        for (std::size_t column = 0; column < hidden; ++column) {
+          tokens.push_back(projected[time * hidden + column] +
+                           positions[time * hidden + column]);
+        }
+      }
+      begin += length;
     }
-    begin += length;
   }
   if (tokens.size() / hidden !=
       AudioTokenCount(static_cast<std::uint32_t>(frames), config)) {
