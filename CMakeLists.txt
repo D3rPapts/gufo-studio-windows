@@ -1833,6 +1833,10 @@ endif()
 # projector): its runtime library and the gufo-omni driver.
 add_subdirectory(src/models/qwen3_omni)
 
+# MOSS-Music-8B-Instruct (music understanding): configuration, weight table
+# and shape tests; runtime stages follow (tools/moss_music, docs in PLAN).
+add_subdirectory(src/models/moss_music)
+
 # Wan 2.2 TI2V-5B: umT5 text encoder and the gufo-wan-t5 driver.
 add_subdirectory(src/models/wan22)
 add_subdirectory(src/models/rife)
