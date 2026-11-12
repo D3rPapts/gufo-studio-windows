@@ -397,6 +397,8 @@ add_subdirectory(src/models/indextts)
 add_subdirectory(src/models/moss_image)
 # CCIP + anime face detector for POST /v1/figuren ("verfahren": "ccip").
 add_subdirectory(src/models/ccip)
+# TRELLIS.2 image -> 3D with PBR (feat/trellis2): stage 1 is CPU only (sparse engine reference).
+add_subdirectory(src/models/trellis2)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
