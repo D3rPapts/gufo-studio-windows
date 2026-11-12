@@ -555,6 +555,27 @@ std::string VideoJobId(const std::string& path) {
   return std::string(remainder);
 }
 
+/// Job id from `/v1/3d/generations/<id>[/content|/preview]`, the async 3D
+/// reads and the cancel `gufo serve objekt` serves (1.4.23c); empty otherwise.
+std::string ObjektJobId(const std::string& path) {
+  constexpr std::string_view prefix = "/v1/3d/generations/";
+  std::string_view remainder(path);
+  if (!remainder.starts_with(prefix)) {
+    return "";
+  }
+  remainder.remove_prefix(prefix.size());
+  for (std::string_view suffix : {"/content", "/preview"}) {
+    if (remainder.ends_with(suffix)) {
+      remainder.remove_suffix(suffix.size());
+      break;
+    }
+  }
+  if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
+    return "";
+  }
+  return std::string(remainder);
+}
+
 Resolution ResolveModel(const HttpRequest& req) {
   Resolution resolution;
   if (IsJsonModelPost(req)) {
@@ -584,6 +605,13 @@ Resolution ResolveModel(const HttpRequest& req) {
   }
   if (req.method == "GET" && !MusicJobId(req.path).empty()) {
     // Optional: without ?model= the job's recorded owner answers.
+    resolution.model_id = req.query_param("model");
+    return resolution;
+  }
+  if ((req.method == "GET" || req.method == "DELETE") &&
+      !ObjektJobId(req.path).empty()) {
+    // 3D status/content/preview reads and the cancel: `model` comes as a
+    // query (RunObjekt sends it); without it the recorded owner answers.
     resolution.model_id = req.query_param("model");
     return resolution;
   }
@@ -1096,6 +1124,18 @@ public:
       if (resolved.model_id.empty()) {
         return Err(404, "Not Found", "unknown music job " + music_job,
                    "invalid_request_error", "not_found");
+      }
+    }
+    if (resolved.model_id.empty() &&
+        (req.method == "GET" || req.method == "DELETE")) {
+      // 3D reads/cancel without ?model=: the worker that answered the POST.
+      const std::string objekt_job = ObjektJobId(req.path);
+      if (!objekt_job.empty()) {
+        resolved.model_id = registry.JobOwner(objekt_job);
+        if (resolved.model_id.empty()) {
+          return Err(404, "Not Found", "unknown 3D job " + objekt_job,
+                     "invalid_request_error", "not_found");
+        }
       }
     }
     if (resolved.model_id.empty()) {

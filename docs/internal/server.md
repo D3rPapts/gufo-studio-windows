@@ -719,6 +719,8 @@ files. `GET /router/capabilities` reports `"capability": "image_to_3d"`
 for presets whose command line is `serve objekt`, so the pages can tell
 which router runs the worker.
 
+1.4.23c: status, content, preview reads and the cancel on `/v1/3d/generations/<id>` resolve the worker by the `model` query or, without it, by the recorded job owner (the router used to know that only for music jobs and answered 404).
+
 **Waiting jobs (1.4.21).** With `--jobs-parallel 2` a job is
 `in_progress` at once, and its request may then wait in the router's
 pool for a free machine (`event=pool ... choice=wait reason="both
