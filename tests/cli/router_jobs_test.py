@@ -238,7 +238,7 @@ def check_objekt_direct(router):
     code, status = router.json("GET", "/v1/3d/generations/" + running)
     assert code == 200 and status["model"] == "triposg", status
     assert status["status"] == "in_progress", status
-    assert model_busy(router, "triposg")
+    wait_until(lambda: model_busy(router, "triposg"), "busy while running")
     # The job sweep (every 10 s) asks the 3D status path; before 1.4.24 it
     # asked /v1/videos/<id>, got 404 and released the running job.
     time.sleep(11)
@@ -254,7 +254,8 @@ def check_objekt_direct(router):
         "model": "triposg", "image": "AAAA", "fake_seconds": 0.5})
     assert code == 202, created
     short = created["id"]
-    assert model_busy(router, "triposg")
+    # The create is recorded once its body is relayed: wait for it.
+    wait_until(lambda: model_busy(router, "triposg"), "busy after create")
     wait_until(lambda: router.json("GET", "/v1/3d/generations/" + short)[1]
                ["status"] == "completed", "3D job completed")
     wait_until(lambda: not model_busy(router, "triposg"), "busy after completed")
