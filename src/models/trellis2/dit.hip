@@ -118,6 +118,7 @@ std::unique_ptr<DitHip> DitHip::Create(const std::filesystem::path& file, const 
         const auto& out = impl->weights.Get("out_layer.weight").shape;
         impl->shape.in_channels = in[1];
         impl->shape.out_channels = out[0];
+        impl->rt.SetCacheLimit(std::size_t{1} << 30);   // several runtimes share the GPU (pipeline)
         return std::unique_ptr<DitHip>(new DitHip(std::move(impl)));
     } catch (const std::exception& e) {
         if (error) *error = std::string("TRELLIS.2 DiT: ") + e.what();

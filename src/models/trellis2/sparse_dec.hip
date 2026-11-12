@@ -217,6 +217,7 @@ std::unique_ptr<SparseDecHip> SparseDecHip::Create(const std::filesystem::path& 
         impl->shape.latent_channels = impl->weights.Get("from_latent.weight").shape[1];
         impl->shape.outputs = impl->weights.Get("output_layer.weight").shape[0];
         impl->shape.pred_subdiv = impl->weights.Contains("blocks.0.4.to_subdiv.weight");
+        impl->rt.SetCacheLimit(std::size_t{1} << 30);
         return std::unique_ptr<SparseDecHip>(new SparseDecHip(std::move(impl)));
     } catch (const std::exception& e) {
         if (error) *error = std::string("TRELLIS.2 sparse decoder: ") + e.what();
@@ -300,6 +301,9 @@ bool SparseDecHip::Forward(const float* latent, const std::vector<Coord>& coords
         Matrix out = rt.Linear(rt.Normalize(x, Norm::kLayer, "", SparseDecConfig::final_norm_eps), "output_layer");
         result->outputs = rt.Download(out);
         rt.Synchronize();
+        x = Matrix();
+        out = Matrix();
+        rt.Trim();   // the level buffers (up to ~2 GB) go back to HIP for the next model
         return true;
     } catch (const std::exception& e) {
         if (error) *error = std::string("TRELLIS.2 sparse decoder forward: ") + e.what();
