@@ -116,7 +116,8 @@ constexpr std::string_view kJobPaths[] = {
     "/v1/responses",          "/v1/messages",
     "/v1/audio/foley",        "/v1/images/upscale",
     "/v1/videos/upscale",     "/v1/audio/convert",
-    "/v1/audio/separate",     "/v1/videos/concat"};
+    "/v1/audio/separate",     "/v1/videos/concat",
+    "/v1/3d/generations"};
 
 /// Answered by the job store itself (ffmpeg), not by a worker.
 constexpr std::string_view kConcatPath = "/v1/videos/concat";
@@ -316,6 +317,8 @@ std::string ExtensionFor(std::string_view content_type) {
     return "srt";
   if (type == "application/json")
     return "json";
+  if (type == "model/gltf-binary")
+    return "glb";
   if (type.starts_with("text/"))
     return "txt";
   return "bin";
@@ -343,6 +346,8 @@ std::string ContentTypeFor(std::string_view name) {
     return "audio/ogg";
   if (ext == "opus")
     return "audio/opus";
+  if (ext == "glb")
+    return "model/gltf-binary";
   if (ext == "mp4")
     return "video/mp4";
   if (ext == "vtt")
@@ -3365,6 +3370,8 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
       throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status);
     if (job->path == "/v1/videos" || job->path == "/v1/videos/upscale")
       RunVideo(job, result);  // both answer 202 with a worker video job
+    else if (job->path == "/v1/3d/generations")
+      RunObjekt(job, result);  // 202 with a worker 3D job (gufo serve objekt)
     else
       Finish(job, "completed", StoreResult(*job, result), json::Value());
   } catch (const Cancelled&) {
@@ -3510,6 +3517,110 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
   json::Value result = json::Value::object();
   result["status_code"] = created.status;
   result["content_type"] = ContentTypeFor(name);
+  result["files"] = std::move(files);
+  result["response"] = std::move(final_status);
+  Finish(job, "completed", std::move(result), json::Value());
+}
+
+// gufo serve objekt: poll /v1/3d/generations/<id> until completed, then fetch
+// the GLB (model.glb) and the preview (preview.png) into the job directory.
+void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
+                         const FetchResult& created) {
+  std::string objekt_id;
+  try {
+    objekt_id = json::parse(created.body).member_str("id");
+  } catch (const std::exception&) {
+  }
+  if (objekt_id.empty())
+    throw JobFailure("the 3D response has no id", "upstream_error",
+                     created.status);
+  const std::string base_path = "/v1/3d/generations/" + objekt_id;
+  // Status, content and cancel carry no model in the body: the router routes
+  // them to the worker by the `model` query (like the music jobs), otherwise
+  // it answers "no route for this path" (12.11., 1.4.23b).
+  const std::string query = "model=" + job->model;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    job->upstream_id = objekt_id;
+    job->progress = 0;
+    PersistLocked();
+  }
+  json::Value final_status;
+  for (;;) {
+    const auto until = std::chrono::steady_clock::now() + options_.video_poll;
+    while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (job->cancel.load()) {
+      HttpRequest cancel;
+      cancel.method = "DELETE";
+      cancel.path = base_path;
+      cancel.query = query;
+      cancel.request_id = job->id;
+      try {
+        (void)options_.fetch(cancel);
+      } catch (const std::exception&) {
+      }
+      throw Cancelled();
+    }
+    HttpRequest poll;
+    poll.method = "GET";
+    poll.path = base_path;
+    poll.query = query;
+    poll.request_id = job->id;
+    const FetchResult state = options_.fetch(poll);
+    if (state.status != 200)
+      throw JobFailure("3D status failed: " + ErrorMessage(state),
+                       ErrorCode(state), state.status);
+    json::Value parsed = json::parse(state.body);
+    const std::string status = parsed.member_str("status");
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      job->progress =
+          std::min(99.0, std::max(0.0, parsed.member_double("progress", 0)));
+    }
+    if (status == "completed") {
+      final_status = std::move(parsed);
+      break;
+    }
+    if (status == "failed" || status == "cancelled" || status == "expired") {
+      const json::Value* error = parsed.find("error");
+      throw JobFailure(
+          "3D " + status +
+              (error != nullptr && error->is_object()
+                   ? ": " + error->member_str("message")
+                   : std::string()),
+          "objekt_" + status, 200);
+    }
+  }
+  const FetchResult content =
+      Call(job, "GET", base_path + "/content", query, "", "");
+  if (content.status != 200 || content.body.empty())
+    throw JobFailure("3D content failed: " + ErrorMessage(content),
+                     ErrorCode(content), content.status);
+  const std::string base = "/v1/jobs/" + job->id + "/files/";
+  json::Value files = json::Value::array();
+  const auto add_file = [&](const std::string& name, const std::string& body,
+                            const std::string& type) {
+    WriteAll(JobDir(job->id) / name, body);
+    json::Value file = json::Value::object();
+    file["name"] = name;
+    file["url"] = base + name;
+    file["content_type"] = type;
+    file["bytes"] = static_cast<long long>(body.size());
+    files.push_back(std::move(file));
+  };
+  add_file("model.glb", content.body, "model/gltf-binary");
+  try {
+    const FetchResult preview =
+        Call(job, "GET", base_path + "/preview", query, "", "");
+    if (preview.status == 200 && !preview.body.empty())
+      add_file("preview.png", preview.body, "image/png");
+  } catch (const std::exception&) {
+  }
+  add_file("response.json", final_status.dump(), "application/json");
+  json::Value result = json::Value::object();
+  result["status_code"] = created.status;
+  result["content_type"] = "model/gltf-binary";
   result["files"] = std::move(files);
   result["response"] = std::move(final_status);
   Finish(job, "completed", std::move(result), json::Value());

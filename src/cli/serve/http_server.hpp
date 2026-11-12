@@ -28,6 +28,7 @@ class OmniService;
 class MusicService;
 class FoleyService;
 class UpscaleService;
+class ObjektService;
 class WebSocket;
 
 struct HttpRequest {
@@ -154,6 +155,9 @@ public:
   void set_upscale(std::shared_ptr<UpscaleService> upscale) {
     upscale_ = std::move(upscale);
   }
+  void set_objekt(std::shared_ptr<ObjektService> objekt) {
+    objekt_ = std::move(objekt);
+  }
 
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
@@ -193,6 +197,7 @@ private:
   std::shared_ptr<MusicService> music_;
   std::shared_ptr<FoleyService> foley_;
   std::shared_ptr<UpscaleService> upscale_;
+  std::shared_ptr<ObjektService> objekt_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

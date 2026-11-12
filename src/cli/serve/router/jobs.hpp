@@ -534,6 +534,8 @@ private:
   void RunnerMain();
   void Execute(const std::shared_ptr<Job>& job);
   void RunVideo(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunObjekt(const std::shared_ptr<Job>& job,
+                 const FetchResult& created);
   void RunMusic(const std::shared_ptr<Job>& job, const FetchResult& created);
   void RunConcat(const std::shared_ptr<Job>& job, const std::string& payload);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,

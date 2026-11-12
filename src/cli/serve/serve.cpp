@@ -50,6 +50,8 @@
 #include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/foley_api.hpp"
 #include "src/cli/serve/upscale_api.hpp"
+#include "src/cli/serve/objekt_service.hpp"
+#include "src/models/triposg/runner.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -1009,7 +1011,9 @@ void PrintServeHelp(std::string_view program_name,
       << "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
          "(/v1/audio/foley)\n"
       << "  upscale   Serve Real-ESRGAN image upscaling on the NPU, GPU or "
-         "CPU (/v1/images/upscale)\n\n"
+         "CPU (/v1/images/upscale)\n"
+      << "  objekt    Serve TripoSG image-to-3D (GLB) jobs "
+         "(/v1/3d/generations)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -1104,7 +1108,8 @@ int RunServe(std::span<const char* const> args) {
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
         arg == "image" || arg == "embedding" || arg == "omni" ||
-        arg == "music" || arg == "foley" || arg == "upscale") {
+        arg == "music" || arg == "foley" || arg == "upscale" ||
+        arg == "objekt") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1113,7 +1118,7 @@ int RunServe(std::span<const char* const> args) {
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
           topic != "embedding" && topic != "omni" && topic != "music" &&
-          topic != "foley" && topic != "upscale") {
+          topic != "foley" && topic != "upscale" && topic != "objekt") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1205,8 +1210,81 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::MusicService> music;
   std::shared_ptr<server::FoleyService> foley;
   std::shared_ptr<server::UpscaleService> upscale;
+  std::shared_ptr<server::ObjektService> objekt;
 
-  if (subcommand == "upscale") {
+  if (subcommand == "objekt") {
+    std::filesystem::path objekt_model;
+    std::filesystem::path objekt_root;
+    std::string objekt_name = "triposg";
+    double objekt_ttl_seconds = 86400;
+    ArgParser parser("gufo serve objekt",
+                     "Serve TripoSG image-to-3D generation as asynchronous "
+                     "jobs (POST /v1/3d/generations -> GLB).");
+    parser.AddOption("-m", "--model", "FILE",
+                     "Converted TripoSG weights (triposg.safetensors from "
+                     "tools/triposg/convert_hf_to_gufo.py)",
+                     "Model", &objekt_model);
+    parser.AddOption("", "--root", "DIR",
+                     "Job storage (default: <temp>/gufo-objekt)", "Model",
+                     &objekt_root);
+    parser.AddOption("", "--served-model-name", "NAME",
+                     "Public model ID (default: triposg; the router passes "
+                     "the section id)",
+                     "Model", &objekt_name);
+    parser.AddOption("", "--ttl", "SECONDS",
+                     "How long finished results stay (default: 86400)",
+                     "Model", &objekt_ttl_seconds);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      parser.PrintHelp();
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (objekt_model.empty()) {
+      std::cerr << "Error: --model FILE is required for objekt server\n";
+      return 2;
+    }
+    {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(objekt_model, ec)) {
+        std::cerr << "Error: --model file not found: "
+                  << objekt_model.string() << '\n';
+        return 2;
+      }
+    }
+    if (validate_only)
+      return 0;
+    ModelLoadLog load_log("objekt", objekt_model);
+    std::string error;
+    std::shared_ptr<triposg::ObjektRunner> runner =
+        triposg::CreateObjektRunner(objekt_model, &error);
+    if (runner == nullptr) {
+      std::cerr << "Error loading TripoSG: " << error << '\n';
+      return 1;
+    }
+    objekt = std::make_shared<server::ObjektService>(
+        server::ObjektServiceOptions{
+            .runner = runner,
+            .model_id = objekt_name,
+            .storage_root = objekt_root,
+            .queue_capacity = 1,
+            .artifact_ttl = std::chrono::seconds(
+                static_cast<std::chrono::seconds::rep>(objekt_ttl_seconds)),
+        });
+    if (!objekt->ready()) {
+      std::cerr << "Error enabling the 3D service: "
+                << objekt->initialization_error() << '\n';
+      return 1;
+    }
+    load_log.Complete("model=" + objekt->model_id() + " weights_mib=" +
+                          std::to_string(objekt->weight_bytes() >> 20),
+                      true);
+  } else if (subcommand == "upscale") {
     server::UpscaleServeOptions options;
     ArgParser parser(
         "gufo serve upscale",
@@ -2329,6 +2407,9 @@ int RunServe(std::span<const char* const> args) {
   if (upscale != nullptr) {
     server.set_upscale(upscale);
   }
+  if (objekt != nullptr) {
+    server.set_objekt(objekt);
+  }
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
@@ -2360,7 +2441,7 @@ std::string ValidateServeArgvByParsing(std::string_view modality,
                                        const std::vector<std::string>& argv) {
   static constexpr std::string_view kModalities[] = {
       "llm",       "image", "video", "tts",  "asr",
-      "embedding", "omni",  "music", "foley", "upscale"};
+      "embedding", "omni",  "music", "foley", "upscale", "objekt"};
   if (std::ranges::find(kModalities, modality) == std::end(kModalities)) {
     return "unknown modality '" + std::string(modality) + "'";
   }

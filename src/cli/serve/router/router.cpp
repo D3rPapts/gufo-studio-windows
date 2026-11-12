@@ -451,7 +451,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
       "/v1/images/upscale",
       // Voice conversion / stem separation (gufo serve voice, D5).
-      "/v1/audio/convert", "/v1/audio/separate"};
+      "/v1/audio/convert", "/v1/audio/separate",
+      // TripoSG image-to-3D jobs (gufo serve objekt), async via /v1/jobs.
+      "/v1/3d/generations"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
