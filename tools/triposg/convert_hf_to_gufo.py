@@ -251,7 +251,9 @@ def plan_component(plan, prefix, src, heads, with_encoder):
         for name in sorted(names - done):
             if name == "embeddings.mask_token":
                 continue  # training only
-            passthrough(name, force_f32=True)
+            # Only the MLP / output projections are matrices worth BF16; the patch
+            # embedding (4-D), tables, norms and LayerScale stay F32.
+            passthrough(name, force_f32=not (name.endswith(".weight") and (".mlp." in name or ".output.dense" in name)))
 
 
 def bake_positions(table, n_in, n_out, mode):
