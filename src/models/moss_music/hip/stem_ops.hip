@@ -259,6 +259,15 @@ __global__ void RoundBfloat16Kernel(float* values, std::size_t elements) {
   }
 }
 
+__global__ void ZeroColumnsKernel(B* values, std::size_t width,
+                                  std::size_t valid, std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements && index % width >= valid) {
+    values[index] = B(0.0F);
+  }
+}
+
 __global__ void FloatToBfloat16Kernel(const float* input, B* output,
                                       std::size_t elements) {
   const std::size_t index =
@@ -392,6 +401,15 @@ void LaunchRoundBfloat16(float* values, std::size_t elements,
                          hipStream_t stream) {
   hipLaunchKernelGGL(RoundBfloat16Kernel, dim3(Blocks(elements)),
                      dim3(kThreads), 0, stream, values, elements);
+}
+
+void LaunchZeroColumns(void* values_bfloat16, std::size_t rows,
+                       std::size_t width, std::size_t valid,
+                       hipStream_t stream) {
+  const std::size_t elements = rows * width;
+  hipLaunchKernelGGL(ZeroColumnsKernel, dim3(Blocks(elements)), dim3(kThreads),
+                     0, stream, static_cast<B*>(values_bfloat16), width, valid,
+                     elements);
 }
 
 void LaunchFloatToBfloat16(const float* input, void* output_bfloat16,

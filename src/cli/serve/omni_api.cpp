@@ -173,6 +173,38 @@ HttpResponse ChatCompletions(const HttpRequest& request, OmniService& service) {
   if (!FindAudio(*messages, &audio, &error)) {
     return Error(400, "Bad Request", std::move(error), "missing_audio");
   }
+  // Text parts of the last user message and the system message: the
+  // question for models that take one (MOSS-Music); Omni ignores them.
+  std::string instruction;
+  std::string system;
+  for (const json::Value& message : messages->items()) {
+    if (!message.is_object()) {
+      continue;
+    }
+    const std::string role = message.member_str("role");
+    const json::Value* content = message.find("content");
+    if (content == nullptr) {
+      continue;
+    }
+    std::string text;
+    if (content->is_string()) {
+      text = content->str();
+    } else if (content->is_array()) {
+      for (const json::Value& part : content->items()) {
+        if (part.is_object() && part.member_str("type") == "text") {
+          if (!text.empty()) {
+            text += "\n";
+          }
+          text += part.member_str("text");
+        }
+      }
+    }
+    if (role == "system") {
+      system = text;
+    } else if (role == "user") {
+      instruction = text;
+    }
+  }
   const std::string format = audio->member_str("format", "wav");
   if (format != "wav") {
     return Error(400, "Bad Request", "input_audio format must be wav",
@@ -207,6 +239,12 @@ HttpResponse ChatCompletions(const HttpRequest& request, OmniService& service) {
   caption.top_p = static_cast<float>(body.member_double("top_p", 0.95));
   caption.top_k = body.member_size("top_k", 20);
   caption.seed = body.member_size("seed", 1234);
+  caption.instruction = std::move(instruction);
+  caption.system = std::move(system);
+  if (const json::Value* value = body.find("time_markers");
+      value != nullptr && value->is_bool()) {
+    caption.time_markers = value->as_bool(true);
+  }
   if (!std::isfinite(caption.temperature) || caption.temperature < 0.0F ||
       !std::isfinite(caption.top_p) || caption.top_p <= 0.0F ||
       caption.top_p > 1.0F) {

@@ -23,6 +23,12 @@ struct CaptionRequest {
   std::function<bool(std::string_view)> on_text{};
   /// Non-empty: write PREFIX.audio.f32, PREFIX.logits.f32, PREFIX.tokens.txt.
   std::string dump_prefix{};
+  /// Question / instruction text and system prompt for models that take one
+  /// (MOSS-Music); the Omni captioner takes none and ignores them.
+  std::string instruction{};
+  std::string system{};
+  /// Time-marker digits every 2 s inside the audio span (MOSS-Music).
+  bool time_markers{true};
 };
 
 struct CaptionResult {

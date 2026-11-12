@@ -215,6 +215,34 @@ void TestTimeMarkers() {
   }
 }
 
+void TestPromptRows() {
+  const moss::TokenIds ids;
+  // A prompt: 3 text tokens, <|audio_bos|>, the span, <|audio_eos|>, text.
+  std::vector<std::int32_t> prompt{151644, 8948, 198, ids.audio_start};
+  const std::vector<std::int32_t> span = moss::AudioSpan(63, true, ids);
+  prompt.insert(prompt.end(), span.begin(), span.end());
+  prompt.push_back(ids.audio_end);
+  prompt.push_back(198);
+  const std::vector<std::uint32_t> rows = moss::AudioRowIndices(prompt, ids);
+  CheckEq(rows.size(), 63, "63 audio rows");
+  CheckEq(rows.front(), 4, "first audio row after <|audio_bos|>");
+  // Marker "2" sits at span index 25 (prompt 29): row 25 jumps over it.
+  CheckEq(rows[24], 28, "row 24 before the first marker");
+  CheckEq(rows[25], 30, "row 25 after the first marker");
+  // Marker "4" after 50 placeholders (span index 51, prompt 55).
+  CheckEq(rows[49], 54, "row 49 before the second marker");
+  CheckEq(rows[50], 56, "row 50 after the second marker");
+  CheckEq(rows.back(), 68, "last audio row");
+  for (std::size_t i = 1; i < rows.size(); ++i) {
+    Check(rows[i] > rows[i - 1], "rows strictly increasing");
+  }
+  // Without markers the span is plain and the rows are contiguous.
+  const std::vector<std::int32_t> plain = moss::AudioSpan(63, false, ids);
+  CheckEq(plain.size(), 63, "plain span length");
+  Check(plain == std::vector<std::int32_t>(63, ids.audio_pad),
+        "plain span is all placeholders");
+}
+
 void TestWeightTable() {
   const std::vector<moss::TensorDescription> tensors = moss::DescribeTensors();
   // 9 stem/norm entries + 32 * 15 layer entries + 2 final norm = 491 encoder,
@@ -288,6 +316,7 @@ int main() {
   TestStemShape();
   TestChunking();
   TestTimeMarkers();
+  TestPromptRows();
   TestWeightTable();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";

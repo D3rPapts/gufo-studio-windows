@@ -234,6 +234,29 @@ struct StemShape {
   return AudioSpanWithMarkers(audio_tokens).size() - audio_tokens;
 }
 
+/// The audio span of a prompt: with markers (the processor's default and
+/// infer.py's setting) or plain placeholders.
+[[nodiscard]] inline std::vector<std::int32_t> AudioSpan(
+    std::size_t audio_tokens, bool time_markers, const TokenIds& ids = {}) {
+  if (time_markers) {
+    return AudioSpanWithMarkers(audio_tokens, ids);
+  }
+  return std::vector<std::int32_t>(audio_tokens, ids.audio_pad);
+}
+
+/// Prompt positions holding <|AUDIO|>, in order: the rows that receive the
+/// adapter output and the DeepStack additions (markers interrupt them).
+[[nodiscard]] inline std::vector<std::uint32_t> AudioRowIndices(
+    const std::vector<std::int32_t>& prompt, const TokenIds& ids = {}) {
+  std::vector<std::uint32_t> rows;
+  for (std::size_t index = 0; index < prompt.size(); ++index) {
+    if (prompt[index] == ids.audio_pad) {
+      rows.push_back(static_cast<std::uint32_t>(index));
+    }
+  }
+  return rows;
+}
+
 }  // namespace gufo::models::moss_music
 
 #endif  // GUFO_MODELS_MOSS_MUSIC_CONFIG_HPP_

@@ -242,9 +242,11 @@ struct AudioEncoder::Impl {
 
   /// Chunking, the Conv2d stem, stem_proj and positions -> `compact`
   /// [tokens, d_model]. Every chunk is computed at 400 frames (zero-padded),
-  /// which matches the reference whenever a full chunk shares the batch; a
-  /// clip shorter than one chunk is evaluated unpadded by the reference and
-  /// may differ in the last token or two.
+  /// which matches the reference whenever a full chunk shares the batch. A
+  /// clip shorter than one chunk is evaluated unpadded by the reference:
+  /// zeroing the padded time columns after each convolution reproduces that
+  /// exactly, because the next convolution then reads zeros past the valid
+  /// edge just as the reference's one-pixel zero padding does.
   std::size_t Frontend(std::span<const float> log_mel, std::size_t frames) {
     const AudioEncoderConfig& audio = config.audio;
     const std::size_t chunk_frames = audio.ChunkFrames();
@@ -271,14 +273,26 @@ struct AudioEncoder::Impl {
                "hipMemcpyAsync MOSS-Music log-mel");
     LaunchChunkLogMel(feature_input.get(), input.get(), frames, chunks,
                       audio.mel_bins, chunk_frames, stream);
+    const bool unpadded = chunks == 1U && frames < chunk_frames;
+    std::size_t valid = frames;
     LaunchFirstConvolution(input.get(), conv1_weight.get(), conv1.get(), chunks,
                            stream);
     asr::LaunchBiasGelu(conv1.get(), conv1_bias.get(), chunks * conv1_elements,
                         channels, 64U * (chunk_frames / 2), stream);
+    if (unpadded) {
+      valid = ConvOutLength(static_cast<std::uint32_t>(valid));
+      LaunchZeroColumns(conv1.get(), channels * 64U, chunk_frames / 2, valid,
+                        stream);
+    }
     LaunchConvolution(conv1.get(), conv2_weight.get(), conv2.get(), chunks, 64,
                       chunk_frames / 2, stream);
     asr::LaunchBiasGelu(conv2.get(), conv2_bias.get(), chunks * conv2_elements,
                         channels, 32U * (chunk_frames / 4), stream);
+    if (unpadded) {
+      valid = ConvOutLength(static_cast<std::uint32_t>(valid));
+      LaunchZeroColumns(conv2.get(), channels * 32U, chunk_frames / 4, valid,
+                        stream);
+    }
     LaunchConvolution(conv2.get(), conv3_weight.get(), conv3.get(), chunks, 32,
                       chunk_frames / 4, stream);
     asr::LaunchBiasGelu(conv3.get(), conv3_bias.get(), chunks * conv3_elements,

@@ -63,6 +63,13 @@ void LaunchSiluMulToBfloat16(const float* gate, const float* up,
 void LaunchRoundBfloat16(float* values, std::size_t elements,
                          hipStream_t stream);
 
+/// Zeroes the time columns >= `valid` of a BF16 [rows][width] activation:
+/// a clip shorter than one chunk is evaluated unpadded by the reference, so
+/// after each stem convolution the padded region must read as zeros.
+void LaunchZeroColumns(void* values_bfloat16, std::size_t rows,
+                       std::size_t width, std::size_t valid,
+                       hipStream_t stream);
+
 void LaunchFloatToBfloat16(const float* input, void* output_bfloat16,
                            std::size_t elements, hipStream_t stream);
 

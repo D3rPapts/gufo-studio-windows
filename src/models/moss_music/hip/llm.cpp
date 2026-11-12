@@ -10,7 +10,9 @@
 #include <string_view>
 #include <utility>
 
+#include "ds4_mmq.h"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/moss_music/hip/stem_ops.hpp"
 #include "src/models/qwen3_asr/hip/blas.hpp"
 #include "src/models/qwen3_asr/hip/text_ops.hpp"
@@ -20,6 +22,10 @@ namespace {
 
 namespace asr = qwen3_asr::hip;
 using Bf16 = hip_bfloat16;
+using core::GgmlType;
+
+/// Batch sizes up to this many rows take the MMVQ vector kernels.
+constexpr std::size_t kVectorRows = 8;
 
 void RequireHip(hipError_t status, std::string_view operation) {
   if (status != hipSuccess) {
@@ -31,6 +37,13 @@ void RequireHip(hipError_t status, std::string_view operation) {
 void RequireHipblas(hipblasStatus_t status, const char* operation) {
   if (status != HIPBLAS_STATUS_SUCCESS) {
     throw std::runtime_error(std::string(operation) + ": status " +
+                             std::to_string(status));
+  }
+}
+
+void Check(int status, const char* operation) {
+  if (status != 0) {
+    throw std::runtime_error(std::string(operation) + ": MMQ status " +
                              std::to_string(status));
   }
 }
@@ -95,16 +108,24 @@ std::uint32_t MetadataU32(const core::GgufReader& reader, std::string_view key) 
   return *value;
 }
 
+bool Quantized(GgmlType type) {
+  return type == GgmlType::kQ8_0 || type == GgmlType::kQ4_K ||
+         type == GgmlType::kQ6_K;
+}
+
 const core::GgufTensorInfo& Require(const core::GgufReader& reader,
                                     std::string_view name,
                                     std::initializer_list<std::uint64_t> shape,
-                                    core::GgmlType type) {
+                                    bool matrix) {
   const core::GgufTensorInfo* info = reader.FindTensor(name);
   if (info == nullptr) {
     throw std::runtime_error("MOSS-Music LLM tensor missing: " +
                              std::string(name));
   }
-  bool ok = info->type == type && info->dimensions.size() == shape.size();
+  const bool type_ok = matrix ? (info->type == GgmlType::kBF16 ||
+                                 Quantized(info->type))
+                              : info->type == GgmlType::kF32;
+  bool ok = type_ok && info->dimensions.size() == shape.size();
   std::size_t index = 0;
   for (const std::uint64_t dimension : shape) {
     ok = ok && index < info->dimensions.size() &&
@@ -112,20 +133,31 @@ const core::GgufTensorInfo& Require(const core::GgufReader& reader,
   }
   if (!ok) {
     throw std::runtime_error("MOSS-Music LLM tensor " + std::string(name) +
-                             " has an unexpected shape or type");
+                             " has an unexpected shape or type (" +
+                             std::string(core::ToString(info->type)) + ")");
   }
   return *info;
 }
 
+/// A weight matrix on the device in its GGUF encoding: BF16 for the hipBLAS
+/// path, Q8_0/Q4_K/Q6_K for the MMQ path. `rows` is the output dimension.
+struct Matrix {
+  DeviceBuffer<std::uint8_t> bytes;
+  GgmlType type{GgmlType::kBF16};
+  std::size_t rows{0};
+  std::size_t cols{0};
+
+  [[nodiscard]] bool quantized() const { return Quantized(type); }
+};
+
 struct LayerWeights {
-  DeviceBuffer<Bf16> q, k, v, o, gate, up, down;
+  Matrix q, k, v, o, gate, up, down;
   DeviceBuffer<float> input_norm, q_norm, k_norm, post_norm;
 };
 
-struct GemmProjection {
-  const void* weights{nullptr};
+struct Projection {
+  const Matrix* weights{nullptr};
   float* output{nullptr};
-  std::size_t rows{0U};
 };
 
 }  // namespace
@@ -184,26 +216,35 @@ struct Llm::Impl {
     }
   }
 
-  /// A BF16 matrix straight from the file into device memory; the mapped
-  /// pages are never read on the host (Windows would keep them resident).
-  DeviceBuffer<Bf16> UploadMatrix(gufo::hip::WeightUpload& upload,
-                                  std::string_view name, std::uint64_t cols,
-                                  std::uint64_t rows) {
-    const core::GgufTensorInfo& info =
-        Require(*reader, name, {cols, rows}, core::GgmlType::kBF16);
-    DeviceBuffer<Bf16> device(static_cast<std::size_t>(cols * rows));
+  /// A matrix straight from the file into device memory; the mapped pages
+  /// are never read on the host (Windows would keep them resident).
+  Matrix UploadMatrix(gufo::hip::WeightUpload& upload, std::string_view name,
+                      std::uint64_t cols, std::uint64_t rows) {
+    const core::GgufTensorInfo& info = Require(*reader, name, {cols, rows}, true);
+    Matrix matrix;
+    matrix.type = info.type;
+    matrix.rows = static_cast<std::size_t>(rows);
+    matrix.cols = static_cast<std::size_t>(cols);
+    matrix.bytes.Reset(info.size_bytes);
     std::string error;
-    if (!upload.CopyMapped(info.data, info.size_bytes, device.get(), &error)) {
+    if (!upload.CopyMapped(info.data, info.size_bytes, matrix.bytes.get(),
+                           &error)) {
       throw std::runtime_error("MOSS-Music LLM upload of " + std::string(name) +
                                " failed: " + error);
     }
+    if (matrix.quantized()) {
+      if (!mmq_ready) {
+        Check(ds4_mmq_init(0), "ds4_mmq_init");
+        mmq_ready = true;
+      }
+      quantized_bytes += info.size_bytes;
+    }
     bytes += info.size_bytes;
-    return device;
+    return matrix;
   }
 
   DeviceBuffer<float> UploadNorm(std::string_view name, std::uint64_t size) {
-    const core::GgufTensorInfo& info =
-        Require(*reader, name, {size}, core::GgmlType::kF32);
+    const core::GgufTensorInfo& info = Require(*reader, name, {size}, false);
     DeviceBuffer<float> device(static_cast<std::size_t>(size));
     RequireHip(hipMemcpy(device.get(), info.data, info.size_bytes,
                          hipMemcpyHostToDevice),
@@ -220,7 +261,15 @@ struct Llm::Impl {
       throw std::runtime_error("MOSS-Music LLM weight upload: " + error);
     }
     const std::uint64_t h = config.hidden;
-    embedding = UploadMatrix(*upload, "token_embd.weight", h, config.vocab);
+    // The embedding table stays in the file: rows are decoded on the host
+    // (a few hundred per request), so any GGUF type works for it.
+    embedding = &Require(*reader, "token_embd.weight", {h, config.vocab}, true);
+    embedding_row_bytes =
+        quant::EncodedSizeBytes(embedding->type, static_cast<std::size_t>(h));
+    if (embedding_row_bytes == 0U ||
+        embedding_row_bytes * config.vocab != embedding->size_bytes) {
+      throw std::runtime_error("MOSS-Music LLM embedding table layout");
+    }
     lm_head = UploadMatrix(*upload, "output.weight", h, config.vocab);
     final_norm = UploadNorm("output_norm.weight", h);
     layers.reserve(config.layers);
@@ -251,6 +300,7 @@ struct Llm::Impl {
 
   void AllocateState() {
     const std::size_t capacity = maximum_tokens;
+    const std::size_t widest = std::max(config.hidden, config.intermediate);
     hidden.Reset(capacity * config.hidden);
     q.Reset(capacity * config.QDim());
     k.Reset(capacity * config.KvDim());
@@ -260,69 +310,157 @@ struct Llm::Impl {
     gate.Reset(capacity * config.intermediate);
     up.Reset(capacity * config.intermediate);
     feed_forward.Reset(capacity * config.hidden);
-    bfloat16_scratch.Reset(capacity *
-                           std::max(config.hidden, config.intermediate));
-    gemv_input.Reset(std::max(config.hidden, config.intermediate));
+    bfloat16_scratch.Reset(capacity * widest);
+    activation_f32.Reset(capacity * widest);
     const std::size_t cache =
         static_cast<std::size_t>(config.layers) * config.kv_heads * capacity *
         config.head_dim;
     key_cache.Reset(cache);
     value_cache.Reset(cache);
     logits.Reset(config.vocab);
-    token_ids.Reset(capacity);
     audio_rows.Reset(capacity);
+    host_rows.resize(config.hidden);
   }
 
-  void GemmFused(const GemmProjection* projections, std::uint32_t count,
-                 const void* inputs_bfloat16, std::size_t batch,
-                 std::size_t columns) {
-    if (batch == 1U && count <= asr::kTextDecodeGemvMaxTensors) {
-      std::array<asr::TextDecodeGemvTensor, asr::kTextDecodeGemvMaxTensors>
-          tensors{};
-      bool representable = true;
-      for (std::uint32_t index = 0U; index < count; ++index) {
-        if (projections[index].rows >
-            std::numeric_limits<std::uint32_t>::max()) {
-          representable = false;
+  /// y[n][rows] = x[n][cols] . W^T for a quantized matrix, x in F32.
+  void Dense(const Matrix& weight, const float* x, float* y, std::size_t n) {
+    const int count = static_cast<int>(n);
+    const int rows = static_cast<int>(weight.rows);
+    const int cols = static_cast<int>(weight.cols);
+    int status = -1;
+    if (n <= kVectorRows) {
+      switch (weight.type) {
+        case GgmlType::kQ8_0:
+          status = ds4_mmq_q8_0_dense_vec(weight.bytes.get(), x, y, rows, count,
+                                          cols, stream);
           break;
-        }
-        tensors[index] = {
-            .weights_bfloat16 = projections[index].weights,
-            .output = projections[index].output,
-            .rows = static_cast<std::uint32_t>(projections[index].rows)};
+        case GgmlType::kQ4_K:
+          status = ds4_mmq_q4_K_dense_vec(weight.bytes.get(), x, y, rows, count,
+                                          cols, stream);
+          break;
+        case GgmlType::kQ6_K:
+          status = ds4_mmq_q6_K_dense_vec(weight.bytes.get(), x, y, rows, count,
+                                          cols, stream);
+          break;
+        default:
+          break;
       }
-      if (representable &&
-          asr::LaunchTextDecodeGemv(tensors.data(), count, inputs_bfloat16,
-                                    columns, stream)) {
-        return;
-      }
+      Check(status, "MOSS-Music quantized vector projection");
+      return;
     }
+    switch (weight.type) {
+      case GgmlType::kQ8_0:
+        status = ds4_mmq_q8_0_dense(weight.bytes.get(), x, y, rows, count, cols,
+                                    stream);
+        break;
+      case GgmlType::kQ4_K:
+        status = ds4_mmq_q4_K_dense(weight.bytes.get(), x, y, rows, count, cols,
+                                    stream);
+        break;
+      case GgmlType::kQ6_K:
+        status = ds4_mmq_q6_K_dense(weight.bytes.get(), x, y, rows, count, cols,
+                                    stream);
+        break;
+      default:
+        break;
+    }
+    Check(status, "MOSS-Music quantized projection");
+  }
+
+  /// Projections sharing one BF16 activation [batch, columns]: BF16 weights
+  /// through hipBLAS/hipBLASLt (or the fused decode GEMV), quantized weights
+  /// through the MMQ kernels on an F32 copy of the activation.
+  void Project(const Projection* projections, std::uint32_t count,
+               const Bf16* inputs, std::size_t batch, std::size_t columns) {
+    bool need_f32 = false;
     for (std::uint32_t index = 0U; index < count; ++index) {
-      if (batch == 1U) {
-        asr::LaunchTextBfloat16ToFloat(inputs_bfloat16, gemv_input.get(),
-                                       columns, stream);
-        asr::LaunchTextRowGemv(projections[index].weights, gemv_input.get(),
-                               projections[index].output,
-                               projections[index].rows, columns, stream);
+      need_f32 = need_f32 || projections[index].weights->quantized();
+    }
+    if (need_f32) {
+      asr::LaunchTextBfloat16ToFloat(inputs, activation_f32.get(),
+                                     batch * columns, stream);
+    }
+    // BF16 members first, fused for batch one.
+    std::array<asr::TextDecodeGemvTensor, asr::kTextDecodeGemvMaxTensors>
+        tensors{};
+    std::uint32_t bf16_count = 0;
+    for (std::uint32_t index = 0U; index < count; ++index) {
+      const Projection& p = projections[index];
+      if (p.weights->quantized()) {
+        Dense(*p.weights, activation_f32.get(), p.output, batch);
+        continue;
+      }
+      if (batch == 1U && bf16_count < tensors.size() &&
+          p.weights->rows <= std::numeric_limits<std::uint32_t>::max()) {
+        tensors[bf16_count++] = {
+            .weights_bfloat16 = p.weights->bytes.get(),
+            .output = p.output,
+            .rows = static_cast<std::uint32_t>(p.weights->rows)};
         continue;
       }
       if (prefill_lt != nullptr &&
-          prefill_lt->Run(projections[index].weights, inputs_bfloat16,
-                          projections[index].output, batch,
-                          projections[index].rows, columns, stream)) {
+          prefill_lt->Run(p.weights->bytes.get(), inputs, p.output, batch,
+                          p.weights->rows, columns, stream)) {
         continue;
       }
-      asr::LaunchGemmBf16(blas, projections[index].weights, inputs_bfloat16,
-                          projections[index].output, batch,
-                          projections[index].rows, columns, stream);
+      asr::LaunchGemmBf16(blas, p.weights->bytes.get(), inputs, p.output, batch,
+                          p.weights->rows, columns, stream);
+    }
+    if (bf16_count > 0U &&
+        !asr::LaunchTextDecodeGemv(tensors.data(), bf16_count, inputs, columns,
+                                   stream)) {
+      if (!need_f32) {
+        asr::LaunchTextBfloat16ToFloat(inputs, activation_f32.get(), columns,
+                                       stream);
+      }
+      for (std::uint32_t index = 0U; index < bf16_count; ++index) {
+        asr::LaunchTextRowGemv(tensors[index].weights_bfloat16,
+                               activation_f32.get(), tensors[index].output,
+                               tensors[index].rows, columns, stream);
+      }
     }
   }
 
-  void Gemm(const void* weights, const void* inputs_bfloat16, float* output,
-            std::size_t batch, std::size_t rows, std::size_t columns) {
-    const GemmProjection projection{
-        .weights = weights, .output = output, .rows = rows};
-    GemmFused(&projection, 1U, inputs_bfloat16, batch, columns);
+  void Project(const Matrix& weights, const Bf16* inputs, float* output,
+               std::size_t batch, std::size_t columns) {
+    const Projection projection{.weights = &weights, .output = output};
+    Project(&projection, 1U, inputs, batch, columns);
+  }
+
+  /// The embedding row of `token` as BF16-valued F32, decoded on the host.
+  void EmbedToken(std::uint32_t token, float* out) {
+    const auto* row = static_cast<const std::uint8_t*>(embedding->data) +
+                      static_cast<std::size_t>(token) * embedding_row_bytes;
+    const std::size_t hidden_size = config.hidden;
+    switch (embedding->type) {
+      case GgmlType::kBF16: {
+        const auto* bits = reinterpret_cast<const std::uint16_t*>(row);
+        for (std::size_t i = 0; i < hidden_size; ++i) {
+          const std::uint32_t widened = static_cast<std::uint32_t>(bits[i]) << 16;
+          std::memcpy(out + i, &widened, sizeof(float));
+        }
+        return;
+      }
+      case GgmlType::kQ8_0:
+        quant::DequantizeQ8_0(row, out, hidden_size);
+        break;
+      case GgmlType::kQ4_K:
+        quant::DequantizeQ4_K(row, out, hidden_size);
+        break;
+      case GgmlType::kQ6_K:
+        quant::DequantizeQ6_K(row, out, hidden_size);
+        break;
+      default:
+        throw std::runtime_error("MOSS-Music LLM embedding type unsupported");
+    }
+    // The reference reads a BF16 table: round the decoded values.
+    for (std::size_t i = 0; i < hidden_size; ++i) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, out + i, sizeof(bits));
+      bits += 0x7FFFU + ((bits >> 16U) & 1U);
+      bits &= 0xFFFF0000U;
+      std::memcpy(out + i, &bits, sizeof(bits));
+    }
   }
 
   void CopyRows(const float* device, std::size_t count,
@@ -335,8 +473,8 @@ struct Llm::Impl {
   }
 
   /// `tokens` rows of `hidden` at positions start.., with `deepstack[j]`
-  /// (device, [audio_count, hidden]) added to rows `audio_row_count` of
-  /// `audio_rows` after layers 0..2 when present.
+  /// (device, [audio_count, hidden]) added to rows `audio_rows` after layers
+  /// 0..2 when present.
   void RunTokens(std::size_t tokens, std::uint32_t start_position,
                  const std::array<const float*, 3>& deepstack,
                  std::size_t audio_count, PrefillTrace* trace,
@@ -358,17 +496,11 @@ struct Llm::Impl {
         throw std::runtime_error("MOSS-Music generation cancelled");
       }
       const LayerWeights& weights = layers[layer];
-      const std::array<GemmProjection, 3> qkv{
-          GemmProjection{.weights = weights.q.get(),
-                         .output = q.get(),
-                         .rows = config.QDim()},
-          GemmProjection{.weights = weights.k.get(),
-                         .output = k.get(),
-                         .rows = config.KvDim()},
-          GemmProjection{.weights = weights.v.get(),
-                         .output = v.get(),
-                         .rows = config.KvDim()}};
-      GemmFused(qkv.data(), 3U, bfloat16_scratch.get(), tokens, config.hidden);
+      const std::array<Projection, 3> qkv{
+          Projection{.weights = &weights.q, .output = q.get()},
+          Projection{.weights = &weights.k, .output = k.get()},
+          Projection{.weights = &weights.v, .output = v.get()}};
+      Project(qkv.data(), 3U, bfloat16_scratch.get(), tokens, config.hidden);
       if (!asr::LaunchTextQkNormRoPE(
               q.get(), k.get(), v.get(), weights.q_norm.get(),
               weights.k_norm.get(), tokens, config.heads, config.kv_heads,
@@ -391,24 +523,20 @@ struct Llm::Impl {
             start_position, tokens, static_cast<std::uint32_t>(maximum_tokens),
             config.heads, config.kv_heads, config.head_dim, stream);
       }
-      Gemm(weights.o.get(), bfloat16_scratch.get(), projection.get(), tokens,
-           config.hidden, config.QDim());
+      Project(weights.o, bfloat16_scratch.get(), projection.get(), tokens,
+              config.QDim());
       asr::LaunchTextResidualAddRMSNorm(
           hidden.get(), projection.get(), weights.post_norm.get(),
           bfloat16_scratch.get(), tokens, config.hidden, config.eps, stream);
-      const std::array<GemmProjection, 2> gate_up{
-          GemmProjection{.weights = weights.gate.get(),
-                         .output = gate.get(),
-                         .rows = config.intermediate},
-          GemmProjection{.weights = weights.up.get(),
-                         .output = up.get(),
-                         .rows = config.intermediate}};
-      GemmFused(gate_up.data(), 2U, bfloat16_scratch.get(), tokens,
-                config.hidden);
+      const std::array<Projection, 2> gate_up{
+          Projection{.weights = &weights.gate, .output = gate.get()},
+          Projection{.weights = &weights.up, .output = up.get()}};
+      Project(gate_up.data(), 2U, bfloat16_scratch.get(), tokens,
+              config.hidden);
       asr::LaunchTextSwiGLU(gate.get(), up.get(), bfloat16_scratch.get(),
                             ffn_elements, stream);
-      Gemm(weights.down.get(), bfloat16_scratch.get(), feed_forward.get(),
-           tokens, config.hidden, config.intermediate);
+      Project(weights.down, bfloat16_scratch.get(), feed_forward.get(), tokens,
+              config.intermediate);
       const float* next_norm = layer + 1U < layers.size()
                                    ? layers[layer + 1U].input_norm.get()
                                    : final_norm.get();
@@ -437,8 +565,7 @@ struct Llm::Impl {
     }
     const Bf16* last_hidden =
         bfloat16_scratch.get() + ((tokens - 1U) * config.hidden);
-    Gemm(lm_head.get(), last_hidden, logits.get(), 1U, config.vocab,
-         config.hidden);
+    Project(lm_head, last_hidden, logits.get(), 1U, config.hidden);
     asr::LaunchTextRoundBfloat16(logits.get(), config.vocab, stream);
   }
 
@@ -463,26 +590,24 @@ struct Llm::Impl {
     if (!rows.empty() && audio_device == nullptr) {
       throw std::invalid_argument("MOSS-Music audio rows without embeddings");
     }
-    std::vector<std::uint32_t> ids(prompt.size());
+    std::vector<float> embedded(prompt.size() * config.hidden);
     for (std::size_t index = 0; index < prompt.size(); ++index) {
       if (prompt[index] < 0 ||
           static_cast<std::uint32_t>(prompt[index]) >= config.vocab) {
         throw std::out_of_range("MOSS-Music prompt token is out of range");
       }
-      ids[index] = static_cast<std::uint32_t>(prompt[index]);
+      EmbedToken(static_cast<std::uint32_t>(prompt[index]),
+                 embedded.data() + index * config.hidden);
     }
     for (const std::uint32_t row : rows) {
       if (row >= prompt.size()) {
         throw std::out_of_range("MOSS-Music audio row is outside the prompt");
       }
     }
-    RequireHip(hipMemcpyAsync(token_ids.get(), ids.data(),
-                              ids.size() * sizeof(std::uint32_t),
+    RequireHip(hipMemcpyAsync(hidden.get(), embedded.data(),
+                              embedded.size() * sizeof(float),
                               hipMemcpyHostToDevice, stream),
-               "hipMemcpyAsync MOSS-Music prompt ids");
-    asr::LaunchTextEmbeddingLookup(embedding.get(), token_ids.get(),
-                                   hidden.get(), prompt.size(), config.hidden,
-                                   stream);
+               "hipMemcpyAsync MOSS-Music prompt embeddings");
     if (!rows.empty()) {
       RequireHip(hipMemcpyAsync(audio_rows.get(), rows.data(),
                                 rows.size() * sizeof(std::uint32_t),
@@ -491,6 +616,8 @@ struct Llm::Impl {
       LaunchScatterRowsRounded(hidden.get(), audio_device, audio_rows.get(),
                                rows.size(), config.hidden, stream);
     }
+    // The host buffers feed asynchronous copies: wait before they go away.
+    RequireHip(hipStreamSynchronize(stream), "MOSS-Music prompt upload");
     RunTokens(prompt.size(), 0U, deepstack, rows.size(), trace, is_cancelled);
     cache_tokens = prompt.size();
     FetchLogits(host_logits);
@@ -503,12 +630,10 @@ struct Llm::Impl {
     if (cache_tokens >= maximum_tokens) {
       throw std::length_error("MOSS-Music generation exceeds the KV capacity");
     }
-    const auto id = static_cast<std::uint32_t>(token);
-    RequireHip(hipMemcpyAsync(token_ids.get(), &id, sizeof(id),
-                              hipMemcpyHostToDevice, stream),
-               "hipMemcpyAsync MOSS-Music token");
-    asr::LaunchTextEmbeddingLookup(embedding.get(), token_ids.get(),
-                                   hidden.get(), 1U, config.hidden, stream);
+    EmbedToken(static_cast<std::uint32_t>(token), host_rows.data());
+    RequireHip(hipMemcpy(hidden.get(), host_rows.data(),
+                         config.hidden * sizeof(float), hipMemcpyHostToDevice),
+               "hipMemcpy MOSS-Music token embedding");
     RunTokens(1U, static_cast<std::uint32_t>(cache_tokens), {}, 0U, nullptr,
               {});
     ++cache_tokens;
@@ -520,22 +645,26 @@ struct Llm::Impl {
   std::size_t maximum_tokens{0};
   std::size_t cache_tokens{0};
   std::size_t bytes{0};
+  std::size_t quantized_bytes{0};
+  bool mmq_ready{false};
   hipStream_t stream{nullptr};
   hipblasHandle_t blas{nullptr};
   std::unique_ptr<asr::GemmLt> prefill_lt;
 
-  DeviceBuffer<Bf16> embedding, lm_head;
+  const core::GgufTensorInfo* embedding{nullptr};
+  std::size_t embedding_row_bytes{0};
+  Matrix lm_head;
   DeviceBuffer<float> final_norm;
   std::vector<LayerWeights> layers;
 
   DeviceBuffer<float> hidden, q, k, v, attention, projection, gate, up,
       feed_forward;
   DeviceBuffer<Bf16> bfloat16_scratch;
-  DeviceBuffer<float> gemv_input;
+  DeviceBuffer<float> activation_f32;
   DeviceBuffer<float> key_cache, value_cache;
   DeviceBuffer<float> logits;
-  DeviceBuffer<std::uint32_t> token_ids;
   DeviceBuffer<std::uint32_t> audio_rows;
+  std::vector<float> host_rows;
 };
 
 Llm::Llm(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

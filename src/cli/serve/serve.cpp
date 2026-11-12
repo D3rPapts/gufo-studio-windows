@@ -43,6 +43,9 @@
 #if defined(GUFO_HAVE_QWEN3_OMNI)
 #include "src/models/qwen3_omni/captioner.hpp"
 #endif
+#if defined(GUFO_HAVE_MOSS_MUSIC)
+#include "src/models/moss_music/captioner.hpp"
+#endif
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -500,6 +503,33 @@ void AddOmniOptions(ArgParser& parser, OmniOptions* options) {
                    "Model", &options->served_model_name);
 }
 
+struct MossMusicOptions {
+  std::string audio_gguf;
+  std::string llm_gguf;
+  std::size_t context{4096};
+  std::size_t max_tokens{1024};
+  std::string served_model_name{"moss-music-8b"};
+};
+
+void AddMossMusicOptions(ArgParser& parser, MossMusicOptions* options) {
+  parser.AddOption("-m", "--model", "PATH",
+                   "MOSS-Music LLM GGUF (llama.cpp qwen3: BF16, Q8_0, Q4_K_M)",
+                   "Model", &options->llm_gguf);
+  parser.AddOption("", "--audio-gguf", "PATH",
+                   "MOSS-Music audio GGUF (encoder, adapter, DeepStack mergers)",
+                   "Model", &options->audio_gguf);
+  parser.AddOption("-c", "--context", "N",
+                   "Context capacity: audio span with time markers, question "
+                   "and answer (default: 4096)",
+                   "Model", &options->context);
+  parser.AddOption("-n", "--max-tokens", "N",
+                   "Answer length limit and default (default: 1024)", "Model",
+                   &options->max_tokens);
+  parser.AddOption("", "--served-model-name", "NAME",
+                   "Public API model ID (default: moss-music-8b)", "Model",
+                   &options->served_model_name);
+}
+
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
   parser.AddOption("-m", "--model", "DIR",
                    tts ? "Qwen3-TTS 12Hz 1.7B model directory"
@@ -791,6 +821,17 @@ void PrintServeHelp(std::string_view program_name,
     return;
   }
 
+  if (subcommand == "moss-music") {
+    MossMusicOptions options;
+    ArgParser parser(std::string(program_name) + " serve moss-music",
+                     "Serve MOSS-Music-8B-Instruct music understanding.");
+    AddMossMusicOptions(parser, &options);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
+    parser.PrintHelp();
+    return;
+  }
+
   if (subcommand == "tts" || subcommand == "asr") {
     const bool tts = subcommand == "tts";
     SpeechOptions options{.context = tts ? 4096U : 1024U};
@@ -1004,6 +1045,8 @@ void PrintServeHelp(std::string_view program_name,
          "(/v1/embeddings)\n"
       << "  omni      Serve Qwen3-Omni-30B-A3B-Captioner audio captions "
          "(/v1/chat/completions with input_audio)\n"
+      << "  moss-music Serve MOSS-Music-8B-Instruct music understanding "
+         "(/v1/chat/completions with input_audio + text)\n"
       << "  music     Serve ACE-Step 1.5 XL turbo text-to-music "
          "(/v1/audio/music)\n"
       << "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
@@ -1104,7 +1147,8 @@ int RunServe(std::span<const char* const> args) {
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
         arg == "image" || arg == "embedding" || arg == "omni" ||
-        arg == "music" || arg == "foley" || arg == "upscale") {
+        arg == "moss-music" || arg == "music" || arg == "foley" ||
+        arg == "upscale") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
@@ -1112,8 +1156,8 @@ int RunServe(std::span<const char* const> args) {
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
           topic != "tts" && topic != "asr" && topic != "image" &&
-          topic != "embedding" && topic != "omni" && topic != "music" &&
-          topic != "foley" && topic != "upscale") {
+          topic != "embedding" && topic != "omni" && topic != "moss-music" &&
+          topic != "music" && topic != "foley" && topic != "upscale") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -1166,7 +1210,8 @@ int RunServe(std::span<const char* const> args) {
     // rest of the boot sequence instead of leaking it before SetLevel ran.
     const auto profile =
         subcommand == "llm" ? diagnostics::QueueProfile::kText
-        : (subcommand == "tts" || subcommand == "asr" || subcommand == "omni")
+        : (subcommand == "tts" || subcommand == "asr" ||
+           subcommand == "omni" || subcommand == "moss-music")
             ? diagnostics::QueueProfile::kAudio
             : diagnostics::QueueProfile::kUnmeasured;
     const auto plan =
@@ -1875,6 +1920,68 @@ int RunServe(std::span<const char* const> args) {
                  "HIP)\n";
     return 1;
 #endif
+  } else if (subcommand == "moss-music") {
+    MossMusicOptions options;
+    ArgParser parser("gufo serve moss-music",
+                     "Serve MOSS-Music-8B-Instruct music understanding.");
+    AddMossMusicOptions(parser, &options);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", subcommand);
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (options.llm_gguf.empty() || options.audio_gguf.empty()) {
+      std::cerr << "Error: --model <PATH> and --audio-gguf <PATH> are "
+                   "required for the moss-music server\n";
+      return 2;
+    }
+    if (options.context < 64U || options.max_tokens == 0U) {
+      std::cerr << "Error: --context must be at least 64 and --max-tokens "
+                   "positive\n";
+      return 2;
+    }
+#if defined(GUFO_HAVE_MOSS_MUSIC)
+    if (validate_only)
+      return 0;
+    ModelLoadLog load_log(subcommand, options.llm_gguf);
+    std::string error;
+    std::shared_ptr<models::moss_music::Captioner> captioner =
+        models::moss_music::Captioner::Create(
+            {.audio_gguf = options.audio_gguf,
+             .llm_gguf = options.llm_gguf,
+             .context = options.context},
+            &error);
+    if (captioner == nullptr) {
+      std::cerr << "Error loading MOSS-Music: " << error << '\n';
+      return 1;
+    }
+    omni = std::make_shared<server::OmniService>(server::OmniServiceOptions{
+        .model_id = options.served_model_name,
+        .context_tokens = options.context,
+        .max_tokens = options.max_tokens,
+        .runner =
+            [captioner](const models::qwen3_omni::CaptionRequest& request,
+                        const models::qwen3_omni::CancellationCheck& cancelled,
+                        models::qwen3_omni::CaptionResult* result,
+                        std::string* failure) {
+              return captioner->Caption(request, cancelled, result, failure);
+            },
+    });
+    load_log.Complete(
+        "model=" + omni->model_id() + " quant=" + captioner->quantization() +
+        " weights_mib=" + std::to_string(captioner->weight_bytes() >> 20) +
+        " sessions=1 context_tokens=" + std::to_string(options.context));
+#else
+    std::cerr << "Error: this gufo build has no MOSS-Music support (needs "
+                 "HIP)\n";
+    return 1;
+#endif
   } else {
     // Default to LLM server
     std::string model;
@@ -2359,8 +2466,8 @@ namespace {
 std::string ValidateServeArgvByParsing(std::string_view modality,
                                        const std::vector<std::string>& argv) {
   static constexpr std::string_view kModalities[] = {
-      "llm",       "image", "video", "tts",  "asr",
-      "embedding", "omni",  "music", "foley", "upscale"};
+      "llm",       "image", "video", "tts",   "asr",       "embedding",
+      "omni",      "moss-music", "music", "foley", "upscale"};
   if (std::ranges::find(kModalities, modality) == std::end(kModalities)) {
     return "unknown modality '" + std::string(modality) + "'";
   }
