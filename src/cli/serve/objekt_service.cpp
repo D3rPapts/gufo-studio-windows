@@ -91,6 +91,7 @@ struct Job {
   std::string phase;
   long long created_at = 0, completed_at = 0, expires_at = 0;
   std::string model;
+  std::shared_ptr<triposg::ObjektRunner> runner;   // the model's runner
   triposg::ObjektRequest request;  // rgba is cleared after the run
   triposg::ObjektResult result;    // glb/preview cleared after writing
   std::string error_code, error_message;
@@ -317,7 +318,7 @@ struct ObjektService::Impl {
         job->phase = phase;
         job->progress = std::clamp(ProgressPercent(phase, completed, total), 1, 99);
       };
-      const bool ok = options.runner->Run(job->request, progress, &job->cancel, &result, &error);
+      const bool ok = job->runner->Run(job->request, progress, &job->cancel, &result, &error);
       std::string write_error;
       bool written = false;
       if (ok) {
@@ -360,8 +361,24 @@ ObjektService::ObjektService(ObjektServiceOptions options) : impl_(std::make_uni
 ObjektService::~ObjektService() = default;
 bool ObjektService::ready() const noexcept { return impl_->init_error.empty() && impl_->options.runner != nullptr; }
 std::string ObjektService::model_id() const { return impl_->options.model_id; }
+std::vector<std::string> ObjektService::model_ids() const {
+  std::vector<std::string> ids{impl_->options.model_id};
+  for (const auto& [id, runner] : impl_->options.runners)
+    if (id != impl_->options.model_id && runner) ids.push_back(id);
+  return ids;
+}
+std::string ObjektService::capability_note(const std::string& id) const {
+  if (id == impl_->options.model_id && impl_->options.runner) return impl_->options.runner->capability_note();
+  const auto it = impl_->options.runners.find(id);
+  return it != impl_->options.runners.end() && it->second ? it->second->capability_note() : "";
+}
 std::string ObjektService::initialization_error() const { return impl_->init_error; }
-std::size_t ObjektService::weight_bytes() const { return impl_->options.runner ? impl_->options.runner->weight_bytes() : 0; }
+std::size_t ObjektService::weight_bytes() const {
+  std::size_t total = impl_->options.runner ? impl_->options.runner->weight_bytes() : 0;
+  for (const auto& [id, runner] : impl_->options.runners)
+    if (runner && runner != impl_->options.runner) total += runner->weight_bytes();
+  return total;
+}
 
 bool IsObjektApiPath(std::string_view path) noexcept {
   return path == kObjektApiPath || path.starts_with(std::string(kObjektApiPath) + "/");
@@ -408,17 +425,24 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     } catch (const std::exception& e) {
       return Error(400, "Bad Request", std::string("cannot decode image: ") + e.what(), "invalid_image");
     }
-    job->request.steps = static_cast<int>(body.member_double("steps", 50));
+    job->model = body.member_str("model", m.options.model_id);
+    job->runner = job->model == m.options.model_id ? m.options.runner : nullptr;
+    if (!job->runner) {
+      const auto it = m.options.runners.find(job->model);
+      if (it != m.options.runners.end()) job->runner = it->second;
+    }
+    if (!job->runner) return Error(400, "Bad Request", "unknown model '" + job->model + "'", "unknown_model");
+    job->request.steps = static_cast<int>(body.member_double("steps", job->runner->default_steps()));
     job->request.guidance = static_cast<float>(body.member_double("guidance", 7.0));
     job->request.seed = static_cast<std::uint64_t>(body.member_double("seed", 42));
     job->request.resolution = static_cast<int>(body.member_double("resolution", 512));
     job->request.max_faces = static_cast<int>(body.member_double("max_faces", 200000));
     if (const json::Value* p = body.find("preview"); p && p->is_bool()) job->request.preview = p->as_bool();
+    if (const json::Value* p = body.find("texture"); p && p->is_bool()) job->request.texture = p->as_bool();
     if (job->request.steps < 1 || job->request.steps > 200) return Error(400, "Bad Request", "steps must be 1..200", "invalid_steps");
     if (job->request.guidance < 0.f || job->request.guidance > 30.f) return Error(400, "Bad Request", "guidance must be 0..30", "invalid_guidance");
     if (job->request.resolution != 256 && job->request.resolution != 512) return Error(400, "Bad Request", "resolution must be 256 or 512", "invalid_resolution");
     if (job->request.max_faces < 0 || job->request.max_faces > 5000000) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
-    job->model = body.member_str("model", m.options.model_id);
     job->created_at = UnixNow();
     {
       const std::lock_guard<std::mutex> lock(m.mutex);

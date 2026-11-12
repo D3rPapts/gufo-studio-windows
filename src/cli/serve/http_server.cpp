@@ -2291,13 +2291,16 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     }
     if (objekt_ != nullptr && objekt_->ready()) {
       json::Value models = json::parse(listed.body);
-      json::Value model = json::Value::object();
-      model["id"] = objekt_->model_id();
-      model["object"] = "model";
-      model["created"] = Now();
-      model["owned_by"] = "operator-supplied-triposg";
-      model["capability"] = "image_to_3d";
-      models["data"].push_back(std::move(model));
+      for (const std::string& id : objekt_->model_ids()) {
+        json::Value model = json::Value::object();
+        model["id"] = id;
+        model["object"] = "model";
+        model["created"] = Now();
+        model["owned_by"] = "operator-supplied-" + id;
+        model["capability"] = "image_to_3d";
+        model["note"] = objekt_->capability_note(id);
+        models["data"].push_back(std::move(model));
+      }
       listed.body = models.dump();
     }
     return listed;

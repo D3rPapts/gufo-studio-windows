@@ -523,9 +523,9 @@ endif()
 target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
 # TripoSG image-to-3D (gufo serve objekt): GPU runner in HIP builds, stub otherwise.
 if (ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo_http PUBLIC gufo_triposg)
+  target_link_libraries(gufo_http PUBLIC gufo_triposg gufo_trellis2)
 else()
-  target_link_libraries(gufo_http PUBLIC gufo_triposg_stub)
+  target_link_libraries(gufo_http PUBLIC gufo_triposg_stub gufo_trellis2_stub)
 endif()
 # mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
 target_compile_definitions(gufo_http PRIVATE

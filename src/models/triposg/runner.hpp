@@ -23,6 +23,7 @@ struct ObjektRequest {
     int resolution = 512;
     int max_faces = 200000;
     bool preview = true;
+    bool texture = false;   // TRELLIS.2: texture flow + decoder (vertex colours)
 };
 
 struct ObjektResult {
@@ -42,6 +43,9 @@ public:
     virtual bool Run(const ObjektRequest& request, const ObjektProgress& progress, const std::atomic<bool>* cancel,
                      ObjektResult* result, std::string* error) = 0;
     virtual std::size_t weight_bytes() const = 0;
+    // Sampler default when the request omits `steps` (TripoSG 50, TRELLIS.2 12).
+    virtual int default_steps() const { return 50; }
+    virtual std::string capability_note() const { return "shape"; }
 };
 
 // Loads the converted triposg.safetensors onto the GPU (HIP build) or fails with *error.

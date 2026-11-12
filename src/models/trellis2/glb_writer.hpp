@@ -17,6 +17,11 @@ struct GlbWriteOptions {
     bool write_normals = true;        // smooth per-vertex normals (area weighted)
     std::string generator = "gufo trellis2";
     std::string mesh_name = "trellis2";
+    // Optional per-vertex RGBA colours in [0, 1] ([vertices * 4]); written as COLOR_0 (VEC4
+    // FLOAT) with a pbrMetallicRoughness material (base colour factor 1, the factors below).
+    const std::vector<float>* vertex_colors = nullptr;
+    float metallic_factor = 0.f;
+    float roughness_factor = 0.9f;
 };
 
 // Serialises the mesh as one GLB (12-byte header, JSON chunk, BIN chunk);

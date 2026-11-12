@@ -51,6 +51,7 @@
 #include "src/cli/serve/foley_api.hpp"
 #include "src/cli/serve/upscale_api.hpp"
 #include "src/cli/serve/objekt_service.hpp"
+#include "src/models/trellis2/runner.hpp"
 #include "src/models/triposg/runner.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -1215,6 +1216,8 @@ int RunServe(std::span<const char* const> args) {
   if (subcommand == "objekt") {
     std::filesystem::path objekt_model;
     std::filesystem::path objekt_root;
+    std::filesystem::path trellis2_dir;
+    bool trellis2_texture = false;
     std::string objekt_name = "triposg";
     double objekt_ttl_seconds = 86400;
     ArgParser parser("gufo serve objekt",
@@ -1224,6 +1227,15 @@ int RunServe(std::span<const char* const> args) {
                      "Converted TripoSG weights (triposg.safetensors from "
                      "tools/triposg/convert_hf_to_gufo.py)",
                      "Model", &objekt_model);
+    parser.AddOption("", "--trellis2", "DIR",
+                     "TRELLIS.2 weights directory (trellis2-*.safetensors from "
+                     "tools/trellis2/convert_hf_to_gufo.py); served as model "
+                     "\"trellis2\" next to (or instead of) TripoSG",
+                     "Model", &trellis2_dir);
+    parser.AddFlag("", "--trellis2-texture",
+                   "Also load the TRELLIS.2 texture flow + decoder (vertex "
+                   "colours, +3.3 GB)",
+                   "Model", &trellis2_texture);
     parser.AddOption("", "--root", "DIR",
                      "Job storage (default: <temp>/gufo-objekt)", "Model",
                      &objekt_root);
@@ -1245,11 +1257,11 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!prepare_server_options())
       return 2;
-    if (objekt_model.empty()) {
-      std::cerr << "Error: --model FILE is required for objekt server\n";
+    if (objekt_model.empty() && trellis2_dir.empty()) {
+      std::cerr << "Error: --model FILE (TripoSG) or --trellis2 DIR is required for objekt server\n";
       return 2;
     }
-    {
+    if (!objekt_model.empty()) {
       std::error_code ec;
       if (!std::filesystem::is_regular_file(objekt_model, ec)) {
         std::cerr << "Error: --model file not found: "
@@ -1259,17 +1271,34 @@ int RunServe(std::span<const char* const> args) {
     }
     if (validate_only)
       return 0;
-    ModelLoadLog load_log("objekt", objekt_model);
+    ModelLoadLog load_log("objekt", objekt_model.empty() ? trellis2_dir : objekt_model);
     std::string error;
-    std::shared_ptr<triposg::ObjektRunner> runner =
-        triposg::CreateObjektRunner(objekt_model, &error);
-    if (runner == nullptr) {
-      std::cerr << "Error loading TripoSG: " << error << '\n';
-      return 1;
+    std::shared_ptr<triposg::ObjektRunner> runner;
+    std::map<std::string, std::shared_ptr<triposg::ObjektRunner>> runners;
+    if (!objekt_model.empty()) {
+      runner = triposg::CreateObjektRunner(objekt_model, &error);
+      if (runner == nullptr) {
+        std::cerr << "Error loading TripoSG: " << error << '\n';
+        return 1;
+      }
+    }
+    if (!trellis2_dir.empty()) {
+      std::shared_ptr<triposg::ObjektRunner> t2 =
+          trellis2::CreateObjektRunner(trellis2_dir, trellis2_texture, &error);
+      if (t2 == nullptr) {
+        std::cerr << "Error loading TRELLIS.2: " << error << '\n';
+        return 1;
+      }
+      runners["trellis2"] = t2;
+      if (runner == nullptr) {
+        runner = t2;
+        if (objekt_name == "triposg") objekt_name = "trellis2";
+      }
     }
     objekt = std::make_shared<server::ObjektService>(
         server::ObjektServiceOptions{
             .runner = runner,
+            .runners = runners,
             .model_id = objekt_name,
             .storage_root = objekt_root,
             .queue_capacity = 1,

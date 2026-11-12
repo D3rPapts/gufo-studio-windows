@@ -13,9 +13,11 @@
 
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/models/triposg/runner.hpp"
@@ -23,7 +25,8 @@
 namespace gufo::server {
 
 struct ObjektServiceOptions {
-    std::shared_ptr<triposg::ObjektRunner> runner;
+    std::shared_ptr<triposg::ObjektRunner> runner;          // default model (model_id)
+    std::map<std::string, std::shared_ptr<triposg::ObjektRunner>> runners;   // further models by id
     std::string model_id = "triposg";
     std::filesystem::path storage_root;
     std::size_t queue_capacity = 1;
@@ -43,6 +46,8 @@ public:
 
     bool ready() const noexcept;
     std::string model_id() const;
+    std::vector<std::string> model_ids() const;
+    std::string capability_note(const std::string& model_id) const;
     std::string initialization_error() const;
     std::size_t weight_bytes() const;
     HttpResponse Handle(const HttpRequest& request);

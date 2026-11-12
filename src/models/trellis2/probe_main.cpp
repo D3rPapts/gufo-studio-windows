@@ -24,6 +24,9 @@
 //       [--device cpu|gpu] [--cpu-check] [--cpu-levels 2]
 //     DIR holds shape_latent_final.npy + shape_coords.npy; writes shape_dec_out.npy [M,7], shape_dec_coords.npy,
 //     shape_subdiv_{0..3}.npy, mesh.glb (dual grid, 512^3) and preview.png.
+//   gufo-trellis2-probe --stage full --weights-dir DIR --image bild.png --out DIR --name tasse
+//       [--steps 12] [--seed 42] [--max-faces 500000] [--texture]
+//     whole pipeline (HIP): writes <name>-trellis2.glb (y-up, holes filled, decimated) and <name>-trellis2-vorschau.png.
 //
 // No server, no port; the GPU path needs a HIP build (GUFO_TRELLIS2_HIP).
 // AI-assisted (Claude Code), 2026-11-12.
@@ -51,6 +54,7 @@
 #include "src/models/trellis2/glb_writer.hpp"
 #include "src/models/trellis2/mesh_preview.hpp"
 #include "src/models/trellis2/npy.hpp"
+#include "src/models/trellis2/pipeline.hpp"
 #include "src/models/trellis2/png.hpp"
 #include "src/models/trellis2/preprocess.hpp"
 #include "src/models/trellis2/scheduler.hpp"
@@ -588,12 +592,70 @@ int run_shapedec(const std::string& weights, const std::string& dumps, const std
     return 0;
 }
 
+// ---------------------------------------------------------------- full pipeline (HIP)
+int run_full(const std::string& weights_dir, const std::string& image, const std::string& out, const std::string& name,
+             int steps, int seed, int max_faces, bool texture) {
+#if GUFO_TRELLIS2_HIP
+    std::string error;
+    std::filesystem::create_directories(out);
+    gufo::models::qwen_image_21::Image rgba;
+    try {
+        rgba = gufo::models::qwen_image_21::DecodeImage(gufo::core::ReadImageFile(image));
+    } catch (const std::exception& e) {
+        std::cerr << "image: " << e.what() << '
+';
+        return 1;
+    }
+    auto t0 = Clock::now();
+    auto pipe = tr::Pipeline::Load(weights_dir, texture, &error);
+    if (!pipe) { std::cerr << "load: " << error << '
+'; return 1; }
+    std::cout << "pipeline loaded in " << ms_since(t0) << " ms, texture " << (pipe->has_texture() ? "yes" : "no") << '
+';
+    tr::GenerateOptions o;
+    o.steps = steps; o.seed = static_cast<std::uint64_t>(seed); o.max_faces = max_faces; o.texture = texture;
+    tr::GenerateResult r;
+    std::string last_phase;
+    t0 = Clock::now();
+    const bool ok = pipe->Generate(rgba.rgba.data(), rgba.width, rgba.height, o,
+                                   [&](const std::string& phase, int done, int total) {
+                                       if (phase != last_phase) { std::cout << "  " << phase << " ..." << std::flush; last_phase = phase; }
+                                       if (done == total) std::cout << " done
+";
+                                   }, nullptr, &r, &error);
+    if (!ok) { std::cerr << "generate: " << error << '
+'; return 1; }
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << name << ": " << r.structure_voxels << " structure voxels, " << r.shape_voxels << " shape voxels, mesh "
+              << r.faces_before_decimation << " -> " << r.faces << " faces, " << r.vertices << " vertices, holes filled " << r.holes_filled
+              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", volume " << r.volume << '
+';
+    std::cout << "  seconds: encode " << r.seconds_encode << " structure " << r.seconds_structure << " shape " << r.seconds_shape
+              << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " total " << ms_since(t0) / 1000 << '
+';
+    std::ofstream glb(std::filesystem::path(out) / (name + "-trellis2.glb"), std::ios::binary);
+    glb.write(reinterpret_cast<const char*>(r.glb.data()), static_cast<std::streamsize>(r.glb.size()));
+    std::ofstream png(std::filesystem::path(out) / (name + "-trellis2-vorschau.png"), std::ios::binary);
+    png.write(reinterpret_cast<const char*>(r.preview_png.data()), static_cast<std::streamsize>(r.preview_png.size()));
+    std::cout << "  wrote " << name << "-trellis2.glb (" << r.glb.size() / (1024.0 * 1024.0) << " MiB) and " << name << "-trellis2-vorschau.png
+";
+    return 0;
+#else
+    (void)weights_dir; (void)image; (void)out; (void)name; (void)steps; (void)seed; (void)max_faces; (void)texture;
+    std::cerr << "no HIP build
+";
+    return 1;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
     std::string stage, weights, image, out, dumps, device = "gpu";
-    int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2;
+    int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2, max_faces = 500000;
+    std::string weights_dir, name = "objekt";
+    bool texture = false;
     bool selftest = false, zero_cond = false, cpu_check = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -609,6 +671,10 @@ int main(int argc, char** argv) {
         else if (a == "--seed") seed = std::stoi(next());
         else if (a == "--steps") steps = std::stoi(next());
         else if (a == "--cpu-levels") cpu_levels = std::stoi(next());
+        else if (a == "--weights-dir") weights_dir = next();
+        else if (a == "--name") name = next();
+        else if (a == "--max-faces") max_faces = std::stoi(next());
+        else if (a == "--texture") texture = true;
         else if (a == "--selftest-dino") selftest = true;
         else if (a == "--zero-cond") zero_cond = true;
         else if (a == "--cpu-check") cpu_check = true;
@@ -640,6 +706,10 @@ int main(int argc, char** argv) {
     if (stage == "shapedec") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
         return run_shapedec(weights, dumps, out, device, cpu_check, cpu_levels);
+    }
+    if (stage == "full") {
+        if (weights_dir.empty() || image.empty() || out.empty()) return usage();
+        return run_full(weights_dir, image, out, name, steps, seed, max_faces, texture);
     }
     return usage();
 }

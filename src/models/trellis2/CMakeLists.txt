@@ -19,10 +19,11 @@ add_library(gufo_trellis2_cpu STATIC
   sparse_dec_cpu.cpp
   dual_grid_mesh.cpp
   glb_writer.cpp
-  mesh_preview.cpp)
+  mesh_preview.cpp
+  mesh_post.cpp)
 target_include_directories(gufo_trellis2_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_trellis2_cpu PUBLIC cxx_std_20)
-target_link_libraries(gufo_trellis2_cpu PUBLIC gufo_platform)
+target_link_libraries(gufo_trellis2_cpu PUBLIC gufo_platform gufo_triposg_cpu)
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
   target_link_libraries(gufo_trellis2_cpu PRIVATE OpenMP::OpenMP_CXX)
@@ -35,13 +36,18 @@ else()
 endif()
 
 if (ENGINE_ENABLE_HIP)
-  add_library(gufo_trellis2 STATIC EXCLUDE_FROM_ALL dinov3.hip dit.hip ss_dec.hip sparse_dec.hip)
+  add_library(gufo_trellis2 STATIC EXCLUDE_FROM_ALL dinov3.hip dit.hip ss_dec.hip sparse_dec.hip pipeline.cpp runner.cpp)
   target_include_directories(gufo_trellis2 PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_trellis2 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_compile_definitions(gufo_trellis2 PUBLIC GUFO_TRELLIS2_HIP=1)
   target_link_libraries(gufo_trellis2 PUBLIC gufo_trellis2_cpu gufo_qwen_image_21 hip::host roc::rocblas)
 endif()
+
+# Server runner without a GPU: reports the missing HIP build.
+add_library(gufo_trellis2_stub STATIC runner_stub.cpp)
+target_include_directories(gufo_trellis2_stub PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(gufo_trellis2_stub PUBLIC cxx_std_20)
 
 # Stage probe: DINOv3 tokens, sparse-structure flow and decoder as .npy dumps.
 add_executable(gufo-trellis2-probe EXCLUDE_FROM_ALL probe_main.cpp)
@@ -53,7 +59,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (BUILD_TESTING)
-  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer)
+  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer mesh_post)
     add_executable(trellis2_${name}_test
       ${PROJECT_SOURCE_DIR}/tests/models/trellis2/${name}_test.cpp)
     target_link_libraries(trellis2_${name}_test PRIVATE gufo_trellis2_cpu)

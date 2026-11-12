@@ -105,6 +105,14 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
         normals_bytes = bin.size() - normals_offset;
     }
 
+    std::size_t colors_offset = 0, colors_bytes = 0;
+    const bool with_colors = options.vertex_colors != nullptr && options.vertex_colors->size() == mesh.vertices.size() * 4;
+    if (with_colors) {
+        colors_offset = bin.size();
+        for (float c : *options.vertex_colors) put_f32(bin, std::min(1.f, std::max(0.f, c)));
+        colors_bytes = bin.size() - colors_offset;
+    }
+
     const std::size_t indices_offset = bin.size();
     for (const auto& f : mesh.faces) { put_u32(bin, f[0]); put_u32(bin, f[1]); put_u32(bin, f[2]); }
     const std::size_t indices_bytes = bin.size() - indices_offset;
@@ -160,6 +168,11 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
         const int nrm_view = add_view(normals_offset, normals_bytes, kTargetArrayBuffer);
         nrm_acc = add_accessor(nrm_view, kComponentFloat, mesh.vertices.size(), "VEC3");
     }
+    int col_acc = -1;
+    if (with_colors) {
+        const int col_view = add_view(colors_offset, colors_bytes, kTargetArrayBuffer);
+        col_acc = add_accessor(col_view, kComponentFloat, mesh.vertices.size(), "VEC4");
+    }
     const int idx_view = add_view(indices_offset, indices_bytes, kTargetElementArrayBuffer);
     const int idx_acc = add_accessor(idx_view, kComponentUnsignedInt, mesh.faces.size() * 3, "SCALAR");
 
@@ -169,10 +182,26 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
     Value attributes = Value::object();
     attributes["POSITION"] = Value(pos_acc);
     if (nrm_acc >= 0) attributes["NORMAL"] = Value(nrm_acc);
+    if (col_acc >= 0) attributes["COLOR_0"] = Value(col_acc);
     Value primitive = Value::object();
     primitive["attributes"] = attributes;
     primitive["indices"] = Value(idx_acc);
     primitive["mode"] = Value(4);  // TRIANGLES
+    if (col_acc >= 0) {
+        Value pbr = Value::object();
+        Value base = Value::array();
+        for (int k = 0; k < 4; ++k) base.push_back(Value(1.0));
+        pbr["baseColorFactor"] = base;
+        pbr["metallicFactor"] = Value(static_cast<double>(options.metallic_factor));
+        pbr["roughnessFactor"] = Value(static_cast<double>(options.roughness_factor));
+        Value material = Value::object();
+        material["name"] = Value(options.mesh_name + "-vertex-colours");
+        material["pbrMetallicRoughness"] = pbr;
+        Value materials = Value::array();
+        materials.push_back(material);
+        root["materials"] = materials;
+        primitive["material"] = Value(0);
+    }
     Value primitives = Value::array();
     primitives.push_back(primitive);
     Value mesh_obj = Value::object();
