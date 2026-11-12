@@ -1138,6 +1138,9 @@ endfunction()
       src/cli/video/video.cpp
     )
     target_link_libraries(video_cli_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries} gufo_ext_runtime)
+    # src/cli/video/video.cpp registers the built extensions itself (RunVideo),
+    # so the test needs its own generated registry like prompt_cli_test.
+    gufo_target_extensions(video_cli_test EXTENSIONS ${gufo_selected_extensions})
     add_test(NAME video_cli_test COMMAND video_cli_test)
     set_tests_properties(video_cli_test PROPERTIES
       LABELS "cpu;server;cli;minimax-h3;quality")
