@@ -91,7 +91,7 @@ struct DitRunner {
 };
 
 int run_dit(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device,
-            std::uint64_t seed, int steps, float guidance, bool only_cond) {
+            std::uint64_t seed, int steps, float guidance, bool only_cond, bool trace, float t_override) {
     namespace tp = gufo::triposg;
     std::string error;
     std::vector<float> cond, x;
@@ -141,8 +141,9 @@ int run_dit(const std::string& weights, const std::string& dumps, const std::str
     taps_opt.tap_layers = {0, 20};
     std::map<int, std::vector<float>> taps;
     std::vector<float> v_cond, v_uncond;
+    const float t_first = t_override >= 0.f ? t_override : tp::flow_timestep(sigmas, 0);
     t0 = Clock::now();
-    if (!runner.forward(x, cond, tp::flow_timestep(sigmas, 0), &v_cond, &taps, taps_opt, &error)) {
+    if (!runner.forward(x, cond, t_first, &v_cond, &taps, taps_opt, &error)) {
         std::cerr << "forward: " << error << '\n';
         return 1;
     }
@@ -152,7 +153,7 @@ int run_dit(const std::string& weights, const std::string& dumps, const std::str
     tp::npy::write_f32(std::filesystem::path(out) / "dit_v_step00_cond.npy", v_cond.data(), {2048, 64}, &error);
     if (!only_cond) {
         t0 = Clock::now();
-        if (!runner.forward(x, zeros, tp::flow_timestep(sigmas, 0), &v_uncond, nullptr, {}, &error)) {
+        if (!runner.forward(x, zeros, t_first, &v_uncond, nullptr, {}, &error)) {
             std::cerr << "forward: " << error << '\n';
             return 1;
         }
@@ -165,6 +166,7 @@ int run_dit(const std::string& weights, const std::string& dumps, const std::str
             return 1;
         }
         t0 = Clock::now();
+        const std::vector<float> noise = x;
         for (int i = 0; i < steps; ++i) {
             const float t = tp::flow_timestep(sigmas, i);
             if (i > 0) {
@@ -174,9 +176,21 @@ int run_dit(const std::string& weights, const std::string& dumps, const std::str
                     return 1;
                 }
             }
+            // Trace: how the guided velocity relates to the start noise and the sample.
+            double vv = 0, vn = 0, nn = 0, xx = 0, xn = 0, cu = 0, cc = 0, uu = 0;
+            for (std::size_t k = 0; k < x.size(); ++k) {
+                const double n = noise[k], c = v_cond[k], u = v_uncond[k];
+                nn += n * n; xx += static_cast<double>(x[k]) * x[k]; xn += x[k] * n;
+                cc += c * c; uu += u * u; cu += c * u; vn += c * n; vv += c * c;
+            }
             tp::apply_guidance(&v_cond, v_uncond, guidance);
             tp::euler_step(x, v_cond, sigmas, i);
-            if (i % 10 == 9 || i + 1 == steps) std::cout << "  step " << i + 1 << "/" << steps << " after " << ms_since(t0) / 1000 << " s\n";
+            if (trace)
+                std::cout << "  t=" << t << " rms(v_cond) " << std::sqrt(cc / x.size()) << " corr(v_cond,noise) " << vn / std::sqrt(vv * nn)
+                          << " corr(cond,uncond) " << cu / std::sqrt(cc * uu) << " rms(x) " << std::sqrt(xx / x.size())
+                          << " corr(x,noise) " << xn / std::sqrt(xx * nn) << '\n';
+            else if (i % 10 == 9 || i + 1 == steps)
+                std::cout << "  step " << i + 1 << "/" << steps << " after " << ms_since(t0) / 1000 << " s\n";
         }
         tp::npy::write_f32(std::filesystem::path(out) / "latents_final.npy", x.data(), {2048, 64}, &error);
         double energy = 0;
@@ -231,7 +245,8 @@ int selftest(const std::string& device, int layers) {
 
 int main(int argc, char** argv) {
     std::string stage = "dino", weights, image, out, device = "cpu", dumps;
-    bool self = false, only_cond = false;
+    bool self = false, only_cond = false, trace = false;
+    float t_override = -1.f;
     int layers = 24, steps = 0;
     std::uint64_t seed = 42;
     float guidance = 7.f;
@@ -250,12 +265,14 @@ int main(int argc, char** argv) {
         else if (a == "--steps") steps = std::stoi(next());
         else if (a == "--guidance") guidance = std::stof(next());
         else if (a == "--only-cond") only_cond = true;
+        else if (a == "--trace") trace = true;
+        else if (a == "--t") t_override = std::stof(next());
         else return usage();
     }
     if (self) return selftest(device, layers);
     if (stage == "dit") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
-        return run_dit(weights, dumps, out, device, seed, steps, guidance, only_cond);
+        return run_dit(weights, dumps, out, device, seed, steps, guidance, only_cond, trace, t_override);
     }
     if (stage != "dino" || weights.empty() || image.empty() || out.empty()) return usage();
 
