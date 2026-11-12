@@ -565,6 +565,17 @@ std::string ObjektJobId(const std::string& path) {
   return std::string(remainder);
 }
 
+/// Status path of a recorded job by its worker-assigned id: async music ids
+/// are music_N, 3D ids obj_<hex> (gufo serve objekt), everything else is a
+/// video job (video_<hex>).
+std::string JobStatusPath(const std::string& job_id) {
+  if (job_id.starts_with("music_"))
+    return "/v1/audio/music/" + job_id;
+  if (job_id.starts_with("obj_"))
+    return "/v1/3d/generations/" + job_id;
+  return "/v1/videos/" + job_id;
+}
+
 Resolution ResolveModel(const HttpRequest& req) {
   Resolution resolution;
   if (IsJsonModelPost(req)) {
@@ -750,6 +761,12 @@ bool IsVideoCreate(const HttpRequest& req) {
 
 bool IsMusicCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/audio/music";
+}
+
+/// POST /v1/3d/generations: gufo serve objekt answers 202 with an obj_ job
+/// the router records like a video job (1.4.24).
+bool IsObjektCreate(const HttpRequest& req) {
+  return req.method == "POST" && req.path == "/v1/3d/generations";
 }
 
 /// A POST with a JSON object body (Content-Type application/json, or no
@@ -1317,6 +1334,10 @@ public:
         (req.method == "GET" || req.method == "DELETE")) {
       job = VideoJobId(req.path);
     }
+    if (job.empty() && (req.method == "GET" || req.method == "DELETE")) {
+      // A 3D job stays on the machine it runs on (1.4.24).
+      job = ObjektJobId(req.path);
+    }
     if (!job.empty() && registry.JobOwner(job) == preset.id) {
       return registry.JobRemote(job);
     }
@@ -1556,8 +1577,8 @@ public:
           forced = "local";
       }
     }
-    const bool may_retry =
-        !IsVideoCreate(req) && !IsMusicCreate(req) && forced != "remote";
+    const bool may_retry = !IsVideoCreate(req) && !IsMusicCreate(req) &&
+                           !IsObjektCreate(req) && forced != "remote";
     // The job this request belongs to (job store): its pool state is
     // reported and, while it waits, may be redirected to the partner.
     const std::string job_id =
@@ -2483,8 +2504,9 @@ public:
       target.head_timeout = kRemoteProbeTimeout;
       HttpRequest status;
       status.method = "GET";
-      status.path = (job.music ? "/v1/audio/music/" : "/v1/videos/") + job_id;
-      if (job.music)
+      status.path = job.music ? "/v1/audio/music/" + job_id
+                              : JobStatusPath(job_id);
+      if (job.music || job_id.starts_with("obj_"))
         status.query = "model=" + job.model_id;
       const auto deadline =
           std::chrono::steady_clock::now() + 2 * kRemoteProbeTimeout;
@@ -2587,11 +2609,10 @@ public:
     for (const Probe& probe : probes) {
       HttpRequest poll;
       poll.method = "GET";
-      // Async music ids are music_N; everything else is a video job.
-      poll.path = std::string(probe.job.starts_with("music_")
-                                  ? "/v1/audio/music/"
-                                  : "/v1/videos/") +
-                  probe.job;
+      // Async music ids are music_N, 3D ids obj_<hex>; everything else is a
+      // video job (a 3D job polled as a video answered 404 and was released
+      // as finished while the worker still computed it).
+      poll.path = JobStatusPath(probe.job);
       poll.request_id = "router-job-sweep";
       // A status read answers at once; a stuck worker must not hold up the
       // supervision tick.
@@ -3118,13 +3139,14 @@ private:
   }
 
   /// Job bookkeeping for proxied 2xx responses: the create response of a
-  /// video or async music job records the worker-assigned id against the
-  /// owning model; a terminal status read, a video DELETE or a music result
-  /// download releases it. Returns nullptr for every other request.
+  /// video, async music or 3D job records the worker-assigned id against the
+  /// owning model; a terminal status read, a video or 3D DELETE or a music
+  /// or 3D result download releases it. Returns nullptr for every other
+  /// request.
   std::shared_ptr<JobBodySniffer> MakeJobSniffer(const HttpRequest& req,
                                                  const std::string& model_id,
                                                  bool remote = false) {
-    if (IsVideoCreate(req) || IsMusicCreate(req)) {
+    if (IsVideoCreate(req) || IsMusicCreate(req) || IsObjektCreate(req)) {
       // A synchronous music answer is a WAV body: it never parses and
       // records nothing.
       return std::make_shared<JobBodySniffer>(
@@ -3143,6 +3165,20 @@ private:
     }
     if (req.method != "GET" && req.method != "DELETE") {
       return nullptr;
+    }
+    if (const std::string objekt_id = ObjektJobId(req.path);
+        !objekt_id.empty()) {
+      // 3D (1.4.24): status and DELETE like a video job, /content like a
+      // music download; /preview (a PNG, written with the result) records
+      // nothing.
+      if (req.path.ends_with("/preview"))
+        return nullptr;
+      return std::make_shared<JobBodySniffer>(
+          mutex, registry,
+          req.method == "DELETE"            ? JobBodySniffer::Kind::kDelete
+          : req.path.ends_with("/content") ? JobBodySniffer::Kind::kContent
+                                           : JobBodySniffer::Kind::kStatus,
+          model_id, objekt_id, remote);
     }
     const std::string job_id = VideoStatusJobId(req.path);
     if (job_id.empty()) {

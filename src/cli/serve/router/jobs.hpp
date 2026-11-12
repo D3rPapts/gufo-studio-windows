@@ -258,6 +258,13 @@ struct Options {
   Resolver resolve;
   Deliver deliver;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// Whole-job limit of a 3D job's status polls (gufo serve objekt; up to
+  /// ~2 min per object measured): past it the worker job is cancelled and
+  /// the job fails with objekt_timeout. Zero = no limit.
+  std::chrono::milliseconds objekt_deadline{std::chrono::minutes(30)};
+  /// Transient 3D status answers (5xx, a connection error, a non-JSON body)
+  /// tolerated in a row before the job fails.
+  int objekt_poll_retries{5};
   /// Preview poll for the progress of image jobs.
   std::chrono::milliseconds progress_poll{std::chrono::seconds(1)};
   /// Result media of finished, not kept jobs are deleted this long after

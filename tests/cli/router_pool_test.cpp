@@ -180,6 +180,8 @@ void TestGpuWorkModel() {
   CHECK(gufo::router::IsGpuWorkModel(model));
   model.argv = {"serve", "music"};
   CHECK(gufo::router::IsGpuWorkModel(model));
+  model.argv = {"serve", "objekt"};
+  CHECK(gufo::router::IsGpuWorkModel(model));
   model.argv = {"serve", "llm", "--model", "x"};
   CHECK(!gufo::router::IsGpuWorkModel(model));
   model.argv = {"--model", "image"};

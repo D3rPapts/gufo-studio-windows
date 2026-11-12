@@ -3534,6 +3534,13 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
   if (objekt_id.empty())
     throw JobFailure("the 3D response has no id", "upstream_error",
                      created.status);
+  // The id goes into the request path: word characters only (the worker's
+  // ids are obj_<24 hex>).
+  if (!std::all_of(objekt_id.begin(), objekt_id.end(), [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '_' || c == '-';
+      }))
+    throw JobFailure("the 3D response has an invalid id", "upstream_error",
+                     created.status);
   const std::string base_path = "/v1/3d/generations/" + objekt_id;
   // Status, content and cancel carry no model in the body: the router routes
   // them to the worker by the `model` query (like the music jobs), otherwise
@@ -3545,33 +3552,92 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     job->progress = 0;
     PersistLocked();
   }
+  // The cancel carries the job and pool-side headers like Call() (1.4.24);
+  // it is built here because Call() aborts at once for a cancelled job.
+  const auto cancel_worker = [&] {
+    HttpRequest cancel;
+    cancel.method = "DELETE";
+    cancel.path = base_path;
+    cancel.query = query;
+    cancel.request_id = job->id;
+    cancel.headers.emplace_back(kJobHeader, job->id);
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!job->side.empty())
+        cancel.headers.emplace_back(kPoolSideHeader, job->side);
+    }
+    try {
+      (void)options_.fetch(cancel);
+    } catch (const std::exception&) {
+    }
+  };
+  const auto started = std::chrono::steady_clock::now();
+  // Transient status answers in a row (5xx while the worker reloads or a
+  // relay hiccups, a connection error, a body that is no JSON).
+  int transient = 0;
   json::Value final_status;
   for (;;) {
     const auto until = std::chrono::steady_clock::now() + options_.video_poll;
     while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     if (job->cancel.load()) {
-      HttpRequest cancel;
-      cancel.method = "DELETE";
-      cancel.path = base_path;
-      cancel.query = query;
-      cancel.request_id = job->id;
-      try {
-        (void)options_.fetch(cancel);
-      } catch (const std::exception&) {
-      }
+      cancel_worker();
       throw Cancelled();
     }
-    HttpRequest poll;
-    poll.method = "GET";
-    poll.path = base_path;
-    poll.query = query;
-    poll.request_id = job->id;
-    const FetchResult state = options_.fetch(poll);
-    if (state.status != 200)
-      throw JobFailure("3D status failed: " + ErrorMessage(state),
-                       ErrorCode(state), state.status);
-    json::Value parsed = json::parse(state.body);
+    if (options_.objekt_deadline.count() > 0 &&
+        std::chrono::steady_clock::now() - started >=
+            options_.objekt_deadline) {
+      // A worker stuck on in_progress must not hold the job forever.
+      cancel_worker();
+      throw JobFailure(
+          "the 3D job did not finish within " +
+              std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                 options_.objekt_deadline)
+                                 .count()) +
+              " s",
+          "objekt_timeout", 504);
+    }
+    // Over Call(): job and pool-side headers, and a cancel interrupts a
+    // poll that hangs.
+    FetchResult state;
+    std::string problem;
+    json::Value parsed;
+    try {
+      state = Call(job, "GET", base_path, query, "", "");
+      if (state.status >= 500) {
+        problem = "status " + std::to_string(state.status) + ": " +
+                  ErrorMessage(state);
+      } else if (state.status != 200) {
+        throw JobFailure("3D status failed: " + ErrorMessage(state),
+                         ErrorCode(state), state.status);
+      } else {
+        try {
+          parsed = json::parse(state.body);
+        } catch (const std::exception& error) {
+          problem = std::string("no JSON status: ") + error.what();
+        }
+      }
+    } catch (const Cancelled&) {
+      cancel_worker();
+      throw;
+    } catch (const JobFailure&) {
+      throw;
+    } catch (const std::exception& error) {
+      problem = error.what();
+    }
+    if (!problem.empty()) {
+      if (++transient > options_.objekt_poll_retries)
+        throw JobFailure("3D status failed " + std::to_string(transient) +
+                             " times in a row: " + problem,
+                         state.status >= 500 ? ErrorCode(state)
+                                             : std::string("upstream_error"),
+                         state.status >= 500 ? state.status : 502);
+      Logger::Warn("jobs", "event=objekt_poll_retry job=" + job->id +
+                               " attempt=" + std::to_string(transient) +
+                               " detail=\"" + problem + "\"");
+      continue;
+    }
+    transient = 0;
     const std::string status = parsed.member_str("status");
     {
       const std::lock_guard<std::mutex> lock(mutex_);

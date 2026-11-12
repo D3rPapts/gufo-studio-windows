@@ -91,6 +91,16 @@ def serve_fake_worker(argv):
     lock = threading.Lock()
     videos = {}
     previews = {}  # id -> polls answered
+    # gufo serve objekt: id -> {"until": monotonic, "state": ..., "flaky": n}
+    objekte = {}
+
+    def objekt_status(objekt_id):
+        job = objekte[objekt_id]
+        if job["state"] == "in_progress" and time.monotonic() >= job["until"]:
+            job["state"] = "completed"
+        return {"id": objekt_id, "object": "3d.generation", "model": model,
+                "status": job["state"],
+                "progress": 100 if job["state"] == "completed" else 50}
 
     def log(entry):
         entry["model"] = model
@@ -137,9 +147,44 @@ def serve_fake_worker(argv):
                     return self.send(200, videos[rest[:-8]], "video/mp4")
                 return self.send(200, {"id": rest, "object": "video",
                                        "status": "completed", "progress": 100})
+            if path.startswith("/v1/3d/generations/"):
+                rest = path[len("/v1/3d/generations/"):]
+                objekt_id, _, part = rest.partition("/")
+                log({"path": "/v1/3d/generations/", "id": objekt_id,
+                     "part": part, "query": query})
+                with lock:
+                    if objekt_id not in objekte:
+                        return self.send(404, {"error": {"message": "unknown 3D job",
+                                                         "code": "not_found"}})
+                    job = objekte[objekt_id]
+                    if not part and job["flaky"] > 0:
+                        job["flaky"] -= 1
+                        return self.send(503, {"error": {"message": "loading",
+                                                         "code": "model_loading"}})
+                    status = objekt_status(objekt_id)
+                if not part:
+                    return self.send(200, status)
+                if status["status"] != "completed":
+                    return self.send(409, {"error": {"message": "not ready"}})
+                if part == "content":
+                    return self.send(200, b"glTF-fake-" + model.encode(),
+                                     "model/gltf-binary")
+                if part == "preview":
+                    return self.send(200, make_png(4, 4), "image/png")
             self.send(404, {"error": {"message": "no route"}})
 
         def do_DELETE(self):
+            path = self.path.split("?")[0]
+            if path.startswith("/v1/3d/generations/"):
+                objekt_id = path[len("/v1/3d/generations/"):]
+                log({"path": "DELETE /v1/3d/generations/", "id": objekt_id})
+                with lock:
+                    if objekt_id not in objekte:
+                        return self.send(404, {"error": {"message": "unknown 3D job",
+                                                         "code": "not_found"}})
+                    if objekte[objekt_id]["state"] == "in_progress":
+                        objekte[objekt_id]["state"] = "cancelled"
+                return self.send(200, {"id": objekt_id, "deleted": True})
             self.send(200, {"deleted": True})
 
         def image_reply(self, fields, size, count):
@@ -192,6 +237,21 @@ def serve_fake_worker(argv):
                 fields = json.loads(raw)
                 log({"path": path, "fields": fields})
                 return self.send(200, make_wav(0.5, 48000), "audio/wav")
+            if path == "/v1/3d/generations":
+                # fake_seconds: how long the job stays in_progress;
+                # fake_flaky: status polls answered 503 first.
+                fields = json.loads(raw)
+                log({"path": path, "fields": {k: v for k, v in fields.items()
+                                              if k != "image"}})
+                objekt_id = "obj_" + os.urandom(12).hex()
+                with lock:
+                    objekte[objekt_id] = {
+                        "until": time.monotonic() + float(fields.get("fake_seconds", 0.3)),
+                        "state": "in_progress",
+                        "flaky": int(fields.get("fake_flaky", 0))}
+                return self.send(202, {"id": objekt_id, "object": "3d.generation",
+                                       "model": model, "status": "queued",
+                                       "progress": 0})
             if path == "/v1/videos":
                 fields = json.loads(raw)
                 def describe(url):

@@ -196,6 +196,10 @@ struct FakeApi {
   bool video_deleted{false};
   bool objekt_deleted = false;
   int objekt_polls = 0;
+  /// 3D status polls answered 503 before the real answer (a reloading
+  /// worker), and the X-Gufo-Job header of every 3D poll and cancel.
+  int objekt_flaky = 0;
+  std::vector<std::string> objekt_job_headers;
   int unreachable_calls{0};
   /// Music: the async job stays in_progress while set.
   std::atomic<bool> music_hold{false};
@@ -414,6 +418,10 @@ struct FakeApi {
       result.body = R"({"error":{"message":"no route for this path","code":"not_found"}})";
       return result;
     }
+    if (request.path.starts_with("/v1/3d/generations/obj_1")) {
+      const std::lock_guard<std::mutex> lock(mutex);
+      objekt_job_headers.push_back(request.header(jobs::kJobHeader));
+    }
     if (request.method == "DELETE" && request.path == "/v1/3d/generations/obj_1") {
       const std::lock_guard<std::mutex> lock(mutex);
       objekt_deleted = true;
@@ -422,6 +430,12 @@ struct FakeApi {
     }
     if (request.method == "GET" && request.path == "/v1/3d/generations/obj_1") {
       const std::lock_guard<std::mutex> lock(mutex);
+      if (objekt_flaky > 0) {
+        --objekt_flaky;
+        result.status = 503;
+        result.body = R"({"error":{"message":"loading","code":"model_loading"}})";
+        return result;
+      }
       ++objekt_polls;
       result.body =
           release.load() || objekt_polls < 3
@@ -494,6 +508,8 @@ struct Harness {
   std::function<std::optional<json::Value>()> partner_capabilities;
   std::string self_name;
   std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
+  /// Set before Open(true): the 3D poll limit (zero keeps the default).
+  std::chrono::milliseconds objekt_deadline{0};
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -540,6 +556,8 @@ struct Harness {
     options.self_name = self_name;
     options.pull_poll = std::chrono::milliseconds(20);
     options.pull_hold = pull_hold;
+    if (objekt_deadline.count() > 0)
+      options.objekt_deadline = objekt_deadline;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -813,6 +831,49 @@ void TestObjektCancel() {
   }
   h.Call("DELETE", "/v1/jobs/" + id);
   h.WaitFor(id, "cancelled");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->objekt_deleted);
+  // Polls and the cancel carry the job header like Call() (1.4.24, M2).
+  CHECK(!h.api->objekt_job_headers.empty());
+  for (const std::string& header : h.api->objekt_job_headers)
+    CHECK(header == id);
+}
+
+// 1.4.24 (M1): a few 503 status answers (worker reloading) are tolerated.
+void TestObjektTransient() {
+  Harness h("objekt-transient", false);
+  h.api->objekt_flaky = 3;
+  h.queue->Start();
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  h.WaitFor(id, "completed");
+}
+
+// More 503 answers in a row than tolerated fail the job.
+void TestObjektTransientGivesUp() {
+  Harness h("objekt-giveup", false);
+  h.api->objekt_flaky = 100;
+  h.queue->Start();
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  const json::Value failed = h.WaitFor(id, "failed");
+  CHECK(failed.find("error")->member_str("code") == "model_loading");
+}
+
+// 1.4.24 (M1): a worker stuck on in_progress fails the job at the deadline
+// and gets the cancel.
+void TestObjektDeadline() {
+  Harness h("objekt-deadline", false);
+  h.objekt_deadline = std::chrono::milliseconds(200);
+  h.Open(true);
+  h.api->release.store(true);  // never completes
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  const json::Value failed = h.WaitFor(id, "failed");
+  CHECK(failed.find("error")->member_str("code") == "objekt_timeout");
   const std::lock_guard<std::mutex> lock(h.api->mutex);
   CHECK(h.api->objekt_deleted);
 }
@@ -2338,6 +2399,9 @@ int main() {
   TestVideoCancel();
   TestObjekt();
   TestObjektCancel();
+  TestObjektTransient();
+  TestObjektTransientGivesUp();
+  TestObjektDeadline();
   TestWebhook();
   TestWebhookGivesUp();
   TestIdempotency();
