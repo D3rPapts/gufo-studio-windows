@@ -2836,9 +2836,27 @@ public:
     }
   }
 
+  /// Why `model_id` cannot be loaded here right now (state mutex held):
+  /// a pool load or admission failure within kPoolLocalFailHold, or a
+  /// failed autoload still waiting for its retry; "" when it can.
+  std::string UnavailableLocked(const std::string& model_id,
+                                std::string_view status) const {
+    if (const auto it = pool_.find(model_id);
+        it != pool_.end() && it->second.local_failed &&
+        std::chrono::steady_clock::now() - it->second.local_failed_at <
+            router::kPoolLocalFailHold)
+      return "local load failed";
+    if (const auto it = autoload_failed.find(model_id);
+        it != autoload_failed.end() && status != "loaded")
+      return "autoload failed: " + it->second.error;
+    return "";
+  }
+
   /// GET /router/capabilities: what this router can run, for the partner's
   /// pool decision and shared queue: per model its modality, placement,
-  /// state and the LoRA names of its preset (`lora = name=path` lines).
+  /// state, the LoRA names of its preset (`lora = name=path` lines) and
+  /// whether it can be loaded now ("available"; false with "unavailable"
+  /// while a load failure holds, which the shared queue's pulls honour).
   json::Value Capabilities() {
     json::Value models = json::Value::object();
     {
@@ -2851,6 +2869,10 @@ public:
         model["switchable"] = preset->switchable;
         model["status"] = std::string(status);
         model["loaded"] = status == "loaded";
+        const std::string unavailable = UnavailableLocked(preset->id, status);
+        model["available"] = unavailable.empty();
+        if (!unavailable.empty())
+          model["unavailable"] = unavailable;
         json::Value loras = json::Value::array();
         for (const std::string& name : router::LoraNamesOf(*preset))
           loras.push_back(name);

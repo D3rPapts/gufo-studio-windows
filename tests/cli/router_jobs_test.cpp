@@ -1827,6 +1827,18 @@ void TestLoraNamesAndCanRun() {
   CHECK(why.find("none registered") != std::string::npos);
   // The "models" object alone works too.
   CHECK(jobs::CanRun(*CapsB().find("models"), "qwen-image", {"winkel"}));
+  // "available": false (a load failure holds): capable, but not now.
+  const json::Value failed = json::parse(
+      R"({"models":{"qwen-image":{"placement":"pool","loras":["anime"],)"
+      R"("available":false,"unavailable":"local load failed"},)"
+      R"("minimax-h3":{"placement":"pool","loras":[],"available":true}}})");
+  CHECK(jobs::CanRun(failed, "qwen-image", {"anime"}, &why));
+  CHECK(!jobs::CanRun(failed, "qwen-image", {"anime"}, &why, /*now=*/true));
+  CHECK(why.find("cannot load model 'qwen-image' now (local load failed)") !=
+        std::string::npos);
+  CHECK(jobs::CanRun(failed, "minimax-h3", {}, &why, /*now=*/true));
+  // Older routers send no field: may run.
+  CHECK(jobs::CanRun(CapsA(), "qwen-image", {"anime"}, &why, /*now=*/true));
 }
 
 void TestCapabilityRouting() {
@@ -2186,6 +2198,12 @@ void TestPoolPullOwner() {
   };
   // A requester without the model gets nothing.
   CHECK(pull(R"({"models":{"minimax-h3":{"placement":"pool","loras":[]}}})")
+            .find("job")
+            ->is_null());
+  // Nor one whose own load of the model just failed (12.11. 17:51: the
+  // .198 pulled a qwen-image job 72 s after its own load failed with 502).
+  CHECK(pull(R"({"models":{"qwen-image":{"placement":"pool","loras":[],)"
+             R"("available":false,"unavailable":"local load failed"}}})")
             .find("job")
             ->is_null());
   // Without the winkel LoRA: the second job (the first is running).

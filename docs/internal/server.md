@@ -803,6 +803,16 @@ or 3D model with work in flight) and no pool request is claimed or
 waiting here. Before, an idle runner was enough, and a machine busy with
 ComfyUI pulled jobs that then waited in its pool.
 
+**Load failures in the capabilities.** Each model in `GET
+/router/capabilities` carries `"available": true|false`; `false` with
+`"unavailable": "local load failed"` while a pool load or admission
+failure holds (60 s) or `"autoload failed: <error>"` while a failed
+autoload waits for its retry. Pulls honour it on both ends: the
+requester does not pull such a model and the owner hands it no job for
+it. Submitting a job and the pool's LoRA check stay capability-only, so a
+passing failure never turns into `400 no_capable_router`. A router older
+than this sends no field, which counts as available.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

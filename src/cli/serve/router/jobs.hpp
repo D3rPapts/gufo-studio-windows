@@ -360,9 +360,13 @@ std::vector<std::string> LoraNames(const json::Value& body);
 /// /router/capabilities, or the whole answer) can run a job: the model is
 /// served there, not placed remote, and every LoRA is registered. *why
 /// (optional) gets the reason ("no model 'x'", "no LoRA 'winkel'").
+/// `now` (pulls of the shared queue): also not while the router reports
+/// the model `"available": false` (a load failure holds). Without it the
+/// answer is about capability only (submit, pool LoRA check), so a
+/// passing failure never refuses a job with 400.
 bool CanRun(const json::Value& capabilities, const std::string& model,
             const std::vector<std::string>& loras,
-            std::string* why = nullptr);
+            std::string* why = nullptr, bool now = false);
 
 // ------------------------------------------------- video concat helpers
 

@@ -180,6 +180,8 @@ def check_lora_side(router, remote):
     # One "lora = a=..;b=.." line registers both names (gufo 2.0 form).
     code, caps = router.json("GET", "/router/capabilities")
     assert code == 200 and caps["models"]["twin"]["loras"] == ["a", "b"], caps
+    assert caps["models"]["twin"]["available"] is True, caps
+    assert "unavailable" not in caps["models"]["twin"], caps
     remote.clear()
     code, answer = lora_chat(router, "b")
     assert code == 200 and rp.where(answer) == "local", (code, answer)

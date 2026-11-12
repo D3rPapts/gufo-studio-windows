@@ -1441,7 +1441,8 @@ std::vector<std::string> LoraNames(const json::Value& body) {
 }
 
 bool CanRun(const json::Value& capabilities, const std::string& model,
-            const std::vector<std::string>& loras, std::string* why) {
+            const std::vector<std::string>& loras, std::string* why,
+            bool now) {
   const json::Value* models = capabilities.find("models");
   if (models == nullptr || !models->is_object())
     models = &capabilities;
@@ -1455,6 +1456,19 @@ bool CanRun(const json::Value& capabilities, const std::string& model,
     if (why != nullptr)
       *why = "has model '" + model + "' placed remote";
     return false;
+  }
+  if (now) {
+    // A load failure holds there (older routers send no field: may).
+    const json::Value* available = entry->find("available");
+    if (available != nullptr && available->is_bool() &&
+        !available->as_bool()) {
+      if (why != nullptr) {
+        const std::string reason = entry->member_str("unavailable");
+        *why = "cannot load model '" + model + "' now" +
+               (reason.empty() ? "" : " (" + reason + ")");
+      }
+      return false;
+    }
   }
   const json::Value* have = entry->find("loras");
   for (const std::string& need : loras) {
@@ -2836,7 +2850,8 @@ bool JobQueue::TryPull(long long mine_created_at) {
   for (const PartnerJob& candidate : *queued) {
     if (mine_created_at > 0 && candidate.created_at >= mine_created_at)
       break;  // ours is older: it goes first
-    if (!CanRun(mine, candidate.model, candidate.loras))
+    if (!CanRun(mine, candidate.model, candidate.loras, nullptr,
+                /*now=*/true))
       continue;
     // The runner is free, but the GPU may not be (12.11.: the .56 pulled
     // while ComfyUI and the film ran there).
@@ -3027,7 +3042,7 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
       if (entry == nullptr || !entry->is_object() ||
           entry->member_str("placement") != "pool")
         continue;
-      if (!CanRun(*caps, job->model, job->loras))
+      if (!CanRun(*caps, job->model, job->loras, nullptr, /*now=*/true))
         continue;
       if (waiting) {
         // The router redirects the waiting request (503 pool_redirected)
