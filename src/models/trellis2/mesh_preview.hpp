@@ -18,6 +18,8 @@ struct PreviewOptions {
     float pitch_degrees = 20.f;      // camera elevation
     std::uint8_t background[3] = {245, 245, 245};
     std::uint8_t colour[3] = {200, 160, 110};
+    // Optional per-vertex RGBA in [0, 1] ([vertices * 4]): faces take the mean of their vertices.
+    const std::vector<float>* vertex_colors = nullptr;
 };
 
 // Axis-aligned bounds of the mesh; false (zeros) for an empty mesh.

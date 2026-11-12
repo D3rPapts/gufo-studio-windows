@@ -262,8 +262,13 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     Mesh mesh = dual_grid_to_mesh(in, &st);
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
-    const HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);
+    HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);
     result->holes_filled = hf.filled;
+    result->open_loops = hf.skipped_large + hf.skipped_nonmanifold;
+    hf.skipped_perimeters.resize(std::min<std::size_t>(hf.skipped_perimeters.size(), 5));
+    result->largest_open_loops = std::move(hf.skipped_perimeters);
+    { std::vector<float>().swap(dual); std::vector<float>().swap(wgt); std::vector<std::uint8_t>().swap(inter); }   // host RAM
+    std::vector<float>().swap(dec.outputs);
     report("mesh", 2, 3);
     if (o.max_faces > 0 && mesh.faces.size() > static_cast<std::size_t>(o.max_faces))
         mesh = decimate_mesh(mesh, static_cast<std::size_t>(o.max_faces));
@@ -300,6 +305,7 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     if (o.preview) {
         PreviewOptions po;
         po.size = o.preview_size;
+        if (!colours.empty()) po.vertex_colors = &colours;
         int pw, ph;
         const auto rgb = render_preview(mesh, po, &pw, &ph);
         result->preview_png = encode_png_rgb(rgb.data(), pw, ph);

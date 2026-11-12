@@ -719,7 +719,12 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << name << ": " << r.structure_voxels << " structure voxels, " << r.shape_voxels << " shape voxels, mesh "
               << r.faces_before_decimation << " -> " << r.faces << " faces, " << r.vertices << " vertices, holes filled " << r.holes_filled
-              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", volume " << r.volume << '\n';
+              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", open loops " << r.open_loops << ", volume " << r.volume << '\n';
+    if (!r.largest_open_loops.empty()) {
+        std::cout << "  largest open loops (perimeter):";
+        for (float p : r.largest_open_loops) std::cout << ' ' << p;
+        std::cout << '\n';
+    }
     std::cout << "  seconds: encode " << r.seconds_encode << " structure " << r.seconds_structure << " shape " << r.seconds_shape
               << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " total " << ms_since(t0) / 1000 << '\n';
     std::ofstream glb(std::filesystem::path(out) / (name + "-trellis2.glb"), std::ios::binary);

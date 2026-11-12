@@ -90,6 +90,11 @@ std::vector<std::uint8_t> render_preview(const Mesh& mesh, const PreviewOptions&
             if (nz < 0.f) lambert = -lambert;  // two-sided: back faces lit as if flipped
             lambert = std::max(0.f, lambert);
             const float shade = 0.25f + 0.75f * lambert;
+            float base[3] = {static_cast<float>(o.colour[0]), static_cast<float>(o.colour[1]), static_cast<float>(o.colour[2])};
+            if (o.vertex_colors && o.vertex_colors->size() == mesh.vertices.size() * 4)
+                for (int ch = 0; ch < 3; ++ch)
+                    base[ch] = 255.f * ((*o.vertex_colors)[f[0] * 4 + static_cast<std::size_t>(ch)] + (*o.vertex_colors)[f[1] * 4 + static_cast<std::size_t>(ch)] +
+                                        (*o.vertex_colors)[f[2] * 4 + static_cast<std::size_t>(ch)]) / 3.f;
             const int x0 = std::max(0, static_cast<int>(std::floor(std::min({a.x, b.x, c.x}))));
             const int x1 = std::min(S - 1, static_cast<int>(std::ceil(std::max({a.x, b.x, c.x}))));
             const int y0 = std::max(0, static_cast<int>(std::floor(std::min({a.y, b.y, c.y}))));
@@ -108,7 +113,7 @@ std::vector<std::uint8_t> render_preview(const Mesh& mesh, const PreviewOptions&
                     if (z <= zb) continue;
                     zb = z;
                     std::uint8_t* px_out = rgb.data() + (static_cast<std::size_t>(y) * static_cast<std::size_t>(*width) + static_cast<std::size_t>(view * S + x)) * 3;
-                    for (int ch = 0; ch < 3; ++ch) px_out[ch] = static_cast<std::uint8_t>(std::min(255.f, o.colour[ch] * shade));
+                    for (int ch = 0; ch < 3; ++ch) px_out[ch] = static_cast<std::uint8_t>(std::min(255.f, base[ch] * shade));
                 }
         }
     }

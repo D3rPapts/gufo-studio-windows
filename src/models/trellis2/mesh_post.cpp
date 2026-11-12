@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -63,7 +64,7 @@ HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
             const MeshVertex& q = mesh->vertices[loop[(i + 1) % loop.size()]];
             perimeter += std::sqrt(static_cast<double>(p.x - q.x) * (p.x - q.x) + static_cast<double>(p.y - q.y) * (p.y - q.y) + static_cast<double>(p.z - q.z) * (p.z - q.z));
         }
-        if (perimeter > max_perimeter) { ++st.skipped_large; continue; }
+        if (perimeter > max_perimeter) { ++st.skipped_large; st.skipped_perimeters.push_back(static_cast<float>(perimeter)); continue; }
         if (loop.size() == 3) {
             // loop runs b->a... (opposite to the face side): the triangle (l0, l1, l2) closes it.
             mesh->faces.push_back({loop[0], loop[1], loop[2]});
@@ -77,6 +78,7 @@ HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
         }
         ++st.filled;
     }
+    std::sort(st.skipped_perimeters.begin(), st.skipped_perimeters.end(), std::greater<float>());
     return st;
 }
 

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 #include "src/models/trellis2/mesh.hpp"
 
@@ -13,6 +14,7 @@ namespace gufo::trellis2 {
 
 struct HoleFillStats {
     std::size_t loops = 0, filled = 0, skipped_large = 0, skipped_nonmanifold = 0;
+    std::vector<float> skipped_perimeters;   // perimeters of the loops left open (sorted descending)
 };
 
 // Fills boundary loops whose perimeter is below `max_perimeter` (object units). Returns stats.
