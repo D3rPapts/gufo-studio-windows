@@ -54,6 +54,10 @@ struct AdapterOptions {
   /// ffmpeg for FLAC output, PNG frames from videos and non-WAV voice
   /// references; empty = WAV output, no frame extraction.
   std::filesystem::path ffmpeg;
+  /// ffprobe (next to ffmpeg): the frame rate of a LoadVideo file that is
+  /// only interpolated / upscaled, so RIFE x5 of a 12 fps shot is 60 fps.
+  /// Empty = 24 fps assumed.
+  std::filesystem::path ffprobe;
   ModelIds models;
   Fetch fetch;
   /// POST /free: unloads idle workers. Optional.
@@ -124,6 +128,8 @@ private:
 
   std::filesystem::path FilePath(const FileRef& ref) const;
   std::string ReadFileRef(const FileRef& ref) const;
+  /// Frame rate of a LoadVideo file (AdapterOptions::ffprobe); 0 = unknown.
+  double ProbeSourceFps(const FileRef& ref) const;
   json::Value SaveBytes(const OutputTarget& target, std::string_view extension,
                         const std::string& bytes);
   json::Value SaveVideoFrames(const OutputTarget& target,

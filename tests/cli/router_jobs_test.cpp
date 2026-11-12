@@ -2070,6 +2070,56 @@ void TestPoolPullOwner() {
   CHECK(h.queue->Handle(bad)->status == 404);
 }
 
+void TestReachableUrl() {
+  // A router bound to 0.0.0.0 must not name itself so (12.11. 06:59: the
+  // .198 pulled an ACE job and logged to=http://0.0.0.0:8081).
+  CHECK(jobs::IsUnreachableUrl(""));
+  CHECK(jobs::IsUnreachableUrl("http://0.0.0.0:8081"));
+  CHECK(jobs::IsUnreachableUrl("http://[::]:8081"));
+  CHECK(jobs::IsUnreachableUrl("http://::"));
+  CHECK(jobs::IsUnreachableUrl("http://:8081"));
+  CHECK(!jobs::IsUnreachableUrl("http://192.168.100.56:8081"));
+  CHECK(!jobs::IsUnreachableUrl("http://evo56:8081/"));
+  CHECK(jobs::ReachableUrl("http://0.0.0.0:8081", "http://192.168.100.56:8081") ==
+        "http://192.168.100.56:8081");
+  CHECK(jobs::ReachableUrl("http://10.0.0.1:8081", "x") ==
+        "http://10.0.0.1:8081");
+  // The route toward a loopback partner leaves from 127.0.0.1.
+  CHECK(jobs::LocalUrlToward("http://127.0.0.1:8081", 8082) ==
+        "http://127.0.0.1:8082");
+  // Without a partner: the computer's name, never a bind-all address.
+  const std::string own = jobs::LocalUrlToward("", 8081);
+  CHECK(own.starts_with("http://") && own.ends_with(":8081"));
+  CHECK(!jobs::IsUnreachableUrl(own));
+}
+
+void TestPoolPullBindAddress() {
+  // A requester bound to 0.0.0.0 sends "from": "http://0.0.0.0:8081"; the
+  // owner shows the partner URL it knows as running_on instead (1.4.22).
+  Harness h("pull-bind", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.partner_name = "http://10.0.0.1:8081";
+  h.Open(true);
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string second =
+      h.Submit(ImageJob("SLOW second")).member_str("id");
+  HttpRequest request;
+  request.method = "POST";
+  request.path = jobs::kPullPath;
+  request.body =
+      R"({"from":"http://0.0.0.0:8081","router_id":"ra","capabilities":{"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+  request.headers.emplace_back("Content-Type", "application/json");
+  request.headers.emplace_back(jobs::kRelayHeader, "1");
+  const auto answer = h.queue->Handle(request);
+  CHECK(answer && answer->status == 200);
+  CHECK(answer && json::parse(answer->body).member_str("job") == second);
+  const json::Value view =
+      json::parse(h.Call("GET", "/v1/jobs/" + second).body);
+  CHECK(view.member_str("running_on") == "http://10.0.0.1:8081");
+}
+
 void TestPoolWaitTakeover() {
   // Router B with two runners busy: a job in_progress whose request waits
   // in the pool ("both busy") counts as queued for the shared queue,
@@ -2223,6 +2273,8 @@ int main() {
   TestPoolPullRequester();
   TestPoolPullOldPartner();
   TestPoolPullOwner();
+  TestReachableUrl();
+  TestPoolPullBindAddress();
   TestPoolWaitTakeover();
   TestPoolPullWaitingRequester();
   if (failures != 0) {

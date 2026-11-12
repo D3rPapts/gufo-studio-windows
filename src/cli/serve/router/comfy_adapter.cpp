@@ -38,6 +38,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
+#include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/websocket.hpp"
 
@@ -538,7 +539,8 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
     job->extra_data["client_id"] = job->client_id;
   job->extra_data["create_time"] = NowMs();
   PlanError plan_error;
-  if (!BuildPlan(job->prompt, options_.models, &job->plan, &plan_error)) {
+  if (!BuildPlan(job->prompt, options_.models, &job->plan, &plan_error,
+                 [this](const FileRef& ref) { return ProbeSourceFps(ref); })) {
     Logger::Warn("comfy", "event=prompt_rejected type=" + plan_error.type +
                               " message=" + plan_error.message);
     json::Value error = json::Value::object();
@@ -732,6 +734,26 @@ std::string Adapter::ReadFileRef(const FileRef& ref) const {
     throw std::runtime_error("file not found: " + ref.name + " [" + ref.folder +
                              "]");
   return ReadAll(path);
+}
+
+double Adapter::ProbeSourceFps(const FileRef& ref) const {
+  if (options_.ffprobe.empty())
+    return 0;
+  const fs::path path = FilePath(ref);
+  std::error_code ec;
+  if (path.empty() || !fs::is_regular_file(path, ec))
+    return 0;  // the missing file is reported after the plan
+  std::string error;
+  const double fps = jobs::ProbeFrameRate(options_.ffprobe, path, &error);
+  if (fps > 0) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.3f", fps);
+    Logger::Info("comfy", "event=source_fps file=" + ref.name + " fps=" + text);
+  } else {
+    Logger::Warn("comfy", "event=source_fps_unknown file=" + ref.name +
+                              " error=" + error + " (24 fps assumed)");
+  }
+  return fps;
 }
 
 HttpResponse Adapter::View(const HttpRequest& request) {

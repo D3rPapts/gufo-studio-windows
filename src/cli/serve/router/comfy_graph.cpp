@@ -2506,6 +2506,51 @@ int RoundEven(double value) {
   return std::max(2, static_cast<int>(std::lround(value / 2.0)) * 2);
 }
 
+/// Frame rates within 0.5 % of each other count as the same (59.94 ~ 60,
+/// 23.976 ~ 24, an ffprobe 11.9988 ~ 12).
+constexpr double kFpsTolerance = 0.005;
+
+bool SameFps(double a, double b) {
+  return a > 0 && b > 0 && std::abs(a - b) <= kFpsTolerance * std::max(a, b);
+}
+
+/// "60" or "59.94".
+std::string FpsText(double fps) {
+  if (std::abs(fps - std::round(fps)) < 1e-6)
+    return std::to_string(static_cast<int>(std::lround(fps)));
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.3g", fps);
+  return buf;
+}
+
+/// The rate the frames of `video` come at before RIFE: the family's rate,
+/// or for a loaded video (kProcess) the file's probed rate; 24 when the
+/// adapter could not probe it.
+double SourceFps(const VideoTask& video) {
+  if (video.family == VideoFamily::kProcess && video.source_fps > 0)
+    return video.source_fps;
+  return VideoFamilyFps(video.family);
+}
+
+/// Two outputs of one video job agree when they ask for the same RIFE
+/// multiplier and upscale; a target frame rate (a SaveVideo's CreateVideo
+/// fps) only has to agree with another target rate, up to fps rounding. An
+/// output without one (SaveImage, or a video at the RIFE rate) takes the
+/// job's frames as they are.
+/// Empty when they agree, else what differs.
+std::string DeliveryConflict(const Delivery& a, const Delivery& b) {
+  if (a.multiplier != b.multiplier)
+    return "RIFE multiplier x" + std::to_string(a.multiplier) + " vs x" +
+           std::to_string(b.multiplier);
+  if (a.upscale != b.upscale)
+    return "upscale";
+  const double fps_a = static_cast<double>(a.fps_num) / a.fps_den;
+  const double fps_b = static_cast<double>(b.fps_num) / b.fps_den;
+  if (a.fps_num > 0 && b.fps_num > 0 && !SameFps(fps_a, fps_b))
+    return "frame rate " + FpsText(fps_a) + " vs " + FpsText(fps_b);
+  return "";
+}
+
 /// RIFE VFI, ImageUpscaleWithModel and ImageScale / ImageScaleBy between
 /// the decode of `video` and output `id` (`upstream` = its ancestors).
 Delivery DeliveryOf(const Graph& graph, const std::string& id,
@@ -2538,7 +2583,12 @@ Delivery DeliveryOf(const Graph& graph, const std::string& id,
                         "ImageUpscaleWithModel on a video");
     return delivery;
   }
-  const int base = VideoFamilyFps(video->family);
+  // The rate the frames come at: the family's rate, or for a loaded video
+  // (kProcess) the file's own rate when the adapter probed it (24 assumed
+  // otherwise). 1.4.22: before, a 12 fps shot x5 with CreateVideo at 60
+  // counted as 24 x5 = 120 -> "resample to 60", and the SaveImage output of
+  // the same job (no rate) then differed -> "same RIFE interpolation".
+  const double base = SourceFps(*video);
   if (!rife.empty()) {
     if (rife.size() > 1)
       throw NodeFailure(rife.back(), "unsupported_link",
@@ -2572,15 +2622,16 @@ Delivery DeliveryOf(const Graph& graph, const std::string& id,
         fps_node = node_id;
       }
   }
-  const double natural = static_cast<double>(base * delivery.multiplier);
-  if (out_fps > 0 && std::abs(out_fps - natural) > 1e-6) {
-    if (rife.empty() || out_fps <= base) {
+  const double natural = base * delivery.multiplier;
+  // A rate that is the RIFE rate up to fps rounding (59.94 for 60, 23.976
+  // for 24, a probed 12.0003 source) is the RIFE rate, not a resample.
+  if (out_fps > 0 && !SameFps(out_fps, natural)) {
+    if (rife.empty() || out_fps <= base + kFpsTolerance * base) {
       // A rate at or below the generated one (e.g. CreateVideo left at 16 or
       // 24 after RIFE) is not a delivery rate: keep real time.
       warnings->push_back(
           "node " + fps_node + ": fps " + std::to_string(out_fps) +
-          " ignored; gufo writes " +
-          std::to_string(static_cast<int>(natural)) +
+          " ignored; gufo writes " + FpsText(natural) +
           " fps at the original speed" +
           (rife.empty() ? " (add a RIFE VFI node to resample)" : ""));
     } else {
@@ -3194,7 +3245,7 @@ std::optional<std::string> ProcessSource(const Graph& graph,
 }  // namespace
 
 bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
-               PlanError* error) {
+               PlanError* error, const SourceFpsProbe& source_fps) {
   *plan = Plan{};
   if (!original.is_object() || original.empty()) {
     error->type = "invalid_prompt";
@@ -3340,6 +3391,10 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                   : models.h3;
           video.source_video =
               ParseFileRef(graph.Str(generator, "file"), "input");
+          // The file's frame rate (ffprobe through the adapter): the RIFE
+          // rate is multiplier x this, not x 24. 0 = unknown.
+          if (source_fps)
+            video.source_fps = source_fps(*video.source_video);
           task.spec = std::move(video);
         } else if (IsFoley(task.class_type)) {
           task.spec = BuildFoley(graph, generator, models, &plan->warnings);
@@ -3413,22 +3468,26 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
             DeliveryOf(graph, id, upstream, video, &plan->warnings);
         if (video != nullptr) {
           auto& seen = delivery_of[found->second];
-          if (seen && !(*seen == delivery))
-            throw NodeFailure(id, "unsupported_link",
-                              "outputs of one video need the same RIFE "
-                              "interpolation and upscale (gufo interpolates "
-                              "and upscales the whole job)");
-          seen = delivery;
-          video->interpolate = delivery.multiplier;
-          video->fps_num = delivery.fps_num;
-          video->fps_den = delivery.fps_den;
-          video->upscale = delivery.upscale;
-          const int base = VideoFamilyFps(video->family);
-          video->fps = delivery.fps_num > 0
-                           ? static_cast<int>(std::lround(
-                                 static_cast<double>(delivery.fps_num) /
-                                 delivery.fps_den))
-                           : base * delivery.multiplier;
+          if (seen) {
+            const std::string conflict = DeliveryConflict(*seen, delivery);
+            if (!conflict.empty())
+              throw NodeFailure(id, "unsupported_link",
+                                "outputs of one video need the same RIFE "
+                                "interpolation and upscale (gufo "
+                                "interpolates and upscales the whole job): " +
+                                    conflict);
+          }
+          // The first target rate wins; an output without one joins it.
+          if (!seen || (seen->fps_num == 0 && delivery.fps_num > 0))
+            seen = delivery;
+          video->interpolate = seen->multiplier;
+          video->fps_num = seen->fps_num;
+          video->fps_den = seen->fps_den;
+          video->upscale = seen->upscale;
+          video->fps = static_cast<int>(std::lround(
+              seen->fps_num > 0 ? static_cast<double>(seen->fps_num) /
+                                      seen->fps_den
+                                : SourceFps(*video) * seen->multiplier));
         }
       }
       if (cls == "VHS_VideoCombine") {
