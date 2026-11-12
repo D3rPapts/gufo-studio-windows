@@ -218,6 +218,10 @@ std::unique_ptr<SparseDecHip> SparseDecHip::Create(const std::filesystem::path& 
         impl->shape.outputs = impl->weights.Get("output_layer.weight").shape[0];
         impl->shape.pred_subdiv = impl->weights.Contains("blocks.0.4.to_subdiv.weight");
         impl->rt.SetCacheLimit(std::size_t{1} << 30);
+        if (!impl->rt.UploadMissing("")) {
+            if (error) *error = "TRELLIS.2 sparse decoder: weight upload failed for " + file.string();
+            return nullptr;
+        }
         return std::unique_ptr<SparseDecHip>(new SparseDecHip(std::move(impl)));
     } catch (const std::exception& e) {
         if (error) *error = std::string("TRELLIS.2 sparse decoder: ") + e.what();

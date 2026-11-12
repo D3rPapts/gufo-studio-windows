@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_map>
+#include <vector>
 
 #include "src/models/trellis2/config.hpp"
 
@@ -89,16 +89,22 @@ Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats) {
 }
 
 std::size_t count_boundary_edges(const Mesh& mesh) {
-    std::unordered_map<std::uint64_t, int> edges;
+    // Undirected edge keys sorted: a boundary edge appears exactly once.
+    std::vector<std::uint64_t> edges;
     edges.reserve(mesh.faces.size() * 3);
     for (const auto& f : mesh.faces)
         for (int e = 0; e < 3; ++e) {
             const std::uint32_t a = f[static_cast<std::size_t>(e)], b = f[static_cast<std::size_t>((e + 1) % 3)];
-            const std::uint64_t key = (static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
-            ++edges[key];
+            edges.push_back((static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b));
         }
+    std::sort(edges.begin(), edges.end());
     std::size_t open = 0;
-    for (const auto& [k, c] : edges) open += c == 1;
+    for (std::size_t i = 0; i < edges.size();) {
+        std::size_t j = i + 1;
+        while (j < edges.size() && edges[j] == edges[i]) ++j;
+        open += (j - i) == 1;
+        i = j;
+    }
     return open;
 }
 

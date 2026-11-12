@@ -16,21 +16,29 @@ namespace gufo::trellis2 {
 
 HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {
     HoleFillStats st;
-    // Directed edges a->b of the faces; an edge is a boundary edge when its reverse b->a is absent.
-    std::unordered_map<std::uint64_t, std::uint32_t> directed;   // key(a,b) -> count
-    directed.reserve(mesh->faces.size() * 3);
-    auto key = [](std::uint32_t a, std::uint32_t b) { return (static_cast<std::uint64_t>(a) << 32) | b; };
-    for (const auto& f : mesh->faces)
-        for (int e = 0; e < 3; ++e) ++directed[key(f[static_cast<std::size_t>(e)], f[static_cast<std::size_t>((e + 1) % 3)])];
-    // Boundary edges a->b (face side); the hole loop runs b->a. next[b] = a; vertices with more
+    // Directed edges a->b of the faces, sorted; an edge is a boundary edge when it occurs once
+    // and its reverse b->a is absent. The hole loop runs b->a: next[b] = a. Vertices with more
     // than one outgoing boundary edge are non-manifold -> their loops are skipped.
+    auto key = [](std::uint32_t a, std::uint32_t b) { return (static_cast<std::uint64_t>(a) << 32) | b; };
+    std::vector<std::uint64_t> directed;
+    directed.reserve(mesh->faces.size() * 3);
+    for (const auto& f : mesh->faces)
+        for (int e = 0; e < 3; ++e) directed.push_back(key(f[static_cast<std::size_t>(e)], f[static_cast<std::size_t>((e + 1) % 3)]));
+    std::sort(directed.begin(), directed.end());
+    auto present = [&](std::uint64_t k) { return std::binary_search(directed.begin(), directed.end(), k); };
     std::unordered_map<std::uint32_t, std::uint32_t> next;
     std::unordered_map<std::uint32_t, int> out_degree;
-    for (const auto& [k, c] : directed) {
-        const std::uint32_t a = static_cast<std::uint32_t>(k >> 32), b = static_cast<std::uint32_t>(k & 0xFFFFFFFFu);
-        if (c != 1 || directed.count(key(b, a))) continue;
-        next[b] = a;
-        ++out_degree[b];
+    for (std::size_t i = 0; i < directed.size();) {
+        std::size_t j = i + 1;
+        while (j < directed.size() && directed[j] == directed[i]) ++j;
+        if (j - i == 1) {
+            const std::uint32_t a = static_cast<std::uint32_t>(directed[i] >> 32), b = static_cast<std::uint32_t>(directed[i] & 0xFFFFFFFFu);
+            if (!present(key(b, a))) {
+                next[b] = a;
+                ++out_degree[b];
+            }
+        }
+        i = j;
     }
     std::unordered_map<std::uint32_t, bool> visited;
     for (const auto& [start, _] : next) {

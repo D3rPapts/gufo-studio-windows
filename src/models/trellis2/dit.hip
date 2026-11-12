@@ -119,6 +119,12 @@ std::unique_ptr<DitHip> DitHip::Create(const std::filesystem::path& file, const 
         impl->shape.in_channels = in[1];
         impl->shape.out_channels = out[0];
         impl->rt.SetCacheLimit(std::size_t{1} << 30);   // several runtimes share the GPU (pipeline)
+        // Upload everything now through the bounded pinned path: touching the mapped file lazily
+        // would keep ~2.4 GB of checkpoint pages in the process working set (host RAM is tight).
+        if (!impl->rt.UploadMissing("")) {
+            if (error) *error = "TRELLIS.2 DiT: weight upload failed for " + file.string();
+            return nullptr;
+        }
         return std::unique_ptr<DitHip>(new DitHip(std::move(impl)));
     } catch (const std::exception& e) {
         if (error) *error = std::string("TRELLIS.2 DiT: ") + e.what();
