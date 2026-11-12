@@ -51,10 +51,23 @@ struct TileRect {
   }
 };
 
-/// Padded side length of a tile when `size` pixels are split `n` ways.
+/// Padded side length of the widest tile when `size` pixels are split `n`
+/// ways: an interior core carries the halo on both sides, an edge core only
+/// on its inner side (the frame edge clips the other), and a trailing slot
+/// the ceil division left short counts with its real width.
 [[nodiscard]] constexpr int PaddedTileSide(int n, int size, int halo) noexcept {
+  if (n <= 1 || size <= 0)
+    return size;
   const int core = (size + n - 1) / n;
-  return std::min(size, core + (n > 1 ? 2 * halo : 0));
+  int widest = 0;
+  for (int i = 0; i < n; ++i) {
+    const int c0 = i * core;
+    if (c0 >= size)
+      break;
+    const int c1 = std::min(size, c0 + core);
+    widest = std::max(widest, std::min(size, c1 + halo) - std::max(0, c0 - halo));
+  }
+  return widest;
 }
 
 /// Fewest tiles whose padded size fits `tile_pixels` (0: the default): the

@@ -227,8 +227,6 @@ bool MusicService::HandlesPath(std::string_view path) const {
 
 MusicService::MusicService(const MusicServiceOptions& options)
     : model_id_(options.model_id) {
-#if defined(ENGINE_ENABLE_HIP)
-  // The file resolution reads safetensors metadata (HIP build only).
   ace::ModelPaths paths;
   if (!ace::ModelPaths::Resolve(options.model_root, options.dit, options.lm,
                                 options.variant, &paths, &init_error_))
@@ -236,6 +234,7 @@ MusicService::MusicService(const MusicServiceOptions& options)
   if (model_id_.empty())
     model_id_ =
         "ace-step-1.5-xl-" + std::string(ace::DitVariantName(paths.variant));
+#if defined(ENGINE_ENABLE_HIP)
   pipeline_ = ace::MusicPipeline::Load(paths, &init_error_);
   if (pipeline_)
     worker_ = std::thread([this] { Worker(); });

@@ -53,9 +53,11 @@ std::unique_ptr<server::UpscaleEngine> FakeEngine(std::vector<std::string>* call
   auto engine = std::make_unique<server::UpscaleEngine>();
   engine->device = "cpu";
   engine->model_names = {"anime", "general"};
+  engine->models = {{"anime", "", "anime.onnx"}, {"general", "", "general.onnx"}};
   engine->runtime = "stand-in";
-  engine->run = [calls](const std::string& model, const std::uint8_t* rgb24,
-                        int w, int h, int out_w, int out_h,
+  engine->run = [calls](const std::string& model, const std::string&,
+                        const std::uint8_t* rgb24, int w, int h, int out_w,
+                        int out_h,
                         const std::string& fit, server::UpscaleOutcome* out,
                         std::string*) {
     calls->push_back(model + ":" + fit);
@@ -143,7 +145,10 @@ void TestMusicAndFoleyStartup(const std::filesystem::path& root) {
   // A directory without the model files: not ready, with a reason, and the
   // routes they own.
   std::filesystem::create_directories(root / "empty");
-  server::MusicService music(root / "empty", "ace-step-1.5-xl-turbo");
+  server::MusicServiceOptions music_options;
+  music_options.model_root = root / "empty";
+  music_options.model_id = "ace-step-1.5-xl-turbo";
+  server::MusicService music(music_options);
   assert(!music.ready());
   assert(music.initialization_error().find("dit.safetensors") !=
          std::string::npos);
@@ -262,7 +267,9 @@ void TestServeOptions(const std::filesystem::path& root) {
   server::MediaServeArgs music_args;
   gufo::cli::ArgParser music_parser("gufo serve music");
   server::AddMediaServeOptions("music", music_parser, &music_args);
-  assert(music_args.name == "ace-step-1.5-xl-turbo");
+  // The model id follows the DiT variant (ace-step-1.5-xl-<variant>) unless
+  // --served-model-name says otherwise.
+  assert(music_args.name.empty());
   assert(!server::ValidateMediaServeArgs("music", &music_args, &error) &&
          error.find("--model") != std::string::npos);
 
