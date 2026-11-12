@@ -2858,21 +2858,19 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     // Candidates, oldest first: queued jobs (a job a runner already took
     // is not in pending_) and in_progress jobs whose request still waits
     // in the pool for a machine (nothing started yet).
+    // order_ is the submit order (created_at has whole seconds only), and
+    // a requeued job keeps its place in it.
     std::vector<std::pair<std::shared_ptr<Job>, bool>> candidates;
-    for (const auto& job : pending_)
-      candidates.emplace_back(job, false);
     std::size_t waiting_count = 0;
     for (const auto& job : order_) {
-      if (job->status == "in_progress" && job->pulled_by.empty() &&
-          PoolStateOf(*job) == "wait") {
+      if (job->status == "queued") {
+        candidates.emplace_back(job, false);
+      } else if (job->status == "in_progress" && job->pulled_by.empty() &&
+                 PoolStateOf(*job) == "wait") {
         candidates.emplace_back(job, true);
         ++waiting_count;
       }
     }
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const auto& a, const auto& b) {
-                       return a.first->created_at < b.first->created_at;
-                     });
     for (const auto& [job, waiting] : candidates) {
       if (job->path == kConcatPath || job->cancel.load())
         continue;  // runs on this router's ffmpeg
