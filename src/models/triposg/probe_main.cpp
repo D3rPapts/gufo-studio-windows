@@ -8,17 +8,23 @@
 //     random weights: CPU path vs HIP path (relative RMS), timings
 //   gufo-triposg-probe --stage dit --weights F --dumps DIR --out DIR [--device cpu|gpu]
 //       [--seed 42] [--steps 0] [--guidance 7] [--only-cond]
+//   gufo-triposg-probe --stage vae|mesh --weights F --dumps DIR --out DIR [--device cpu|gpu]
+//       [--grid 256] [--chunk 32768]
+//     vae: latents_final.npy -> vae_kv.npy (+ sdf_values.npy at sdf_points.npy if present);
+//     mesh: additionally the dense grid -> grid256.npy, mesh.glb, mesh.obj, preview.png
 //     DIR holds dino_tokens.npy (ours or the reference's) and optionally dit_in.npy;
 //     writes dit_in.npy (if generated), dit_block00/20.npy, dit_v_step00_{cond,uncond}.npy
 //     and with --steps N > 0 latents_final.npy after N Euler steps with CFG.
 //
 // No server, no port; the GPU path needs a HIP build (GUFO_TRIPOSG_HIP).
 // AI-assisted (Claude Code), 2026-11-12.
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -29,9 +35,13 @@
 #include "src/models/qwen_image_21/model.hpp"
 #include "src/models/triposg/dinov2.hpp"
 #include "src/models/triposg/dit.hpp"
+#include "src/models/triposg/glb_writer.hpp"
+#include "src/models/triposg/marching_cubes.hpp"
+#include "src/models/triposg/mesh_preview.hpp"
 #include "src/models/triposg/npy.hpp"
 #include "src/models/triposg/preprocess.hpp"
 #include "src/models/triposg/scheduler.hpp"
+#include "src/models/triposg/vae.hpp"
 
 namespace {
 
@@ -89,6 +99,135 @@ struct DitRunner {
         return gufo::triposg::dit_forward_cpu(*cpu, x.data(), tokens, cond.data(), cond_tokens, t, v, taps, error, opt);
     }
 };
+
+// --stage vae: KV cache and logits at the reference point set (CPU or GPU);
+// --stage mesh: dense grid -> marching cubes -> GLB/OBJ + preview PNG (GPU).
+int run_vae(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device,
+            const std::string& stage, int grid_n, int chunk) {
+    namespace tp = gufo::triposg;
+    std::string error;
+    std::vector<float> z;
+    std::vector<std::size_t> shape;
+    if (!tp::npy::read_f32(std::filesystem::path(dumps) / "latents_final.npy", &z, &shape, &error) || z.size() != 2048u * 64) {
+        std::cerr << "latents_final.npy: " << error << '\n';
+        return 1;
+    }
+    std::filesystem::create_directories(out);
+    auto t0 = Clock::now();
+    std::unique_ptr<tp::VaeHostWeights> cpu;
+#if GUFO_TRIPOSG_HIP
+    std::unique_ptr<tp::VaeHip> gpu;
+#endif
+    std::vector<float> kv;
+    if (device == "gpu") {
+#if GUFO_TRIPOSG_HIP
+        gpu = tp::VaeHip::Create(weights, &error);
+        if (!gpu || !gpu->Prepare(z.data(), 2048, &error)) {
+            std::cerr << "gpu: " << error << '\n';
+            return 1;
+        }
+        kv = gpu->DownloadKv();
+#else
+        std::cerr << "gpu path not built\n";
+        return 1;
+#endif
+    } else {
+        cpu = std::make_unique<tp::VaeHostWeights>();
+        if (!tp::VaeHostWeights::FromFile(weights, cpu.get(), &error) || !tp::vae_kv_cpu(*cpu, z.data(), 2048, &kv, &error)) {
+            std::cerr << "cpu: " << error << '\n';
+            return 1;
+        }
+    }
+    std::cout << "vae (" << device << "): kv cache [2048,1024] in " << ms_since(t0) << " ms, kv[0..3] = " << kv[0] << ' ' << kv[1] << ' ' << kv[2] << '\n';
+    tp::npy::write_f32(std::filesystem::path(out) / "vae_kv.npy", kv.data(), {2048, 1024}, &error);
+    auto query = [&](const float* points, int count, std::vector<float>* logits) {
+#if GUFO_TRIPOSG_HIP
+        if (gpu) return gpu->Query(points, count, logits, &error, chunk);
+#endif
+        return tp::vae_query_cpu(*cpu, kv.data(), 2048, points, count, logits, &error);
+    };
+    const auto points_path = std::filesystem::path(dumps) / "sdf_points.npy";
+    if (std::filesystem::exists(points_path)) {
+        std::vector<float> points, logits;
+        if (!tp::npy::read_f32(points_path, &points, &shape, &error) || shape.size() != 2 || shape[1] != 3) {
+            std::cerr << "sdf_points.npy: " << error << '\n';
+            return 1;
+        }
+        t0 = Clock::now();
+        if (!query(points.data(), static_cast<int>(shape[0]), &logits)) {
+            std::cerr << "query: " << error << '\n';
+            return 1;
+        }
+        std::size_t inside = 0;
+        for (float l : logits) inside += l > 0.f;
+        std::cout << "sdf: " << shape[0] << " points in " << ms_since(t0) << " ms, inside " << inside << '\n';
+        tp::npy::write_f32(std::filesystem::path(out) / "sdf_values.npy", logits.data(), {shape[0]}, &error);
+    }
+    if (stage != "mesh") return 0;
+
+    // Dense grid of grid_n^3 samples in [-b, b]^3 (linspace incl. both ends, index order ij).
+    const float b = tp::GeometryConfig::bounds;
+    const std::size_t N = static_cast<std::size_t>(grid_n);
+    std::vector<float> grid(N * N * N);
+    std::vector<float> points, logits;
+    t0 = Clock::now();
+    const std::size_t rows_per_chunk = std::max<std::size_t>(1, static_cast<std::size_t>(chunk) / (N * N));
+    for (std::size_t ix0 = 0; ix0 < N; ix0 += rows_per_chunk) {
+        const std::size_t ix1 = std::min(N, ix0 + rows_per_chunk);
+        points.resize((ix1 - ix0) * N * N * 3);
+        std::size_t k = 0;
+        for (std::size_t ix = ix0; ix < ix1; ++ix)
+            for (std::size_t iy = 0; iy < N; ++iy)
+                for (std::size_t iz = 0; iz < N; ++iz) {
+                    points[k++] = -b + 2 * b * static_cast<float>(ix) / static_cast<float>(N - 1);
+                    points[k++] = -b + 2 * b * static_cast<float>(iy) / static_cast<float>(N - 1);
+                    points[k++] = -b + 2 * b * static_cast<float>(iz) / static_cast<float>(N - 1);
+                }
+        if (!query(points.data(), static_cast<int>((ix1 - ix0) * N * N), &logits)) {
+            std::cerr << "grid query: " << error << '\n';
+            return 1;
+        }
+        std::copy(logits.begin(), logits.end(), grid.begin() + static_cast<std::ptrdiff_t>(ix0 * N * N));
+        if (ix0 == 0 || (ix0 / rows_per_chunk) % 16 == 0)
+            std::cout << "  grid rows " << ix1 << "/" << N << " after " << ms_since(t0) / 1000 << " s\n";
+    }
+    std::size_t inside = 0;
+    for (float l : grid) inside += l < 0.f;
+    std::cout << "grid " << N << "^3 in " << ms_since(t0) / 1000 << " s, inside (negative) " << 100.0 * static_cast<double>(inside) / static_cast<double>(grid.size()) << " %\n";
+    tp::npy::write_f32(std::filesystem::path(out) / ("grid" + std::to_string(grid_n) + ".npy"), grid.data(), {N, N, N}, &error);
+
+    t0 = Clock::now();
+    tp::ScalarGrid sg;
+    sg.values = grid.data();
+    sg.nx = sg.ny = sg.nz = N;
+    for (int a = 0; a < 3; ++a) { sg.min[a] = -b; sg.max[a] = b; }
+    // Measured on the mug latents: the decoder output (-proj_out) is NEGATIVE inside the
+    // shape (13 % of the box) and positive outside, i.e. SDF-like.
+    tp::MarchingCubesOptions mo;
+    mo.inside_positive = false;
+    tp::Mesh mesh = tp::marching_cubes(sg, mo);
+    float bmin[3] = {0, 0, 0}, bmax[3] = {0, 0, 0};
+    tp::bounding_box(mesh, bmin, bmax);
+    std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " faces, open edges "
+              << tp::count_open_edges(mesh) << ", volume " << tp::signed_volume(mesh) << ", bbox [" << bmin[0] << ' ' << bmin[1]
+              << ' ' << bmin[2] << "] .. [" << bmax[0] << ' ' << bmax[1] << ' ' << bmax[2] << "] in " << ms_since(t0) << " ms\n";
+    if (!tp::write_glb_file(std::filesystem::path(out) / "mesh.glb", mesh, &error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+    {
+        std::ofstream obj(std::filesystem::path(out) / "mesh.obj");
+        obj << tp::write_obj(mesh);
+    }
+    int pw = 0, ph = 0;
+    const auto rgb = tp::render_preview(mesh, {}, &pw, &ph);
+    if (!tp::write_png_rgb(std::filesystem::path(out) / "preview.png", rgb.data(), pw, ph, &error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+    std::cout << "wrote " << out << "/mesh.glb, mesh.obj, preview.png (" << pw << "x" << ph << ")\n";
+    return 0;
+}
 
 int run_dit(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device,
             std::uint64_t seed, int steps, float guidance, bool only_cond, bool trace, float t_override) {
@@ -247,7 +386,7 @@ int main(int argc, char** argv) {
     std::string stage = "dino", weights, image, out, device = "cpu", dumps;
     bool self = false, only_cond = false, trace = false;
     float t_override = -1.f;
-    int layers = 24, steps = 0;
+    int layers = 24, steps = 0, grid_n = 256, chunk = 32768;
     std::uint64_t seed = 42;
     float guidance = 7.f;
     for (int i = 1; i < argc; ++i) {
@@ -267,12 +406,18 @@ int main(int argc, char** argv) {
         else if (a == "--only-cond") only_cond = true;
         else if (a == "--trace") trace = true;
         else if (a == "--t") t_override = std::stof(next());
+        else if (a == "--grid") grid_n = std::stoi(next());
+        else if (a == "--chunk") chunk = std::stoi(next());
         else return usage();
     }
     if (self) return selftest(device, layers);
     if (stage == "dit") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
         return run_dit(weights, dumps, out, device, seed, steps, guidance, only_cond, trace, t_override);
+    }
+    if (stage == "vae" || stage == "mesh") {
+        if (weights.empty() || dumps.empty() || out.empty()) return usage();
+        return run_vae(weights, dumps, out, device, stage, grid_n, chunk);
     }
     if (stage != "dino" || weights.empty() || image.empty() || out.empty()) return usage();
 

@@ -75,7 +75,8 @@ struct VaeConfig {
     static constexpr int encoder_in_channels = 3 + query_channels;      // 54 (encoder proj_in)
     // The last block is cross attention: q from the embedded query points, k/v from the
     // kv cache with `norm_cross` LayerNorm(1024); then norm_out + proj_out (1024 -> 1).
-    // The decoder returns -logit, i.e. positive inside the shape (level set 0).
+    // The decoder returns -logit. Measured on real latents (mug, 12.11.): this value is
+    // NEGATIVE inside the shape and positive outside (SDF-like), level set 0.
 };
 
 // --- Scheduler: RectifiedFlowScheduler ---------------------------------------
