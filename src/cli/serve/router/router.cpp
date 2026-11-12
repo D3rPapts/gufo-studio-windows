@@ -904,6 +904,52 @@ public:
   std::optional<json::Value> partner_caps_;
   std::chrono::steady_clock::time_point partner_caps_at_{};
   bool partner_caps_old_logged_{false};
+  /// Where the pool put each job's request (X-Gufo-Job), state mutex:
+  /// "wait" while it waits for a machine, then "local" or "remote"; the
+  /// job store reads it for running_on / position and may redirect a
+  /// waiting one to the partner (shared queue).
+  struct PoolJobState {
+    std::string where;
+    bool redirect{false};
+    std::chrono::steady_clock::time_point at{};
+  };
+  std::map<std::string, PoolJobState> pool_jobs_;
+
+  /// {job id: "wait"|"local"|"remote"}; entries older than a day go.
+  std::map<std::string, std::string> PoolJobStates() {
+    std::map<std::string, std::string> out;
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = pool_jobs_.begin(); it != pool_jobs_.end();) {
+      if (now - it->second.at > std::chrono::hours(24)) {
+        it = pool_jobs_.erase(it);
+        continue;
+      }
+      out[it->first] = it->second.where;
+      ++it;
+    }
+    return out;
+  }
+
+  /// Marks a waiting job's request: its pool loop answers 503
+  /// pool_redirected instead of taking a machine. False unless it waits.
+  bool RedirectWaitingJob(const std::string& job_id) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto it = pool_jobs_.find(job_id);
+    if (it == pool_jobs_.end() || it->second.where != "wait")
+      return false;
+    it->second.redirect = true;
+    return true;
+  }
+
+  void NotePoolJobLocked(const std::string& job_id, const char* where) {
+    if (job_id.empty())
+      return;
+    PoolJobState& state = pool_jobs_[job_id];
+    state.where = where;
+    state.redirect = false;
+    state.at = std::chrono::steady_clock::now();
+  }
   /// Remote jobs holding a GPU slot, by job id (own mutex, never nested
   /// inside the state mutex).
   std::mutex remote_jobs_mutex_;
@@ -1476,6 +1522,10 @@ public:
     }
     const bool may_retry =
         !IsVideoCreate(req) && !IsMusicCreate(req) && forced != "remote";
+    // The job this request belongs to (job store): its pool state is
+    // reported and, while it waits, may be redirected to the partner.
+    const std::string job_id =
+        forwarded ? std::string() : req.header(router::jobs::kJobHeader);
     const auto began = std::chrono::steady_clock::now();
     const auto deadline =
         began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
@@ -1491,6 +1541,22 @@ public:
     for (;;) {
       const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - began);
+      if (waiting && !job_id.empty()) {
+        // Handed to the partner by the job store while it waited: nothing
+        // has started here, the runner sends it again as remote.
+        const auto it = pool_jobs_.find(job_id);
+        if (it != pool_jobs_.end() && it->second.redirect) {
+          stop_waiting();
+          pool_jobs_.erase(it);
+          Logger::Info("router", "event=pool_redirected model=" + model_id +
+                                     " job=" + job_id + " waited_ms=" +
+                                     std::to_string(waited.count()));
+          return Err(503, "Service Unavailable",
+                     "job " + job_id +
+                         " was handed to the partner router while it waited",
+                     "server_error", router::jobs::kPoolRedirected);
+        }
+      }
       router::PoolInput pool_input =
           PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited);
       // One side only (capabilities): the other is out, even when free.
@@ -1502,6 +1568,7 @@ public:
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
+        NotePoolJobLocked(job_id, "local");
         ++pool_[model_id].local_picks;
         // The claim keeps the local worker "taken" for other pool requests
         // until this one's busy count is armed (after a cold load).
@@ -1539,6 +1606,7 @@ public:
       if (decision.choice == router::PoolChoice::kRemote) {
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
+        NotePoolJobLocked(job_id, "remote");
         ++pool_[model_id].remote_picks;
         pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
         HttpResponse response =
@@ -1577,17 +1645,22 @@ public:
       if (local_failure.has_value() &&
           (forwarded || remote_failed || !pool_input.remote.available)) {
         stop_waiting();
+        if (!job_id.empty())
+          pool_jobs_.erase(job_id);
         return std::move(*local_failure);
       }
       if (!waiting) {
         waiting = true;
         ++pool_[model_id].waiting;
         NotePoolLocked(model_id, decision, waited);
+        NotePoolJobLocked(job_id, "wait");
       }
       const bool gone = req.is_cancelled && req.is_cancelled();
       if (gone || std::chrono::steady_clock::now() >= deadline ||
           stop_requested.load()) {
         stop_waiting();
+        if (!job_id.empty())
+          pool_jobs_.erase(job_id);
         if (local_failure.has_value() && !gone)
           return std::move(*local_failure);
         Logger::Warn("router", "event=pool_busy model=" + model_id +
@@ -3699,6 +3772,10 @@ int RunRouter(std::span<const char* const> args) {
     jobs_options.capabilities = [raw] { return raw->Capabilities(); };
     jobs_options.partner_capabilities = [raw] {
       return raw->PartnerCapabilities();
+    };
+    jobs_options.pool_states = [raw] { return raw->PoolJobStates(); };
+    jobs_options.redirect_waiting = [raw](const std::string& job_id) {
+      return raw->RedirectWaitingJob(job_id);
     };
     jobs_options.self_name = state->self_name;
     for (const auto& model : models)

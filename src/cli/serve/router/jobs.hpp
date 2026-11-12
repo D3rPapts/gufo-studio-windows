@@ -77,10 +77,21 @@
 //    local one. Answer {"job": id, ...} or {"job": null}. A partner that
 //    answers 404 (older than 1.4.20) pauses pulling for pull_hold, logged
 //    once; an unreachable partner means "as before".
+//  - Waiting jobs (1.4.21): with --jobs-parallel 2 a job is in_progress at
+//    once and its request may wait in the router's pool for a free machine
+//    ("both busy"). The router reports that per job (Options::pool_states,
+//    by the X-Gufo-Job header of the job's requests): such a job counts as
+//    queued for the shared queue (position, pool_queue), shows
+//    "running_on": null and "pool_wait": true, and can be pulled: the
+//    owner marks it (Options::redirect_waiting), the router answers the
+//    waiting request 503 pool_redirected instead of starting it, and the
+//    owner's runner sends it again with X-Gufo-Pool: remote (no double
+//    start: a request already on a worker is never redirected).
 //  - View: every job carries "request.loras" and "running_on" ("local",
-//    the partner's url while it runs there, null when not running);
-//    scope=pool items add "position" (1 = the oldest queued job of both
-//    routers). /router/status gets "pool_queue".
+//    the partner's url while it runs there or the pool sent it there,
+//    null while it waits or does not run); scope=pool items add
+//    "position" (1 = the oldest queued or waiting job of both routers).
+//    /router/status gets "pool_queue".
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -284,6 +295,17 @@ struct Options {
   /// After a 404 on /router/pool/pull (partner older than 1.4.20) pulling
   /// pauses this long.
   std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
+  /// Where the router's pool put each job's request, by job id (the
+  /// X-Gufo-Job header): "wait" (no free machine yet, nothing started),
+  /// "local" or "remote". Empty = unknown. May be called with the queue's
+  /// lock held (the router never calls back into the queue under its own
+  /// lock).
+  std::function<std::map<std::string, std::string>()> pool_states;
+  /// Marks a waiting job's request for the partner: the router answers it
+  /// 503 pool_redirected instead of starting it here and the runner sends
+  /// it again with X-Gufo-Pool: remote. False when the request waits no
+  /// longer (then the job is not handed out).
+  std::function<bool(const std::string& job_id)> redirect_waiting;
 };
 
 /// Set on every request relayed to the partner; never relayed on.
@@ -293,6 +315,11 @@ inline constexpr const char* kRelayHeader = "X-Gufo-Relay";
 inline constexpr const char* kPoolSideHeader = "X-Gufo-Pool";
 /// POST: the partner asks for a queued job to run on its worker.
 inline constexpr const char* kPullPath = "/router/pool/pull";
+/// Set on every request of a job: its id, so the router's pool can report
+/// where the request went (Options::pool_states) and redirect it.
+inline constexpr const char* kJobHeader = "X-Gufo-Job";
+/// Error code the router answers a redirected waiting request with.
+inline constexpr const char* kPoolRedirected = "pool_redirected";
 
 /// The LoRA names a request body asks for: "loras"[].name (images) and
 /// "gufo"."lora" (videos, a string); empty for anything else.
@@ -448,6 +475,8 @@ private:
     std::string model;
     long long created_at{0};
     std::vector<std::string> loras;
+    /// in_progress but waiting in the partner's pool ("pool_wait").
+    bool waiting{false};
   };
   /// The partner's queued jobs (oldest first), cached pull_poll; nullopt
   /// when the partner did not answer.
@@ -465,6 +494,12 @@ private:
   std::string SideFor(const Job& job, json::Value* refusal);
   /// Joins pulled-job threads that ended (mutex held).
   void ReapPulledLocked();
+  /// The router's pool state of a job's request ("wait", "local",
+  /// "remote", "" = unknown); only meaningful while it is in_progress.
+  std::string PoolStateOf(const Job& job) const;
+  /// The job's POST to the router; sent again with the new side when the
+  /// router redirected it (503 pool_redirected) after a pull.
+  FetchResult Post(const std::shared_ptr<Job>& job, const std::string& body);
   /// POST /v1/videos/concat answered at once: the mp4 bytes.
   server::HttpResponse Concat(const server::HttpRequest& request);
   /// Stitches the clips named by `body` into `output` (the job's temp

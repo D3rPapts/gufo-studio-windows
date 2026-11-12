@@ -21,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -200,11 +201,40 @@ struct FakeApi {
   int music_polls{0};
   /// X-Gufo-Pool of every POST, by image prompt / speech input.
   std::map<std::string, std::string> sides;
+  /// Image requests with "WAIT" in the prompt stay here (as the router's
+  /// pool does while both machines are busy) until released or redirected
+  /// (then 503 pool_redirected); the job ids come from X-Gufo-Job.
+  std::set<std::string> waiting;
+  std::set<std::string> redirected;
+  int image_posts{0};
 
   std::string SideOf(const std::string& prompt) {
     const std::lock_guard<std::mutex> lock(mutex);
     const auto it = sides.find(prompt);
     return it == sides.end() ? "(none)" : it->second;
+  }
+
+  /// What the router reports as Options::pool_states.
+  std::map<std::string, std::string> PoolStates() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    std::map<std::string, std::string> states;
+    for (const std::string& id : waiting)
+      states[id] = "wait";
+    return states;
+  }
+
+  /// Options::redirect_waiting: only a waiting request can be redirected.
+  bool Redirect(const std::string& id) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!waiting.contains(id))
+      return false;
+    redirected.insert(id);
+    return true;
+  }
+
+  bool Waiting(const std::string& id) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return waiting.contains(id);
   }
 
   jobs::FetchResult operator()(const HttpRequest& request) {
@@ -230,6 +260,37 @@ struct FakeApi {
     if (request.path == "/v1/images/generations") {
       const json::Value body = json::parse(request.body);
       const std::string prompt = body.member_str("prompt");
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        ++image_posts;
+      }
+      if (prompt.find("WAIT") != std::string::npos &&
+          request.header(jobs::kPoolSideHeader) != "remote") {
+        const std::string id = request.header(jobs::kJobHeader);
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          waiting.insert(id);
+        }
+        for (;;) {
+          {
+            const std::lock_guard<std::mutex> lock(mutex);
+            if (redirected.contains(id)) {
+              redirected.erase(id);
+              waiting.erase(id);
+              result.status = 503;
+              result.body =
+                  R"({"error":{"message":"handed to the partner","code":"pool_redirected"}})";
+              return result;
+            }
+            if (release.load() ||
+                (request.is_cancelled && request.is_cancelled())) {
+              waiting.erase(id);
+              break;
+            }
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+      }
       if (prompt.find("SLOW") != std::string::npos) {
         while (!release.load() &&
                !(request.is_cancelled && request.is_cancelled()))
@@ -428,6 +489,10 @@ struct Harness {
     options.progress_poll = std::chrono::milliseconds(10);
     options.relay = relay;
     options.partner_name = partner_name;
+    options.pool_states = [api_ref] { return api_ref->PoolStates(); };
+    options.redirect_waiting = [api_ref](const std::string& id) {
+      return api_ref->Redirect(id);
+    };
     options.capabilities = capabilities;
     options.partner_capabilities = partner_capabilities;
     options.self_name = self_name;
@@ -1698,6 +1763,8 @@ struct FakePartner {
   std::mutex mutex;
   /// Its queued list (newest first, as /v1/jobs answers).
   std::string queued;
+  /// Its in_progress list (jobs waiting in its pool carry pool_wait).
+  std::string in_progress = R"({"object":"list","data":[]})";
   /// Answer to POST /router/pool/pull.
   std::string pull_answer = R"({"job":"job_bbbbbbbbbbbbbbbbbbbbbbb2"})";
   int pull_status{200};
@@ -1722,6 +1789,10 @@ struct FakePartner {
         request.query.find("status=queued") != std::string::npos)
       return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
                                     : queued);
+    if (request.method == "GET" && request.path == "/v1/jobs" &&
+        request.query.find("status=in_progress") != std::string::npos)
+      return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
+                                    : in_progress);
     if (request.method == "GET" && request.path == "/v1/jobs")
       return JsonAnswer(
           200,
@@ -1999,6 +2070,124 @@ void TestPoolPullOwner() {
   CHECK(h.queue->Handle(bad)->status == 404);
 }
 
+void TestPoolWaitTakeover() {
+  // Router B with two runners busy: a job in_progress whose request waits
+  // in the pool ("both busy") counts as queued for the shared queue,
+  // shows running_on null / pool_wait true, has a position, and a pull
+  // takes it over: the router answers the waiting request 503
+  // pool_redirected and the runner sends it again with X-Gufo-Pool:
+  // remote; nothing ran twice.
+  Harness h("pool-wait", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const std::string first = h.Submit(ImageJob("WAIT first")).member_str("id");
+  for (int i = 0; i < 200 && !h.api->Waiting(first); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  CHECK(h.api->Waiting(first));
+  const std::string second = h.Submit(ImageJob("second")).member_str("id");
+  json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + first).body);
+  CHECK(view.member_str("status") == "in_progress");
+  CHECK(view.find("running_on")->is_null());
+  CHECK(view.find("pool_wait")->as_bool());
+  view = json::parse(h.Call("GET", "/v1/jobs/" + second).body);
+  CHECK(view.member_str("status") == "queued");
+  CHECK(!view.find("pool_wait")->as_bool());
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  for (const json::Value& job : listed.find("data")->items()) {
+    if (job.member_str("id") == first)
+      CHECK(job.member_double("position") == 1);
+    else
+      CHECK(job.member_double("position") == 2);
+  }
+  json::Value status = h.queue->PoolQueueStatus();
+  CHECK(status.member_double("local") == 2);
+  CHECK(status.member_double("local_waiting") == 1);
+  // The requester lacks nothing: the waiting job (oldest) is handed out.
+  HttpRequest request;
+  request.method = "POST";
+  request.path = jobs::kPullPath;
+  request.body =
+      R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":{"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+  request.headers.emplace_back("Content-Type", "application/json");
+  request.headers.emplace_back(jobs::kRelayHeader, "1");
+  auto answer = h.queue->Handle(request);
+  CHECK(answer && answer->status == 200);
+  json::Value handed = json::parse(answer->body);
+  CHECK(handed.member_str("job") == first);
+  CHECK(handed.find("was_waiting")->as_bool());
+  CHECK(handed.member_double("queued") == 1);
+  h.WaitFor(first, "completed");
+  CHECK(h.api->SideOf("WAIT first") == "remote");
+  CHECK(!h.api->Waiting(first));
+  h.WaitFor(second, "completed");
+  CHECK(h.api->SideOf("second").empty());
+  {
+    // first (waited, then again as remote) + second: three POSTs, no
+    // request ran twice on a worker.
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(h.api->image_posts == 3);
+  }
+  status = h.queue->PoolQueueStatus();
+  CHECK(status.member_double("pushed") == 1);
+  CHECK(status.member_double("local") == 0);
+  CHECK(status.find("pushed_active")->items().empty());
+  // A job that waits no longer (released meanwhile) is not handed out.
+  const std::string third = h.Submit(ImageJob("WAIT third")).member_str("id");
+  for (int i = 0; i < 200 && !h.api->Waiting(third); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  h.api->release.store(true);
+  for (int i = 0; i < 200 && h.api->Waiting(third); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  answer = h.queue->Handle(request);
+  CHECK(answer && json::parse(answer->body).find("job")->is_null());
+  h.WaitFor(third, "completed");
+  CHECK(h.api->SideOf("WAIT third").empty());
+}
+
+void TestPoolPullWaitingRequester() {
+  // Router A pulls the partner's job that is in_progress but waiting in
+  // the partner's pool (pool_wait) when nothing is queued there.
+  auto partner = std::make_shared<FakePartner>();
+  partner->queued = R"({"object":"list","data":[]})";
+  partner->in_progress =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"in_progress","pool_wait":true,"running_on":null,"created_at":1001,"request":{"model":"qwen-image","loras":[]}},)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb3","status":"in_progress","pool_wait":false,"running_on":"local","created_at":1000,"request":{"model":"qwen-image","loras":[]}}]})";
+  Harness h("pull-waiting", false);
+  partner->api = h.api;
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  h.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  const std::string mine = h.Submit(ImageJob("after")).member_str("id");
+  h.WaitFor(mine, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 1);
+    if (!partner->pull_requests.empty())
+      CHECK(json::parse(partner->pull_requests[0].body).member_str("job") ==
+            "job_bbbbbbbbbbbbbbbbbbbbbbb2");
+  }
+  CHECK(h.queue->PoolQueueStatus().member_double("pulled") == 1);
+  // The partner's running job keeps its running_on; the pulled one shows
+  // none while the partner lists it as waiting.
+  partner->pulled = false;
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  for (const json::Value& job : listed.find("data")->items()) {
+    const std::string id = job.member_str("id");
+    if (id == "job_bbbbbbbbbbbbbbbbbbbbbbb3")
+      CHECK(job.member_str("running_on") == "http://10.0.0.2:8081");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -2034,6 +2223,8 @@ int main() {
   TestPoolPullRequester();
   TestPoolPullOldPartner();
   TestPoolPullOwner();
+  TestPoolWaitTakeover();
+  TestPoolPullWaitingRequester();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;
