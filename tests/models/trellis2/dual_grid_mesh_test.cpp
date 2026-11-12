@@ -52,7 +52,7 @@ int main() {
            "split along 0-2 when w0*w2 > w1*w3");
     // open edges: the three quads share vertex 0 pairwise with one edge each (0-1, 0-2, 0-4): 12 - 2*3 = 6
     Expect(st.open_edges == 6, "6 boundary edges for the three quads (" + std::to_string(st.open_edges) + ")");
-    // missing neighbour: drop voxel (0,1,1) -> x-edge of (0,0,0) skipped, y-edge needs (0,0,1) & (1,0,1): still there
+    // missing neighbour: drop voxel (0,1,1) -> the x-edge of (0,0,0) is skipped; y- and z-edge quads remain
     std::vector<tr::Coord> fewer = coords;
     fewer.erase(fewer.begin() + 3);
     std::vector<float> dual2(fewer.size() * 3, 0.5f), wgt2(fewer.size(), 1.f);
@@ -61,7 +61,7 @@ int main() {
     tr::DualGridInput in2 = in;
     in2.coords = &fewer; in2.dual = dual2.data(); in2.intersected = inter2.data(); in2.split_weight = wgt2.data();
     mesh = tr::dual_grid_to_mesh(in2, &st);
-    Expect(st.quads == 1 && st.skipped_edges == 2, "edges whose four voxels are not all active are skipped (" + std::to_string(st.quads) + "/" + std::to_string(st.skipped_edges) + ")");
+    Expect(st.quads == 2 && st.skipped_edges == 1, "edges whose four voxels are not all active are skipped (" + std::to_string(st.quads) + "/" + std::to_string(st.skipped_edges) + ")");
     // decoding
     std::vector<float> out7 = {0.f, 10.f, -10.f, 1.f, -1.f, 0.f, 0.f};
     std::vector<float> d, sw;
