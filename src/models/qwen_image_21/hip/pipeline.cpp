@@ -892,6 +892,8 @@ struct Model::Impl {
   std::mutex mutex;
   std::atomic<bool> lost{false};
   std::function<void(const std::string&)> log;
+  // --keep-text-encoder (set before serving): see ReleasesTextEncoder.
+  bool keep_text_encoder{false};
   // Under `mutex`: the set whose weights the runtime has built; reset while
   // a switch is unfinished so the next request completes it.
   std::optional<std::vector<Lora>> installed{std::in_place};
@@ -1123,15 +1125,17 @@ Result Model::Generate(const Request& request,
     }
     const bool regional = !request.regions.empty();
     result.metrics.region_condition_rows = region_rows;
-    // Every DiT condition row keeps 32 layers of K and V (512 KiB per row).
-    // With several references these caches can outgrow the memory beside all
-    // weights; then the text encoder (16 GB) leaves until the next request.
-    // When the request fits beside it, the encoder stays and the next request
-    // skips reloading it (memory placement only; results are unchanged).
+    // Every prompt is encoded; the text encoder (16 GB) has no further use
+    // in this request. By default it leaves now and the next request uploads
+    // it again (ReleasesTextEncoder; memory placement only, results are
+    // unchanged). With --keep-text-encoder it stays unless a large request's
+    // condition caches (32 layers of K and V, 512 KiB per row) do not fit
+    // beside all weights.
     const int condition_rows = ConditionRows(prompt);
     result.metrics.condition_rows = condition_rows;
     report("encoded");
     const bool large = condition_rows + region_rows > kReleaseEncoderRows;
+    bool large_fits = false;
     if (large) {
       // Freed temporaries stay cached up to this bound (8 GB otherwise).
       rt.SetCacheLimit(kLargeRequestCacheBytes);
@@ -1141,7 +1145,7 @@ Result Model::Generate(const Request& request,
       const char* force = std::getenv("GUFO_QWEN_IMAGE_RELEASE_TEXT_ENCODER");
       const bool force_release = force && *force && std::string(force) != "0";
       bool keep = false;
-      if (!force_release) {
+      if (!force_release && impl_->keep_text_encoder) {
         // Return cached encoder temporaries before measuring.
         rt.Trim();
         const auto memory = hip::QueryDeviceMemory();
@@ -1160,11 +1164,18 @@ Result Model::Generate(const Request& request,
             " available_mib=" + std::to_string(available >> 20) + " " +
             memory.Describe());
       }
-      if (!keep) {
-        rt.Evict("text_encoder.model.language_model.");
-        rt.Evict("text_encoder.model.visual.");
-        result.metrics.released_text_encoder = true;
-      }
+      large_fits = keep;
+    }
+    if (ReleasesTextEncoder(impl_->keep_text_encoder, large, large_fits)) {
+      const auto before = rt.WeightBytes();
+      rt.Evict("text_encoder.model.language_model.");
+      rt.Evict("text_encoder.model.visual.");
+      result.metrics.released_text_encoder = true;
+      Log("event=text_encoder_released mib=" +
+          std::to_string((before - rt.WeightBytes()) >> 20) +
+          " large=" + (large ? "1" : "0"));
+      if (!large)
+        report("released");
     }
     if (large && result.metrics.released_text_encoder) {
       // Refuse before the caches fill instead of failing inside a kernel:
@@ -1413,6 +1424,10 @@ Result Model::Generate(const Request& request,
                                        request.width, request.height,
                                        request.mask_feather));
     result.metrics.vae_ms = Milliseconds(vae_start);
+    // The decoder's temporaries would stay cached (up to 8 GB) until the
+    // next request; between jobs only the resident weights remain.
+    rt.Trim();
+    report("finished");
     result.metrics.total_ms = Milliseconds(total_start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();
     result.metrics.steps = steps;
@@ -1425,8 +1440,16 @@ Result Model::Generate(const Request& request,
     // later requests (they fail with "unspecified launch failure").
     const std::string_view what = error.what();
     if (status != hipSuccess || what.starts_with("Qwen-Image HIP") ||
-        what.starts_with("Qwen-Image hipBLAS"))
+        what.starts_with("Qwen-Image hipBLAS")) {
       impl_->lost.store(true, std::memory_order_release);
+    } else {
+      // The request's temporaries are back in the pool; a cancelled or
+      // refused job leaves only the resident weights, like a finished one.
+      try {
+        rt.Trim();
+      } catch (...) {
+      }
+    }
     throw;
   } catch (...) {
     (void)hipStreamSynchronize(rt.stream());
@@ -1436,6 +1459,11 @@ Result Model::Generate(const Request& request,
 
 void Model::SetLog(std::function<void(const std::string&)> log) {
   impl_->log = std::move(log);
+}
+
+void Model::SetKeepTextEncoder(bool keep) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->keep_text_encoder = keep;
 }
 
 bool Model::DeviceLost() const {

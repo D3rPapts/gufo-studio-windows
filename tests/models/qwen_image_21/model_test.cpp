@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "src/core/json.hpp"
+#include "src/models/qwen_image_21/request.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 #include "src/models/qwen_image_21/weights.hpp"
 #include "tests/support/model_api_test_support.hpp"
@@ -36,6 +37,24 @@ int main(int argc, char** argv) {
          {151644, 872, 198, 27, 1805, 16, 29, 151652, 151655, 151653}}};
     for (const auto& [text, expected] : cases)
       assert(tokenizer.Encode(text) == expected);
+  }
+  // Text encoder placement: by default it always leaves after encoding;
+  // --keep-text-encoder keeps it unless a large request does not fit.
+  static_assert(ReleasesTextEncoder(false, false, false));
+  static_assert(ReleasesTextEncoder(false, true, true));
+  static_assert(ReleasesTextEncoder(false, true, false));
+  static_assert(!ReleasesTextEncoder(true, false, false));
+  static_assert(!ReleasesTextEncoder(true, true, true));
+  static_assert(ReleasesTextEncoder(true, true, false));
+  assert(!ParseStartupOptions({}).keep_text_encoder);
+  assert(ParseStartupOptions({{"--keep-text-encoder", true}}).keep_text_encoder);
+  assert(
+      !ParseStartupOptions({{"--keep-text-encoder", false}}).keep_text_encoder);
+  {
+    const auto both = ParseStartupOptions(
+        {{"--keep-text-encoder", true},
+         {"--lora", std::string("a=x.safetensors;b=y.safetensors")}});
+    assert(both.keep_text_encoder && both.loras.size() == 2);
   }
   const Image image{
       2, 2, {255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 127, 63, 21, 255}};

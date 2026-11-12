@@ -473,6 +473,8 @@ StartupOptions ParseStartupOptions(const ext::ParsedOptions& options) {
       }
     } else if (name == "--controlnet") {
       out.controlnet = std::get<std::string>(value);
+    } else if (name == "--keep-text-encoder") {
+      out.keep_text_encoder = std::get<bool>(value);
     } else {
       throw std::invalid_argument("Qwen-Image-2.1 has no option " + name);
     }

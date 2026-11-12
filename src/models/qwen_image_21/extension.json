@@ -58,6 +58,17 @@
         "qwen-image-21"
       ],
       "help": "Qwen-Image-2.1 Fun ControlNet-Union safetensors file; enables gufo.control_image (pose, depth, canny, lineart, ...)"
+    },
+    {
+      "name": "--keep-text-encoder",
+      "type": "boolean",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Keep the text encoder (about 16 GB) in GPU memory between requests; by default it leaves after encoding and reloads on the next request"
     }
   ],
   "targets": {

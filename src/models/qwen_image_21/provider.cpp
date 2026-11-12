@@ -32,6 +32,9 @@ public:
   QwenImage21RunnerImpl(std::unique_ptr<Model> model, StartupOptions startup)
       : model_(std::move(model)), startup_(std::move(startup)) {
     model_->SetLog(&Log);
+    model_->SetKeepTextEncoder(startup_.keep_text_encoder);
+    Log(std::string("event=text_encoder_policy placement=") +
+        (startup_.keep_text_encoder ? "keep" : "release_after_encode"));
     if (!startup_.controlnet.empty()) {
       if (!std::filesystem::is_regular_file(startup_.controlnet))
         throw std::invalid_argument("--controlnet file not found: " +

@@ -236,7 +236,9 @@ struct Metrics {
   /// the negative prompt's own rows (references are shared).
   int condition_rows{0};
   int negative_condition_rows{0};
-  /// The text encoder left GPU memory for this request's caches.
+  /// The text encoder left GPU memory after this request's prompts were
+  /// encoded (by default always; with --keep-text-encoder only when a large
+  /// request's caches do not fit beside it).
   bool released_text_encoder{false};
   double lora_ms{0};  // adapter switch, before prompt encoding
   /// Regional prompts: their condition rows and transformer passes.
@@ -300,6 +302,17 @@ struct SamplingConfig {
   std::vector<float> Sigmas(int requested, int image_tokens) const;
 };
 
+/// Whether the text encoder (Qwen2.5-VL, about 16 GB BF16) leaves GPU memory
+/// once a request's prompts are encoded. GPU memory of an APU is host memory
+/// and counts against the commit charge, so by default it always leaves and
+/// the next request uploads it again from the mapped files (identical
+/// weights, identical images). `keep_resident` (--keep-text-encoder) keeps it
+/// unless a `large` request's caches do not fit beside it (`fits_beside`).
+constexpr bool ReleasesTextEncoder(bool keep_resident, bool large,
+                                   bool fits_beside) {
+  return !keep_resident || (large && !fits_beside);
+}
+
 class Model {
 public:
   explicit Model(const std::filesystem::path& root);
@@ -317,6 +330,8 @@ public:
   bool DeviceLost() const;
   /// Diagnostic lines (memory per phase, memory checks).
   void SetLog(std::function<void(const std::string&)> log);
+  /// --keep-text-encoder: see ReleasesTextEncoder. Set before serving.
+  void SetKeepTextEncoder(bool keep);
   const SamplingConfig& sampling() const;
   /// Validate and register an adapter before serving; requests select it by
   /// name.

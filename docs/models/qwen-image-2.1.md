@@ -58,6 +58,12 @@ Output is base64 PNG. URL output, separate masks, streaming and
 The upstream project recommends 2048 × 2048; Gufo defaults to 1024 × 1024,
 like the pinned Diffusers version. Set `size` for larger images.
 
+The text encoder (about 16 GB) leaves GPU memory once a request's prompts are
+encoded and is uploaded again by the next request; between requests only the
+transformer and the VAE stay resident. On an APU, GPU memory is host memory.
+`--keep-text-encoder` keeps the encoder resident and saves the reload at the
+cost of that memory. Images are the same either way.
+
 ## Qwen-Image-2.1-Turbo
 
 Turbo is a separately trained checkpoint (about 32.5 GB, same license) that

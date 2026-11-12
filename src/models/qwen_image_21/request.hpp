@@ -32,12 +32,13 @@ Request BuildRequest(const ext::ImageRequest& request,
 /// Converts the provider's `serve image` manifest options (extension.json,
 /// delivered as ext::ParsedOptions) to the 1.4.9 startup inputs:
 /// --lora NAME=PATH[;NAME=PATH...], --lora-default NAME:SCALE[;...] and
-/// --controlnet FILE. The lists are ';'-separated because a manifest option
+/// --controlnet FILE, plus the --keep-text-encoder switch. The lists are ';'-separated because a manifest option
 /// cannot repeat. Throws std::invalid_argument.
 struct StartupOptions {
   std::vector<std::pair<std::string, std::string>> loras;  // name, path
   std::vector<Lora> default_loras;
   std::string controlnet;
+  bool keep_text_encoder{false};
 };
 StartupOptions ParseStartupOptions(const ext::ParsedOptions& options);
 
