@@ -53,6 +53,9 @@ inline constexpr std::chrono::seconds kPoolSpillAfter{10};
 inline constexpr std::chrono::seconds kPoolSticky{300};
 /// A local load failure keeps pool requests off the local worker this long.
 inline constexpr std::chrono::seconds kPoolLocalFailHold{60};
+/// A partner that answered a pool request 502/503/504 (its worker did not
+/// start, its load timed out) gets no pool request of that model this long.
+inline constexpr std::chrono::seconds kPoolRemoteFailHold{60};
 
 /// What one machine looks like for one pool model.
 struct PoolSide {
@@ -178,6 +181,34 @@ struct PoolDecision {
     }
   }
   return names;
+}
+
+/// How the pool treats the partner's answer to a relayed pool request
+/// that has not reached the client yet (a relayed answer streams lazily,
+/// so even a streaming error body can still be dropped).
+enum class PoolRemoteAnswer {
+  /// Pass it to the client (success, client errors, 500 and the like).
+  kPass,
+  /// 507: the partner could not fit the model; this machine tries once.
+  kRetryMemory,
+  /// No answer at all (503 remote_unavailable, made here): try here once.
+  kRetryUnreachable,
+  /// 502 (worker failed to start), 503 (upstream_unavailable, pool_busy,
+  /// ...) or 504 (load timed out) from the partner: try here once and keep
+  /// pool requests of this model off the partner for kPoolRemoteFailHold.
+  kRetryFailed,
+};
+
+[[nodiscard]] inline PoolRemoteAnswer ClassifyPoolRemoteAnswer(
+    int status, bool streaming_body, std::string_view log_details) {
+  if (status == 507)
+    return PoolRemoteAnswer::kRetryMemory;
+  if (status == 503 && !streaming_body &&
+      log_details.starts_with("remote_unavailable"))
+    return PoolRemoteAnswer::kRetryUnreachable;
+  if (status == 502 || status == 503 || status == 504)
+    return PoolRemoteAnswer::kRetryFailed;
+  return PoolRemoteAnswer::kPass;
 }
 
 /// "local" | "remote" from an X-Gufo-Pool header value; "" for anything

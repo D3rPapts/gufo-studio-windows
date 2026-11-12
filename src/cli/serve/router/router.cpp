@@ -1378,6 +1378,11 @@ public:
     /// A local load or admission failed: kPoolLocalFailHold off the worker.
     bool local_failed{false};
     std::chrono::steady_clock::time_point local_failed_at{};
+    /// The partner answered 502/503/504 for this model: kPoolRemoteFailHold
+    /// off the partner (unless a request is pinned there).
+    bool remote_failed{false};
+    std::chrono::steady_clock::time_point remote_failed_at{};
+    std::string remote_failed_detail;
     long long local_picks{0};
     long long remote_picks{0};
     long long retried_local{0};
@@ -1461,7 +1466,8 @@ public:
   router::PoolInput PoolInputLocked(const router::PresetModel& preset,
                                     bool forwarded, bool from_comfy,
                                     bool remote_failed,
-                                    std::chrono::milliseconds waited) {
+                                    std::chrono::milliseconds waited,
+                                    bool ignore_remote_hold = false) {
     const auto now = std::chrono::steady_clock::now();
     const auto within = [now](std::chrono::steady_clock::time_point at) {
       return at != std::chrono::steady_clock::time_point{} &&
@@ -1496,7 +1502,10 @@ public:
     local.sticky = within(pool.local_warm_at);
 
     router::PoolSide& remote = in.remote;
-    if (remotes != nullptr && !remote_failed) {
+    const bool remote_held =
+        !ignore_remote_hold && pool.remote_failed &&
+        now - pool.remote_failed_at < router::kPoolRemoteFailHold;
+    if (remotes != nullptr && !remote_failed && !remote_held) {
       const router::RemoteEndpoint& url = preset.remote->url;
       const router::RemoteHub::ModelView view = remotes->View(url, preset.id);
       std::string error;
@@ -1658,7 +1667,8 @@ public:
         }
       }
       router::PoolInput pool_input =
-          PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited);
+          PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited,
+                          /*ignore_remote_hold=*/forced == "remote");
       // One side only (capabilities): the other is out, even when free.
       if (forced == "remote")
         pool_input.local.available = false;
@@ -1718,15 +1728,33 @@ public:
         // its own idle residents, so it tries once itself instead of handing
         // the 507 to the client (10.11.: hemmingway 507 on .198 for an hour
         // while .56 kept an idle flash-next-q3 loaded).
-        const bool remote_refused_memory =
-            response.status == 507 && !forwarded;
         // A relayed 507 arrives with a lazy streaming body; nothing has
         // reached the client until it is written, so it can be dropped
         // (10.11. 07:31: the first 1.4.12 skipped the retry for this reason).
-        if (may_retry && !remote_failed &&
-            (remote_refused_memory ||
-             (!response.streaming_body && response.status == 503 &&
-              response.log_details.starts_with("remote_unavailable")))) {
+        // The same holds for a 502/503/504 of the partner (its worker did
+        // not start, its load timed out): 12.11. 21:00 the .56 answered 502
+        // "worker failed to start" while qwen-image was warm and free here,
+        // and the client got the 502.
+        const router::PoolRemoteAnswer answer =
+            router::ClassifyPoolRemoteAnswer(
+                response.status, static_cast<bool>(response.streaming_body),
+                response.log_details);
+        if (answer == router::PoolRemoteAnswer::kRetryFailed && !forwarded) {
+          // Keep the next pool requests of this model off the partner too.
+          PoolEntry& pool = pool_[model_id];
+          pool.remote_failed = true;
+          pool.remote_failed_at = std::chrono::steady_clock::now();
+          pool.remote_failed_detail =
+              std::to_string(response.status) + " " + response.log_details;
+          Logger::Warn("router", "event=pool_remote_failed model=" + model_id +
+                                     " status=" +
+                                     std::to_string(response.status) +
+                                     " hold_s=" +
+                                     std::to_string(
+                                         router::kPoolRemoteFailHold.count()));
+        }
+        if (may_retry && !remote_failed && !forwarded &&
+            answer != router::PoolRemoteAnswer::kPass) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
@@ -1809,6 +1837,13 @@ public:
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - pool.local_failed_at)
                 .count());
+      }
+      if (pool.remote_failed) {
+        out["remote_failed_s_ago"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - pool.remote_failed_at)
+                .count());
+        out["remote_failed"] = pool.remote_failed_detail;
       }
     } else {
       out["waiting"] = 0LL;

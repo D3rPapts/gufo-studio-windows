@@ -214,6 +214,27 @@ void TestLoraNames() {
   CHECK(LoraNamesOf(model) == std::vector<std::string>{"x"});
 }
 
+void TestRemoteAnswerClassification() {
+  using gufo::router::ClassifyPoolRemoteAnswer;
+  using gufo::router::PoolRemoteAnswer;
+  CHECK(ClassifyPoolRemoteAnswer(200, true, "") == PoolRemoteAnswer::kPass);
+  CHECK(ClassifyPoolRemoteAnswer(400, true, "") == PoolRemoteAnswer::kPass);
+  CHECK(ClassifyPoolRemoteAnswer(500, true, "") == PoolRemoteAnswer::kPass);
+  CHECK(ClassifyPoolRemoteAnswer(507, true, "") ==
+        PoolRemoteAnswer::kRetryMemory);
+  CHECK(ClassifyPoolRemoteAnswer(503, false, "remote_unavailable detail=x") ==
+        PoolRemoteAnswer::kRetryUnreachable);
+  // 12.11. 21:00: the partner's 502 "worker failed to start" reached the
+  // client although this machine was warm and free.
+  CHECK(ClassifyPoolRemoteAnswer(502, true, "") ==
+        PoolRemoteAnswer::kRetryFailed);
+  CHECK(ClassifyPoolRemoteAnswer(503, true, "") ==
+        PoolRemoteAnswer::kRetryFailed);
+  CHECK(ClassifyPoolRemoteAnswer(504, true, "") ==
+        PoolRemoteAnswer::kRetryFailed);
+  CHECK(gufo::router::kPoolRemoteFailHold == std::chrono::seconds(60));
+}
+
 gufo::router::PresetModel PoolTwin() {
   gufo::router::PresetModel model;
   model.modality = "llm";
@@ -315,6 +336,7 @@ int main() {
   TestForwardedStaysLocal();
   TestGpuWorkModel();
   TestLoraNames();
+  TestRemoteAnswerClassification();
   TestProbeActivity();
   TestGpuSlotIdle();
   TestRegistryCounts();

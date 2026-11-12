@@ -769,6 +769,20 @@ Limits: the pool has exactly one partner; the image preview of a pulled job runs
 worker, so the owner shows no live step for it; a job with a multipart
 body states its LoRAs only through a `loras` JSON part.
 
+### Pool failures (after 1.4.24)
+
+**Partner failure.** When the partner answers a relayed pool request
+`502` (its worker did not start), `503` (`upstream_unavailable`,
+`pool_busy`, ...) or `504` (its load timed out), nothing has reached the
+client yet, so the pool decides once more without the partner (this
+machine, or wait for it), like it already did for `507` and for `503
+remote_unavailable`. Video, music and 3D creates and requests pinned
+with `X-Gufo-Pool: remote` are not retried. The partner then gets no
+pool request of that model for 60 s (`event=pool_remote_failed`;
+pinned requests ignore the hold); `/router/status` and
+`/router/placement` show `"remote_failed_s_ago"` and `"remote_failed"`
+(status and detail) in the model's `pool` block.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

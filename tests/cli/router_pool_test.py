@@ -170,6 +170,34 @@ def check_lora_side(router, remote):
     assert remote_chats(remote) == 0
 
 
+def check_remote_failure_retries_local(router, remote):
+    # The partner answers 502 (its worker did not start) while the local
+    # worker is busy: the request is served here once the local worker is
+    # free instead of handing the 502 to the client, and the partner gets
+    # no request of this model for 60 s.
+    remote.clear()
+    remote.chat_fail = 502
+    try:
+        running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+        time.sleep(0.5)
+        code, answer = rp.chat(router, "twin")
+        assert code == 200 and rp.where(answer) == "local", (code, answer)
+        assert remote_chats(remote) == 1, remote.entries()
+        running.join(10)
+        pool = router.status()["remote"]["models"]["twin"]["pool"]
+        assert "remote_failed_s_ago" in pool and pool["retried_local"] >= 1, pool
+    finally:
+        remote.chat_fail = None
+    # Held: local busy again, the next request waits for the local worker.
+    remote.clear()
+    running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+    time.sleep(0.5)
+    code, answer = rp.chat(router, "twin")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    assert remote_chats(remote) == 0, remote.entries()
+    running.join(10)
+
+
 def check_remote_gone(router, remote):
     # The remote goes away while the router still lists it as reachable:
     # a request sent there is decided again and served here.
@@ -207,6 +235,8 @@ def main():
                  lambda: check_forwarded_stays_local(router, remote)),
                 ("remote activity", lambda: check_remote_activity(router, remote)),
                 ("lora side", lambda: check_lora_side(router, remote)),
+                ("remote failure retries local",
+                 lambda: check_remote_failure_retries_local(router, remote)),
                 ("remote gone", lambda: check_remote_gone(router, remote))):
             case()
             print("router_pool_test: %s ok" % name, flush=True)
