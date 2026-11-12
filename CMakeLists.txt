@@ -397,6 +397,8 @@ add_subdirectory(src/models/indextts)
 add_subdirectory(src/models/moss_image)
 # CCIP + anime face detector for POST /v1/figuren ("verfahren": "ccip").
 add_subdirectory(src/models/ccip)
+# TripoSG image -> 3D (feat/triposg): stage 1 is CPU only (marching cubes, GLB).
+add_subdirectory(src/models/triposg)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
