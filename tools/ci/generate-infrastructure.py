@@ -512,7 +512,7 @@ def write_targets(root: Path) -> List[str]:
     for path, expected_content in targets.items():
         rel_path = path.relative_to(root).as_posix()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(expected_content, encoding="utf-8")
+        path.write_text(expected_content, encoding="utf-8", newline="\n")
         written.append(rel_path)
 
     return written

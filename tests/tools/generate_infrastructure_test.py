@@ -29,12 +29,14 @@ class GenerateInfrastructureTest(unittest.TestCase):
         expected = [
             "deepseek_v4_flash",
             "embedding_gemma2",
+            "fish_drama3",
             "minimax_h3",
             "qwen",
             "qwen38_flash_next",
             "qwen3_asr",
             "qwen3_tts",
             "qwen_image_21",
+            "wan22",
         ]
         self.assertEqual(names, sorted(expected))
 
