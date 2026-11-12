@@ -4,7 +4,9 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string_view>
@@ -305,6 +307,15 @@ std::vector<float> MakeContext(std::span<const float> source,
   return context;
 }
 
+// Diagnostics: GUFO_ACE_DUMP=<dir> writes the raw source latents, the FSQ
+// codes and the detokenized hints of a request as flat little-endian files.
+template <typename T>
+void DumpRaw(const char* dir, const char* name, const std::vector<T>& data) {
+  std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(data.size() * sizeof(T)));
+}
+
 }  // namespace
 
 bool MusicPipeline::Generate(const MusicRequest& request,
@@ -424,8 +435,12 @@ bool MusicPipeline::Generate(const MusicRequest& request,
   tm.encode_seconds = Since(start);
 
   start = std::chrono::steady_clock::now();
-  const std::string instruction =
+  std::string instruction =
       MusicInstruction(task, request.track, request.track_classes);
+  // Diagnostics: GUFO_ACE_INSTRUCTION overrides the DiT task instruction.
+  if (const char* override_instruction = std::getenv("GUFO_ACE_INSTRUCTION");
+      override_instruction != nullptr && *override_instruction != '\0')
+    instruction = override_instruction;
   std::vector<std::uint32_t> text_ids, lyric_ids;
   if (!m.Encode(MusicTextPrompt(request, instruction, duration),
                 kMaxTextTokens, &text_ids, error) ||
@@ -526,6 +541,25 @@ bool MusicPipeline::Generate(const MusicRequest& request,
         !m.dit->CodeHints(codes, frames, &source, error))
       return false;
     tm.codes = static_cast<int>(codes.size());
+  }
+  if (const char* dump = std::getenv("GUFO_ACE_DUMP");
+      dump != nullptr && *dump != '\0') {
+    DumpRaw(dump, "source_latents.f32", source_pre_fsq);
+    DumpRaw(dump, "codes.i32", codes);
+    DumpRaw(dump, "hints.f32", source);
+  }
+  // Diagnostics: GUFO_ACE_HINTS_FILE=<file> replaces the cover hints with
+  // [frames, 64] float32 read from the file (reference hints for A/B tests).
+  if (const char* inject = std::getenv("GUFO_ACE_HINTS_FILE");
+      inject != nullptr && *inject != '\0' && TaskIsCover(task)) {
+    std::ifstream in(inject, std::ios::binary);
+    std::vector<float> file(std::size_t(frames) * kLatentChannels);
+    in.read(reinterpret_cast<char*>(file.data()),
+            static_cast<std::streamsize>(file.size() * sizeof(float)));
+    if (in.gcount() == static_cast<std::streamsize>(file.size() * sizeof(float)))
+      source = file;
+    else
+      return Fail(error, "GUFO_ACE_HINTS_FILE has the wrong size");
   }
   if (!m.dit->EncodeConditions(text, tm.text_tokens, lyric, tm.lyric_tokens,
                                timbre, kTimbreFrames, &conditions, error))
