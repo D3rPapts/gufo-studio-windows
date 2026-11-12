@@ -804,7 +804,8 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << name << ": " << r.structure_voxels << " structure voxels, " << r.shape_voxels << " shape voxels, mesh "
               << r.faces_before_decimation << " -> " << r.faces << " faces, " << r.vertices << " vertices, holes filled " << r.holes_filled
-              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", open loops " << r.open_loops << ", volume " << r.volume << '\n';
+              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", open loops " << r.open_loops << ", flipped faces "
+              << r.flipped_faces << ", volume " << r.volume << '\n';
     if (!r.largest_open_loops.empty()) {
         std::cout << "  largest open loops (perimeter):";
         for (float p : r.largest_open_loops) std::cout << ' ' << p;
