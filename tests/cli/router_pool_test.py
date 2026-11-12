@@ -100,6 +100,9 @@ def check_both_busy_waits(router, remote):
     waiting, waiting_result = rp.in_background(lambda: rp.chat(router, "twin"))
     time.sleep(0.5)
     assert router.status()["remote"]["models"]["twin"]["pool"]["waiting"] == 1
+    # What the partner's probe reads: the waiting request apart from busy.
+    activity = router.models()["twin"]["activity"]
+    assert activity["waiting"] == 1 and activity["busy"] is True, activity
     waiting.join(15)
     code, answer = waiting_result["value"]
     assert code == 200, (code, answer)
@@ -126,7 +129,8 @@ def check_remote_activity(router, remote):
     for flags in ({"busy": True, "gpu_busy": False, "others_busy": False},
                   {"busy": False, "gpu_busy": True, "others_busy": True}):
         remote.activity["twin"] = flags
-        rr.wait_for(lambda: router_entry(router, remote)["activity"].get("twin") == flags,
+        rr.wait_for(lambda: same_flags(router_entry(router, remote)["activity"].get("twin"),
+                                       flags),
                     15, "the probe to read %s" % flags)
         remote.clear()
         running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
@@ -137,9 +141,32 @@ def check_remote_activity(router, remote):
         assert time.monotonic() - began >= 1, "did not wait for the local worker"
         assert remote_chats(remote) == 0, flags
         running.join(10)
+    # Requests that only wait there for a machine do not occupy it: the
+    # partner reports them as "waiting", not "busy" (12.11.: mutual wait).
+    flags = {"busy": False, "waiting": 2, "gpu_busy": False, "others_busy": False}
+    remote.activity["twin"] = flags
+    rr.wait_for(lambda: same_flags(router_entry(router, remote)["activity"].get("twin"),
+                                   flags),
+                15, "the probe to read %s" % flags)
+    remote.clear()
+    running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+    time.sleep(0.5)
+    began = time.monotonic()
+    code, answer = rp.chat(router, "twin")
+    assert code == 200 and rp.where(answer) == "remote", (code, answer)
+    assert time.monotonic() - began < 1, "waited although the remote was free"
+    running.join(10)
     remote.activity.clear()
     rr.wait_for(lambda: router_entry(router, remote)["activity"] == {}, 15,
                 "the probe to clear the activity")
+
+
+def same_flags(seen, flags):
+    """The probe's copy of an activity object ("waiting" defaults to 0)."""
+    if seen is None:
+        return False
+    return all(seen.get(key, 0) == value for key, value in flags.items()) and \
+        seen.get("waiting", 0) == flags.get("waiting", 0)
 
 
 def lora_chat(router, lora, headers=None):

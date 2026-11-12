@@ -235,6 +235,72 @@ void TestRemoteAnswerClassification() {
   CHECK(gufo::router::kPoolRemoteFailHold == std::chrono::seconds(60));
 }
 
+gufo::router::PresetModel PoolTwin();
+
+/// One router of the pair as its partner's probe sees it: a GET
+/// /v1/models answer with "big" loaded and the given activity object.
+gufo::router::RemoteHub::ModelView ProbedView(
+    gufo::router::RemoteHub& hub, const gufo::router::RemoteEndpoint& url,
+    const std::string& activity) {
+  gufo::router::RemoteProbe probe;
+  probe.reachable = true;
+  gufo::router::ParseRemoteModels(
+      R"({"object":"list","data":[{"id":"big","status":{"value":"loaded"},)"
+      R"("activity":)" +
+          activity + "}]}",
+      &probe);
+  (void)hub.Record(url, probe);
+  return hub.View(url, "big");
+}
+
+void TestWaitingIsNotBusy() {
+  using gufo::router::PoolActivityBusy;
+  using gufo::router::RemoteObservation;
+  using gufo::router::RemotePoolSide;
+  // 12.11. 17:34-18:05: router A holds a request pinned to B (X-Gufo-Pool:
+  // remote after a redirect), B holds one pinned to A; both models warm,
+  // nothing computes anywhere. Each reports its waiting request.
+  const std::vector<gufo::router::PresetModel> presets = {PoolTwin()};
+  gufo::router::RemoteHub hub(presets);
+  const auto& url = presets[0].remote->url;
+  const bool busy = PoolActivityBusy(/*in_flight=*/false, /*local_claims=*/0);
+  CHECK(!busy);
+  CHECK(PoolActivityBusy(true, 0) && PoolActivityBusy(false, 1));
+  const std::string reported = std::string(R"({"busy":)") +
+                               (busy ? "true" : "false") +
+                               R"(,"waiting":1,"gpu_busy":false,)"
+                               R"("others_busy":false})";
+  RemoteObservation seen;
+  seen.view = ProbedView(hub, url, reported);
+  seen.reachable = true;
+  CHECK(seen.view.activity.waiting == 1 && !seen.view.activity.busy);
+  PoolSide pinned_away = Warm(true);
+  pinned_away.available = false;  // forced remote: this side is out
+  PoolInput in;
+  in.local = pinned_away;
+  in.remote = RemotePoolSide(seen);
+  CHECK(in.remote.available && in.remote.warm && in.remote.free);
+  // Each side's request goes to the other at once (before: wait 900 s).
+  CHECK(ChoosePool(in).choice == PoolChoice::kRemote);
+  // The old report (busy = waiting > 0) reproduces the deadlock.
+  seen.view = ProbedView(
+      hub, url,
+      R"({"busy":true,"gpu_busy":false,"others_busy":false})");
+  in.remote = RemotePoolSide(seen);
+  CHECK(!in.remote.free);
+  CHECK(ChoosePool(in).choice == PoolChoice::kWait);
+  // Real work there still counts: busy, a relay of ours, a stale probe.
+  seen.view = ProbedView(hub, url, reported);
+  seen.ours = 1;
+  CHECK(!RemotePoolSide(seen).free);
+  seen.ours = 0;
+  seen.slot_idle = false;
+  CHECK(!RemotePoolSide(seen).free);
+  seen.slot_idle = true;
+  seen.reachable = false;
+  CHECK(!RemotePoolSide(seen).available);
+}
+
 gufo::router::PresetModel PoolTwin() {
   gufo::router::PresetModel model;
   model.modality = "llm";
@@ -337,6 +403,7 @@ int main() {
   TestGpuWorkModel();
   TestLoraNames();
   TestRemoteAnswerClassification();
+  TestWaitingIsNotBusy();
   TestProbeActivity();
   TestGpuSlotIdle();
   TestRegistryCounts();

@@ -783,6 +783,26 @@ pinned requests ignore the hold); `/router/status` and
 `/router/placement` show `"remote_failed_s_ago"` and `"remote_failed"`
 (status and detail) in the model's `pool` block.
 
+**Waiting is not busy.** The `"activity"` object of a pool model in `GET
+/v1/models` (what the partner's probe reads) reports `"busy"` only for
+work of the model that runs or loads here (a request, socket or job, or
+a pool request that picked this machine), and apart from it `"waiting"`:
+the number of pool requests of the model that wait for a machine. The
+partner counts only `busy` as occupied, and `"others_busy"` leaves out
+other models' waiting requests too, so two requests pinned to the other
+side (`X-Gufo-Pool: remote`) no longer wait for each other until the
+queue timeout (12.11.: 900 s). A router older than this reports waiting
+requests as busy; the field is then missing and reads as 0.
+`/router/status` copies `waiting` into each remote router's
+`activity`.
+
+**Pull only with a free GPU.** A free job runner pulls a partner job
+only when this machine's GPU can take it now: the job's model is not
+busy here, no other GPU work runs (ComfyUI queue, an image, video, music
+or 3D model with work in flight) and no pool request is claimed or
+waiting here. Before, an idle runner was enough, and a machine busy with
+ComfyUI pulled jobs that then waited in its pool.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

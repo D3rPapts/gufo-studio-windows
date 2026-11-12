@@ -1429,8 +1429,10 @@ public:
 
   /// Anything but `model_id` in flight here: another model's request,
   /// socket or job, the ComfyUI queue (unless `from_comfy`) or another pool
-  /// model's claimed or waiting request.
-  bool OthersBusyLocked(const std::string& model_id, bool from_comfy) const {
+  /// model's claimed request, and (`count_waiting`) another pool model's
+  /// request that waits for a machine.
+  bool OthersBusyLocked(const std::string& model_id, bool from_comfy,
+                        bool count_waiting = true) const {
     if (!from_comfy && comfy != nullptr && comfy->QueueRemaining() > 0)
       return true;
     for (const auto& [preset, status] : registry.Statuses()) {
@@ -1439,27 +1441,61 @@ public:
         return true;
     }
     for (const auto& [id, entry] : pool_) {
-      if (id != model_id && (entry.local_claims > 0 || entry.waiting > 0))
+      if (id != model_id &&
+          (entry.local_claims > 0 || (count_waiting && entry.waiting > 0)))
         return true;
     }
     return false;
   }
 
   /// GET /v1/models "activity" of a model served here: what the partner
-  /// router's pool reads from its probe.
+  /// router's pool reads from its probe. "busy" = work of the model runs
+  /// (or loads) here; "waiting" = pool requests of it that only wait for a
+  /// machine, reported apart so the partner does not count them as
+  /// occupied (12.11.: mutual 900 s wait). "others_busy" likewise leaves
+  /// out other models' waiting requests.
   json::Value ActivityLocked(const std::string& model_id) const {
     json::Value out = json::Value::object();
-    bool busy = registry.Busy(model_id);
-    if (const auto it = pool_.find(model_id); it != pool_.end())
-      busy = busy || it->second.local_claims > 0 || it->second.waiting > 0;
-    out["busy"] = busy;
+    int claims = 0;
+    int waiting = 0;
+    if (const auto it = pool_.find(model_id); it != pool_.end()) {
+      claims = it->second.local_claims;
+      waiting = it->second.waiting;
+    }
+    out["busy"] = router::PoolActivityBusy(registry.Busy(model_id), claims);
+    out["waiting"] = static_cast<long long>(waiting);
     std::string reason;
     const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
     out["gpu_busy"] = gpu_busy;
     if (gpu_busy)
       out["gpu_busy_reason"] = reason;
-    out["others_busy"] = OthersBusyLocked(model_id, false);
+    out["others_busy"] =
+        OthersBusyLocked(model_id, false, /*count_waiting=*/false);
     return out;
+  }
+
+  /// Whether this machine may pull a job of `model_id` from the partner
+  /// now (job store, shared queue): a free job runner says nothing about
+  /// the GPU. Not while the model is busy here, other GPU work runs
+  /// (ComfyUI queue, an image/video/music model) or a pool request here is
+  /// claimed or waits (12.11. 17:34 and 17:50 the .56 pulled while its GPU
+  /// ran ComfyUI and the film). *why gets the reason.
+  bool MayPull(const std::string& model_id, std::string* why) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (registry.Busy(model_id)) {
+      *why = model_id + " busy";
+      return false;
+    }
+    if (GpuBusyLocked(model_id, false, why))
+      return false;
+    for (const auto& [id, entry] : pool_) {
+      if (entry.local_claims > 0 || entry.waiting > 0) {
+        *why = "pool request of " + id +
+               (entry.local_claims > 0 ? " loading" : " waiting");
+        return false;
+      }
+    }
+    return true;
   }
 
   /// Both machines as the pool decision sees them (state mutex held).
@@ -1507,22 +1543,16 @@ public:
         now - pool.remote_failed_at < router::kPoolRemoteFailHold;
     if (remotes != nullptr && !remote_failed && !remote_held) {
       const router::RemoteEndpoint& url = preset.remote->url;
-      const router::RemoteHub::ModelView view = remotes->View(url, preset.id);
+      router::RemoteObservation seen;
+      seen.view = remotes->View(url, preset.id);
       std::string error;
-      remote.available = view.served && remotes->Reachable(url, &error);
-      remote.warm = view.status == "loaded" || view.status == "loading";
-      const std::size_t ours = registry.RemoteRequests(preset.id);
+      seen.reachable = remotes->Reachable(url, &error);
+      seen.ours = registry.RemoteRequests(preset.id);
+      seen.slot_idle = gpu_slots.Idle(preset.remote->gpu_slot);
       // A probe from before our last relay ended may still count it.
-      const bool stale =
-          view.checked_at <= registry.LastRemoteFinished(preset.id);
-      const bool theirs = view.has_activity && view.activity.busy && !stale;
-      remote.free =
-          ours < static_cast<std::size_t>(router::kPoolRemoteCapacity) &&
-          gpu_slots.Idle(preset.remote->gpu_slot) && !theirs;
-      remote.gpu_busy = view.has_activity && view.activity.gpu_busy;
-      remote.idle = remote.free && ours == 0 &&
-                    !(view.has_activity && view.activity.others_busy);
-      remote.empty = !view.others_loaded;
+      seen.stale =
+          seen.view.checked_at <= registry.LastRemoteFinished(preset.id);
+      remote = router::RemotePoolSide(seen);
       if (remote.available && remote.warm)
         pool.remote_warm_at = now;
       remote.sticky = within(pool.remote_warm_at);
@@ -3947,6 +3977,9 @@ int RunRouter(std::span<const char* const> args) {
       return raw->PartnerCapabilities();
     };
     jobs_options.pool_states = [raw] { return raw->PoolJobStates(); };
+    jobs_options.may_pull = [raw](const std::string& model, std::string* why) {
+      return raw->MayPull(model, why);
+    };
     jobs_options.redirect_waiting = [raw](const std::string& job_id) {
       return raw->RedirectWaitingJob(job_id);
     };

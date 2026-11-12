@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "src/cli/serve/router/preset.hpp"
+#include "src/cli/serve/router/remote.hpp"
 
 namespace gufo::router {
 
@@ -181,6 +182,49 @@ struct PoolDecision {
     }
   }
   return names;
+}
+
+/// The "busy" a router reports to its partner for a model (GET /v1/models
+/// "activity"): a request, socket or job of it is in flight here, or a
+/// pool request picked this machine and is loading it (local claim). A
+/// pool request that only waits for a machine is not busy; it is reported
+/// apart as "waiting". 12.11. 17:34-18:05: two requests pinned to the
+/// other side each saw the other's waiting request as busy and both
+/// waited the full 900 s.
+[[nodiscard]] inline bool PoolActivityBusy(bool in_flight, int local_claims) {
+  return in_flight || local_claims > 0;
+}
+
+/// What the pool knows about the partner for one model.
+struct RemoteObservation {
+  /// The last probe's view of the model.
+  RemoteHub::ModelView view;
+  /// The partner counts as reachable.
+  bool reachable{false};
+  /// Relays of this model from here that are open now.
+  std::size_t ours{0};
+  /// The partner's GPU slot (if any) is idle.
+  bool slot_idle{true};
+  /// The probe ran before our last relay ended (may still count it).
+  bool stale{false};
+};
+
+/// The partner's PoolSide (without `sticky`, which the router keeps).
+/// Only the partner's "busy" counts as occupied: its "waiting" requests
+/// wait for a machine and hold nothing.
+[[nodiscard]] inline PoolSide RemotePoolSide(const RemoteObservation& in) {
+  PoolSide side;
+  const RemoteHub::ModelView& view = in.view;
+  side.available = view.served && in.reachable;
+  side.warm = view.status == "loaded" || view.status == "loading";
+  const bool theirs = view.has_activity && view.activity.busy && !in.stale;
+  side.free = in.ours < static_cast<std::size_t>(kPoolRemoteCapacity) &&
+              in.slot_idle && !theirs;
+  side.gpu_busy = view.has_activity && view.activity.gpu_busy;
+  side.idle = side.free && in.ours == 0 &&
+              !(view.has_activity && view.activity.others_busy);
+  side.empty = !view.others_loaded;
+  return side;
 }
 
 /// How the pool treats the partner's answer to a relayed pool request

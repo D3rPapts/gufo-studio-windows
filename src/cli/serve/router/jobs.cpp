@@ -2836,10 +2836,15 @@ bool JobQueue::TryPull(long long mine_created_at) {
   for (const PartnerJob& candidate : *queued) {
     if (mine_created_at > 0 && candidate.created_at >= mine_created_at)
       break;  // ours is older: it goes first
-    if (CanRun(mine, candidate.model, candidate.loras)) {
-      pick = &candidate;
-      break;
-    }
+    if (!CanRun(mine, candidate.model, candidate.loras))
+      continue;
+    // The runner is free, but the GPU may not be (12.11.: the .56 pulled
+    // while ComfyUI and the film ran there).
+    std::string busy_why;
+    if (options_.may_pull && !options_.may_pull(candidate.model, &busy_why))
+      continue;
+    pick = &candidate;
+    break;
   }
   if (pick == nullptr)
     return false;

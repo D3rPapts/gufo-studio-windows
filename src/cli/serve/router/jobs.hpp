@@ -313,6 +313,11 @@ struct Options {
   /// it again with X-Gufo-Pool: remote. False when the request waits no
   /// longer (then the job is not handed out).
   std::function<bool(const std::string& job_id)> redirect_waiting;
+  /// Whether this machine's GPU may take a job of `model` from the
+  /// partner now (the router: the model not busy here, no other GPU work,
+  /// no pool request claimed or waiting); a free runner alone says nothing
+  /// about the GPU. Empty = always. Called without the queue's lock held.
+  std::function<bool(const std::string& model, std::string* why)> may_pull;
 };
 
 /// Set on every request relayed to the partner; never relayed on.

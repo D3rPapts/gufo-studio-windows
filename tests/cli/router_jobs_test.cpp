@@ -508,6 +508,8 @@ struct Harness {
   std::function<std::optional<json::Value>()> partner_capabilities;
   std::string self_name;
   std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
+  /// Set before Open(true): the router's GPU gate for pulls (empty = any).
+  std::function<bool(const std::string&, std::string*)> may_pull;
   /// Set before Open(true): the 3D poll limit (zero keeps the default).
   std::chrono::milliseconds objekt_deadline{0};
 
@@ -556,6 +558,7 @@ struct Harness {
     options.self_name = self_name;
     options.pull_poll = std::chrono::milliseconds(20);
     options.pull_hold = pull_hold;
+    options.may_pull = may_pull;
     if (objekt_deadline.count() > 0)
       options.objekt_deadline = objekt_deadline;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
@@ -2057,6 +2060,55 @@ void TestPoolPullRequester() {
   }
 }
 
+void TestPoolPullGpuBusy() {
+  // A free runner whose GPU is busy (ComfyUI queue, another heavy model,
+  // a pool request waiting here) pulls nothing: 12.11. 17:34 and 17:50
+  // the .56 pulled while ComfyUI and the film ran, and the pulled request
+  // waited 900 s. Once the GPU is free, the pull follows.
+  auto partner = std::make_shared<FakePartner>();
+  partner->queued =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":1001,"request":{"model":"qwen-image","loras":[]}}]})";
+  Harness h("pull-gpu-busy", false);
+  partner->api = h.api;
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  auto gpu_busy = std::make_shared<std::atomic<bool>>(true);
+  auto asked = std::make_shared<std::atomic<int>>(0);
+  h.may_pull = [gpu_busy, asked](const std::string& model, std::string* why) {
+    ++*asked;
+    if (gpu_busy->load()) {
+      *why = "comfy queue 1";
+      return false;
+    }
+    return model == "qwen-image";
+  };
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 0);
+  }
+  CHECK(asked->load() > 0);
+  CHECK(h.queue->PoolQueueStatus().member_double("pulled") == 0);
+  gpu_busy->store(false);
+  for (int i = 0; i < 200; ++i) {
+    {
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      if (partner->pulls > 0)
+        break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const std::lock_guard<std::mutex> lock(partner->mutex);
+  CHECK(partner->pulls == 1);
+}
+
 void TestPoolPullOldPartner() {
   // The partner answers 404 on the pull route (older version): pulling
   // pauses for pull_hold, the local job runs as before, and a later
@@ -2421,6 +2473,7 @@ int main() {
   TestCapabilityRouting();
   TestPoolPullRequester();
   TestPoolPullOldPartner();
+  TestPoolPullGpuBusy();
   TestPoolPullOwner();
   TestReachableUrl();
   TestPoolPullBindAddress();
