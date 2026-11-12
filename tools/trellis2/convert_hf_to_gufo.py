@@ -46,8 +46,12 @@ PARTS = {
     "shape_dec": ("trellis2", "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors", "co_tap_ci"),
     "tex_dec": ("trellis2", "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors", "co_tap_ci"),
     "ss_dec": ("trellis1", "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", "co_ci_tap"),
+    # DINOv3 ViT-L/16 (Meta DINOv3 licence, gated): q/k/v fused to attention.qkv (k bias = 0),
+    # patch weight [1024,3,16,16] -> [1024,768], mask_token and the unused final `norm` dropped;
+    # everything stays F32 (the encoder runs FP32 and the file is 1.2 GB).
+    "dinov3": ("dinov3", "model.safetensors", None),
 }
-DEFAULT_PARTS = ["ss_flow", "ss_dec", "shape_flow_512", "shape_dec", "tex_flow_512", "tex_dec"]
+DEFAULT_PARTS = ["ss_flow", "ss_dec", "shape_flow_512", "shape_dec", "tex_flow_512", "tex_dec", "dinov3"]
 
 # Expected config values (ckpts/*.json) per part.
 EXPECTED = {
@@ -65,6 +69,10 @@ EXPECTED = {
                 "num_blocks": [4, 16, 8, 4, 0], "pred_subdiv": False},
     "ss_dec": {"out_channels": 1, "latent_channels": 8, "num_res_blocks": 2, "num_res_blocks_middle": 2,
                "channels": [512, 128, 32], "use_fp16": True},
+    "dinov3": {"hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 16, "patch_size": 16,
+               "num_register_tokens": 4, "rope_theta": 100.0, "layer_norm_eps": 1e-05, "hidden_act": "gelu",
+               "key_bias": False, "query_bias": True, "value_bias": True, "proj_bias": True, "mlp_bias": True,
+               "use_gated_mlp": False, "intermediate_size": 4096},
 }
 
 
@@ -152,8 +160,42 @@ def output_dtype(name, shape, keep_f32):
 
 
 # ------------------------------------------------------------------------ plan
+def plan_dinov3(src):
+    """Fused qkv per layer, flattened patch weight, no mask_token / final norm; all F32."""
+    entries = []
+    names = set(src.names())
+    layers = sorted({int(n.split(".")[1]) for n in names if n.startswith("layer.")})
+    w = src.shape("embeddings.patch_embeddings.weight")
+    entries.append(("embeddings.cls_token", (w[0],), "F32", lambda: src.read("embeddings.cls_token").reshape(-1)))
+    entries.append(("embeddings.register_tokens", (4, w[0]), "F32",
+                    lambda: src.read("embeddings.register_tokens").reshape(4, -1)))
+    entries.append(("embeddings.patch_embeddings.weight", (w[0], w[1] * w[2] * w[3]), "F32",
+                    lambda: src.read("embeddings.patch_embeddings.weight").reshape(w[0], -1)))
+    entries.append(("embeddings.patch_embeddings.bias", (w[0],), "F32", lambda: src.read("embeddings.patch_embeddings.bias")))
+    for i in layers:
+        p = f"layer.{i}."
+        hidden = src.shape(p + "attention.q_proj.weight")[0]
+
+        def qkv_w(p=p):
+            return np.concatenate([src.read(p + f"attention.{c}_proj.weight") for c in "qkv"], axis=0)
+
+        def qkv_b(p=p, hidden=hidden):
+            k_bias = src.read(p + "attention.k_proj.bias") if (p + "attention.k_proj.bias") in src.tensors else np.zeros(hidden, np.float32)
+            return np.concatenate([src.read(p + "attention.q_proj.bias"), k_bias, src.read(p + "attention.v_proj.bias")], axis=0)
+
+        entries.append((p + "attention.qkv.weight", (3 * hidden, hidden), "F32", qkv_w))
+        entries.append((p + "attention.qkv.bias", (3 * hidden,), "F32", qkv_b))
+        for n in ("attention.o_proj.weight", "attention.o_proj.bias", "layer_scale1.lambda1", "layer_scale2.lambda1",
+                  "norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias", "mlp.up_proj.weight", "mlp.up_proj.bias",
+                  "mlp.down_proj.weight", "mlp.down_proj.bias"):
+            entries.append((p + n, tuple(src.shape(p + n)), "F32", lambda n=p + n: src.read(n)))
+    return entries
+
+
 def plan_part(part, src, keep_f32):
     _, _, layout = PARTS[part]
+    if part == "dinov3":
+        return plan_dinov3(src)
     entries = []
     for name in sorted(src.names(), key=natural_key):
         shape = src.shape(name)
@@ -228,7 +270,7 @@ def selftest():
 def check_config(part, path):
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    args = cfg.get("args", {})
+    args = cfg.get("args", cfg)
     problems = [f"{part}: {k} = {args.get(k)!r}, expected {v!r}" for k, v in EXPECTED[part].items() if args.get(k) != v]
     return problems
 
@@ -237,6 +279,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trellis2", default="", help="HF snapshot of microsoft/TRELLIS.2-4B")
     ap.add_argument("--trellis1", default="", help="HF snapshot of microsoft/TRELLIS-image-large (ss_dec)")
+    ap.add_argument("--dinov3", default="", help="HF snapshot of facebook/dinov3-vitl16-pretrain-lvd1689m")
     ap.add_argument("--out", default="", help="output directory")
     ap.add_argument("--parts", default=",".join(DEFAULT_PARTS), help="comma-separated parts (default: 512 path)")
     ap.add_argument("--dry-run", action="store_true", help="list the output tensors, write nothing")
@@ -259,7 +302,7 @@ def main():
     rc = 0
     for part in parts:
         snapshot, rel, _ = PARTS[part]
-        root = args.trellis2 if snapshot == "trellis2" else args.trellis1
+        root = {"trellis2": args.trellis2, "trellis1": args.trellis1, "dinov3": args.dinov3}[snapshot]
         if not root:
             print(f"{part}: --{snapshot} not given, skipped", file=sys.stderr)
             rc = 2
@@ -269,7 +312,8 @@ def main():
             print(f"{part}: missing {path}", file=sys.stderr)
             rc = 2
             continue
-        problems = check_config(part, path[:-len(".safetensors")] + ".json")
+        config_path = os.path.join(root, "config.json") if part == "dinov3" else path[:-len(".safetensors")] + ".json"
+        problems = check_config(part, config_path)
         for p in problems:
             print("config:", p, file=sys.stderr)
         if problems:
@@ -286,8 +330,11 @@ def main():
                 print(f"{part}  {name:<{width}}  {dtype:<4}  {str(list(shape)):<24}  {math.prod(shape) * DTYPE_SIZE[dtype]:>12,d}")
         print(f"{part}: {len(entries)} tensors, {params:,d} parameters ({src_params:,d} in the source), "
               f"{total / 2**30:.2f} GiB output", file=sys.stderr)
-        if params != src_params:
-            print(f"{part}: parameter count changed!", file=sys.stderr)
+        expected_params = src_params
+        if part == "dinov3":   # dropped: mask_token [1024], norm.weight/bias [2*1024]; added: zero k bias 24 x [1024]
+            expected_params = src_params - 3 * 1024 + 24 * 1024
+        if params != expected_params:
+            print(f"{part}: parameter count changed! {params:,d} != expected {expected_params:,d}", file=sys.stderr)
             rc = 1
         if args.dry_run:
             continue
@@ -297,9 +344,11 @@ def main():
             "format": "pt",
             "gufo.trellis2.format": "1",
             "gufo.trellis2.part": part,
-            "gufo.trellis2.source": ("microsoft/TRELLIS.2-4B" if snapshot == "trellis2" else "microsoft/TRELLIS-image-large")
+            "gufo.trellis2.source": {"trellis2": "microsoft/TRELLIS.2-4B", "trellis1": "microsoft/TRELLIS-image-large",
+                                     "dinov3": "facebook/dinov3-vitl16-pretrain-lvd1689m"}[snapshot]
                                     + (f"@{args.revision}" if args.revision else ""),
-            "gufo.trellis2.license": "MIT (Microsoft), see LICENSE of the HF snapshot",
+            "gufo.trellis2.license": ("DINOv3 License (Meta, see LICENSE.md of the snapshot; 'Built with DINOv3')"
+                                      if part == "dinov3" else "MIT (Microsoft), see LICENSE of the HF snapshot"),
             "gufo.trellis2.conv_layout": "co_tap_ci",
             "gufo.trellis2.source_file": rel,
         }
