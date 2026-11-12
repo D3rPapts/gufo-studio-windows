@@ -186,11 +186,6 @@ Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats) {
         }
         queue.clear();
     };
-    auto seed = [&](std::size_t i, bool sign) {
-        visited.set(i, true);
-        inside.set(i, sign);
-        queue.push_back(static_cast<std::uint32_t>(i));
-    };
     std::vector<std::uint32_t> shell_seeds;   // exterior corners with a neighbour on the active shell
     {
         std::vector<std::uint32_t> ext;
@@ -220,25 +215,57 @@ Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats) {
     }
     queue = std::move(shell_seeds);   // already visited and outside (inside bits default to 0)
     flood();
-    // Enclosed regions: scanned in index order, so a lower neighbour is already visited.
-    for (std::size_t i = 0; i < total; ++i) {
-        if (visited.get(i)) continue;
-        const int z = static_cast<int>(i % static_cast<std::size_t>(D[2]));
-        const int y = static_cast<int>((i / static_cast<std::size_t>(D[2])) % static_cast<std::size_t>(D[1]));
-        const int x = static_cast<int>(i / stride[0]);
-        const int c[3] = {x, y, z};
-        bool sign = false;
-        for (int a = 0; a < 3; ++a) {
-            if (c[a] == 0) continue;
-            const std::size_t j = i - stride[a];
-            if (!visited.get(j)) continue;
-            int lo[3] = {x, y, z};
-            lo[a] -= 1;
-            sign = inside.get(j) != flagged(lo[0], lo[1], lo[2], a);
-            break;
+    // Enclosed regions (not reached from the exterior, e.g. the interior of a wall sealed by the
+    // active shell): the whole component is collected first with the parity of every member
+    // relative to its start corner, then its sign is decided by a majority vote over all edges
+    // into already visited corners. A single neighbour would be fragile: one leaked corner next
+    // to a sealed wall interior would turn the whole wall inside out.
+    {
+        Bits member(total);
+        std::vector<std::uint32_t> members;
+        std::vector<std::uint8_t> rel;
+        for (std::size_t start = 0; start < total; ++start) {
+            if (visited.get(start)) continue;
+            members.clear();
+            rel.clear();
+            members.push_back(static_cast<std::uint32_t>(start));
+            rel.push_back(0);
+            visited.set(start, true);
+            member.set(start, true);
+            std::size_t votes_inside = 0, votes_outside = 0, head = 0;
+            while (head < members.size()) {
+                const std::size_t i = members[head];
+                const bool r = rel[head] != 0;
+                ++head;
+                const int z = static_cast<int>(i % static_cast<std::size_t>(D[2]));
+                const int y = static_cast<int>((i / static_cast<std::size_t>(D[2])) % static_cast<std::size_t>(D[1]));
+                const int x = static_cast<int>(i / stride[0]);
+                const int c[3] = {x, y, z};
+                for (int a = 0; a < 3; ++a)
+                    for (int dir = -1; dir <= 1; dir += 2) {
+                        int nb[3] = {x, y, z};
+                        nb[a] += dir;
+                        if (nb[a] < 0 || nb[a] >= D[a]) continue;
+                        const std::size_t j = i + (dir > 0 ? stride[a] : static_cast<std::size_t>(0) - stride[a]);
+                        const bool f = dir > 0 ? flagged(c[0], c[1], c[2], a) : flagged(nb[0], nb[1], nb[2], a);
+                        if (!visited.get(j)) {
+                            visited.set(j, true);
+                            member.set(j, true);
+                            members.push_back(static_cast<std::uint32_t>(j));
+                            rel.push_back(static_cast<std::uint8_t>(r != f));
+                        } else if (!member.get(j)) {
+                            // start sign implied by this neighbour: sign(j) xor flag, undone by the member's parity
+                            const bool start_inside = (inside.get(j) != f) != r;
+                            if (start_inside) ++votes_inside; else ++votes_outside;
+                        }
+                    }
+            }
+            const bool start_sign = votes_inside > votes_outside;
+            for (std::size_t k = 0; k < members.size(); ++k) {
+                inside.set(members[k], start_sign != (rel[k] != 0));
+                member.set(members[k], false);
+            }
         }
-        seed(i, sign);
-        flood();
     }
     std::vector<std::uint32_t>().swap(queue);
 
