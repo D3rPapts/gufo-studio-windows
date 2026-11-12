@@ -1,0 +1,112 @@
+{
+ "date": "2026-11-12T10:20:01",
+ "exe": "D:/llm-modelle/gufo/src/gufo-mossmusic/build/mossmusic-hip/gufo-moss-music.exe",
+ "audio_gguf": "moss-music-8b.audio.gguf",
+ "llm_gguf": "moss-music-8b.llm-Q8_0.gguf",
+ "llm_gguf_sha256": "eeeb19b6f78342cc",
+ "max_new": 64,
+ "context": 2048,
+ "text": "Please give a detailed musical description of this clip.",
+ "pieces": {
+  "akt1_00002_16k": {
+   "sha256_wav": "96158f498964ec07",
+   "frames": 1760,
+   "audio_tokens": 220,
+   "prompt_tokens": 264,
+   "greedy_ids_sha256": "cfe6b43d75d062ed",
+   "greedy_count": 64,
+   "argmax": 1986,
+   "top5": [
+    1986,
+    32,
+    2082,
+    43288,
+    1
+   ],
+   "answer": "This brief ambient-drone piece unfolds over 17.6 seconds with a slow, meditative pulse of approximately 56 BPM, centered in D major. The track features a minimalist arrangement built on sustained synth pads and a deep, resonant bass drone, creating a spacious and immersive sonic environment. The production is",
+   "encoder_s": 0.473643,
+   "prefill_s": 0.508913,
+   "decode_s": 3.99695
+  },
+  "akt1_00003_16k": {
+   "sha256_wav": "8697a0b06c92998c",
+   "frames": 2560,
+   "audio_tokens": 320,
+   "prompt_tokens": 372,
+   "greedy_ids_sha256": "a046ee1672b8332f",
+   "greedy_count": 64,
+   "argmax": 1986,
+   "top5": [
+    1986,
+    32,
+    2082,
+    334,
+    117882
+   ],
+   "answer": "This minimalist ambient-drone piece unfolds over 25.6 seconds with a slow, meditative pulse of approximately 76 BPM, rooted in a tonal center of C major. The composition is entirely instrumental, featuring a single resonant piano that articulates sparse, sustained chords with deliberate spacing, allowing each note",
+   "encoder_s": 0.517718,
+   "prefill_s": 0.499005,
+   "decode_s": 3.90126
+  },
+  "akt3_00001_16k": {
+   "sha256_wav": "133331834b628e37",
+   "frames": 1500,
+   "audio_tokens": 188,
+   "prompt_tokens": 230,
+   "greedy_ids_sha256": "219c4177e0c7afde",
+   "greedy_count": 64,
+   "argmax": 32,
+   "top5": [
+    32,
+    1986,
+    43288,
+    334,
+    117882
+   ],
+   "answer": "A minimalist ambient-drone piece unfolding over 15 seconds, this track centers on a single, sustained piano tone that resonates with deep clarity and spatial presence. The tempo, though nominally around 120 BPM, is felt only as a faint pulse beneath the stillness, as the music eschews",
+   "encoder_s": 0.430283,
+   "prefill_s": 0.380796,
+   "decode_s": 4.09586
+  },
+  "akt3_00002_16k": {
+   "sha256_wav": "1ae5c2b0d74f50f5",
+   "frames": 2300,
+   "audio_tokens": 288,
+   "prompt_tokens": 338,
+   "greedy_ids_sha256": "869d55745e7dbf72",
+   "greedy_count": 64,
+   "argmax": 32,
+   "top5": [
+    1986,
+    32,
+    2082,
+    43288,
+    117882
+   ],
+   "answer": "A slow, meditative ambient drone piece unfolding over 23 seconds, this track centers on a deep, resonant synth pad that sustains a rich harmonic bed in E minor. The tempo, though not rhythmically articulated, suggests a slow pulse around 120 BPM, contributing to a sense of suspended time",
+   "encoder_s": 0.510884,
+   "prefill_s": 0.821068,
+   "decode_s": 16.7414
+  },
+  "synth_2s5": {
+   "sha256_wav": "4dda9e48ca94991d",
+   "frames": 250,
+   "audio_tokens": 32,
+   "prompt_tokens": 65,
+   "greedy_ids_sha256": "c3eb0c961d823e58",
+   "greedy_count": 64,
+   "argmax": 1986,
+   "top5": [
+    1986,
+    32,
+    334,
+    43288,
+    2082
+   ],
+   "answer": "This brief ambient-drone piece unfolds over 2.56 seconds with a slow, meditative pulse and a tonal center in C minor. Despite the high tempo value indicated, the music feels unhurried, emphasizing texture and atmosphere over rhythmic drive. The harmonic foundation is built on a sustained C minor chord",
+   "encoder_s": 0.842316,
+   "prefill_s": 0.640536,
+   "decode_s": 17.4342
+  }
+ }
+}
