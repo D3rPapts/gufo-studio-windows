@@ -28,6 +28,10 @@ struct DualGridInput {
     int resolution = 512;
     float aabb_min = -0.5f;
     float aabb_max = 0.5f;
+    // Majority passes (3x3x3 corners, only next to active voxels) over the sign field before the
+    // quads are built: removes one-voxel slivers where the flags are noisy (cup interior), the
+    // geometry still follows the predicted dual vertices. 0 = off.
+    int sign_smooth_passes = 1;
 };
 
 struct DualGridStats {
@@ -36,6 +40,7 @@ struct DualGridStats {
     std::size_t extra_vertices = 0;             // vertices beyond one per voxel (sheet splits)
     std::size_t virtual_vertices = 0;           // centre vertices of inactive voxels next to a sign change
     std::size_t seam_edges = 0;                 // edges whose sign change and flag disagree (parity defects)
+    std::size_t smoothed_corners = 0;           // corners whose sign the majority passes changed
 };
 
 Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats = nullptr);

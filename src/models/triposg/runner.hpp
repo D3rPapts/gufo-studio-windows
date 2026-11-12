@@ -24,6 +24,7 @@ struct ObjektRequest {
     int max_faces = 200000;
     bool preview = true;
     bool texture = false;   // TRELLIS.2: texture flow + decoder (vertex colours)
+    int texture_size = 1024;   // TRELLIS.2 with texture: 0 = vertex colours, else baked PBR textures of this size
 };
 
 struct ObjektResult {

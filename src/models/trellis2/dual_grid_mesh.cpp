@@ -269,6 +269,28 @@ Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats) {
     }
     std::vector<std::uint32_t>().swap(queue);
 
+    // Majority smoothing of the sign field next to the active shell (3x3x3 corners, 14 of 27 win).
+    for (int pass = 0; pass < in.sign_smooth_passes; ++pass) {
+        Bits next(total);
+        std::size_t changed = 0;
+        for (int x = 0; x < D[0]; ++x)
+            for (int y = 0; y < D[1]; ++y)
+                for (int z = 0; z < D[2]; ++z) {
+                    const std::size_t i = index(x, y, z);
+                    const bool s = inside.get(i);
+                    if (!near.get(i) || x == 0 || y == 0 || z == 0 || x == D[0] - 1 || y == D[1] - 1 || z == D[2] - 1) { next.set(i, s); continue; }
+                    int votes = 0;
+                    for (int dx = -1; dx <= 1; ++dx)
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dz = -1; dz <= 1; ++dz) votes += inside.get(index(x + dx, y + dy, z + dz));
+                    const bool m = votes >= 14;
+                    next.set(i, m);
+                    changed += m != s;
+                }
+        inside = std::move(next);
+        st.smoothed_corners += changed;
+    }
+
     auto sign_at = [&](int x, int y, int z) { return inside.get(index(x, y, z)); };   // box corner coordinates
 
     // Sheets per active voxel from the sign changes on its 12 edges.

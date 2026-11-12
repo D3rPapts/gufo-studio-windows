@@ -29,7 +29,7 @@
 //     DIR holds dino_tokens_512, shape_latent_final, shape_coords, shape_subdiv_0..3; writes tex_noise.npy,
 //     tex_v_step00_cond.npy, tex_latent_final.npy [N,32] and tex_dec_out.npy [M,6] (* 0.5 + 0.5).
 //   gufo-trellis2-probe --stage full --weights-dir DIR --image bild.png --out DIR --name tasse
-//       [--steps 12] [--seed 42] [--max-faces 500000] [--texture]
+//       [--steps 12] [--seed 42] [--max-faces 500000] [--texture] [--texture-size 1024|2048|0]
 //     whole pipeline (HIP): writes <name>-trellis2.glb (y-up, holes filled, decimated) and <name>-trellis2-vorschau.png.
 //
 // No server, no port; the GPU path needs a HIP build (GUFO_TRELLIS2_HIP).
@@ -41,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -62,6 +63,7 @@
 #include "src/models/trellis2/npy.hpp"
 #include "src/models/trellis2/pipeline.hpp"
 #include "src/models/trellis2/png.hpp"
+#include "src/models/trellis2/texture_bake.hpp"
 #include "src/models/trellis2/preprocess.hpp"
 #include "src/models/trellis2/scheduler.hpp"
 #include "src/models/trellis2/sparse_dec.hpp"
@@ -691,6 +693,62 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
 }
 
 // ---------------------------------------------------------------- mesh analysis (CPU, from dumps)
+// ---------------------------------------------------------------- stage uv (CPU): unwrap settings on a GLB
+int run_uv(const std::string& glb_path, int texture_size, const std::string& preset) {
+    std::string error;
+    std::ifstream in(glb_path, std::ios::binary);
+    if (!in) { std::cerr << "cannot read " << glb_path << '\n'; return 1; }
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    tr::Mesh mesh;
+    if (!tr::read_glb(bytes, &mesh, &error)) { std::cerr << "glb: " << error << '\n'; return 1; }
+    std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles, texture " << texture_size << '\n';
+    struct Preset { const char* name; tr::UnwrapOptions o; };
+    std::vector<Preset> presets;
+    { tr::UnwrapOptions o; presets.push_back({"box", o}); }
+    { tr::UnwrapOptions o; o.min_chart_faces = 1000; presets.push_back({"box-1000", o}); }
+    { tr::UnwrapOptions o; o.normal_smoothing_passes = 8; o.min_chart_faces = 1000; presets.push_back({"box-smooth8-1000", o}); }
+    { tr::UnwrapOptions o; o.box_projection = false; o.max_cost = 2.f; o.normal_deviation_weight = 2.f; o.straightness_weight = 6.f; o.normal_seam_weight = 4.f; presets.push_back({"xatlas-default", o}); }
+    { tr::UnwrapOptions o; o.box_projection = false; presets.push_back({"tuned-8", o}); }
+    const std::vector<tr::Coord> no_coords;
+    const std::vector<float> no_attrs;
+    const tr::VoxelAttrSampler dummy(no_coords, no_attrs, 6, 512, 0);
+    for (const Preset& p : presets) {
+        if (preset != "all" && preset != p.name) continue;
+        tr::UvMesh uvm;
+        auto t0 = Clock::now();
+        const bool ok = tr::unwrap_uv(mesh, texture_size, &uvm, &error, p.o);
+        const double unwrap_ms = ms_since(t0);
+        if (!ok) { std::cout << p.name << ": FAILED " << error << '\n'; continue; }
+        t0 = Clock::now();
+        const tr::BakedTextures bt = tr::bake_textures(uvm, dummy, texture_size, 0);
+        std::cout << p.name << ": " << uvm.charts << " charts, atlas " << uvm.atlas_width << "x" << uvm.atlas_height << ", " << uvm.mesh.vertices.size()
+                  << " vertices, coverage " << 100.0 * static_cast<double>(bt.covered_texels) / (static_cast<double>(texture_size) * texture_size)
+                  << " %, unwrap " << unwrap_ms / 1000 << " s, bake " << ms_since(t0) / 1000 << " s\n";
+        // Chart layout image: covered texels coloured by the face's chart (hash), uncovered grey.
+        {
+            std::vector<std::uint8_t> rgb(static_cast<std::size_t>(texture_size) * static_cast<std::size_t>(texture_size) * 3, 60);
+            const float S = static_cast<float>(texture_size);
+            for (std::size_t f = 0; f < uvm.mesh.faces.size(); ++f) {
+                const auto& t = uvm.mesh.faces[f];
+                const std::uint32_t h = (uvm.source[t[0]] * 2654435761u) ^ (static_cast<std::uint32_t>(f) * 40503u);
+                float px[3], py[3];
+                for (int k = 0; k < 3; ++k) { px[k] = uvm.uv[t[static_cast<std::size_t>(k)] * 2] * S; py[k] = uvm.uv[t[static_cast<std::size_t>(k)] * 2 + 1] * S; }
+                const int x0 = std::max(0, static_cast<int>(std::min({px[0], px[1], px[2]}))), x1 = std::min(texture_size - 1, static_cast<int>(std::max({px[0], px[1], px[2]})));
+                const int y0 = std::max(0, static_cast<int>(std::min({py[0], py[1], py[2]}))), y1 = std::min(texture_size - 1, static_cast<int>(std::max({py[0], py[1], py[2]})));
+                for (int y = y0; y <= y1; ++y)
+                    for (int x = x0; x <= x1; ++x) {
+                        std::uint8_t* q = rgb.data() + (static_cast<std::size_t>(y) * static_cast<std::size_t>(texture_size) + static_cast<std::size_t>(x)) * 3;
+                        q[0] = static_cast<std::uint8_t>(80 + (h & 0x7F)); q[1] = static_cast<std::uint8_t>(80 + ((h >> 8) & 0x7F)); q[2] = static_cast<std::uint8_t>(80 + ((h >> 16) & 0x7F));
+                    }
+            }
+            std::string err;
+            const std::filesystem::path img = std::filesystem::path(glb_path).parent_path() / (std::string("uv-") + p.name + ".png");
+            if (tr::write_png_rgb(img, rgb.data(), texture_size, texture_size, &err)) std::cout << "  wrote " << img.filename().string() << '\n';
+        }
+    }
+    return 0;
+}
+
 int run_mesh(const std::string& dumps, float hole_perimeter) {
     std::string error;
     std::vector<float> out7;
@@ -711,7 +769,7 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles, " << st.quads << " quads, " << st.skipped_edges
-              << " skipped edges, " << st.open_edges << " open edges, " << st.extra_vertices << " sheet-split vertices, " << st.virtual_vertices << " virtual vertices, " << st.seam_edges << " seam edges\n";
+              << " skipped edges, " << st.open_edges << " open edges, " << st.extra_vertices << " sheet-split vertices, " << st.virtual_vertices << " virtual vertices, " << st.seam_edges << " seam edges, " << st.smoothed_corners << " smoothed corners\n";
     // Edge multiplicities: undirected count and directed duplicates.
     std::vector<std::uint64_t> und, dir;
     und.reserve(mesh.faces.size() * 3);
@@ -743,7 +801,7 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     for (const auto& f : mesh.faces) degenerate += (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]);
     std::cout << "degenerate faces: " << degenerate << '\n';
     tr::Mesh filled = mesh;
-    std::cout << "remove_small_components(64): " << tr::remove_small_components(&filled) << " removed -> " << filled.faces.size() << " triangles\n";
+    std::cout << "remove_small_components(512): " << tr::remove_small_components(&filled, 512) << " removed -> " << filled.faces.size() << " triangles\n";
     const tr::UnifyStats un = tr::unify_orientation(&filled);
     std::cout << "unify_orientation: " << un.components << " components, " << un.flipped_faces << " faces flipped, global flip " << un.global_flip
               << " -> open edges " << tr::count_boundary_edges(filled) << ", volume " << tr::mesh_stats(filled).volume << '\n';
@@ -789,13 +847,20 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
         tr::GlbWriteOptions go;
         if (!tr::write_glb_file(dir / "mesh-closed.glb", mesh, &err, go)) std::cerr << err << '\n';
         else std::cout << "  wrote mesh-closed.glb\n";
+        const auto t_dec = Clock::now();
+        const tr::Mesh small = tr::decimate_mesh(filled, 500000);
+        const tr::MeshStats sm = tr::mesh_stats(small);
+        std::cout << "decimated to " << small.faces.size() << " triangles, " << small.vertices.size() << " vertices, open edges " << sm.open_edges
+                  << ", volume " << sm.volume << ", " << ms_since(t_dec) / 1000 << " s\n";
+        if (!tr::write_glb_file(dir / "mesh-closed-500k.glb", small, &err, go)) std::cerr << err << '\n';
+        else std::cout << "  wrote mesh-closed-500k.glb\n";
     }
     return 0;
 }
 
 // ---------------------------------------------------------------- full pipeline (HIP)
 int run_full(const std::string& weights_dir, const std::string& image, const std::string& out, const std::string& name,
-             int steps, int seed, int max_faces, bool texture) {
+             int steps, int seed, int max_faces, bool texture, int texture_size) {
 #if GUFO_TRELLIS2_HIP
     std::string error;
     std::filesystem::create_directories(out);
@@ -811,7 +876,7 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     if (!pipe) { std::cerr << "load: " << error << '\n'; return 1; }
     std::cout << "pipeline loaded in " << ms_since(t0) << " ms, texture " << (pipe->has_texture() ? "yes" : "no") << '\n';
     tr::GenerateOptions o;
-    o.steps = steps; o.seed = static_cast<std::uint64_t>(seed); o.max_faces = max_faces; o.texture = texture;
+    o.steps = steps; o.seed = static_cast<std::uint64_t>(seed); o.max_faces = max_faces; o.texture = texture; o.texture_size = texture ? texture_size : 0;
     tr::GenerateResult r;
     std::string last_phase;
     t0 = Clock::now();
@@ -833,7 +898,9 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
         std::cout << '\n';
     }
     std::cout << "  seconds: encode " << r.seconds_encode << " structure " << r.seconds_structure << " shape " << r.seconds_shape
-              << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " total " << ms_since(t0) / 1000 << '\n';
+              << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " bake " << r.seconds_bake << " total " << ms_since(t0) / 1000 << '\n';
+    if (r.texture_size)
+        std::cout << "  textures: " << r.texture_size << " px, " << r.uv_charts << " charts, coverage " << r.texel_coverage * 100 << " %, unsampled texels " << r.unsampled_texels << '\n';
     std::ofstream glb(std::filesystem::path(out) / (name + "-trellis2.glb"), std::ios::binary);
     glb.write(reinterpret_cast<const char*>(r.glb.data()), static_cast<std::streamsize>(r.glb.size()));
     std::ofstream png(std::filesystem::path(out) / (name + "-trellis2-vorschau.png"), std::ios::binary);
@@ -841,7 +908,7 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     std::cout << "  wrote " << name << "-trellis2.glb (" << r.glb.size() / (1024.0 * 1024.0) << " MiB) and " << name << "-trellis2-vorschau.png\n";
     return 0;
 #else
-    (void)weights_dir; (void)image; (void)out; (void)name; (void)steps; (void)seed; (void)max_faces; (void)texture;
+    (void)weights_dir; (void)image; (void)out; (void)name; (void)steps; (void)seed; (void)max_faces; (void)texture; (void)texture_size;
     std::cerr << "no HIP build\n";
     return 1;
 #endif
@@ -851,8 +918,8 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
 
 int main(int argc, char** argv) {
     std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
-    std::string stage, weights, image, out, dumps, device = "gpu";
-    int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2, max_faces = 500000;
+    std::string stage, weights, image, out, dumps, glb, device = "gpu", preset = "box";
+    int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2, max_faces = 500000, texture_size = 1024;
     std::string weights_dir, name = "objekt";
     bool texture = false;
     bool selftest = false, zero_cond = false, cpu_check = false;
@@ -864,6 +931,8 @@ int main(int argc, char** argv) {
         else if (a == "--image") image = next();
         else if (a == "--out") out = next();
         else if (a == "--dumps") dumps = next();
+        else if (a == "--glb") glb = next();
+        else if (a == "--preset") preset = next();
         else if (a == "--device") device = next();
         else if (a == "--image-size") image_size = std::stoi(next());
         else if (a == "--layers") layers = std::stoi(next());
@@ -874,6 +943,7 @@ int main(int argc, char** argv) {
         else if (a == "--name") name = next();
         else if (a == "--max-faces") max_faces = std::stoi(next());
         else if (a == "--texture") texture = true;
+        else if (a == "--texture-size") texture_size = std::stoi(next());
         else if (a == "--selftest-dino") selftest = true;
         else if (a == "--zero-cond") zero_cond = true;
         else if (a == "--cpu-check") cpu_check = true;
@@ -910,13 +980,14 @@ int main(int argc, char** argv) {
         if (weights.empty() || weights_dir.empty() || dumps.empty() || out.empty()) return usage();
         return run_tex(weights, weights_dir, dumps, out, seed, steps);
     }
+    if (stage == "uv") return run_uv(glb, texture_size, preset);
     if (stage == "mesh") {
         if (dumps.empty()) return usage();
         return run_mesh(dumps, 0.03f);
     }
     if (stage == "full") {
         if (weights_dir.empty() || image.empty() || out.empty()) return usage();
-        return run_full(weights_dir, image, out, name, steps, seed, max_faces, texture);
+        return run_full(weights_dir, image, out, name, steps, seed, max_faces, texture, texture_size);
     }
     return usage();
 }

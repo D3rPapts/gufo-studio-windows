@@ -6,6 +6,8 @@
 #include <cmath>
 #include <fstream>
 
+#include <zlib.h>
+
 namespace gufo::trellis2 {
 namespace {
 
@@ -40,39 +42,31 @@ void chunk(std::vector<std::uint8_t>& out, const char* type, const std::vector<s
 
 }  // namespace
 
-std::vector<std::uint8_t> encode_png_rgb(const std::uint8_t* rgb, int width, int height) {
+std::vector<std::uint8_t> encode_png(const std::uint8_t* pixels, int width, int height, int channels) {
     std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     std::vector<std::uint8_t> ihdr;
     put_be32(ihdr, static_cast<std::uint32_t>(width));
     put_be32(ihdr, static_cast<std::uint32_t>(height));
-    ihdr.insert(ihdr.end(), {8, 2, 0, 0, 0});
+    ihdr.insert(ihdr.end(), {8, static_cast<std::uint8_t>(channels == 4 ? 6 : 2), 0, 0, 0});
     chunk(png, "IHDR", ihdr);
+    const std::size_t row = static_cast<std::size_t>(width) * static_cast<std::size_t>(channels);
     std::vector<std::uint8_t> raw;
-    raw.reserve(static_cast<std::size_t>(height) * (static_cast<std::size_t>(width) * 3 + 1));
+    raw.reserve(static_cast<std::size_t>(height) * (row + 1));
     for (int y = 0; y < height; ++y) {
-        raw.push_back(0);
-        raw.insert(raw.end(), rgb + static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 3,
-                   rgb + static_cast<std::size_t>(y + 1) * static_cast<std::size_t>(width) * 3);
+        raw.push_back(0);   // filter: none
+        raw.insert(raw.end(), pixels + static_cast<std::size_t>(y) * row, pixels + static_cast<std::size_t>(y + 1) * row);
     }
-    std::vector<std::uint8_t> z = {0x78, 0x01};
-    std::size_t pos = 0;
-    while (pos < raw.size() || raw.empty()) {
-        const std::size_t n = std::min<std::size_t>(65535, raw.size() - pos);
-        const bool last = pos + n >= raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back(static_cast<std::uint8_t>(n & 0xFF)); z.push_back(static_cast<std::uint8_t>(n >> 8));
-        z.push_back(static_cast<std::uint8_t>(~n & 0xFF)); z.push_back(static_cast<std::uint8_t>((~n >> 8) & 0xFF));
-        z.insert(z.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos), raw.begin() + static_cast<std::ptrdiff_t>(pos + n));
-        pos += n;
-        if (raw.empty()) break;
-    }
-    std::uint32_t a = 1, b = 0;
-    for (std::uint8_t byte : raw) { a = (a + byte) % 65521; b = (b + a) % 65521; }
-    put_be32(z, (b << 16) | a);
+    uLongf dest_len = compressBound(static_cast<uLong>(raw.size()));
+    std::vector<std::uint8_t> z(dest_len);
+    if (compress2(z.data(), &dest_len, raw.data(), static_cast<uLong>(raw.size()), 6) != Z_OK) dest_len = 0;
+    z.resize(dest_len);
     chunk(png, "IDAT", z);
     chunk(png, "IEND", {});
     return png;
 }
+
+std::vector<std::uint8_t> encode_png_rgb(const std::uint8_t* rgb, int width, int height) { return encode_png(rgb, width, height, 3); }
+std::vector<std::uint8_t> encode_png_rgba(const std::uint8_t* rgba, int width, int height) { return encode_png(rgba, width, height, 4); }
 
 bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, int width, int height, std::string* error) {
     const std::vector<std::uint8_t> png = encode_png_rgb(rgb, width, height);

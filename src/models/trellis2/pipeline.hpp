@@ -2,7 +2,8 @@
 // preprocess -> DINOv3 (FP32) -> sparse-structure flow (BF16, 12 Euler steps with
 // interval CFG) -> ss decoder -> 32^3 active voxels -> shape flow 512 (sparse DiT) ->
 // shape decoder (sparse engine) -> flexible dual grid -> fill holes -> decimation ->
-// y-up GLB + preview PNG. The texture branch (stage 8) hangs off the same latents.
+// y-up GLB + preview PNG. The texture branch (stage 8) hangs off the same latents; stage 9
+// unwraps (xatlas) and bakes the voxel attributes into PBR textures when texture_size > 0.
 // AI-assisted (Claude Code), 2026-11-12.
 #pragma once
 
@@ -25,6 +26,7 @@ struct GenerateOptions {
     bool preview = true;
     int preview_size = 384;
     bool texture = false;       // stage 8: texture flow + decoder -> vertex colours
+    int texture_size = 0;       // stage 9: > 0 bakes PBR textures of this size (UV unwrap), 0 = vertex colours
 };
 
 struct GenerateResult {
@@ -33,6 +35,8 @@ struct GenerateResult {
     std::size_t vertices = 0, faces = 0, faces_before_decimation = 0;
     std::size_t structure_voxels = 0, shape_voxels = 0, holes_filled = 0, open_edges = 0, open_loops = 0, flipped_faces = 0;
     std::size_t seam_edges = 0, small_components_removed = 0;   // sign-field seams (parity defects), stray bubbles dropped
+    std::size_t uv_charts = 0, texture_size = 0, unsampled_texels = 0;   // stage 9 (0 when vertex colours were written)
+    double texel_coverage = 0, seconds_bake = 0;
     std::vector<float> largest_open_loops;   // perimeters of the biggest loops left open (object units)
     float bbox_min[3] = {0, 0, 0}, bbox_max[3] = {0, 0, 0};
     double volume = 0;

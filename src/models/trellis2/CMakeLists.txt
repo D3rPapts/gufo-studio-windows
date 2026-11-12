@@ -9,7 +9,19 @@
 # sparse_dec.hip (sparse engine: device hashmap, neighbour table, gather + hipBLASLt).
 # AI-assisted (Claude Code), 2026-11-12.
 
+# xatlas (MIT, third_party/xatlas): UV unwrap for the texture baking; warnings of the vendored file are silenced.
+add_library(gufo_xatlas STATIC ${PROJECT_SOURCE_DIR}/third_party/xatlas/xatlas.cpp)
+target_include_directories(gufo_xatlas PUBLIC ${PROJECT_SOURCE_DIR}/third_party/xatlas)
+target_compile_features(gufo_xatlas PUBLIC cxx_std_17)
+if (MSVC)
+  target_compile_options(gufo_xatlas PRIVATE /w)
+else()
+  target_compile_options(gufo_xatlas PRIVATE -w)
+endif()
+find_package(ZLIB REQUIRED)
+
 add_library(gufo_trellis2_cpu STATIC
+  texture_bake.cpp
   sparse_conv_cpu.cpp
   dinov3_cpu.cpp
   preprocess.cpp
@@ -23,7 +35,7 @@ add_library(gufo_trellis2_cpu STATIC
   mesh_post.cpp)
 target_include_directories(gufo_trellis2_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_trellis2_cpu PUBLIC cxx_std_20)
-target_link_libraries(gufo_trellis2_cpu PUBLIC gufo_platform gufo_triposg_cpu)
+target_link_libraries(gufo_trellis2_cpu PUBLIC gufo_platform gufo_triposg_cpu PRIVATE gufo_xatlas ZLIB::ZLIB)
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
   target_link_libraries(gufo_trellis2_cpu PRIVATE OpenMP::OpenMP_CXX)
@@ -59,7 +71,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (BUILD_TESTING)
-  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer mesh_post)
+  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer mesh_post texture_bake)
     add_executable(trellis2_${name}_test
       ${PROJECT_SOURCE_DIR}/tests/models/trellis2/${name}_test.cpp)
     target_link_libraries(trellis2_${name}_test PRIVATE gufo_trellis2_cpu)

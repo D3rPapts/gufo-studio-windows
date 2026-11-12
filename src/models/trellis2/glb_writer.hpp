@@ -22,6 +22,14 @@ struct GlbWriteOptions {
     const std::vector<float>* vertex_colors = nullptr;
     float metallic_factor = 0.f;
     float roughness_factor = 0.9f;
+    // Optional textures (stage 9): per-vertex UV ([vertices * 2], v = 0 at the top of the image) and
+    // PNG images embedded in the BIN chunk. With UVs and the base colour image the material gets
+    // baseColorTexture (+ metallicRoughnessTexture: G roughness, B metallic) with factors 1 and
+    // COLOR_0 is not written.
+    const std::vector<float>* texcoords = nullptr;
+    const std::vector<std::uint8_t>* base_color_png = nullptr;
+    const std::vector<std::uint8_t>* metallic_roughness_png = nullptr;
+    bool double_sided = true;
 };
 
 // Serialises the mesh as one GLB (12-byte header, JSON chunk, BIN chunk);

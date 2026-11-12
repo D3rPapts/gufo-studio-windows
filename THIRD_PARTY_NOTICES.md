@@ -38,6 +38,7 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | DS4 | Adapted loader, tokenizer, sessions and HIP kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
 | DS4 GB10/GX10 fork | Adapted paired MoE launch code, now HIP | `MIT` | `910501e` | [xangel82/DS4](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA) |
 | h3.c | Adapted H3 geometry, scheduling and sampler; implementation reference | `MIT` | `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [antirez/h3.c](https://github.com/antirez/h3.c) |
+| xatlas | Vendored source (`third_party/xatlas`); UV unwrap for TRELLIS.2 texture baking | `MIT` | `f700c7790aaa030e794b52ba7791a05c085faf0c` | [jpcy/xatlas](https://github.com/jpcy/xatlas); [license](licenses/xatlas.txt) |
 | ccv TensorOps ancestry | Attribution retained through h3.c | `BSD-3-Clause` | h3.c pin above | [liuliu/ccv](https://github.com/liuliu/ccv) |
 
 Upstream license texts are retained in `licenses/` and

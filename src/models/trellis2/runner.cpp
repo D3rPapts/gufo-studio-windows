@@ -2,6 +2,8 @@
 // AI-assisted (Claude Code), 2026-11-12.
 #include "src/models/trellis2/runner.hpp"
 
+#include <algorithm>
+
 #include "src/models/trellis2/pipeline.hpp"
 
 namespace gufo::trellis2 {
@@ -19,6 +21,7 @@ public:
         o.max_faces = r.max_faces;
         o.preview = r.preview;
         o.texture = r.texture && pipeline_->has_texture();
+        o.texture_size = o.texture ? std::clamp(r.texture_size, 0, 4096) : 0;
         GenerateResult g;
         if (!pipeline_->Generate(r.rgba.data(), r.width, r.height, o, progress, cancel, &g, error)) return false;
         out->glb = std::move(g.glb);
@@ -37,7 +40,7 @@ public:
     }
     std::size_t weight_bytes() const override { return pipeline_->weight_bytes(); }
     int default_steps() const override { return 12; }
-    std::string capability_note() const override { return pipeline_->has_texture() ? "shape+pbr-vertex-colours" : "shape"; }
+    std::string capability_note() const override { return pipeline_->has_texture() ? "shape+pbr-textures" : "shape"; }
     // TRELLIS.2 encodes the image with DINOv3 (Meta, DINOv3 License).
     std::string attribution() const override { return "TRELLIS.2 (Microsoft, MIT). Built with DINOv3 (Meta, DINOv3 License)."; }
 

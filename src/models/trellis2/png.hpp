@@ -1,5 +1,4 @@
-// TRELLIS.2: dependency-free PNG writer (RGB8, stored zlib blocks; same as the TripoSG
-// preview writer) and a slice mosaic for voxel grids (occupancy / logits as images).
+// TRELLIS.2: small PNG writer (RGB8/RGBA8, zlib-compressed through the zlib that libpng brings) and a slice mosaic for voxel grids (occupancy / logits as images).
 // AI-assisted (Claude Code), 2026-11-12.
 #pragma once
 
@@ -10,7 +9,10 @@
 
 namespace gufo::trellis2 {
 
+// PNG with zlib-compressed IDAT (channels 3 = RGB8, 4 = RGBA8).
+std::vector<std::uint8_t> encode_png(const std::uint8_t* pixels, int width, int height, int channels);
 std::vector<std::uint8_t> encode_png_rgb(const std::uint8_t* rgb, int width, int height);
+std::vector<std::uint8_t> encode_png_rgba(const std::uint8_t* rgba, int width, int height);
 bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, int width, int height, std::string* error);
 
 // Mosaic of `res` z-slices (each res x res, laid out in a square grid, `scale` pixels per

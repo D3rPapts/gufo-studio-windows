@@ -196,6 +196,8 @@ struct ObjektService::Impl {
     root["seed"] = static_cast<unsigned long long>(j.request.seed);
     root["resolution"] = j.request.resolution;
     root["max_faces"] = j.request.max_faces;
+    root["texture"] = j.request.texture;
+    root["texture_size"] = j.request.texture_size;
     root["created_at"] = j.created_at;
     root["completed_at"] = j.completed_at > 0 ? json::Value(j.completed_at) : json::Value();
     root["expires_at"] = j.expires_at > 0 ? json::Value(j.expires_at) : json::Value();
@@ -271,6 +273,7 @@ struct ObjektService::Impl {
         job->request.seed = static_cast<std::uint64_t>(v.member_double("seed", 42));
         job->request.resolution = static_cast<int>(v.member_double("resolution", 512));
         job->request.max_faces = static_cast<int>(v.member_double("max_faces", 200000));
+        job->request.texture_size = static_cast<int>(v.member_double("texture_size", 1024));
         if (const json::Value* data = v.find("data"); data && data->is_array() && !data->empty()) {
           const json::Value& item = data->items()[0];
           job->result.vertices = item.member_size("vertices");
@@ -470,6 +473,7 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     if (!IntInRange(body, "max_faces", 200000, 0, 5000000, &job->request.max_faces)) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
     if (const json::Value* p = body.find("preview"); p && p->is_bool()) job->request.preview = p->as_bool();
     if (const json::Value* p = body.find("texture"); p && p->is_bool()) job->request.texture = p->as_bool();
+    if (!IntInRange(body, "texture_size", 1024, 0, 4096, &job->request.texture_size)) return Error(400, "Bad Request", "texture_size must be 0..4096", "invalid_texture_size");
     job->created_at = UnixNow();
     {
       const std::lock_guard<std::mutex> lock(m.mutex);

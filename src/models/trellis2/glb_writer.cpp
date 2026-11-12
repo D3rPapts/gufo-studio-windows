@@ -105,18 +105,42 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
         normals_bytes = bin.size() - normals_offset;
     }
 
+    const bool textured = options.texcoords != nullptr && options.texcoords->size() == mesh.vertices.size() * 2 &&
+                          options.base_color_png != nullptr && !options.base_color_png->empty();
     std::size_t colors_offset = 0, colors_bytes = 0;
-    const bool with_colors = options.vertex_colors != nullptr && options.vertex_colors->size() == mesh.vertices.size() * 4;
+    const bool with_colors = !textured && options.vertex_colors != nullptr && options.vertex_colors->size() == mesh.vertices.size() * 4;
     if (with_colors) {
         colors_offset = bin.size();
         for (float c : *options.vertex_colors) put_f32(bin, std::min(1.f, std::max(0.f, c)));
         colors_bytes = bin.size() - colors_offset;
     }
 
+    std::size_t uv_offset = 0, uv_bytes = 0;
+    if (textured) {
+        uv_offset = bin.size();
+        for (float t : *options.texcoords) put_f32(bin, t);
+        uv_bytes = bin.size() - uv_offset;
+    }
+
     const std::size_t indices_offset = bin.size();
     for (const auto& f : mesh.faces) { put_u32(bin, f[0]); put_u32(bin, f[1]); put_u32(bin, f[2]); }
     const std::size_t indices_bytes = bin.size() - indices_offset;
     pad_to(bin, 4, 0x00);
+
+    // Images live in the BIN chunk too (bufferViews without a target).
+    std::size_t image_offset[2] = {0, 0}, image_bytes[2] = {0, 0};
+    int image_count = 0;
+    if (textured) {
+        const std::vector<std::uint8_t>* pngs[2] = {options.base_color_png, options.metallic_roughness_png};
+        for (int i = 0; i < 2; ++i) {
+            if (!pngs[i] || pngs[i]->empty()) continue;
+            image_offset[image_count] = bin.size();
+            bin.insert(bin.end(), pngs[i]->begin(), pngs[i]->end());
+            image_bytes[image_count] = bin.size() - image_offset[image_count];
+            pad_to(bin, 4, 0x00);
+            ++image_count;
+        }
+    }
 
     // --- JSON chunk ------------------------------------------------------
     Value root = Value::object();
@@ -175,6 +199,19 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
     }
     const int idx_view = add_view(indices_offset, indices_bytes, kTargetElementArrayBuffer);
     const int idx_acc = add_accessor(idx_view, kComponentUnsignedInt, mesh.faces.size() * 3, "SCALAR");
+    int uv_acc = -1, image_view[2] = {-1, -1};
+    if (textured) {
+        const int uv_view = add_view(uv_offset, uv_bytes, kTargetArrayBuffer);
+        uv_acc = add_accessor(uv_view, kComponentFloat, mesh.vertices.size(), "VEC2");
+        for (int i = 0; i < image_count; ++i) {
+            Value v = Value::object();
+            v["buffer"] = Value(0);
+            v["byteOffset"] = Value(static_cast<unsigned long long>(image_offset[i]));
+            v["byteLength"] = Value(static_cast<unsigned long long>(image_bytes[i]));
+            views.push_back(v);
+            image_view[i] = static_cast<int>(views.size() - 1);
+        }
+    }
 
     root["bufferViews"] = views;
     root["accessors"] = accessors;
@@ -183,19 +220,60 @@ std::vector<std::uint8_t> write_glb(const Mesh& mesh, const GlbWriteOptions& opt
     attributes["POSITION"] = Value(pos_acc);
     if (nrm_acc >= 0) attributes["NORMAL"] = Value(nrm_acc);
     if (col_acc >= 0) attributes["COLOR_0"] = Value(col_acc);
+    if (uv_acc >= 0) attributes["TEXCOORD_0"] = Value(uv_acc);
     Value primitive = Value::object();
     primitive["attributes"] = attributes;
     primitive["indices"] = Value(idx_acc);
     primitive["mode"] = Value(4);  // TRIANGLES
-    if (col_acc >= 0) {
+    if (col_acc >= 0 || uv_acc >= 0) {
         Value pbr = Value::object();
         Value base = Value::array();
         for (int k = 0; k < 4; ++k) base.push_back(Value(1.0));
         pbr["baseColorFactor"] = base;
-        pbr["metallicFactor"] = Value(static_cast<double>(options.metallic_factor));
-        pbr["roughnessFactor"] = Value(static_cast<double>(options.roughness_factor));
         Value material = Value::object();
-        material["name"] = Value(options.mesh_name + "-vertex-colours");
+        if (uv_acc >= 0) {
+            Value images = Value::array(), textures = Value::array(), samplers = Value::array();
+            Value sampler = Value::object();
+            sampler["magFilter"] = Value(9729);   // LINEAR
+            sampler["minFilter"] = Value(9987);   // LINEAR_MIPMAP_LINEAR
+            sampler["wrapS"] = Value(10497);      // REPEAT
+            sampler["wrapT"] = Value(10497);
+            samplers.push_back(sampler);
+            for (int i = 0; i < image_count; ++i) {
+                Value img = Value::object();
+                img["bufferView"] = Value(image_view[i]);
+                img["mimeType"] = Value("image/png");
+                images.push_back(img);
+                Value tex = Value::object();
+                tex["sampler"] = Value(0);
+                tex["source"] = Value(i);
+                textures.push_back(tex);
+            }
+            root["images"] = images;
+            root["textures"] = textures;
+            root["samplers"] = samplers;
+            Value base_tex = Value::object();
+            base_tex["index"] = Value(0);
+            base_tex["texCoord"] = Value(0);
+            pbr["baseColorTexture"] = base_tex;
+            if (image_count > 1) {
+                Value mr_tex = Value::object();
+                mr_tex["index"] = Value(1);
+                mr_tex["texCoord"] = Value(0);
+                pbr["metallicRoughnessTexture"] = mr_tex;
+                pbr["metallicFactor"] = Value(1.0);
+                pbr["roughnessFactor"] = Value(1.0);
+            } else {
+                pbr["metallicFactor"] = Value(static_cast<double>(options.metallic_factor));
+                pbr["roughnessFactor"] = Value(static_cast<double>(options.roughness_factor));
+            }
+            material["name"] = Value(options.mesh_name + "-pbr-textured");
+            material["doubleSided"] = Value(options.double_sided);
+        } else {
+            pbr["metallicFactor"] = Value(static_cast<double>(options.metallic_factor));
+            pbr["roughnessFactor"] = Value(static_cast<double>(options.roughness_factor));
+            material["name"] = Value(options.mesh_name + "-vertex-colours");
+        }
         material["pbrMetallicRoughness"] = pbr;
         Value materials = Value::array();
         materials.push_back(material);

@@ -15,6 +15,7 @@
 #include "src/models/trellis2/mesh_post.hpp"
 #include "src/models/trellis2/mesh_preview.hpp"
 #include "src/models/trellis2/png.hpp"
+#include "src/models/trellis2/texture_bake.hpp"
 #include "src/models/trellis2/preprocess.hpp"
 #include "src/models/trellis2/scheduler.hpp"
 #include "src/models/trellis2/sparse_conv.hpp"
@@ -79,26 +80,14 @@ bool run_flow(DitHip& dit, std::vector<float>& x, int channels, const std::vecto
 // Colours per mesh vertex from the per-voxel attributes [N, 6] (base colour 3, metallic,
 // roughness, alpha) by voxel lookup; returns RGBA [vertices * 4] and the mean metallic /
 // roughness of the used voxels.
-std::vector<float> voxel_colours(const Mesh& mesh, const std::vector<Coord>& coords, const std::vector<float>& attrs,
-                                 int resolution, float* metallic, float* roughness) {
-    VoxelHashMap map;
-    map.Build(coords);
+std::vector<float> voxel_colours(const Mesh& mesh, const VoxelAttrSampler& sampler, float* metallic, float* roughness) {
     std::vector<float> out(mesh.vertices.size() * 4, 1.f);
     double m_sum = 0, r_sum = 0;
     std::size_t used = 0;
-    const float voxel = 1.f / static_cast<float>(resolution);
     for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
         const MeshVertex& v = mesh.vertices[i];
-        const int cx = static_cast<int>(std::floor((v.x - MeshConfig::aabb_min) / voxel));
-        const int cy = static_cast<int>(std::floor((v.y - MeshConfig::aabb_min) / voxel));
-        const int cz = static_cast<int>(std::floor((v.z - MeshConfig::aabb_min) / voxel));
-        std::int64_t idx = map.Find(cx, cy, cz);
-        for (int r = 1; r <= 2 && idx < 0; ++r)
-            for (int dx = -r; dx <= r && idx < 0; ++dx)
-                for (int dy = -r; dy <= r && idx < 0; ++dy)
-                    for (int dz = -r; dz <= r && idx < 0; ++dz) idx = map.Find(cx + dx, cy + dy, cz + dz);
-        if (idx < 0) { out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = 0.5f; continue; }
-        const float* a = attrs.data() + static_cast<std::size_t>(idx) * 6;
+        float a[16];
+        if (!sampler.Sample(v.x, v.y, v.z, a)) { out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = 0.5f; continue; }
         out[i * 4] = a[0]; out[i * 4 + 1] = a[1]; out[i * 4 + 2] = a[2]; out[i * 4 + 3] = 1.f;
         m_sum += a[3]; r_sum += a[4];
         ++used;
@@ -263,7 +252,7 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
     result->seam_edges = st.seam_edges;
-    result->small_components_removed = remove_small_components(&mesh);
+    result->small_components_removed = remove_small_components(&mesh, 512);
     const UnifyStats un = unify_orientation(&mesh);
     result->flipped_faces = un.flipped_faces;
     HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);
@@ -276,15 +265,33 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     report("mesh", 2, 3);
     if (o.max_faces > 0 && mesh.faces.size() > static_cast<std::size_t>(o.max_faces))
         mesh = decimate_mesh(mesh, static_cast<std::size_t>(o.max_faces));
-    // Vertex colours after decimation: every vertex takes the attributes of the active voxel
-    // it lies in (or the nearest of the 26 neighbours) in the z-up voxel frame.
+    // Colours after decimation, in the z-up voxel frame: trilinear voxel attributes per vertex
+    // (seam caps take the nearest active voxel within 8 voxels); with texture_size > 0 the mesh is
+    // unwrapped (xatlas) and the attributes are baked into PBR textures instead.
     std::vector<float> colours;
     float metallic = 0.f, roughness = 0.9f;
-    if (!attrs.empty()) {
-        colours = voxel_colours(mesh, dec.coords, attrs, o.resolution, &metallic, &roughness);
+    std::unique_ptr<VoxelAttrSampler> sampler;
+    if (!attrs.empty()) sampler = std::make_unique<VoxelAttrSampler>(dec.coords, attrs, 6, o.resolution, 8);
+    const MeshStats ms = mesh_stats(to_y_up(mesh));   // topology of the closed mesh, before seam duplication
+    UvMesh uvm;
+    BakedTextures baked;
+    bool textured = false;
+    if (sampler && o.texture_size > 0) {
+        const auto t_bake = Clock::now();
+        std::string unwrap_error;
+        if (unwrap_uv(mesh, o.texture_size, &uvm, &unwrap_error)) {
+            baked = bake_textures(uvm, *sampler, o.texture_size);
+            mesh = std::move(uvm.mesh);
+            textured = true;
+            result->uv_charts = uvm.charts;
+            result->texture_size = static_cast<std::size_t>(o.texture_size);
+            result->unsampled_texels = baked.unsampled_texels;
+            result->texel_coverage = static_cast<double>(baked.covered_texels) / (static_cast<double>(o.texture_size) * static_cast<double>(o.texture_size));
+        }
+        result->seconds_bake = seconds_since(t_bake);
     }
+    if (sampler) colours = voxel_colours(mesh, *sampler, &metallic, &roughness);
     mesh = to_y_up(mesh);
-    const MeshStats ms = mesh_stats(mesh);
     result->vertices = mesh.vertices.size();
     result->faces = mesh.faces.size();
     result->open_edges = ms.open_edges;
@@ -300,7 +307,14 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     GlbWriteOptions go;
     go.generator = "gufo trellis2";
     go.mesh_name = "trellis2";
-    if (!colours.empty()) {
+    std::vector<std::uint8_t> base_png, mr_png;
+    if (textured) {
+        base_png = encode_png_rgba(baked.base_color.data(), baked.size, baked.size);
+        mr_png = encode_png_rgb(baked.metallic_roughness.data(), baked.size, baked.size);
+        go.texcoords = &uvm.uv;
+        go.base_color_png = &base_png;
+        go.metallic_roughness_png = &mr_png;
+    } else if (!colours.empty()) {
         go.vertex_colors = &colours;
         go.metallic_factor = metallic;
         go.roughness_factor = roughness;

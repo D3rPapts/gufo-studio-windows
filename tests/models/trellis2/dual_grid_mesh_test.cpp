@@ -55,6 +55,7 @@ int main() {
     tr::DualGridInput in;
     in.coords = &coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
     in.resolution = 2;
+    in.sign_smooth_passes = 0;
     tr::DualGridStats st;
     tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
     Expect(st.quads == 6 && mesh.faces.size() == 12, "six quads -> twelve triangles (" + std::to_string(st.quads) + ")");
@@ -118,6 +119,7 @@ int main() {
     tr::DualGridInput in3;
     in3.coords = &block; in3.dual = dual3.data(); in3.intersected = inter3.data(); in3.split_weight = wgt3.data();
     in3.resolution = 3;
+    in3.sign_smooth_passes = 0;
     mesh = tr::dual_grid_to_mesh(in3, &st);
     Expect(st.quads == 12 && mesh.faces.size() == 24 && st.seam_edges == 0, "two enclosed corners -> twelve quads (" + std::to_string(st.quads) + ")");
     Expect(st.extra_vertices == 2 && mesh.vertices.size() == 29,
@@ -151,6 +153,7 @@ int main() {
         tr::DualGridInput inb;
         inb.coords = &big; inb.dual = dualb.data(); inb.intersected = interb.data(); inb.split_weight = wgtb.data();
         inb.resolution = 5;
+        inb.sign_smooth_passes = 0;
         mesh = tr::dual_grid_to_mesh(inb, &st);
         worst = std::max(worst, tr::max_edge_multiplicity(mesh));
         splits += st.extra_vertices;
@@ -180,6 +183,39 @@ int main() {
     Expect(open == 0, "random flags: always closed (" + std::to_string(open) + " open edges)");
     Expect(worst <= 4, "random flags: at most four triangles per edge (" + std::to_string(worst) + ")");
     Expect(splits > 0, "random flags produce some sheet splits (" + std::to_string(splits) + ")");
+    // Majority smoothing: one enclosed corner in a 5x5x5 block is a sliver (1 of 27 inside) and vanishes
+    // with one pass; the random-flag meshes stay closed with smoothing on.
+    {
+        std::vector<std::uint8_t> one(big.size() * 3, 0);
+        auto rowb = [](int x, int y, int z) { return static_cast<std::size_t>((x * 5 + y) * 5 + z); };
+        auto flagb = [&](int cx, int cy, int cz, int ax, int dir) {
+            int c[3] = {cx, cy, cz};
+            if (dir < 0) c[ax] -= 1;
+            one[rowb(c[0] - (ax != 0), c[1] - (ax != 1), c[2] - (ax != 2)) * 3 + static_cast<std::size_t>(ax)] = 1;
+        };
+        for (int ax = 0; ax < 3; ++ax) for (int dir = -1; dir <= 1; dir += 2) flagb(2, 2, 2, ax, dir);
+        tr::DualGridInput ins;
+        ins.coords = &big; ins.dual = dualb.data(); ins.intersected = one.data(); ins.split_weight = wgtb.data();
+        ins.resolution = 5;
+        ins.sign_smooth_passes = 0;
+        mesh = tr::dual_grid_to_mesh(ins, &st);
+        Expect(st.quads == 6 && st.smoothed_corners == 0, "lone corner without smoothing: six quads");
+        ins.sign_smooth_passes = 1;
+        mesh = tr::dual_grid_to_mesh(ins, &st);
+        Expect(st.quads == 0 && st.smoothed_corners == 1 && st.open_edges == 0, "one majority pass removes the sliver (" + std::to_string(st.quads) + "/" + std::to_string(st.smoothed_corners) + ")");
+        rng = 777u;
+        std::size_t open_s = 0;
+        for (int trial = 0; trial < 10; ++trial) {
+            for (auto& v : interb) { rng = rng * 1664525u + 1013904223u; v = (rng >> 24) < 128u ? 1 : 0; }
+            tr::DualGridInput inr;
+            inr.coords = &big; inr.dual = dualb.data(); inr.intersected = interb.data(); inr.split_weight = wgtb.data();
+            inr.resolution = 5;
+            inr.sign_smooth_passes = 1;
+            mesh = tr::dual_grid_to_mesh(inr, &st);
+            open_s += st.open_edges;
+        }
+        Expect(open_s == 0, "random flags with smoothing: still closed");
+    }
     if (failures == 0) std::cout << "trellis2_dual_grid_mesh_test: all checks passed\n";
     return failures == 0 ? 0 : 1;
 }
