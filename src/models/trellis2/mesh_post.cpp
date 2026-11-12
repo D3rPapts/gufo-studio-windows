@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <tuple>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -64,6 +65,89 @@ UnifyStats unify_orientation(Mesh* mesh) {
                     stack.push_back(n);
                 }
             }
+        }
+    }
+    // Second pass: components only meet at non-manifold edges (3+ faces). Orient them by
+    // majority vote across those edges, spreading from the largest component.
+    {
+        std::vector<std::uint32_t> component(F, 0);
+        std::vector<std::uint32_t> order(F);
+        for (std::uint32_t f = 0; f < F; ++f) order[f] = f;
+        // recompute components by a second BFS over manifold edges (cheap, reuses `edges`)
+        std::fill(visited.begin(), visited.end(), 0);
+        std::uint32_t ncomp = 0;
+        std::vector<std::size_t> comp_size;
+        for (std::uint32_t seed = 0; seed < F; ++seed) {
+            if (visited[seed]) continue;
+            const std::uint32_t id = ncomp++;
+            comp_size.push_back(0);
+            visited[seed] = 1;
+            stack.push_back(seed);
+            while (!stack.empty()) {
+                const std::uint32_t f = stack.back();
+                stack.pop_back();
+                component[f] = id;
+                ++comp_size[id];
+                for (int e = 0; e < 3; ++e) {
+                    const std::uint32_t a = mesh->faces[f][static_cast<std::size_t>(e)], b = mesh->faces[f][static_cast<std::size_t>((e + 1) % 3)];
+                    const auto [lo, hi] = range((static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b));
+                    if (hi - lo != 2) continue;
+                    for (auto it = lo; it != hi; ++it)
+                        if (!visited[it->second]) { visited[it->second] = 1; stack.push_back(it->second); }
+                }
+            }
+        }
+        if (ncomp > 1) {
+            // votes[(c1, c2)]: +1 when a face pair across a non-manifold edge is consistent, -1 otherwise
+            std::vector<std::tuple<std::uint32_t, std::uint32_t, int>> votes;
+            for (std::size_t i = 0; i < edges.size();) {
+                std::size_t j = i + 1;
+                while (j < edges.size() && edges[j].first == edges[i].first) ++j;
+                if (j - i >= 3) {
+                    const std::uint32_t a = static_cast<std::uint32_t>(edges[i].first >> 32), b = static_cast<std::uint32_t>(edges[i].first & 0xFFFFFFFFu);
+                    for (std::size_t x = i; x < j; ++x)
+                        for (std::size_t y = x + 1; y < j; ++y) {
+                            const std::uint32_t f = edges[x].second, h = edges[y].second;
+                            if (component[f] == component[h]) continue;
+                            const bool same = has_directed(f, a, b) == has_directed(h, a, b);
+                            votes.emplace_back(component[f], component[h], same ? -1 : 1);
+                        }
+                }
+                i = j;
+            }
+            std::sort(votes.begin(), votes.end());
+            // adjacency per component with summed votes
+            std::vector<std::vector<std::pair<std::uint32_t, int>>> adj(ncomp);
+            for (std::size_t i = 0; i < votes.size();) {
+                std::size_t j = i + 1;
+                int sum = std::get<2>(votes[i]);
+                while (j < votes.size() && std::get<0>(votes[j]) == std::get<0>(votes[i]) && std::get<1>(votes[j]) == std::get<1>(votes[i])) sum += std::get<2>(votes[j++]);
+                adj[std::get<0>(votes[i])].emplace_back(std::get<1>(votes[i]), sum);
+                adj[std::get<1>(votes[i])].emplace_back(std::get<0>(votes[i]), sum);
+                i = j;
+            }
+            std::vector<std::int8_t> flip(ncomp, -1);   // -1 unknown, 0 keep, 1 flip
+            std::vector<std::uint32_t> by_size(ncomp);
+            for (std::uint32_t c = 0; c < ncomp; ++c) by_size[c] = c;
+            std::sort(by_size.begin(), by_size.end(), [&](std::uint32_t x, std::uint32_t y) { return comp_size[x] > comp_size[y]; });
+            for (std::uint32_t seed : by_size) {
+                if (flip[seed] >= 0) continue;
+                flip[seed] = 0;
+                std::vector<std::uint32_t> q{seed};
+                while (!q.empty()) {
+                    const std::uint32_t c = q.back();
+                    q.pop_back();
+                    for (const auto& [n, sum] : adj[c]) {
+                        if (flip[n] >= 0) continue;
+                        // consistent (+) means n keeps c's state; inconsistent means n must be flipped relative to c
+                        flip[n] = static_cast<std::int8_t>((sum >= 0) ? flip[c] : 1 - flip[c]);
+                        q.push_back(n);
+                    }
+                }
+            }
+            for (std::uint32_t f = 0; f < F; ++f)
+                if (flip[component[f]] == 1) { std::swap(mesh->faces[f][1], mesh->faces[f][2]); ++st.flipped_faces; }
+            st.components = ncomp;
         }
     }
     if (mesh_stats(*mesh).volume < 0) {
