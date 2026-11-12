@@ -301,6 +301,19 @@ void TestTasks() {
   Check(ace::MusicInstruction(ace::MusicTask::kText2Music, "", {}) ==
             ace::DefaultMusicInstruction(),
         "text2music instruction");
+  // The plain branch of cover_strength < 1 re-encodes the prompt with the
+  // default instruction, whose word (and token) count differs from the
+  // cover instruction's: the pipeline must pass that prompt's own row count.
+  const auto words = [](const std::string& text) {
+    int count = 0;
+    for (std::size_t i = 0; i < text.size(); ++i)
+      if (text[i] != ' ' && (i == 0 || text[i - 1] == ' '))
+        ++count;
+    return count;
+  };
+  Check(words(ace::MusicInstruction(ace::MusicTask::kCover, "", {})) !=
+            words(ace::DefaultMusicInstruction()),
+        "cover and default instructions differ in length");
 }
 
 // WAV round trip through the writer and the decoder, mono duplication, and

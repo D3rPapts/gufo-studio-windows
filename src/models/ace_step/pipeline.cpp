@@ -443,13 +443,17 @@ bool MusicPipeline::Generate(const MusicRequest& request,
       task == MusicTask::kText2Music
           ? 1.0F
           : std::clamp(request.cover_strength, 0.0F, 1.0F);
+  // The plain prompt carries a different instruction, so its token count
+  // differs from the task prompt's: it must travel with its own row count.
   std::vector<float> text_plain;
+  int plain_tokens = 0;
   if (cover_strength < 1.0F) {
     std::vector<std::uint32_t> plain_ids;
     if (!m.Encode(MusicTextPrompt(request, DefaultMusicInstruction(), duration),
                   kMaxTextTokens, &plain_ids, error) ||
         !m.text->Encode(plain_ids, &text_plain, error))
       return false;
+    plain_tokens = static_cast<int>(plain_ids.size());
   }
   tm.text_seconds = Since(start);
   if (!report(0.05, "conditions"))
@@ -533,7 +537,7 @@ bool MusicPipeline::Generate(const MusicRequest& request,
     return false;
   std::vector<float> conditions_plain, context_plain;
   if (cover_strength < 1.0F) {
-    if (!m.dit->EncodeConditions(text_plain, tm.text_tokens, lyric,
+    if (!m.dit->EncodeConditions(text_plain, plain_tokens, lyric,
                                  tm.lyric_tokens, timbre, kTimbreFrames,
                                  &conditions_plain, error))
       return false;
