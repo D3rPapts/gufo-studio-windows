@@ -725,6 +725,15 @@ partner means "as before" (local jobs run locally). Log events:
 `pool_pulled` (requester), `pool_pushed` (owner), `pool_pull_failed`,
 `pool_pull_lost`.
 
+**3D jobs (1.4.23).** `POST /v1/jobs` with `request.path`
+`/v1/3d/generations` wraps a `gufo serve objekt` worker: the router posts
+the request, polls `GET /v1/3d/generations/{id}` every `video_poll`
+(progress copied, `DELETE` on cancel) and stores `model.glb`
+(`model/gltf-binary`), `preview.png` and `response.json` as the job's
+files. `GET /router/capabilities` reports `"capability": "image_to_3d"`
+for presets whose command line is `serve objekt`, so the pages can tell
+which router runs the worker.
+
 **Waiting jobs (1.4.21).** With `--jobs-parallel 2` a job is
 `in_progress` at once, and its request may then wait in the router's
 pool for a free machine (`event=pool ... choice=wait reason="both
@@ -950,6 +959,11 @@ ids that `changed`. Errors: 400 `invalid_placement`, 404
 | `GET` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
+| `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header |
+| `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds}}` |
+| `GET` | `/v1/3d/generations/{id}/content` | The finished GLB (`model/gltf-binary`, `Content-Disposition: attachment`) |
+| `GET` | `/v1/3d/generations/{id}/preview` | Three-view preview PNG of the mesh |
+| `DELETE` | `/v1/3d/generations/{id}` | Cancels or removes the job |
 
 `gufo serve video --rife-model rife49.safetensors` adds RIFE frame
 interpolation of the finished video: `"gufo": {"interpolate": 4}` on

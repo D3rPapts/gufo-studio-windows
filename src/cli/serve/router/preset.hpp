@@ -87,6 +87,10 @@ struct PresetModel {
   Placement placement{Placement::kLocal};
 };
 
+/// The worker capability of an external preset derived from its command line
+/// ("serve objekt" -> "image_to_3d"); "" when none is known.
+std::string CapabilityOf(const PresetModel& preset);
+
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves
 /// relative path values; when empty, values are passed through unchanged.
 /// Returns false and sets `error` (section-prefixed, e.g.
