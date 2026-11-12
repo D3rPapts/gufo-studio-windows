@@ -54,6 +54,33 @@
 // relayed thumbs are cached under DIR/relay-cache/<id>/ for a day. Every
 // relayed request carries X-Gufo-Relay: 1 and a request with that header
 // (or X-Gufo-Forwarded) is never relayed on.
+//
+// Shared queue (1.4.20, Options::capabilities + relay): the router that
+// took a job stays its owner (files, result, progress, webhook); only the
+// execution may move to the partner.
+//  - Needs: a job needs its model and the LoRA names of its body
+//    ("loras"[].name, "gufo"."lora"). Submit answers 400 no_capable_router
+//    when neither router can run it (message names what each has); at
+//    dispatch the job's request carries X-Gufo-Pool: local|remote when
+//    only one side can run it, and the router's pool decision keeps to
+//    that side (waits there when it is busy).
+//  - Order: a free runner compares its oldest queued job with the
+//    partner's (GET /v1/jobs?status=queued, cached pull_poll). When the
+//    partner's is older and this machine can run it, the runner POSTs
+//    <partner>/router/pool/pull {"from", "router_id", "capabilities"}; the
+//    partner hands out its oldest queued job the requester can run (never
+//    a job a runner already took, never a concat job, only models it has
+//    in the pool), marks it running on the requester and executes it on
+//    its own thread with X-Gufo-Pool: remote, so the requester's worker
+//    does the work while the owner keeps everything else. The requester's
+//    runner waits for that job (polls the owner) before it takes the next
+//    local one. Answer {"job": id, ...} or {"job": null}. A partner that
+//    answers 404 (older than 1.4.20) pauses pulling for pull_hold, logged
+//    once; an unreachable partner means "as before".
+//  - View: every job carries "request.loras" and "running_on" ("local",
+//    the partner's url while it runs there, null when not running);
+//    scope=pool items add "position" (1 = the oldest queued job of both
+//    routers). /router/status gets "pool_queue".
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -240,10 +267,44 @@ struct Options {
   Relay relay;
   /// "http://host:port" of the partner, as /router/status names it.
   std::string partner_name;
+  /// What this router can run, as GET /router/capabilities answers it
+  /// ({"router_id", "partner", "models": {id: {"loras", "placement",
+  /// ...}}}); empty = no capability checks, no pulling. Called without the
+  /// queue's lock held.
+  std::function<json::Value()> capabilities;
+  /// The partner's answer to GET /router/capabilities (cached by the
+  /// caller), nullopt while unknown (unreachable, older version).
+  std::function<std::optional<json::Value>()> partner_capabilities;
+  /// "http://host:port" this router is reached under: sent as "from" on a
+  /// pull; the partner's capabilities name it more exactly ("partner").
+  std::string self_name;
+  /// How often a free runner looks at the partner's queue; the partner's
+  /// queued list and a pulled job's state are read at most this often.
+  std::chrono::milliseconds pull_poll{std::chrono::seconds(2)};
+  /// After a 404 on /router/pool/pull (partner older than 1.4.20) pulling
+  /// pauses this long.
+  std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
 };
 
 /// Set on every request relayed to the partner; never relayed on.
 inline constexpr const char* kRelayHeader = "X-Gufo-Relay";
+/// Set on a job's request when only one side of the pool can run it
+/// ("local" | "remote"); the router's pool decision keeps to that side.
+inline constexpr const char* kPoolSideHeader = "X-Gufo-Pool";
+/// POST: the partner asks for a queued job to run on its worker.
+inline constexpr const char* kPullPath = "/router/pool/pull";
+
+/// The LoRA names a request body asks for: "loras"[].name (images) and
+/// "gufo"."lora" (videos, a string); empty for anything else.
+std::vector<std::string> LoraNames(const json::Value& body);
+
+/// Whether a router with these capabilities (the "models" object of
+/// /router/capabilities, or the whole answer) can run a job: the model is
+/// served there, not placed remote, and every LoRA is registered. *why
+/// (optional) gets the reason ("no model 'x'", "no LoRA 'winkel'").
+bool CanRun(const json::Value& capabilities, const std::string& model,
+            const std::vector<std::string>& loras,
+            std::string* why = nullptr);
 
 // ------------------------------------------------- video concat helpers
 
@@ -354,6 +415,10 @@ public:
   /// Removes relay-cache folders (thumbs of the partner's jobs) untouched
   /// for a day; runs with the expiry pass.
   void ExpireRelayCache();
+  /// /router/status "pool_queue": {"local": queued here, "partner": queued
+  /// there (null when unknown), "pulled": jobs this router fetched from the
+  /// partner, "pushed": jobs handed to the partner, ...}.
+  json::Value PoolQueueStatus();
 
   struct Job;
 
@@ -374,6 +439,32 @@ private:
   /// A job this router does not know: the same request to the partner.
   server::HttpResponse RelayJob(const std::string& id, std::string_view tail,
                                 const server::HttpRequest& request);
+  /// POST /router/pool/pull: hands the oldest queued job the requester can
+  /// run to it (see the shared queue above).
+  server::HttpResponse Pull(const server::HttpRequest& request);
+  /// One queued job of the partner, as its list shows it.
+  struct PartnerJob {
+    std::string id;
+    std::string model;
+    long long created_at{0};
+    std::vector<std::string> loras;
+  };
+  /// The partner's queued jobs (oldest first), cached pull_poll; nullopt
+  /// when the partner did not answer.
+  std::optional<std::vector<PartnerJob>> PartnerQueued();
+  /// Runner side: pulls the partner's oldest queued job when it is older
+  /// than `mine_created_at` (0 = nothing queued here) and runs here; waits
+  /// for it to end. True when a job was pulled (the runner looks again).
+  bool TryPull(long long mine_created_at);
+  /// Waits (polling the partner) until the pulled job `id` left the
+  /// requester's worker, or the partner stopped answering.
+  void WaitForPulled(const std::string& id);
+  /// Which side of the pool must run `job` ("local", "remote", "" = any),
+  /// from the capabilities; `*refusal` gets the error of a job neither
+  /// router can run (then "" is returned).
+  std::string SideFor(const Job& job, json::Value* refusal);
+  /// Joins pulled-job threads that ended (mutex held).
+  void ReapPulledLocked();
   /// POST /v1/videos/concat answered at once: the mp4 bytes.
   server::HttpResponse Concat(const server::HttpRequest& request);
   /// Stitches the clips named by `body` into `output` (the job's temp
@@ -419,6 +510,25 @@ private:
   std::deque<std::shared_ptr<Job>> pending_;
   /// Learned seconds per "<path> <model>" for the estimated progress.
   std::map<std::string, double> durations_;
+  /// Shared queue bookkeeping (mutex held).
+  long long pulled_{0};
+  long long pushed_{0};
+  /// Jobs this router pulled and waits for (ids on the partner).
+  std::vector<std::string> pulling_;
+  /// Pulling pauses until then after a 404 from the partner.
+  std::chrono::steady_clock::time_point pull_hold_until_{};
+  bool pull_hold_logged_{false};
+  /// Last partner queued list (PartnerQueued cache).
+  std::chrono::steady_clock::time_point partner_queued_at_{};
+  std::optional<std::vector<PartnerJob>> partner_queued_;
+  /// How the partner names this router (its capabilities' "partner").
+  std::string self_name_;
+  /// Pulled jobs run on their own threads (the runners are for local work).
+  struct PulledThread {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
+  std::vector<PulledThread> pulled_threads_;
   /// Next expiry pass (supervision thread only).
   std::chrono::steady_clock::time_point next_expiry_{};
   /// One ffmpeg thumbnail at a time.

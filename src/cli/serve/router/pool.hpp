@@ -30,6 +30,8 @@
 
 #include <chrono>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "src/cli/serve/router/preset.hpp"
 
@@ -142,6 +144,30 @@ struct PoolDecision {
     }
   }
   return {PoolChoice::kWait, "both busy"};
+}
+
+/// The LoRA names a preset registers: every `lora = name=path[,...]` line
+/// (argv "--lora", "name=path"). What GET /router/capabilities lists and
+/// the pool checks a request's "loras" against.
+[[nodiscard]] inline std::vector<std::string> LoraNamesOf(
+    const PresetModel& preset) {
+  std::vector<std::string> names;
+  for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
+    if (preset.argv[i] != "--lora")
+      continue;
+    const std::string& value = preset.argv[++i];
+    const std::string name = value.substr(0, value.find('='));
+    if (!name.empty())
+      names.push_back(name);
+  }
+  return names;
+}
+
+/// "local" | "remote" from an X-Gufo-Pool header value; "" for anything
+/// else (any side).
+[[nodiscard]] inline std::string PoolSideOf(std::string_view header) {
+  return header == "local" || header == "remote" ? std::string(header)
+                                                  : std::string();
 }
 
 /// Whether a local model counts as GPU work for the pool's busy rule:
