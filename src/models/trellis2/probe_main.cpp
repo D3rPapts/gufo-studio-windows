@@ -606,18 +606,15 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
     std::vector<float> cond, slat;
     std::vector<std::size_t> shape;
     if (!tr::npy::read_f32(std::filesystem::path(dumps) / "dino_tokens_512.npy", &cond, &shape, &error) || cond.size() != static_cast<std::size_t>(M) * 1024) {
-        std::cerr << "dino_tokens_512.npy: " << error << '
-';
+        std::cerr << "dino_tokens_512.npy: " << error << '\n';
         return 1;
     }
     if (!tr::npy::read_f32(std::filesystem::path(dumps) / "shape_latent_final.npy", &slat, &shape, &error) || shape.size() != 2 || shape[1] != 32) {
-        std::cerr << "shape_latent_final.npy: " << error << '
-';
+        std::cerr << "shape_latent_final.npy: " << error << '\n';
         return 1;
     }
     const std::vector<tr::Coord> coords = read_coords((std::filesystem::path(dumps) / "shape_coords.npy").string(), &error);
-    if (coords.size() != shape[0]) { std::cerr << "shape_coords.npy: " << error << '
-'; return 1; }
+    if (coords.size() != shape[0]) { std::cerr << "shape_coords.npy: " << error << '\n'; return 1; }
     const int N = static_cast<int>(coords.size());
     // normalised shape latent as the extra 32 input channels
     std::vector<float> slat_norm(slat.size());
@@ -625,8 +622,7 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
         for (int c = 0; c < C; ++c) slat_norm[static_cast<std::size_t>(i) * C + c] = (slat[static_cast<std::size_t>(i) * C + c] - tr::kShapeMean[c]) / tr::kShapeStd[c];
     std::vector<float> x;
     if (tr::npy::read_f32(std::filesystem::path(dumps) / "tex_noise.npy", &x, &shape, &error) && x.size() == static_cast<std::size_t>(N) * C) {
-        std::cout << "noise: tex_noise.npy from the dumps
-";
+        std::cout << "noise: tex_noise.npy from the dumps\n";
     } else {
         std::mt19937_64 rng(static_cast<std::uint64_t>(seed) + 2);
         std::normal_distribution<float> nd(0.f, 1.f);
@@ -637,8 +633,7 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
     tr::DitShape ds;
     ds.in_channels = 64; ds.out_channels = 32;
     auto dit = tr::DitHip::Create(flow_weights, ds, &error);
-    if (!dit) { std::cerr << error << '
-'; return 1; }
+    if (!dit) { std::cerr << error << '\n'; return 1; }
     const tr::SamplerParams p = tr::kTexSampler;
     const std::vector<float> times = tr::flow_times(steps, p.rescale_t);
     std::vector<float> input(static_cast<std::size_t>(N) * 64);
@@ -649,13 +644,11 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
             std::copy(slat_norm.begin() + static_cast<std::ptrdiff_t>(r) * C, slat_norm.begin() + static_cast<std::ptrdiff_t>(r + 1) * C, input.begin() + static_cast<std::ptrdiff_t>(r) * 64 + C);
         }
         std::vector<float> v;
-        if (!dit->Forward(input.data(), coords, cond.data(), M, tr::model_timestep(times[static_cast<std::size_t>(i)]), &v, nullptr, &error)) { std::cerr << error << '
-'; return 1; }
+        if (!dit->Forward(input.data(), coords, cond.data(), M, tr::model_timestep(times[static_cast<std::size_t>(i)]), &v, nullptr, &error)) { std::cerr << error << '\n'; return 1; }
         if (i == 0 && !save(out, "tex_v_step00_cond.npy", v, {static_cast<std::size_t>(N), 32})) return 1;
         tr::euler_step(x, v, times[static_cast<std::size_t>(i)], times[static_cast<std::size_t>(i) + 1]);   // guidance 1: no CFG pass
     }
-    std::cout << "texture flow: " << N << " tokens, " << steps << " steps in " << ms_since(t0) << " ms
-";
+    std::cout << "texture flow: " << N << " tokens, " << steps << " steps in " << ms_since(t0) << " ms\n";
     for (int i = 0; i < N; ++i)
         for (int c = 0; c < C; ++c) x[static_cast<std::size_t>(i) * C + c] = x[static_cast<std::size_t>(i) * C + c] * tr::kTexStd[c] + tr::kTexMean[c];
     if (!save(out, "tex_latent_final.npy", x, {static_cast<std::size_t>(N), 32})) return 1;
@@ -664,8 +657,7 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
     for (int l = 0; l < 4; ++l) {
         std::vector<float> mf;
         if (!tr::npy::read_f32(std::filesystem::path(dumps) / ("shape_subdiv_" + std::to_string(l) + ".npy"), &mf, &shape, &error)) {
-            std::cerr << "shape_subdiv_" << l << ".npy: " << error << '
-';
+            std::cerr << "shape_subdiv_" << l << ".npy: " << error << '\n';
             return 1;
         }
         masks.emplace_back(mf.begin(), mf.end());
@@ -674,29 +666,24 @@ int run_tex(const std::string& flow_weights, const std::string& dec_weights, con
     dshape.outputs = 6;
     dshape.pred_subdiv = false;
     auto dec = tr::SparseDecHip::Create(dec_weights, dshape, &error);
-    if (!dec) { std::cerr << error << '
-'; return 1; }
+    if (!dec) { std::cerr << error << '\n'; return 1; }
     tr::SparseDecOptions opts;
     opts.guide_masks = &masks;
     tr::SparseDecResult res;
     t0 = Clock::now();
-    if (!dec->Forward(x.data(), coords, &res, &error, opts)) { std::cerr << error << '
-'; return 1; }
-    std::cout << "texture decoder: " << res.coords.size() << " voxels in " << ms_since(t0) << " ms
-";
+    if (!dec->Forward(x.data(), coords, &res, &error, opts)) { std::cerr << error << '\n'; return 1; }
+    std::cout << "texture decoder: " << res.coords.size() << " voxels in " << ms_since(t0) << " ms\n";
     for (auto& v : res.outputs) v = v * 0.5f + 0.5f;
     double mean[6] = {0, 0, 0, 0, 0, 0};
     for (std::size_t i = 0; i < res.coords.size(); ++i)
         for (int c = 0; c < 6; ++c) mean[c] += res.outputs[i * 6 + static_cast<std::size_t>(c)];
     std::cout << std::defaultfloat << std::setprecision(4) << "  mean base colour " << mean[0] / res.coords.size() << " " << mean[1] / res.coords.size() << " "
               << mean[2] / res.coords.size() << " metallic " << mean[3] / res.coords.size() << " roughness " << mean[4] / res.coords.size()
-              << " alpha " << mean[5] / res.coords.size() << '
-';
+              << " alpha " << mean[5] / res.coords.size() << '\n';
     return save(out, "tex_dec_out.npy", res.outputs, {res.coords.size(), 6}) ? 0 : 1;
 #else
     (void)flow_weights; (void)dec_weights; (void)dumps; (void)out; (void)seed; (void)steps;
-    std::cerr << "no HIP build
-";
+    std::cerr << "no HIP build\n";
     return 1;
 #endif
 }
@@ -711,16 +698,13 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     try {
         rgba = gufo::models::qwen_image_21::DecodeImage(gufo::core::ReadImageFile(image));
     } catch (const std::exception& e) {
-        std::cerr << "image: " << e.what() << '
-';
+        std::cerr << "image: " << e.what() << '\n';
         return 1;
     }
     auto t0 = Clock::now();
     auto pipe = tr::Pipeline::Load(weights_dir, texture, &error);
-    if (!pipe) { std::cerr << "load: " << error << '
-'; return 1; }
-    std::cout << "pipeline loaded in " << ms_since(t0) << " ms, texture " << (pipe->has_texture() ? "yes" : "no") << '
-';
+    if (!pipe) { std::cerr << "load: " << error << '\n'; return 1; }
+    std::cout << "pipeline loaded in " << ms_since(t0) << " ms, texture " << (pipe->has_texture() ? "yes" : "no") << '\n';
     tr::GenerateOptions o;
     o.steps = steps; o.seed = static_cast<std::uint64_t>(seed); o.max_faces = max_faces; o.texture = texture;
     tr::GenerateResult r;
@@ -729,30 +713,24 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     const bool ok = pipe->Generate(rgba.rgba.data(), rgba.width, rgba.height, o,
                                    [&](const std::string& phase, int done, int total) {
                                        if (phase != last_phase) { std::cout << "  " << phase << " ..." << std::flush; last_phase = phase; }
-                                       if (done == total) std::cout << " done
-";
+                                       if (done == total) std::cout << " done\n";
                                    }, nullptr, &r, &error);
-    if (!ok) { std::cerr << "generate: " << error << '
-'; return 1; }
+    if (!ok) { std::cerr << "generate: " << error << '\n'; return 1; }
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << name << ": " << r.structure_voxels << " structure voxels, " << r.shape_voxels << " shape voxels, mesh "
               << r.faces_before_decimation << " -> " << r.faces << " faces, " << r.vertices << " vertices, holes filled " << r.holes_filled
-              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", volume " << r.volume << '
-';
+              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", volume " << r.volume << '\n';
     std::cout << "  seconds: encode " << r.seconds_encode << " structure " << r.seconds_structure << " shape " << r.seconds_shape
-              << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " total " << ms_since(t0) / 1000 << '
-';
+              << " decode " << r.seconds_decode << " texture " << r.seconds_texture << " mesh " << r.seconds_mesh << " total " << ms_since(t0) / 1000 << '\n';
     std::ofstream glb(std::filesystem::path(out) / (name + "-trellis2.glb"), std::ios::binary);
     glb.write(reinterpret_cast<const char*>(r.glb.data()), static_cast<std::streamsize>(r.glb.size()));
     std::ofstream png(std::filesystem::path(out) / (name + "-trellis2-vorschau.png"), std::ios::binary);
     png.write(reinterpret_cast<const char*>(r.preview_png.data()), static_cast<std::streamsize>(r.preview_png.size()));
-    std::cout << "  wrote " << name << "-trellis2.glb (" << r.glb.size() / (1024.0 * 1024.0) << " MiB) and " << name << "-trellis2-vorschau.png
-";
+    std::cout << "  wrote " << name << "-trellis2.glb (" << r.glb.size() / (1024.0 * 1024.0) << " MiB) and " << name << "-trellis2-vorschau.png\n";
     return 0;
 #else
     (void)weights_dir; (void)image; (void)out; (void)name; (void)steps; (void)seed; (void)max_faces; (void)texture;
-    std::cerr << "no HIP build
-";
+    std::cerr << "no HIP build\n";
     return 1;
 #endif
 }
