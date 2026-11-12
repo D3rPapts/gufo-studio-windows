@@ -1552,7 +1552,9 @@ public:
     // The side the request must run on: the job store sets X-Gufo-Pool
     // when only one router can run a job; a direct request's LoRA names
     // are checked here against this preset and the partner's
-    // capabilities (neither: 400, both: as before).
+    // capabilities (neither: 400, both: as before). An explicit header
+    // wins over the LoRA check; 400 pool_side_cannot_run when that side
+    // lacks a LoRA.
     std::string forced =
         router::PoolSideOf(req.header(router::jobs::kPoolSideHeader));
     if (!forwarded && IsJsonBody(req)) {
@@ -1592,9 +1594,29 @@ public:
                          "; partner " + partner_name + " " + why_partner,
                      "invalid_request_error", "no_capable_router");
         }
-        if (!local_ok)
+        // An explicit X-Gufo-Pool (client or job store) is never
+        // overridden: the side it names must have the LoRAs, else 400.
+        if (forced == "local" && !local_ok) {
+          std::string registered;
+          for (const std::string& name : have)
+            registered += (registered.empty() ? "" : ", ") + name;
+          return Err(400, "Bad Request",
+                     std::string("X-Gufo-Pool: local, but this router has "
+                                 "no LoRA '") +
+                         missing + "' for model '" + model_id + "'" +
+                         (registered.empty()
+                              ? " (none registered)"
+                              : " (registered: " + registered + ")"),
+                     "invalid_request_error", "pool_side_cannot_run");
+        }
+        if (forced == "remote" && !partner_ok)
+          return Err(400, "Bad Request",
+                     "X-Gufo-Pool: remote, but partner " + partner_name +
+                         " " + why_partner,
+                     "invalid_request_error", "pool_side_cannot_run");
+        if (forced.empty() && !local_ok)
           forced = "remote";
-        else if (!partner_ok)
+        else if (forced.empty() && !partner_ok)
           forced = "local";
       }
     }

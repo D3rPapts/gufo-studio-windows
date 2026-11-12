@@ -671,8 +671,9 @@ job only goes to a machine that can run it.
 can run: `{"router_id", "self", "partner", "models": {"<id>":
 {"modality", "placement": "local|remote|pool", "switchable", "status",
 "loaded", "loras": ["winkel", ...]}}}`. The LoRA names come from the
-preset (`lora = name=path[,...]` lines of the section), the placement
-follows `POST /router/placement`. A job needs its model and the LoRA
+preset: every `lora =` line of the section, split at `;` (`lora =
+a=p1;b=p2`, the one-line form gufo 2.0's image worker needs), the name
+before `=` of each entry. The placement follows `POST /router/placement`. A job needs its model and the LoRA
 names of its body (`loras[].name` for images, `gufo.lora` for videos);
 the router reads the partner's capabilities through the same route
 (cached 30 s, 3 s limit). When only one router can run a job, the
@@ -684,7 +685,11 @@ instead of taking the other); when neither can, `POST /v1/jobs` answers
 anime); partner http://192.168.100.56:8081 has no LoRA 'nix' ...`). A
 direct request (not a job) to a pool model is checked the same way. A
 partner whose capabilities cannot be read (unreachable, older version)
-counts as "may have it".
+counts as "may have it". An explicit `X-Gufo-Pool: local|remote` on a
+request is never overridden by the LoRA check: when the side it names
+lacks a LoRA of the request the answer is `400 pool_side_cannot_run`
+(message names the LoRA and what that side has), never a silent relay
+to the other side.
 
 **Order.** A free runner (a job slot of `--jobs-parallel`) compares its
 oldest queued job with the partner's (`GET /v1/jobs?status=queued` and

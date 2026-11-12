@@ -29,7 +29,8 @@ def write_preset(path, remote_port, python):
     with open(path, "w") as handle:
         handle.write(
             "[external/twin]\ncommand = %s\nargs = %s --fake-worker\n"
-            "served-model-name = twin\n\n"
+            "served-model-name = twin\n"
+            "lora = a=/l/a.safetensors;b=/l/b.safetensors\n\n"
             "[remote/twin]\nurl = http://127.0.0.1:%d\napi-key-env = %s\n"
             "queue-timeout-seconds = 20\nplacement = pool\n"
             % (python, rp.THIS, remote_port, rr.KEY_ENV))
@@ -141,6 +142,34 @@ def check_remote_activity(router, remote):
                 "the probe to clear the activity")
 
 
+def lora_chat(router, lora, headers=None):
+    return router.json("POST", "/v1/chat/completions",
+                       {"model": "twin", "prompt": "", "loras": [{"name": lora}],
+                        "messages": [{"role": "user", "content": "x"}]},
+                       headers)
+
+
+def check_lora_side(router, remote):
+    # One "lora = a=..;b=.." line registers both names (gufo 2.0 form).
+    code, caps = router.json("GET", "/router/capabilities")
+    assert code == 200 and caps["models"]["twin"]["loras"] == ["a", "b"], caps
+    remote.clear()
+    code, answer = lora_chat(router, "b")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    code, answer = lora_chat(router, "b", {"X-Gufo-Pool": "local"})
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    # Not here, partner unknown (no capabilities route): goes remote ...
+    code, answer = lora_chat(router, "zzz")
+    assert code == 200 and rp.where(answer) == "remote", (code, answer)
+    # ... unless the client pins this side: then 400, never silently remote.
+    remote.clear()
+    code, answer = lora_chat(router, "zzz", {"X-Gufo-Pool": "local"})
+    assert code == 400, (code, answer)
+    assert answer["error"]["code"] == "pool_side_cannot_run", answer
+    assert "zzz" in answer["error"]["message"], answer
+    assert remote_chats(remote) == 0
+
+
 def check_remote_gone(router, remote):
     # The remote goes away while the router still lists it as reachable:
     # a request sent there is decided again and served here.
@@ -177,6 +206,7 @@ def main():
                 ("forwarded stays local",
                  lambda: check_forwarded_stays_local(router, remote)),
                 ("remote activity", lambda: check_remote_activity(router, remote)),
+                ("lora side", lambda: check_lora_side(router, remote)),
                 ("remote gone", lambda: check_remote_gone(router, remote))):
             case()
             print("router_pool_test: %s ok" % name, flush=True)

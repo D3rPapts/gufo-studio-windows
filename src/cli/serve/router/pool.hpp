@@ -28,6 +28,7 @@
 // A request another router relayed here (X-Gufo-Forwarded) is always served
 // here (loop guard); it only waits while this machine has GPU work.
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -146,19 +147,35 @@ struct PoolDecision {
   return {PoolChoice::kWait, "both busy"};
 }
 
-/// The LoRA names a preset registers: every `lora = name=path[,...]` line
-/// (argv "--lora", "name=path"). What GET /router/capabilities lists and
-/// the pool checks a request's "loras" against.
+/// The LoRA names a preset registers: every `lora = ...` value (argv
+/// "--lora", value) split at ';' into entries `name=path[,steps=N,...]`,
+/// the name before '=' of each. One line may register several adapters
+/// (`lora = a=p1;b=p2`, the form gufo 2.0's image worker requires since
+/// it rejects a repeated --lora); ',' only separates an entry's own
+/// attributes (video LoRAs), never two adapters. What GET
+/// /router/capabilities lists and the pool checks a request's "loras"
+/// against.
 [[nodiscard]] inline std::vector<std::string> LoraNamesOf(
     const PresetModel& preset) {
   std::vector<std::string> names;
   for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
     if (preset.argv[i] != "--lora")
       continue;
-    const std::string& value = preset.argv[++i];
-    const std::string name = value.substr(0, value.find('='));
-    if (!name.empty())
-      names.push_back(name);
+    const std::string_view value = preset.argv[++i];
+    std::size_t start = 0;
+    while (start <= value.size()) {
+      const std::size_t end = value.find(';', start);
+      const std::string_view entry = value.substr(
+          start, end == std::string_view::npos ? std::string_view::npos
+                                               : end - start);
+      const std::string_view name = entry.substr(0, entry.find('='));
+      if (!name.empty() &&
+          std::find(names.begin(), names.end(), name) == names.end())
+        names.emplace_back(name);
+      if (end == std::string_view::npos)
+        break;
+      start = end + 1;
+    }
   }
   return names;
 }

@@ -192,6 +192,28 @@ void TestGpuWorkModel() {
   CHECK(!gufo::router::IsGpuWorkModel(model));
 }
 
+void TestLoraNames() {
+  using gufo::router::LoraNamesOf;
+  gufo::router::PresetModel model;
+  model.argv = {"serve", "image", "--lora", "anime=/l/a.safetensors"};
+  CHECK(LoraNamesOf(model) == std::vector<std::string>{"anime"});
+  // gufo 2.0 takes --lora once: several adapters in one ';' value
+  // (12.11.: "winkel" was missing from /router/capabilities).
+  model.argv = {"--lora", "Qwen2.1_Anime_consistency=D:/l/a.safetensors;"
+                          "winkel=D:/l/w.safetensors"};
+  CHECK(LoraNamesOf(model) ==
+        (std::vector<std::string>{"Qwen2.1_Anime_consistency", "winkel"}));
+  // Repeated lines (1.4.x) and empty entries; ',' keeps an entry's own
+  // attributes (video LoRA steps/strength), the name stays before '='.
+  model.argv = {"--lora", "a=p1;;b=p2,steps=4,strength=0.8;", "--lora",
+                "c=p3", "--lora", "a=p4"};
+  CHECK(LoraNamesOf(model) == (std::vector<std::string>{"a", "b", "c"}));
+  model.argv = {"--lora"};  // no value: nothing
+  CHECK(LoraNamesOf(model).empty());
+  model.argv = {"--lora", "=p;x=y"};  // a nameless entry is skipped
+  CHECK(LoraNamesOf(model) == std::vector<std::string>{"x"});
+}
+
 gufo::router::PresetModel PoolTwin() {
   gufo::router::PresetModel model;
   model.modality = "llm";
@@ -292,6 +314,7 @@ int main() {
   TestGpuBusyRule();
   TestForwardedStaysLocal();
   TestGpuWorkModel();
+  TestLoraNames();
   TestProbeActivity();
   TestGpuSlotIdle();
   TestRegistryCounts();
