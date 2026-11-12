@@ -16,6 +16,14 @@
 //       [--device cpu|gpu] [--cpu-check]
 //     DIR holds ss_latent_final.npy; writes ss_logits64.npy, ss_occupancy64.npy (0/1), ss_coords32.npy [N,3],
 //     ss_slices.png (mosaic of the 64 z-slices) and prints the active voxel counts.
+//   gufo-trellis2-probe --stage shape --weights trellis2-shape_flow_512.safetensors --dumps DIR --out DIR
+//       [--device cpu|gpu] [--seed 42] [--steps 12] [--cpu-check] [--layers N]
+//     DIR holds dino_tokens_512.npy + ss_coords32.npy (+ optional shape_noise.npy [N,32]); writes shape_noise.npy,
+//     shape_block00/29.npy, shape_v_step00_cond.npy and shape_latent_final.npy [N,32] (after * std + mean) + shape_coords.npy.
+//   gufo-trellis2-probe --stage shapedec --weights trellis2-shape_dec.safetensors --dumps DIR --out DIR
+//       [--device cpu|gpu] [--cpu-check] [--cpu-levels 2]
+//     DIR holds shape_latent_final.npy + shape_coords.npy; writes shape_dec_out.npy [M,7], shape_dec_coords.npy,
+//     shape_subdiv_{0..3}.npy, mesh.glb (dual grid, 512^3) and preview.png.
 //
 // No server, no port; the GPU path needs a HIP build (GUFO_TRELLIS2_HIP).
 // AI-assisted (Claude Code), 2026-11-12.
@@ -39,10 +47,14 @@
 #include "src/models/trellis2/config.hpp"
 #include "src/models/trellis2/dinov3.hpp"
 #include "src/models/trellis2/dit.hpp"
+#include "src/models/trellis2/dual_grid_mesh.hpp"
+#include "src/models/trellis2/glb_writer.hpp"
+#include "src/models/trellis2/mesh_preview.hpp"
 #include "src/models/trellis2/npy.hpp"
 #include "src/models/trellis2/png.hpp"
 #include "src/models/trellis2/preprocess.hpp"
 #include "src/models/trellis2/scheduler.hpp"
+#include "src/models/trellis2/sparse_dec.hpp"
 #include "src/models/trellis2/ss_dec.hpp"
 
 namespace {
@@ -360,12 +372,222 @@ int run_ssdec(const std::string& weights, const std::string& dumps, const std::s
     return 0;
 }
 
+// ---------------------------------------------------------------- shape flow (sparse DiT)
+std::vector<tr::Coord> read_coords(const std::string& path, std::string* error) {
+    std::vector<float> cf;
+    std::vector<std::size_t> shape;
+    std::vector<tr::Coord> coords;
+    if (!tr::npy::read_f32(path, &cf, &shape, error) || shape.size() != 2 || shape[1] != 3) {
+        if (error && error->empty()) *error = "expected [N,3]";
+        return coords;
+    }
+    coords.reserve(shape[0]);
+    for (std::size_t i = 0; i < shape[0]; ++i)
+        coords.push_back({static_cast<int>(cf[i * 3]), static_cast<int>(cf[i * 3 + 1]), static_cast<int>(cf[i * 3 + 2])});
+    return coords;
+}
+
+int run_shape(const SsRun& o) {
+    std::string error;
+    std::filesystem::create_directories(o.out);
+    const int M = tr::DinoV3Config::tokens_512, C = 32;
+    std::vector<float> cond;
+    std::vector<std::size_t> shape;
+    if (!tr::npy::read_f32(std::filesystem::path(o.dumps) / "dino_tokens_512.npy", &cond, &shape, &error) || cond.size() != static_cast<std::size_t>(M) * 1024) {
+        std::cerr << "dino_tokens_512.npy: " << error << '\n';
+        return 1;
+    }
+    const std::vector<tr::Coord> coords = read_coords((std::filesystem::path(o.dumps) / "ss_coords32.npy").string(), &error);
+    if (coords.empty()) { std::cerr << "ss_coords32.npy: " << error << '\n'; return 1; }
+    const int N = static_cast<int>(coords.size());
+    std::cout << "shape flow: " << N << " tokens\n";
+    std::vector<float> x;
+    if (tr::npy::read_f32(std::filesystem::path(o.dumps) / "shape_noise.npy", &x, &shape, &error) && x.size() == static_cast<std::size_t>(N) * C) {
+        std::cout << "noise: shape_noise.npy from the dumps\n";
+    } else {
+        std::mt19937_64 rng(static_cast<std::uint64_t>(o.seed) + 1);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        x.resize(static_cast<std::size_t>(N) * C);
+        for (auto& v : x) v = nd(rng);
+        if (!save(o.out, "shape_noise.npy", x, {static_cast<std::size_t>(N), 32})) return 1;
+    }
+    tr::DitShape shape_dit;
+    shape_dit.in_channels = 32;
+    shape_dit.out_channels = 32;
+    tr::DitForwardOptions opts;
+    opts.tap_layers = {0, 29};
+    opts.layer_limit = o.layers;
+    std::unique_ptr<tr::DitHip> hip;
+    tr::DitHostWeights host;
+    host.shape = shape_dit;
+    auto t0 = Clock::now();
+    if (o.device == "gpu") {
+#if GUFO_TRELLIS2_HIP
+        hip = tr::DitHip::Create(o.weights, shape_dit, &error);
+        if (!hip) { std::cerr << error << '\n'; return 1; }
+#else
+        std::cerr << "no HIP build\n";
+        return 1;
+#endif
+    }
+    if (o.device == "cpu" || o.cpu_check) {
+        if (!tr::DitHostWeights::FromFile(o.weights, &host, &error)) { std::cerr << error << '\n'; return 1; }
+    }
+    std::cout << "weights ready in " << ms_since(t0) << " ms\n";
+    auto forward = [&](const float* xin, const float* c, float t, std::vector<float>* v, std::map<int, std::vector<float>>* taps) {
+        if (hip) return hip->Forward(xin, coords, c, M, t, v, taps, &error, opts);
+        return tr::dit_forward_cpu(host, xin, coords, c, M, t, v, taps, &error, opts);
+    };
+    const tr::SamplerParams p = tr::kShapeSampler;
+    const std::vector<float> times = tr::flow_times(o.steps, p.rescale_t);
+    std::vector<float> zero_cond(cond.size(), 0.f);
+    std::vector<float> v_cond, v_uncond;
+    std::map<int, std::vector<float>> taps;
+    t0 = Clock::now();
+    if (!forward(x.data(), cond.data(), tr::model_timestep(times[0]), &v_cond, &taps)) { std::cerr << error << '\n'; return 1; }
+    std::cout << "step 0 forward (" << o.device << "): " << ms_since(t0) << " ms\n";
+    for (const auto& [layer, h] : taps) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "shape_block%02d.npy", layer);
+        if (!save(o.out, name, h, {static_cast<std::size_t>(N), 1536})) return 1;
+    }
+    if (!save(o.out, "shape_v_step00_cond.npy", v_cond, {static_cast<std::size_t>(N), 32})) return 1;
+    if (o.cpu_check && hip) {
+        std::vector<float> v_cpu;
+        std::map<int, std::vector<float>> taps_cpu;
+        t0 = Clock::now();
+        if (!tr::dit_forward_cpu(host, x.data(), coords, cond.data(), M, tr::model_timestep(times[0]), &v_cpu, &taps_cpu, &error, opts)) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << std::defaultfloat << std::setprecision(6);
+        std::cout << "cpu check (" << (o.layers > 0 ? o.layers : 30) << " layers): " << ms_since(t0) << " ms\n";
+        for (const auto& [layer, h] : taps_cpu)
+            if (taps.count(layer)) std::cout << "  block " << layer << ": rel RMS " << rel_rms(taps[layer], h) << " cosine " << cosine(taps[layer], h) << '\n';
+        std::cout << "  v: rel RMS " << rel_rms(v_cond, v_cpu) << " cosine " << cosine(v_cond, v_cpu) << '\n';
+    }
+    if (o.steps <= 0 || o.layers > 0) return 0;
+    t0 = Clock::now();
+    for (int i = 0; i < o.steps; ++i) {
+        const float t = times[static_cast<std::size_t>(i)], t_prev = times[static_cast<std::size_t>(i) + 1];
+        std::vector<float> pos, neg;
+        if (i == 0) pos = v_cond;
+        else if (!forward(x.data(), cond.data(), tr::model_timestep(t), &pos, nullptr)) { std::cerr << error << '\n'; return 1; }
+        if (tr::guidance_active(t, p)) {
+            if (!forward(x.data(), zero_cond.data(), tr::model_timestep(t), &neg, nullptr)) { std::cerr << error << '\n'; return 1; }
+            tr::apply_guidance(&pos, neg, x, t, p);
+        }
+        tr::euler_step(x, pos, t, t_prev);
+    }
+    std::cout << o.steps << " steps in " << ms_since(t0) << " ms\n";
+    // slat = z * std + mean
+    for (int i = 0; i < N; ++i)
+        for (int c = 0; c < C; ++c) x[static_cast<std::size_t>(i) * C + c] = x[static_cast<std::size_t>(i) * C + c] * tr::kShapeStd[c] + tr::kShapeMean[c];
+    std::vector<float> cf;
+    for (const auto& c : coords) { cf.push_back(static_cast<float>(c.x)); cf.push_back(static_cast<float>(c.y)); cf.push_back(static_cast<float>(c.z)); }
+    return save(o.out, "shape_latent_final.npy", x, {static_cast<std::size_t>(N), 32}) && save(o.out, "shape_coords.npy", cf, {static_cast<std::size_t>(N), 3}) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- shape decoder + mesh
+int run_shapedec(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device, bool cpu_check, int cpu_levels) {
+    std::string error;
+    std::filesystem::create_directories(out);
+    std::vector<float> latent;
+    std::vector<std::size_t> shape;
+    if (!tr::npy::read_f32(std::filesystem::path(dumps) / "shape_latent_final.npy", &latent, &shape, &error) || shape.size() != 2 || shape[1] != 32) {
+        std::cerr << "shape_latent_final.npy: " << error << '\n';
+        return 1;
+    }
+    const std::vector<tr::Coord> coords = read_coords((std::filesystem::path(dumps) / "shape_coords.npy").string(), &error);
+    if (coords.size() != shape[0]) { std::cerr << "shape_coords.npy: " << error << '\n'; return 1; }
+    tr::SparseDecShape ds;
+    tr::SparseDecResult res;
+    tr::SparseDecOptions opts;
+    auto t0 = Clock::now();
+    if (device == "gpu") {
+#if GUFO_TRELLIS2_HIP
+        auto dec = tr::SparseDecHip::Create(weights, ds, &error);
+        if (!dec) { std::cerr << error << '\n'; return 1; }
+        if (!dec->Forward(latent.data(), coords, &res, &error, opts)) { std::cerr << error << '\n'; return 1; }
+        std::cout << "shape decoder (gpu): " << coords.size() << " -> " << res.coords.size() << " voxels in " << ms_since(t0) << " ms, weights "
+                  << dec->weight_bytes() / (1024.0 * 1024.0) << " MiB\n";
+        if (cpu_check) {
+            tr::SparseDecHostWeights host;
+            if (!tr::SparseDecHostWeights::FromFile(weights, &host, &error)) { std::cerr << error << '\n'; return 1; }
+            tr::SparseDecOptions lim;
+            lim.level_limit = cpu_levels > 0 ? cpu_levels : 2;
+            lim.capture_levels = true;
+            tr::SparseDecResult gpu_taps, cpu_taps;
+            t0 = Clock::now();
+            if (!dec->Forward(latent.data(), coords, &gpu_taps, &error, lim)) { std::cerr << error << '\n'; return 1; }
+            const double gpu_ms = ms_since(t0);
+            t0 = Clock::now();
+            if (!tr::sparse_dec_forward_cpu(host, latent.data(), coords, &cpu_taps, &error, lim)) { std::cerr << error << '\n'; return 1; }
+            std::cout << std::defaultfloat << std::setprecision(6);
+            std::cout << "cpu check (" << lim.level_limit << " levels): gpu " << gpu_ms << " ms, cpu " << ms_since(t0) << " ms\n";
+            for (std::size_t l = 0; l < cpu_taps.level_feats.size() && l < gpu_taps.level_feats.size(); ++l) {
+                const bool same_coords = cpu_taps.level_coords[l] == gpu_taps.level_coords[l];
+                std::cout << "  level " << l << ": " << cpu_taps.level_coords[l].size() << " voxels, coords " << (same_coords ? "equal" : "DIFFER")
+                          << ", feats rel RMS " << rel_rms(gpu_taps.level_feats[l], cpu_taps.level_feats[l]) << " cosine "
+                          << cosine(gpu_taps.level_feats[l], cpu_taps.level_feats[l]) << '\n';
+            }
+            for (std::size_t l = 0; l < cpu_taps.masks.size() && l < gpu_taps.masks.size(); ++l) {
+                std::size_t agree = 0;
+                for (std::size_t i = 0; i < cpu_taps.masks[l].size(); ++i) agree += cpu_taps.masks[l][i] == gpu_taps.masks[l][i];
+                std::cout << "  mask " << l << ": " << 100.0 * agree / std::max<std::size_t>(1, cpu_taps.masks[l].size()) << " % equal\n";
+            }
+        }
+#else
+        std::cerr << "no HIP build\n";
+        return 1;
+#endif
+    } else {
+        tr::SparseDecHostWeights host;
+        if (!tr::SparseDecHostWeights::FromFile(weights, &host, &error)) { std::cerr << error << '\n'; return 1; }
+        if (!tr::sparse_dec_forward_cpu(host, latent.data(), coords, &res, &error, opts)) { std::cerr << error << '\n'; return 1; }
+        std::cout << "shape decoder (cpu): " << res.coords.size() << " voxels in " << ms_since(t0) << " ms\n";
+    }
+    const std::size_t Mv = res.coords.size();
+    if (!save(out, "shape_dec_out.npy", res.outputs, {Mv, 7})) return 1;
+    std::vector<float> cf;
+    for (const auto& c : res.coords) { cf.push_back(static_cast<float>(c.x)); cf.push_back(static_cast<float>(c.y)); cf.push_back(static_cast<float>(c.z)); }
+    if (!save(out, "shape_dec_coords.npy", cf, {Mv, 3})) return 1;
+    for (std::size_t l = 0; l < res.masks.size(); ++l) {
+        std::vector<float> mf(res.masks[l].begin(), res.masks[l].end());
+        if (!save(out, "shape_subdiv_" + std::to_string(l) + ".npy", mf, {mf.size() / 8, 8})) return 1;
+    }
+    // mesh
+    std::vector<float> dual, wgt;
+    std::vector<std::uint8_t> inter;
+    tr::decode_shape_outputs(res.outputs.data(), Mv, &dual, &inter, &wgt);
+    std::size_t intersections = 0;
+    for (auto v : inter) intersections += v;
+    tr::DualGridInput in;
+    in.coords = &res.coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
+    in.resolution = 512;
+    tr::DualGridStats st;
+    t0 = Clock::now();
+    const tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
+    std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles from " << st.quads << " quads ("
+              << intersections << " intersected edges, " << st.skipped_edges << " skipped), " << st.open_edges << " open edges, "
+              << ms_since(t0) << " ms\n";
+    tr::GlbWriteOptions go;
+    if (!tr::write_glb_file(std::filesystem::path(out) / "mesh.glb", mesh, &error, go)) { std::cerr << error << '\n'; return 1; }
+    std::cout << "  wrote mesh.glb\n";
+    tr::PreviewOptions po;
+    int pw, ph;
+    const auto rgb = tr::render_preview(mesh, po, &pw, &ph);
+    if (!tr::write_png_rgb(std::filesystem::path(out) / "preview.png", rgb.data(), pw, ph, &error)) { std::cerr << error << '\n'; return 1; }
+    std::cout << "  wrote preview.png " << pw << "x" << ph << '\n';
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
     std::string stage, weights, image, out, dumps, device = "gpu";
-    int image_size = 512, layers = 0, seed = 42, steps = 12;
+    int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2;
     bool selftest = false, zero_cond = false, cpu_check = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -380,6 +602,7 @@ int main(int argc, char** argv) {
         else if (a == "--layers") layers = std::stoi(next());
         else if (a == "--seed") seed = std::stoi(next());
         else if (a == "--steps") steps = std::stoi(next());
+        else if (a == "--cpu-levels") cpu_levels = std::stoi(next());
         else if (a == "--selftest-dino") selftest = true;
         else if (a == "--zero-cond") zero_cond = true;
         else if (a == "--cpu-check") cpu_check = true;
@@ -400,6 +623,17 @@ int main(int argc, char** argv) {
     if (stage == "ssdec") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
         return run_ssdec(weights, dumps, out, device, cpu_check);
+    }
+    if (stage == "shape") {
+        if (weights.empty() || out.empty() || dumps.empty()) return usage();
+        SsRun o;
+        o.weights = weights; o.dumps = dumps; o.out = out; o.device = device;
+        o.seed = seed; o.steps = steps; o.layers = layers; o.cpu_check = cpu_check;
+        return run_shape(o);
+    }
+    if (stage == "shapedec") {
+        if (weights.empty() || dumps.empty() || out.empty()) return usage();
+        return run_shapedec(weights, dumps, out, device, cpu_check, cpu_levels);
     }
     return usage();
 }

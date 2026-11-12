@@ -4,7 +4,9 @@
 # reference (sparse_conv_cpu.cpp), DINOv3 encoder (dinov3_cpu.cpp), image
 # preprocessing (preprocess.cpp), flow DiT reference (dit_cpu.cpp), sparse-structure
 # decoder reference (ss_dec_cpu.cpp), PNG/npy helpers.
-# HIP: dinov3.hip (FP32 rocBLAS), dit.hip (qwen_image_21 runtime, BF16), ss_dec.hip.
+# Stage 5/6: sparse decoders (sparse_dec_cpu.cpp), dual-grid mesh, GLB writer, preview.
+# HIP: dinov3.hip (FP32 rocBLAS), dit.hip (qwen_image_21 runtime, BF16), ss_dec.hip,
+# sparse_dec.hip (sparse engine: device hashmap, neighbour table, gather + hipBLASLt).
 # AI-assisted (Claude Code), 2026-11-12.
 
 add_library(gufo_trellis2_cpu STATIC
@@ -13,7 +15,11 @@ add_library(gufo_trellis2_cpu STATIC
   preprocess.cpp
   png.cpp
   dit_cpu.cpp
-  ss_dec_cpu.cpp)
+  ss_dec_cpu.cpp
+  sparse_dec_cpu.cpp
+  dual_grid_mesh.cpp
+  glb_writer.cpp
+  mesh_preview.cpp)
 target_include_directories(gufo_trellis2_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_trellis2_cpu PUBLIC cxx_std_20)
 target_link_libraries(gufo_trellis2_cpu PUBLIC gufo_platform)
@@ -29,7 +35,7 @@ else()
 endif()
 
 if (ENGINE_ENABLE_HIP)
-  add_library(gufo_trellis2 STATIC EXCLUDE_FROM_ALL dinov3.hip dit.hip ss_dec.hip)
+  add_library(gufo_trellis2 STATIC EXCLUDE_FROM_ALL dinov3.hip dit.hip ss_dec.hip sparse_dec.hip)
   target_include_directories(gufo_trellis2 PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_trellis2 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
@@ -47,7 +53,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (BUILD_TESTING)
-  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess)
+  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer)
     add_executable(trellis2_${name}_test
       ${PROJECT_SOURCE_DIR}/tests/models/trellis2/${name}_test.cpp)
     target_link_libraries(trellis2_${name}_test PRIVATE gufo_trellis2_cpu)
