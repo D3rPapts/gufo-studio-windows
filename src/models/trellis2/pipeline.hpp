@@ -32,6 +32,7 @@ struct GenerateResult {
     std::vector<std::uint8_t> preview_png;
     std::size_t vertices = 0, faces = 0, faces_before_decimation = 0;
     std::size_t structure_voxels = 0, shape_voxels = 0, holes_filled = 0, open_edges = 0, open_loops = 0, flipped_faces = 0;
+    std::size_t seam_edges = 0, small_components_removed = 0;   // sign-field seams (parity defects), stray bubbles dropped
     std::vector<float> largest_open_loops;   // perimeters of the biggest loops left open (object units)
     float bbox_min[3] = {0, 0, 0}, bbox_max[3] = {0, 0, 0};
     double volume = 0;

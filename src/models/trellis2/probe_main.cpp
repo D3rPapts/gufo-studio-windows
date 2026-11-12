@@ -579,7 +579,7 @@ int run_shapedec(const std::string& weights, const std::string& dumps, const std
     t0 = Clock::now();
     const tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
     std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles from " << st.quads << " quads ("
-              << intersections << " intersected edges, " << st.skipped_edges << " skipped), " << st.open_edges << " open edges, "
+              << intersections << " intersected edges, " << st.skipped_edges << " skipped), " << st.open_edges << " open edges, " << st.extra_vertices << " sheet-split vertices, " << st.virtual_vertices << " virtual vertices, " << st.seam_edges << " seam edges, "
               << ms_since(t0) << " ms\n";
     tr::GlbWriteOptions go;
     if (!tr::write_glb_file(std::filesystem::path(out) / "mesh.glb", mesh, &error, go)) { std::cerr << error << '\n'; return 1; }
@@ -711,7 +711,7 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles, " << st.quads << " quads, " << st.skipped_edges
-              << " skipped edges, " << st.open_edges << " open edges\n";
+              << " skipped edges, " << st.open_edges << " open edges, " << st.extra_vertices << " sheet-split vertices, " << st.virtual_vertices << " virtual vertices, " << st.seam_edges << " seam edges\n";
     // Edge multiplicities: undirected count and directed duplicates.
     std::vector<std::uint64_t> und, dir;
     und.reserve(mesh.faces.size() * 3);
@@ -743,6 +743,7 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     for (const auto& f : mesh.faces) degenerate += (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]);
     std::cout << "degenerate faces: " << degenerate << '\n';
     tr::Mesh filled = mesh;
+    std::cout << "remove_small_components(64): " << tr::remove_small_components(&filled) << " removed -> " << filled.faces.size() << " triangles\n";
     const tr::UnifyStats un = tr::unify_orientation(&filled);
     std::cout << "unify_orientation: " << un.components << " components, " << un.flipped_faces << " faces flipped, global flip " << un.global_flip
               << " -> open edges " << tr::count_boundary_edges(filled) << ", volume " << tr::mesh_stats(filled).volume << '\n';
@@ -769,6 +770,26 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     for (const auto& [v, d] : out_deg) { if (d > 1) ++pinch; if (!in_deg.count(v)) ++dangling; }
     for (const auto& [v, d] : in_deg) if (!out_deg.count(v)) ++dangling;
     std::cout << "boundary vertices: " << out_deg.size() << ", pinch (>1 outgoing) " << pinch << ", dangling (in != out) " << dangling << '\n';
+    // Preview of the closed mesh with the seam parts marked: virtual (centre) vertices red.
+    {
+        const std::size_t real_end = coords.size() + st.extra_vertices;
+        std::vector<float> colours(mesh.vertices.size() * 4, 1.f);
+        for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+            const bool virt = i >= real_end;
+            colours[i * 4] = virt ? 0.9f : 0.78f; colours[i * 4 + 1] = virt ? 0.15f : 0.63f; colours[i * 4 + 2] = virt ? 0.1f : 0.43f;
+        }
+        tr::PreviewOptions po;
+        po.vertex_colors = &colours;
+        int pw, ph;
+        const auto rgb = tr::render_preview(mesh, po, &pw, &ph);
+        std::string err;
+        const std::filesystem::path dir(dumps);
+        if (!tr::write_png_rgb(dir / "preview-closed.png", rgb.data(), pw, ph, &err)) std::cerr << err << '\n';
+        else std::cout << "  wrote preview-closed.png (virtual vertices red)\n";
+        tr::GlbWriteOptions go;
+        if (!tr::write_glb_file(dir / "mesh-closed.glb", mesh, &err, go)) std::cerr << err << '\n';
+        else std::cout << "  wrote mesh-closed.glb\n";
+    }
     return 0;
 }
 
@@ -803,7 +824,8 @@ int run_full(const std::string& weights_dir, const std::string& image, const std
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << name << ": " << r.structure_voxels << " structure voxels, " << r.shape_voxels << " shape voxels, mesh "
               << r.faces_before_decimation << " -> " << r.faces << " faces, " << r.vertices << " vertices, holes filled " << r.holes_filled
-              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", open loops " << r.open_loops << ", flipped faces "
+              << ", open edges " << r.open_edges << (r.closed ? " (closed)" : " (OPEN)") << ", seam edges " << r.seam_edges << ", bubbles removed "
+              << r.small_components_removed << ", open loops " << r.open_loops << ", flipped faces "
               << r.flipped_faces << ", volume " << r.volume << '\n';
     if (!r.largest_open_loops.empty()) {
         std::cout << "  largest open loops (perimeter):";

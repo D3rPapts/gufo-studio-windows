@@ -3,6 +3,7 @@
 #include "src/models/trellis2/mesh_post.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -71,6 +72,46 @@ UnifyStats unify_orientation(Mesh* mesh) {
         st.global_flip = 1;
     }
     return st;
+}
+
+std::size_t remove_small_components(Mesh* mesh, std::size_t min_faces) {
+    const std::size_t F = mesh->faces.size();
+    if (F == 0) return 0;
+    // Union-find over faces through shared vertices (vertex -> first face seen).
+    std::vector<std::uint32_t> parent(F);
+    for (std::uint32_t f = 0; f < F; ++f) parent[f] = f;
+    auto root = [&](std::uint32_t i) {
+        while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+        return i;
+    };
+    std::vector<std::uint32_t> first(mesh->vertices.size(), std::numeric_limits<std::uint32_t>::max());
+    for (std::uint32_t f = 0; f < F; ++f)
+        for (auto v : mesh->faces[f]) {
+            if (first[v] == std::numeric_limits<std::uint32_t>::max()) { first[v] = f; continue; }
+            const std::uint32_t a = root(f), b = root(first[v]);
+            if (a != b) parent[a] = b;
+        }
+    std::vector<std::uint32_t> size(F, 0);
+    for (std::uint32_t f = 0; f < F; ++f) ++size[root(f)];
+    std::size_t removed = 0;
+    for (std::uint32_t f = 0; f < F; ++f)
+        if (parent[f] == f && size[f] < min_faces) ++removed;
+    if (removed == 0) return 0;
+    std::vector<std::array<std::uint32_t, 3>> kept;
+    kept.reserve(F);
+    for (std::uint32_t f = 0; f < F; ++f)
+        if (size[root(f)] >= min_faces) kept.push_back(mesh->faces[f]);
+    mesh->faces = std::move(kept);
+    // Drop unused vertices.
+    std::vector<std::uint32_t> remap(mesh->vertices.size(), std::numeric_limits<std::uint32_t>::max());
+    std::vector<MeshVertex> vertices;
+    for (auto& t : mesh->faces)
+        for (auto& v : t) {
+            if (remap[v] == std::numeric_limits<std::uint32_t>::max()) { remap[v] = static_cast<std::uint32_t>(vertices.size()); vertices.push_back(mesh->vertices[v]); }
+            v = remap[v];
+        }
+    mesh->vertices = std::move(vertices);
+    return removed;
 }
 
 HoleFillStats fill_holes(Mesh* mesh, float max_perimeter) {

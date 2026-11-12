@@ -59,6 +59,17 @@ int main() {
     tr::Mesh open = Cube(0.1f, true);
     Expect(tr::mesh_stats(open).open_edges == 4, "open cube: 4 boundary edges");
     tr::Mesh filled = open;
+    // remove_small_components: a cube (12 triangles) plus a lone triangle far away -> the triangle goes.
+    {
+        tr::Mesh m;
+        m.vertices = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}, {5, 5, 5}, {6, 5, 5}, {5, 6, 5}};
+        m.faces = {{0, 2, 1}, {0, 3, 2}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4}, {1, 2, 6}, {1, 6, 5}, {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}, {8, 9, 10}};
+        const std::size_t removed = tr::remove_small_components(&m, 4);
+        Expect(removed == 1 && m.faces.size() == 12 && m.vertices.size() == 8, "remove_small_components drops the lone triangle and its vertices ("
+               + std::to_string(removed) + "/" + std::to_string(m.faces.size()) + "/" + std::to_string(m.vertices.size()) + ")");
+        Expect(tr::remove_small_components(&m, 4) == 0 && m.faces.size() == 12, "nothing else to remove");
+        Expect(tr::remove_small_components(&m, 13) == 1 && m.faces.empty() && m.vertices.empty(), "threshold above the cube removes it");
+    }
     tr::HoleFillStats hf = tr::fill_holes(&filled, 0.5f);   // perimeter 0.4 < 0.5
     Expect(hf.loops == 1 && hf.filled == 1, "one loop filled");
     st = tr::mesh_stats(filled);

@@ -262,6 +262,8 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     Mesh mesh = dual_grid_to_mesh(in, &st);
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
+    result->seam_edges = st.seam_edges;
+    result->small_components_removed = remove_small_components(&mesh);
     const UnifyStats un = unify_orientation(&mesh);
     result->flipped_faces = un.flipped_faces;
     HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);

@@ -27,6 +27,11 @@ struct UnifyStats {
 // unify_face_orientations at export time).
 UnifyStats unify_orientation(Mesh* mesh);
 
+// Removes edge-connected components with fewer than `min_faces` triangles (stray-flag bubbles of
+// the sign field: six quads around one corner), unused vertices are dropped. Returns the number
+// of removed components.
+std::size_t remove_small_components(Mesh* mesh, std::size_t min_faces = 64);
+
 // Fills boundary loops whose perimeter is below `max_perimeter` (object units). Returns stats.
 HoleFillStats fill_holes(Mesh* mesh, float max_perimeter = 0.03f);
 
