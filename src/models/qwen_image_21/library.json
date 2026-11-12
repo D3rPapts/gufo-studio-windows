@@ -6,7 +6,10 @@
   "purpose": "Qwen-Image-21 image understanding runtime: weights, tokenizer and vision input.",
   "consumers": [],
   "checks": [
+    "qwen_image_21_control_api_test",
+    "qwen_image_21_control_test",
     "qwen_image_21_kernel_test",
+    "qwen_image_21_lora_test",
     "qwen_image_21_probe",
     "qwen_image_21_test",
     "qwen_image_21_weight_upload_test",
