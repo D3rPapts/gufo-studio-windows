@@ -321,6 +321,25 @@ inline constexpr const char* kJobHeader = "X-Gufo-Job";
 /// Error code the router answers a redirected waiting request with.
 inline constexpr const char* kPoolRedirected = "pool_redirected";
 
+/// True when `url` names no host another machine can reach: empty, no host,
+/// or a bind-all address (0.0.0.0, ::, [::]). A router started with
+/// --host 0.0.0.0 would otherwise name itself "http://0.0.0.0:8081".
+bool IsUnreachableUrl(std::string_view url);
+
+/// `url`, or `fallback` when IsUnreachableUrl(url).
+std::string ReachableUrl(std::string_view url, std::string_view fallback);
+
+/// "http://<address>:<port>" with the local address a connection toward
+/// `toward` ("http://host:port", e.g. the pool partner) leaves from (UDP
+/// connect + getsockname, nothing is sent), else with the computer's name;
+/// "" when neither is known.
+std::string LocalUrlToward(std::string_view toward, int port);
+
+/// The frame rate of a video file (ffprobe, r_frame_rate else
+/// avg_frame_rate); 0 with *error when it cannot be read.
+double ProbeFrameRate(const std::filesystem::path& ffprobe,
+                      const std::filesystem::path& video, std::string* error);
+
 /// The LoRA names a request body asks for: "loras"[].name (images) and
 /// "gufo"."lora" (videos, a string); empty for anything else.
 std::vector<std::string> LoraNames(const json::Value& body);

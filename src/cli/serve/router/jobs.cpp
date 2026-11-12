@@ -756,7 +756,141 @@ bool ParseFilter(const HttpRequest& request, Filter* filter,
   return true;
 }
 
+/// "http://host:port/..." -> host (without brackets) and port text; false
+/// for a URL whose host cannot be told apart.
+bool SplitUrlHost(std::string_view url, std::string* host, std::string* port) {
+  if (const auto scheme = url.find("://"); scheme != std::string_view::npos)
+    url.remove_prefix(scheme + 3);
+  if (const auto slash = url.find('/'); slash != std::string_view::npos)
+    url = url.substr(0, slash);
+  port->clear();
+  if (url.starts_with('[')) {
+    const auto close = url.find(']');
+    if (close == std::string_view::npos)
+      return false;
+    *host = std::string(url.substr(1, close - 1));
+    const std::string_view rest = url.substr(close + 1);
+    if (rest.starts_with(':'))
+      *port = std::string(rest.substr(1));
+    return true;
+  }
+  const auto colon = url.rfind(':');
+  if (colon != std::string_view::npos && url.find(':') == colon) {
+    *host = std::string(url.substr(0, colon));
+    *port = std::string(url.substr(colon + 1));
+  } else {
+    *host = std::string(url);  // no port, or a bare IPv6 address
+  }
+  return true;
+}
+
 }  // namespace
+
+bool IsUnreachableUrl(std::string_view url) {
+  std::string host, port;
+  if (!SplitUrlHost(url, &host, &port))
+    return true;
+  return host.empty() || host == "0.0.0.0" || host == "::";
+}
+
+std::string ReachableUrl(std::string_view url, std::string_view fallback) {
+  return std::string(IsUnreachableUrl(url) ? fallback : url);
+}
+
+std::string LocalUrlToward(std::string_view toward, int port) {
+  try {
+    net::EnsureSocketRuntimeStarted();
+  } catch (const std::exception&) {
+    return "";
+  }
+  std::string address;
+  std::string host, remote_port;
+  if (!toward.empty() && SplitUrlHost(toward, &host, &remote_port) &&
+      !host.empty() && host != "0.0.0.0" && host != "::") {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* found = nullptr;
+    if (::getaddrinfo(host.c_str(),
+                      remote_port.empty() ? "8081" : remote_port.c_str(),
+                      &hints, &found) == 0 &&
+        found != nullptr) {
+      for (addrinfo* it = found; it != nullptr && address.empty();
+           it = it->ai_next) {
+        const net::Socket sock =
+            ::socket(it->ai_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == net::kInvalidSocket)
+          continue;
+        // A connected UDP socket picks the route; nothing is sent.
+        if (::connect(sock, it->ai_addr,
+                      static_cast<net::SocklenT>(it->ai_addrlen)) == 0) {
+          sockaddr_storage local{};
+          net::SocklenT length = sizeof(local);
+          char text[NI_MAXHOST]{};
+          if (::getsockname(sock, reinterpret_cast<sockaddr*>(&local),
+                            &length) == 0 &&
+              ::getnameinfo(reinterpret_cast<sockaddr*>(&local), length, text,
+                            sizeof(text), nullptr, 0, NI_NUMERICHOST) == 0)
+            address = text;
+        }
+        net::CloseSocket(sock);
+      }
+      ::freeaddrinfo(found);
+    }
+  }
+  if (address.empty()) {
+    char name[256]{};
+    if (::gethostname(name, sizeof(name) - 1) == 0)
+      address = name;
+  }
+  if (address.empty() || address == "0.0.0.0" || address == "::")
+    return "";
+  if (address.find(':') != std::string::npos)
+    address = "[" + address + "]";
+  return "http://" + address + ":" + std::to_string(port);
+}
+
+double ProbeFrameRate(const fs::path& ffprobe, const fs::path& video,
+                      std::string* error) {
+  if (ffprobe.empty()) {
+    *error = "no ffprobe configured (--comfy-ffmpeg)";
+    return 0;
+  }
+  static std::atomic<unsigned> counter{0};
+  std::error_code ec;
+  const fs::path base = fs::temp_directory_path(ec);
+  if (ec) {
+    *error = "no temp directory: " + ec.message();
+    return 0;
+  }
+  TempDir work{base / ("gufo-probe-" +
+                       std::to_string(std::chrono::steady_clock::now()
+                                          .time_since_epoch()
+                                          .count()) +
+                       "-" + std::to_string(counter++))};
+  fs::create_directories(work.path, ec);
+  if (!fs::is_directory(work.path, ec)) {
+    *error = "cannot create " + work.path.string();
+    return 0;
+  }
+  const fs::path out = work.path / "probe.json";
+  const fs::path err = work.path / "probe.err";
+  const int code = RunCaptured(ffprobe,
+                               {"-v", "error", "-print_format", "json",
+                                "-show_streams", "-show_format", video},
+                               std::chrono::minutes(1), out, err, nullptr,
+                               error);
+  if (code != 0) {
+    if (error->empty())
+      *error = "ffprobe exit " + std::to_string(code) + ": " +
+               TailOf(ReadIfThere(err), 300);
+    return 0;
+  }
+  ProbeInfo info;
+  if (!ParseProbe(ReadIfThere(out), &info, error))
+    return 0;
+  return FrameRateValue(info.frame_rate);
+}
 
 std::string KindOf(std::string_view path) {
   if (path.starts_with("/v1/images"))
@@ -2842,6 +2976,9 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
                "send {\"from\": \"http://host:port\", \"capabilities\": "
                "{...}} (GET /router/capabilities of the requester)",
                "invalid_request");
+  // A requester bound to 0.0.0.0 names itself so; the job then shows the
+  // partner's known URL (1.4.22: "running_on": "http://0.0.0.0:8081").
+  const std::string requester = ReachableUrl(from, options_.partner_name);
   const json::Value mine = options_.capabilities();
   const json::Value* models = mine.find("models");
   if (models == nullptr || !models->is_object())
@@ -2898,7 +3035,7 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     }
     queued = pending_.size() + waiting_count;
     if (picked != nullptr) {
-      picked->pulled_by = from;
+      picked->pulled_by = requester;
       picked->side = "remote";
       ++pushed_;
       if (!picked_waiting) {
@@ -2921,7 +3058,7 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     out["created_at"] = picked->created_at;
     out["was_waiting"] = picked_waiting;
     Logger::Info("jobs", "event=pool_pushed id=" + picked->id + " model=" +
-                             picked->model + " to=" + from +
+                             picked->model + " to=" + requester +
                              (picked_waiting ? " was=waiting" : " was=queued"));
   } else {
     out["job"] = nullptr;

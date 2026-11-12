@@ -3725,6 +3725,15 @@ int RunRouter(std::span<const char* const> args) {
     router::comfy::AdapterOptions comfy_options;
     comfy_options.root = comfy_dir;
     comfy_options.ffmpeg = comfy_ffmpeg;
+    if (!comfy_ffmpeg.empty()) {
+      // The frame rate of a LoadVideo file (RIFE of a loaded shot).
+      std::filesystem::path probe = comfy_ffmpeg;
+      probe.replace_filename(std::filesystem::path("ffprobe") +=
+                             comfy_ffmpeg.extension());
+      std::error_code probe_ec;
+      if (std::filesystem::is_regular_file(probe, probe_ec))
+        comfy_options.ffprobe = probe;
+    }
     // Graphs that need a model the preset lacks (Qwen-Image Turbo) fail
     // validation instead of running on another model.
     for (const auto& model : models)
@@ -3762,6 +3771,15 @@ int RunRouter(std::span<const char* const> args) {
           "http://" + router::EndpointKey(partner->remote->url);
     }
     state->self_name = "http://" + host + ":" + std::to_string(port);
+    if (router::jobs::IsUnreachableUrl(state->self_name)) {
+      // Bound to all interfaces: name the address the partner reaches us
+      // under (the route toward it), else the computer's name, so
+      // /router/capabilities "self" and a pull's "from" are no 0.0.0.0.
+      const std::string reachable =
+          router::jobs::LocalUrlToward(state->partner_name, port);
+      if (!reachable.empty())
+        state->self_name = reachable;
+    }
   }
   if (!jobs_dir.empty()) {
     router::jobs::Options jobs_options;

@@ -52,6 +52,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -349,6 +350,9 @@ struct VideoTask {
   std::optional<FileRef> render_video;
   /// kProcess: the LoadVideo file, sent as source_video.
   std::optional<FileRef> source_video;
+  /// kProcess: the file's frame rate (BuildPlan's probe, ffprobe on the
+  /// adapter); 0 = unknown, 24 assumed. The RIFE rate is multiplier x this.
+  double source_fps{0};
   /// VACE family (gufo.vace, the files added by the executor): control
   /// video, mask (a video or a still for every frame) with its channel,
   /// reference images, strength, sampler / shift, and whether the bundle's
@@ -405,8 +409,12 @@ struct PlanError {
   json::Value node_errors = json::Value::object();
 };
 
+/// Frame rate of a LoadVideo file (kProcess), 0 when unknown. The adapter
+/// probes the file in its input folder with ffprobe; tests pass a lambda.
+using SourceFpsProbe = std::function<double(const FileRef& file)>;
+
 bool BuildPlan(const json::Value& prompt, const ModelIds& models, Plan* plan,
-               PlanError* error);
+               PlanError* error, const SourceFpsProbe& source_fps = {});
 
 /// Every node class a workflow may contain.
 const std::vector<std::string>& SupportedClassTypes();
