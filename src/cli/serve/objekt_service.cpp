@@ -392,6 +392,11 @@ std::string ObjektService::capability_note(const std::string& id) const {
   return it != impl_->options.runners.end() && it->second ? it->second->capability_note() : "";
 }
 std::string ObjektService::initialization_error() const { return impl_->init_error; }
+std::string ObjektService::attribution(const std::string& id) const {
+  if (id == impl_->options.model_id && impl_->options.runner) return impl_->options.runner->attribution();
+  const auto it = impl_->options.runners.find(id);
+  return it != impl_->options.runners.end() && it->second ? it->second->attribution() : "";
+}
 std::size_t ObjektService::weight_bytes() const {
   std::size_t total = impl_->options.runner ? impl_->options.runner->weight_bytes() : 0;
   for (const auto& [id, runner] : impl_->options.runners)

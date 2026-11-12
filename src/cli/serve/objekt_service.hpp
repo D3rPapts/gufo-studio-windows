@@ -48,6 +48,7 @@ public:
     std::string model_id() const;
     std::vector<std::string> model_ids() const;
     std::string capability_note(const std::string& model_id) const;
+    std::string attribution(const std::string& model_id) const;
     std::string initialization_error() const;
     std::size_t weight_bytes() const;
     HttpResponse Handle(const HttpRequest& request);

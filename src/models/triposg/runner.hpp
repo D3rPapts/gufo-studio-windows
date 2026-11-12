@@ -46,6 +46,8 @@ public:
     // Sampler default when the request omits `steps` (TripoSG 50, TRELLIS.2 12).
     virtual int default_steps() const { return 50; }
     virtual std::string capability_note() const { return "shape"; }
+    // Attribution the model's licences ask for, shown in /v1/models ("" = none).
+    virtual std::string attribution() const { return ""; }
 };
 
 // Loads the converted triposg.safetensors onto the GPU (HIP build) or fails with *error.

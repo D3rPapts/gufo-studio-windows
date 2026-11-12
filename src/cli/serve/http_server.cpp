@@ -2299,6 +2299,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
         model["owned_by"] = "operator-supplied-" + id;
         model["capability"] = "image_to_3d";
         model["note"] = objekt_->capability_note(id);
+        if (const std::string credit = objekt_->attribution(id); !credit.empty())
+          model["attribution"] = credit;
         models["data"].push_back(std::move(model));
       }
       listed.body = models.dump();

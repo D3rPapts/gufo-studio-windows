@@ -38,6 +38,8 @@ public:
     std::size_t weight_bytes() const override { return pipeline_->weight_bytes(); }
     int default_steps() const override { return 12; }
     std::string capability_note() const override { return pipeline_->has_texture() ? "shape+pbr-vertex-colours" : "shape"; }
+    // TRELLIS.2 encodes the image with DINOv3 (Meta, DINOv3 License).
+    std::string attribution() const override { return "TRELLIS.2 (Microsoft, MIT). Built with DINOv3 (Meta, DINOv3 License)."; }
 
 private:
     std::unique_ptr<Pipeline> pipeline_;
