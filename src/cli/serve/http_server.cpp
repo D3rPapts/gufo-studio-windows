@@ -36,6 +36,7 @@
 #include "src/cli/serve/music_api.hpp"
 #include "src/cli/serve/foley_api.hpp"
 #include "src/cli/serve/upscale_api.hpp"
+#include "src/cli/serve/objekt_service.hpp"
 #include "src/cli/serve/omni_api.hpp"
 #include "src/cli/serve/omni_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -2210,6 +2211,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (music_ != nullptr && music_->ready()) ||
                        (foley_ != nullptr && foley_->ready()) ||
                        (upscale_ != nullptr && upscale_->ready()) ||
+                       (objekt_ != nullptr && objekt_->ready()) ||
                        images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
@@ -2230,6 +2232,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     } else if (upscale_ != nullptr && upscale_->ready()) {
       body["model"] = upscale_->model_id();
       body["device"] = upscale_->engine().device;
+    } else if (objekt_ != nullptr && objekt_->ready()) {
+      body["model"] = objekt_->model_id();
+      body["capability"] = "image_to_3d";
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
@@ -2284,7 +2289,24 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       }
       listed.body = models.dump();
     }
+    if (objekt_ != nullptr && objekt_->ready()) {
+      json::Value models = json::parse(listed.body);
+      json::Value model = json::Value::object();
+      model["id"] = objekt_->model_id();
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-triposg";
+      model["capability"] = "image_to_3d";
+      models["data"].push_back(std::move(model));
+      listed.body = models.dump();
+    }
     return listed;
+  }
+  if (objekt_ != nullptr && IsObjektApiPath(req.path)) {
+    if (!objekt_->ready())
+      return Err(503, "Service Unavailable", "3D service is not ready",
+                 "server_error", "objekt_service_unavailable");
+    return objekt_->Handle(req);
   }
   if (upscale_ != nullptr && IsUpscaleApiPath(req.path)) {
     if (!upscale_->ready())

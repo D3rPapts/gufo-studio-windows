@@ -496,6 +496,7 @@ add_library(gufo_http STATIC
   src/cli/serve/music_encode.cpp
   src/cli/serve/foley_api.cpp
   src/cli/serve/upscale_api.cpp
+  src/cli/serve/objekt_service.cpp
   src/cli/serve/video_upscale.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
@@ -518,6 +519,12 @@ else()
 endif()
 # Real-ESRGAN on the NPU / CPU (ONNX Runtime) behind `gufo serve upscale`.
 target_link_libraries(gufo_http PUBLIC gufo_realesrgan_cpu)
+# TripoSG image-to-3D (gufo serve objekt): GPU runner in HIP builds, stub otherwise.
+if (ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_http PUBLIC gufo_triposg)
+else()
+  target_link_libraries(gufo_http PUBLIC gufo_triposg_stub)
+endif()
 # mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
 target_compile_definitions(gufo_http PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")

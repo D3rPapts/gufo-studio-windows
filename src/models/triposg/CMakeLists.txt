@@ -34,13 +34,18 @@ else()
 endif()
 
 if (ENGINE_ENABLE_HIP)
-  add_library(gufo_triposg STATIC EXCLUDE_FROM_ALL dinov2.hip dit.hip vae.hip)
+  add_library(gufo_triposg STATIC EXCLUDE_FROM_ALL dinov2.hip dit.hip vae.hip pipeline.cpp runner.cpp)
   target_include_directories(gufo_triposg PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_triposg PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_compile_definitions(gufo_triposg PUBLIC GUFO_TRIPOSG_HIP=1)
   target_link_libraries(gufo_triposg PUBLIC gufo_triposg_cpu gufo_qwen_image_21 hip::host roc::rocblas)
 endif()
+
+# Server runner without a GPU: reports the missing HIP build.
+add_library(gufo_triposg_stub STATIC runner_stub.cpp)
+target_include_directories(gufo_triposg_stub PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(gufo_triposg_stub PUBLIC cxx_std_20)
 
 # Stage probe: preprocessing + DINOv2 tokens as .npy for tools/triposg/vergleich.py.
 add_executable(gufo-triposg-probe EXCLUDE_FROM_ALL probe_main.cpp)

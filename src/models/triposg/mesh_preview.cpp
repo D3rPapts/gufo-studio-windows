@@ -125,7 +125,7 @@ std::vector<std::uint8_t> render_preview(const Mesh& mesh, const PreviewOptions&
     return rgb;
 }
 
-bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, int width, int height, std::string* error) {
+std::vector<std::uint8_t> encode_png_rgb(const std::uint8_t* rgb, int width, int height) {
     std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     std::vector<std::uint8_t> ihdr;
     put_be32(ihdr, static_cast<std::uint32_t>(width));
@@ -158,6 +158,11 @@ bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, i
     put_be32(z, (b << 16) | a);
     chunk(png, "IDAT", z);
     chunk(png, "IEND", {});
+    return png;
+}
+
+bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, int width, int height, std::string* error) {
+    const std::vector<std::uint8_t> png = encode_png_rgb(rgb, width, height);
     std::ofstream out(path, std::ios::binary);
     if (!out) {
         if (error) *error = "cannot write " + path.string();

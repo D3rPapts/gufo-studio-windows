@@ -23,7 +23,8 @@ struct PreviewOptions {
 // RGB8 image of width size * views, height size.
 std::vector<std::uint8_t> render_preview(const Mesh& mesh, const PreviewOptions& options, int* width, int* height);
 
-// Minimal PNG writer (RGB8, stored zlib blocks).
+// Minimal PNG encoder/writer (RGB8, stored zlib blocks).
+std::vector<std::uint8_t> encode_png_rgb(const std::uint8_t* rgb, int width, int height);
 bool write_png_rgb(const std::filesystem::path& path, const std::uint8_t* rgb, int width, int height, std::string* error);
 
 }  // namespace gufo::triposg
