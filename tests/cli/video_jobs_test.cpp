@@ -470,15 +470,34 @@ void TestRecoveryHardening(const std::filesystem::path& root) {
   std::error_code link_error;
   std::filesystem::create_symlink(secret, linked_content / "output.mp4",
                                   link_error);
-  Check(!link_error, "content symlink fixture created");
+  // Windows refuses symlinks without SeCreateSymbolicLinkPrivilege
+  // (ERROR_PRIVILEGE_NOT_HELD, 1314): the symlink checks are skipped there,
+  // the metadata/directory ID mismatch check still runs. POSIX keeps the
+  // fixture mandatory.
+  const bool symlinks = !link_error;
+#ifdef _WIN32
+  const bool privilege_missing = link_error && link_error.value() == 1314;
+#else
+  const bool privilege_missing = false;
+#endif
+  if (privilege_missing) {
+    std::cerr << "SKIP video_jobs_test: symlink fixtures (no "
+                 "SeCreateSymbolicLinkPrivilege)" << '\n';
+    std::filesystem::remove(linked_content / "output.mp4", link_error);
+    std::ofstream(linked_content / "output.mp4") << "placeholder";
+  } else {
+    Check(symlinks, "content symlink fixture created");
+  }
 
   const std::string linked_directory_id = "video_0000000000000000000000c1";
   const std::filesystem::path external = root / "external-job";
   WriteCompletedJob(external, linked_directory_id);
   std::ofstream(external / "output.mp4") << "outside-directory";
-  std::filesystem::create_directory_symlink(
-      external, root / linked_directory_id, link_error);
-  Check(!link_error, "directory symlink fixture created");
+  if (symlinks) {
+    std::filesystem::create_directory_symlink(
+        external, root / linked_directory_id, link_error);
+    Check(!link_error, "directory symlink fixture created");
+  }
 
   VideoJobService service({
       .model_root = "/models/h3",
@@ -495,6 +514,7 @@ void TestRecoveryHardening(const std::filesystem::path& root) {
   Check(service.ready(), service.initialization_error());
   Check(service.Get(claimed_id).result == VideoJobResult::kNotFound,
         "recovery rejects metadata/directory ID mismatch");
+  if (!symlinks) return;
   Check(service.Get(linked_content_id).result == VideoJobResult::kNotFound,
         "recovery rejects symlinked content");
   Check(service.Get(linked_directory_id).result == VideoJobResult::kNotFound,
