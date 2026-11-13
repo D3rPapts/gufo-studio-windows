@@ -9,11 +9,14 @@ you'll reach for most; `gufo <command> --help` lists every option.
 | Command | What it does |
 | --- | --- |
 | `gufo serve` | Starts the [OpenAI-compatible server](server.md) for one model. |
+| `gufo router` | Serves several preset models under one URL with on-demand loading; see the [model router](internal/server.md#model-router). |
 | `gufo chat` | Holds a conversation with a text model in the terminal. |
 | `gufo prompt` | Answers one prompt and exits; reads standard input when piped. |
 | `gufo transcribe` | Transcribes an audio file, or live audio with `--live`. |
 | `gufo speak` | Synthesizes speech, or answers in speech with models that support it. |
 | `gufo video` | Generates a video with [MiniMax H3](models/minimax-h3.md). |
+| `gufo video-interpolate` | RIFE frame interpolation of an MP4; see [RIFE](models/rife/README.md). |
+| `gufo video-upscale` | Real-ESRGAN upscaling of an MP4 or image; see [Real-ESRGAN](models/realesrgan/README.md). |
 | `gufo decide` | Answers decision requests from a file or standard input. |
 | `gufo bench` | Measures prefill and decode speed of a model. |
 | `gufo eval` | Grades a running server on a fixed set of questions. |
@@ -38,9 +41,14 @@ gufo serve [server options] <modality> [model options]
 | `image` | Image generation and editing | `/v1/images/generations`, `/v1/images/edits` |
 | `video` | Video generation | `/v1/videos` |
 | `decision` | Decision models | `/v1/systemone` |
+| `music` | ACE-Step 1.5 XL music generation | `/v1/audio/music` |
+| `foley` | MMAudio video/text-to-audio | `/v1/audio/foley` |
+| `upscale` | Real-ESRGAN image and video upscaling (NPU, GPU or CPU) | `/v1/images/upscale`, `/v1/videos/upscale` |
+| `omni` | Qwen3-Omni captioner: audio to text description | `/v1/chat/completions` with an `input_audio` part |
 
-One process serves one model. To offer several models under one URL, put
-them behind [llama-swap](server.md#llama-swap).
+One process serves one model. To offer several models under one URL, run
+them behind `gufo router`, which starts each worker on demand from a preset
+file; see the [model router](internal/server.md#model-router).
 
 These server options work with every modality:
 
