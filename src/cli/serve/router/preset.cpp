@@ -327,15 +327,54 @@ bool IsReservedKey(std::string_view key) {
   return key == "host" || key == "port" || key == "api-key";
 }
 
+/// `[router]` keys (users and access control, 2.0.3). Values are checked
+/// here so a typo stops the router at start like any other preset error.
+bool ParseRouterSection(const Section& section, RouterSection* out,
+                        std::string* error) {
+  const auto fail = [&](const std::string& message) {
+    *error = "[router] " + message;
+    return false;
+  };
+  for (const auto& [key, value] : section.entries) {
+    if (key == "auth") {
+      if (value != "off" && value != "lan" && value != "all")
+        return fail("auth takes off|lan|all, got '" + value + "'");
+      out->auth = value;
+    } else if (key == "auth-loopback") {
+      if (value != "admin" && value != "login")
+        return fail("auth-loopback takes admin|login, got '" + value + "'");
+      out->auth_loopback = value;
+    } else if (key == "users-file") {
+      if (value.empty())
+        return fail("users-file needs a path");
+      out->users_file = value;
+    } else if (key == "pool-secret-env") {
+      if (value.empty())
+        return fail("pool-secret-env needs an environment variable name");
+      out->pool_secret_env = value;
+    } else {
+      return fail("unknown key '" + key +
+                  "' (auth, auth-loopback, users-file, pool-secret-env)");
+    }
+  }
+  out->present = true;
+  return true;
+}
+
 bool LoadPreset(const std::filesystem::path& file,
                 const std::filesystem::path& models_dir,
-                std::vector<PresetModel>* models, std::string* error) {
+                std::vector<PresetModel>* models, std::string* error,
+                RouterSection* router) {
   std::ifstream input(file, std::ios::binary);
   if (!input) {
     *error = "cannot open preset file '" + file.string() + "'";
     return false;
   }
   models->clear();
+  RouterSection router_section;
+  if (router == nullptr)
+    router = &router_section;
+  bool router_seen = false;
   // `[remote/<id>]` sections, merged into a local twin of the same id (a
   // switchable model) or kept as remote-only models at the end.
   struct RemoteSection {
@@ -348,6 +387,9 @@ bool LoadPreset(const std::filesystem::path& file,
   const auto flush = [&](const Section& section) -> bool {
     if (section.entries.empty()) {
       return SectionError(section, "empty section body", error);
+    }
+    if (section.modality == "router") {
+      return ParseRouterSection(section, router, error);
     }
     if (section.modality == "remote") {
       RemoteSection remote{section, {}, false};
@@ -489,10 +531,24 @@ bool LoadPreset(const std::filesystem::path& file,
                                           ? line.substr(1)
                                           : line.substr(1, close - 1);
       const auto slash = header.find('/');
+      if (close != std::string_view::npos && slash == std::string_view::npos &&
+          TrimSpaces(header) == "router" &&
+          TrimSpaces(line.substr(close + 1)).empty()) {
+        // `[router]`: users and access control, once per file.
+        if (router_seen) {
+          *error = "[router] appears twice";
+          return false;
+        }
+        router_seen = true;
+        section.modality = "router";
+        section.id = "router";
+        in_section = true;
+        continue;
+      }
       if (close == std::string_view::npos || slash == std::string_view::npos ||
           !TrimSpaces(line.substr(close + 1)).empty()) {
         *error = "invalid section header '" + std::string(line) +
-                 "': expected [modality/id]";
+                 "': expected [modality/id] or [router]";
         return false;
       }
       section.modality = std::string(TrimSpaces(header.substr(0, slash)));
