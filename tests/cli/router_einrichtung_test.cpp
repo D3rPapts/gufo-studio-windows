@@ -5,19 +5,24 @@
 // einrichten.py --plan section by section like vergleich_preset.py), the
 // foreign-block keeper and the service's endpoints with a temp folder.
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/preset.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 
 namespace {
@@ -574,6 +579,9 @@ void TestService() {
   r = service.Handle(Req("GET", "/router/setup/nix", "127.0.0.1"));
   CHECK(r.has_value() && r->status == 404);
   r = service.Handle(Req("GET", "/router/setup/downloads", "127.0.0.1"));
+  CHECK(r.has_value() && r->status == 200);
+  CHECK(!Body(*r).find("laeuft")->as_bool());
+  r = service.Handle(Req("GET", "/router/setup/selbsttest", "127.0.0.1"));
   CHECK(r.has_value() && r->status == 501);
 
   // The admin needs the data folder first (users file unknown).
@@ -777,12 +785,625 @@ void TestService() {
   std::filesystem::remove_all(tmp, ec);
 }
 
+// ---------------------------------------------------------------------------
+// Downloads: a local stand-in for Hugging Face (HEAD, GET, Range, 401 for a
+// gated repo, 503 for a flaky one, a server that ignores Range, a slow
+// file for pause/cancel) and the service's /router/setup/downloads.
+
+namespace {
+
+std::string PseudoRandom(std::size_t n, unsigned seed) {
+  std::string out(n, '\0');
+  unsigned x = seed * 2654435761u + 12345u;
+  for (std::size_t i = 0; i < n; ++i) {
+    x = x * 1103515245u + 12345u;
+    out[i] = static_cast<char>((x >> 16) & 0xff);
+  }
+  return out;
+}
+
+std::string Sha(const std::string& text) {
+  return gufo::crypto::Sha256Hex(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+}
+
+struct FakeHf {
+  struct Entry {
+    std::string body;
+    bool gated{false};
+    int fail_first{0};     // 503 for the first n requests
+    bool ignore_range{false};
+    int chunk_ms{0};        // >0: streamed in 64 KB chunks with this pause
+    bool linked_etag{false};  // X-Linked-ETag with the body's SHA-256
+  };
+  std::map<std::string, Entry> files;
+  std::mutex mutex;
+  std::vector<std::pair<std::string, std::string>> ranges;  // path, Range
+  std::map<std::string, int> fails;
+  int requests{0};
+  std::unique_ptr<gufo::server::HttpServer> server;
+  std::thread thread;
+  int port{0};
+
+  void Start() {
+    gufo::server::HttpServerOptions options;
+    options.dispatcher = [this](const HttpRequest& req) { return Serve(req); };
+    server = std::make_unique<gufo::server::HttpServer>(
+        "127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+        std::move(options));
+    std::string error;
+    CHECK(server->start(&error));
+    port = server->port();
+    thread = std::thread([this] { server->run(false); });
+  }
+  ~FakeHf() {
+    if (server != nullptr)
+      server->stop();
+    if (thread.joinable())
+      thread.join();
+  }
+  std::string Base() const { return "http://127.0.0.1:" + std::to_string(port); }
+
+  HttpResponse Serve(const HttpRequest& req) {
+    const auto it = files.find(req.path);
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++requests;
+    }
+    if (it == files.end())
+      return HttpResponse{.status = 404, .reason = "Not Found", .body = "{}"};
+    const Entry& e = it->second;
+    if (e.gated && req.header("Authorization") != "Bearer hf_test")
+      return HttpResponse{.status = 401, .reason = "Unauthorized", .body = "{}"};
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (fails[req.path] < e.fail_first) {
+        ++fails[req.path];
+        return HttpResponse{.status = 503, .reason = "Service Unavailable",
+                            .body = "{}"};
+      }
+    }
+    HttpResponse r;
+    r.headers.emplace_back("Content-Type", "application/octet-stream");
+    r.headers.emplace_back("Accept-Ranges", "bytes");
+    if (e.linked_etag) {
+      r.headers.emplace_back("X-Linked-Size", std::to_string(e.body.size()));
+      r.headers.emplace_back("X-Linked-ETag", "\"" + Sha(e.body) + "\"");
+    }
+    if (req.method == "HEAD") {
+      // The body is sent too (the server sets Content-Length from it);
+      // curl's HEAD reads the headers only.
+      r.body = e.body;
+      return r;
+    }
+    std::size_t from = 0;
+    const std::string range = req.header("Range");
+    if (!range.empty()) {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ranges.emplace_back(req.path, range);
+    }
+    if (!range.empty() && !e.ignore_range && range.starts_with("bytes=")) {
+      from = static_cast<std::size_t>(
+          std::strtoull(range.c_str() + 6, nullptr, 10));
+      if (from >= e.body.size())
+        return HttpResponse{.status = 416, .reason = "Range Not Satisfiable",
+                            .body = "{}"};
+      r.status = 206;
+      r.reason = "Partial Content";
+      r.headers.emplace_back(
+          "Content-Range", "bytes " + std::to_string(from) + "-" +
+                               std::to_string(e.body.size() - 1) + "/" +
+                               std::to_string(e.body.size()));
+    }
+    const std::string part = e.body.substr(from);
+    if (e.chunk_ms <= 0) {
+      r.body = part;
+      return r;
+    }
+    r.headers.emplace_back("Content-Length", std::to_string(part.size()));
+    const int chunk_ms = e.chunk_ms;
+    r.streaming_body = [part, chunk_ms](const HttpResponse::BodyWriter& write) {
+      for (std::size_t at = 0; at < part.size(); at += 65536) {
+        if (!write(std::string_view(part).substr(at, 65536)))
+          return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(chunk_ms));
+      }
+    };
+    return r;
+  }
+};
+
+const json::Value* FindFile(const json::Value& body, std::string_view pfad) {
+  const json::Value* list = body.find("dateien");
+  if (list == nullptr)
+    return nullptr;
+  for (const json::Value& d : list->items())
+    if (d.member_str("pfad") == pfad)
+      return &d;
+  return nullptr;
+}
+
+std::string FileStatus(const json::Value& body, std::string_view pfad) {
+  const json::Value* d = FindFile(body, pfad);
+  return d == nullptr ? std::string("(missing)") : d->member_str("status");
+}
+
+std::string FileField(const json::Value& body, std::string_view pfad,
+                      const std::string& key) {
+  const json::Value* d = FindFile(body, pfad);
+  return d == nullptr ? std::string("(missing)") : d->member_str(key);
+}
+
+/// Polls GET until the job neither runs nor pauses (or the deadline).
+json::Value WaitDone(einrichtung::SetupService& service,
+                     std::chrono::milliseconds limit =
+                         std::chrono::milliseconds(20000)) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  for (;;) {
+    const auto r =
+        service.Handle(Req("GET", "/router/setup/downloads", "127.0.0.1"));
+    const json::Value body = Body(*r);
+    if (!body.find("laeuft")->as_bool() && !body.find("pause")->as_bool())
+      return body;
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::cerr << "WaitDone: timeout\n";
+      ++failures;
+      return body;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
+json::Value WaitStatus(einrichtung::SetupService& service,
+                       std::string_view pfad, std::string_view status,
+                       std::chrono::milliseconds limit =
+                           std::chrono::milliseconds(10000)) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  for (;;) {
+    const auto r =
+        service.Handle(Req("GET", "/router/setup/downloads", "127.0.0.1"));
+    const json::Value body = Body(*r);
+    if (FileStatus(body, pfad) == status)
+      return body;
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::cerr << "WaitStatus: timeout waiting for " << pfad << " = "
+                << status << " (is " << FileStatus(body, pfad) << ")\n";
+      ++failures;
+      return body;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
+json::Value FileEntry(const std::string& pfad, std::size_t bytes,
+                      const std::string& sha) {
+  json::Value d = json::Value::object();
+  d["pfad"] = pfad;
+  d["bytes"] = static_cast<double>(bytes);
+  d["sha256"] = sha;
+  d["sha256_status"] = sha.empty() ? "fehlt" : "test";
+  return d;
+}
+
+json::Value ModelEntry(const std::string& id, const std::string& ordner,
+                       const std::string& repo, const std::string& rev,
+                       json::Value dateien) {
+  json::Value m = json::Value::object();
+  m["id"] = id;
+  m["name"] = id;
+  m["pflicht"] = true;
+  m["worker"] = "gufo.exe";
+  json::Value q = json::Value::object();
+  q["ordner"] = ordner;
+  q["hf_repo"] = repo;
+  q["hf_revision"] = rev;
+  json::Value quellen = json::Value::array();
+  quellen.push_back(std::move(q));
+  m["quellen"] = std::move(quellen);
+  m["dateien"] = std::move(dateien);
+  return m;
+}
+
+std::string JsonList(const std::vector<std::string>& items) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < items.size(); ++i)
+    out += (i ? ",\"" : "\"") + items[i] + "\"";
+  return out + "]";
+}
+
+std::string Esc(std::string text) {
+  std::string out;
+  for (const char c : text)
+    out += c == '\\' ? std::string("\\\\") : std::string(1, c);
+  return out;
+}
+
+}  // namespace
+
+void TestDownloads() {
+  CHECK_EQ(einrichtung::DownloadUrl("https://huggingface.co/", "a/b", "",
+                                    "x y\\z.bin"),
+           std::string("https://huggingface.co/a/b/resolve/main/x%20y/z.bin"));
+  CHECK_EQ(einrichtung::DownloadUrl("http://127.0.0.1:1", "a/b", "abc",
+                                    "m.gguf"),
+           std::string("http://127.0.0.1:1/a/b/resolve/abc/m.gguf"));
+
+  const std::filesystem::path tmp = TempDir();
+  FakeHf hf;
+  const std::string good = PseudoRandom(1 << 20, 1);
+  const std::string nosha = PseudoRandom(300000, 2);
+  const std::string bad = PseudoRandom(50000, 3);
+  const std::string have = PseudoRandom(1234, 4);
+  const std::string wrongsize = PseudoRandom(20, 5);
+  const std::string gated = PseudoRandom(4000, 6);
+  const std::string flaky = PseudoRandom(70000, 7);
+  const std::string resume = PseudoRandom(200000, 8);
+  const std::string noresume = PseudoRandom(150000, 9);
+  const std::string slow = PseudoRandom(3 << 20, 10);
+  hf.files["/acme/repo-a/resolve/abc/good.bin"] = {.body = good};
+  hf.files["/acme/repo-a/resolve/abc/nosha.bin"] = {.body = nosha,
+                                                     .linked_etag = true};
+  hf.files["/acme/repo-a/resolve/abc/bad.bin"] = {.body = bad};
+  hf.files["/acme/repo-a/resolve/abc/sub/have.bin"] = {.body = have};
+  hf.files["/acme/repo-a/resolve/abc/wrongsize.bin"] = {.body = wrongsize};
+  hf.files["/acme/gated/resolve/main/g.bin"] = {.body = gated, .gated = true};
+  hf.files["/acme/flaky/resolve/main/f.bin"] = {.body = flaky, .fail_first = 2};
+  hf.files["/acme/repo-a/resolve/abc/resume.bin"] = {.body = resume};
+  hf.files["/acme/repo-a/resolve/abc/noresume.bin"] = {.body = noresume,
+                                                        .ignore_range = true};
+  hf.files["/acme/slow/resolve/main/s.bin"] = {.body = slow, .chunk_ms = 15};
+  hf.Start();
+
+  // A catalogue of its own (dir with katalog.json only).
+  json::Value katalog = json::Value::object();
+  katalog["katalog_version"] = "test";
+  json::Value modelle = json::Value::array();
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\repo-a\\good.bin", good.size(), Sha(good)));
+    d.push_back(FileEntry("acme\\repo-a\\nosha.bin", nosha.size(), ""));
+    d.push_back(FileEntry("acme\\repo-a\\bad.bin", bad.size(), Sha(good)));
+    d.push_back(FileEntry("acme\\repo-a\\sub\\have.bin", have.size(), ""));
+    d.push_back(FileEntry("acme\\repo-a\\wrongsize.bin", 10, ""));
+    modelle.push_back(ModelEntry("m1", "acme\\repo-a", "acme/repo-a", "abc",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\gated\\g.bin", gated.size(), Sha(gated)));
+    modelle.push_back(ModelEntry("m2", "acme\\gated", "acme/gated", "",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    json::Value none = FileEntry("acme\\none\\n.bin", 10, "");
+    none["hf_repo"] = json::Value();
+    none["hf_pfad"] = json::Value();
+    d.push_back(std::move(none));
+    modelle.push_back(ModelEntry("m3", "acme\\none", "acme/none", "",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\flaky\\f.bin", flaky.size(), Sha(flaky)));
+    modelle.push_back(ModelEntry("m4", "acme\\flaky", "acme/flaky", "",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\repo-a\\resume.bin", resume.size(),
+                          Sha(resume)));
+    d.push_back(FileEntry("acme\\repo-a\\noresume.bin", noresume.size(),
+                          Sha(noresume)));
+    modelle.push_back(ModelEntry("m5", "acme\\repo-a", "acme/repo-a", "abc",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\slow\\s.bin", slow.size(), Sha(slow)));
+    modelle.push_back(ModelEntry("m6", "acme\\slow", "acme/slow", "",
+                                 std::move(d)));
+  }
+  {
+    json::Value d = json::Value::array();
+    d.push_back(FileEntry("acme\\huge\\h.bin", 1ull << 56, ""));
+    modelle.push_back(ModelEntry("m7", "acme\\huge", "acme/huge", "",
+                                 std::move(d)));
+  }
+  json::Value chat = json::Value::object();
+  chat["titel"] = "Chat";
+  chat["modelle"] = std::move(modelle);
+  json::Value bausteine = json::Value::object();
+  bausteine["chat"] = std::move(chat);
+  katalog["bausteine"] = std::move(bausteine);
+  WriteFile(tmp / "einr" / "katalog.json", katalog.dump());
+
+  Fixture f(auth::Mode::kOff);
+  einrichtung::ServiceOptions options;
+  options.dir = tmp / "einr";
+  options.exe = tmp / "bin" / "gufo.exe";
+  options.port = 8098;
+  options.gate = f.gate.get();
+  options.hf_base_url = hf.Base();
+  options.download_allow_http = true;
+  options.download_retry_wait_ms = {30, 30, 30, 30, 30};
+  options.download_reserve_bytes = 0;
+  einrichtung::SetupService service(options);
+
+  const std::filesystem::path ziel = tmp / "modelle";
+  WriteFile(ziel / "acme" / "repo-a" / "sub" / "have.bin", have);
+  WriteFile(ziel / "acme" / "repo-a" / "resume.bin.part", resume.substr(0, 1000));
+  WriteFile(ziel / "acme" / "repo-a" / "noresume.bin.part",
+            noresume.substr(0, 777));
+  const std::string ziel_json = "\"ziel\":\"" + Esc(ziel.string()) + "\"";
+  const auto post = [&](const std::string& body) {
+    return service.Handle(
+        Req("POST", "/router/setup/downloads", "127.0.0.1", body));
+  };
+
+  // Nothing yet.
+  std::optional<HttpResponse> r =
+      service.Handle(Req("GET", "/router/setup/downloads", "127.0.0.1"));
+  CHECK(r.has_value() && r->status == 200);
+  CHECK_EQ(Body(*r).find("dateien")->size(), std::size_t(0));
+  r = post("{\"aktion\":\"pause\"}");
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_download");
+  r = post("{\"aktion\":\"planen\",\"modelle\":[\"m1\"],\"ziel\":\"modelle\"}");
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "invalid_path");
+
+  // Plan: the state on disk, sources, no source.
+  const std::vector<std::string> first = {"m1", "m2", "m3", "m4", "m5"};
+  r = post("{\"aktion\":\"planen\",\"modelle\":" + JsonList(first) + "," +
+           ziel_json + "}");
+  CHECK(r.has_value() && r->status == 200);
+  {
+    const json::Value b = Body(*r);
+    CHECK(!b.find("laeuft")->as_bool());
+    CHECK_EQ(b.find("dateien")->size(), std::size_t(10));
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\good.bin"), "wartet");
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\sub\\have.bin"), "vorhanden");
+    CHECK_EQ(FileStatus(b, "acme\\none\\n.bin"), "fehler");
+    CHECK_EQ(FileField(b, "acme\\none\\n.bin", "fehler_code"), "no_source");
+    const json::Value* good_entry = FindFile(b, "acme\\repo-a\\good.bin");
+    CHECK(good_entry != nullptr && good_entry->find("quelle") != nullptr);
+    if (good_entry != nullptr && good_entry->find("quelle") != nullptr) {
+      CHECK_EQ(good_entry->find("quelle")->member_str("hf_repo"), "acme/repo-a");
+      CHECK_EQ(good_entry->find("quelle")->member_str("revision"), "abc");
+    }
+    CHECK_EQ(b.member_str("ziel"), ziel.string());
+  }
+  CHECK(!std::filesystem::exists(ziel / "acme" / "repo-a" / "good.bin"));
+
+  // Start without a token: everything but the gated file settles.
+  r = post("{\"aktion\":\"start\",\"modelle\":" + JsonList(first) + "," +
+           ziel_json + "}");
+  CHECK(r.has_value() && r->status == 202);
+  {
+    const json::Value b = WaitDone(service);
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\good.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\good.bin", "sha256_status"), "ok");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\good.bin", "sha256_quelle"), "katalog");
+    CHECK_EQ(ReadFile(ziel / "acme" / "repo-a" / "good.bin"), good);
+    CHECK(!std::filesystem::exists(ziel / "acme" / "repo-a" / "good.bin.part"));
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\nosha.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\nosha.bin", "sha256_status"), "ok");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\nosha.bin", "sha256_quelle"), "hf");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\nosha.bin", "sha256_ist"), Sha(nosha));
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\bad.bin"), "fehler");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\bad.bin", "fehler_code"), "sha256");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\bad.bin", "sha256_status"), "falsch");
+    CHECK(std::filesystem::exists(ziel / "acme" / "repo-a" / "bad.bin.falsch"));
+    CHECK(!std::filesystem::exists(ziel / "acme" / "repo-a" / "bad.bin"));
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\sub\\have.bin"), "vorhanden");
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\wrongsize.bin"), "fehler");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\wrongsize.bin", "fehler_code"),
+             "size_mismatch");
+    CHECK_EQ(FileStatus(b, "acme\\gated\\g.bin"), "fehler");
+    CHECK_EQ(FileField(b, "acme\\gated\\g.bin", "fehler_code"), "gated");
+    CHECK_EQ(FileStatus(b, "acme\\none\\n.bin"), "fehler");
+    CHECK_EQ(FileStatus(b, "acme\\flaky\\f.bin"), "fertig");
+    CHECK_EQ(FindFile(b, "acme\\flaky\\f.bin")->member_double("versuche"), 2.0);
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\resume.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\resume.bin", "sha256_status"), "ok");
+    CHECK_EQ(ReadFile(ziel / "acme" / "repo-a" / "resume.bin"), resume);
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\noresume.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\noresume.bin", "sha256_status"), "ok");
+    CHECK_EQ(ReadFile(ziel / "acme" / "repo-a" / "noresume.bin"), noresume);
+    bool resumed = false;
+    bool noresumed = false;
+    {
+      const std::lock_guard<std::mutex> lock(hf.mutex);
+      for (const auto& [path, range] : hf.ranges) {
+        if (path == "/acme/repo-a/resolve/abc/resume.bin" &&
+            range == "bytes=1000-")
+          resumed = true;
+        if (path == "/acme/repo-a/resolve/abc/noresume.bin" &&
+            range == "bytes=777-")
+          noresumed = true;
+      }
+    }
+    CHECK(resumed);
+    CHECK(noresumed);
+    CHECK(b.member_double("gesamt_bytes") > 0);
+  }
+  // The state file exists and never carries the token.
+  CHECK(std::filesystem::exists(ziel / ".einrichtung-downloads.json"));
+
+  // Resume with the token: the gated file loads; the others stay.
+  r = post("{\"aktion\":\"weiter\",\"hf_token\":\"hf_test\"}");
+  CHECK(r.has_value() && r->status == 200);
+  {
+    const json::Value b = WaitDone(service);
+    CHECK_EQ(FileStatus(b, "acme\\gated\\g.bin"), "fertig");
+    CHECK_EQ(ReadFile(ziel / "acme" / "gated" / "g.bin"), gated);
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\good.bin"), "fertig");
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\bad.bin"), "fehler");
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\wrongsize.bin"), "fehler");
+  }
+  CHECK(ReadFile(ziel / ".einrichtung-downloads.json").find("hf_test") ==
+        std::string::npos);
+
+  // Pause mid-transfer, resume with a Range, cancel, start again.
+  r = post("{\"aktion\":\"start\",\"modelle\":[\"m6\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 202);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  r = post("{\"aktion\":\"start\",\"modelle\":[\"m6\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "download_running");
+  r = post("{\"aktion\":\"pause\"}");
+  CHECK(r.has_value() && r->status == 200);
+  CHECK(Body(*r).find("pause")->as_bool());
+  {
+    const json::Value b = WaitStatus(service, "acme\\slow\\s.bin", "pause");
+    const std::filesystem::path part = ziel / "acme" / "slow" / "s.bin.part";
+    CHECK(std::filesystem::exists(part));
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(part, ec);
+    CHECK(size > 0 && size < slow.size());
+    CHECK_EQ(static_cast<double>(size),
+             FindFile(b, "acme\\slow\\s.bin")->member_double("geladen"));
+    std::size_t before = 0;
+    {
+      const std::lock_guard<std::mutex> lock(hf.mutex);
+      before = hf.ranges.size();
+    }
+    r = post("{\"aktion\":\"weiter\"}");
+    CHECK(r.has_value() && r->status == 200);
+    const json::Value done = WaitDone(service);
+    CHECK_EQ(FileStatus(done, "acme\\slow\\s.bin"), "fertig");
+    CHECK_EQ(FileField(done, "acme\\slow\\s.bin", "sha256_status"), "ok");
+    CHECK_EQ(ReadFile(ziel / "acme" / "slow" / "s.bin"), slow);
+    bool ranged = false;
+    {
+      const std::lock_guard<std::mutex> lock(hf.mutex);
+      for (std::size_t i = before; i < hf.ranges.size(); ++i)
+        if (hf.ranges[i].first == "/acme/slow/resolve/main/s.bin" &&
+            hf.ranges[i].second == "bytes=" + std::to_string(size) + "-")
+          ranged = true;
+    }
+    CHECK(ranged);
+  }
+  std::filesystem::remove(ziel / "acme" / "slow" / "s.bin");
+  r = post("{\"aktion\":\"start\",\"modelle\":[\"m6\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 202);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  r = post("{\"aktion\":\"abbrechen\"}");
+  CHECK(r.has_value() && r->status == 200);
+  {
+    const json::Value b = WaitStatus(service, "acme\\slow\\s.bin", "abgebrochen");
+    CHECK(!b.find("laeuft")->as_bool());
+    CHECK(!b.find("pause")->as_bool());
+    CHECK(std::filesystem::exists(ziel / "acme" / "slow" / "s.bin.part"));
+    CHECK(!std::filesystem::exists(ziel / "acme" / "slow" / "s.bin"));
+  }
+  r = post("{\"aktion\":\"start\",\"modelle\":[\"m6\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 202);
+  {
+    const json::Value b = WaitDone(service);
+    CHECK_EQ(FileStatus(b, "acme\\slow\\s.bin"), "fertig");
+    CHECK_EQ(ReadFile(ziel / "acme" / "slow" / "s.bin"), slow);
+  }
+
+  // Not enough space: 507 with the numbers, nothing started.
+  r = post("{\"aktion\":\"start\",\"modelle\":[\"m7\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 507);
+  CHECK_EQ(ErrorCode(*r), "disk_full");
+  CHECK(Body(*r).member_double("fehlt_bytes") > 0);
+  CHECK(Body(*r).member_double("frei_bytes") > 0);
+  CHECK(!std::filesystem::exists(ziel / "acme" / "huge" / "h.bin.part"));
+
+  // A new plan finds the digests of the finished files in the state file.
+  r = post("{\"aktion\":\"planen\",\"modelle\":[\"m1\"]," + ziel_json + "}");
+  CHECK(r.has_value() && r->status == 200);
+  {
+    const json::Value b = Body(*r);
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\good.bin"), "vorhanden");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\good.bin", "sha256_status"), "ok");
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\bad.bin"), "wartet");
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(tmp, ec);
+}
+
+/// One small real file from our own Hugging Face repo
+/// (D3rPapst/rife-ifnet-gufo, rife47.safetensors, 21 MB; SHA-256 from
+/// hf-upload 13.11.2026, equal to the X-Linked-ETag Hugging Face reports).
+/// Skipped without network or with GUFO_TEST_OFFLINE set; a transfer that
+/// does not finish within 40 s is cancelled and counts as skipped.
+void TestRealDownload() {
+  if (std::getenv("GUFO_TEST_OFFLINE") != nullptr) {
+    std::cout << "real download: skipped (GUFO_TEST_OFFLINE)\n";
+    return;
+  }
+  const std::filesystem::path tmp = TempDir();
+  json::Value katalog = json::Value::object();
+  json::Value d = json::Value::array();
+  d.push_back(FileEntry(
+      "rife\\weights\\rife47.safetensors", 21312128,
+      "eb3bc69d7539ce6df78b10f00bf0ff450d7617a2f9448d3e380a2259339a94e9"));
+  json::Value modelle = json::Value::array();
+  modelle.push_back(ModelEntry("rife47", "rife\\weights",
+                               "D3rPapst/rife-ifnet-gufo", "", std::move(d)));
+  json::Value chat = json::Value::object();
+  chat["modelle"] = std::move(modelle);
+  json::Value bausteine = json::Value::object();
+  bausteine["chat"] = std::move(chat);
+  katalog["bausteine"] = std::move(bausteine);
+  WriteFile(tmp / "einr" / "katalog.json", katalog.dump());
+  Fixture f(auth::Mode::kOff);
+  einrichtung::ServiceOptions options;
+  options.dir = tmp / "einr";
+  options.exe = tmp / "bin" / "gufo.exe";
+  options.gate = f.gate.get();
+  options.download_retry_wait_ms = {500};
+  options.download_reserve_bytes = 0;
+  const std::filesystem::path ziel = tmp / "modelle";
+  {
+    einrichtung::SetupService service(options);
+    const auto r = service.Handle(Req(
+        "POST", "/router/setup/downloads", "127.0.0.1",
+        "{\"aktion\":\"start\",\"modelle\":[\"rife47\"],\"ziel\":\"" +
+            Esc(ziel.string()) + "\"}"));
+    CHECK(r.has_value() && r->status == 202);
+    const int before = failures;
+    const auto start = std::chrono::steady_clock::now();
+    json::Value b = WaitDone(service, std::chrono::milliseconds(40000));
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    if (failures != before) {
+      failures = before;  // the timeout is not a failure of the code
+      (void)service.Handle(Req("POST", "/router/setup/downloads", "127.0.0.1",
+                               "{\"aktion\":\"abbrechen\"}"));
+      std::cout << "real download: skipped (not finished in 40 s)\n";
+    } else if (FileStatus(b, "rife\\weights\\rife47.safetensors") == "fertig") {
+      CHECK_EQ(FileField(b, "rife\\weights\\rife47.safetensors", "sha256_status"),
+               "ok");
+      std::cout << "real download: rife47.safetensors 21312128 bytes in "
+                << seconds << " s, sha256 "
+                << FileField(b, "rife\\weights\\rife47.safetensors",
+                             "sha256_status")
+                << "\n";
+    } else {
+      std::cout << "real download: skipped ("
+                << FileField(b, "rife\\weights\\rife47.safetensors", "fehler")
+                << ")\n";
+    }
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(tmp, ec);
+}
+
 int main() {
   TestClassifyAndGate();
   TestHelpers();
   TestMachineCheck();
   TestPlan();
   TestService();
+  TestDownloads();
+  TestRealDownload();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

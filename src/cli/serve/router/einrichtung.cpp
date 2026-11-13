@@ -1109,6 +1109,149 @@ std::string Report(const json::Value& a, const json::Value& katalog,
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Downloads (plan section 4): the file list of the chosen models with their
+// Hugging Face address and the state on disk.
+
+std::string DownloadUrl(std::string_view base, std::string_view hf_repo,
+                        std::string_view revision, std::string_view hf_pfad) {
+  std::string url(base);
+  while (!url.empty() && url.back() == '/')
+    url.pop_back();
+  url += '/';
+  url += hf_repo;
+  url += "/resolve/";
+  url += revision.empty() ? std::string("main") : std::string(revision);
+  url += '/';
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  for (const char c : hf_pfad) {
+    const auto u = static_cast<unsigned char>(c);
+    if (c == '\\' || c == '/') {
+      url += '/';
+    } else if (std::isalnum(u) || c == '-' || c == '.' || c == '_' ||
+               c == '~') {
+      url += c;
+    } else {
+      url += '%';
+      url += kHex[u >> 4];
+      url += kHex[u & 15];
+    }
+  }
+  return url;
+}
+
+std::vector<DownloadFile> PlanDownloads(const json::Value& katalog,
+                                        const std::vector<std::string>& modelle,
+                                        std::string_view ziel,
+                                        std::string_view hf_base_url,
+                                        std::vector<std::string>* hinweise) {
+  std::vector<DownloadFile> out;
+  const auto alle = AllModels(katalog);
+  std::set<std::string> seen;
+  std::error_code ec;
+  for (const std::string& mid : modelle) {
+    const Model* model = FindModel(alle, mid);
+    if (model == nullptr) {
+      hinweise->push_back("unbekanntes Modell '" + mid + "' uebersprungen");
+      continue;
+    }
+    const json::Value* quellen = model->json->find("quellen");
+    const json::Value* dateien = model->json->find("dateien");
+    if (dateien == nullptr || !dateien->is_array())
+      continue;
+    for (const json::Value& d : dateien->items()) {
+      const std::string pfad = d.member_str("pfad");
+      if (pfad.empty() || !seen.insert(Lower(pfad)).second)
+        continue;
+      DownloadFile f;
+      f.pfad = pfad;
+      f.modell = mid;
+      f.bytes = static_cast<long long>(d.member_double("bytes", 0.0));
+      const std::string sha = Lower(d.member_str("sha256"));
+      if (sha.size() == 64)
+        f.sha256 = sha;
+      f.ziel = NativePath(JoinPath(std::string(ziel), pfad));
+
+      // The source: the file's own hf_repo/hf_pfad when the catalogue has
+      // them (null = not on Hugging Face), else the model's source whose
+      // folder is the path's prefix (einrichten.py line 274), else any
+      // source of the model with a repo.
+      const json::Value* file_repo = d.find("hf_repo");
+      const bool none = file_repo != nullptr && file_repo->is_null();
+      std::string repo = file_repo != nullptr && file_repo->is_string()
+                             ? file_repo->str()
+                             : std::string();
+      std::string hf_pfad = d.member_str("hf_pfad");
+      std::string revision;
+      std::string ordner;
+      if (!none && quellen != nullptr && quellen->is_array()) {
+        const json::Value* match = nullptr;
+        for (const json::Value& q : quellen->items()) {
+          const std::string folder = q.member_str("ordner");
+          if (folder.empty() ||
+              !Lower(pfad).starts_with(Lower(folder) + "\\"))
+            continue;
+          if (q.member_str("hf_repo").empty())
+            continue;
+          if (!repo.empty() && Lower(q.member_str("hf_repo")) != Lower(repo))
+            continue;
+          match = &q;
+          break;
+        }
+        if (match == nullptr) {
+          for (const json::Value& q : quellen->items()) {
+            if (q.member_str("hf_repo").empty())
+              continue;
+            if (!repo.empty() &&
+                Lower(q.member_str("hf_repo")) != Lower(repo))
+              continue;
+            match = &q;
+            break;
+          }
+        }
+        if (match != nullptr) {
+          if (repo.empty())
+            repo = match->member_str("hf_repo");
+          revision = match->member_str("hf_revision");
+          ordner = match->member_str("ordner");
+        }
+      }
+      if (const json::Value* file_rev = d.find("hf_revision");
+          file_rev != nullptr && file_rev->is_string() &&
+          !file_rev->str().empty())
+        revision = file_rev->str();
+      if (hf_pfad.empty()) {
+        hf_pfad = !ordner.empty() &&
+                          Lower(pfad).starts_with(Lower(ordner) + "\\")
+                      ? pfad.substr(ordner.size() + 1)
+                      : pfad;
+      }
+      if (none || repo.empty()) {
+        f.status = DownloadFile::Status::kFehler;
+        f.fehler_code = "no_source";
+        f.fehler = "keine Download-Quelle im Katalog (von einem "
+                   "eingerichteten Rechner kopieren)";
+      } else {
+        f.hf_repo = repo;
+        f.revision = revision;
+        f.url = DownloadUrl(hf_base_url, repo, revision, hf_pfad);
+      }
+      if (std::filesystem::is_regular_file(f.ziel, ec)) {
+        const auto size =
+            static_cast<long long>(std::filesystem::file_size(f.ziel, ec));
+        if (f.bytes <= 0 || size == f.bytes) {
+          f.status = DownloadFile::Status::kVorhanden;
+          f.geladen = size;
+          f.fehler.clear();
+          f.fehler_code.clear();
+        }
+      }
+      out.push_back(std::move(f));
+    }
+  }
+  return out;
+}
+
 bool BuildPlan(const json::Value& antworten, const json::Value& katalog,
                const std::filesystem::path& bausteine_dir, Plan* out,
                std::string* error) {
@@ -1627,6 +1770,12 @@ json::Value MachineCheck(const CheckOptions& options) {
 SetupService::SetupService(ServiceOptions options)
     : options_(std::move(options)) {}
 
+SetupService::~SetupService() {
+  // Cancels and joins the download workers while the state-file lock and
+  // target are still alive.
+  downloader_.reset();
+}
+
 bool SetupService::LoadKatalog(json::Value* out, std::string* error) const {
   if (options_.dir.empty()) {
     *error = "einrichtung\\katalog.json not found next to the package "
@@ -1967,6 +2116,224 @@ HttpResponse SetupService::Admin(const HttpRequest& req) {
   return Json(201, "Created", out);
 }
 
+// ---------------------------------------------------------------------------
+// Downloads
+
+namespace {
+
+constexpr const char* kDownloadState = ".einrichtung-downloads.json";
+
+json::Value EmptyDownloads(int parallel) {
+  json::Value out = json::Value::object();
+  out["laeuft"] = false;
+  out["pause"] = false;
+  out["ziel"] = "";
+  out["parallel"] = static_cast<double>(parallel);
+  out["rate_bytes_s"] = 0.0;
+  out["gesamt_bytes"] = 0.0;
+  out["geladen_bytes"] = 0.0;
+  out["hinweis"] = "";
+  out["dateien"] = json::Value::array();
+  return out;
+}
+
+}  // namespace
+
+void SetupService::WriteDownloadState(const Downloader& job) {
+  // Called by the download workers (outside their lock) and by the
+  // handlers; never takes mutex_ (a handler may hold it while it joins)
+  // and never reads downloader_ (a handler may be replacing it).
+  const std::lock_guard<std::mutex> lock(download_state_mutex_);
+  if (download_ziel_.empty())
+    return;
+  json::Value state = job.Status();
+  // Finished files of earlier jobs under the same target stay in the file
+  // (the next `planen` takes their digests), the current job's entries
+  // replace theirs.
+  {
+    std::string text;
+    if (ReadText(download_ziel_ / kDownloadState, &text)) {
+      try {
+        const json::Value old = json::parse(text);
+        const json::Value* list = old.find("dateien");
+        json::Value* now = &state["dateien"];
+        std::set<std::string> current;
+        for (const json::Value& d : now->items())
+          current.insert(Lower(d.member_str("pfad")));
+        if (list != nullptr && list->is_array()) {
+          for (const json::Value& d : list->items()) {
+            const std::string st = d.member_str("status");
+            if ((st == "fertig" || st == "vorhanden") &&
+                !current.contains(Lower(d.member_str("pfad"))))
+              now->push_back(d);
+          }
+        }
+      } catch (const std::exception&) {
+      }
+    }
+  }
+  state["ziel"] = download_ziel_.string();
+  state["zeit"] = Now("%Y-%m-%dT%H:%M:%S");
+  state["einrichtung_version"] = kVersion;
+  std::string error;
+  std::error_code ec;
+  std::filesystem::create_directories(download_ziel_, ec);
+  if (!WriteText(download_ziel_ / kDownloadState, state.dump() + "\n", &error))
+    Logger::Warn("router", "event=setup_download_state error=\"" + error + "\"");
+}
+
+HttpResponse SetupService::Downloads() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (downloader_ == nullptr)
+    return JsonOk(EmptyDownloads(options_.download_parallel));
+  json::Value out = downloader_->Status();
+  out["ziel"] = download_ziel_.string();
+  return JsonOk(out);
+}
+
+HttpResponse SetupService::DownloadsPost(const HttpRequest& req) {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Error(400, "Bad Request", "invalid_request",
+                 std::string("bad JSON: ") + e.what());
+  }
+  std::string aktion = body.member_str("aktion", "planen");
+  if (aktion == "fortsetzen")
+    aktion = "weiter";
+  // The token stays in this request and the downloader's memory; it is
+  // never written to the state file, the report or the log.
+  const std::string token = body.member_str("hf_token");
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto status = [this](int code, const char* reason) {
+    json::Value out = downloader_->Status();
+    out["ziel"] = download_ziel_.string();
+    return Json(code, reason, out);
+  };
+  if (aktion == "planen" || aktion == "start") {
+    const std::vector<std::string> modelle = StringList(body.find("modelle"));
+    const std::string ziel = Member(body, "ziel");
+    if (ziel.empty() || !IsSafePath(ziel))
+      return Error(400, "Bad Request", "invalid_path",
+                   "ziel: absoluter Pfad mit Laufwerk, ohne '..' und ohne "
+                   "UNC (" + ziel + ")");
+    if (modelle.empty())
+      return Error(400, "Bad Request", "invalid_request", "modelle fehlt");
+    if (downloader_ != nullptr &&
+        (downloader_->running() || downloader_->paused())) {
+      if (aktion == "planen")
+        return status(200, "OK");
+      return Error(409, "Conflict", "download_running",
+                   "ein Download laeuft schon (pause / weiter / abbrechen)");
+    }
+    json::Value katalog;
+    std::string error;
+    if (!LoadKatalog(&katalog, &error))
+      return Error(404, "Not Found", "katalog_missing", error);
+    std::vector<std::string> hinweise;
+    std::vector<DownloadFile> files = PlanDownloads(
+        katalog, modelle, ziel, options_.hf_base_url, &hinweise);
+    // Digests of files loaded earlier (state file of the last job).
+    const std::filesystem::path ziel_dir = NativePath(ziel);
+    {
+      std::string text;
+      if (ReadText(ziel_dir / kDownloadState, &text)) {
+        try {
+          const json::Value old = json::parse(text);
+          if (const json::Value* list = old.find("dateien");
+              list != nullptr && list->is_array()) {
+            for (const json::Value& d : list->items()) {
+              const std::string st = d.member_str("status");
+              if (st != "fertig" && st != "vorhanden")
+                continue;
+              for (DownloadFile& f : files) {
+                if (f.status != DownloadFile::Status::kVorhanden ||
+                    Lower(f.pfad) != Lower(d.member_str("pfad")) ||
+                    static_cast<long long>(d.member_double("bytes", -1.0)) !=
+                        f.bytes)
+                  continue;
+                if (d.member_str("sha256_status") == "ok" ||
+                    d.member_str("sha256_status") == "unbekannt") {
+                  f.sha256_status = d.member_str("sha256_status");
+                  f.sha256_quelle = d.member_str("sha256_quelle");
+                  f.sha256_ist = d.member_str("sha256_ist");
+                }
+              }
+            }
+          }
+        } catch (const std::exception&) {
+        }
+      }
+    }
+    // The old job (finished or cancelled) goes first, so its last
+    // on_change cannot overwrite the new plan's state file.
+    downloader_.reset();
+    {
+      const std::lock_guard<std::mutex> state_lock(download_state_mutex_);
+      download_ziel_ = ziel_dir;
+    }
+    DownloaderOptions o;
+    o.parallel = options_.download_parallel;
+    o.retry_wait_ms = options_.download_retry_wait_ms;
+    o.allow_http = options_.download_allow_http;
+    o.on_change = [this](const Downloader& job) { WriteDownloadState(job); };
+    downloader_ = std::make_unique<Downloader>(std::move(o), std::move(files));
+    if (aktion == "planen") {
+      json::Value out = downloader_->Status();
+      out["ziel"] = download_ziel_.string();
+      out["hinweise"] = ListOf(hinweise);
+      return JsonOk(out);
+    }
+    const long long open = downloader_->BytesOpen();
+    std::error_code ec;
+    std::filesystem::create_directories(ziel_dir, ec);
+    const auto space = std::filesystem::space(ziel_dir, ec);
+    const long long frei = ec ? -1 : static_cast<long long>(space.available);
+    if (frei >= 0 && open + options_.download_reserve_bytes > frei) {
+      json::Value out =
+          ErrorBody("disk_full",
+                    "zu wenig Platz auf " + ziel + ": " +
+                        std::to_string(open) + " Bytes zu laden + " +
+                        std::to_string(options_.download_reserve_bytes) +
+                        " Bytes Luft, frei " + std::to_string(frei));
+      out["fehlt_bytes"] = static_cast<double>(
+          open + options_.download_reserve_bytes - frei);
+      out["offen_bytes"] = static_cast<double>(open);
+      out["frei_bytes"] = static_cast<double>(frei);
+      out["ziel"] = ziel;
+      return Json(507, "Insufficient Storage", out);
+    }
+    const bool started = downloader_->Start(token);
+    Logger::Info("router", "event=setup_download_start ziel=" + ziel +
+                               " dateien=" +
+                               std::to_string(downloader_->Files().size()) +
+                               " offen_bytes=" + std::to_string(open) +
+                               " token=" + (token.empty() ? "no" : "yes"));
+    WriteDownloadState(*downloader_);
+    json::Value out = downloader_->Status();
+    out["ziel"] = download_ziel_.string();
+    out["hinweise"] = ListOf(hinweise);
+    return Json(started ? 202 : 200, started ? "Accepted" : "OK", out);
+  }
+  if (aktion == "pause" || aktion == "weiter" || aktion == "abbrechen") {
+    if (downloader_ == nullptr)
+      return Error(409, "Conflict", "no_download",
+                   "kein Download geplant (erst planen oder start)");
+    if (aktion == "pause")
+      downloader_->Pause();
+    else if (aktion == "weiter")
+      downloader_->Resume(token);
+    else
+      downloader_->Cancel();
+    Logger::Info("router", "event=setup_download_" + aktion);
+    WriteDownloadState(*downloader_);
+    return status(200, "OK");
+  }
+  return Error(400, "Bad Request", "invalid_request",
+               "aktion: planen | start | pause | weiter | abbrechen");
+}
+
 std::optional<HttpResponse> SetupService::Handle(const HttpRequest& req) {
   if (!req.path.starts_with("/router/setup/"))
     return std::nullopt;
@@ -1989,9 +2356,16 @@ std::optional<HttpResponse> SetupService::Handle(const HttpRequest& req) {
   if (rest == "admin")
     return post ? Admin(req)
                 : Error(405, "Method Not Allowed", "method_not_allowed", "POST");
-  if (rest == "downloads" || rest == "selbsttest")
+  if (rest == "downloads") {
+    if (get)
+      return Downloads();
+    if (post)
+      return DownloadsPost(req);
+    return Error(405, "Method Not Allowed", "method_not_allowed", "GET or POST");
+  }
+  if (rest == "selbsttest")
     return Error(501, "Not Implemented", "not_implemented",
-                 std::string(rest) + " comes with a later 2.1 commit");
+                 "selbsttest comes with a later 2.1 commit");
   return NotFound();
 }
 

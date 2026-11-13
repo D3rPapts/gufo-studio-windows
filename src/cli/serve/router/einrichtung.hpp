@@ -6,9 +6,10 @@
 // behind the gate (loopback or an admin session, else 404), the machine
 // check, the building-block catalogue, the preset written from the blocks
 // (a port of einrichtung/einrichten.py, which stays the reference and the
-// unattended tool) and the first admin account. The downloads (C3) and the
-// self-test (C5) come later. `gufo router --einrichtung` runs without a
-// preset: pages and this API only, nothing loads.
+// unattended tool), the first admin account and the downloads from Hugging
+// Face (download.hpp). The self-test (C5) comes later. `gufo router
+// --einrichtung` runs without a preset: pages and this API only, nothing
+// loads.
 
 #include <filesystem>
 #include <functional>
@@ -22,6 +23,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/auth.hpp"
+#include "src/cli/serve/router/download.hpp"
 #include "src/cli/serve/router/memory.hpp"
 #include "src/core/json.hpp"
 
@@ -97,6 +99,26 @@ struct Plan {
 /// (einrichten.py's fremde_bloecke): kept at the end of a rewritten one.
 [[nodiscard]] std::vector<std::string> ForeignBlocks(std::string_view old);
 
+/// The download address of one catalogue file:
+/// `<base>/<hf_repo>/resolve/<revision or main>/<path in the repo>`, the
+/// path percent-encoded per segment. `hf_pfad` is the file's own entry
+/// when the catalogue has one, else the catalogue path without the
+/// source's folder prefix (backslashes become slashes).
+[[nodiscard]] std::string DownloadUrl(std::string_view base,
+                                      std::string_view hf_repo,
+                                      std::string_view revision,
+                                      std::string_view hf_pfad);
+
+/// The files of the given models (catalogue order, each path once) with
+/// their source and the state on disk under `ziel`: `vorhanden` when the
+/// file is there with the catalogue size, `fehler`/no_source without a
+/// Hugging Face source, else `wartet`. Unknown model ids are skipped and
+/// named in *hinweise.
+[[nodiscard]] std::vector<DownloadFile> PlanDownloads(
+    const json::Value& katalog, const std::vector<std::string>& modelle,
+    std::string_view ziel, std::string_view hf_base_url,
+    std::vector<std::string>* hinweise);
+
 /// One result line of the machine check.
 struct CheckOptions {
   std::filesystem::path exe;  // gufo.exe of this router
@@ -123,13 +145,24 @@ struct ServiceOptions {
   /// Parses a preset file like the router at start (router::LoadPreset);
   /// "" = valid, else the message. Set by the router.
   std::function<std::string(const std::filesystem::path&)> check_preset;
+  /// Where the files come from; a test points this at a local server.
+  std::string hf_base_url{"https://huggingface.co"};
+  /// Download tuning (tests shorten the retry pauses and allow http).
+  std::vector<int> download_retry_wait_ms{5000, 10000, 20000, 40000, 60000};
+  bool download_allow_http{false};
+  int download_parallel{2};
+  /// Space the start keeps free on top of the open bytes (plan: 2 GB).
+  long long download_reserve_bytes{2LL << 30};
 };
 
-/// /router/setup/{katalog,pruefen,preset,admin}; the gate has already
-/// refused everyone who is neither loopback nor admin.
+/// /router/setup/{katalog,pruefen,preset,admin,downloads}; the gate has
+/// already refused everyone who is neither loopback nor admin.
 class SetupService {
 public:
   explicit SetupService(ServiceOptions options);
+  ~SetupService();
+  SetupService(const SetupService&) = delete;
+  SetupService& operator=(const SetupService&) = delete;
 
   [[nodiscard]] std::optional<server::HttpResponse> Handle(
       const server::HttpRequest& req);
@@ -147,6 +180,15 @@ private:
       const server::HttpRequest& req);
   [[nodiscard]] server::HttpResponse Preset(const server::HttpRequest& req);
   [[nodiscard]] server::HttpResponse Admin(const server::HttpRequest& req);
+  /// GET: the live state of the download job (empty when none).
+  [[nodiscard]] server::HttpResponse Downloads();
+  /// POST {aktion: planen|start|pause|weiter|abbrechen, modelle, ziel,
+  /// hf_token?}.
+  [[nodiscard]] server::HttpResponse DownloadsPost(
+      const server::HttpRequest& req);
+  /// `<ziel>\.einrichtung-downloads.json`: the status snapshot, so a
+  /// restarted router (and the next `planen`) finds the digests again.
+  void WriteDownloadState(const Downloader& job);
   /// Binds the gate's users file to <preset dir>\nutzer\nutzer.json once
   /// the paths are known (users_unbound only).
   void BindUsers(const std::filesystem::path& preset);
@@ -156,6 +198,11 @@ private:
   std::unique_ptr<MemoryProbe> probe_;
   /// The preset path step 3 implied (pfade.preset or <daten>\gufo-router.ini).
   std::filesystem::path preset_path_;
+  /// Download job: the state-file lock and target are declared before the
+  /// downloader so its last on_change still finds them.
+  std::mutex download_state_mutex_;
+  std::filesystem::path download_ziel_;
+  std::unique_ptr<Downloader> downloader_;
 };
 
 }  // namespace gufo::router::einrichtung
