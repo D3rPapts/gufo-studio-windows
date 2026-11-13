@@ -7,7 +7,8 @@
 // check, the building-block catalogue, the preset written from the blocks
 // (a port of einrichtung/einrichten.py, which stays the reference and the
 // unattended tool), the first admin account and the downloads from Hugging
-// Face (download.hpp). The self-test (C5) comes later. `gufo router
+// Face (download.hpp) and the self-test (selbsttest.hpp: one request per
+// block against a router started from the new preset). `gufo router
 // --einrichtung` runs without a preset: pages and this API only, nothing
 // loads.
 
@@ -25,6 +26,7 @@
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/download.hpp"
 #include "src/cli/serve/router/memory.hpp"
+#include "src/cli/serve/router/selbsttest.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::einrichtung {
@@ -153,10 +155,16 @@ struct ServiceOptions {
   int download_parallel{2};
   /// Space the start keeps free on top of the open bytes (plan: 2 GB).
   long long download_reserve_bytes{2LL << 30};
+  /// Self-test: a test points this at a fake router instead of starting
+  /// the preset's router as a child; the timeouts are shortened then.
+  std::string selbsttest_base_url;
+  int selbsttest_start_timeout_s{180};
+  int selbsttest_test_timeout_s{900};
+  int selbsttest_poll_ms{2000};
 };
 
-/// /router/setup/{katalog,pruefen,preset,admin,downloads}; the gate has
-/// already refused everyone who is neither loopback nor admin.
+/// /router/setup/{katalog,pruefen,preset,admin,downloads,selbsttest}; the
+/// gate has already refused everyone who is neither loopback nor admin.
 class SetupService {
 public:
   explicit SetupService(ServiceOptions options);
@@ -189,6 +197,12 @@ private:
   /// `<ziel>\.einrichtung-downloads.json`: the status snapshot, so a
   /// restarted router (and the next `planen`) finds the digests again.
   void WriteDownloadState(const Downloader& job);
+  /// GET: the state of the self-test (409 no_preset before any preset).
+  [[nodiscard]] server::HttpResponse Selbsttest();
+  /// POST {aktion: start|abbrechen, bausteine?, alle_modelle?, preset?,
+  /// tests?: [{baustein, modell, art?}]}.
+  [[nodiscard]] server::HttpResponse SelbsttestPost(
+      const server::HttpRequest& req);
   /// Binds the gate's users file to <preset dir>\nutzer\nutzer.json once
   /// the paths are known (users_unbound only).
   void BindUsers(const std::filesystem::path& preset);
@@ -203,6 +217,8 @@ private:
   std::mutex download_state_mutex_;
   std::filesystem::path download_ziel_;
   std::unique_ptr<Downloader> downloader_;
+  /// Self-test job (one at a time); stopped before the downloader.
+  std::unique_ptr<SelfTest> selbsttest_;
 };
 
 }  // namespace gufo::router::einrichtung

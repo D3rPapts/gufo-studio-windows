@@ -255,10 +255,11 @@ let schritt = 1;
 let fertig = new Set();        // abgeschlossene Schritte
 let dlTimer = null, testTimer = null, wegTimer = null;
 let presetOk = false;
+let presetDatei = ''; // Pfad aus Schritt 5 (preset_datei); der Selbsttest nennt ihn, damit ein neu gestarteter Router das Preset findet
 
 const speicher = {
-  laden() { try { const s = localStorage.getItem('gufo-einrichtung'); if (s) { const d = JSON.parse(s); antworten = Object.assign(antworten, d.antworten || {}); schritt = d.schritt || 1; fertig = new Set(d.fertig || []); } } catch (e) {} },
-  sichern() { try { localStorage.setItem('gufo-einrichtung', JSON.stringify({ antworten, schritt, fertig: [...fertig] })); } catch (e) {} }
+  laden() { try { const s = localStorage.getItem('gufo-einrichtung'); if (s) { const d = JSON.parse(s); antworten = Object.assign(antworten, d.antworten || {}); schritt = d.schritt || 1; fertig = new Set(d.fertig || []); presetDatei = d.presetDatei || ''; presetOk = fertig.has(5) && !!presetDatei; } } catch (e) {} },
+  sichern() { try { localStorage.setItem('gufo-einrichtung', JSON.stringify({ antworten, schritt, fertig: [...fertig], presetDatei })); } catch (e) {} }
 };
 
 // ---------------------------------------------------------------------------------------------- Router-Schicht
@@ -591,7 +592,7 @@ function s5Zeichnen() {
   $('autostart').checked = antworten.autostart !== false;
   $('partnerBlock').hidden = !antworten.bausteine.includes('zweiter-rechner');
   $('partnerUrl').value = antworten.partner.url || '';
-  $('presetSchreiben').disabled = true; presetOk = false;
+  $('presetSchreiben').disabled = true; presetOk = fertig.has(5) && !!presetDatei;
 }
 function s5Uebernehmen() {
   if (!$('port').value) return;
@@ -614,7 +615,7 @@ async function preset(schreiben) {
     const d = await api('/router/setup/preset', 'POST', { antworten, schreiben: !!schreiben });
     $('presetText').textContent = d.preset_text || '';
     $('berichtText').textContent = d.bericht || '';
-    if (schreiben) { presetOk = true; fertig.add(5); melden($('s5Meldung'), T('s5.geschrieben', 'Geschrieben: {d}', { d: (d.geschrieben || []).join(' · ') }), 'ok'); }
+    if (schreiben) { presetOk = true; presetDatei = d.preset_datei || presetDatei; fertig.add(5); speicher.sichern(); melden($('s5Meldung'), T('s5.geschrieben', 'Geschrieben: {d}', { d: (d.geschrieben || []).join(' · ') }), 'ok'); }
     else { melden($('s5Meldung'), (d.lizenzen_offen || []).length ? T('s5.lizenzen', 'Vorschau fertig; Lizenzen offen: {l}', { l: d.lizenzen_offen.join(', ') }) : T('s5.vorschau.ok', 'Vorschau fertig – prüfen, dann „Preset schreiben“.'), 'ok'); $('presetSchreiben').disabled = !!(d.lizenzen_offen || []).length; }
   } catch (e) {
     if (e.code === 'licenses_open') melden($('s5Meldung'), T('s5.lizenzen', 'Vorschau fertig; Lizenzen offen: {l}', { l: (e.daten.lizenzen_offen || []).join(', ') }), 'err');
@@ -667,7 +668,7 @@ $('testStart').onclick = async () => {
   melden($('s6Meldung'), T('laeuft', 'wird geprüft …'));
   $('testStart').disabled = true;
   try {
-    const d = await api('/router/setup/selbsttest', 'POST', { aktion: 'start', bausteine: antworten.bausteine });
+    const d = await api('/router/setup/selbsttest', 'POST', { aktion: 'start', bausteine: antworten.bausteine, preset: presetDatei || undefined });
     if (d.neustart) melden($('s6Meldung'), T('s6.neustart', 'Router startet neu mit dem Preset …'), 'warn'); else testsZeichnen(d);
     clearInterval(testTimer); testTimer = setInterval(s6Tick, 3000);
   } catch (e) { melden($('s6Meldung'), fehlerText(e), 'err'); }

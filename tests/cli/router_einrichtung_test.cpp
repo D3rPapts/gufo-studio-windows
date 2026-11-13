@@ -3,8 +3,10 @@
 // the catalogue, the preset built from the building blocks (against the
 // real einrichtung/ folder and, when python3 is known, against
 // einrichten.py --plan section by section like vergleich_preset.py), the
-// foreign-block keeper and the service's endpoints with a temp folder.
+// foreign-block keeper, the service's endpoints with a temp folder and the
+// self-test against a fake router.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -22,6 +24,7 @@
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/preset.hpp"
+#include "src/core/base64.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 
@@ -582,7 +585,8 @@ void TestService() {
   CHECK(r.has_value() && r->status == 200);
   CHECK(!Body(*r).find("laeuft")->as_bool());
   r = service.Handle(Req("GET", "/router/setup/selbsttest", "127.0.0.1"));
-  CHECK(r.has_value() && r->status == 501);
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_preset");
 
   // The admin needs the data folder first (users file unknown).
   r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
@@ -1396,6 +1400,533 @@ void TestRealDownload() {
   std::filesystem::remove_all(tmp, ec);
 }
 
+// ---------------------------------------------------------------------------
+// The self-test: planning, the preset's start line, the service against a
+// fake router (every endpoint the cases use), the report.
+
+struct FakeRouter {
+  std::mutex mutex;
+  std::vector<std::string> unloaded;
+  std::vector<std::string> paths;
+  int video_polls{0};
+  int objekt_polls{0};
+  int chat_delay_ms{0};
+  std::unique_ptr<gufo::server::HttpServer> server;
+  std::thread thread;
+  int port{0};
+
+  void Start() {
+    gufo::server::HttpServerOptions options;
+    options.dispatcher = [this](const HttpRequest& req) { return Serve(req); };
+    server = std::make_unique<gufo::server::HttpServer>(
+        "127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+        std::move(options));
+    std::string error;
+    CHECK(server->start(&error));
+    port = server->port();
+    thread = std::thread([this] { server->run(false); });
+  }
+  ~FakeRouter() {
+    if (server != nullptr)
+      server->stop();
+    if (thread.joinable())
+      thread.join();
+  }
+  std::string Base() const { return "http://127.0.0.1:" + std::to_string(port); }
+
+  static HttpResponse JsonOk(const json::Value& v, int status = 200) {
+    HttpResponse r;
+    r.status = status;
+    r.reason = status == 202 ? "Accepted" : "OK";
+    r.headers.emplace_back("Content-Type", "application/json");
+    r.body = v.dump();
+    return r;
+  }
+  static HttpResponse Wav() {
+    HttpResponse r;
+    r.headers.emplace_back("Content-Type", "audio/wav");
+    r.body = "RIFF" + std::string(60, 'x');
+    return r;
+  }
+  static HttpResponse Err(int status, const std::string& message) {
+    json::Value e = json::Value::object();
+    e["message"] = message;
+    e["code"] = status;
+    json::Value v = json::Value::object();
+    v["error"] = std::move(e);
+    HttpResponse r = JsonOk(v);
+    r.status = status;
+    r.reason = "Error";
+    return r;
+  }
+
+  HttpResponse Serve(const HttpRequest& req) {
+    json::Value body;
+    if (!req.body.empty()) {
+      try {
+        body = json::parse(req.body);
+      } catch (const std::exception&) {
+      }
+    }
+    const std::string model = body.member_str("model");
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      paths.push_back(req.method + " " + req.path +
+                      (req.query.empty() ? "" : "?" + req.query));
+    }
+    if (req.path == "/ready" || req.path == "/health") {
+      json::Value v = json::Value::object();
+      v["status"] = "ok";
+      return JsonOk(v);
+    }
+    if (req.path == "/v1/models") {
+      json::Value data = json::Value::array();
+      for (const char* id :
+           {"qwen3.8-27b", "qwen-image-2.1-turbo", "qwen3-tts",
+            "wan2.2-ti2v-5b", "ace-step-1.5-xl-turbo", "triposg",
+            "gufo-upscale", "m-fail"}) {
+        json::Value m = json::Value::object();
+        m["id"] = id;
+        data.push_back(std::move(m));
+      }
+      json::Value v = json::Value::object();
+      v["data"] = std::move(data);
+      return JsonOk(v);
+    }
+    if (req.path == "/models/unload") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      unloaded.push_back(model);
+      return JsonOk(json::Value::object());
+    }
+    if (req.path == "/v1/chat/completions") {
+      if (model == "m-fail")
+        return Err(507, "ResourceExhausted: GPU memory");
+      if (chat_delay_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(chat_delay_ms));
+      json::Value msg = json::Value::object();
+      msg["role"] = "assistant";
+      msg["content"] = "Die Sonne steigt langsam aus dem Meer.";
+      json::Value choice = json::Value::object();
+      choice["message"] = std::move(msg);
+      json::Value choices = json::Value::array();
+      choices.push_back(std::move(choice));
+      json::Value usage = json::Value::object();
+      usage["completion_tokens"] = 9;
+      json::Value v = json::Value::object();
+      v["choices"] = std::move(choices);
+      v["usage"] = std::move(usage);
+      return JsonOk(v);
+    }
+    if (req.path == "/v1/images/generations" ||
+        req.path == "/v1/images/upscale") {
+      if (body.member_str("size", "512x512") != "512x512" &&
+          req.path == "/v1/images/generations")
+        return Err(400, "size");
+      json::Value d = json::Value::object();
+      d["b64_json"] = gufo::core::EncodeBase64(einrichtung::TestImagePng());
+      json::Value data = json::Value::array();
+      data.push_back(std::move(d));
+      json::Value v = json::Value::object();
+      v["data"] = std::move(data);
+      v["width"] = 128;
+      v["height"] = 128;
+      return JsonOk(v);
+    }
+    if (req.path == "/v1/audio/voices") {
+      json::Value voices = json::Value::array();
+      voices.push_back(json::Value("erzaehler"));
+      json::Value v = json::Value::object();
+      v["voices"] = std::move(voices);
+      return JsonOk(v);
+    }
+    if (req.path == "/v1/audio/speech") {
+      if (body.member_str("voice") != "erzaehler")
+        return Err(400, "voice missing");
+      return Wav();
+    }
+    if (req.path == "/v1/audio/music")
+      return Wav();
+    if (req.path == "/v1/videos" || req.path == "/v1/3d/generations") {
+      json::Value v = json::Value::object();
+      v["id"] = req.path == "/v1/videos" ? "vid_1" : "obj_1";
+      v["status"] = "queued";
+      return JsonOk(v, 202);
+    }
+    if (req.path == "/v1/videos/vid_1" || req.path == "/v1/3d/generations/obj_1") {
+      int& polls = req.path == "/v1/videos/vid_1" ? video_polls : objekt_polls;
+      int n = 0;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        n = ++polls;
+      }
+      json::Value v = json::Value::object();
+      v["id"] = req.path == "/v1/videos/vid_1" ? "vid_1" : "obj_1";
+      v["status"] = n < 2 ? "running" : "completed";
+      return JsonOk(v);
+    }
+    if (req.path == "/v1/videos/vid_1/content") {
+      HttpResponse r;
+      r.headers.emplace_back("Content-Type", "video/mp4");
+      r.body = "MP4DATA";
+      return r;
+    }
+    if (req.path == "/v1/3d/generations/obj_1/content") {
+      HttpResponse r;
+      r.headers.emplace_back("Content-Type", "model/gltf-binary");
+      r.body = "GLBDATA";
+      return r;
+    }
+    return HttpResponse{.status = 404, .reason = "Not Found", .body = "{}"};
+  }
+};
+
+json::Value WaitSelfTest(einrichtung::SetupService& service,
+                         std::chrono::milliseconds limit =
+                             std::chrono::milliseconds(20000)) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  for (;;) {
+    const auto r =
+        service.Handle(Req("GET", "/router/setup/selbsttest", "127.0.0.1"));
+    const json::Value body = Body(*r);
+    if (!body.find("laeuft")->as_bool())
+      return body;
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::cerr << "WaitSelfTest: timeout\n";
+      ++failures;
+      return body;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
+const json::Value* FindTest(const json::Value& body, std::string_view modell) {
+  const json::Value* list = body.find("tests");
+  if (list == nullptr)
+    return nullptr;
+  for (const json::Value& t : list->items())
+    if (t.member_str("modell") == modell)
+      return &t;
+  return nullptr;
+}
+
+std::string TestStatus(const json::Value& body, std::string_view modell) {
+  const json::Value* t = FindTest(body, modell);
+  return t == nullptr ? std::string("(missing)") : t->member_str("status");
+}
+
+void TestSelfTestPlanning() {
+  // The request per model.
+  CHECK_EQ(einrichtung::TestKind("chat", "qwen3.8-27b"), std::string("chat"));
+  CHECK_EQ(einrichtung::TestKind("bilder", "lora-anime-consistency"),
+           std::string("keiner"));
+  CHECK_EQ(einrichtung::TestKind("stimme", "qwen3-asr-1.7b"),
+           std::string("keiner"));
+  CHECK_EQ(einrichtung::TestKind("stimme", "qwen3-tts-clone"),
+           std::string("keiner"));
+  CHECK_EQ(einrichtung::TestKind("stimme", "fish-drama-3"),
+           std::string("stimme"));
+  CHECK_EQ(einrichtung::TestKind("video", "wan2.1-uni3c"), std::string("keiner"));
+  CHECK_EQ(einrichtung::TestKind("video", "minimax-h3"), std::string("video"));
+  CHECK_EQ(einrichtung::TestKind("werkzeuge", "gufo-rife"),
+           std::string("keiner"));
+  CHECK_EQ(einrichtung::TestKind("werkzeuge", "gufo-upscale"),
+           std::string("upscale"));
+  CHECK_EQ(einrichtung::TestKind("zweiter-rechner", "x"),
+           std::string("partner"));
+
+  // One case per block from the real catalogue: the required model, the
+  // turbo one for pictures; unchosen models are left out; the partner only
+  // with an address.
+  const json::Value katalog = LoadJson(kDir / "katalog.json");
+  const std::vector<std::string> all = {"chat", "bilder", "stimme", "video",
+                                        "musik", "3d", "werkzeuge",
+                                        "zweiter-rechner"};
+  const std::vector<std::string> modelle = {
+      "qwen3.8-27b", "qwen3.8-flash-next-q3", "qwen-image-2.1",
+      "qwen-image-2.1-turbo", "qwen3-tts", "qwen3-tts-voicedesign",
+      "qwen3-tts-clone", "qwen3-asr-1.7b", "wan2.2-ti2v-5b",
+      "ace-step-1.5-xl-turbo", "triposg", "gufo-upscale", "gufo-rife"};
+  std::vector<einrichtung::SelfTestCase> plan =
+      einrichtung::PlanSelfTest(katalog, all, modelle, false, "");
+  CHECK_EQ(plan.size(), std::size_t(7));
+  if (plan.size() == 7) {
+    CHECK_EQ(plan[0].modell, std::string("qwen3.8-27b"));
+    CHECK_EQ(plan[1].modell, std::string("qwen-image-2.1-turbo"));
+    CHECK_EQ(plan[2].modell, std::string("qwen3-tts"));
+    CHECK_EQ(plan[3].modell, std::string("wan2.2-ti2v-5b"));
+    CHECK_EQ(plan[4].modell, std::string("ace-step-1.5-xl-turbo"));
+    CHECK_EQ(plan[5].modell, std::string("triposg"));
+    CHECK_EQ(plan[6].modell, std::string("gufo-upscale"));
+    CHECK_EQ(plan[6].art, std::string("upscale"));
+  }
+  plan = einrichtung::PlanSelfTest(katalog, all, modelle, true,
+                                   "http://192.168.100.56:8081");
+  // Every chosen model with a request: 27b, flash-next-q3, both pictures,
+  // qwen3-tts, wan, ace, triposg, upscale, partner.
+  CHECK_EQ(plan.size(), std::size_t(10));
+  if (plan.size() == 10) {
+    CHECK_EQ(plan[1].modell, std::string("qwen3.8-flash-next-q3"));
+    CHECK_EQ(plan.back().art, std::string("partner"));
+    CHECK_EQ(plan.back().modell, std::string("http://192.168.100.56:8081"));
+  }
+  plan = einrichtung::PlanSelfTest(katalog, {"chat", "nix"}, {"hemmingway-1.5"},
+                                   false, "");
+  CHECK_EQ(plan.size(), std::size_t(1));
+  if (!plan.empty())
+    CHECK_EQ(plan[0].modell, std::string("hemmingway-1.5"));
+
+  // The start line of a written preset.
+  const std::vector<std::string> args =
+      einrichtung::SplitArgs("a \"b c\" d \"\" e");
+  CHECK_EQ(args.size(), std::size_t(5));
+  if (args.size() == 5) {
+    CHECK_EQ(args[1], std::string("b c"));
+    CHECK_EQ(args[3], std::string(""));
+  }
+  einrichtung::StartLine start;
+  CHECK(!einrichtung::ParseStartLine("[router]\nauth = off\n", &start));
+  const std::string header =
+      "# baustein: router\n"
+      "# start: \"C:\\gufo\\2.1\\bin\\gufo.exe\" router --models-preset "
+      "\"C:\\gufo\\gufo-router.ini\" --models-max 0 --host 0.0.0.0 --port "
+      "8081 --pages-dir \"C:\\gufo\\2.1\\pages\"\n"
+      "# start-opt: --remote-allow 192.168.100.198\n"
+      "# env: GUFO_HOST_RESERVE_MIB=2048\n"
+      "# env: GUFO_QWEN27_LOOKUP=7\n"
+      "# a comment\n"
+      "[router]\n";
+  CHECK(einrichtung::ParseStartLine(header, &start));
+  CHECK_EQ(start.program, std::string("C:\\gufo\\2.1\\bin\\gufo.exe"));
+  // router --models-preset <ini> --models-max 0 --pages-dir <dir>
+  // --remote-allow <ip>: nine, --host/--port gone.
+  CHECK_EQ(start.args.size(), std::size_t(9));
+  if (start.args.size() == 9) {
+    CHECK_EQ(start.args[0], std::string("router"));
+    CHECK_EQ(start.args[2], std::string("C:\\gufo\\gufo-router.ini"));
+    CHECK_EQ(start.args[3], std::string("--models-max"));
+    CHECK_EQ(start.args[6], std::string("C:\\gufo\\2.1\\pages"));
+    CHECK_EQ(start.args[7], std::string("--remote-allow"));
+    CHECK_EQ(start.args[8], std::string("192.168.100.198"));
+  }
+  CHECK_EQ(start.env.size(), std::size_t(2));
+  if (start.env.size() == 2) {
+    CHECK_EQ(start.env[0].first, std::string("GUFO_HOST_RESERVE_MIB"));
+    CHECK_EQ(start.env[1].second, std::string("7"));
+  }
+
+  // The built-in picture is a PNG with alpha.
+  const std::string png = einrichtung::TestImagePng();
+  CHECK(png.starts_with("\x89PNG"));
+  CHECK(png.size() > 100);
+}
+
+void TestSelfTestService() {
+  const std::filesystem::path tmp = TempDir();
+  FakeRouter router;
+  router.Start();
+  Fixture f(auth::Mode::kOff);
+  einrichtung::ServiceOptions options;
+  options.dir = kDir;
+  options.exe = tmp / "bin" / "gufo.exe";
+  options.port = 8098;
+  options.users_unbound = true;
+  options.gate = f.gate.get();
+  options.selbsttest_base_url = router.Base();
+  options.selbsttest_start_timeout_s = 5;
+  options.selbsttest_test_timeout_s = 10;
+  options.selbsttest_poll_ms = 20;
+  einrichtung::SetupService service(options);
+
+  // Before a preset: 409 no_preset on GET and POST.
+  std::optional<HttpResponse> r =
+      service.Handle(Req("GET", "/router/setup/selbsttest", "127.0.0.1"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_preset");
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"start\",\"bausteine\":[\"chat\"]}"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_preset");
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"abbrechen\"}"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_selbsttest");
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"start\",\"preset\":\"relativ.ini\"}"));
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "invalid_path");
+
+  // A preset with einrichtung.json next to it (as step 5 writes them).
+  const std::filesystem::path daten = tmp / "daten";
+  const std::filesystem::path preset = daten / "gufo-router.ini";
+  WriteFile(preset, "# baustein: router\n[router]\nauth = off\n");
+  {
+    json::Value ein = json::Value::object();
+    json::Value antworten = json::Value::object();
+    json::Value bausteine = json::Value::array();
+    for (const char* b : {"chat", "bilder", "stimme", "video", "musik", "3d",
+                          "werkzeuge", "zweiter-rechner"})
+      bausteine.push_back(json::Value(b));
+    antworten["bausteine"] = std::move(bausteine);
+    json::Value pfade = json::Value::object();
+    pfade["daten"] = daten.string();
+    antworten["pfade"] = std::move(pfade);
+    json::Value partner = json::Value::object();
+    partner["url"] = router.Base();
+    antworten["partner"] = std::move(partner);
+    ein["antworten"] = std::move(antworten);
+    json::Value modelle = json::Value::array();
+    for (const char* m : {"qwen3.8-27b", "qwen-image-2.1",
+                          "qwen-image-2.1-turbo", "qwen3-tts",
+                          "qwen3-asr-1.7b", "wan2.2-ti2v-5b",
+                          "ace-step-1.5-xl-turbo", "triposg", "gufo-upscale"})
+      modelle.push_back(json::Value(m));
+    ein["modelle"] = std::move(modelle);
+    WriteFile(daten / "einrichtung.json", ein.tojson() + "\n");
+  }
+
+  // Start with the preset named (the page's way after a restart); the
+  // blocks come from einrichtung.json.
+  router.chat_delay_ms = 300;
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"start\",\"preset\":\"" +
+                             Esc(preset.string()) + "\"}"));
+  CHECK(r.has_value() && r->status == 202);
+  {
+    const json::Value body = Body(*r);
+    CHECK(body.find("laeuft")->as_bool());
+    CHECK_EQ(body.find("tests")->size(), std::size_t(8));
+    CHECK_EQ(TestStatus(body, "qwen3.8-27b"), std::string("wartet"));
+  }
+  // A second start while it runs: 409.
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"start\"}"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "selbsttest_running");
+  json::Value done = WaitSelfTest(service);
+  CHECK(done.find("fertig")->as_bool());
+  CHECK_EQ(done.member_double("ok"), 8.0);
+  CHECK_EQ(done.member_double("fehler"), 0.0);
+  for (const char* m : {"qwen3.8-27b", "qwen-image-2.1-turbo", "qwen3-tts",
+                        "wan2.2-ti2v-5b", "ace-step-1.5-xl-turbo", "triposg",
+                        "gufo-upscale"})
+    CHECK_EQ(TestStatus(done, m), std::string("ok"));
+  CHECK_EQ(TestStatus(done, router.Base()), std::string("ok"));
+  {
+    const json::Value* chat = FindTest(done, "qwen3.8-27b");
+    CHECK(chat != nullptr && chat->member_double("dauer_s") >= 0.3);
+    CHECK(chat != nullptr &&
+          chat->member_str("hinweis").find("Sonne") != std::string::npos);
+    CHECK(chat != nullptr &&
+          chat->member_str("datei") == "chat-qwen3.8-27b.txt");
+  }
+  const std::filesystem::path ordner = daten / "jobs" / "selbsttest";
+  CHECK_EQ(done.member_str("ordner"), ordner.string());
+  CHECK(std::filesystem::is_regular_file(ordner / "chat-qwen3.8-27b.txt"));
+  CHECK(std::filesystem::is_regular_file(ordner / "bilder-qwen-image-2.1-turbo.png"));
+  CHECK(std::filesystem::is_regular_file(ordner / "stimme-qwen3-tts.wav"));
+  CHECK(std::filesystem::is_regular_file(ordner / "video-wan2.2-ti2v-5b.mp4"));
+  CHECK(std::filesystem::is_regular_file(ordner / "musik-ace-step-1.5-xl-turbo.wav"));
+  CHECK(std::filesystem::is_regular_file(ordner / "3d-triposg.glb"));
+  CHECK(std::filesystem::is_regular_file(ordner / "werkzeuge-gufo-upscale.png"));
+  CHECK(std::filesystem::is_regular_file(ordner / "selbsttest.json"));
+  CHECK_EQ(ReadFile(ordner / "video-wan2.2-ti2v-5b.mp4"), std::string("MP4DATA"));
+  CHECK_EQ(ReadFile(ordner / "3d-triposg.glb"), std::string("GLBDATA"));
+  CHECK_EQ(ReadFile(ordner / "chat-qwen3.8-27b.txt"),
+           std::string("Die Sonne steigt langsam aus dem Meer."));
+  // Every model was unloaded after its case; the partner is no model.
+  {
+    const std::lock_guard<std::mutex> lock(router.mutex);
+    CHECK_EQ(router.unloaded.size(), std::size_t(7));
+    CHECK(std::find(router.paths.begin(), router.paths.end(),
+                    "GET /v1/audio/voices?model=qwen3-tts") !=
+          router.paths.end());
+    CHECK(std::find(router.paths.begin(), router.paths.end(),
+                    "GET /v1/videos/vid_1/content") != router.paths.end());
+  }
+  // The report in einrichtung.json.
+  {
+    const json::Value ein = LoadJson(daten / "einrichtung.json");
+    const json::Value* st = ein.find("selbsttest");
+    CHECK(st != nullptr && st->member_double("ok") == 8.0);
+    CHECK(st != nullptr && !st->member_str("zeit_ende").empty());
+    CHECK(ein.find("antworten") != nullptr);
+  }
+  // GET after the run keeps the result.
+  r = service.Handle(Req("GET", "/router/setup/selbsttest", "127.0.0.1"));
+  CHECK(r.has_value() && r->status == 200);
+  CHECK(!Body(*r).find("laeuft")->as_bool());
+
+  // Explicit cases: a memory failure is red with the filtered cause, a
+  // model the target does not know is skipped, a model without a request
+  // is skipped.
+  router.chat_delay_ms = 0;
+  r = service.Handle(Req(
+      "POST", "/router/setup/selbsttest", "127.0.0.1",
+      "{\"aktion\":\"start\",\"tests\":[{\"baustein\":\"chat\",\"modell\":"
+      "\"m-fail\"},{\"baustein\":\"chat\",\"modell\":\"m-unknown\"},"
+      "{\"baustein\":\"stimme\",\"modell\":\"qwen3-asr-1.7b\"},"
+      "{\"baustein\":\"chat\",\"modell\":\"qwen3.8-27b\"}]}"));
+  CHECK(r.has_value() && r->status == 202);
+  done = WaitSelfTest(service);
+  CHECK_EQ(TestStatus(done, "m-fail"), std::string("fehler"));
+  CHECK_EQ(TestStatus(done, "m-unknown"), std::string("uebersprungen"));
+  CHECK_EQ(TestStatus(done, "qwen3-asr-1.7b"), std::string("uebersprungen"));
+  CHECK_EQ(TestStatus(done, "qwen3.8-27b"), std::string("ok"));
+  {
+    const json::Value* fail = FindTest(done, "m-fail");
+    CHECK(fail != nullptr &&
+          fail->member_str("hinweis").starts_with("zu wenig Speicher"));
+    CHECK(fail != nullptr &&
+          fail->member_str("log").find("ResourceExhausted") !=
+              std::string::npos);
+  }
+  CHECK_EQ(done.member_double("ok"), 1.0);
+  CHECK_EQ(done.member_double("fehler"), 1.0);
+
+  // Cancel: the running case ends, the waiting ones are abgebrochen.
+  router.chat_delay_ms = 2000;
+  r = service.Handle(Req(
+      "POST", "/router/setup/selbsttest", "127.0.0.1",
+      "{\"aktion\":\"start\",\"tests\":[{\"baustein\":\"chat\",\"modell\":"
+      "\"qwen3.8-27b\"},{\"baustein\":\"chat\",\"modell\":\"qwen3.8-27b\"}]}"));
+  CHECK(r.has_value() && r->status == 202);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  r = service.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                         "{\"aktion\":\"abbrechen\"}"));
+  CHECK(r.has_value() && r->status == 200);
+  CHECK(Body(*r).find("abgebrochen")->as_bool());
+  done = WaitSelfTest(service);
+  CHECK(done.find("abgebrochen")->as_bool());
+  CHECK_EQ(done.member_double("ok"), 0.0);
+  {
+    const json::Value* list = done.find("tests");
+    CHECK(list != nullptr && list->size() == 2);
+    if (list != nullptr && list->size() == 2) {
+      CHECK_EQ(list->items()[0].member_str("status"), std::string("abgebrochen"));
+      CHECK_EQ(list->items()[1].member_str("status"), std::string("abgebrochen"));
+    }
+  }
+
+  // An unreachable target: every case red with the reason, nothing hangs.
+  {
+    einrichtung::ServiceOptions dead = options;
+    dead.selbsttest_base_url = "http://127.0.0.1:9";
+    dead.selbsttest_start_timeout_s = 1;
+    einrichtung::SetupService service2(dead);
+    r = service2.Handle(Req("POST", "/router/setup/selbsttest", "127.0.0.1",
+                            "{\"aktion\":\"start\",\"preset\":\"" +
+                                Esc(preset.string()) +
+                                "\",\"bausteine\":[\"chat\"]}"));
+    CHECK(r.has_value() && r->status == 202);
+    done = WaitSelfTest(service2);
+    CHECK_EQ(TestStatus(done, "qwen3.8-27b"), std::string("fehler"));
+    CHECK(done.member_str("hinweis").find("antwortet nicht") !=
+          std::string::npos);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(tmp, ec);
+}
+
 int main() {
   TestClassifyAndGate();
   TestHelpers();
@@ -1404,6 +1935,8 @@ int main() {
   TestService();
   TestDownloads();
   TestRealDownload();
+  TestSelfTestPlanning();
+  TestSelfTestService();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

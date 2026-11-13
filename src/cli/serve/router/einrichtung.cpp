@@ -1771,8 +1771,9 @@ SetupService::SetupService(ServiceOptions options)
     : options_(std::move(options)) {}
 
 SetupService::~SetupService() {
-  // Cancels and joins the download workers while the state-file lock and
-  // target are still alive.
+  // The self-test first (it stops its child router and joins), then the
+  // download workers while the state-file lock and target are still alive.
+  selbsttest_.reset();
   downloader_.reset();
 }
 
@@ -2334,6 +2335,149 @@ HttpResponse SetupService::DownloadsPost(const HttpRequest& req) {
                "aktion: planen | start | pause | weiter | abbrechen");
 }
 
+// ---------------------------------------------------------------------------
+// Self-test (selbsttest.hpp)
+
+HttpResponse SetupService::Selbsttest() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (selbsttest_ != nullptr)
+    return JsonOk(selbsttest_->Status());
+  if (preset_path_.empty())
+    return Error(409, "Conflict", "no_preset",
+                 "noch kein Preset geschrieben (Schritt 5); der Selbsttest "
+                 "braucht eins");
+  json::Value out = json::Value::object();
+  out["laeuft"] = false;
+  out["fertig"] = false;
+  out["preset"] = preset_path_.string();
+  out["tests"] = json::Value::array();
+  return JsonOk(out);
+}
+
+HttpResponse SetupService::SelbsttestPost(const HttpRequest& req) {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Error(400, "Bad Request", "invalid_request",
+                 std::string("bad JSON: ") + e.what());
+  }
+  const std::string aktion = body.member_str("aktion", "start");
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (aktion == "abbrechen") {
+    if (selbsttest_ == nullptr)
+      return Error(409, "Conflict", "no_selbsttest",
+                   "kein Selbsttest gestartet");
+    selbsttest_->Cancel();
+    Logger::Info("router", "event=selbsttest_cancel");
+    return JsonOk(selbsttest_->Status());
+  }
+  if (aktion != "start")
+    return Error(400, "Bad Request", "invalid_request",
+                 "aktion: start | abbrechen");
+  // The preset: named in the request (the page remembers step 5's file
+  // across a restart of this router) or the one step 5 wrote.
+  std::filesystem::path preset = preset_path_;
+  if (const std::string named = Member(body, "preset"); !named.empty()) {
+    if (!IsSafePath(named))
+      return Error(400, "Bad Request", "invalid_path",
+                   "preset: absoluter Pfad mit Laufwerk, ohne '..' und ohne "
+                   "UNC (" + named + ")");
+    preset = NativePath(named);
+  }
+  std::error_code ec;
+  if (preset.empty() || !std::filesystem::is_regular_file(preset, ec))
+    return Error(409, "Conflict", "no_preset",
+                 "noch kein Preset geschrieben (Schritt 5)" +
+                     (preset.empty() ? std::string()
+                                     : ": " + preset.string() + " fehlt"));
+  if (selbsttest_ != nullptr && selbsttest_->running())
+    return Error(409, "Conflict", "selbsttest_running",
+                 "ein Selbsttest laeuft schon (abbrechen oder abwarten)");
+  if (downloader_ != nullptr && downloader_->running())
+    return Error(409, "Conflict", "download_running",
+                 "erst den Download abwarten oder pausieren; der Selbsttest "
+                 "startet den Router mit dem neuen Preset");
+  // einrichtung.json next to the preset: the chosen models, the data
+  // folder and the partner. A hand-written preset has none; then the
+  // request names its cases in `tests`.
+  json::Value ein;
+  const json::Value* antworten = nullptr;
+  {
+    std::string text;
+    if (ReadText(preset.parent_path() / "einrichtung.json", &text)) {
+      try {
+        ein = json::parse(text);
+      } catch (const std::exception&) {
+        ein = json::Value();
+      }
+      if (ein.is_object())
+        antworten = ein.find("antworten");
+    }
+  }
+  std::vector<std::string> bausteine = StringList(body.find("bausteine"));
+  if (bausteine.empty() && antworten != nullptr)
+    bausteine = StringList(antworten->find("bausteine"));
+  const std::vector<std::string> modelle =
+      ein.is_object() ? StringList(ein.find("modelle"))
+                      : std::vector<std::string>{};
+  std::string daten;
+  std::string partner_url;
+  if (antworten != nullptr) {
+    if (const json::Value* pfade = antworten->find("pfade"))
+      daten = pfade->member_str("daten");
+    if (const json::Value* partner = antworten->find("partner"))
+      partner_url = partner->member_str("url");
+  }
+  const bool alle = Truthy(body.find("alle_modelle"));
+  std::vector<SelfTestCase> tests;
+  if (const json::Value* list = body.find("tests");
+      list != nullptr && list->is_array()) {
+    for (const json::Value& t : list->items()) {
+      SelfTestCase c;
+      c.baustein = t.member_str("baustein");
+      c.modell = t.member_str("modell");
+      if (c.baustein.empty() || c.modell.empty())
+        return Error(400, "Bad Request", "invalid_request",
+                     "tests[]: baustein und modell fehlen");
+      c.art = t.member_str("art", TestKind(c.baustein, c.modell));
+      tests.push_back(std::move(c));
+    }
+  } else {
+    json::Value katalog;
+    std::string error;
+    if (!LoadKatalog(&katalog, &error))
+      return Error(404, "Not Found", "katalog_missing", error);
+    tests = PlanSelfTest(katalog, bausteine, modelle, alle, partner_url);
+  }
+  if (tests.empty())
+    return Error(400, "Bad Request", "invalid_request",
+                 "keine Pruefpunkte: bausteine und modelle (einrichtung.json "
+                 "neben dem Preset) oder tests[] fehlen");
+  SelfTestOptions o;
+  o.preset = preset;
+  o.daten = daten.empty() ? preset.parent_path() : NativePath(daten);
+  o.exe = options_.exe;
+  o.base_url = options_.selbsttest_base_url;
+  o.partner_url = partner_url;
+  o.tests = std::move(tests);
+  o.start_timeout_s = options_.selbsttest_start_timeout_s;
+  o.test_timeout_s = options_.selbsttest_test_timeout_s;
+  o.poll_ms = options_.selbsttest_poll_ms;
+  const std::size_t count = o.tests.size();
+  selbsttest_ = std::make_unique<SelfTest>(std::move(o));
+  selbsttest_->Start();
+  preset_path_ = preset;
+  BindUsers(preset);
+  Logger::Info("router", "event=selbsttest_start preset=" + preset.string() +
+                             " tests=" + std::to_string(count) +
+                             (options_.selbsttest_base_url.empty()
+                                  ? std::string(" target=child")
+                                  : " target=" +
+                                        options_.selbsttest_base_url));
+  return Json(202, "Accepted", selbsttest_->Status());
+}
+
 std::optional<HttpResponse> SetupService::Handle(const HttpRequest& req) {
   if (!req.path.starts_with("/router/setup/"))
     return std::nullopt;
@@ -2363,9 +2507,13 @@ std::optional<HttpResponse> SetupService::Handle(const HttpRequest& req) {
       return DownloadsPost(req);
     return Error(405, "Method Not Allowed", "method_not_allowed", "GET or POST");
   }
-  if (rest == "selbsttest")
-    return Error(501, "Not Implemented", "not_implemented",
-                 "selbsttest comes with a later 2.1 commit");
+  if (rest == "selbsttest") {
+    if (get)
+      return Selbsttest();
+    if (post)
+      return SelbsttestPost(req);
+    return Error(405, "Method Not Allowed", "method_not_allowed", "GET or POST");
+  }
   return NotFound();
 }
 
