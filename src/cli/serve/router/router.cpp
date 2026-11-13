@@ -31,6 +31,7 @@
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
+#include "src/cli/serve/router/mcp.hpp"
 #include "src/cli/serve/router/names.hpp"
 #include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/preset.hpp"
@@ -966,6 +967,10 @@ public:
   /// in front of Dispatch. Always set; with auth = off it only answers the
   /// auth endpoints.
   std::unique_ptr<router::auth::Gate> gate;
+  /// MCP endpoint POST /mcp (2.1): tools over JSON-RPC for agents; behind
+  /// the gate like everything else. Always set ([router] mcp = off makes
+  /// it answer 404).
+  std::unique_ptr<router::mcp::McpService> mcp;
   /// metadata.nutzer of a local job (the gate's owner check); nullopt when
   /// the job API is off or the job is unknown here.
   std::optional<std::string> JobOwner(const std::string& job_id) {
@@ -1117,6 +1122,12 @@ public:
       return JsonOk(Capabilities());
     if (req.method == "GET" && req.path.starts_with("/router/partner/"))
       return router::PartnerRead(partner_spec, router_id, req);
+    // /mcp before every model route; its tools come back through the
+    // gate and this Dispatch as inner requests (no lock held here).
+    if (mcp != nullptr) {
+      if (auto answer = mcp->Handle(req))
+        return std::move(*answer);
+    }
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);
@@ -4416,6 +4427,30 @@ int RunRouter(std::span<const char* const> args) {
       std::cerr << "Error: --names-file: " << error.what() << '\n';
       return 2;
     }
+  }
+
+  {
+    // MCP endpoint (2.1). Every tool call is one inner request through
+    // the gate and Dispatch, under the caller's own token (never the
+    // internal key: the user's rights must hold).
+    router::mcp::Options mcp_options;
+    mcp_options.serve = [raw](const HttpRequest& inner) {
+      return raw->gate->Serve(inner, [raw](const HttpRequest& checked) {
+        return raw->Dispatch(checked);
+      });
+    };
+    mcp_options.gate = state->gate.get();
+    mcp_options.models = models;
+    mcp_options.self_name = state->self_name;
+    mcp_options.enabled = router_section.mcp != "off";
+    mcp_options.jobs_api = state->jobs != nullptr;
+    state->mcp =
+        std::make_unique<router::mcp::McpService>(std::move(mcp_options));
+    Logger::Info("router",
+                 "event=mcp enabled=" +
+                     std::string(router_section.mcp != "off" ? "yes" : "no") +
+                     " tools=" + std::to_string(state->mcp->tools().size()) +
+                     " jobs=" + (state->jobs != nullptr ? "yes" : "no"));
   }
 
   HttpServerOptions options;

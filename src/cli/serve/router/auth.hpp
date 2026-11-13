@@ -292,6 +292,8 @@ struct Route {
     kAdminControl, // model load/unload, placement: admin
     kJobs,         // /v1/jobs*: area ablage, own jobs only
     kWork,         // generation endpoints
+    kMcp,          // /mcp (2.1): bearer of any role, loopback, auth = off;
+                   // a cookie is 403 mcp_token_required, the partner 404
     kOther         // unknown path: authenticated, the router answers
   };
   Kind kind{Kind::kOther};

@@ -21,6 +21,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/figuren.cpp
   src/cli/serve/router/figuren_ccip.cpp
   src/cli/serve/router/jobs.cpp
+  src/cli/serve/router/mcp.cpp
   src/cli/serve/router/names.cpp
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
@@ -45,6 +46,11 @@ else()
 endif()
 target_compile_definitions(gufo_router PUBLIC
   GUFO_ROUTER_FORK_SERVE=$<BOOL:${GUFO_ROUTER_FORK_SERVE}>)
+# The MCP endpoint reports the build's version as serverInfo.version (the
+# macros are otherwise defined for the `gufo` executable only).
+set_source_files_properties(src/cli/serve/router/mcp.cpp PROPERTIES
+  COMPILE_DEFINITIONS
+  "GUFO_RELEASE_VERSION=\"${GUFO_RELEASE_VERSION}\";GUFO_REVISION=\"${GUFO_REVISION}\"")
 target_link_libraries(gufo_router PUBLIC gufo_http gufo_core)
 target_link_libraries(gufo PRIVATE gufo_router)
 
@@ -67,7 +73,7 @@ if (BUILD_TESTING)
       router_preset_test router_registry_test router_memory_test
       router_names_test router_figuren_test router_proxy_remote_test
       router_jobs_test router_pool_test router_figuren_ccip_endpoint_test
-      router_auth_test)
+      router_auth_test router_mcp_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})

@@ -357,10 +357,14 @@ bool ParseRouterSection(const Section& section, RouterSection* out,
         return fail("csrf-allow-origins needs a comma list of origins "
                     "(http://host:port)");
       out->csrf_allow_origins = value;
+    } else if (key == "mcp") {
+      if (value != "on" && value != "off")
+        return fail("mcp takes on|off, got '" + value + "'");
+      out->mcp = value;
     } else {
       return fail("unknown key '" + key +
                   "' (auth, auth-loopback, users-file, pool-secret-env, "
-                  "csrf-allow-origins)");
+                  "csrf-allow-origins, mcp)");
     }
   }
   out->present = true;

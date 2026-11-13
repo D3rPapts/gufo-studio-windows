@@ -1209,6 +1209,7 @@ pool-secret-env = GUFO_POOL_SECRET
 | `users-file` | `nutzer\nutzer.json` next to the preset | The users file; a relative path resolves against the preset's directory. `nutzer\filter-woerter.txt` and `nutzer\zugriff.log` live beside it. |
 | `csrf-allow-origins` | none | Comma list of origins (`http://host:port`) whose pages may make browser writes besides this router's own address: pages served from another port of this machine (8096, 8090) and reverse proxies that rewrite `Host`. Spelling is normalised (case, default port, trailing slash). |
 | `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
+| `mcp` | `on` | The MCP endpoint `POST /mcp` (2.1, see [MCP endpoint](#mcp-endpoint-post-mcp)); `off` answers it `404`. |
 
 Order per request: free paths (`/health`, `/ready`, `/login/` and its
 files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
@@ -1382,6 +1383,62 @@ de/en, dark mode) and `gemeinsam/anmeldung.js`, which every page loads
 after `sprache.js`: it reads `/router/me`, shows the name and "Abmelden",
 hides tiles and menu entries of closed areas and goes to `/login/` on
 `401`.
+
+### MCP endpoint (`POST /mcp`)
+
+From 2.1 the router is an MCP server (Model Context Protocol, Streamable
+HTTP transport) so Claude Code, the Regie and other agents use its
+abilities as tools under their own token. Protocol versions 2025-03-26,
+2025-06-18 and 2025-11-25 with the `initialize` handshake: `initialize`
+answers the client's version when it is one of these, else 2025-06-18,
+with `capabilities.tools` and `serverInfo.name = "gufo-router"` (the
+build's version); `notifications/initialized` and every other
+notification are `202`; `ping` answers `{}`. One JSON-RPC 2.0 message per
+`POST /mcp` (a batch is `400 -32600`), answered as `application/json`;
+`GET` and `DELETE` are `405` (no server-initiated stream, no sessions:
+`Mcp-Session-Id` is never issued and ignored when sent); a body that is
+no `application/json` is `415`, an `Accept` without JSON `406`. A missing
+`MCP-Protocol-Version` header counts as 2025-03-26, an unknown one is
+`400` with a JSON-RPC error that lists the supported versions. Malformed
+JSON is `400 -32700`, a frame without `jsonrpc: "2.0"` or `method` `400
+-32600`, an unknown method `200 -32601`, an unknown or invisible tool and
+bad arguments `200 -32602`, an exception `200 -32603`. The 2026-07-28 era
+(`server/discover`, per-request `_meta` version) is not spoken yet.
+
+Who: `Authorization: Bearer gufo_...` of any role (admin, nutzer,
+dienst), loopback as admin and `auth = off`; a cookie session is `403
+mcp_token_required` (a page must not drive the tools through a browser
+session), the partner router `404`. The gate runs first, so an unsigned
+call is `401` without a tool list, and `GET /mcp` is no page (no `302`).
+An `Origin` header must pass the CSRF rule for every identity, tokens
+included (`403 csrf_rejected`; MCP clients send none, browsers always
+do), at `auth = off` as well. `[router] mcp = off` turns the endpoint off
+(`404`).
+
+Tools (`tools/list`, German names with an English sentence in each
+description, JSON schemas for input and output): `modelle` (every
+signed-in user), `chat` (area text, synchronous `/v1/chat/completions`
+without a stream), `bild_erzeugen`, `bild_bearbeiten` (bild),
+`video_erzeugen` (video), `stimme` (stimme), `musik` (musik), `objekt_3d`
+(3d), `hochskalieren` (bild or video; each a `POST /v1/jobs` around the
+matching endpoint, answering `{auftrag_id, status, position?, url}`),
+`auftrag_status`, `auftrag_liste`, `auftrag_abbrechen` and `ablage_lesen`
+(ablage; `/v1/jobs/{id}[/files/{name}]`). A user sees only the tools of
+its areas; the job tools exist only with `--jobs-dir`. The `model`
+field of a tool carries the preset's default and names the preset's
+models of that modality in its description (no `enum`: a model the user
+may not use is the gate's `403 model_forbidden` at call time). Files
+travel as `/v1/jobs/{id}/files/{name}` links; `ablage_lesen` embeds an
+image or audio file as base64 only on request and up to 4 MiB.
+
+From 2.1 (Commit 2/3): every `tools/call` is one inner request through
+the same gate and dispatch as an HTTP client's, under the caller's
+token (area, model list, word filter, daily limit, own jobs,
+`X-Gufo-User`, access log); a refusal or a router error comes back as a
+tool result with `isError: true` and `structuredContent {http_status,
+code, message}`. Until the builders land, every known tool answers
+`isError: true` with "noch nicht umgesetzt". The access log carries
+`mcp:<tool>:<result>` beside the inner request's line.
 
 
 ## Endpoint Set
@@ -2313,7 +2370,9 @@ are from `src/cli/serve/router/{auth,router,jobs,remote}.cpp`:
   `POST /router/login`). Type `authentication_error`.
 - `403` signed in but not allowed: `forbidden` (area not enabled for
   the user), `model_forbidden` (model not in the user's list),
-  `csrf_rejected` (browser write from another origin or scheme);
+  `csrf_rejected` (browser write from another origin or scheme),
+  `mcp_token_required` (`POST /mcp` with a cookie session instead of a
+  bearer token);
   the password-change codes are listed under
   [Users and access](#users-and-access). Type `permission_error`.
 - `415` `json_required`: a write to the users API without

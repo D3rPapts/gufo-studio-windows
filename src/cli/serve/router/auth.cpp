@@ -1200,6 +1200,10 @@ Route Classify(const HttpRequest& req) {
                  entry.filtered && post);
     }
   }
+  // The MCP endpoint (2.1), any method: before the page rule, so GET /mcp
+  // is no page (302 to the login) and POST /mcp no open kOther.
+  if (p == "/mcp")
+    return set(Route::Kind::kMcp);
   if (get && !p.starts_with("/v1/") && !p.starts_with("/router/") &&
       !p.starts_with("/models"))
     return set(Route::Kind::kPage, PageArea(p));
@@ -2029,6 +2033,21 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                            "Authorization: Bearer gufo_...)",
                      SetupPending() ? "no_admin" : "not_authenticated");
   }
+  // /mcp (2.1): a token of any role, loopback as admin and the router's
+  // own calls; never a browser session (a page could otherwise drive the
+  // tools through a cookie) and nothing for the partner router, which has
+  // its own front. Area rights apply per tool inside the MCP code.
+  if (route.kind == Route::Kind::kMcp) {
+    if (who.source == Identity::Source::kPool)
+      return NotFound();
+    if (who.source == Identity::Source::kCookie)
+      return Forbidden("/mcp nur mit API-Token (Authorization: Bearer "
+                       "gufo_...) oder von der Maschine selbst, nicht mit "
+                       "einer Browser-Sitzung (MCP takes a bearer token, "
+                       "not a cookie session)",
+                       "mcp_token_required");
+    return std::nullopt;
+  }
   // The partner's relayed job requests run for the user the entry router
   // named: its rights were checked there, but which jobs are its own only
   // this router knows (the owner check below applies).
@@ -2065,6 +2084,7 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
       return std::nullopt;
     case Route::Kind::kAnyUser:
     case Route::Kind::kOther:
+    case Route::Kind::kMcp:  // answered above
       return std::nullopt;
     case Route::Kind::kJobs: {
       if (!pool_user && !who.rechte.AllowsArea("ablage"))
