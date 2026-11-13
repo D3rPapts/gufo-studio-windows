@@ -1086,7 +1086,7 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | --- | --- | --- |
 | `bereiche` | all | Subset of `text`, `bild`, `video`, `stimme`, `musik`, `3d`, `ablage`, `pool`, `status`. A request outside the user's areas is `403 forbidden` ("Bereich bild ist für diesen Nutzer nicht freigegeben"); a page of a closed area is a small 403 page. |
 | `modelle` | all | Allowed model ids; another model is `403 model_forbidden`. |
-| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart): `400 content_filtered`. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
+| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart), and since 2.0.5 on the user texts of a chat (`POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`: `prompt`, every `user` message of `messages` and every `user` item of `input`, as a string or `text` parts; system and assistant turns are not read): `400 content_filtered`, logged `abgelehnt:content_filtered`, before any stream starts; the daily limit counts chats as before. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
 | `tageslimit` | 0 (unlimited) | POST requests on generation endpoints per UTC day, videos count twice: `429 daily_limit`. Counted in memory (a restart resets it). |
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
@@ -1300,7 +1300,14 @@ API URL should offer both synthesis and transcription.
 | --- | --- | --- | --- |
 | CustomVoice | `qwen3-tts-12hz-1.7b-customvoice` | `talker_config.spk_id` names | `voice` |
 | VoiceDesign | `qwen3-tts-12hz-1.7b-voice-design` | `voice-design` | `instructions` |
-| Base | `qwen3-tts-12hz-1.7b-base` | `voice-clone` | `reference_audio`, plus `reference_text` unless `voice_clone_mode` is `speaker_embedding_only` |
+| Base | `qwen3-tts-12hz-1.7b-base` | `voice-clone` | `reference_audio`, plus `reference_text` unless `voice_clone_mode` is `speaker_embedding_only` (`400 missing_reference_text` otherwise: the provider declares reference audio *required*) |
+
+A provider that declares reference audio *optional* (VoxCPM2, Fish
+Drama-3, Ming TTS: it can clone from the clip alone) takes
+`reference_audio` without `reference_text` as `speaker_embedding_only`
+cloning since 2.0.5, no error; `voice_clone_mode: "icl"` without a
+transcript still answers `400 missing_reference_text`, and a transcript
+with the clip is ICL cloning as before.
 
 `GET /v1/audio/voices` lists the advertised voices. CustomVoice exposes the
 speaker names in `talker_config.spk_id`, while VoiceDesign and Base expose a
