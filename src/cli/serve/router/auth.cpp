@@ -2019,6 +2019,13 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
           }
           body = &parsed;
         }
+        // A webhook (2.0.5) is for admin and service accounts: the router
+        // would call any address of --jobs-webhook-allow for a user.
+        if (const json::Value* webhook = body->find("webhook_url");
+            webhook != nullptr && !webhook->is_null() && who.rolle != "dienst")
+          return Forbidden("Webhook nur für admin und dienst (webhook_url "
+                           "is admin/dienst only)",
+                           "webhook_not_allowed");
         const json::Value* request = body->find("request");
         if (request != nullptr && request->is_object()) {
           inner.path = request->member_str("path");
@@ -2052,6 +2059,17 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
       return std::nullopt;
     }
     case Route::Kind::kWork: {
+      if (req.method == "GET" && req.path == "/view" && hooks_.comfy_file_prompt) {
+        // A ComfyUI result file (2.0.5): the prompt that made it names
+        // the owner, like /history; a file of nobody's prompt is open.
+        if (const auto prompt = hooks_.comfy_file_prompt(
+                req.query_param("filename"), req.query_param("subfolder"),
+                req.query_param("type"))) {
+          const auto owner = OwnerOf("prompt:" + *prompt);
+          if (!owner.has_value() || *owner != who.name)
+            return NotFound();
+        }
+      }
       int counts = route.counts;
       std::optional<std::vector<WorkItem>> items;
       if (req.method == "POST" && req.path == "/prompt" && hooks_.comfy_plan &&
@@ -2238,6 +2256,15 @@ void Gate::After(const HttpRequest& req, const Route& route,
     return;
   }
   const bool restricted = !who.admin() && !(who.trusted() && !pool_user);
+  if (restricted && req.method == "GET" &&
+      route.kind == Route::Kind::kAnyUser && response->status == 200 &&
+      !response->streaming_body) {
+    if (req.path == "/v1/models" || req.path == "/models")
+      HideModelArgs(response);
+    else if (req.path == "/router/status")
+      HideOthersJobs(who, response);
+    return;
+  }
   if (restricted && req.method == "GET" && route.kind == Route::Kind::kWork &&
       (req.path == "/history" || req.path.starts_with("/history/")) &&
       response->status == 200 && !response->streaming_body) {
@@ -2291,6 +2318,96 @@ void Gate::After(const HttpRequest& req, const Route& route,
     const json::Value* metadata = job.find("metadata");
     if (metadata == nullptr || metadata->member_str("nutzer") != who.name)
       *response = NotFound();
+  } catch (const std::exception&) {
+  }
+}
+
+void Gate::HideModelArgs(HttpResponse* response) {
+  try {
+    const json::Value body = json::parse(response->body);
+    const json::Value* data = body.find("data");
+    if (data == nullptr || !data->is_array())
+      return;
+    json::Value out = json::Value::object();
+    for (const auto& [key, value] : body.members()) {
+      if (key != "data")
+        out.append_member(key, value);
+    }
+    json::Value kept = json::Value::array();
+    for (const json::Value& model : data->items()) {
+      if (!model.is_object()) {
+        kept.push_back(model);
+        continue;
+      }
+      json::Value copy = json::Value::object();
+      for (const auto& [key, value] : model.members()) {
+        if (key == "status" && value.is_object()) {
+          json::Value state = json::Value::object();
+          for (const auto& [k, v] : value.members())
+            if (k != "args" && k != "command")
+              state.append_member(k, v);
+          copy.append_member(key, std::move(state));
+        } else {
+          copy.append_member(key, value);
+        }
+      }
+      kept.push_back(std::move(copy));
+    }
+    out["data"] = std::move(kept);
+    response->body = out.dump();
+  } catch (const std::exception&) {
+  }
+}
+
+void Gate::HideOthersJobs(const Identity& who, HttpResponse* response) {
+  const auto mine = [this, &who](const std::string& id) {
+    if (hooks_.job_owner) {
+      if (const auto owner = hooks_.job_owner(id);
+          owner.has_value() && *owner == who.name)
+        return true;
+    }
+    const auto video = OwnerOf("video:" + id);
+    return video.has_value() && *video == who.name;
+  };
+  try {
+    const json::Value body = json::parse(response->body);
+    if (!body.is_object())
+      return;
+    json::Value out = json::Value::object();
+    for (const auto& [key, value] : body.members()) {
+      if (key == "pool_queue" && value.is_object()) {
+        json::Value queue = json::Value::object();
+        for (const auto& [k, v] : value.members()) {
+          if ((k == "pulling" || k == "pushed_active") && v.is_array()) {
+            json::Value ids = json::Value::array();
+            for (const json::Value& id : v.items())
+              if (id.is_string() && mine(id.str()))
+                ids.push_back(id);
+            queue.append_member(k, std::move(ids));
+          } else {
+            queue.append_member(k, v);
+          }
+        }
+        out.append_member(key, std::move(queue));
+      } else if (key == "remote" && value.is_object()) {
+        json::Value remote = json::Value::object();
+        for (const auto& [k, v] : value.members()) {
+          if (k == "jobs" && v.is_object()) {
+            json::Value jobs = json::Value::object();
+            for (const auto& [id, job] : v.members())
+              if (mine(id))
+                jobs.append_member(id, job);
+            remote.append_member(k, std::move(jobs));
+          } else {
+            remote.append_member(k, v);
+          }
+        }
+        out.append_member(key, std::move(remote));
+      } else {
+        out.append_member(key, value);
+      }
+    }
+    response->body = out.dump();
   } catch (const std::exception&) {
   }
 }

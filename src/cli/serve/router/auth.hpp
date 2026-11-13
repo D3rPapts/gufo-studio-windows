@@ -368,6 +368,13 @@ public:
     std::function<std::optional<std::vector<WorkItem>>(
         const server::HttpRequest&, const json::Value& body)>
         comfy_plan;
+    /// The ComfyUI prompt whose finished outputs list a file (`/view`'s
+    /// filename, subfolder, type); nullopt for a file no history entry
+    /// names (an upload, a file of a deleted entry): those stay open.
+    std::function<std::optional<std::string>(const std::string& filename,
+                                             const std::string& subfolder,
+                                             const std::string& type)>
+        comfy_file_prompt;
   };
 
   Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks);
@@ -406,6 +413,12 @@ public:
   /// owner.
   void After(const server::HttpRequest& req, const Route& route,
              const Identity& who, server::HttpResponse* response);
+  /// `/v1/models` for a user (2.0.5): the worker command lines (paths on
+  /// this machine) are left out of every `status`.
+  static void HideModelArgs(server::HttpResponse* response);
+  /// `/router/status` for a user (2.0.5): the shared queue's id lists and
+  /// the remote jobs keep only the user's own jobs.
+  void HideOthersJobs(const Identity& who, server::HttpResponse* response);
 
   /// Login/logout/me/users endpoints; nullopt when `req` is none of them.
   [[nodiscard]] std::optional<server::HttpResponse> AuthEndpoint(

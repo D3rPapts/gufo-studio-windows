@@ -162,6 +162,17 @@ struct Fixture {
         return std::nullopt;
       }
     };
+    hooks.comfy_file_prompt =
+        [](const std::string& filename, const std::string& subfolder,
+           const std::string& type) -> std::optional<std::string> {
+      if (!subfolder.empty() || (!type.empty() && type != "output"))
+        return std::nullopt;
+      if (filename == "tim_00001_.png")
+        return std::string("p-tim");
+      if (filename == "anna_00001_.png")
+        return std::string("p-anna");
+      return std::nullopt;
+    };
     hooks.job_owner = [](const std::string& id) -> std::optional<std::string> {
       if (id == "j-tim")
         return std::string("tim");
@@ -2123,6 +2134,191 @@ void TestPresetSection() {
   std::filesystem::remove_all(dir, ec);
 }
 
+void TestModelArgsHidden() {
+  // 2.0.5: the worker command lines (paths on this machine) are for the
+  // admin and the machine itself; a user or service account sees the
+  // state without them. Other fields stay as they came.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  f.next = [](const HttpRequest&) {
+    json::Value model = json::Value::object();
+    model["id"] = "qwen3.8-27b";
+    model["modality"] = "llm";
+    model["loaded"] = true;
+    json::Value args = json::Value::array();
+    args.push_back("--model");
+    args.push_back("D:\\modelle\\x.gguf");
+    json::Value status = json::Value::object();
+    status["value"] = "loaded";
+    status["args"] = std::move(args);
+    status["failed"] = false;
+    model["status"] = std::move(status);
+    json::Value data = json::Value::array();
+    data.push_back(std::move(model));
+    json::Value body = json::Value::object();
+    body["object"] = "list";
+    body["data"] = std::move(data);
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  const auto status_of = [](const HttpResponse& r) {
+    return *json::parse(r.body).find("data")->items().front().find("status");
+  };
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  CHECK(r.body.find("x.gguf") == std::string::npos);
+  CHECK(status_of(r).find("args") == nullptr);
+  CHECK_EQ(status_of(r).member_str("value"), std::string("loaded"));
+  CHECK(json::parse(r.body).find("data")->items().front().find("loaded")->as_bool());
+  CHECK_EQ(json::parse(r.body).member_str("object"), std::string("list"));
+  r = f.Serve(Req("GET", "/models", "192.168.178.50", "",
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 200);
+  CHECK(status_of(r).find("args") == nullptr);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  CHECK(status_of(r).find("args") != nullptr);
+  r = f.Serve(Req("GET", "/v1/models", "127.0.0.1"));
+  CHECK(status_of(r).find("args") != nullptr);
+}
+
+void TestStatusJobsHidden() {
+  // 2.0.5: /router/status names job ids of the shared queue and the
+  // remote jobs; a user sees its own, an admin all, the rest of the
+  // status stays.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.next = [](const HttpRequest&) {
+    json::Value ids = json::Value::array();
+    ids.push_back("j-tim");
+    ids.push_back("j-anna");
+    ids.push_back("j-unbekannt");
+    json::Value queue = json::Value::object();
+    queue["local"] = 3;
+    queue["pulling"] = ids;
+    queue["pushed_active"] = ids;
+    queue["enabled"] = true;
+    json::Value jobs = json::Value::object();
+    jobs["j-tim"] = json::Value::object();
+    jobs["j-anna"] = json::Value::object();
+    json::Value remote = json::Value::object();
+    remote["router_id"] = "r1";
+    remote["jobs"] = std::move(jobs);
+    json::Value body = json::Value::object();
+    body["models_max"] = 2;
+    body["pool_queue"] = std::move(queue);
+    body["remote"] = std::move(remote);
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/router/status", "192.168.178.50", "",
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  json::Value body = json::parse(r.body);
+  const json::Value* queue = body.find("pool_queue");
+  CHECK(queue != nullptr);
+  CHECK_EQ(queue->find("pulling")->items().size(), std::size_t(1));
+  CHECK_EQ(queue->find("pulling")->items().front().str(), std::string("j-tim"));
+  CHECK_EQ(queue->find("pushed_active")->items().size(), std::size_t(1));
+  CHECK_EQ(queue->member_size("local"), std::size_t(3));
+  CHECK(queue->find("enabled")->as_bool());
+  const json::Value* remote = body.find("remote");
+  CHECK(remote != nullptr);
+  CHECK_EQ(remote->find("jobs")->members().size(), std::size_t(1));
+  CHECK(remote->find("jobs")->find("j-tim") != nullptr);
+  CHECK_EQ(remote->member_str("router_id"), std::string("r1"));
+  CHECK_EQ(body.member_size("models_max"), std::size_t(2));
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/router/status", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  body = json::parse(r.body);
+  CHECK_EQ(body.find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(3));
+  CHECK_EQ(body.find("remote")->find("jobs")->members().size(),
+           std::size_t(2));
+  r = f.Serve(Req("GET", "/router/status", "127.0.0.1"));
+  CHECK_EQ(json::parse(r.body).find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(3));
+}
+
+void TestWebhookRoles() {
+  // 2.0.5: a webhook_url in a job is for admin and dienst; a nutzer gets
+  // 403 webhook_not_allowed, its job without a webhook goes through.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  const std::string with_hook =
+      "{\"request\":{\"path\":\"/v1/images/generations\",\"body\":"
+      "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}},"
+      "\"webhook_url\":\"http://192.168.178.56:8096/fertig\"}";
+  const std::string without =
+      "{\"request\":{\"path\":\"/v1/images/generations\",\"body\":"
+      "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}}}";
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("webhook_not_allowed"));
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50",
+                  "{\"request\":{\"path\":\"/v1/images/generations\"},"
+                  "\"webhook_url\":null}",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);  // null = none
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", without,
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 200);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                  {{"Cookie", admin}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/v1/jobs", "127.0.0.1", with_hook));
+  CHECK_EQ(r.status, 200);
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(20))
+    logged = logged || line.find("abgelehnt:webhook_not_allowed") !=
+                           std::string::npos;
+  CHECK(logged);
+}
+
+void TestViewOwner() {
+  // 2.0.5: a ComfyUI result file answers 404 to another user; the owner
+  // and an admin read it; a file no prompt names stays open.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  CHECK(f.gate->RememberOwner("prompt:p-tim", "tim"));
+  CHECK(f.gate->RememberOwner("prompt:p-anna", "anna"));
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/view?filename=tim_00001_.png",
+                               "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png&type=output",
+                  "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("GET", "/view?filename=hochgeladen.png&type=input",
+                  "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png", "192.168.178.50",
+                  "", {{"Cookie", admin}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png", "127.0.0.1"));
+  CHECK_EQ(r.status, 200);
+}
+
 }  // namespace
 
 int main() {
@@ -2141,6 +2337,10 @@ int main() {
   TestLoopbackBearer();
   TestModes();
   TestPresetSection();
+  TestModelArgsHidden();
+  TestStatusJobsHidden();
+  TestWebhookRoles();
+  TestViewOwner();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

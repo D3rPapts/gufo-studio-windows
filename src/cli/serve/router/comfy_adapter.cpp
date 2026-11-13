@@ -756,6 +756,41 @@ double Adapter::ProbeSourceFps(const FileRef& ref) const {
   return fps;
 }
 
+std::optional<std::string> Adapter::PromptOfFile(const std::string& filename,
+                                                 const std::string& subfolder,
+                                                 const std::string& type) {
+  if (filename.empty())
+    return std::nullopt;
+  const std::string want_type = type.empty() ? std::string("output") : type;
+  // History entries report the subfolder with the platform's separator;
+  // a client may ask with either.
+  const std::string want_sub = ReportedSubfolder(subfolder);
+  const std::lock_guard<std::mutex> lock(mutex_);
+  for (auto it = history_order_.rbegin(); it != history_order_.rend(); ++it) {
+    const auto entry = history_.find(*it);
+    if (entry == history_.end())
+      continue;
+    const json::Value* outputs = entry->second.find("outputs");
+    if (outputs == nullptr || !outputs->is_object())
+      continue;
+    for (const auto& [node, lists] : outputs->members()) {
+      if (!lists.is_object())
+        continue;
+      for (const auto& [kind, files] : lists.members()) {
+        if (!files.is_array())
+          continue;
+        for (const json::Value& file : files.items()) {
+          if (file.is_object() && file.member_str("filename") == filename &&
+              ReportedSubfolder(file.member_str("subfolder")) == want_sub &&
+              file.member_str("type", "output") == want_type)
+            return *it;
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 HttpResponse Adapter::View(const HttpRequest& request) {
   const std::string filename = request.query_param("filename");
   std::string type = request.query_param("type");

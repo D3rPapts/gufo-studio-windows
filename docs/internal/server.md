@@ -538,7 +538,11 @@ returns 404 `model_not_found` listing the preset ids. The front answers
 `GET /health` and `GET /ready` (with the `/healthz`, `/readyz` and
 `/v1/...` aliases) once preset validation passed and the listener is up,
 independent of workers. `GET /v1/models` lists every preset model in
-OpenAI list shape with the extension field `"loaded": true|false`.
+OpenAI list shape with the extension field `"loaded": true|false`. Its
+`"modality"` (also in `/router/capabilities`) is the section's; an
+`[external/<id>]` section reports the modality its leading `args = serve
+<modality>` names (`llm`, `image`, `tts`, ...) and `external` only when
+the command line does not say (2.0.5).
 `GET /v1/slots` and `GET /v1/metrics` require `?model=<id>`: they proxy to
 that worker when loaded and return 409 `model_not_loaded` otherwise.
 Unknown paths return 404 `not_found`, and video routes keep `serve`'s verb
@@ -1095,7 +1099,12 @@ voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
 `GET /v1/models`, `/router/status`, `/router/capabilities`, `GET
 /router/placement` and `/v1/names` are open to every signed-in user (the
 pages need them); `pool` and `status` gate the pages of those names
-(`/pool/`, `/speicher/`, `/status/`, ...).
+(`/pool/`, `/speicher/`, `/status/`, ...). Two of them say less to a
+`nutzer` or `dienst` than to an admin or the machine itself (2.0.5):
+`GET /v1/models` leaves the worker command lines out (`status.args`,
+paths on this machine), and `GET /router/status` keeps in
+`pool_queue.pulling`, `pool_queue.pushed_active` and `remote.jobs` only
+the caller's own jobs (counts and everything else stay).
 
 Jobs belong to a user: the job API stamps `metadata.nutzer` from
 `X-Gufo-User` (set by the gate on every request it lets through; a
@@ -1111,7 +1120,12 @@ file), stores a job it takes under that user, and applies the own-jobs
 rule to the relayed user's job requests itself (a relayed `nutzer` sees,
 cancels or deletes only its own jobs there too; a relayed `admin` sees
 all). The entry router's own jobs runner runs each job as its owner (the
-job header).
+job header). A `webhook_url` in a job is for admin, `dienst` and the
+machine itself: a `nutzer` gets `403 webhook_not_allowed` (2.0.5; the
+router would otherwise call any address of `--jobs-webhook-allow` for
+it). A router started with `--jobs-webhook-allow` but without
+`--jobs-webhook-secret` logs `event=jobs_webhook_unsigned` at start:
+receivers cannot verify such calls.
 
 Endpoints (JSON):
 
@@ -1184,9 +1198,13 @@ while): `GET /history` shows a
 user its own prompts, `POST /history` deletes only its own,
 `/v1/videos/<id>[/content]` and the job files a `POST /v1/videos/concat`
 names answer `404` for another user's; an id the gate never saw (before
-a restart, or created by the router itself) is open. `/view` is not
-checked (ComfyUI file names carry no owner). Idempotency keys are per
-owner. The users file (`{"version": 1,
+a restart, or created by the router itself) is open. `GET /view` (2.0.5)
+asks the ComfyUI adapter which finished prompt lists the file in its
+outputs (`history.json`, by filename, subfolder and type) and answers
+`404` unless that prompt's owner is the caller; a file no history entry
+names (an upload, a file of a deleted entry) stays open, and a prompt
+whose owner the gate never saw (before a restart) is closed to users
+like its history entry. Idempotency keys are per owner. The users file (`{"version": 1,
 "nutzer": [...]}`) holds per user the name, role, PBKDF2-SHA256 hash
 (600 000 rounds, 16-byte salt), rights, token hashes with name and
 expiry, remembered session hashes, timestamps and `gesperrt`; it is

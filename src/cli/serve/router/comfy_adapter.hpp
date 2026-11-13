@@ -89,6 +89,13 @@ public:
   /// a non-empty queue keeps pool LLM requests off this machine).
   [[nodiscard]] int QueueRemaining() const { return queue_remaining_.load(); }
 
+  /// The finished prompt whose outputs list this file, as `/view` names it
+  /// (type "" = output); nullopt when no history entry does (an upload, a
+  /// deleted entry). The access gate asks before it serves `/view` (2.0.5).
+  [[nodiscard]] std::optional<std::string> PromptOfFile(
+      const std::string& filename, const std::string& subfolder,
+      const std::string& type);
+
   struct Job;
 
 private:
