@@ -224,17 +224,10 @@ std::string RequestAddress(const HttpRequest& req) {
 /// The headers that carry an identity the gate (or the partner) sets:
 /// never from a client.
 bool IsIdentityHeader(std::string_view name) {
-  const auto equals = [name](std::string_view known) {
-    if (name.size() != known.size())
-      return false;
-    for (std::size_t i = 0; i < name.size(); ++i)
-      if (std::tolower(static_cast<unsigned char>(name[i])) !=
-          std::tolower(static_cast<unsigned char>(known[i])))
-        return false;
-    return true;
-  };
-  return equals(kUserHeader) || equals(kRightsHeader) ||
-         equals(kInternalHeader) || equals(kPoolKeyHeader);
+  return EqualsIgnoreCase(name, kUserHeader) ||
+         EqualsIgnoreCase(name, kRightsHeader) ||
+         EqualsIgnoreCase(name, kInternalHeader) ||
+         EqualsIgnoreCase(name, kPoolKeyHeader);
 }
 
 void DropIdentityHeaders(HttpRequest* req) {
@@ -344,6 +337,10 @@ bool IsValidName(std::string_view name) {
       return false;
   }
   return true;
+}
+
+bool IsReservedName(std::string_view name) {
+  return name == "lokal" || name == "partner";
 }
 
 bool IsLoopback(std::string_view address) {
@@ -611,7 +608,7 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
         continue;
       User user;
       user.name = Lower(item.member_str("name"));
-      if (!IsValidName(user.name)) {
+      if (!IsValidName(user.name) || IsReservedName(user.name)) {
         *error = "users file: bad user name '" + user.name + "'";
         return false;
       }
@@ -797,6 +794,10 @@ bool UserStore::Put(User user, std::string* error) {
   user.name = Lower(user.name);
   if (!IsValidName(user.name)) {
     *error = "bad user name (1-32 of a-z 0-9 . _ -)";
+    return false;
+  }
+  if (IsReservedName(user.name)) {
+    *error = "the name is reserved (lokal, partner)";
     return false;
   }
   if (!IsRole(user.rolle)) {
@@ -1112,10 +1113,6 @@ Route Classify(const HttpRequest& req) {
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||
       p.starts_with("/v1/names/") || p == "/v1/systemone")
     return set(Route::Kind::kAnyUser);
-  // Introspection without a model names nothing to load: any user.
-  if ((p == "/props" || p == "/v1/slots" || p == "/slots") &&
-      req.query_param("model").empty())
-    return set(Route::Kind::kAnyUser);
   // Generation endpoints by prefix.
   struct Prefix {
     const char* prefix;
@@ -1335,6 +1332,15 @@ std::string WordFilter::HitText(std::string_view text) {
   return {};
 }
 
+std::string WordFilter::HitJson(const json::Value& body) {
+  std::vector<std::string> texts;
+  CollectStrings(body, /*all=*/true, 0, &texts);
+  for (const std::string& text : texts)
+    if (const std::string word = HitText(text); !word.empty())
+      return word;
+  return {};
+}
+
 std::string WordFilter::Hit(const HttpRequest& req, bool comfy) {
   for (const std::string& text : PromptTexts(req, comfy)) {
     if (const std::string word = HitText(text); !word.empty())
@@ -1514,11 +1520,14 @@ Identity Gate::Identify(const HttpRequest& req) {
       who.source = Identity::Source::kInternal;
       who.rolle = "admin";
       who.name = "lokal";
+      who.placeholder = true;
       const std::string job = req.header("X-Gufo-Job");
       if (!job.empty() && hooks_.job_owner) {
         if (const auto owner = hooks_.job_owner(job);
-            owner.has_value() && !owner->empty())
+            owner.has_value() && !owner->empty()) {
           who.name = *owner;
+          who.placeholder = false;  // the job's owner is a real user
+        }
       }
       return who;
     }
@@ -1537,6 +1546,7 @@ Identity Gate::Identify(const HttpRequest& req) {
         // secret opens no users API and no model control).
         who.name = "partner";
         who.rolle = "partner";
+        who.placeholder = true;
         return who;
       }
       // A relayed request for one of the partner's users: its rights as
@@ -1578,6 +1588,7 @@ Identity Gate::Identify(const HttpRequest& req) {
     who.source = Identity::Source::kLoopback;
     who.name = "lokal";
     who.rolle = "admin";
+    who.placeholder = true;
     return who;
   }
   if (settings_.mode == Mode::kOff) {
@@ -1585,6 +1596,7 @@ Identity Gate::Identify(const HttpRequest& req) {
     who.source = Identity::Source::kOff;
     who.name = "lokal";
     who.rolle = "admin";
+    who.placeholder = true;
     return who;
   }
   return Identity{};
@@ -1604,58 +1616,114 @@ bool Gate::CountDaily(const Identity& who, int weight, long long limit) {
   return true;
 }
 
+namespace {
+/// Takes or confirms `key` for `name` (state mutex held).
+bool TakeOwnerLocked(std::map<std::string, Gate::OwnerEntry>* owners,
+                     std::string_view key, std::string_view name,
+                     long long now, bool reserved) {
+  if (const auto it = owners->find(std::string(key)); it != owners->end()) {
+    if (it->second.at >= now - 86400 && it->second.name != name)
+      return false;  // the first owner keeps it
+    it->second = {std::string(name), now, reserved};
+    return true;
+  }
+  if (owners->size() >= 20000) {
+    for (auto it = owners->begin(); it != owners->end();)
+      it = it->second.at < now - 86400 ? owners->erase(it) : std::next(it);
+    if (owners->size() >= 20000)
+      owners->clear();  // a day's worth of ids is gone: unknown = open
+  }
+  (*owners)[std::string(key)] = {std::string(name), now, reserved};
+  return true;
+}
+}  // namespace
+
 bool Gate::RememberOwner(std::string_view key, std::string_view name) {
-  if (key.empty() || name.empty() || name == "lokal")
-    return true;  // the router itself owns nothing
+  if (key.empty() || name.empty())
+    return true;
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
-  if (const auto it = owners_.find(std::string(key));
-      it != owners_.end() && it->second.second >= now - 86400) {
-    // The first owner keeps it (a client may choose its prompt id).
-    return it->second.first == name;
-  }
-  if (owners_.size() >= 20000) {
-    for (auto it = owners_.begin(); it != owners_.end();)
-      it = it->second.second < now - 86400 ? owners_.erase(it) : std::next(it);
-    if (owners_.size() >= 20000)
-      owners_.clear();  // a day's worth of ids is gone: unknown = open
-  }
-  owners_[std::string(key)] = {std::string(name), now};
-  return true;
+  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/false);
+}
+
+bool Gate::ReserveOwner(std::string_view key, std::string_view name) {
+  if (key.empty() || name.empty())
+    return true;
+  const long long now = Now();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = owners_.find(std::string(key));
+  if (it != owners_.end() && it->second.at >= now - 86400)
+    return it->second.name == name;  // held: only by this user
+  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true);
+}
+
+void Gate::ReleaseOwner(std::string_view key, std::string_view name) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = owners_.find(std::string(key));
+  if (it != owners_.end() && it->second.reserved && it->second.name == name)
+    owners_.erase(it);
 }
 
 std::optional<std::string> Gate::OwnerOf(std::string_view key) {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = owners_.find(std::string(key));
-  if (it == owners_.end() || it->second.second < Now() - 86400 ||
-      it->second.first == "lokal")
+  if (it == owners_.end() || it->second.at < Now() - 86400)
     return std::nullopt;
-  return it->second.first;
+  return it->second.name;
 }
 
-std::optional<HttpResponse> Gate::CsrfRefusal(const HttpRequest& req,
-                                              const Identity& who) {
-  if (req.method == "GET" || req.method == "HEAD" ||
-      (who.source != Identity::Source::kCookie &&
-       who.source != Identity::Source::kLoopback))
-    return std::nullopt;
+namespace {
+/// "host" of "scheme://host[:port]/..." or "host[:port]": lower case, no
+/// port, no IPv6 brackets.
+std::string HostOnly(std::string_view text) {
+  std::string host = Lower(text);
+  if (const auto scheme = host.find("://"); scheme != std::string::npos)
+    host.erase(0, scheme + 3);
+  if (const auto slash = host.find('/'); slash != std::string::npos)
+    host.resize(slash);
+  if (host.starts_with('[')) {
+    if (const auto close = host.find(']'); close != std::string::npos)
+      return host.substr(1, close - 1);
+    return host;
+  }
+  if (const auto colon = host.rfind(':'); colon != std::string::npos &&
+                                          host.find(':') == colon)
+    host.resize(colon);
+  return host;
+}
+}  // namespace
+
+std::optional<HttpResponse> Gate::CsrfCheck(const HttpRequest& req) const {
   if (Lower(req.header("Sec-Fetch-Site")) == "cross-site")
     return AuthError(403, "Forbidden",
                      "cross-site request refused (Sec-Fetch-Site)",
                      "csrf_rejected");
-  const std::string origin = Lower(req.header("Origin"));
+  std::string origin = Lower(req.header("Origin"));
   if (origin.empty() || origin == "null")
     return std::nullopt;
-  std::string origin_host = origin;
-  if (const auto scheme = origin_host.find("://"); scheme != std::string::npos)
-    origin_host.erase(0, scheme + 3);
-  const std::string host = Lower(req.header("Host"));
-  if (host.empty() || origin_host != host)
+  while (!origin.empty() && origin.back() == '/')
+    origin.pop_back();
+  if (Contains(settings_.csrf_allow_origins, origin))
+    return std::nullopt;
+  // Same machine on another port (the pages on 8096, the transcript
+  // server) is the same site: the browser sends the cookie there too.
+  const std::string host = HostOnly(req.header("Host"));
+  if (host.empty() || HostOnly(origin) != host)
     return AuthError(403, "Forbidden",
                      "cross-site request refused (Origin " + origin +
-                         " is not this router)",
+                         " is not this router; csrf-allow-origins lists "
+                         "proxies)",
                      "csrf_rejected");
   return std::nullopt;
+}
+
+std::optional<HttpResponse> Gate::CsrfRefusal(const HttpRequest& req,
+                                              const Identity& who) const {
+  if (req.method == "GET" || req.method == "HEAD" ||
+      (who.source != Identity::Source::kCookie &&
+       who.source != Identity::Source::kLoopback))
+    return std::nullopt;
+  return CsrfCheck(req);
 }
 
 long long Gate::DailyCount(std::string_view name) {
@@ -1740,6 +1808,23 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
   if (route.kind == Route::Kind::kLogin || route.kind == Route::Kind::kLogout ||
       route.kind == Route::Kind::kMe)
     return std::nullopt;
+  if (who.authenticated() && req.method == "POST" && req.path == "/prompt" &&
+      body != nullptr) {
+    // A client may choose its prompt id: never one that belongs to
+    // another user's history entry, whoever asks (an admin too); taken
+    // now, atomically, so two submits of one id cannot both pass.
+    if (const json::Value* id = body->find("prompt_id");
+        id != nullptr && id->is_string() && !id->str().empty()) {
+      const std::string key = "prompt:" + id->str();
+      const bool mine = who.placeholder
+                            ? !OwnerOf(key).has_value() ||
+                                  *OwnerOf(key) == who.name
+                            : ReserveOwner(key, who.name);
+      if (!mine)
+        return AuthError(409, "Conflict", "prompt_id belongs to another user",
+                         "prompt_id_taken");
+    }
+  }
   if (!who.authenticated()) {
     if (!BearerOf(req).empty())
       return AuthError(401, "Unauthorized", "unknown or expired API token",
@@ -1850,40 +1935,25 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
     case Route::Kind::kWork: {
       int counts = route.counts;
       std::optional<std::vector<WorkItem>> items;
-      if (req.method == "POST" && req.path == "/prompt" && hooks_.comfy_plan) {
-        // A ComfyUI graph: every task it resolves to is checked like a
-        // direct request (area, model, filter), the daily limit counts
-        // them all (videos twice). A graph that does not build gets the
-        // plain checks below (area bild, every string through the
-        // filter) and the adapter's error; nothing is counted for it.
-        items = hooks_.comfy_plan(req);
+      if (req.method == "POST" && req.path == "/prompt" && hooks_.comfy_plan &&
+          body != nullptr) {
+        // A ComfyUI graph (parsed once by Serve): every task it resolves
+        // to is checked like a direct request (area, model), the daily
+        // limit counts them all (videos twice). A graph that does not
+        // build gets the plain checks below (area bild, every string
+        // through the filter) and the adapter's error; nothing is counted
+        // for it.
+        items = hooks_.comfy_plan(req, *body);
         if (!items.has_value())
           counts = 0;
       }
-      if (req.method == "POST" && req.path == "/prompt") {
-        // A client may choose its prompt id: never one that belongs to
-        // another user's history entry.
-        if (const auto id = TopLevelMemberText(req.body, "prompt_id");
-            id.has_value()) {
-          try {
-            const json::Value value = json::parse(*id);
-            if (value.is_string()) {
-              if (const auto owner = OwnerOf("prompt:" + value.str());
-                  owner.has_value() && *owner != who.name)
-                return AuthError(409, "Conflict",
-                                 "prompt_id belongs to another user",
-                                 "prompt_id_taken");
-            }
-          } catch (const std::exception&) {
-          }
-        }
-      }
       if (items.has_value()) {
         counts = 0;
-        // Every string of the graph as the floor, then the texts the plan
-        // names (prompts, speech, lyrics ...) task by task.
+        // Every string of the graph through the filter: the texts the plan
+        // names (prompts, speech, lyrics ...) are among them, so one pass
+        // over the parsed body covers each task.
         if (who.rechte.FilterOn(who.rolle)) {
-          if (const std::string word = filter_.Hit(req, true); !word.empty()) {
+          if (const std::string word = filter_.HitJson(*body); !word.empty()) {
             Log(req, who, "abgelehnt:content_filtered");
             return AuthError(400, "Bad Request",
                              "Der Prompt enthält ein gesperrtes Wort (the "
@@ -1900,18 +1970,6 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                                  "(model " +
                                  item.model + " is not enabled for this user)",
                              "model_forbidden");
-          if (who.rechte.FilterOn(who.rolle)) {
-            for (const std::string& text : item.texts) {
-              if (const std::string word = filter_.HitText(text);
-                  !word.empty()) {
-                Log(req, who, "abgelehnt:content_filtered", item.model);
-                return AuthError(400, "Bad Request",
-                                 "Der Prompt enthält ein gesperrtes Wort "
-                                 "(the prompt contains a blocked word)",
-                                 "content_filtered");
-              }
-            }
-          }
           counts += item.counts;
         }
         if (counts > 0 && who.rechte.tageslimit > 0 &&
@@ -2009,7 +2067,7 @@ void Gate::Rewrite(HttpRequest* req, const Identity& who) {
     // The job API keeps the pin on the job (pin_local), the pool decision
     // keeps a direct request here.
     std::erase_if(req->headers, [](const auto& header) {
-      return Lower(header.first) == "x-gufo-pool";
+      return EqualsIgnoreCase(header.first, "X-Gufo-Pool");
     });
     req->headers.emplace_back("X-Gufo-Pool", "local");
   }
@@ -2018,11 +2076,30 @@ void Gate::Rewrite(HttpRequest* req, const Identity& who) {
 }
 
 void Gate::After(const HttpRequest& req, const Route& route,
-                 const Identity& who, HttpResponse* response) {
+                 const Identity& who, HttpResponse* response,
+                 const json::Value* body) {
   const bool pool_user = who.relayed_user();
-  // Owners of ComfyUI prompts and direct video jobs come from the answer.
-  if (req.method == "POST" && response->status < 300 && !who.name.empty() &&
-      who.name != "lokal" && route.kind == Route::Kind::kWork) {
+  // A prompt id reserved in Refuse: confirmed by the answer that carries
+  // it, released when the adapter refused or used another id.
+  if (req.method == "POST" && req.path == "/prompt" && body != nullptr &&
+      !who.placeholder) {
+    if (const json::Value* id = body->find("prompt_id");
+        id != nullptr && id->is_string() && !id->str().empty()) {
+      std::string answered;
+      if (response->status < 300 && !response->streaming_body) {
+        try {
+          answered = json::parse(response->body).member_str("prompt_id");
+        } catch (const std::exception&) {
+        }
+      }
+      if (answered != id->str())
+        ReleaseOwner("prompt:" + id->str(), who.name);
+    }
+  }
+  // Owners of ComfyUI prompts and direct video jobs come from the answer
+  // (never for a placeholder: the router itself, loopback, the partner).
+  if (req.method == "POST" && response->status < 300 && !who.placeholder &&
+      route.kind == Route::Kind::kWork) {
     if (req.path == "/prompt" && !response->streaming_body) {
       try {
         const std::string id = json::parse(response->body).member_str("prompt_id");
@@ -2267,6 +2344,11 @@ HttpResponse Gate::UsersApi(const HttpRequest& req, const Identity& who) {
         return AuthError(400, "Bad Request",
                          "bad user name (1-32 of a-z 0-9 . _ -)",
                          "invalid_name");
+      if (IsReservedName(user.name))
+        return AuthError(400, "Bad Request",
+                         "the name is reserved (lokal = the router itself, "
+                         "partner = the partner router)",
+                         "name_reserved");
       if (!IsRole(user.rolle))
         return AuthError(400, "Bad Request", "rolle takes admin|nutzer|dienst",
                          "invalid_role");
@@ -2461,6 +2543,17 @@ HttpResponse Gate::Serve(
     // Stage 0: only the auth endpoints exist. A client's identity headers
     // still go (they would name a job's owner here and reach a partner
     // with auth = lan beside the real pool key); nothing else is touched.
+    // Even at stage 0 a web page in a browser on this machine must not
+    // reach the admin paths through loopback.
+    if (req.method != "GET" && req.method != "HEAD" &&
+        (route.kind == Route::Kind::kUsers ||
+         route.kind == Route::Kind::kAdminControl) &&
+        IsLoopback(RequestAddress(req))) {
+      if (auto refusal = CsrfCheck(req)) {
+        Log(req, who, "abgelehnt:csrf_rejected");
+        return std::move(*refusal);
+      }
+    }
     if (auto answer = AuthEndpoint(req, route, who))
       return std::move(*answer);
     if (who.source == Identity::Source::kPool ||
@@ -2480,13 +2573,16 @@ HttpResponse Gate::Serve(
   // API parses its own copy; nothing is re-serialised).
   json::Value submit;
   const json::Value* submit_body = nullptr;
-  if (req.method == "POST" && req.path == "/v1/jobs" && !who.admin() &&
-      !who.trusted()) {
+  if (req.method == "POST" &&
+      ((req.path == "/v1/jobs" && !who.admin() && !who.trusted()) ||
+       req.path == "/prompt")) {
+    // A ComfyUI prompt is parsed for everyone (the prompt id check); the
+    // plan, the filter and the owner bookkeeping reuse the one parse.
     try {
       submit = json::parse(req.body);
       submit_body = &submit;
     } catch (const std::exception&) {
-      // The job API answers the parse error.
+      // The job API / the adapter answers the parse error.
     }
   }
   if (auto refusal = Refuse(req, route, who, submit_body)) {
@@ -2508,7 +2604,7 @@ HttpResponse Gate::Serve(
   HttpRequest copy = req;
   Rewrite(&copy, who);
   HttpResponse response = next(copy);
-  After(req, route, who, &response);
+  After(req, route, who, &response, submit_body);
   if (req.method != "GET" && req.method != "HEAD" &&
       (route.kind == Route::Kind::kWork || route.kind == Route::Kind::kJobs ||
        route.kind == Route::Kind::kAdminControl)) {

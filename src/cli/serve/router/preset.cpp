@@ -352,9 +352,15 @@ bool ParseRouterSection(const Section& section, RouterSection* out,
       if (value.empty())
         return fail("pool-secret-env needs an environment variable name");
       out->pool_secret_env = value;
+    } else if (key == "csrf-allow-origins") {
+      if (value.empty())
+        return fail("csrf-allow-origins needs a comma list of origins "
+                    "(http://host:port)");
+      out->csrf_allow_origins = value;
     } else {
       return fail("unknown key '" + key +
-                  "' (auth, auth-loopback, users-file, pool-secret-env)");
+                  "' (auth, auth-loopback, users-file, pool-secret-env, "
+                  "csrf-allow-origins)");
     }
   }
   out->present = true;

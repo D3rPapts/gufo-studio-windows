@@ -139,10 +139,9 @@ struct Fixture {
       return req.query_param("model");
     };
     // A fake graph plan: the body's "tasks" [{area, model, counts, texts}].
-    hooks.comfy_plan = [](const HttpRequest& req)
+    hooks.comfy_plan = [](const HttpRequest&, const json::Value& body)
         -> std::optional<std::vector<auth::WorkItem>> {
       try {
-        const json::Value body = json::parse(req.body);
         const json::Value* tasks = body.find("tasks");
         if (tasks == nullptr || !tasks->is_array())
           return std::nullopt;
@@ -646,7 +645,8 @@ void TestAreasAndJobs() {
   r = f.Serve(Req("GET", "/v1/slots?model=qwen3.8-27b", "192.168.178.50", "",
                   {{"Cookie", tim}}));
   CHECK_EQ(r.status, 403);
-  // Without a model they load nothing: status reads for any user.
+  // With or without a model: work of the text area (the router answers
+  // 400 missing_model itself when none is named).
   {
     auth::Rights bild_only;
     bild_only.bereiche = {"bild"};
@@ -654,6 +654,8 @@ void TestAreasAndJobs() {
     const std::string maler = f.LoginCookie("maler", "maler-pw");
     for (const char* path : {"/props", "/v1/slots", "/slots"}) {
       r = f.Serve(Req("GET", path, "192.168.178.50", "", {{"Cookie", maler}}));
+      CHECK_EQ(r.status, 403);
+      r = f.Serve(Req("GET", path, "192.168.178.50", "", {{"Cookie", tim}}));
       CHECK_EQ(r.status, 200);
     }
     r = f.Serve(Req("GET", "/props?model=qwen3.5-4b", "192.168.178.50", "",
@@ -1150,7 +1152,7 @@ void TestFilterAndLimit() {
     CHECK(c.gate->OwnerOf("prompt:p-tim") == std::optional<std::string>("tim"));
     CHECK(c.gate->RememberOwner("prompt:p-anna", "anna"));
     // The first owner keeps an id: neither a later answer nor a client's
-    // chosen prompt_id takes it over.
+    // chosen prompt_id takes it over, whoever asks (an admin too).
     CHECK(!c.gate->RememberOwner("prompt:p-anna", "tim"));
     CHECK(c.gate->OwnerOf("prompt:p-anna") == std::optional<std::string>("anna"));
     r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
@@ -1158,14 +1160,68 @@ void TestFilterAndLimit() {
                     {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 409);
     CHECK_EQ(ErrorCode(r), std::string("prompt_id_taken"));
+    c.AddUser("chef", "admin", "chef-pw");
+    const std::string chef = c.LoginCookie("chef", "chef-pw");
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    "{\"prompt_id\":\"p-anna\",\"prompt\":{},\"tasks\":[]}",
+                    {{"Cookie", chef}}));
+    CHECK_EQ(r.status, 409);
+    r = c.Serve(Req("POST", "/prompt", "127.0.0.1",
+                    "{\"prompt_id\":\"p-anna\",\"prompt\":{},\"tasks\":[]}"));
+    CHECK_EQ(r.status, 409);  // loopback as admin too
     r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
                     "{\"prompt_id\":\"p-tim\",\"prompt\":{},\"tasks\":[]}",
                     {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 200);
     CHECK(c.gate->OwnerOf("prompt:p-anna") == std::optional<std::string>("anna"));
-    // The router's own placeholder owns nothing: such a video stays open.
-    CHECK(c.gate->RememberOwner("video:video_lokal", "lokal"));
-    CHECK(!c.gate->OwnerOf("video:video_lokal").has_value());
+    // A new id is taken for the submitter before the adapter runs: two
+    // submits of one id let exactly one through; the reservation of the
+    // refused one is not there, the winner's is confirmed by the answer.
+    {
+      const HttpRequest first_req = Req("POST", "/prompt", "192.168.178.50",
+                                        "{\"prompt_id\":\"p-neu\",\"prompt\":{},\"tasks\":[]}",
+                                        {{"Cookie", cookie}});
+      const HttpRequest second_req = Req("POST", "/prompt", "192.168.178.50",
+                                         "{\"prompt_id\":\"p-neu\",\"prompt\":{},\"tasks\":[]}",
+                                         {{"Cookie", anna}});
+      const json::Value first_body = json::parse(first_req.body);
+      const json::Value second_body = json::parse(second_req.body);
+      const auto route = auth::Classify(first_req);
+      const auto tim_id = c.gate->Identify(first_req);
+      const auto anna_id = c.gate->Identify(second_req);
+      CHECK(!c.gate->Refuse(first_req, route, tim_id, &first_body).has_value());
+      const auto refused = c.gate->Refuse(second_req, route, anna_id, &second_body);
+      CHECK(refused.has_value() && refused->status == 409);
+      CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
+      // The adapter answered with another id: the reservation goes back.
+      HttpResponse answer{.status = 200, .reason = "OK",
+                          .body = "{\"prompt_id\":\"p-anders\"}"};
+      c.gate->After(first_req, route, tim_id, &answer, &first_body);
+      CHECK(!c.gate->OwnerOf("prompt:p-neu").has_value());
+      CHECK(c.gate->OwnerOf("prompt:p-anders") == std::optional<std::string>("tim"));
+      // A refusal gives it back as well.
+      CHECK(!c.gate->Refuse(second_req, route, anna_id, &second_body).has_value());
+      HttpResponse failed{.status = 400, .reason = "Bad Request", .body = "{}"};
+      c.gate->After(second_req, route, anna_id, &failed, &second_body);
+      CHECK(!c.gate->OwnerOf("prompt:p-neu").has_value());
+      // The same id confirmed by the answer stays with its user.
+      CHECK(!c.gate->Refuse(first_req, route, tim_id, &first_body).has_value());
+      HttpResponse kept{.status = 200, .reason = "OK",
+                        .body = "{\"prompt_id\":\"p-neu\"}"};
+      c.gate->After(first_req, route, tim_id, &kept, &first_body);
+      CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
+    }
+    // Placeholders (the router itself, loopback) own nothing, by source:
+    // their answers are not remembered.
+    {
+      const HttpRequest own = Req("POST", "/v1/videos", "127.0.0.1",
+                                  "{\"model\":\"h3\",\"prompt\":\"See\"}");
+      const auto lokal = c.gate->Identify(own);
+      CHECK(lokal.placeholder);
+      HttpResponse made{.status = 200, .reason = "OK", .body = "{\"id\":\"video_lokal\"}"};
+      c.gate->After(own, auth::Classify(own), lokal, &made);
+      CHECK(!c.gate->OwnerOf("video:video_lokal").has_value());
+    }
     r = c.Serve(Req("GET", "/history", "192.168.178.50", "", {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 200);
     {
@@ -1344,6 +1400,19 @@ void TestUsersApi() {
   r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
                   "{\"name\":\"tim\",\"rolle\":\"chef\",\"passwort\":\"abcd\"}"));
   CHECK_EQ(r.status, 400);
+  for (const char* reserved : {"lokal", "partner", "Lokal"}) {
+    r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
+                    std::string("{\"name\":\"") + reserved +
+                        "\",\"passwort\":\"abcd\"}"));
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(ErrorCode(r), std::string("name_reserved"));
+  }
+  {
+    auth::User reserved;
+    reserved.name = "partner";
+    std::string error;
+    CHECK(!f.store->Put(reserved, &error));
+  }
   r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
                   "{\"name\":\"tim\",\"passwort\":\"tim-pw\",\"rechte\":{\"bereiche\":"
                   "[\"text\",\"bild\"],\"tageslimit\":5}}"));
@@ -1429,6 +1498,39 @@ void TestUsersApi() {
   r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
                   {{"Cookie", admin}, {"Sec-Fetch-Site", "cross-site"}}));
   CHECK_EQ(r.status, 200);  // reads are never refused
+  // Same machine, another port (the pages on 8096): the same site.
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "http://192.168.178.198:8096"},
+                   {"Host", "192.168.178.198:8081"}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "http://192.168.178.199:8081"},
+                   {"Host", "192.168.178.198:8081"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                  {{"Origin", "http://[::1]:8096"}, {"Host", "[::1]:8081"}}));
+  CHECK_EQ(r.status, 200);
+  // A proxy named in csrf-allow-origins passes, another does not.
+  {
+    auth::Settings proxied = f.gate->settings();
+    proxied.csrf_allow_origins = {"https://gufo.proxy.local"};
+    auth::Gate behind(proxied, f.store, {});
+    // Sessions live in the gate: sign in at this one.
+    const std::string admin_behind = CookieOf(behind.Serve(
+        Req("POST", "/login", "192.168.178.50",
+            "{\"name\":\"fabian\",\"passwort\":\"geheim123\"}"),
+        f.next));
+    r = behind.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                         {{"Cookie", admin_behind}, {"Origin", "https://gufo.proxy.local"},
+                          {"Host", "192.168.178.198:8081"}}),
+                     f.next);
+    CHECK_EQ(r.status, 200);
+    r = behind.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                         {{"Cookie", admin_behind}, {"Origin", "https://andere.proxy.local"},
+                          {"Host", "192.168.178.198:8081"}}),
+                     f.next);
+    CHECK_EQ(r.status, 403);
+  }
   r = f.Serve(Req("DELETE", "/router/users/film-56/tokens/csrf", "127.0.0.1"));
   CHECK_EQ(r.status, 200);
   r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50", "", {{"Cookie", admin}}));
@@ -1501,6 +1603,35 @@ void TestModes() {
     CHECK_EQ(f.last.header("X-Gufo-Internal"), std::string(""));
     CHECK_EQ(f.last.header("X-Gufo-Pool"), std::string("remote"));  // a client's own pin stays
     CHECK_EQ(f.last.header("X-Other"), std::string("bleibt"));
+    // Stage 0 too: a browser page on this machine must not reach the
+    // admin paths through loopback (the first admin is created here).
+    r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
+                    "{\"name\":\"csrf\",\"passwort\":\"abcd\"}",
+                    {{"Content-Type", "application/json"},
+                     {"Sec-Fetch-Site", "cross-site"}}));
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+    r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                    {{"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
+    CHECK_EQ(r.status, 403);
+    r = f.Serve(Req("POST", "/router/placement", "127.0.0.1", "{}",
+                    {{"Sec-Fetch-Site", "cross-site"}}));
+    CHECK_EQ(r.status, 403);
+    r = f.Serve(Req("POST", "/router/pool/pull", "127.0.0.1", "{}",
+                    {{"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
+    CHECK_EQ(r.status, 403);
+    CHECK(!f.store->Find("csrf").has_value());
+    r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                    {{"Origin", "http://127.0.0.1:8096"}, {"Host", "127.0.0.1:8081"}}));
+    CHECK_EQ(r.status, 200);
+    r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}"));
+    CHECK_EQ(r.status, 200);
+    r = f.Serve(Req("GET", "/router/users", "127.0.0.1", "",
+                    {{"Sec-Fetch-Site", "cross-site"}}));
+    CHECK_EQ(r.status, 200);  // reads stay open
+    r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50", "{}",
+                    {{"Sec-Fetch-Site", "cross-site"}}));
+    CHECK_EQ(r.status, 200);  // stage 0: generation is open to everyone anyway
     r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50"));
     CHECK_EQ(r.status, 404);
     r = f.Serve(Req("GET", "/router/users", "192.168.178.50"));
@@ -1577,7 +1708,8 @@ void TestPresetSection() {
     std::ofstream out(file, std::ios::binary);
     out << "[remote/m]\nurl = http://192.168.1.2:8081\nmodality = llm\n\n"
            "[router]\nauth = lan\nauth-loopback = login\n"
-           "users-file = konten\\nutzer.json\npool-secret-env = GUFO_POOL\n";
+           "users-file = konten\\nutzer.json\npool-secret-env = GUFO_POOL\n"
+           "csrf-allow-origins = https://gufo.proxy.local, http://10.0.0.5:80\n";
   }
   CHECK(gufo::router::LoadPreset(file, {}, &models, &error, &section));
   CHECK(error.empty());
@@ -1586,6 +1718,8 @@ void TestPresetSection() {
   CHECK_EQ(section.auth_loopback, std::string("login"));
   CHECK_EQ(section.users_file, std::string("konten\\nutzer.json"));
   CHECK_EQ(section.pool_secret_env, std::string("GUFO_POOL"));
+  CHECK_EQ(section.csrf_allow_origins,
+           std::string("https://gufo.proxy.local, http://10.0.0.5:80"));
   CHECK_EQ(models.size(), std::size_t(1));
   // Without the section: defaults, and the old call without the argument.
   {
@@ -1599,6 +1733,7 @@ void TestPresetSection() {
   CHECK(gufo::router::LoadPreset(file, {}, &models, &error));
   // Bad values stop the router like any preset error.
   for (const char* body : {"[router]\nauth = ja\n", "[router]\nfoo = 1\n",
+                           "[router]\ncsrf-allow-origins =\n",
                            "[router]\nauth-loopback = x\n",
                            "[router]\nauth = lan\n[router]\nauth = lan\n",
                            "[router/x]\nauth = lan\n",

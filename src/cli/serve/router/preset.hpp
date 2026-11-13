@@ -109,6 +109,9 @@ struct RouterSection {
   std::string auth_loopback{"admin"};  // admin|login
   std::string users_file;              // "" = <preset dir>/nutzer/nutzer.json
   std::string pool_secret_env;         // "" = no pool secret
+  /// Comma list of origins (scheme://host[:port]) whose pages may make
+  /// browser writes besides this router's own address (a reverse proxy).
+  std::string csrf_allow_origins;
 };
 
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves

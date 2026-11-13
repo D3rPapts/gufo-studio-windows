@@ -22,6 +22,18 @@ namespace gufo::router {
   return out;
 }
 
+/// ASCII case-insensitive equality (header names, fixed tokens).
+[[nodiscard]] inline bool EqualsIgnoreCase(std::string_view a,
+                                           std::string_view b) {
+  if (a.size() != b.size())
+    return false;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i])))
+      return false;
+  return true;
+}
+
 /// Without leading and trailing ASCII whitespace.
 [[nodiscard]] inline std::string_view Trim(std::string_view text) {
   while (!text.empty() &&

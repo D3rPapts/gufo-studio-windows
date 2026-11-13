@@ -69,6 +69,9 @@ enum class LoopbackPolicy { kAdmin, kLogin };
 [[nodiscard]] bool IsRole(std::string_view role);
 /// User and token names: 1..32 of [a-z0-9._-].
 [[nodiscard]] bool IsValidName(std::string_view name);
+/// "lokal" (the router itself, loopback) and "partner" (the partner
+/// router) name no user and cannot be created.
+[[nodiscard]] bool IsReservedName(std::string_view name);
 
 /// Per-user rights (concept section 3). Empty lists mean "the role
 /// decides" (every area, every model).
@@ -225,6 +228,9 @@ struct Identity {
   std::string name;
   std::string rolle;
   Rights rechte;
+  /// The name is a placeholder, not a user: the router itself, loopback
+  /// as admin, auth = off, the partner router. Owns nothing.
+  bool placeholder{false};
 
   [[nodiscard]] bool authenticated() const { return source != Source::kNone; }
   [[nodiscard]] bool admin() const { return rolle == "admin"; }
@@ -256,6 +262,9 @@ struct Settings {
   /// Environment variable with the shared pool secret and its value.
   std::string pool_secret_env;
   std::string pool_secret;
+  /// Origins (lower case, scheme://host[:port]) whose pages may make
+  /// browser writes besides this router's own address.
+  std::vector<std::string> csrf_allow_origins;
 };
 
 /// The pool secret outgoing partner calls carry (remote.cpp adds it to
@@ -309,6 +318,8 @@ public:
   /// The first blocked word found in the request's prompt texts, "" when
   /// clean. `comfy` scans every string of the body (ComfyUI graphs).
   [[nodiscard]] std::string Hit(const server::HttpRequest& req, bool comfy);
+  /// Every string of a parsed body (a ComfyUI graph).
+  [[nodiscard]] std::string HitJson(const json::Value& body);
   [[nodiscard]] std::string HitText(std::string_view text);
   [[nodiscard]] std::size_t size();
 
@@ -345,10 +356,11 @@ public:
     /// The owner (metadata.nutzer) of a local job, nullopt when unknown.
     std::function<std::optional<std::string>(const std::string& job_id)>
         job_owner;
-    /// The tasks a ComfyUI /prompt body resolves to (the adapter's plan);
-    /// nullopt when the graph does not build (the adapter answers that).
+    /// The tasks a ComfyUI /prompt body (parsed once by the gate) resolves
+    /// to (the adapter's plan); nullopt when the graph does not build (the
+    /// adapter answers that).
     std::function<std::optional<std::vector<WorkItem>>(
-        const server::HttpRequest&)>
+        const server::HttpRequest&, const json::Value& body)>
         comfy_plan;
   };
 
@@ -384,9 +396,11 @@ public:
   /// owner from it), pins the pool side. Never touches the body.
   void Rewrite(server::HttpRequest* req, const Identity& who);
   /// A user's job list shows only its own jobs; its job reads 404 for
-  /// others' jobs.
+  /// others' jobs. `body` (may be null) is the parsed request body the
+  /// caller holds (a ComfyUI prompt).
   void After(const server::HttpRequest& req, const Route& route,
-             const Identity& who, server::HttpResponse* response);
+             const Identity& who, server::HttpResponse* response,
+             const json::Value* body = nullptr);
 
   /// Login/logout/me/users endpoints; nullopt when `req` is none of them.
   [[nodiscard]] std::optional<server::HttpResponse> AuthEndpoint(
@@ -417,19 +431,35 @@ public:
   /// Daily count of a user (tests).
   [[nodiscard]] long long DailyCount(std::string_view name);
 
+  struct OwnerEntry {
+    std::string name;
+    long long at{0};
+    bool reserved{false};
+  };
   /// Owners of things the job store does not know: ComfyUI prompts
   /// ("prompt:<id>") and direct video jobs ("video:<id>"), remembered
   /// from the answers for a day (in memory; unknown = not checked). The
-  /// first owner wins: false when a live entry names someone else. The
-  /// placeholder "lokal" (the router itself) is never an owner.
+  /// first owner wins: false when a live entry names someone else.
   bool RememberOwner(std::string_view key, std::string_view name);
+  /// Takes `key` for `name` before the work runs (a client-chosen prompt
+  /// id), atomically: false when someone else holds it. RememberOwner
+  /// confirms it, ReleaseOwner drops a reservation that was not used.
+  bool ReserveOwner(std::string_view key, std::string_view name);
+  void ReleaseOwner(std::string_view key, std::string_view name);
   [[nodiscard]] std::optional<std::string> OwnerOf(std::string_view key);
   /// Browser requests (a cookie session, loopback as admin) that change
   /// something must come from this router's own pages: a cross-site
-  /// fetch or a foreign Origin is 403 csrf_rejected. Tokens, the partner
-  /// and the router's own calls are no browsers and pass. Nullopt = fine.
-  [[nodiscard]] static std::optional<server::HttpResponse> CsrfRefusal(
-      const server::HttpRequest& req, const Identity& who);
+  /// fetch or an Origin of another site is 403 csrf_rejected. Tokens, the
+  /// partner and the router's own calls are no browsers and pass.
+  /// Nullopt = fine.
+  [[nodiscard]] std::optional<server::HttpResponse> CsrfRefusal(
+      const server::HttpRequest& req, const Identity& who) const;
+  /// The header rule alone (any identity): Sec-Fetch-Site: cross-site,
+  /// or an Origin whose host is not the Host header's host (ports may
+  /// differ: the pages on another port of this machine) and not in
+  /// Settings::csrf_allow_origins.
+  [[nodiscard]] std::optional<server::HttpResponse> CsrfCheck(
+      const server::HttpRequest& req) const;
 
 private:
   struct SessionInfo {
@@ -459,7 +489,7 @@ private:
   std::map<std::string, SessionInfo> sessions_;
   std::map<std::string, std::deque<long long>> failures_;
   std::map<std::string, std::pair<std::string, long long>> daily_;
-  std::map<std::string, std::pair<std::string, long long>> owners_;
+  std::map<std::string, OwnerEntry> owners_;
   std::mutex log_mutex_;
   std::string log_day_;
 };
