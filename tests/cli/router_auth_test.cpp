@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/auth.hpp"
+#include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/core/json.hpp"
 
@@ -119,6 +120,16 @@ struct Fixture {
     settings.pool_secret = std::move(pool_secret);
     auth::Gate::Hooks hooks;
     hooks.model_of = [](const HttpRequest& req) {
+      const std::string type = req.header("Content-Type");
+      if (type.starts_with("multipart/form-data")) {
+        std::vector<gufo::router::comfy::MultipartPart> parts;
+        std::string error;
+        if (gufo::router::comfy::ParseMultipart(type, req.body, &parts, &error))
+          for (const auto& part : parts)
+            if (part.name == "model")
+              return part.data;
+        return std::string();
+      }
       try {
         return json::parse(req.body).member_str("model");
       } catch (const std::exception&) {
@@ -530,6 +541,29 @@ void TestGateOrder() {
     CHECK(!fresh.Identify(Req("GET", "/router/me", "192.168.178.50", "",
                               {{"Cookie", plain}}))
                .authenticated());
+    // The stored expiry counts after a restart, not a fresh 30 days.
+    std::string error;
+    const long long soon = auth::NowUnix() + 50;
+    CHECK(f.store->RememberSession("tim", "s-kurz", soon, &error));
+    CHECK(fresh.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                             {{"Cookie", "gufo_sitzung=s-kurz"}}))
+              .authenticated());
+    auth::Gate later(settings, f.store, {});
+    later.SetClock([soon] { return soon + 10; });
+    CHECK(!later.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                              {{"Cookie", "gufo_sitzung=s-kurz"}}))
+               .authenticated());
+    // Cached once, it expires at the stored time as well.
+    auth::Gate cached(settings, f.store, {});
+    long long clock = soon - 10;
+    cached.SetClock([&clock] { return clock; });
+    CHECK(cached.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                              {{"Cookie", "gufo_sitzung=s-kurz"}}))
+              .authenticated());
+    clock = soon + 10;
+    CHECK(!cached.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                               {{"Cookie", "gufo_sitzung=s-kurz"}}))
+               .authenticated());
   }
 }
 
@@ -610,10 +644,33 @@ void TestAreasAndJobs() {
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.seen.size(), std::size_t(1));
   {
+    // The body passes untouched (no re-serialisation); the job API stamps
+    // metadata.nutzer from the user header the gate sets.
     const json::Value sent = json::parse(f.last.body);
-    CHECK_EQ(sent.find("metadata")->member_str("nutzer"), std::string("tim"));
     CHECK_EQ(sent.find("metadata")->member_str("titel"), std::string("t"));
+    CHECK(!sent.find("metadata")->contains("nutzer"));
+    CHECK_EQ(f.last.header("X-Gufo-User"), std::string("tim"));
   }
+  // A multipart job (body_base64, as the pages send edits and upscales)
+  // is checked like a direct one: area, model, filter.
+  const auto multipart_job = [](const std::string& model,
+                                const std::string& prompt) {
+    const std::string raw =
+        "--xyz\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" +
+        model + "\r\n--xyz\r\nContent-Disposition: form-data; name=\"prompt\""
+        "\r\n\r\n" + prompt + "\r\n--xyz--\r\n";
+    json::Value body = json::Value::object();
+    json::Value request = json::Value::object();
+    request["path"] = "/v1/images/edits";
+    request["content_type"] = "multipart/form-data; boundary=xyz";
+    request["body_base64"] = gufo::router::comfy::Base64Encode(raw);
+    body["request"] = std::move(request);
+    return body.dump();
+  };
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50",
+                  multipart_job("qwen-image-2.1", "Haus"), {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);  // tim: no bild area
+  CHECK_EQ(ErrorCode(r), std::string("forbidden"));
   r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50",
                   "{\"request\":{\"path\":\"/v1/images/generations\",\"body\":"
                   "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}}}",
@@ -700,13 +757,58 @@ void TestPoolSecret() {
                    {"X-Gufo-Rights", "rolle=nutzer;bereiche=text"}}));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.seen.size(), std::size_t(1));
-  CHECK_EQ(json::parse(f.last.body).find("metadata")->member_str("nutzer"),
-           std::string("tim"));
+  CHECK_EQ(f.last.header("X-Gufo-User"), std::string("tim"));
   const auto who = f.gate->Identify(Req("GET", "/v1/models", "192.168.100.56", "",
                                         {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK(who.source == auth::Identity::Source::kPool);
   CHECK_EQ(who.name, std::string("partner"));
   CHECK_EQ(who.rolle, std::string("dienst"));
+  // Job requests the partner relays for a user: that user's jobs only
+  // (the entry router cannot know this router's jobs); an admin sees all.
+  const std::vector<std::pair<std::string, std::string>> as_tim = {
+      {"X-Gufo-Pool-Key", "sehr-geheim"}, {"X-Gufo-User", "tim"},
+      {"X-Gufo-Rights", "rolle=nutzer;bereiche=ablage"}};
+  const std::vector<std::pair<std::string, std::string>> as_admin = {
+      {"X-Gufo-Pool-Key", "sehr-geheim"}, {"X-Gufo-User", "fabian"},
+      {"X-Gufo-Rights", "rolle=admin"}};
+  r = f.Serve(Req("GET", "/v1/jobs/j-tim", "192.168.100.56", "", as_tim));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/v1/jobs/j-anna", "192.168.100.56", "", as_tim));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("DELETE", "/v1/jobs/j-anna", "192.168.100.56", "", as_tim));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("GET", "/v1/jobs/j-anna/files/a.png", "192.168.100.56", "",
+                  as_tim));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("DELETE", "/v1/jobs?older_than=1", "192.168.100.56", "", as_tim));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("GET", "/v1/jobs/j-anna", "192.168.100.56", "", as_admin));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("DELETE", "/v1/jobs/j-anna", "192.168.100.56", "", as_admin));
+  CHECK_EQ(r.status, 200);
+  // A relayed list shows the relayed user only its own jobs.
+  f.next = [](const HttpRequest&) {
+    json::Value body = json::Value::object();
+    json::Value data = json::Value::array();
+    for (const char* owner : {"tim", "anna"}) {
+      json::Value job = json::Value::object();
+      job["id"] = std::string("j-") + owner;
+      json::Value metadata = json::Value::object();
+      metadata["nutzer"] = owner;
+      job["metadata"] = std::move(metadata);
+      data.push_back(std::move(job));
+    }
+    body["data"] = std::move(data);
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  r = f.Serve(Req("GET", "/v1/jobs?scope=pool", "192.168.100.56", "", as_tim));
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(1));
+  r = f.Serve(Req("GET", "/v1/jobs", "192.168.100.56", "", as_admin));
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(2));
+  // Generation requests of a relayed user are not checked again here.
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.100.56",
+                  "{\"model\":\"m\",\"prompt\":\"nackt\"}", as_tim));
+  CHECK_EQ(r.status, 200);
   // Outgoing: RemoteTarget adds the key when the process secret is set.
   auth::SetPoolSecret("sehr-geheim");
   CHECK_EQ(auth::PoolSecret(), std::string("sehr-geheim"));
@@ -830,6 +932,19 @@ void TestFilterAndLimit() {
   r = g.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
                   "{\"model\":\"m\",\"messages\":[{\"content\":\"nackt\"}]}",
                   {{"Cookie", kind2}}));
+  CHECK_EQ(r.status, 200);
+  // Umlauts: "Töten" and "TÖTEN" meet "töt*" (UTF-8 aware lower case).
+  CHECK_EQ(auth::LowerUtf8("TÖTEN Ärger ÜBER Straße ×"),
+           std::string("töten ärger über straße ×"));
+  for (const char* word : {"Töten", "TÖTEN", "töten"}) {
+    r = g.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                    std::string("{\"model\":\"m\",\"prompt\":\"") + word +
+                        " im Park\"}",
+                    {{"Cookie", kind2}}));
+    CHECK_EQ(r.status, 400);
+  }
+  r = g.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"Tölpel\"}", {{"Cookie", kind2}}));
   CHECK_EQ(r.status, 200);
   // Multipart edits: the prompt field, not the image bytes.
   const std::string multipart =
@@ -963,6 +1078,9 @@ void TestUsersApi() {
   CHECK_EQ(r.status, 200);
   CHECK(f.store->Verify("tim", "neu-pw").has_value());
   CHECK(f.store->Find("tim")->rechte.bereiche == std::vector<std::string>{"text"});
+  // The session that used the old password is over at once.
+  r = f.Serve(Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 401);
   r = f.Serve(Req("POST", "/router/users/film-56/tokens", "192.168.178.50",
                   "{\"name\":\"pipeline\",\"tage\":30}", {{"Cookie", admin}}));
   CHECK_EQ(r.status, 201);
@@ -1051,14 +1169,23 @@ void TestModes() {
     r = f.Serve(Req("GET", "/router/users", "127.0.0.1", "", {{"Cookie", admin}}));
     CHECK_EQ(r.status, 200);
   }
-  // auth = lan with auth-loopback = login: loopback logs in, but may
-  // still manage users (the emergency path).
+  // auth = lan with auth-loopback = login: loopback logs in, the users
+  // API and /verwaltung/ included (the emergency path is the preset).
   {
     Fixture f(auth::Mode::kLan, "", auth::LoopbackPolicy::kLogin);
     f.AddUser("fabian", "admin", "geheim123");
     HttpResponse r = f.Serve(Req("GET", "/v1/models", "127.0.0.1"));
     CHECK_EQ(r.status, 401);
     r = f.Serve(Req("GET", "/router/users", "127.0.0.1"));
+    CHECK_EQ(r.status, 404);
+    r = f.Serve(Req("GET", "/router/zugriff", "127.0.0.1"));
+    CHECK_EQ(r.status, 404);
+    r = f.Serve(Req("GET", "/verwaltung/", "127.0.0.1"));
+    CHECK_EQ(r.status, 404);
+    const std::string admin = f.LoginCookie("fabian", "geheim123", false, "127.0.0.1");
+    r = f.Serve(Req("GET", "/router/users", "127.0.0.1", "", {{"Cookie", admin}}));
+    CHECK_EQ(r.status, 200);
+    r = f.Serve(Req("GET", "/verwaltung/", "127.0.0.1", "", {{"Cookie", admin}}));
     CHECK_EQ(r.status, 200);
   }
 }
@@ -1096,11 +1223,14 @@ void TestPresetSection() {
   // Bad values stop the router like any preset error.
   for (const char* body : {"[router]\nauth = ja\n", "[router]\nfoo = 1\n",
                            "[router]\nauth-loopback = x\n",
-                           "[router]\nauth = lan\n[router]\nauth = lan\n"}) {
+                           "[router]\nauth = lan\n[router]\nauth = lan\n",
+                           "[router/x]\nauth = lan\n",
+                           "[router/x]\nauth = lan\n[router]\nauth = lan\n"}) {
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     out << "[remote/m]\nurl = http://192.168.1.2:8081\nmodality = llm\n"
         << body;
     out.close();
+    section = {};
     CHECK(!gufo::router::LoadPreset(file, {}, &models, &error, &section));
     CHECK(error.find("[router]") != std::string::npos);
   }

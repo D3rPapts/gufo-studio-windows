@@ -1045,7 +1045,7 @@ pool-secret-env = GUFO_POOL_SECRET
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `auth` | `off` | `off`: everyone may use everything (today's behaviour); the users API and `/verwaltung/` answer from `127.0.0.1` only. `lan`: `127.0.0.1` is admin (see `auth-loopback`), everyone else logs in. `all`: the machine itself logs in too (strangers at the keyboard). |
-| `auth-loopback` | `admin` | With `auth = lan`: whether `127.0.0.1`/`::1` counts as the admin `lokal` without a login (`admin`) or must log in like the LAN (`login`). The users API and `/verwaltung/` stay open from `127.0.0.1` either way (emergency path: a forgotten admin password is reset at the machine). |
+| `auth-loopback` | `admin` | With `auth = lan`: whether `127.0.0.1`/`::1` counts as the admin `lokal` without a login (`admin`) or must log in like the LAN (`login`). With `admin` the users API and `/verwaltung/` are open from `127.0.0.1` without a login (emergency path: a forgotten admin password is reset at the machine); with `login` they need an admin session like everything else, and the emergency path is the preset (set `auth-loopback = admin`, restart). |
 | `users-file` | `nutzer\nutzer.json` next to the preset | The users file; a relative path resolves against the preset's directory. `nutzer\filter-woerter.txt` and `nutzer\zugriff.log` live beside it. |
 | `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
 
@@ -1072,7 +1072,7 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | `modelle` | all | Allowed model ids; another model is `403 model_forbidden`. |
 | `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart): `400 content_filtered`. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
 | `tageslimit` | 0 (unlimited) | POST requests on generation endpoints per UTC day, videos count twice: `429 daily_limit`. Counted in memory (a restart resets it). |
-| `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`). |
+| `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
 Areas by endpoint: text = chat, completions, responses, messages,
 embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*` and
@@ -1085,16 +1085,21 @@ voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
 pages need them); `pool` and `status` gate the pages of those names
 (`/pool/`, `/speicher/`, `/status/`, ...).
 
-Jobs belong to a user: `POST /v1/jobs` stamps `metadata.nutzer`, a job's
-inner request is checked like a direct one (area, model, filter, limit),
-`GET /v1/jobs` lists only the user's jobs, a read, file, patch or delete
-of another user's job is `404`, bulk delete is admin only. Admins and the
-partner see everything. Relayed and pulled requests carry `X-Gufo-User`
-and `X-Gufo-Rights` (`rolle=...;bereiche=...;modelle=...;filter=...;
-tageslimit=...;pool=...`) set by the entry router; the partner trusts
-them when the pool key is valid, so the second machine needs no copy of
-the users file, and a job it runs is stored under that user. The entry
-router's own jobs runner runs each job as its owner (the job header).
+Jobs belong to a user: the job API stamps `metadata.nutzer` from
+`X-Gufo-User` (set by the gate on every request it lets through; a
+client's own copy is dropped), a job's inner request is checked like a
+direct one (area, model, filter, limit; a `body_base64` multipart body is
+decoded for that), `GET /v1/jobs` lists only the user's jobs, a read,
+file, patch or delete of another user's job is `404`, bulk delete is
+admin only. Admins see everything. Relayed and pulled requests carry
+`X-Gufo-User` and `X-Gufo-Rights` (`rolle=...;bereiche=...;modelle=...;
+filter=...;tageslimit=...;pool=...`) set by the entry router; the partner
+trusts the rights when the pool key is valid (no second copy of the users
+file), stores a job it takes under that user, and applies the own-jobs
+rule to the relayed user's job requests itself (a relayed `nutzer` sees,
+cancels or deletes only its own jobs there too; a relayed `admin` sees
+all). The entry router's own jobs runner runs each job as its owner (the
+job header).
 
 Endpoints (JSON):
 

@@ -5,15 +5,20 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <span>
 #include <sstream>
 #include <system_error>
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/strings.hpp"
+#include "src/core/crypto/sha256.hpp"
 
 namespace gufo::router::auth {
 namespace {
@@ -21,45 +26,6 @@ namespace {
 using server::HttpRequest;
 using server::HttpResponse;
 using server::Logger;
-
-std::string Lower(std::string_view text) {
-  std::string out(text);
-  for (char& c : out)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return out;
-}
-
-std::string_view Trim(std::string_view text) {
-  while (!text.empty() &&
-         std::isspace(static_cast<unsigned char>(text.front())))
-    text.remove_prefix(1);
-  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
-    text.remove_suffix(1);
-  return text;
-}
-
-std::vector<std::string> Split(std::string_view text, char sep) {
-  std::vector<std::string> out;
-  std::size_t begin = 0;
-  while (begin <= text.size()) {
-    const auto end = std::min(text.find(sep, begin), text.size());
-    const std::string_view part = Trim(text.substr(begin, end - begin));
-    if (!part.empty())
-      out.emplace_back(part);
-    begin = end + 1;
-  }
-  return out;
-}
-
-std::string Join(const std::vector<std::string>& parts, char sep) {
-  std::string out;
-  for (const std::string& part : parts) {
-    if (!out.empty())
-      out += sep;
-    out += part;
-  }
-  return out;
-}
 
 bool Contains(const std::vector<std::string>& list, std::string_view item) {
   return std::find(list.begin(), list.end(), item) != list.end();
@@ -180,14 +146,6 @@ std::string BearerOf(const HttpRequest& req) {
       return "";
   }
   return std::string(Trim(std::string_view(header).substr(kBearer.size())));
-}
-
-bool IsJsonBody(const HttpRequest& req) {
-  const std::string type = Lower(req.header("Content-Type"));
-  if (type.find("application/json") != std::string::npos)
-    return true;
-  const std::string_view body = Trim(req.body);
-  return type.empty() && !body.empty() && (body.front() == '{');
 }
 
 std::string MultipartBoundary(const HttpRequest& req) {
@@ -422,12 +380,8 @@ std::string RandomHex(std::size_t bytes) {
 }
 
 std::string Sha256Hex(std::string_view text) {
-  unsigned char digest[EVP_MAX_MD_SIZE];
-  unsigned int length = 0;
-  if (EVP_Digest(text.data(), text.size(), digest, &length, EVP_sha256(),
-                 nullptr) != 1)
-    return {};
-  return HexOf(std::string_view(reinterpret_cast<const char*>(digest), length));
+  return crypto::Sha256Hex(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
 }
 
 std::string Pbkdf2Hex(std::string_view password, std::string_view salt,
@@ -983,7 +937,8 @@ bool UserStore::RememberSession(std::string_view name,
   return SaveLocked(error);
 }
 
-std::optional<User> UserStore::FindBySession(std::string_view session_id) const {
+std::optional<User> UserStore::FindBySession(std::string_view session_id,
+                                             long long* ablauf) const {
   const std::string hash = Sha256Hex(session_id);
   const long long now = NowUnix();
   const std::lock_guard<std::mutex> lock(mutex_);
@@ -993,6 +948,8 @@ std::optional<User> UserStore::FindBySession(std::string_view session_id) const 
         continue;
       if (user.gesperrt || (s.ablauf > 0 && s.ablauf < now))
         return std::nullopt;
+      if (ablauf != nullptr)
+        *ablauf = s.ablauf;
       return user;
     }
   }
@@ -1276,7 +1233,7 @@ void WordFilter::Reload() {
     const std::string_view trimmed = Trim(line);
     if (trimmed.empty() || trimmed.front() == '#' || trimmed.front() == ';')
       continue;
-    words.push_back(Lower(trimmed));
+    words.push_back(LowerUtf8(trimmed));
   }
   words_ = std::move(words);
   loaded_at_ = stamp;
@@ -1295,12 +1252,34 @@ bool IsWordChar(unsigned char c) {
 }
 }  // namespace
 
+std::string LowerUtf8(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    // U+00C0..U+00DE (except U+00D7, the multiplication sign) are the
+    // Latin-1 capitals; their small letters sit 0x20 higher: C3 80..9E ->
+    // C3 A0..BE.
+    if (c == 0xC3 && i + 1 < text.size()) {
+      const unsigned char d = static_cast<unsigned char>(text[i + 1]);
+      if (d >= 0x80 && d <= 0x9E && d != 0x97) {
+        out += static_cast<char>(0xC3);
+        out += static_cast<char>(d + 0x20);
+        ++i;
+        continue;
+      }
+    }
+    out += static_cast<char>(std::tolower(c));
+  }
+  return out;
+}
+
 std::string WordFilter::HitText(std::string_view text) {
   const std::lock_guard<std::mutex> lock(mutex_);
   Reload();
   if (words_.empty() || text.empty())
     return {};
-  const std::string lower = Lower(text);
+  const std::string lower = LowerUtf8(text);
   for (const std::string& entry : words_) {
     std::string_view word = entry;
     const bool stem = word.ends_with('*');
@@ -1437,6 +1416,16 @@ void Gate::EndSession(std::string_view id) {
     store_->ForgetSession(id);
 }
 
+void Gate::EndSessionsOf(std::string_view name) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  for (auto it = sessions_.begin(); it != sessions_.end();) {
+    if (it->second.name == name)
+      it = sessions_.erase(it);
+    else
+      ++it;
+  }
+}
+
 std::optional<Identity> Gate::SessionIdentity(std::string_view id) {
   if (id.empty())
     return std::nullopt;
@@ -1458,12 +1447,15 @@ std::optional<Identity> Gate::SessionIdentity(std::string_view id) {
     if (user.has_value() && user->gesperrt)
       user.reset();
   } else {
-    // A remembered session from before a restart: cache it in memory.
-    user = store_->FindBySession(id);
+    // A remembered session from before a restart: cache it in memory with
+    // the expiry the file holds.
+    long long ablauf = 0;
+    user = store_->FindBySession(id, &ablauf);
+    if (user.has_value() && ablauf > 0 && ablauf < Now())
+      user.reset();
     if (user.has_value()) {
       const std::lock_guard<std::mutex> lock(mutex_);
-      sessions_[std::string(id)] =
-          SessionInfo{user->name, Now() + kRememberTtl.count(), true};
+      sessions_[std::string(id)] = SessionInfo{user->name, ablauf, true};
     }
   }
   if (!user.has_value())
@@ -1633,7 +1625,8 @@ std::string JobIdOf(const std::string& path) {
 
 std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                                          const Route& route,
-                                         const Identity& who) {
+                                         const Identity& who,
+                                         const json::Value* body) {
   if (route.kind == Route::Kind::kFree)
     return std::nullopt;
   // A pool key that did not match: 401 whatever else the request carries,
@@ -1662,7 +1655,13 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                            "Authorization: Bearer gufo_...)",
                      SetupPending() ? "no_admin" : "not_authenticated");
   }
-  if (who.trusted() || who.admin())
+  // The partner's relayed job requests run for the user the entry router
+  // named: its rights were checked there, but which jobs are its own only
+  // this router knows (the owner check below applies).
+  const bool pool_user =
+      who.source == Identity::Source::kPool && !who.admin();
+  if (who.admin() ||
+      (who.trusted() && !(pool_user && route.kind == Route::Kind::kJobs)))
     return std::nullopt;
   switch (route.kind) {
     case Route::Kind::kAdminControl:
@@ -1680,29 +1679,45 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
     case Route::Kind::kOther:
       return std::nullopt;
     case Route::Kind::kJobs: {
-      if (!who.rechte.AllowsArea("ablage"))
+      if (!pool_user && !who.rechte.AllowsArea("ablage"))
         return Forbidden(AreaMessage("ablage"), "forbidden");
       if (req.method == "DELETE" && req.path == "/v1/jobs")
         return Forbidden("Sammel-Löschen nur admin (bulk delete is admin "
                          "only)",
                          "forbidden");
       if (req.method == "POST" && req.path == "/v1/jobs") {
-        // The wrapped request is checked like a direct one.
+        if (pool_user)
+          return std::nullopt;  // checked by the entry router
+        // The wrapped request is checked like a direct one: a JSON body
+        // or a base64 body (multipart edits, upscale) with its type.
         HttpRequest inner;
         inner.method = "POST";
         inner.client_id = req.client_id;
-        try {
-          const json::Value body = json::parse(req.body);
-          const json::Value* request = body.find("request");
-          if (request != nullptr && request->is_object()) {
-            inner.path = request->member_str("path");
-            if (const json::Value* b = request->find("body");
-                b != nullptr && !b->is_null())
-              inner.body = b->dump();
-            inner.headers.emplace_back("Content-Type", "application/json");
+        json::Value parsed;
+        if (body == nullptr) {
+          try {
+            parsed = json::parse(req.body);
+          } catch (const std::exception&) {
+            return std::nullopt;  // the job API answers the parse error
           }
-        } catch (const std::exception&) {
-          return std::nullopt;  // the job API answers the parse error
+          body = &parsed;
+        }
+        const json::Value* request = body->find("request");
+        if (request != nullptr && request->is_object()) {
+          inner.path = request->member_str("path");
+          if (const json::Value* b = request->find("body");
+              b != nullptr && !b->is_null()) {
+            inner.body = b->dump();
+            inner.headers.emplace_back("Content-Type", "application/json");
+          } else if (const json::Value* raw = request->find("body_base64");
+                     raw != nullptr && raw->is_string()) {
+            auto decoded = comfy::Base64Decode(raw->str());
+            if (!decoded.has_value())
+              return std::nullopt;  // the job API answers invalid_request
+            inner.body = std::move(*decoded);
+            inner.headers.emplace_back("Content-Type",
+                                       request->member_str("content_type"));
+          }
         }
         if (inner.path.empty())
           return std::nullopt;
@@ -1766,33 +1781,24 @@ void Gate::Rewrite(HttpRequest* req, const Identity& who) {
   req->headers.emplace_back(kRightsHeader,
                             "rolle=" + who.rolle + ";" + who.rechte.Encode());
   if (!who.trusted() && !who.admin() && !who.rechte.pool) {
+    // The job API keeps the pin on the job (pin_local), the pool decision
+    // keeps a direct request here.
     std::erase_if(req->headers, [](const auto& header) {
       return Lower(header.first) == "x-gufo-pool";
     });
     req->headers.emplace_back("X-Gufo-Pool", "local");
   }
-  if (req->method == "POST" && req->path == "/v1/jobs" && !who.name.empty() &&
-      who.source != Identity::Source::kInternal) {
-    try {
-      json::Value body = json::parse(req->body);
-      if (body.is_object()) {
-        json::Value& metadata = body["metadata"];
-        if (!metadata.is_object())
-          metadata = json::Value::object();
-        metadata["nutzer"] = who.name;
-        req->body = body.dump();
-      }
-    } catch (const std::exception&) {
-      // The job API answers the parse error.
-    }
-  }
+  // The job API stamps metadata.nutzer from kUserHeader itself (no second
+  // parse and no re-serialisation of a submit body here).
 }
 
 void Gate::After(const HttpRequest& req, const Route& route,
                  const Identity& who, HttpResponse* response) {
-  if (route.kind != Route::Kind::kJobs || who.trusted() || who.admin() ||
-      req.method != "GET" || response->status != 200 ||
-      response->streaming_body)
+  const bool pool_user =
+      who.source == Identity::Source::kPool && !who.admin();
+  if (route.kind != Route::Kind::kJobs || who.admin() ||
+      (who.trusted() && !pool_user) || req.method != "GET" ||
+      response->status != 200 || response->streaming_body)
     return;
   if (req.path == "/v1/jobs") {
     try {
@@ -2042,7 +2048,11 @@ HttpResponse Gate::UsersApi(const HttpRequest& req, const Identity& who) {
           !password.empty()) {
         if (!store_->SetPassword(name, password, &error))
           return AuthError(400, "Bad Request", error, "invalid_password");
+        // Whoever held the old password is out, in memory as well.
+        EndSessionsOf(name);
       }
+      if (user->gesperrt)
+        EndSessionsOf(name);
       Log(req, who, "nutzer_geaendert:" + name);
       return JsonOk(store_->Find(name)->PublicJson());
     }
@@ -2060,6 +2070,7 @@ HttpResponse Gate::UsersApi(const HttpRequest& req, const Identity& who) {
       user->gesperrt = true;
       if (!store_->Put(*user, &error))
         return AuthError(500, "Internal Server Error", error, "users_file");
+      EndSessionsOf(name);
       Log(req, who, "nutzer_gesperrt:" + name);
       return JsonOk(store_->Find(name)->PublicJson());
     }
@@ -2134,10 +2145,13 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
       return Logout(req, who);
     case Route::Kind::kUsers:
     case Route::Kind::kAdminPage: {
-      // Loopback (unless auth = all) or an admin session; everyone else
-      // sees 404 so the pages stay invisible from outside.
+      // Loopback while it counts as admin (auth = lan with auth-loopback
+      // = admin, or auth = off) or an admin session; everyone else sees
+      // 404 so the pages stay invisible from outside. With auth-loopback
+      // = login the emergency path is the preset: set it to admin, restart.
       const bool loopback_ok = IsLoopback(RequestAddress(req)) &&
-                               settings_.mode != Mode::kAll;
+                               settings_.mode != Mode::kAll &&
+                               settings_.loopback == LoopbackPolicy::kAdmin;
       const bool admin_ok = who.authenticated() && who.admin() &&
                             who.source != Identity::Source::kOff;
       if (!loopback_ok && !admin_ok)
@@ -2166,7 +2180,20 @@ HttpResponse Gate::Serve(
   }
   if (auto answer = AuthEndpoint(req, route, who))
     return std::move(*answer);
-  if (auto refusal = Refuse(req, route, who)) {
+  // A job submit is parsed once here for the inner-request check (the job
+  // API parses its own copy; nothing is re-serialised).
+  json::Value submit;
+  const json::Value* submit_body = nullptr;
+  if (req.method == "POST" && req.path == "/v1/jobs" && !who.admin() &&
+      !who.trusted()) {
+    try {
+      submit = json::parse(req.body);
+      submit_body = &submit;
+    } catch (const std::exception&) {
+      // The job API answers the parse error.
+    }
+  }
+  if (auto refusal = Refuse(req, route, who, submit_body)) {
     std::string model;
     if (hooks_.model_of && route.kind == Route::Kind::kWork)
       model = hooks_.model_of(req);
