@@ -1,5 +1,7 @@
 #include "src/cli/serve/router/remote.hpp"
 
+#include "src/cli/serve/router/auth.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -71,6 +73,11 @@ UpstreamTarget RemoteTarget(const RemoteSpec& spec,
     // Replaces a client's header of the same name: the next router sees
     // who relayed it.
     target.extra_headers.emplace_back(kForwardedHeader, router_id);
+  }
+  // The shared pool secret (preset `[router] pool-secret-env`, 2.0.3): a
+  // partner with `auth = lan` admits router-to-router calls only with it.
+  if (const std::string& secret = auth::PoolSecret(); !secret.empty()) {
+    target.extra_headers.emplace_back(auth::kPoolKeyHeader, secret);
   }
   return target;
 }
@@ -168,8 +175,12 @@ void ParseRemoteModels(const std::string& body, RemoteProbe* probe) {
         const json::Value* value = activity->find(key);
         return value != nullptr && value->as_bool();
       };
+      const json::Value* waiting = activity->find("waiting");
       probe->activity[id->str()] = RemoteActivity{
-          flag("busy"), flag("gpu_busy"), flag("others_busy")};
+          flag("busy"), flag("gpu_busy"), flag("others_busy"),
+          waiting != nullptr && waiting->is_number()
+              ? static_cast<long long>(waiting->as_double())
+              : 0LL};
     }
   }
 }
@@ -357,6 +368,7 @@ json::Value RemoteHub::Status() const {
       flags["busy"] = found->second.busy;
       flags["gpu_busy"] = found->second.gpu_busy;
       flags["others_busy"] = found->second.others_busy;
+      flags["waiting"] = found->second.waiting;
       activity[id] = std::move(flags);
     }
     entry["activity"] = std::move(activity);

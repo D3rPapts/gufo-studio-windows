@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "qwen3_omni",
+  "target": "gufo_qwen3_omni",
+  "kind": "static",
+  "purpose": "Qwen3-Omni captioner (gufo-studio-windows): GGUF loading, F32 reference and the HIP audio encoder and thinker behind gufo serve omni.",
+  "consumers": [],
+  "checks": []
+}

@@ -66,13 +66,18 @@ inline constexpr const char* kForwardedHeader = "X-Gufo-Forwarded";
 /// What a router reports per locally served model in GET /v1/models
 /// (`"activity"`, placement = pool reads it from the partner).
 struct RemoteActivity {
-  /// A request, socket or job of this model is in flight there.
+  /// A request, socket or job of this model is in flight there (or a pool
+  /// request picked that machine and loads it). Pool requests that only
+  /// wait for a machine are not busy (`waiting`).
   bool busy{false};
   /// GPU work runs there (its ComfyUI queue is not empty, or an
   /// image/video/music model has work in flight).
   bool gpu_busy{false};
   /// Anything else is in flight there (another model, the ComfyUI queue).
   bool others_busy{false};
+  /// Pool requests of this model waiting there for a machine (0 from a
+  /// router older than the field).
+  long long waiting{0};
 };
 
 /// One GET /v1/models against a remote router.

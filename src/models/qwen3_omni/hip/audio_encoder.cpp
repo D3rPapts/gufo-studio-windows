@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include "src/models/qwen3_asr/hip/audio_ops.hpp"
 #include "src/models/qwen3_asr/hip/blas.hpp"
 #include "src/models/qwen3_omni/hip/device_buffer.hpp"

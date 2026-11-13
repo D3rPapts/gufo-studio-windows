@@ -4,12 +4,24 @@
 #include "src/models/mmaudio/video_input.hpp"
 
 #include <algorithm>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "src/models/mmaudio/preprocess.hpp"
 #include "src/models/rife/video_io.hpp"
 
 namespace gufo::models::mmaudio {
+namespace {
+
+// CPU code: the Fail of common.hpp belongs to the HIP side.
+bool Fail(std::string* error, std::string message) {
+  if (error != nullptr)
+    *error = std::move(message);
+  return false;
+}
+
+}  // namespace
 
 bool LoadVideoFrames(const std::filesystem::path& path,
                      const FrameOptions& options, FoleyRequest* request,

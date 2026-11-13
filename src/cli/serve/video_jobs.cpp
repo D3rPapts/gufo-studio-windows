@@ -25,233 +25,49 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
-#include "src/cli/serve/video_vace.hpp"
-#include "src/cli/serve/video_talk.hpp"
-#include "src/cli/serve/video_wan21.hpp"
-#include "src/cli/serve/preview.hpp"
-#include "src/cli/serve/video_wan22.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
-#include "src/models/minimax_h3/sha256.hpp"
-#include "src/models/rife/video_io.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
-
-bool IsWan22ModelDirectory(const std::filesystem::path& root) {
-  std::ifstream input(root / "model_index.json", std::ios::binary);
-  if (!input)
-    return false;
-  const std::string text((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-  try {
-    const json::Value index = json::parse(text);
-    const json::Value* transformer_2 = index.find("transformer_2");
-    const bool single_transformer =
-        transformer_2 == nullptr || transformer_2->is_null() ||
-        (transformer_2->is_array() && !transformer_2->empty() &&
-         transformer_2->items()[0].is_null());
-    return index.member_str("_class_name") == "WanPipeline" &&
-           single_transformer &&
-           std::filesystem::exists(root / "vae" / "config.json") &&
-           std::filesystem::exists(root / "transformer" / "config.json");
-  } catch (...) {
-    return false;
-  }
-}
-
-bool IsWan21CameraDirectory(const std::filesystem::path& root) {
-  std::ifstream input(root / "gufo-camera.json", std::ios::binary);
-  if (!input)
-    return false;
-  const std::string text((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-  try {
-    return json::parse(text).member_str("_class_name") ==
-           "GufoWan21Uni3CCamera";
-  } catch (...) {
-    return false;
-  }
-}
-
-bool IsWan21TalkDirectory(const std::filesystem::path& root) {
-  std::ifstream input(root / "gufo-talk.json", std::ios::binary);
-  if (!input)
-    return false;
-  const std::string text((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-  try {
-    return json::parse(text).member_str("_class_name") ==
-           "GufoWan21InfiniteTalk";
-  } catch (...) {
-    return false;
-  }
-}
-
-bool ValidateWan21TalkParameters(const minimax_h3::GenerationParameters& p,
-                                 std::string* error) {
-  const auto fail = [error](const char* message) {
-    if (error != nullptr)
-      *error = message;
-    return false;
-  };
-  if (p.preset != kWan21TalkPreset)
-    return fail("InfiniteTalk jobs use the 'wan21-talk' preset");
-  const int w = p.output_width, h = p.output_height;
-  if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
-      h % 16 != 0 || w * h > 896 * 512)
-    return fail(
-        "size must be WxH with multiples of 16, 256..1024 per side and at "
-        "most 832x480 pixels");
-  if (p.frames < 1 || p.frames > 1500)
-    return fail("frames must be 1..1500 (60 s at 25 fps)");
-  if (p.evaluations < 1 || p.evaluations > 20)
-    return fail("steps must be 1..20");
-  return true;
-}
-
-std::optional<int> ResolveWan21TalkDurationFrames(std::string_view seconds,
-                                                  std::string* error) {
-  double value = 0;
-  const auto parsed =
-      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
-  if (parsed.ec != std::errc() ||
-      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
-      value < 0.04 || value > 60.0) {
-    if (error != nullptr)
-      *error = "'seconds' must be a number between 0.04 and 60";
-    return std::nullopt;
-  }
-  return std::clamp(static_cast<int>(std::lround(value * 25.0)), 1, 1500);
-}
-
-bool ValidateWan21Parameters(const minimax_h3::GenerationParameters& p,
-                             std::string* error) {
-  const auto fail = [error](const char* message) {
-    if (error != nullptr)
-      *error = message;
-    return false;
-  };
-  if (p.preset != kWan21Preset)
-    return fail("Wan 2.1 camera jobs use the 'wan21' preset");
-  const int w = p.output_width, h = p.output_height;
-  if (w < 256 || h < 256 || w > 1024 || h > 1024 || w % 16 != 0 ||
-      h % 16 != 0 || w * h > 896 * 512)
-    return fail(
-        "size must be WxH with multiples of 16, 256..1024 per side and at "
-        "most 832x480 pixels");
-  if (p.frames < 5 || p.frames > 81 || (p.frames - 1) % 4 != 0)
-    return fail("frames must be 4k + 1 between 5 and 81");
-  if (p.evaluations < 1 || p.evaluations > 20)
-    return fail("steps must be 1..20");
-  return true;
-}
-
-bool IsWan21VaceDirectory(const std::filesystem::path& root) {
-  std::ifstream input(root / "gufo-vace.json", std::ios::binary);
-  if (!input)
-    return false;
-  const std::string text((std::istreambuf_iterator<char>(input)),
-                         std::istreambuf_iterator<char>());
-  try {
-    return json::parse(text).member_str("_class_name") == "GufoWan21Vace";
-  } catch (...) {
-    return false;
-  }
-}
-
-bool ValidateWan21VaceParameters(const minimax_h3::GenerationParameters& p,
-                                 std::string* error) {
-  const auto fail = [error](const char* message) {
-    if (error != nullptr)
-      *error = message;
-    return false;
-  };
-  if (p.preset != kWan21VacePreset)
-    return fail("Wan 2.1 VACE jobs use the 'wan21-vace' preset");
-  const int w = p.output_width, h = p.output_height;
-  if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 16 != 0 ||
-      h % 16 != 0 || w * h > 1280 * 720)
-    return fail(
-        "size must be WxH with multiples of 16, 256..1280 per side and at "
-        "most 1280x720 pixels");
-  if (p.frames < 5 || p.frames > 81 || (p.frames - 1) % 4 != 0)
-    return fail("frames must be 4k + 1 between 5 and 81");
-  if (p.evaluations < 1 || p.evaluations > 50)
-    return fail("steps must be 1..50");
-  return true;
-}
-
-std::optional<int> ResolveWan21DurationFrames(std::string_view seconds,
-                                              std::string* error) {
-  double value = 0;
-  const auto parsed =
-      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
-  if (parsed.ec != std::errc() ||
-      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
-      value < 0.25 || value > 5.05) {
-    if (error != nullptr)
-      *error = "'seconds' must be a number between 0.25 and 5";
-    return std::nullopt;
-  }
-  const int groups = std::max(1, static_cast<int>(std::lround(value * 4.0)));
-  return std::min(4 * groups + 1, 81);
-}
-
-bool ParseVideoSize(std::string_view size, int* width, int* height) {
-  const auto x = size.find('x');
-  if (x == std::string_view::npos || x == 0 || x + 1 >= size.size())
-    return false;
-  int w = 0, h = 0;
-  const auto first = std::from_chars(size.data(), size.data() + x, w);
-  const auto second =
-      std::from_chars(size.data() + x + 1, size.data() + size.size(), h);
-  if (first.ec != std::errc() || first.ptr != size.data() + x ||
-      second.ec != std::errc() || second.ptr != size.data() + size.size())
-    return false;
-  *width = w;
-  *height = h;
-  return true;
-}
-
-bool ValidateWan22Parameters(const minimax_h3::GenerationParameters& p,
-                             std::string* error) {
-  const auto fail = [error](const char* message) {
-    if (error != nullptr)
-      *error = message;
-    return false;
-  };
-  if (p.preset != kWan22Preset)
-    return fail("Wan 2.2 jobs use the 'wan22' preset");
-  const int w = p.output_width, h = p.output_height;
-  if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 32 != 0 ||
-      h % 32 != 0 || w * h > 1280 * 704)
-    return fail(
-        "size must be WxH with multiples of 32, 256..1280 per side and at "
-        "most 1280x704 pixels");
-  if (p.frames < 5 || p.frames > 121 || (p.frames - 1) % 4 != 0)
-    return fail("frames must be 4k + 1 between 5 and 121");
-  if (p.evaluations < 1 || p.evaluations > 100)
-    return fail("steps must be 1..100");
-  return true;
-}
-
-std::optional<int> ResolveWan22DurationFrames(std::string_view seconds,
-                                              std::string* error) {
-  double value = 0;
-  const auto parsed =
-      std::from_chars(seconds.data(), seconds.data() + seconds.size(), value);
-  if (parsed.ec != std::errc() ||
-      parsed.ptr != seconds.data() + seconds.size() || !std::isfinite(value) ||
-      value < 0.2 || value > 5.05) {
-    if (error != nullptr)
-      *error = "'seconds' must be a number between 0.2 and 5";
-    return std::nullopt;
-  }
-  const int groups = std::max(1, static_cast<int>(std::lround(value * 6.0)));
-  return std::min(4 * groups + 1, 121);
-}
-
 namespace {
+
+std::optional<int> ResolveDurationFrames(const ext::VideoProvider* provider,
+                                         std::string_view seconds,
+                                         std::string* error = nullptr) {
+  if (provider && provider->resolve_duration_frames) {
+    return provider->resolve_duration_frames(seconds, error);
+  }
+  return std::nullopt;
+}
+
+bool ValidateGenerationParameters(const ext::VideoProvider* provider,
+                                  const ext::VideoParameters& parameters,
+                                  std::string* error = nullptr) {
+  if (provider && provider->validate_parameters) {
+    return provider->validate_parameters(parameters, error);
+  }
+  return false;
+}
+
+std::string GenerationParametersJson(const ext::VideoProvider* provider,
+                                     const ext::VideoParameters& parameters,
+                                     std::uint64_t seed,
+                                     std::string_view prompt_sha256) {
+  if (provider && provider->parameters_json) {
+    return provider->parameters_json(parameters, seed, prompt_sha256);
+  }
+  return "{}";
+}
+
+std::string GenerationTelemetryJson(const ext::VideoProvider* provider,
+                                    const ext::VideoTelemetry& telemetry) {
+  if (provider && provider->telemetry_json) {
+    return provider->telemetry_json(telemetry);
+  }
+  return "{}";
+}
 
 bool IsH3Model(std::string_view model) {
   return model == "minimax-h3" || model == "minimax-h3-exact" ||
@@ -263,19 +79,54 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
   if (model == "minimax-h3") {
     return true;
   }
-  return (model == "minimax-h3-exact" &&
-          (preset == "exact-512" ||
-           (preset.starts_with("exact-") &&
-            minimax_h3::ParseCanvasSize(preset.substr(6)).has_value()))) ||
+  return (model == "minimax-h3-exact" && preset == "exact-512") ||
          (model == "minimax-h3-fast" && preset == "fast-384") ||
          (model == "minimax-h3-aggressive" && preset == "aggressive-320") ||
          (model == "minimax-h3-dev" && preset == "development-256") ||
          (model == "minimax-h3-fullres" && preset == "exact-1344x768");
 }
 
-bool MatchesOutputContract(const VideoJobRequest& request) {
+// Providers that parse their own requests: the provider id is the model,
+// output is always MP4 and the provider checks everything else.
+bool IsPreparedProvider(const ext::VideoProvider* provider) {
+  return provider != nullptr && provider->prepare_request != nullptr;
+}
+
+// MiniMax H3 keeps its preset-selecting model names, PPM diagnostics and
+// "exact-WxH" canvases even with its own prepare_request
+// (gufo-studio-windows, as 1.4.9).
+bool UsesH3Contract(const ext::VideoProvider* provider) {
+  return !IsPreparedProvider(provider) || provider->id == "minimax-h3";
+}
+
+bool IsServedModel(const ext::VideoProvider* provider, std::string_view model) {
+  return UsesH3Contract(provider) ? IsH3Model(model) : model == provider->id;
+}
+
+bool ParseSize(std::string_view size, int* width, int* height) {
+  const auto x = size.find('x');
+  if (x == std::string_view::npos || x == 0 || x + 1 >= size.size()) {
+    return false;
+  }
+  const auto first = std::from_chars(size.data(), size.data() + x, *width);
+  const auto second =
+      std::from_chars(size.data() + x + 1, size.data() + size.size(), *height);
+  return first.ec == std::errc() && first.ptr == size.data() + x &&
+         second.ec == std::errc() && second.ptr == size.data() + size.size() &&
+         *width > 0 && *height > 0;
+}
+
+bool MatchesOutputContract(const ext::VideoProvider* provider,
+                           const VideoJobRequest& request) {
   const auto& parameters = request.parameters;
-  const auto frames = minimax_h3::ResolveDurationFrames(request.seconds);
+  if (!UsesH3Contract(provider)) {
+    int width = 0;
+    int height = 0;
+    return request.output_format == "mp4" &&
+           ParseSize(request.size, &width, &height) &&
+           ResolveDurationFrames(provider, request.seconds).has_value();
+  }
+  const auto frames = ResolveDurationFrames(provider, request.seconds);
   if (!frames || parameters.frames != *frames ||
       !ModelMatchesPreset(request.model, parameters.preset)) {
     return false;
@@ -291,14 +142,17 @@ bool MatchesOutputContract(const VideoJobRequest& request) {
         parameters.internal_width == 1344 &&
         parameters.internal_height == 768 && parameters.output_width == 1344 &&
         parameters.output_height == 768;
-    // "exact-WxH" at any accepted canvas (e.g. 832x512), rendered natively.
-    const auto canvas = minimax_h3::ParseCanvasSize(request.size);
+    // "exact-WxH" at any accepted canvas (e.g. FilmStudio's 832x512),
+    // rendered natively (gufo-studio-windows, as 1.4.9).
+    int canvas_width = 0;
+    int canvas_height = 0;
     const bool exact_canvas =
-        canvas.has_value() && parameters.preset == "exact-" + request.size &&
-        parameters.internal_width == canvas->first &&
-        parameters.internal_height == canvas->second &&
-        parameters.output_width == canvas->first &&
-        parameters.output_height == canvas->second &&
+        ParseSize(request.size, &canvas_width, &canvas_height) &&
+        parameters.preset == "exact-" + request.size &&
+        parameters.internal_width == canvas_width &&
+        parameters.internal_height == canvas_height &&
+        parameters.output_width == canvas_width &&
+        parameters.output_height == canvas_height &&
         (request.model == "minimax-h3" || request.model == "minimax-h3-exact");
     return (square || released_full_resolution || exact_canvas) &&
            parameters.mux && parameters.decode_audio &&
@@ -470,14 +324,8 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "inventory") {
     return scaled(1, 3);
   }
-  if (phase == "vision") {
-    return 3;
-  }
   if (phase == "prompt") {
-    return scaled(3, 9);
-  }
-  if (phase == "keyframes" || phase == "guide_clips") {
-    return scaled(9, 10);
+    return scaled(3, 10);
   }
   if (phase == "denoiser") {
     return scaled(10, 80);
@@ -491,80 +339,10 @@ int ProgressPercent(std::string_view phase, int completed, int total) {
   if (phase == "media") {
     return scaled(97, 99);
   }
-  if (phase == "interpolate" || phase == "upscale") {
-    return scaled(98, 99);
+  if (const auto post = VideoPostProcessPercent(phase, completed, total)) {
+    return *post;
   }
   return 1;
-}
-
-// Decodes uploaded MiniMax H3 guide clips (MP4) with FFmpeg from the job
-// directory into RGB8 frame sets. At most `max_frames` frames are kept: the
-// reference anchors only the first 17k + 5 frames, and a clip longer than the
-// video cannot fit anyway. The upload bytes are released on the way.
-bool DecodeH3GuideVideos(const std::filesystem::path& directory,
-                         std::vector<VideoGuideUpload>* uploads,
-                         int max_frames,
-                         std::vector<minimax_h3::GenerationVideoGuide>* guides,
-                         std::string* error) {
-  for (std::size_t index = 0; index < uploads->size(); ++index) {
-    VideoGuideUpload& upload = (*uploads)[index];
-    const std::filesystem::path path =
-        directory / ("guide_clip_" + std::to_string(index) + ".mp4");
-    {
-      std::ofstream file(path, std::ios::binary);
-      file.write(reinterpret_cast<const char*>(upload.mp4.data()),
-                 static_cast<std::streamsize>(upload.mp4.size()));
-      if (!file) {
-        *error = "cannot store MiniMax H3 guide clip " + std::to_string(index);
-        return false;
-      }
-    }
-    std::vector<std::uint8_t>().swap(upload.mp4);
-    models::rife::VideoInfo info;
-    if (!models::rife::ProbeVideo(path, &info, error)) {
-      return false;
-    }
-    if (info.width < 16 || info.height < 16 || info.width > 4096 ||
-        info.height > 4096) {
-      *error = "MiniMax H3 guide clip " + std::to_string(index) +
-               " has an unsupported size";
-      return false;
-    }
-    models::rife::FrameReader reader;
-    if (!reader.Open(path, info.width, info.height, error)) {
-      return false;
-    }
-    minimax_h3::GenerationVideoGuide guide;
-    guide.frame = upload.frame;
-    guide.width = info.width;
-    guide.height = info.height;
-    const std::size_t frame_bytes = static_cast<std::size_t>(info.width) *
-                                    static_cast<std::size_t>(info.height) * 3U;
-    std::vector<std::uint8_t> frame(frame_bytes);
-    while (guide.frames < max_frames) {
-      bool end = false;
-      if (!reader.Read(frame.data(), &end, error)) {
-        if (!end) {
-          reader.Close();
-          return false;
-        }
-        error->clear();
-        break;
-      }
-      guide.rgb.insert(guide.rgb.end(), frame.begin(), frame.end());
-      ++guide.frames;
-    }
-    reader.Close();
-    std::error_code ignored;
-    std::filesystem::remove(path, ignored);
-    if (guide.frames == 0) {
-      *error = "MiniMax H3 guide clip " + std::to_string(index) +
-               " has no frames";
-      return false;
-    }
-    guides->push_back(std::move(guide));
-  }
-  return true;
 }
 
 }  // namespace
@@ -592,7 +370,7 @@ struct VideoJobService::Impl {
     std::filesystem::path directory;
     std::filesystem::path content_path;
     std::string media_type;
-    minimax_h3::CancellationToken cancellation;
+    std::atomic<bool> cancelled{false};
     bool deleted{false};
     std::string logged_phase;
     int logged_bucket{-1};
@@ -606,95 +384,84 @@ struct VideoJobService::Impl {
     if (!options.now) {
       options.now = UnixNow;
     }
-    const bool vace = options.family == VideoModelFamily::kWan21Vace;
-    const bool talk = options.family == VideoModelFamily::kWan21Talk;
-    const bool wan21 =
-        options.family == VideoModelFamily::kWan21Uni3C || vace;
-    const bool wan = options.family == VideoModelFamily::kWan22 || wan21 ||
-                     talk;
-    if (wan && options.model_id.empty()) {
-      options.model_id = std::string(vace    ? kWan21VaceModelId
-                                     : talk  ? kWan21TalkModelId
-                                     : wan21 ? kWan21ModelId
-                                             : kWan22ModelId);
+    // The provider: named, else the one that accepts the model directory,
+    // else MiniMax H3 (the only provider before provider-owned requests).
+    provider = options.provider_id.empty()
+                   ? ext::ProbeVideoProvider(options.model_root.string())
+                   : ext::FindVideoProvider(options.provider_id);
+    if (provider == nullptr && options.provider_id.empty()) {
+      provider = ext::FindVideoProvider("minimax-h3");
     }
-    if (!wan) {
-      options.model_id = "minimax-h3";
+    if (provider == nullptr) {
+      initialization_error =
+          "video provider '" +
+          (options.provider_id.empty() ? std::string("minimax-h3")
+                                       : options.provider_id) +
+          "' is not available";
+      return;
     }
     if (!options.runner) {
-      if (vace) {
-        options.runner = RunWan21VaceJob;
-      } else if (talk) {
-        options.runner = RunWan21TalkJob;
-      } else if (wan21) {
-        options.runner = RunWan21Job;
-      } else if (wan) {
-        options.runner = RunWan22Job;
-      } else {
-        options.runner = minimax_h3::GenerateTextVideo;
+      if (!options.provider_options.empty() &&
+          provider->create_with_options == nullptr) {
+        initialization_error = "video provider '" + provider->id +
+                               "' takes no provider options (--" +
+                               options.provider_options.front().first + ")";
+        return;
+      }
+      if (provider->create_with_options || provider->create) {
+        std::string create_err;
+        auto video_runner =
+            provider->create_with_options
+                ? provider->create_with_options(
+                      {.model_root = options.model_root.string(),
+                       .options = options.provider_options},
+                      &create_err)
+                : provider->create(options.model_root.string(), &create_err);
+        if (!video_runner && provider->create_with_options) {
+          initialization_error = create_err.empty()
+                                     ? "cannot create the video runner"
+                                     : create_err;
+          return;
+        }
+        if (video_runner) {
+          std::shared_ptr<ext::VideoRunner> shared_runner =
+              std::move(video_runner);
+          options.runner = [shared_runner](const ext::VideoRequest& req,
+                                           const ext::CancellationCheck& check,
+                                           ext::VideoProgress progress,
+                                           void* progress_opaque,
+                                           ext::VideoTelemetry* telem,
+                                           std::string* err) {
+            return shared_runner->Generate(req, check, progress,
+                                           progress_opaque, telem, err);
+          };
+        }
       }
     }
-    if (wan) {
-      if (options.model_root.empty() || options.storage_root.empty() ||
-          options.queue_capacity == 0 ||
-          options.artifact_ttl <= std::chrono::seconds::zero()) {
-        initialization_error = "invalid Wan 2.2 video job configuration";
-        return;
-      }
-#if !defined(ENGINE_ENABLE_HIP)
-      if (options.validate_model_inventory) {
-        initialization_error =
-            "Wan 2.2 video serving requires a ROCm HIP-enabled build";
-        return;
-      }
-#endif
-      if (options.validate_model_inventory && vace &&
-          !IsWan21VaceDirectory(options.model_root)) {
-        initialization_error =
-            "not a Wan 2.1 VACE bundle (gufo-vace.json): " +
-            options.model_root.string();
-        return;
-      }
-      if (options.validate_model_inventory && wan21 && !vace &&
-          !IsWan21CameraDirectory(options.model_root)) {
-        initialization_error =
-            "not a Wan 2.1 camera bundle (gufo-camera.json): " +
-            options.model_root.string();
-        return;
-      }
-      if (options.validate_model_inventory && talk &&
-          !IsWan21TalkDirectory(options.model_root)) {
-        initialization_error =
-            "not a Wan 2.1 InfiniteTalk bundle (gufo-talk.json): " +
-            options.model_root.string();
-        return;
-      }
-      if (options.validate_model_inventory && !wan21 && !talk &&
-          !IsWan22ModelDirectory(options.model_root)) {
-        initialization_error = "not a Wan 2.2 TI2V-5B Diffusers directory: " +
-                               options.model_root.string();
-        return;
-      }
-    } else if (options.model_root.empty() || options.source_manifest.empty() ||
-               options.storage_root.empty() || options.queue_capacity == 0 ||
-               options.artifact_ttl <= std::chrono::seconds::zero()) {
-      initialization_error = "invalid MiniMax H3 video job configuration";
+    if (options.model_root.empty() || options.source_manifest.empty() ||
+        options.storage_root.empty() || options.queue_capacity == 0 ||
+        options.artifact_ttl <= std::chrono::seconds::zero()) {
+      initialization_error = "invalid video job configuration";
       return;
     }
 #if !defined(ENGINE_ENABLE_HIP)
     if (options.validate_model_inventory) {
       initialization_error =
-          "MiniMax H3 video serving requires a ROCm HIP-enabled build; no CPU "
-          "inference fallback is provided";
+          "video serving (" + provider->id +
+          ") requires a ROCm HIP-enabled build; no CPU inference fallback is "
+          "provided";
       return;
     }
 #endif
-    if (!wan && options.validate_model_inventory) {
-      std::string inspection_error;
-      if (!minimax_h3::ModelInventory::Inspect(
-               options.model_root, options.source_manifest, &inspection_error)
-               .has_value()) {
-        initialization_error = std::move(inspection_error);
+    if (options.validate_model_inventory) {
+      std::string resolve_error;
+      if ((provider->resolve &&
+           !provider->resolve(options.model_root.string(),
+                              options.source_manifest.string(),
+                              &resolve_error))) {
+        initialization_error = resolve_error.empty()
+                                   ? "video model not resolved"
+                                   : std::move(resolve_error);
         return;
       }
     }
@@ -732,10 +499,10 @@ struct VideoJobService::Impl {
       {
         const std::lock_guard<std::mutex> lock(mutex);
         if (active != nullptr) {
-          active->cancellation.Cancel();
+          active->cancelled.store(true, std::memory_order_relaxed);
         }
         for (const auto& job : queue) {
-          job->cancellation.Cancel();
+          job->cancelled.store(true, std::memory_order_relaxed);
           WipeString(&job->request.prompt);
         }
       }
@@ -807,29 +574,19 @@ struct VideoJobService::Impl {
         const double completed_at = value.member_double("completed_at", -1);
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
-        const bool wan = options.family != VideoModelFamily::kMinimaxH3;
-        const bool wan21 = options.family == VideoModelFamily::kWan21Uni3C ||
-                           options.family == VideoModelFamily::kWan21Vace;
-        const bool talk = options.family == VideoModelFamily::kWan21Talk;
-        int recovered_width = 0, recovered_height = 0;
+        int recovered_width = 0;
+        int recovered_height = 0;
         const bool valid_output =
-            wan ? job->snapshot.output_format == "mp4" &&
-                      job->snapshot.model == options.model_id &&
-                      ParseVideoSize(job->snapshot.size, &recovered_width,
-                                     &recovered_height) &&
-                      (talk ? ResolveWan21TalkDurationFrames(
-                                  job->snapshot.seconds)
-                       : wan21
-                           ? ResolveWan21DurationFrames(job->snapshot.seconds)
-                           : ResolveWan22DurationFrames(job->snapshot.seconds))
-                : ((job->snapshot.output_format == "mp4" &&
-                    (job->snapshot.size == "512x512" ||
-                     job->snapshot.size == "1344x768" ||
-                     minimax_h3::ParseCanvasSize(job->snapshot.size))) ||
-                   (job->snapshot.output_format == "ppm" &&
-                    job->snapshot.size == "256x256")) &&
-                      IsH3Model(job->snapshot.model) &&
-                      minimax_h3::ResolveDurationFrames(job->snapshot.seconds);
+            !UsesH3Contract(provider)
+                ? job->snapshot.output_format == "mp4" &&
+                      ParseSize(job->snapshot.size, &recovered_width,
+                                &recovered_height)
+                : (job->snapshot.output_format == "mp4" &&
+                                   ParseSize(job->snapshot.size,
+                                             &recovered_width,
+                                             &recovered_height)) ||
+                                  (job->snapshot.output_format == "ppm" &&
+                                   job->snapshot.size == "256x256");
         const bool valid_numbers =
             std::isfinite(progress) && std::floor(progress) == progress &&
             progress == 100.0 && std::isfinite(created_at) &&
@@ -847,8 +604,10 @@ struct VideoJobService::Impl {
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
         if (value.member_str("schema") != "gufo.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
-            !valid_output || !valid_numbers ||
-            expires_at <= static_cast<double>(now_value) ||
+            !IsServedModel(provider, job->snapshot.model) ||
+            !ResolveDurationFrames(provider, job->snapshot.seconds) ||
+            !valid_output ||
+            !valid_numbers || expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
           std::filesystem::remove_all(entry.path(), filesystem_error);
           filesystem_error.clear();
@@ -976,17 +735,9 @@ struct VideoJobService::Impl {
               job->request.parameters.preset + " size=" + job->request.size +
               " frames=" + std::to_string(job->request.parameters.frames) +
               " steps=" + std::to_string(job->request.parameters.evaluations) +
-              " seed=" + std::to_string(job->request.seed) + " keyframes=" +
-              std::to_string(job->request.keyframes.size()) + " audio_guides=" +
-              std::to_string(job->request.audio_guides.size()) + " lora=" +
-              (job->request.lora.empty() ? "none" : job->request.lora) +
-              (job->request.first_frame.empty()
-                   ? std::string()
-                   : " first_frame=" +
-                         std::to_string(job->request.first_frame_width) + "x" +
-                         std::to_string(job->request.first_frame_height)) +
-              " " + Logger::MemoryStatus());
-      minimax_h3::GenerationRequest generation{
+              " seed=" + std::to_string(job->request.seed) + " " +
+              Logger::MemoryStatus());
+      ext::VideoRequest generation{
           .model_root = options.model_root,
           .source_manifest = options.source_manifest,
           .output_path = job->directory / "output.mp4",
@@ -997,65 +748,31 @@ struct VideoJobService::Impl {
           .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
-          .keyframes = std::move(job->request.keyframes),
-          .audio_guides = std::move(job->request.audio_guides),
-          .lora_path = {},
-          .lora_strength = 1.0F,
-          .vision_projector = options.vision_projector,
-          .first_frame_width = job->request.first_frame_width,
-          .first_frame_height = job->request.first_frame_height,
-          .first_frame = std::move(job->request.first_frame),
-          .negative_prompt = job->request.negative_prompt,
-          .guidance = static_cast<float>(job->request.guidance),
-          .camera_json = job->request.camera_json,
-          .guide_video_path = {},
-          .vace_json = job->request.vace_json,
-          .mask_path = {},
-          .talk_json = job->request.talk_json,
-          .speaker_masks = std::move(job->request.speaker_masks),
+          .options_json = job->request.options_json,
+          .attachments = {},
       };
-      if (!job->request.mask_file.empty()) {
-        // VACE mask (MP4 or still image), decoded from the job directory.
-        generation.mask_path =
-            job->directory / ("mask" + job->request.mask_extension);
-        std::ofstream mask(generation.mask_path, std::ios::binary);
-        mask.write(
-            reinterpret_cast<const char*>(job->request.mask_file.data()),
-            static_cast<std::streamsize>(job->request.mask_file.size()));
-        std::vector<std::uint8_t>().swap(job->request.mask_file);
-      }
-      if (!job->request.guide_video.empty()) {
-        // The uploaded guide is decoded by FFmpeg from the job directory.
-        generation.guide_video_path = job->directory / "guide.mp4";
-        std::ofstream guide(generation.guide_video_path, std::ios::binary);
-        guide.write(
-            reinterpret_cast<const char*>(job->request.guide_video.data()),
-            static_cast<std::streamsize>(job->request.guide_video.size()));
-        std::vector<std::uint8_t>().swap(job->request.guide_video);
-      }
-      if (!job->request.lora.empty()) {
-        const VideoLora& lora = options.loras.at(job->request.lora);
-        generation.lora_path = lora.path;
-        generation.lora_strength =
-            job->request.lora_strength.has_value()
-                ? static_cast<float>(*job->request.lora_strength)
-                : lora.strength;
-      }
+      std::vector<std::uint8_t> source_video;
       {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
         generation.prompt = std::move(job->request.prompt);
         WipeString(&job->request.prompt);
+        // Inputs are needed once; the job keeps only its metadata.
+        generation.attachments = std::move(job->request.attachments);
+        job->request.attachments.clear();
+        source_video = std::move(job->request.source_video);
+        job->request.source_video.clear();
       }
-      const std::string prompt_hash = minimax_h3::Sha256(std::span(
-          reinterpret_cast<const unsigned char*>(generation.prompt.data()),
-          generation.prompt.size()));
+      const std::string prompt_hash =
+          crypto::Sha256Hex(std::span<const std::uint8_t>(
+              reinterpret_cast<const std::uint8_t*>(generation.prompt.data()),
+              generation.prompt.size()));
       std::string metadata_error;
-      if (!WriteAtomic(
-              job->directory / "parameters.json",
-              minimax_h3::GenerationParametersJson(
-                  job->request.parameters, job->request.seed, prompt_hash),
-              &metadata_error)) {
+      if (!WriteAtomic(job->directory / "parameters.json",
+                       GenerationParametersJson(provider,
+                                                job->request.parameters,
+                                                job->request.seed, prompt_hash),
+                       &metadata_error)) {
         WipeString(&generation.prompt);
         const std::lock_guard<std::mutex> lock(mutex);
         active.reset();
@@ -1069,49 +786,43 @@ struct VideoJobService::Impl {
         condition.notify_all();
         continue;
       }
-      // Live preview under the job id while someone watches it.
-      // Wan 2.1 Uni3C keeps the dense default: its distilled 4-step LCM
-      // schedule would otherwise show a single preview (step 2).
-      PreviewOptions preview = job->request.preview;
-      if (options.family == VideoModelFamily::kWan22)
-        preview.dense_up_to = 0;
-      preview.pixel_frames = job->request.parameters.frames;
-      const bool wan21_family =
-          options.family == VideoModelFamily::kWan21Uni3C ||
-          options.family == VideoModelFamily::kWan21Vace ||
-          options.family == VideoModelFamily::kWan21Talk;
-      preview.fps = options.family == VideoModelFamily::kWan21Talk ? 25
-                    : wan21_family                                 ? 16
-                                                                   : 24;
-      generation.preview = PreviewHub::Global().Begin(
-          job->snapshot.id,
-          options.family == VideoModelFamily::kWan22 ? LatentFormat::kWan22
-          : wan21_family                             ? LatentFormat::kWan21
-              : LatentFormat::kMinimaxH3,
-          preview);
-      const auto preview_before = PreviewHub::Global().stats();
+      // Live preview under the job id while someone watches it (1.4.9).
+      std::optional<PreviewHub::Stats> preview_before;
+      if (provider != nullptr && provider->preview_latent != nullptr &&
+          source_video.empty()) {
+        const std::string_view latent = provider->preview_latent;
+        PreviewOptions preview = job->request.preview;
+        if (latent == "wan22")
+          preview.dense_up_to = 0;
+        preview.pixel_frames = job->request.parameters.frames;
+        preview.fps = provider->preview_fps > 0 ? provider->preview_fps : 24;
+        generation.preview = PreviewHub::Global().Begin(
+            job->snapshot.id,
+            latent == "wan22"   ? LatentFormat::kWan22
+            : latent == "wan21" ? LatentFormat::kWan21
+                                : LatentFormat::kMinimaxH3,
+            preview);
+        preview_before = PreviewHub::Global().stats();
+      }
       ProgressContext progress{this, job};
-      minimax_h3::GenerationTelemetry telemetry;
+      ext::VideoTelemetry telemetry;
       std::string error;
       bool success = false;
+      const ext::CancellationCheck is_cancelled = [&] {
+        return job->cancelled.load(std::memory_order_relaxed);
+      };
       try {
-        if (!job->request.source_video.empty()) {
+        if (!source_video.empty()) {
           // Post-processing only: the upload stands in for the generated MP4.
           std::ofstream source(generation.output_path, std::ios::binary);
-          source.write(
-              reinterpret_cast<const char*>(job->request.source_video.data()),
-              static_cast<std::streamsize>(job->request.source_video.size()));
+          source.write(reinterpret_cast<const char*>(source_video.data()),
+                       static_cast<std::streamsize>(source_video.size()));
           success = static_cast<bool>(source.flush());
           if (!success)
             error = "cannot store the uploaded source video";
-          std::vector<std::uint8_t>().swap(job->request.source_video);
-        } else if (DecodeH3GuideVideos(job->directory,
-                                       &job->request.h3_guide_videos,
-                                       job->request.parameters.frames,
-                                       &generation.video_guides, &error)) {
-          // MiniMax H3 guide clips are decoded here (FFmpeg) so the model
-          // library stays free of media decoding; a broken clip fails the job.
-          success = options.runner(generation, &job->cancellation, Progress,
+          std::vector<std::uint8_t>().swap(source_video);
+        } else {
+          success = options.runner(generation, is_cancelled, Progress,
                                    &progress, &telemetry, &error);
         }
       } catch (const std::exception& exception) {
@@ -1120,97 +831,38 @@ struct VideoJobService::Impl {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
-      PreviewHub::Global().End(job->snapshot.id,
-                               success && !job->cancellation.IsCancelled());
-      if (const auto stats = PreviewHub::Global().stats();
-          stats.published > preview_before.published) {
-        // Previews handed over during this job (process totals, so a
-        // concurrent image job would count too) and their encode time.
-        std::ostringstream line;
-        line << "job=" << job->snapshot.id << " event=previews published="
-             << stats.published - preview_before.published
-             << " encoded=" << stats.encoded - preview_before.encoded
-             << " encode_ms=" << std::lround(stats.encode_ms -
-                                             preview_before.encode_ms)
-             << " read_ms=" << std::lround(telemetry.denoiser.preview_ms)
-             << " read=" << telemetry.denoiser.previews;
-        Logger::Info("video", line.str());
+      if (preview_before) {
+        PreviewHub::Global().End(
+            job->snapshot.id,
+            success && !job->cancelled.load(std::memory_order_relaxed));
+        if (const auto stats = PreviewHub::Global().stats();
+            stats.published > preview_before->published) {
+          // Previews handed over during this job (process totals) and their
+          // encode time.
+          std::ostringstream line;
+          line << "job=" << job->snapshot.id << " event=previews published="
+               << stats.published - preview_before->published
+               << " encoded=" << stats.encoded - preview_before->encoded
+               << " encode_ms="
+               << std::lround(stats.encode_ms - preview_before->encode_ms);
+          Logger::Info("video", line.str());
+        }
       }
-      if (!success && !job->cancellation.IsCancelled()) {
+      if (!success && !job->cancelled.load(std::memory_order_relaxed)) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);
       }
 
       std::filesystem::path content_path;
       std::string media_type;
-      bool output_ready = success && !job->cancellation.IsCancelled();
-      const VideoInterpolation interpolation{
-          .multiplier = job->request.interpolate,
-          .fps_num = job->request.interpolate_fps_num,
-          .fps_den = job->request.interpolate_fps_den};
-      // Post-processing: output.mp4 -> generated.mp4 -> processed output.mp4.
-      const auto post_process =
-          [&](const char* event, const std::string& detail,
-              const std::function<bool(const std::filesystem::path&,
-                                       const std::filesystem::path&,
-                                       std::string*)>& run) {
-            const auto generated = job->directory / "generated.mp4";
-            const auto stage_start = std::chrono::steady_clock::now();
-            std::error_code rename_error;
-            std::filesystem::rename(job->directory / "output.mp4", generated,
-                                    rename_error);
-            std::string stage_error =
-                rename_error ? "cannot stage the generated MP4" : "";
-            const bool ok =
-                !rename_error &&
-                run(generated, job->directory / "output.mp4", &stage_error);
-            std::filesystem::remove(generated, rename_error);
-            if (!ok && !job->cancellation.IsCancelled()) {
-              Logger::Error("video", "job=" + job->snapshot.id + " event=" +
-                                         event + "_failed detail=" +
-                                         stage_error);
-            } else if (ok) {
-              Logger::Info(
-                  "video",
-                  "job=" + job->snapshot.id + " event=" + event + "d " +
-                      detail + " elapsed_ms=" +
-                      std::to_string(
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - stage_start)
-                              .count()));
-            }
-            return ok;
-          };
+      bool output_ready =
+          success && !job->cancelled.load(std::memory_order_relaxed);
       if (output_ready && job->request.output_format == "mp4" &&
-          interpolation.enabled()) {
-        output_ready = post_process(
-            "interpolate",
-            interpolation.fps_num > 0
-                ? "fps=" + std::to_string(interpolation.fps_num) + "/" +
-                      std::to_string(interpolation.fps_den)
-                : "multiplier=" + std::to_string(interpolation.multiplier),
-            [&](const std::filesystem::path& in,
-                const std::filesystem::path& out, std::string* stage_error) {
-              return options.interpolator(in, out, interpolation,
-                                          &job->cancellation, Progress,
-                                          &progress, stage_error);
-            });
-      }
-      if (output_ready && job->request.output_format == "mp4" &&
-          job->request.upscale.enabled()) {
-        const VideoUpscale& upscale = job->request.upscale;
-        output_ready = post_process(
-            "upscale",
-            "size=" + std::to_string(upscale.width) + "x" +
-                std::to_string(upscale.height) + " fit=" + upscale.fit +
-                " model=" +
-                (upscale.model.empty() ? options.upscale_models.front()
-                                       : upscale.model),
-            [&](const std::filesystem::path& in,
-                const std::filesystem::path& out, std::string* stage_error) {
-              return options.upscaler(in, out, upscale, &job->cancellation,
-                                      Progress, &progress, stage_error);
-            });
+          job->request.post.enabled()) {
+        // gufo-studio-windows post-steps (src/cli/serve/media).
+        output_ready = RunVideoPostProcess(
+            job->request.post, options.postprocessors, job->directory,
+            job->snapshot.id, is_cancelled, Progress, &progress);
       }
       if (output_ready && job->request.output_format == "mp4") {
         content_path = job->directory / "output.mp4";
@@ -1239,7 +891,7 @@ struct VideoJobService::Impl {
       if (output_ready) {
         std::string telemetry_error;
         if (!WriteAtomic(job->directory / "telemetry.json",
-                         minimax_h3::GenerationTelemetryJson(telemetry),
+                         GenerationTelemetryJson(provider, telemetry),
                          &telemetry_error)) {
           output_ready = false;
           storage_failure = true;
@@ -1260,7 +912,7 @@ struct VideoJobService::Impl {
           if (output_ready) {
             snapshot.status = VideoJobStatus::kCompleted;
             snapshot.progress = 100;
-          } else if (job->cancellation.IsCancelled()) {
+          } else if (job->cancelled.load(std::memory_order_relaxed)) {
             snapshot.status = VideoJobStatus::kCancelled;
             snapshot.error_code = "cancelled";
             snapshot.error_message = "video generation was cancelled";
@@ -1314,43 +966,12 @@ struct VideoJobService::Impl {
         }
       }
       condition.notify_all();
-      if (!deleted && snapshot.status == VideoJobStatus::kCompleted &&
-          options.family == VideoModelFamily::kMinimaxH3 &&
-          options.recycle_rows > 0 && options.recycle) {
-        const auto& parameters = job->request.parameters;
-        const std::size_t rows =
-            static_cast<std::size_t>(
-                minimax_h3::VideoLatentFrameCount(parameters.frames)) *
-            static_cast<std::size_t>(parameters.internal_width / 32) *
-            static_cast<std::size_t>(parameters.internal_height / 32);
-        if (rows >= options.recycle_rows) {
-          bool idle = false;
-          {
-            const std::lock_guard<std::mutex> lock(mutex);
-            idle = queue.empty();
-            recycling = idle;
-          }
-          if (idle) {
-            Logger::Info("video", "job=" + job->snapshot.id +
-                                      " event=recycle video_rows=" +
-                                      std::to_string(rows) +
-                                      " reason=release_gpu_memory");
-            options.recycle(job->snapshot.id);
-            return;
-          }
-          Logger::Warn("video", "job=" + job->snapshot.id +
-                                    " event=recycle_skipped video_rows=" +
-                                    std::to_string(rows) +
-                                    " reason=another_job_queued");
-        }
-      }
     }
   }
 
   VideoJobServiceOptions options;
+  const ext::VideoProvider* provider{nullptr};
   bool ready{false};
-  // Set (under mutex) once the worker hands the process to `recycle`.
-  bool recycling{false};
   std::string initialization_error;
   std::filesystem::path canonical_storage_root;
   std::mutex mutex;
@@ -1375,13 +996,30 @@ std::string VideoJobService::initialization_error() const {
                           : impl_->initialization_error;
 }
 
-VideoModelFamily VideoJobService::family() const noexcept {
-  return impl_ == nullptr ? VideoModelFamily::kMinimaxH3
-                          : impl_->options.family;
+const ext::VideoProvider* VideoJobService::provider() const noexcept {
+  return impl_ == nullptr ? nullptr : impl_->provider;
 }
 
 std::string VideoJobService::model_id() const {
-  return impl_ == nullptr ? std::string("minimax-h3") : impl_->options.model_id;
+  const auto* video = provider();
+  return UsesH3Contract(video) ? std::string("minimax-h3") : video->id;
+}
+
+bool VideoJobService::serves_model(std::string_view name) const {
+  return IsServedModel(impl_->provider, name) ||
+         std::find(impl_->options.model_aliases.begin(),
+                   impl_->options.model_aliases.end(),
+                   std::string(name)) != impl_->options.model_aliases.end();
+}
+
+std::string VideoJobService::normalize_model(std::string_view name) const {
+  if (IsServedModel(impl_->provider, name))
+    return std::string(name);
+  return serves_model(name) ? model_id() : std::string(name);
+}
+
+const std::vector<std::string>& VideoJobService::model_aliases() const {
+  return impl_->options.model_aliases;
 }
 
 VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
@@ -1390,208 +1028,55 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .job = std::nullopt,
             .error = initialization_error()};
   }
-  if (!request.source_video.empty()) {
+  const ext::VideoProvider* video = impl_->provider;
+  const bool process_only = !request.source_video.empty();
+  std::string post_error;
+  if (process_only) {
     // Post-processing only: the generator's request shape does not apply.
-    if (request.output_format != "mp4" ||
-        (request.interpolate <= 1 && request.interpolate_fps_num <= 0 &&
-         !request.upscale.enabled())) {
+    if (request.output_format != "mp4" || !request.post.enabled()) {
       return {.result = VideoJobResult::kInvalid,
               .job = std::nullopt,
               .error = "'source_video' needs MP4 output and 'interpolate' or "
                        "'upscale'"};
     }
-  } else if (impl_->options.family == VideoModelFamily::kWan21Talk) {
-    int width = 0, height = 0;
-    const auto frames = ResolveWan21TalkDurationFrames(request.seconds);
-    const bool two = request.audio_guides.size() == 2;
-    if (request.model != impl_->options.model_id ||
-        request.prompt.find('\0') != std::string::npos ||
-        request.output_format != "mp4" ||
-        !ParseVideoSize(request.size, &width, &height) ||
-        width != request.parameters.output_width ||
-        height != request.parameters.output_height || !frames ||
-        *frames != request.parameters.frames ||
-        !ValidateWan21TalkParameters(request.parameters, nullptr) ||
-        !request.keyframes.empty() || !request.h3_guide_videos.empty() ||
-        !request.lora.empty() ||
-        request.audio_guides.empty() || request.audio_guides.size() > 2 ||
-        request.speaker_masks.size() != (two ? 2U : 0U) ||
-        request.first_frame.empty() ||
-        request.first_frame.size() !=
-            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
-                static_cast<std::size_t>(
-                    std::max(request.first_frame_height, 0)) *
-                3U ||
-        !request.camera_json.empty() || !request.vace_json.empty() ||
-        !request.mask_file.empty()) {
-      // guide_video: the video-to-video input ("gufo.talk.video").
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = "invalid Wan 2.1 InfiniteTalk video job request"};
-    }
-  } else if (impl_->options.family == VideoModelFamily::kWan21Uni3C) {
-    int width = 0, height = 0;
-    const auto frames = ResolveWan21DurationFrames(request.seconds);
-    if (request.model != impl_->options.model_id ||
-        request.prompt.find('\0') != std::string::npos ||
-        request.output_format != "mp4" ||
-        !ParseVideoSize(request.size, &width, &height) ||
-        width != request.parameters.output_width ||
-        height != request.parameters.output_height || !frames ||
-        *frames != request.parameters.frames ||
-        !ValidateWan21Parameters(request.parameters, nullptr) ||
-        !request.keyframes.empty() || !request.h3_guide_videos.empty() ||
-        !request.lora.empty() ||
-        request.first_frame.empty() ||
-        request.first_frame.size() !=
-            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
-                static_cast<std::size_t>(
-                    std::max(request.first_frame_height, 0)) *
-                3U ||
-        (!request.camera_json.empty() && !request.guide_video.empty())) {
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = "invalid Wan 2.1 camera video job request"};
-    }
-  } else if (impl_->options.family == VideoModelFamily::kWan21Vace) {
-    int width = 0, height = 0;
-    const auto frames = ResolveWan21DurationFrames(request.seconds);
-    bool references_valid = request.keyframes.size() <= 4;
-    for (const auto& reference : request.keyframes)
-      references_valid =
-          references_valid && reference.width > 0 && reference.height > 0 &&
-          reference.rgb.size() == static_cast<std::size_t>(reference.width) *
-                                      static_cast<std::size_t>(
-                                          reference.height) *
-                                      3U;
-    if (request.model != impl_->options.model_id ||
-        request.prompt.find('\0') != std::string::npos ||
-        request.negative_prompt.find('\0') != std::string::npos ||
-        request.output_format != "mp4" ||
-        !ParseVideoSize(request.size, &width, &height) ||
-        width != request.parameters.output_width ||
-        height != request.parameters.output_height || !frames ||
-        *frames != request.parameters.frames ||
-        !ValidateWan21VaceParameters(request.parameters, nullptr) ||
-        !references_valid || !request.lora.empty() ||
-        !request.first_frame.empty() || !request.camera_json.empty() ||
-        !std::isfinite(request.guidance) || request.guidance < 1.0 ||
-        request.guidance > 20.0 ||
-        (!request.mask_file.empty() && request.mask_extension != ".mp4" &&
-         request.mask_extension != ".ppm")) {
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = "invalid Wan 2.1 VACE video job request"};
-    }
-  } else if (impl_->options.family == VideoModelFamily::kWan22) {
-    int width = 0, height = 0;
-    const auto frames = ResolveWan22DurationFrames(request.seconds);
-    if (request.model != impl_->options.model_id || request.prompt.empty() ||
-        request.prompt.find('\0') != std::string::npos ||
-        request.output_format != "mp4" ||
-        !ParseVideoSize(request.size, &width, &height) ||
-        width != request.parameters.output_width ||
-        height != request.parameters.output_height || !frames ||
-        *frames != request.parameters.frames ||
-        !ValidateWan22Parameters(request.parameters, nullptr) ||
-        !request.keyframes.empty() || !request.audio_guides.empty() ||
-        !request.h3_guide_videos.empty() || !request.lora.empty() ||
-        request.first_frame.size() !=
-            static_cast<std::size_t>(std::max(request.first_frame_width, 0)) *
-                static_cast<std::size_t>(
-                    std::max(request.first_frame_height, 0)) *
-                3U ||
-        !std::isfinite(request.guidance) || request.guidance < 0.0 ||
-        request.guidance > 20.0 ||
-        request.negative_prompt.find('\0') != std::string::npos) {
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = "invalid Wan 2.2 video job request"};
-    }
-  } else if (!IsH3Model(request.model) || request.prompt.empty() ||
+  } else if (!IsServedModel(video, request.model) ||
+             // Prepared providers decide whether a prompt is required (an
+             // empty prompt is legal for image- or audio-driven video).
+             (request.prompt.empty() && UsesH3Contract(video)) ||
              request.prompt.find('\0') != std::string::npos ||
              (request.output_format != "mp4" &&
               request.output_format != "ppm") ||
-             !minimax_h3::ValidateGenerationParameters(request.parameters,
-                                                       nullptr) ||
-             request.keyframes.size() + request.h3_guide_videos.size() >
-                 minimax_h3::kH3MaximumKeyframes ||
-             !MatchesOutputContract(request)) {
+             (!IsPreparedProvider(video) &&
+              !ValidateGenerationParameters(video, request.parameters,
+                                            nullptr)) ||
+             (IsPreparedProvider(video) &&
+              video->validate_parameters != nullptr &&
+              !ValidateGenerationParameters(video, request.parameters,
+                                            nullptr)) ||
+             !MatchesOutputContract(video, request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
-            .error = "invalid MiniMax H3 video job request"};
+            .error = "invalid video job request for " + video->id};
+  }
+  // gufo-studio-windows post-steps (src/cli/serve/media).
+  if (!ValidateVideoPostProcess(request.post, impl_->options.postprocessors,
+                                request.output_format, &post_error)) {
+    return {.result = VideoJobResult::kInvalid,
+            .job = std::nullopt,
+            .error = std::move(post_error)};
   }
 
-  const bool interpolate = request.interpolate > 1 ||
-                           request.interpolate_fps_num > 0;
-  const bool interpolate_valid =
-      request.interpolate >= 1 && request.interpolate <= 8 &&
-      request.interpolate_fps_num >= 0 && request.interpolate_fps_den >= 1 &&
-      request.interpolate_fps_den <= 1001 &&
-      request.interpolate_fps_num <= 240 * request.interpolate_fps_den &&
-      !(request.interpolate > 1 && request.interpolate_fps_num > 0);
-  if (!interpolate_valid ||
-      (interpolate &&
-       (request.output_format != "mp4" || !impl_->options.interpolator))) {
-    return {.result = VideoJobResult::kInvalid,
-            .job = std::nullopt,
-            .error = interpolate_valid && request.output_format == "mp4"
-                         ? "frame interpolation is not enabled on this "
-                           "server (gufo serve video --rife-model)"
-                         : "'interpolate' must be 1..8 or a target fps with "
-                           "MP4 output"};
-  }
-  const VideoUpscale& upscale = request.upscale;
-  if (upscale.enabled()) {
-    const bool shape = upscale.width >= 2 && upscale.height >= 2 &&
-                       upscale.width <= 7680 && upscale.height <= 4320 &&
-                       upscale.width % 2 == 0 && upscale.height % 2 == 0 &&
-                       (upscale.fit == "pad" || upscale.fit == "crop" ||
-                        upscale.fit == "stretch");
-    const auto& models = impl_->options.upscale_models;
-    if (!shape || request.output_format != "mp4" ||
-        !impl_->options.upscaler || models.empty() ||
-        (!upscale.model.empty() &&
-         std::ranges::find(models, upscale.model) == models.end())) {
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = !shape || request.output_format != "mp4"
-                           ? "'upscale' needs an even width and height up to "
-                             "7680x4320, fit pad, crop or stretch, and MP4 "
-                             "output"
-                       : !impl_->options.upscaler || models.empty()
-                           ? "upscaling is not enabled on this server (gufo "
-                             "serve video --upscale-model)"
-                           : "unknown upscale model '" + upscale.model + "'"};
-    }
-  }
   auto job = std::make_shared<Impl::Job>();
   job->request = request;
-  if (!request.lora.empty()) {
-    const auto lora = impl_->options.loras.find(request.lora);
-    if (lora == impl_->options.loras.end()) {
-      return {.result = VideoJobResult::kInvalid,
-              .job = std::nullopt,
-              .error = "unknown LoRA '" + request.lora +
-                       "'; the server registers LoRAs with --lora NAME=PATH"};
-    }
-    if (!request.steps_explicit && lora->second.steps != 0) {
-      job->request.parameters.evaluations = lora->second.steps;
-      // A step-distilled LoRA (turbo, 8 steps) cannot afford the fast/
-      // aggressive presets' step reuse and block skipping: with 8 steps
-      // half of them would be extrapolated and 5-10 blocks dropped, which
-      // produced jumping video and broken audio (11.11.). Run every step on
-      // every block; the preset's internal resolution stays as chosen.
-      job->request.parameters.reuse_interval = 1;
-      job->request.parameters.active_blocks = 50;
-    }
-  }
+
   job->snapshot.id = impl_->options.id_factory();
   job->snapshot.status = VideoJobStatus::kQueued;
   job->snapshot.created_at = impl_->options.now();
-  job->snapshot.model = request.model;
-  job->snapshot.size = request.size;
-  job->snapshot.seconds = request.seconds;
+  // A post-processing-only job is recorded under the served model with a
+  // size and duration every provider recovers after a restart.
+  job->snapshot.model = process_only ? model_id() : request.model;
+  job->snapshot.size = process_only ? std::string("512x512") : request.size;
+  job->snapshot.seconds = process_only ? std::string("1") : request.seconds;
   job->snapshot.output_format = request.output_format;
   if (!IsVideoId(job->snapshot.id)) {
     WipeString(&job->request.prompt);
@@ -1605,19 +1090,11 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->SweepExpiredLocked();
-    if (impl_->recycling) {
-      WipeString(&job->request.prompt);
-      return {.result = VideoJobResult::kIoError,
-              .job = std::nullopt,
-              .error =
-                  "video worker is restarting to release GPU memory; "
-                  "retry shortly"};
-    }
     if (impl_->queue.size() >= impl_->options.queue_capacity) {
       WipeString(&job->request.prompt);
       return {.result = VideoJobResult::kQueueFull,
               .job = std::nullopt,
-              .error = "MiniMax H3 video queue is full"};
+              .error = "video queue is full"};
     }
     if (impl_->jobs.contains(job->snapshot.id)) {
       WipeString(&job->request.prompt);
@@ -1732,7 +1209,7 @@ VideoJobLookupResult VideoJobService::Delete(std::string_view id) {
     job = iterator->second;
     snapshot = job->snapshot;
     job->deleted = true;
-    job->cancellation.Cancel();
+    job->cancelled.store(true, std::memory_order_relaxed);
     WipeString(&job->request.prompt);
     was_active = impl_->active == job;
     std::erase(impl_->queue, job);

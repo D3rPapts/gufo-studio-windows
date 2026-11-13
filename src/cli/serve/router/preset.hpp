@@ -50,6 +50,9 @@ struct RemoteSpec {
   std::optional<RemoteEndpoint> busy_check;
   /// Longest wait for the gpu slot (and the busy check) before 503.
   int queue_timeout_seconds{900};
+  /// placement = pool: longest wait on the partner before a request this
+  /// router can run falls back here (B5 "never stuck").
+  int pool_wait_seconds{60};
   /// Request body limit for this model (0 = only --max-request-bytes).
   std::size_t max_request_bytes{0};
 };
@@ -75,6 +78,11 @@ struct PresetModel {
   /// 200 once ready, as llama-server does. An `args` key puts leading
   /// positional arguments first (`args = serve llm` for another gufo build).
   std::string command;
+  /// `served-model-name` values of a local section other than `id`. Since
+  /// upstream #957 every `gufo serve` modality accepts each repeated
+  /// `--served-model-name` as an alias, so the router routes these names to
+  /// this section too (the request keeps the alias as its `model`).
+  std::vector<std::string> aliases{};
   PresetHints hints{};
   /// Set for `[remote/<id>]` sections, and for a local section with a
   /// `[remote/<id>]` twin of the same id.
@@ -87,14 +95,35 @@ struct PresetModel {
   Placement placement{Placement::kLocal};
 };
 
+/// The worker capability of an external preset derived from its command line
+/// ("serve objekt" -> "image_to_3d"); "" when none is known.
+std::string CapabilityOf(const PresetModel& preset);
+
+/// The optional `[router]` section (2.0.3): users and access control,
+/// see docs/internal/server.md "Users and access". Values are kept as
+/// text; the router resolves them (users-file against the preset's
+/// directory, pool-secret-env against the environment).
+struct RouterSection {
+  bool present{false};
+  std::string auth{"off"};             // off|lan|all
+  std::string auth_loopback{"admin"};  // admin|login
+  std::string users_file;              // "" = <preset dir>/nutzer/nutzer.json
+  std::string pool_secret_env;         // "" = no pool secret
+  /// Comma list of origins (scheme://host[:port]) whose pages may make
+  /// browser writes besides this router's own address (a reverse proxy).
+  std::string csrf_allow_origins;
+};
+
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves
 /// relative path values; when empty, values are passed through unchanged.
 /// Returns false and sets `error` (section-prefixed, e.g.
-/// "[llm/a] Unknown option: --bogus") on any problem.
+/// "[llm/a] Unknown option: --bogus") on any problem. `router` (may be
+/// null) receives the `[router]` section.
 [[nodiscard]] bool LoadPreset(const std::filesystem::path& file,
                               const std::filesystem::path& models_dir,
                               std::vector<PresetModel>* models,
-                              std::string* error);
+                              std::string* error,
+                              RouterSection* router = nullptr);
 
 /// Parses `http://<IPv4>:<port>` (with `allow_path`, an optional path
 /// after it). Returns false and sets `error` otherwise.

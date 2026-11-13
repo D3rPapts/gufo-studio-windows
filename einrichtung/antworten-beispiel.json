@@ -1,0 +1,34 @@
+{
+ "_kommentar": "Beispiel-Antworten fuer einrichten.py (zweite EVO-X2 mit 128 GB, Modelle unter C:\\gufo-modelle wie die .56). Modell-IDs siehe katalog.json; Pflichtmodelle eines Bausteins kommen immer, vorgabe_ram-Modelle (Flash-Next Q3 bei 64, Q4 bei 128) automatisch, der Rest ueber modelle_optional.",
+ "rechner": "evo-56",
+ "ram_gb": 128,
+ "bausteine": ["chat", "bilder", "stimme", "video", "musik", "3d", "werkzeuge", "zweiter-rechner"],
+ "modelle_optional": ["hemmingway-1.5", "lora-anime-consistency", "lora-multiple-angles", "moss-image", "fish-drama-3", "indextts-2.5-german", "voxcpm2-tts", "ming-tts", "wan2.1-uni3c", "wan2.1-infinitetalk-14b", "minimax-h3", "ace-step-1.5-xl-sft", "ace-step-1.5-xl-base", "moss-music-8b", "trellis2", "gufo-rife", "qwen3-omni-captioner"],
+ "modelle_weglassen": [],
+ "pfade": {
+  "modelle": "C:\\gufo-modelle",
+  "app": "C:\\gufo\\2.0.3\\router",
+  "app_35b": "C:\\gufo\\2.0.3\\35b",
+  "app_3d": "C:\\gufo\\2.0.3\\3d",
+  "app_moss": "C:\\gufo\\2.0.3\\moss",
+  "app_d": "C:\\gufo\\2.0.3\\stimme",
+  "app_trellis2": "C:\\gufo\\2.0.3\\trellis2",
+  "daten": "C:\\gufo",
+  "pages": "C:\\gufo\\2.0.3\\pages",
+  "preset": "C:\\gufo\\2.0.3\\gufo-router.ini",
+  "comfy_dir": "C:\\gufo\\2.0.3\\comfy-adapter",
+  "comfy_ffmpeg": "C:\\gufo\\2.0.3\\router\\ffmpeg.exe",
+  "names_file": "C:\\gufo\\2.0.3\\namen\\namen.tsv"
+ },
+ "router": {
+  "port": 8081,
+  "erreichbarkeit": "heimnetz",
+  "adresse": "192.168.100.56",
+  "idle_seconds": 1800,
+  "reserve_mib": 2048,
+  "webhook_allow": "192.168.0.0/16"
+ },
+ "schalter": {"stimmen_vorlage": true},
+ "partner": {"url": "http://192.168.100.198:8081", "modelle": "alle-lokalen", "pool_wait_seconds": null},
+ "lizenzen_bestaetigt": []
+}

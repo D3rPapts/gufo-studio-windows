@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-#include "src/core/platform/fs.hpp"
+#include <gufo/ext/platform/fs.hpp>
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

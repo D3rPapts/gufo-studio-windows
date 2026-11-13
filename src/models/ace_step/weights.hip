@@ -4,7 +4,7 @@
 #include <cstring>
 #include <utility>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/ace_step/weights.hpp"
 
 namespace gufo::models::ace_step {
@@ -145,9 +145,15 @@ bool SafetensorsFile::Open(const std::filesystem::path& path,
     return Fail(error, path.string() + ": " + e.what());
   }
   const std::uint64_t payload = 8 + header_size;
+  metadata_.clear();
   for (const auto& [name, entry] : header.members()) {
-    if (name == "__metadata__")
+    if (name == "__metadata__") {
+      if (entry.is_object())
+        for (const auto& [key, value] : entry.members())
+          if (value.is_string())
+            metadata_[key] = value.str();
       continue;
+    }
     const json::Value* shape = entry.find("shape");
     const json::Value* offsets = entry.find("data_offsets");
     const std::string dtype = entry.member_str("dtype");
@@ -194,7 +200,7 @@ bool SafetensorsFile::Read(std::uint64_t offset, std::size_t bytes, int slot,
   const auto lead = static_cast<std::size_t>(offset - aligned);
   const std::size_t span = (lead + bytes + kSector - 1U) / kSector * kSector;
   auto* buffer = static_cast<std::byte*>(staging_[slot]);
-  if (platform::ReadFileParallel(file_, buffer, span, aligned) < lead + bytes)
+  if (ReadFileParallel(file_, buffer, span, aligned) < lead + bytes)
     return false;
   *data = buffer + lead;
   return true;

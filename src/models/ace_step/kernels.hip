@@ -178,6 +178,18 @@ __global__ void ExpandKernel(const float* in, const float* special, int parts,
   out[i] = in[n * width + c] + special[p * width + c];
 }
 
+__global__ void GroupPrependKernel(const float* in, const float* token,
+                                   int parts, int width, std::size_t count,
+                                   float* out) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::size_t c = i % width, row = i / width;
+  const std::size_t g = row / (parts + 1), p = row % (parts + 1);
+  out[i] = p == 0 ? token[c] : in[(g * parts + p - 1) * width + c];
+}
+
 __global__ void AddKernel(float* x, const float* y, std::size_t count) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -286,6 +298,13 @@ void LaunchExpand(const float* in, const float* special, int rows, int parts,
 void LaunchAdd(float* x, const float* y, std::size_t count,
                hipStream_t stream) {
   AddKernel<<<Blocks(count), kThreads, 0, stream>>>(x, y, count);
+}
+
+void LaunchGroupPrepend(const float* in, const float* token, int groups,
+                        int parts, int width, float* out, hipStream_t stream) {
+  const std::size_t count = std::size_t(groups) * (parts + 1) * width;
+  GroupPrependKernel<<<Blocks(count), kThreads, 0, stream>>>(
+      in, token, parts, width, count, out);
 }
 
 }  // namespace gufo::models::ace_step

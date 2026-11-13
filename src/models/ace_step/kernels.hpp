@@ -69,6 +69,13 @@ void LaunchExpand(const float* in, const float* special, int rows, int parts,
 /// x[i] += y[i] (FP32).
 void LaunchAdd(float* x, const float* y, std::size_t count, hipStream_t stream);
 
+/// Groups of `parts` rows of `in` [groups * parts, width] get `token`
+/// [width] prepended: out[g * (parts + 1), :] = token, out[g * (parts + 1)
+/// + 1 + p, :] = in[g * parts + p, :] (FP32; the attention pooler's
+/// special token).
+void LaunchGroupPrepend(const float* in, const float* token, int groups,
+                        int parts, int width, float* out, hipStream_t stream);
+
 }  // namespace gufo::models::ace_step
 
 #endif  // GUFO_MODELS_ACE_STEP_KERNELS_HPP_

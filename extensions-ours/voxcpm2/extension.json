@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "name": "voxcpm2",
+  "version": "0.2.0",
+  "api_version": ">= 0.3.0",
+  "entry": "voxcpm2_register",
+  "registration_target": "gufo_voxcpm2",
+  "depends": [
+    "ming_tts"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "voxcpm2",
+      "capability": "speech_synthesis",
+      "keys": [
+        "safetensors:voxcpm2"
+      ],
+      "model_ids": [
+        "voxcpm2"
+      ],
+      "target": "gufo_voxcpm2_provider",
+      "entry": "voxcpm2_provider_register",
+      "serving": {
+        "voices": true
+      }
+    }
+  ],
+  "targets": {
+    "gufo_voxcpm2": {
+      "requires": []
+    },
+    "gufo_voxcpm2_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "gufo_voxcpm2_provider": {
+      "requires": []
+    },
+    "voxcpm2_request_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "voxcpm2_oracle_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "voxcpm2_provider_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "voxcpm2_hip_test": {
+      "role": "test",
+      "requires": [
+        "hip",
+        "testing"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "reference/"
+    ]
+  },
+  "docs": {
+    "title": "VoxCPM2",
+    "inputs": "BF16 safetensors + AudioVAE (audiovae.pth or .safetensors); text, optional reference voice and transcript; style in instructions",
+    "guide": "README.md"
+  },
+  "tests": [
+    {
+      "target": "voxcpm2_request_test",
+      "ctest": "voxcpm2.request",
+      "check_pr": true,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "voxcpm2"
+  ],
+  "fixtures": "reference/"
+}

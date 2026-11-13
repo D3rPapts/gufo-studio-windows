@@ -16,7 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::mmaudio {
 namespace {

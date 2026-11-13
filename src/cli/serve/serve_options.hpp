@@ -23,18 +23,20 @@ struct ServerLogOptions {
 };
 
 /// Registers --host, --port, [--sessions], --max-connections,
-/// --max-request-bytes, --api-key, --log-level and -v. `sessions_or_null`
-/// omits --sessions.
+/// --max-request-bytes, --log-level and -v. `sessions_or_null` omits
+/// --sessions. Upstream keeps its own copy private to serve.cpp; this one
+/// serves `gufo router` with the same spelling and help text. There is no
+/// --api-key: upstream dropped API-key auth (#967) and the router follows.
 void AddServerOptions(ArgParser& parser, std::string* host, int* port,
                       std::size_t* sessions_or_null,
                       std::size_t* max_connections,
-                      std::size_t* max_request_bytes, std::string* api_key,
-                      ServerLogOptions* log);
+                      std::size_t* max_request_bytes, ServerLogOptions* log);
 
 /// Checks one preset section: "" when valid, otherwise the message
-/// `gufo serve <modality> argv...` would print. The gufo binary installs the
-/// real check (serve.cpp parses without loading); until one is installed every
-/// section is accepted, which only unit tests without serve.cpp observe.
+/// `gufo serve <modality> argv...` would print. On release/1.4 serve.cpp
+/// installed a parse-only check; upstream v0.31.0 serve.cpp has none, so
+/// (WAVE-A stub) no validator is installed and every section is accepted
+/// here. A bad option then surfaces when the worker starts.
 using ServeArgvValidator = std::string (*)(std::string_view modality,
                                            const std::vector<std::string>& argv);
 void SetServeArgvValidator(ServeArgvValidator validator);

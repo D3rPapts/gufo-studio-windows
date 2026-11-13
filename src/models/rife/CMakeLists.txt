@@ -16,7 +16,8 @@ endif()
 
 # Standalone driver with the same options as `gufo video-interpolate`.
 if (ENGINE_ENABLE_HIP)
-  add_executable(gufo-rife EXCLUDE_FROM_ALL rife_main.cpp
+  add_executable(gufo-rife EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/src/cli/video/rife_main.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/video/video_interpolate.cpp)
   set_target_properties(gufo-rife PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

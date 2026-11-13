@@ -29,12 +29,21 @@ import zlib
 from metrics import compare, comparison_status, join_server_timings, timing_measurement
 
 TESTS = Path(__file__).resolve().parent
-SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
+SUITES = ("discovery", "openai-count-tokens", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
           "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
-          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "responses-logprobs", "batch",
-          "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-instructions", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection", "cache")
+          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-type-unions", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "responses-logprobs", "batch",
+          "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection", "cache")
 # Suites that already run another suite's checks; selecting both repeats the work.
 INCLUDED_IN = {"auto-tools": "tools", "tool-native-types": "tool-native-schemas"}
+# Server --context each suite's histories need. Without an explicit --context
+# the runner starts the server with the largest one selected (8192 at least).
+MIN_CONTEXT = {"cache-stalls": 65536, "cache-depth": 32768, "cache-transforms": 32768,
+               "cache-pressure": 32768, "cache-shared-prefix": 16384, "cache-compaction": 16384,
+               "cache-messages-loop": 16384, "prefill-scheduling": 16384}
+DEFAULT_CONTEXT = 8192
+# These fill the RAM budget before measuring; the default budget sized for the
+# host takes far more requests than they send for a model with small checkpoints.
+NEEDS_CACHE_RAM = ("cache-bridge", "cache-pressure")
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
     "--top-k": ("top_k", int), "--min-p": ("min_p", float),
@@ -50,7 +59,7 @@ COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_override
 
 
 HARNESS_ROOTS = ("run.py", "metrics.py", "progress.py", "stream_start.py", "prefill_scheduling.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
-                 "tool_reasoning.py", "tool_streaming.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_depth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py", "cache_instructions.py", "cache_bridge.py", "system_injection.py",
+                 "tool_reasoning.py", "tool_streaming.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_depth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py", "cache_bridge.py", "system_injection.py",
                  "cache_compaction.py", "cache_workloads.py", "cache_messages_loop.py", "cache_stalls.py",
                  "cache_disk_spacing.py", "cache_persist.py", "tool_images.py",
                  "reasoning_budget.py")
@@ -256,32 +265,12 @@ def image_fixture(path):
         + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
-def host_meminfo():
-    """/proc/meminfo, or its MemAvailable line from GlobalMemoryStatusEx on Windows."""
-    path = Path("/proc/meminfo")
-    if path.is_file() or os.name != "nt":
-        return path.read_text()
-    import ctypes
-
-    class MemoryStatus(ctypes.Structure):
-        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                    ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
-                    ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
-                    ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
-                    ("avail_extended", ctypes.c_ulonglong)]
-
-    status = MemoryStatus()
-    status.length = ctypes.sizeof(status)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-        raise OSError("GlobalMemoryStatusEx failed")
-    return f"MemAvailable: {status.avail_phys // 1024} kB\n"
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
                         help="New report directory; existing results are never overwritten")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"), required=True)
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "provider"), required=True,
+                        help="Expected text defaults; provider reads the served model's own from /props")
     parser.add_argument("--suite", action="append", choices=("all", *SUITES), required=True,
                         help="Repeat to select affected suites; use all for an explicit full run")
     parser.add_argument("--expected-input-modalities", choices=("text", "text,image"),
@@ -306,8 +295,8 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be finite and positive")
-    if set(args.suite) & {"discovery", "messages-image-counts", "all"} and args.expected_input_modalities is None:
-        parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
+    if set(args.suite) & {"discovery", "openai-count-tokens", "messages-image-counts", "all"} and args.expected_input_modalities is None:
+        parser.error("discovery, openai-count-tokens and messages-image-counts require --expected-input-modalities text or text,image")
     if args.allow_missing_progress and not args.record_baseline:
         parser.error("--allow-missing-progress is only for --record-baseline")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -317,8 +306,6 @@ def main():
                      "--cache-disk-staging-bytes"):
         if option(command, reserved) is not None:
             parser.error(f"the test runner owns {reserved}; omit it from the server command")
-    if option(command, "--api-key") is not None:
-        parser.error("omit --api-key for the isolated loopback test server")
     if set(args.suite) & {"image-inputs", "image-count", "tool-images", "image-detail"} and option(command, "--mmproj") is None:
         parser.error("image-inputs, image-count, tool-images, and image-detail require --mmproj in the server command")
     selected = args.suite
@@ -330,7 +317,17 @@ def main():
                          or option(command, "--mmproj") is not None)]
     selected = [suite for suite in dict.fromkeys(selected) if INCLUDED_IN.get(suite) not in selected]
     disk_enabled = bool(set(selected) & {"cache", "image-count"})
+    context_needed = max([DEFAULT_CONTEXT, *(MIN_CONTEXT.get(suite, 0) for suite in selected)])
     try:
+        pressure = [suite for suite in NEEDS_CACHE_RAM if suite in selected]
+        if pressure and option(command, "--cache-ram-bytes") is None:
+            raise ValueError(f"{' and '.join(pressure)} require --cache-ram-bytes in the server "
+                             "command, small enough that their background requests fill it")
+        if option(command, "--context") is not None and \
+                int(option(command, "--context")) < context_needed:
+            raise ValueError(", ".join(f"{suite} needs --context {MIN_CONTEXT[suite]}"
+                                       for suite in selected
+                                       if MIN_CONTEXT.get(suite, 0) > int(option(command, "--context"))))
         overrides = sampling_overrides(command)
         sessions = int(option(command, "--sessions", "4"))
         if not 1 <= sessions <= 8:
@@ -357,7 +354,7 @@ def main():
         port = reserve.getsockname()[1]
     command = [command[0], "serve", "--host", "127.0.0.1", "--port", str(port),
                *command[2:]]
-    for flag, default in (("--sessions", "4"), ("--context", "8192"),
+    for flag, default in (("--sessions", "4"), ("--context", str(context_needed)),
                           ("--served-model-name", "functional-test"),
                           ("--max-pending-per-client", str(max(4, sessions)))):
         if option(command, flag) is None:
@@ -372,7 +369,7 @@ def main():
                          "dspark" if option(command, "--dspark-model") else "off")
     base_url = f"http://127.0.0.1:{port}"
     comparison_command = list(command[1:])
-    for flag in ("--port", "--cache-disk"):
+    for flag in ("--port", "--cache-disk", "--trace"):
         if flag in comparison_command:
             comparison_command[comparison_command.index(flag) + 1] = "<runner-owned>"
     report = {**provenance(), "command": command, "comparison_command": comparison_command,
@@ -451,7 +448,7 @@ def main():
     try:
         if "cache-rotation" in selected:
             from cache_rotation import check_snapshot_budget, host_available_bytes
-            available_before_load = host_available_bytes(host_meminfo())
+            available_before_load = host_available_bytes(Path("/proc/meminfo").read_text())
         startup_started = time.monotonic()
         with server(command, output / "server.log", args.startup_timeout):
             report["startup_ms"] = (time.monotonic() - startup_started) * 1000
@@ -460,7 +457,7 @@ def main():
                     (output / "server.log").read_text(), available_before_load,
                     int(option(command, "--cache-ram-bytes", "0")), sessions)
             configured = bool(set(selected) & {"cache-bridge", "cache-pressure"}) and re.search(
-                r"event=(?:snapshot_cache_configured|configured) .*?\bcapacity_bytes=(\d+)\b",
+                r"event=configured .*?\bcapacity_bytes=(\d+)\b",
                 (output / "server.log").read_text())
             for suite in selected:
                 if suite == "cache":

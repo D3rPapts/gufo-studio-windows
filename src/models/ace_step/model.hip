@@ -18,6 +18,7 @@
 #include "src/models/ace_step/gemm.hpp"
 #include "src/models/ace_step/kernels.hpp"
 #include "src/models/ace_step/model.hpp"
+#include "src/models/ace_step/sampler.hpp"
 #include "src/models/ace_step/weights.hpp"
 
 namespace gufo::models::ace_step {
@@ -69,6 +70,8 @@ struct DitLayer {
   Mlp mlp;
   DeviceBuffer cross_key;     // head-major [8][rows][128]
   DeviceBuffer cross_packed;  // packed values [8][128][PaddedRows(rows)]
+  DeviceBuffer null_key;      // the same for the null condition (1 row)
+  DeviceBuffer null_packed;
 };
 
 // Stacks the rows of `parts` (each [rows_i, columns]) into one BF16 matrix.
@@ -386,6 +389,13 @@ struct Dit::Impl {
   DeviceBuffer detok_embed, detok_embed_bias, detok_special, detok_norm,
       detok_proj, detok_proj_bias;
   std::vector<EncoderLayer> detok_layers;
+  // Audio tokenizer: acoustic projection, attention pooler, FSQ project_in.
+  DeviceBuffer tok_proj, tok_proj_bias;  // [2048, 64]
+  DeviceBuffer pool_embed, pool_embed_bias, pool_token, pool_norm;
+  std::vector<EncoderLayer> pool_layers;
+  std::vector<float> quant_in, quant_in_bias;  // [6, 2048], [6]
+  // Null condition for classifier-free guidance, BF16 [1, 2048].
+  DeviceBuffer null_emb;
   // Activations.
   DeviceBuffer staging, input, hidden, sinusoid, time_hidden, temb, proj,
       temb_r, proj_r, modulation, temb2, out_mod, output;
@@ -425,6 +435,38 @@ struct Dit::Impl {
                  proj_out_values, e.stream);
     // The sinusoid buffer is reused by the next call: wait for its readers.
     return Check(hipStreamSynchronize(e.stream), "time embedding", error);
+  }
+
+  // Projects packed condition states (BF16 [rows, 2048]) through the
+  // condition embedder and every layer's cross-attention key / value
+  // projections into the layers' caches (`null` selects the null set).
+  bool ProjectConditions(const DeviceBuffer& states, int rows, bool null,
+                         std::string* error) {
+    Engine& e = engine;
+    const Shape& s = kDitShape;
+    if (!cond_states.Reserve(std::size_t(rows) * s.width * 2, error) ||
+        !cross_kv.Reserve(std::size_t(rows) * 2 * s.kv_dim() * 2, error) ||
+        !e.value.Reserve(std::size_t(rows) * s.kv_dim() * 2, error) ||
+        !e.Gemm(condition, &condition_bias, states.bf16(), cond_states.bf16(),
+                rows, s.width, kConditionWidth, error))
+      return false;
+    for (DitLayer& l : layers) {
+      DeviceBuffer& key = null ? l.null_key : l.cross_key;
+      DeviceBuffer& packed = null ? l.null_packed : l.cross_packed;
+      if (!key.Reserve(std::size_t(rows) * s.kv_dim() * 2, error) ||
+          !packed.Reserve(std::size_t(PaddedRows(rows)) * s.kv_dim() * 2,
+                          error) ||
+          !e.Gemm(l.cross_attn.kv, nullptr, cond_states.bf16(), cross_kv.bf16(),
+                  rows, 2 * s.kv_dim(), s.width, error))
+        return false;
+      LaunchHeads(cross_kv.bf16(), 2 * s.kv_dim(), 0, rows, s.kv_heads,
+                  l.cross_attn.k_norm.bf16(), false, key.bf16(), e.stream);
+      LaunchHeads(cross_kv.bf16(), 2 * s.kv_dim(), s.kv_dim(), rows,
+                  s.kv_heads, nullptr, false, e.value.bf16(), e.stream);
+      LaunchPackValues(e.value.bf16(), packed.bf16(), rows, s.kv_heads,
+                       e.stream);
+    }
+    return Check(hipStreamSynchronize(e.stream), "conditions", error);
   }
 };
 
@@ -529,6 +571,25 @@ std::unique_ptr<Dit> Dit::Load(const std::filesystem::path& safetensors,
        load("detokenizer.proj_out.weight", std::size_t(kLatentChannels) * ew,
             m.detok_proj) &&
        load("detokenizer.proj_out.bias", kLatentChannels, m.detok_proj_bias);
+  // Audio tokenizer (cover tasks) and the null condition (CFG).
+  ok = ok &&
+       load("tokenizer.audio_acoustic_proj.weight",
+            std::size_t(ew) * kLatentChannels, m.tok_proj) &&
+       load("tokenizer.audio_acoustic_proj.bias", ew, m.tok_proj_bias) &&
+       load("tokenizer.attention_pooler.embed_tokens.weight",
+            std::size_t(ew) * ew, m.pool_embed) &&
+       load("tokenizer.attention_pooler.embed_tokens.bias", ew,
+            m.pool_embed_bias) &&
+       file.Load("tokenizer.attention_pooler.special_token", ew, m.pool_token,
+                 false, error) &&
+       LoadEncoderLayers(file, "tokenizer.attention_pooler.", 2, kEncoderShape,
+                         m.pool_layers, error) &&
+       load("tokenizer.attention_pooler.norm.weight", ew, m.pool_norm) &&
+       file.ReadHost("tokenizer.quantizer.project_in.weight",
+                     std::size_t(6) * ew, &m.quant_in, error) &&
+       file.ReadHost("tokenizer.quantizer.project_in.bias", 6,
+                     &m.quant_in_bias, error) &&
+       load("null_condition_emb", ew, m.null_emb);
   // ConvTranspose1d weight [2560 in, 64 out, 2 taps] -> GEMM rows o * 2 + k.
   std::vector<float> out_weight;
   ok = ok &&
@@ -558,6 +619,11 @@ std::unique_ptr<Dit> Dit::Load(const std::filesystem::path& safetensors,
       !m.modulation.Allocate(6 * w * 4, error) ||
       !m.temb2.Allocate(2 * w * 4, error) ||
       !m.out_mod.Allocate(2 * w * 4, error))
+    return nullptr;
+  // The null condition never changes: its keys / values are cached once.
+  // All rows of the official null batch are the same vector, so one row
+  // attends identically.
+  if (!m.ProjectConditions(m.null_emb, 1, true, error))
     return nullptr;
   return std::unique_ptr<Dit>(new Dit(std::move(impl)));
 }
@@ -630,41 +696,21 @@ bool Dit::SetConditions(std::span<const float> conditions, int rows,
                         std::string* error) {
   Impl& m = *impl_;
   Engine& e = m.engine;
-  const Shape& s = kDitShape;
   if (rows <= 0 || frames <= 0 ||
       conditions.size() != std::size_t(rows) * kConditionWidth ||
       context.size() != std::size_t(frames) * 2 * kLatentChannels)
     return Fail(error, "ACE-Step DiT conditions have wrong sizes");
   if (!e.UploadBf16(conditions, m.staging, m.cond_bf16, error) ||
-      !m.cond_states.Reserve(std::size_t(rows) * s.width * 2, error) ||
-      !m.cross_kv.Reserve(std::size_t(rows) * 2 * s.kv_dim() * 2, error) ||
-      !e.value.Reserve(std::size_t(rows) * s.kv_dim() * 2, error) ||
-      !e.Gemm(m.condition, &m.condition_bias, m.cond_bf16.bf16(),
-              m.cond_states.bf16(), rows, s.width, kConditionWidth, error))
+      !m.ProjectConditions(m.cond_bf16, rows, false, error))
     return false;
-  for (DitLayer& l : m.layers) {
-    if (!l.cross_key.Reserve(std::size_t(rows) * s.kv_dim() * 2, error) ||
-        !l.cross_packed.Reserve(std::size_t(PaddedRows(rows)) * s.kv_dim() * 2,
-                                error) ||
-        !e.Gemm(l.cross_attn.kv, nullptr, m.cond_states.bf16(),
-                m.cross_kv.bf16(), rows, 2 * s.kv_dim(), s.width, error))
-      return false;
-    LaunchHeads(m.cross_kv.bf16(), 2 * s.kv_dim(), 0, rows, s.kv_heads,
-                l.cross_attn.k_norm.bf16(), false, l.cross_key.bf16(),
-                e.stream);
-    LaunchHeads(m.cross_kv.bf16(), 2 * s.kv_dim(), s.kv_dim(), rows, s.kv_heads,
-                nullptr, false, e.value.bf16(), e.stream);
-    LaunchPackValues(e.value.bf16(), l.cross_packed.bf16(), rows, s.kv_heads,
-                     e.stream);
-  }
   m.condition_rows = rows;
   m.context.assign(context.begin(), context.end());
   m.frames = frames;
-  return Check(hipStreamSynchronize(e.stream), "conditions", error);
+  return true;
 }
 
 bool Dit::Velocity(std::span<const float> xt, float t, std::vector<float>* v,
-                   DitProbes* probes, std::string* error) {
+                   DitProbes* probes, std::string* error, bool unconditional) {
   Impl& m = *impl_;
   Engine& e = m.engine;
   const Shape& s = kDitShape;
@@ -733,9 +779,12 @@ bool Dit::Velocity(std::span<const float> xt, float t, std::vector<float>* v,
       return false;
     LaunchHeads(e.qkv.bf16(), s.q_dim(), 0, tokens, s.heads,
                 l.cross_attn.q_norm.bf16(), false, e.query.bf16(), e.stream);
-    LaunchAttention(e.query.bf16(), l.cross_key.bf16(), l.cross_packed.bf16(),
-                    e.attn.bf16(), tokens, m.condition_rows, s.heads,
-                    s.kv_heads, AttentionMask{}, e.stream);
+    LaunchAttention(e.query.bf16(),
+                    unconditional ? l.null_key.bf16() : l.cross_key.bf16(),
+                    unconditional ? l.null_packed.bf16()
+                                  : l.cross_packed.bf16(),
+                    e.attn.bf16(), tokens, unconditional ? 1 : m.condition_rows,
+                    s.heads, s.kv_heads, AttentionMask{}, e.stream);
     if (!e.Gemm(l.cross_attn.out, nullptr, e.attn.bf16(), e.proj.bf16(), tokens,
                 w, s.q_dim(), error))
       return false;
@@ -842,12 +891,103 @@ bool Dit::CodeHints(std::span<const int> codes, int frames,
   return true;
 }
 
+bool Dit::Tokenize(std::span<const float> latents, int frames,
+                   std::span<const float> silence, std::vector<int>* codes,
+                   std::string* error) {
+  Impl& m = *impl_;
+  Engine& e = m.engine;
+  const int ew = kEncoderShape.width;
+  constexpr int kPool = 5;
+  constexpr int kLevels[6] = {8, 8, 8, 5, 5, 5};
+  if (frames <= 0 || latents.size() < std::size_t(frames) * kLatentChannels)
+    return Fail(error, "ACE-Step tokenizer input has the wrong size");
+  const int groups = (frames + kPool - 1) / kPool;
+  const int padded = groups * kPool;
+  if (padded > frames &&
+      silence.size() < std::size_t(padded - frames) * kLatentChannels)
+    return Fail(error, "ACE-Step tokenizer needs silence frames for padding");
+  // Padded latents [padded, 64]: the official `tokenize` appends the first
+  // frames of the silence latent.
+  std::vector<float> input(std::size_t(padded) * kLatentChannels);
+  std::copy_n(latents.begin(), std::size_t(frames) * kLatentChannels,
+              input.begin());
+  for (int f = frames; f < padded; ++f)
+    std::copy_n(silence.begin() + std::size_t(f - frames) * kLatentChannels,
+                kLatentChannels,
+                input.begin() + std::size_t(f) * kLatentChannels);
+  codes->assign(std::size_t(groups), 0);
+  // Groups are independent sequences: work in batches of them.
+  constexpr int kBatchGroups = 256;
+  std::vector<float> pooled(std::size_t(kBatchGroups) * ew);
+  for (int g0 = 0; g0 < groups; g0 += kBatchGroups) {
+    const int count = std::min(kBatchGroups, groups - g0);
+    const int rows5 = count * kPool, rows6 = count * (kPool + 1);
+    const std::span<const float> slice(
+        input.data() + std::size_t(g0) * kPool * kLatentChannels,
+        std::size_t(rows5) * kLatentChannels);
+    if (!e.Reserve(rows6, kEncoderShape, error) ||
+        !m.hidden.Reserve(std::size_t(rows6) * ew * 4, error) ||
+        !m.output.Reserve(std::size_t(rows6) * ew * 4, error) ||
+        !e.UploadBf16(slice, m.staging, m.input, error) ||
+        // audio_acoustic_proj: [rows5, 64] -> [rows5, 2048]
+        !e.Gemm(m.tok_proj, &m.tok_proj_bias, m.input.bf16(), e.proj.bf16(),
+                rows5, ew, kLatentChannels, error) ||
+        // attention_pooler.embed_tokens: [rows5, 2048] -> [rows5, 2048]
+        !e.Gemm(m.pool_embed, &m.pool_embed_bias, e.proj.bf16(), e.qkv.bf16(),
+                rows5, ew, ew, error))
+      return false;
+    LaunchToF32(e.qkv.bf16(), std::size_t(rows5) * ew, m.output.f32(),
+                e.stream);
+    LaunchGroupPrepend(m.output.f32(), m.pool_token.f32(), count, kPool, ew,
+                       m.hidden.f32(), e.stream);
+    if (!e.EncoderLayers(m.pool_layers, kEncoderShape, m.hidden.f32(), rows6,
+                         true, false, error, kPool + 1))
+      return false;
+    LaunchRmsNorm(m.hidden.f32(), m.pool_norm.bf16(), nullptr, nullptr, rows6,
+                  ew, nullptr, m.output.f32(), e.stream);
+    // Row 0 of every group is the pooled representation.
+    if (!Check(hipMemcpy2DAsync(pooled.data(), std::size_t(ew) * 4,
+                                m.output.get(),
+                                std::size_t(kPool + 1) * ew * 4,
+                                std::size_t(ew) * 4, count,
+                                hipMemcpyDeviceToHost, e.stream),
+               "download", error) ||
+        !Check(hipStreamSynchronize(e.stream), "tokenizer", error))
+      return false;
+    // ResidualFSQ (one quantizer) on the host in FP32: project_in, soft
+    // clamp tanh(x / v) * v with v = 1 + 1 / (L - 1), then the bound
+    // floor((L - 1) * (tanh(z) + 1) / 2 + 0.5) and the index.
+    for (int g = 0; g < count; ++g) {
+      const float* row = pooled.data() + std::size_t(g) * ew;
+      int index = 0, basis = 1;
+      for (int l = 0; l < 6; ++l) {
+        double z = m.quant_in_bias[std::size_t(l)];
+        for (int c = 0; c < ew; ++c)
+          z += double(m.quant_in[std::size_t(l) * ew + c]) * double(row[c]);
+        const double levels = kLevels[l];
+        const double clamp = 1.0 + 1.0 / (levels - 1.0);
+        z = std::tanh(z / clamp) * clamp;
+        const double bracket =
+            (levels - 1.0) * (std::tanh(z) + 1.0) / 2.0 + 0.5;
+        const int digit = std::clamp(static_cast<int>(std::floor(bracket)), 0,
+                                     kLevels[l] - 1);
+        index += digit * basis;
+        basis *= kLevels[l];
+      }
+      (*codes)[std::size_t(g0 + g)] = index;
+    }
+  }
+  return true;
+}
+
 // ----------------------------------------------------------------- code LM
 
 namespace {
 
-constexpr Shape kLmShape{2560, 32, 8, 9728};
-constexpr int kLmLayers = 36;
+struct LmShape {
+  Shape shape{2560, 32, 8, 9728};  // Qwen3-4B
+  int layers{36};
+};
 
 struct KvCache {
   DeviceBuffer key, value;  // all layers, concatenated
@@ -859,7 +999,9 @@ struct KvCache {
 
 struct CodeLm::Impl {
   Engine engine;
-  DeviceBuffer embed;  // [vocabulary, 2560]
+  LmShape lm;          // read from the weights
+  DeviceBuffer embed;  // [vocabulary, width]
+  DeviceBuffer head;   // untied lm_head [vocabulary, width], else empty
   std::vector<EncoderLayer> layers;
   DeviceBuffer norm;
   DeviceBuffer hidden, positions, logits;
@@ -869,18 +1011,18 @@ struct CodeLm::Impl {
   std::vector<float> first_logits;
   double codes_per_second{0};
 
-  static std::size_t LayerKeys(const KvCache& c) {
-    return std::size_t(kLmShape.kv_heads) * c.capacity * kHeadDim;
+  std::size_t LayerKeys(const KvCache& c) const {
+    return std::size_t(lm.shape.kv_heads) * c.capacity * kHeadDim;
   }
-  static std::size_t LayerValues(const KvCache& c) {
-    return std::size_t(kLmShape.kv_heads) * PaddedRows(c.capacity) * kHeadDim;
+  std::size_t LayerValues(const KvCache& c) const {
+    return std::size_t(lm.shape.kv_heads) * PaddedRows(c.capacity) * kHeadDim;
   }
 
   bool Allocate(KvCache& c, int capacity, std::string* error) {
     c.capacity = capacity;
     c.length = 0;
-    const std::size_t keys = LayerKeys(c) * kLmLayers * 2;
-    const std::size_t values = LayerValues(c) * kLmLayers * 2;
+    const std::size_t keys = LayerKeys(c) * lm.layers * 2;
+    const std::size_t values = LayerValues(c) * lm.layers * 2;
     return c.key.Reserve(keys, error) && c.value.Reserve(values, error) &&
            Check(hipMemsetAsync(c.key.get(), 0, keys, engine.stream), "memset",
                  error) &&
@@ -894,7 +1036,7 @@ struct CodeLm::Impl {
   bool Layer(int i, int seq, int first, int rows, bool causal,
              std::string* error) {
     Engine& e = engine;
-    const Shape& s = kLmShape;
+    const Shape& s = lm.shape;
     const EncoderLayer& l = layers[i];
     KvCache& c = cache[seq];
     float* x = hidden.f32() + std::size_t(first) * s.width;
@@ -936,11 +1078,12 @@ struct CodeLm::Impl {
   // `out` [n, 64000].
   bool Logits(int n, std::vector<float>* out, std::string* error) {
     Engine& e = engine;
-    const int w = kLmShape.width;
+    const int w = lm.shape.width;
     LaunchRmsNorm(hidden.f32(), norm.bf16(), nullptr, nullptr, n, w,
                   e.normed.bf16(), nullptr, e.stream);
+    const DeviceBuffer& table = head.get() != nullptr ? head : embed;
     if (!logits.Reserve(std::size_t(n) * kCodes * 2, error) ||
-        !e.gemm.Run(embed.bf16() + std::size_t(kFirstCode) * w, nullptr,
+        !e.gemm.Run(table.bf16() + std::size_t(kFirstCode) * w, nullptr,
                     e.normed.bf16(), logits.bf16(), n, kCodes, w, error))
       return false;
     std::vector<std::uint16_t> bits(std::size_t(n) * kCodes);
@@ -969,8 +1112,8 @@ struct CodeLm::Impl {
                "upload", error))
       return false;
     LaunchGather(embed.bf16(), static_cast<const int*>(e.ids.get()),
-                 static_cast<int>(ids.size()), kLmShape.width,
-                 hidden.f32() + std::size_t(first) * kLmShape.width, e.stream);
+                 static_cast<int>(ids.size()), lm.shape.width,
+                 hidden.f32() + std::size_t(first) * lm.shape.width, e.stream);
     return true;
   }
 };
@@ -995,22 +1138,50 @@ std::unique_ptr<CodeLm> CodeLm::Load(const std::filesystem::path& safetensors,
   SafetensorsFile file;
   if (!file.Open(safetensors, impl->engine.stream, error))
     return nullptr;
+  // Qwen3 geometry from the tensors: width from the embedding, heads from
+  // the projections, FFN from gate_proj, layers by counting.
   const auto* embed = file.Find("model.embed_tokens.weight");
-  if (embed == nullptr || embed->shape.size() != 2 ||
-      embed->shape[1] != std::size_t(kLmShape.width) ||
+  const auto* q = file.Find("model.layers.0.self_attn.q_proj.weight");
+  const auto* k = file.Find("model.layers.0.self_attn.k_proj.weight");
+  const auto* gate = file.Find("model.layers.0.mlp.gate_proj.weight");
+  const auto* q_norm = file.Find("model.layers.0.self_attn.q_norm.weight");
+  if (embed == nullptr || embed->shape.size() != 2 || q == nullptr ||
+      q->shape.size() != 2 || k == nullptr || k->shape.size() != 2 ||
+      gate == nullptr || gate->shape.size() != 2 || q_norm == nullptr ||
+      q_norm->count() != std::size_t(kHeadDim) ||
       embed->shape[0] < std::size_t(kFirstCode) + kCodes ||
-      !file.Has("model.layers.35.mlp.down_proj.weight")) {
-    Fail(error, "not an ACE-Step 5 Hz LM (Qwen3-4B): " + safetensors.string());
+      q->shape[1] != embed->shape[1] || q->shape[0] % kHeadDim != 0 ||
+      k->shape[0] % kHeadDim != 0) {
+    Fail(error, "not an ACE-Step 5 Hz LM (Qwen3 with audio codes): " +
+                    safetensors.string());
+    return nullptr;
+  }
+  LmShape& lm = impl->lm;
+  lm.shape.width = static_cast<int>(embed->shape[1]);
+  lm.shape.heads = static_cast<int>(q->shape[0] / kHeadDim);
+  lm.shape.kv_heads = static_cast<int>(k->shape[0] / kHeadDim);
+  lm.shape.ffn = static_cast<int>(gate->shape[0]);
+  lm.layers = 0;
+  while (file.Has("model.layers." + std::to_string(lm.layers) +
+                  ".input_layernorm.weight"))
+    ++lm.layers;
+  if (lm.layers == 0 || lm.shape.heads % lm.shape.kv_heads != 0) {
+    Fail(error, "unexpected ACE-Step LM geometry: " + safetensors.string());
     return nullptr;
   }
   impl->vocabulary = embed->shape[0];
   if (!file.Load("model.embed_tokens.weight", embed->count(), impl->embed, true,
                  error) ||
-      !LoadEncoderLayers(file, "model.", kLmLayers, kLmShape, impl->layers,
+      !LoadEncoderLayers(file, "model.", lm.layers, lm.shape, impl->layers,
                          error) ||
-      !file.Load("model.norm.weight", kLmShape.width, impl->norm, true,
-                 error) ||
-      !file.Finish(error))
+      !file.Load("model.norm.weight", lm.shape.width, impl->norm, true,
+                 error))
+    return nullptr;
+  if (const auto* head = file.Find("lm_head.weight");
+      head != nullptr && head->shape == embed->shape &&
+      !file.Load("lm_head.weight", head->count(), impl->head, true, error))
+    return nullptr;
+  if (!file.Finish(error))
     return nullptr;
   impl->weight_bytes = file.uploaded_bytes();
   return std::unique_ptr<CodeLm>(new CodeLm(std::move(impl)));
@@ -1023,7 +1194,8 @@ bool CodeLm::Generate(std::span<const std::uint32_t> conditional,
                       std::string* error) {
   Impl& m = *impl_;
   Engine& e = m.engine;
-  const int w = kLmShape.width;
+  const int w = m.lm.shape.width;
+  const int layer_count = m.lm.layers;
   const bool guided = sampling.cfg != 1.0F;
   const std::span<const std::uint32_t> prompts[2] = {conditional,
                                                      unconditional};
@@ -1039,7 +1211,7 @@ bool CodeLm::Generate(std::span<const std::uint32_t> conditional,
   const int capacity = longest + count + 1;
   if (!m.hidden.Reserve(std::size_t(longest) * w * 4, error) ||
       !m.positions.Reserve(std::size_t(longest) * 4, error) ||
-      !e.Reserve(longest, kLmShape, error))
+      !e.Reserve(longest, m.lm.shape, error))
     return false;
   for (int q = 0; q < sequences; ++q)
     if (!m.Allocate(m.cache[q], capacity, error))
@@ -1050,7 +1222,7 @@ bool CodeLm::Generate(std::span<const std::uint32_t> conditional,
     const int rows = static_cast<int>(prompts[q].size());
     if (!m.Embed(prompts[q], 0, 0, error))
       return false;
-    for (int i = 0; i < kLmLayers; ++i)
+    for (int i = 0; i < layer_count; ++i)
       if (!m.Layer(i, q, 0, rows, true, error))
         return false;
     m.cache[q].length = rows;
@@ -1129,7 +1301,7 @@ bool CodeLm::Generate(std::span<const std::uint32_t> conditional,
       if (!m.Embed(std::span<const std::uint32_t>(&id, 1), q, m.cache[q].length,
                    error))
         return false;
-    for (int i = 0; i < kLmLayers; ++i)
+    for (int i = 0; i < layer_count; ++i)
       for (int q = 0; q < sequences; ++q)
         if (!m.Layer(i, q, q, 1, false, error))
           return false;
@@ -1144,11 +1316,8 @@ bool CodeLm::Generate(std::span<const std::uint32_t> conditional,
 }
 
 std::vector<float> TurboTimesteps(int steps, float shift) {
-  std::vector<float> t(steps);
-  for (int i = 0; i < steps; ++i) {
-    const double s = 1.0 - static_cast<double>(i) / steps;
-    t[i] = static_cast<float>(shift * s / (1.0 + (shift - 1.0) * s));
-  }
+  std::vector<float> t = MusicTimesteps(steps, shift);
+  t.pop_back();
   return t;
 }
 

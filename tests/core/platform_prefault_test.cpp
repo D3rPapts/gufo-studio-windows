@@ -64,12 +64,12 @@ void CheckReleaseMappedPages() {
 #include <vector>
 
 // Survives NDEBUG: the release builds run these tests too.
-#define REQUIRE(condition)                                                \
-  do {                                                                    \
-    if (!(condition)) {                                                   \
+#define REQUIRE(condition)                                                 \
+  do {                                                                     \
+    if (!(condition)) {                                                    \
       std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); \
-      std::abort();                                                       \
-    }                                                                     \
+      std::abort();                                                        \
+    }                                                                      \
   } while (false)
 
 // Pages of [memory, memory + bytes) in this process's working set.
@@ -78,7 +78,8 @@ std::size_t ResidentPages(const void* memory, std::size_t bytes,
   const std::size_t pages = (bytes + page_size - 1) / page_size;
   std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(pages);
   for (std::size_t i = 0; i < pages; ++i)
-    info[i].VirtualAddress = const_cast<char*>(static_cast<const char*>(memory)) + i * page_size;
+    info[i].VirtualAddress =
+        const_cast<char*>(static_cast<const char*>(memory)) + i * page_size;
   REQUIRE(QueryWorkingSetEx(GetCurrentProcess(), info.data(),
                             static_cast<DWORD>(pages * sizeof(info[0]))));
   std::size_t resident = 0;
@@ -91,21 +92,24 @@ std::size_t ResidentPages(const void* memory, std::size_t bytes,
 // ReleaseMappedPages must trim them while the view keeps its contents.
 void CheckReleaseMappedPages(std::size_t page_size) {
   const std::size_t bytes = page_size * 64;
-  const auto path = std::filesystem::temp_directory_path() /
-                    ("gufo_prefault_test_" + std::to_string(GetCurrentProcessId()));
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("gufo_prefault_test_" + std::to_string(GetCurrentProcessId()));
   {
     std::ofstream out(path, std::ios::binary);
     for (std::size_t i = 0; i < bytes; ++i)
       out.put(static_cast<char>(i % 251));
     REQUIRE(out.good());
   }
-  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE file =
+      CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   REQUIRE(file != INVALID_HANDLE_VALUE);
-  HANDLE section = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  HANDLE section =
+      CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   REQUIRE(section != nullptr);
-  const auto* memory =
-      static_cast<const unsigned char*>(MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0));
+  const auto* memory = static_cast<const unsigned char*>(
+      MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0));
   REQUIRE(memory != nullptr);
   gufo::platform::PrefaultMappedRange(memory, bytes);
   REQUIRE(ResidentPages(memory, bytes, page_size) == bytes / page_size);
@@ -121,6 +125,11 @@ void CheckReleaseMappedPages(std::size_t page_size) {
   REQUIRE(ResidentPages(memory, bytes, page_size) == bytes / page_size);
   gufo::platform::ReleaseMappedPages(memory + 2 * page_size, page_size);
   REQUIRE(ResidentPages(memory, bytes, page_size) == bytes / page_size - 1);
+  // A range starting before the view: only its part inside the view.
+  const auto* before = reinterpret_cast<const void*>(
+      reinterpret_cast<std::uintptr_t>(memory) - page_size);
+  gufo::platform::ReleaseMappedRange(memory, bytes, before, 2 * page_size);
+  REQUIRE(ResidentPages(memory, bytes, page_size) == bytes / page_size - 2);
   REQUIRE(UnmapViewOfFile(memory));
   REQUIRE(CloseHandle(section));
   REQUIRE(CloseHandle(file));

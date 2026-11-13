@@ -172,6 +172,7 @@ void TestRemoteSection() {
       "gpu-slot = studio56\n"
       "busy-check-url = http://192.168.100.56:8085/queue\n"
       "queue-timeout-seconds = 60\n"
+      "pool-wait-seconds = 20\n"
       "max-request-bytes = 67108864\n"
       "\n"
       "[remote/tts]\n"
@@ -197,6 +198,7 @@ void TestRemoteSection() {
   assert(spec.busy_check.has_value() && spec.busy_check->port == 8085 &&
          spec.busy_check->path == "/queue");
   assert(spec.queue_timeout_seconds == 60);
+  assert(spec.pool_wait_seconds == 20);
   assert(spec.max_request_bytes == 67108864u);
   const auto& tts = *models[2].remote;
   // Defaults; a bare trailing slash is no path.
@@ -204,6 +206,7 @@ void TestRemoteSection() {
   assert(tts.connect_timeout_seconds == 3 && tts.head_timeout_seconds == 0);
   assert(tts.gpu_slot.empty() && !tts.busy_check.has_value());
   assert(tts.queue_timeout_seconds == 900 && tts.max_request_bytes == 0);
+  assert(tts.pool_wait_seconds == 60);
 }
 
 void TestRemoteErrors() {
@@ -353,8 +356,42 @@ std::string RejectBogus(std::string_view, const std::vector<std::string>& argv) 
   return {};
 }
 
+// #957: extra `served-model-name` values are aliases of the section; the
+// section id itself never is one, and repeats collapse.
+void TestServedNameAliases() {
+  const auto file = WriteFixture("gufo_router_preset_aliases.conf",
+                                 "[llm/qwen]\n"
+                                 "model = x.gguf\n"
+                                 "served-model-name = qwen\n"
+                                 "served-model-name = gpt-4o\n"
+                                 "served-model-name = gpt-4o\n"
+                                 "served-model-name = local\n"
+                                 "[tts/voice]\n"
+                                 "model = tts\n");
+  std::vector<PresetModel> models;
+  std::string error;
+  assert(LoadPreset(file, "", &models, &error));
+  assert(models.size() == 2);
+  const std::vector<std::string> aliases = {"gpt-4o", "local"};
+  assert(models[0].aliases == aliases);
+  assert(models[1].aliases.empty());
+}
+
+#if !GUFO_ROUTER_FORK_SERVE
+// Without the fork's `gufo serve omni` a local omni section cannot start.
+void TestLocalOmniRejected() {
+  TestErrorMentionsSectionAndToken("gufo_router_preset_omni.conf",
+                                   "[omni/cap]\nmodel = m\n", "[omni/cap]",
+                                   "gufo serve omni");
+}
+#endif
+
 int main() {
   gufo::cli::SetServeArgvValidator(&RejectBogus);
+  TestServedNameAliases();
+#if !GUFO_ROUTER_FORK_SERVE
+  TestLocalOmniRejected();
+#endif
   TestHappyPath();
   TestErrors();
   TestCrlfAndBomMatchLf();

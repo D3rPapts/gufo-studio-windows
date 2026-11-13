@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/platform/pages.hpp"
+#include <gufo/ext/platform/pages.hpp>
 #include "src/models/fish_drama3/hip/backbone_ops.hpp"
 
 namespace gufo::models::fish_drama3::hip {

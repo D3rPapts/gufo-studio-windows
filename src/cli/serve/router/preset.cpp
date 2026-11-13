@@ -10,6 +10,13 @@
 
 #include "src/cli/serve/serve_options.hpp"
 
+// 1 when the build carries the fork-only `gufo serve` modalities (omni,
+// music, foley, upscale) of gufo-studio-windows 1.x; 0 on the plain upstream
+// v0.31.0 serve (WAVE-A). CMake sets it; default 0.
+#ifndef GUFO_ROUTER_FORK_SERVE
+#define GUFO_ROUTER_FORK_SERVE 0
+#endif
+
 namespace gufo::router {
 namespace {
 
@@ -199,6 +206,12 @@ bool ParseRemoteSection(const Section& section, PresetModel* model,
                             "'queue-timeout-seconds' takes 0..86400", error);
       }
       spec.queue_timeout_seconds = static_cast<int>(number);
+    } else if (key == "pool-wait-seconds") {
+      if (!ParseWhole(value, 0, 86400, &number)) {
+        return SectionError(section, "'pool-wait-seconds' takes 0..86400",
+                            error);
+      }
+      spec.pool_wait_seconds = static_cast<int>(number);
     } else if (key == "max-request-bytes") {
       if (!ParseWhole(value, 1, 1LL << 40, &number)) {
         return SectionError(section,
@@ -314,15 +327,60 @@ bool IsReservedKey(std::string_view key) {
   return key == "host" || key == "port" || key == "api-key";
 }
 
+/// `[router]` keys (users and access control, 2.0.3). Values are checked
+/// here so a typo stops the router at start like any other preset error.
+bool ParseRouterSection(const Section& section, RouterSection* out,
+                        std::string* error) {
+  const auto fail = [&](const std::string& message) {
+    *error = "[router] " + message;
+    return false;
+  };
+  for (const auto& [key, value] : section.entries) {
+    if (key == "auth") {
+      if (value != "off" && value != "lan" && value != "all")
+        return fail("auth takes off|lan|all, got '" + value + "'");
+      out->auth = value;
+    } else if (key == "auth-loopback") {
+      if (value != "admin" && value != "login")
+        return fail("auth-loopback takes admin|login, got '" + value + "'");
+      out->auth_loopback = value;
+    } else if (key == "users-file") {
+      if (value.empty())
+        return fail("users-file needs a path");
+      out->users_file = value;
+    } else if (key == "pool-secret-env") {
+      if (value.empty())
+        return fail("pool-secret-env needs an environment variable name");
+      out->pool_secret_env = value;
+    } else if (key == "csrf-allow-origins") {
+      if (value.empty())
+        return fail("csrf-allow-origins needs a comma list of origins "
+                    "(http://host:port)");
+      out->csrf_allow_origins = value;
+    } else {
+      return fail("unknown key '" + key +
+                  "' (auth, auth-loopback, users-file, pool-secret-env, "
+                  "csrf-allow-origins)");
+    }
+  }
+  out->present = true;
+  return true;
+}
+
 bool LoadPreset(const std::filesystem::path& file,
                 const std::filesystem::path& models_dir,
-                std::vector<PresetModel>* models, std::string* error) {
+                std::vector<PresetModel>* models, std::string* error,
+                RouterSection* router) {
   std::ifstream input(file, std::ios::binary);
   if (!input) {
     *error = "cannot open preset file '" + file.string() + "'";
     return false;
   }
   models->clear();
+  RouterSection router_section;
+  if (router == nullptr)
+    router = &router_section;
+  bool router_seen = false;
   // `[remote/<id>]` sections, merged into a local twin of the same id (a
   // switchable model) or kept as remote-only models at the end.
   struct RemoteSection {
@@ -336,6 +394,9 @@ bool LoadPreset(const std::filesystem::path& file,
     if (section.entries.empty()) {
       return SectionError(section, "empty section body", error);
     }
+    if (section.modality == "router") {
+      return ParseRouterSection(section, router, error);
+    }
     if (section.modality == "remote") {
       RemoteSection remote{section, {}, false};
       if (!ParseRemoteSection(section, &remote.model, &remote.placement_given,
@@ -348,10 +409,24 @@ bool LoadPreset(const std::filesystem::path& file,
       models->back().id = section.id;
       return true;
     }
+#if !GUFO_ROUTER_FORK_SERVE
+    // WAVE-A stub: `gufo serve omni` (Qwen3-Omni captioner) exists only in
+    // the release/1.x fork. On the v0.31.0 base a local omni section cannot
+    // start; a [remote/<id>] section with `modality = omni` still works.
+    if (section.modality == "omni") {
+      return SectionError(section,
+                          "local omni workers need the fork's `gufo serve "
+                          "omni` (not in this build); use [remote/<id>] "
+                          "with modality = omni or an [external/<id>] "
+                          "section",
+                          error);
+    }
+#endif
     const bool external = section.modality == "external";
     std::vector<std::string> argv;
     std::string command;
     PresetHints hints;
+    std::vector<std::string> aliases;
     for (const auto& [key, value] : section.entries) {
       if (key.starts_with("router-")) {
         std::string hint_error;
@@ -382,6 +457,10 @@ bool LoadPreset(const std::filesystem::path& file,
         }
         argv.insert(argv.begin(), leading.begin(), leading.end());
         continue;
+      }
+      if (!external && key == "served-model-name" && value != section.id &&
+          std::find(aliases.begin(), aliases.end(), value) == aliases.end()) {
+        aliases.push_back(value);
       }
       if (value == "true") {
         argv.push_back("--" + key);
@@ -423,6 +502,7 @@ bool LoadPreset(const std::filesystem::path& file,
       return SectionError(section, validation, error);
     }
     models->push_back({section.modality, section.id, std::move(argv), {}});
+    models->back().aliases = std::move(aliases);
     models->back().hints = hints;
     return true;
   };
@@ -457,15 +537,35 @@ bool LoadPreset(const std::filesystem::path& file,
                                           ? line.substr(1)
                                           : line.substr(1, close - 1);
       const auto slash = header.find('/');
+      if (close != std::string_view::npos && slash == std::string_view::npos &&
+          TrimSpaces(header) == "router" &&
+          TrimSpaces(line.substr(close + 1)).empty()) {
+        // `[router]`: users and access control, once per file.
+        if (router_seen) {
+          *error = "[router] appears twice";
+          return false;
+        }
+        router_seen = true;
+        section.modality = "router";
+        section.id = "router";
+        in_section = true;
+        continue;
+      }
       if (close == std::string_view::npos || slash == std::string_view::npos ||
           !TrimSpaces(line.substr(close + 1)).empty()) {
         *error = "invalid section header '" + std::string(line) +
-                 "': expected [modality/id]";
+                 "': expected [modality/id] or [router]";
         return false;
       }
       section.modality = std::string(TrimSpaces(header.substr(0, slash)));
       section.id = std::string(TrimSpaces(header.substr(slash + 1)));
       in_section = true;
+      if (section.modality == "router") {
+        // Only the plain `[router]` carries the access keys.
+        *error = "invalid section header '" + std::string(line) +
+                 "': the router section is [router] without an id";
+        return false;
+      }
       if (!IsKnownModality(section.modality)) {
         return SectionError(
             section, "unknown modality '" + section.modality + "'", error);
@@ -548,6 +648,14 @@ bool LoadPreset(const std::filesystem::path& file,
     models->erase(placeholder);
   }
   return true;
+}
+
+std::string CapabilityOf(const PresetModel& preset) {
+  for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
+    if (preset.argv[i] == "serve" && preset.argv[i + 1] == "objekt")
+      return "image_to_3d";
+  }
+  return "";
 }
 
 }  // namespace gufo::router

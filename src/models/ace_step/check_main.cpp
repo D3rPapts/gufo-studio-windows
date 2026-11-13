@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/ace_step/model.hpp"
 #include "src/models/ace_step/tokenizer.hpp"
 #include "src/models/ace_step/vae.hpp"
