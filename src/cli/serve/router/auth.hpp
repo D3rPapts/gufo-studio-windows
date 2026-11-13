@@ -262,9 +262,11 @@ struct Settings {
   /// Environment variable with the shared pool secret and its value.
   std::string pool_secret_env;
   std::string pool_secret;
-  /// Origins (lower case, scheme://host[:port]) whose pages may make
-  /// browser writes besides this router's own address.
+  /// Origins whose pages may make browser writes besides this router's
+  /// own address, normalised (Gate::NormalizeOrigin): set them through
+  /// AllowOrigins so the preset's spelling never matters.
   std::vector<std::string> csrf_allow_origins;
+  void AllowOrigins(const std::vector<std::string>& origins);
 };
 
 /// The pool secret outgoing partner calls carry (remote.cpp adds it to
@@ -434,7 +436,11 @@ public:
   struct OwnerEntry {
     std::string name;
     long long at{0};
+    /// Taken for a request in flight, not confirmed by an answer yet.
     bool reserved{false};
+    /// Requests of `name` sharing the reservation; it goes at 0 unless
+    /// an answer confirmed it.
+    int in_flight{0};
   };
   /// Owners of things the job store does not know: ComfyUI prompts
   /// ("prompt:<id>") and direct video jobs ("video:<id>"), remembered
@@ -442,10 +448,21 @@ public:
   /// first owner wins: false when a live entry names someone else.
   bool RememberOwner(std::string_view key, std::string_view name);
   /// Takes `key` for `name` before the work runs (a client-chosen prompt
-  /// id), atomically: false when someone else holds it. RememberOwner
-  /// confirms it, ReleaseOwner drops a reservation that was not used.
+  /// id), atomically: false when someone else holds it; the same user may
+  /// hold it several times (in flight). RememberOwner confirms it,
+  /// ReleaseOwner ends one holding: a reservation nobody holds and no
+  /// answer confirmed goes.
   bool ReserveOwner(std::string_view key, std::string_view name);
   void ReleaseOwner(std::string_view key, std::string_view name);
+  /// The client-chosen prompt id of a /prompt body, once every check
+  /// passed: reserved for a real user, only checked for a placeholder;
+  /// 409 prompt_id_taken when another user holds it. `key` receives the
+  /// reserved key ("" when nothing was reserved) for ReleaseOwner.
+  [[nodiscard]] std::optional<server::HttpResponse> ReservePrompt(
+      const Identity& who, const json::Value& body, std::string* key);
+  /// "HTTPS://Host:443/" -> "https://host": scheme and host lower case,
+  /// the default port of the scheme dropped, no trailing slash.
+  [[nodiscard]] static std::string NormalizeOrigin(std::string_view origin);
   [[nodiscard]] std::optional<std::string> OwnerOf(std::string_view key);
   /// Browser requests (a cookie session, loopback as admin) that change
   /// something must come from this router's own pages: a cross-site
@@ -455,9 +472,10 @@ public:
   [[nodiscard]] std::optional<server::HttpResponse> CsrfRefusal(
       const server::HttpRequest& req, const Identity& who) const;
   /// The header rule alone (any identity): Sec-Fetch-Site: cross-site,
-  /// or an Origin whose host is not the Host header's host (ports may
-  /// differ: the pages on another port of this machine) and not in
-  /// Settings::csrf_allow_origins.
+  /// or an Origin (normalised, without its scheme) that is not exactly
+  /// the Host header (host and port) and not in
+  /// Settings::csrf_allow_origins (pages on another port of this machine
+  /// need an entry there).
   [[nodiscard]] std::optional<server::HttpResponse> CsrfCheck(
       const server::HttpRequest& req) const;
 

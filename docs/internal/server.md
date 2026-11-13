@@ -1049,7 +1049,7 @@ pool-secret-env = GUFO_POOL_SECRET
 | `auth` | `off` | `off`: everyone may use everything (today's behaviour); the users API and `/verwaltung/` answer from `127.0.0.1` only. `lan`: `127.0.0.1` is admin (see `auth-loopback`), everyone else logs in. `all`: the machine itself logs in too (strangers at the keyboard). |
 | `auth-loopback` | `admin` | With `auth = lan`: whether `127.0.0.1`/`::1` counts as the admin `lokal` without a login (`admin`) or must log in like the LAN (`login`). With `admin` the users API and `/verwaltung/` are open from `127.0.0.1` without a login (emergency path: a forgotten admin password is reset at the machine); with `login` they need an admin session like everything else, and the emergency path is the preset (set `auth-loopback = admin`, restart). |
 | `users-file` | `nutzer\nutzer.json` next to the preset | The users file; a relative path resolves against the preset's directory. `nutzer\filter-woerter.txt` and `nutzer\zugriff.log` live beside it. |
-| `csrf-allow-origins` | none | Comma list of origins (`http://host:port`) whose pages may make browser writes besides this router's own address, e.g. a reverse proxy that rewrites `Host`. Same machine on another port needs no entry. |
+| `csrf-allow-origins` | none | Comma list of origins (`http://host:port`) whose pages may make browser writes besides this router's own address: pages served from another port of this machine (8096, 8090) and reverse proxies that rewrite `Host`. Spelling is normalised (case, default port, trailing slash). |
 | `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
 
 Order per request: free paths (`/health`, `/ready`, `/login/` and its
@@ -1125,11 +1125,10 @@ Everyone else gets `404` on the users API and on `/verwaltung/`, so the
 pages are invisible from outside. Writes to the users API must come as
 `application/json` (`415 json_required`). Every request that changes
 something (not GET/HEAD) from a browser identity, a cookie session or
-loopback-as-admin, must come from this machine's pages:
-`Sec-Fetch-Site: cross-site`, or an `Origin` whose host is not the
-`Host` header's host (the port may differ: the pages on 8096 and the
-transcript server talk to 8081 as the same site, and so does the
-browser's cookie) and not in `csrf-allow-origins`, is `403
+loopback-as-admin, must come from this router's own pages:
+`Sec-Fetch-Site: cross-site`, or an `Origin` that is not exactly the
+`Host` header (host and port; pages on another port of this machine
+need `csrf-allow-origins`) and not in `csrf-allow-origins`, is `403
 csrf_rejected` on any endpoint (users API, model control, generation,
 jobs), so a web page opened on the router machine cannot act through the
 loopback admin path or a signed-in session; tokens, the partner and the
@@ -1138,7 +1137,11 @@ rule guards loopback writes to the users API, `/router/zugriff`,
 `/models/*`, `POST /router/placement` and `/router/pool/pull` (the
 stage in which the first admin is created). The names `lokal` (the
 router itself, loopback) and `partner` (the partner router) are
-reserved: `400 name_reserved`.
+reserved: `400 name_reserved` on creation; a users file from before
+that still loads, such an account is blocked with a warning. The
+router itself, loopback-as-admin and the partner router name no user:
+a job they submit has no owner, their prompts and videos are not
+remembered (open to everyone).
 With `auth = off` the gate still drops a client's `X-Gufo-User`,
 `X-Gufo-Rights`, `X-Gufo-Internal` and `X-Gufo-Pool-Key` headers (not
 the partner's, which carry a checked pool key).
@@ -1151,9 +1154,10 @@ tags and lyrics, and as the floor every string of the graph) and all of
 them count against the daily limit (videos twice). A client-chosen
 `prompt_id` that belongs to another user's history entry is `409
 prompt_id_taken` for everyone, admins included; the id is taken for the
-submitter before the adapter runs (two submits of one id: exactly one
-passes) and given back when the adapter refuses or answers with another
-id. The first owner of an id keeps it. `/props`,
+submitter once every other check passed (a refused submit reserves
+nothing), shared by that user's requests in flight, confirmed by the
+adapter's answer that carries it and given back otherwise (another id,
+a refusal, an exception). The first owner of an id keeps it. `/props`,
 `/sdapi/v1/loras`, `/v1/slots` and `/slots` load the model they name
 (`?model=`) and count as work of that model's area (text, bild, text);
 without a model the router answers `400 missing_model` as before. Beyond the job store the

@@ -4013,13 +4013,8 @@ int RunRouter(std::span<const char* const> args) {
                     ? std::filesystem::absolute(preset_path).parent_path() /
                           router_section.users_file
                     : std::filesystem::path(router_section.users_file));
-  for (std::string origin : router::Split(router_section.csrf_allow_origins, ',')) {
-    origin = router::Lower(origin);
-    while (!origin.empty() && origin.back() == '/')
-      origin.pop_back();
-    if (!origin.empty())
-      auth_settings.csrf_allow_origins.push_back(origin);
-  }
+  auth_settings.AllowOrigins(
+      router::Split(router_section.csrf_allow_origins, ','));
   auth_settings.pool_secret_env = router_section.pool_secret_env;
   if (!auth_settings.pool_secret_env.empty()) {
     if (const char* secret = std::getenv(auth_settings.pool_secret_env.c_str());

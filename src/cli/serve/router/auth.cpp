@@ -608,9 +608,18 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
         continue;
       User user;
       user.name = Lower(item.member_str("name"));
-      if (!IsValidName(user.name) || IsReservedName(user.name)) {
+      if (!IsValidName(user.name)) {
         *error = "users file: bad user name '" + user.name + "'";
         return false;
+      }
+      bool reserved = false;
+      if (IsReservedName(user.name)) {
+        // A file from before the names were reserved: the router starts,
+        // the account is blocked (the name means the router itself or
+        // the partner from now on).
+        reserved = true;
+        Logger::Warn("router", "event=users_file_reserved_name name=" +
+                                   user.name + " action=blocked");
       }
       user.rolle = item.member_str("rolle", "nutzer");
       if (!IsRole(user.rolle))
@@ -655,6 +664,8 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
       if (const json::Value* g = item.find("gesperrt");
           g != nullptr && g->is_bool())
         user.gesperrt = g->as_bool();
+      if (reserved)
+        user.gesperrt = true;
       users.push_back(std::move(user));
     }
   }
@@ -1652,16 +1663,49 @@ bool Gate::ReserveOwner(std::string_view key, std::string_view name) {
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = owners_.find(std::string(key));
-  if (it != owners_.end() && it->second.at >= now - 86400)
-    return it->second.name == name;  // held: only by this user
-  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true);
+  if (it != owners_.end() && it->second.at >= now - 86400) {
+    if (it->second.name != name)
+      return false;  // held: only by this user
+    if (it->second.reserved)
+      ++it->second.in_flight;  // one more request of the same user
+    return true;
+  }
+  if (!TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true))
+    return false;
+  owners_[std::string(key)].in_flight = 1;
+  return true;
 }
 
 void Gate::ReleaseOwner(std::string_view key, std::string_view name) {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = owners_.find(std::string(key));
-  if (it != owners_.end() && it->second.reserved && it->second.name == name)
+  if (it == owners_.end() || !it->second.reserved || it->second.name != name)
+    return;  // confirmed by an answer, or not this user's
+  if (--it->second.in_flight <= 0)
     owners_.erase(it);
+}
+
+std::optional<HttpResponse> Gate::ReservePrompt(const Identity& who,
+                                                const json::Value& body,
+                                                std::string* key) {
+  key->clear();
+  const json::Value* id = body.find("prompt_id");
+  if (id == nullptr || !id->is_string() || id->str().empty())
+    return std::nullopt;
+  const std::string wanted = "prompt:" + id->str();
+  // A placeholder (the router itself, loopback as admin, the partner)
+  // owns nothing: it only must not take a user's id.
+  if (who.placeholder) {
+    if (OwnerOf(wanted).has_value())
+      return AuthError(409, "Conflict", "prompt_id belongs to another user",
+                       "prompt_id_taken");
+    return std::nullopt;
+  }
+  if (!ReserveOwner(wanted, who.name))
+    return AuthError(409, "Conflict", "prompt_id belongs to another user",
+                     "prompt_id_taken");
+  *key = wanted;
+  return std::nullopt;
 }
 
 std::optional<std::string> Gate::OwnerOf(std::string_view key) {
@@ -1672,47 +1716,60 @@ std::optional<std::string> Gate::OwnerOf(std::string_view key) {
   return it->second.name;
 }
 
-namespace {
-/// "host" of "scheme://host[:port]/..." or "host[:port]": lower case, no
-/// port, no IPv6 brackets.
-std::string HostOnly(std::string_view text) {
-  std::string host = Lower(text);
-  if (const auto scheme = host.find("://"); scheme != std::string::npos)
-    host.erase(0, scheme + 3);
-  if (const auto slash = host.find('/'); slash != std::string::npos)
-    host.resize(slash);
-  if (host.starts_with('[')) {
-    if (const auto close = host.find(']'); close != std::string::npos)
-      return host.substr(1, close - 1);
-    return host;
+std::string Gate::NormalizeOrigin(std::string_view text) {
+  std::string origin = Lower(Trim(text));
+  while (!origin.empty() && origin.back() == '/')
+    origin.pop_back();
+  std::string scheme;
+  if (const auto at = origin.find("://"); at != std::string::npos) {
+    scheme = origin.substr(0, at);
+    origin.erase(0, at + 3);
   }
-  if (const auto colon = host.rfind(':'); colon != std::string::npos &&
-                                          host.find(':') == colon)
-    host.resize(colon);
-  return host;
+  if (const auto slash = origin.find('/'); slash != std::string::npos)
+    origin.resize(slash);
+  // The default port of the scheme is what a browser leaves out.
+  const std::string_view default_port =
+      scheme == "https" ? ":443" : scheme == "http" ? ":80" : "";
+  if (!default_port.empty() && origin.ends_with(default_port) &&
+      origin.size() > default_port.size())
+    origin.resize(origin.size() - default_port.size());
+  return scheme.empty() ? origin : scheme + "://" + origin;
 }
-}  // namespace
+
+void Settings::AllowOrigins(const std::vector<std::string>& origins) {
+  csrf_allow_origins.clear();
+  for (const std::string& origin : origins) {
+    const std::string normal = Gate::NormalizeOrigin(origin);
+    if (!normal.empty() && !Contains(csrf_allow_origins, normal))
+      csrf_allow_origins.push_back(normal);
+  }
+}
 
 std::optional<HttpResponse> Gate::CsrfCheck(const HttpRequest& req) const {
   if (Lower(req.header("Sec-Fetch-Site")) == "cross-site")
     return AuthError(403, "Forbidden",
                      "cross-site request refused (Sec-Fetch-Site)",
                      "csrf_rejected");
-  std::string origin = Lower(req.header("Origin"));
-  if (origin.empty() || origin == "null")
+  const std::string raw = req.header("Origin");
+  if (raw.empty() || Lower(raw) == "null")
     return std::nullopt;
-  while (!origin.empty() && origin.back() == '/')
-    origin.pop_back();
+  const std::string origin = NormalizeOrigin(raw);
   if (Contains(settings_.csrf_allow_origins, origin))
     return std::nullopt;
-  // Same machine on another port (the pages on 8096, the transcript
-  // server) is the same site: the browser sends the cookie there too.
-  const std::string host = HostOnly(req.header("Host"));
-  if (host.empty() || HostOnly(origin) != host)
+  // Exactly this router (host and port): the pages on another port of
+  // this machine (8096, 8090) are other sites and need csrf-allow-origins.
+  std::string origin_host = origin;
+  if (const auto at = origin_host.find("://"); at != std::string::npos)
+    origin_host.erase(0, at + 3);
+  // The Host header, normalised the same way (the router speaks http:
+  // ":80" is its default port too).
+  std::string host = NormalizeOrigin("http://" + req.header("Host"));
+  host.erase(0, std::string("http://").size());
+  if (host.empty() || origin_host != host)
     return AuthError(403, "Forbidden",
                      "cross-site request refused (Origin " + origin +
                          " is not this router; csrf-allow-origins lists "
-                         "proxies)",
+                         "other pages and proxies)",
                      "csrf_rejected");
   return std::nullopt;
 }
@@ -1808,23 +1865,6 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
   if (route.kind == Route::Kind::kLogin || route.kind == Route::Kind::kLogout ||
       route.kind == Route::Kind::kMe)
     return std::nullopt;
-  if (who.authenticated() && req.method == "POST" && req.path == "/prompt" &&
-      body != nullptr) {
-    // A client may choose its prompt id: never one that belongs to
-    // another user's history entry, whoever asks (an admin too); taken
-    // now, atomically, so two submits of one id cannot both pass.
-    if (const json::Value* id = body->find("prompt_id");
-        id != nullptr && id->is_string() && !id->str().empty()) {
-      const std::string key = "prompt:" + id->str();
-      const bool mine = who.placeholder
-                            ? !OwnerOf(key).has_value() ||
-                                  *OwnerOf(key) == who.name
-                            : ReserveOwner(key, who.name);
-      if (!mine)
-        return AuthError(409, "Conflict", "prompt_id belongs to another user",
-                         "prompt_id_taken");
-    }
-  }
   if (!who.authenticated()) {
     if (!BearerOf(req).empty())
       return AuthError(401, "Unauthorized", "unknown or expired API token",
@@ -2058,8 +2098,8 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
 
 void Gate::Rewrite(HttpRequest* req, const Identity& who) {
   DropIdentityHeaders(req);
-  if (who.partner_router())
-    return;  // its calls are answered here; it names no user
+  if (who.partner_router() || who.placeholder)
+    return;  // no user to name: a job it submits has no owner
   req->headers.emplace_back(kUserHeader, who.name);
   req->headers.emplace_back(kRightsHeader,
                             "rolle=" + who.rolle + ";" + who.rechte.Encode());
@@ -2079,23 +2119,8 @@ void Gate::After(const HttpRequest& req, const Route& route,
                  const Identity& who, HttpResponse* response,
                  const json::Value* body) {
   const bool pool_user = who.relayed_user();
-  // A prompt id reserved in Refuse: confirmed by the answer that carries
-  // it, released when the adapter refused or used another id.
-  if (req.method == "POST" && req.path == "/prompt" && body != nullptr &&
-      !who.placeholder) {
-    if (const json::Value* id = body->find("prompt_id");
-        id != nullptr && id->is_string() && !id->str().empty()) {
-      std::string answered;
-      if (response->status < 300 && !response->streaming_body) {
-        try {
-          answered = json::parse(response->body).member_str("prompt_id");
-        } catch (const std::exception&) {
-        }
-      }
-      if (answered != id->str())
-        ReleaseOwner("prompt:" + id->str(), who.name);
-    }
-  }
+  (void)body;  // a reserved prompt id is confirmed below by the answer
+                // that carries it; Serve releases what was not confirmed
   // Owners of ComfyUI prompts and direct video jobs come from the answer
   // (never for a placeholder: the router itself, loopback, the partner).
   if (req.method == "POST" && response->status < 300 && !who.placeholder &&
@@ -2573,11 +2598,12 @@ HttpResponse Gate::Serve(
   // API parses its own copy; nothing is re-serialised).
   json::Value submit;
   const json::Value* submit_body = nullptr;
-  if (req.method == "POST" &&
+  if (who.authenticated() && req.method == "POST" &&
       ((req.path == "/v1/jobs" && !who.admin() && !who.trusted()) ||
        req.path == "/prompt")) {
-    // A ComfyUI prompt is parsed for everyone (the prompt id check); the
-    // plan, the filter and the owner bookkeeping reuse the one parse.
+    // Parsed once, for signed-in callers only (an unknown caller gets
+    // its 401 without a parse): the plan, the filter and the prompt id
+    // reuse it.
     try {
       submit = json::parse(req.body);
       submit_body = &submit;
@@ -2600,6 +2626,24 @@ HttpResponse Gate::Serve(
       Log(req, who, code, model);
     }
     return std::move(*refusal);
+  }
+  // A client-chosen prompt id is taken only now, after every check, and
+  // given back on any way out of here (the adapter refused, used another
+  // id, threw) unless the answer confirmed it (After).
+  struct Reservation {
+    Gate* gate;
+    std::string key;
+    std::string name;
+    ~Reservation() {
+      if (!key.empty())
+        gate->ReleaseOwner(key, name);
+    }
+  } reservation{this, {}, who.name};
+  if (submit_body != nullptr && req.path == "/prompt") {
+    if (auto refusal = ReservePrompt(who, *submit_body, &reservation.key)) {
+      Log(req, who, "abgelehnt:prompt_id_taken");
+      return std::move(*refusal);
+    }
   }
   HttpRequest copy = req;
   Rewrite(&copy, who);

@@ -362,12 +362,18 @@ void TestOldFileFormat() {
     std::ofstream out(file, std::ios::binary);
     out << "{\"nutzer\": [{\"name\": \"Alt\", \"rolle\": \"admin\", "
            "\"passwort\": {\"salz\": \"00\", \"hash\": \"ff\", \"runden\": 1}},"
-           " {\"name\": \"ohne\"}]}";
+           " {\"name\": \"ohne\"}, {\"name\": \"partner\", \"rolle\": \"nutzer\"}]}";
   }
   auth::UserStore store(file, kTestRounds);
   std::string error;
   CHECK(store.Load(&error));
-  CHECK_EQ(store.List().size(), std::size_t(2));
+  CHECK_EQ(store.List().size(), std::size_t(3));
+  // A name reserved since 2.0.3 ("partner", "lokal") still loads, as a
+  // blocked account (no refusal to start).
+  CHECK(store.Find("partner").has_value());
+  CHECK(store.Find("partner")->gesperrt);
+  CHECK(store.SetPassword("partner", "abcd", &error));
+  CHECK(!store.Verify("partner", "abcd").has_value());
   const auto alt = store.Find("alt");  // names are lower-cased
   CHECK(alt.has_value());
   CHECK(alt->admin());
@@ -473,6 +479,13 @@ void TestGateOrder() {
   CHECK(lokal.source == auth::Identity::Source::kLoopback);
   CHECK(lokal.admin());
   CHECK_EQ(lokal.name, std::string("lokal"));
+  CHECK(lokal.placeholder);
+  // A placeholder names no user: a job it submits has no owner.
+  const HttpResponse own = f.Serve(Req("POST", "/v1/jobs", "127.0.0.1",
+                                       "{\"request\":{}}"));
+  CHECK_EQ(own.status, 200);
+  CHECK_EQ(f.last.header("X-Gufo-User"), std::string(""));
+  CHECK_EQ(f.last.header("X-Gufo-Rights"), std::string(""));
   // LAN without anything: 401 for the API, 302 for pages.
   HttpResponse r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
                                "{\"model\":\"m\"}"));
@@ -1174,42 +1187,66 @@ void TestFilterAndLimit() {
                     {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 200);
     CHECK(c.gate->OwnerOf("prompt:p-anna") == std::optional<std::string>("anna"));
-    // A new id is taken for the submitter before the adapter runs: two
-    // submits of one id let exactly one through; the reservation of the
-    // refused one is not there, the winner's is confirmed by the answer.
+    // A refused submit reserves nothing: tim (no video area) names id
+    // p-x and is refused, anna may use p-x afterwards.
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    "{\"prompt_id\":\"p-x\",\"prompt\":{},\"tasks\":"
+                    "[{\"area\":\"video\",\"model\":\"minimax-h3\"}]}",
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 403);
+    CHECK(!c.gate->OwnerOf("prompt:p-x").has_value());
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    "{\"prompt_id\":\"p-x\",\"prompt\":{},\"tasks\":[]}",
+                    {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 200);
+    // The adapter answered "p-tim" (c.next above), so p-x went back.
+    CHECK(!c.gate->OwnerOf("prompt:p-x").has_value());
+    // A new id is taken for the submitter once every check passed (the
+    // gate's sequence: ReservePrompt, the adapter, After, release). Two
+    // requests of one user share it; it stays theirs while one is in
+    // flight, and for good once an answer confirmed it.
     {
       const HttpRequest first_req = Req("POST", "/prompt", "192.168.178.50",
                                         "{\"prompt_id\":\"p-neu\",\"prompt\":{},\"tasks\":[]}",
                                         {{"Cookie", cookie}});
-      const HttpRequest second_req = Req("POST", "/prompt", "192.168.178.50",
-                                         "{\"prompt_id\":\"p-neu\",\"prompt\":{},\"tasks\":[]}",
-                                         {{"Cookie", anna}});
-      const json::Value first_body = json::parse(first_req.body);
-      const json::Value second_body = json::parse(second_req.body);
+      const json::Value body = json::parse(first_req.body);
       const auto route = auth::Classify(first_req);
       const auto tim_id = c.gate->Identify(first_req);
-      const auto anna_id = c.gate->Identify(second_req);
-      CHECK(!c.gate->Refuse(first_req, route, tim_id, &first_body).has_value());
-      const auto refused = c.gate->Refuse(second_req, route, anna_id, &second_body);
-      CHECK(refused.has_value() && refused->status == 409);
-      CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
-      // The adapter answered with another id: the reservation goes back.
-      HttpResponse answer{.status = 200, .reason = "OK",
-                          .body = "{\"prompt_id\":\"p-anders\"}"};
-      c.gate->After(first_req, route, tim_id, &answer, &first_body);
-      CHECK(!c.gate->OwnerOf("prompt:p-neu").has_value());
-      CHECK(c.gate->OwnerOf("prompt:p-anders") == std::optional<std::string>("tim"));
-      // A refusal gives it back as well.
-      CHECK(!c.gate->Refuse(second_req, route, anna_id, &second_body).has_value());
+      const auto anna_id = c.gate->Identify(
+          Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", anna}}));
+      std::string key_a;
+      std::string key_b;
+      std::string key_anna;
+      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_a).has_value());
+      CHECK_EQ(key_a, std::string("prompt:p-neu"));
+      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_b).has_value());  // same user, twice
+      const auto taken = c.gate->ReservePrompt(anna_id, body, &key_anna);
+      CHECK(taken.has_value() && taken->status == 409);
+      CHECK(key_anna.empty());
+      // The second request fails at the adapter and goes: the id stays
+      // tim's while the first is still in flight.
       HttpResponse failed{.status = 400, .reason = "Bad Request", .body = "{}"};
-      c.gate->After(second_req, route, anna_id, &failed, &second_body);
-      CHECK(!c.gate->OwnerOf("prompt:p-neu").has_value());
-      // The same id confirmed by the answer stays with its user.
-      CHECK(!c.gate->Refuse(first_req, route, tim_id, &first_body).has_value());
+      c.gate->After(first_req, route, tim_id, &failed, &body);
+      c.gate->ReleaseOwner(key_b, tim_id.name);
+      CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
+      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
+      // The first is confirmed by its answer: the id is tim's for good,
+      // its release is a no-op.
       HttpResponse kept{.status = 200, .reason = "OK",
                         .body = "{\"prompt_id\":\"p-neu\"}"};
-      c.gate->After(first_req, route, tim_id, &kept, &first_body);
+      c.gate->After(first_req, route, tim_id, &kept, &body);
+      c.gate->ReleaseOwner(key_a, tim_id.name);
       CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
+      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
+      // Both in flight, both released without a confirming answer: free.
+      CHECK(!c.gate->ReservePrompt(tim_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_a).has_value());
+      CHECK(!c.gate->ReservePrompt(tim_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_b).has_value());
+      c.gate->ReleaseOwner(key_a, tim_id.name);
+      CHECK(c.gate->OwnerOf("prompt:p-frei") == std::optional<std::string>("tim"));
+      c.gate->ReleaseOwner(key_b, tim_id.name);
+      CHECK(!c.gate->OwnerOf("prompt:p-frei").has_value());
+      CHECK(!c.gate->ReservePrompt(anna_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_anna).has_value());
+      c.gate->ReleaseOwner(key_anna, anna_id.name);
     }
     // Placeholders (the router itself, loopback) own nothing, by source:
     // their answers are not remembered.
@@ -1498,22 +1535,46 @@ void TestUsersApi() {
   r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
                   {{"Cookie", admin}, {"Sec-Fetch-Site", "cross-site"}}));
   CHECK_EQ(r.status, 200);  // reads are never refused
-  // Same machine, another port (the pages on 8096): the same site.
+  // Exactly this router (host and port): another port of this machine
+  // (the pages on 8096, the transcript server) is another site and needs
+  // csrf-allow-origins; a browser's missing default port matches.
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", admin}, {"Origin", "http://192.168.178.198:8096"},
                    {"Host", "192.168.178.198:8081"}}));
-  CHECK_EQ(r.status, 200);
+  CHECK_EQ(r.status, 403);
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", admin}, {"Origin", "http://192.168.178.199:8081"},
                    {"Host", "192.168.178.198:8081"}}));
   CHECK_EQ(r.status, 403);
   r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
                   {{"Origin", "http://[::1]:8096"}, {"Host", "[::1]:8081"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                  {{"Origin", "http://[::1]:8081"}, {"Host", "[::1]:8081"}}));
   CHECK_EQ(r.status, 200);
-  // A proxy named in csrf-allow-origins passes, another does not.
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "http://192.168.178.198:80"},
+                   {"Host", "192.168.178.198"}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "HTTP://192.168.178.198/"},
+                   {"Host", "192.168.178.198:80"}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(auth::Gate::NormalizeOrigin("HTTPS://Gufo.Proxy.Local:443/"),
+           std::string("https://gufo.proxy.local"));
+  CHECK_EQ(auth::Gate::NormalizeOrigin("http://a.b:80"), std::string("http://a.b"));
+  CHECK_EQ(auth::Gate::NormalizeOrigin("http://a.b:8080/"),
+           std::string("http://a.b:8080"));
+  CHECK_EQ(auth::Gate::NormalizeOrigin("https://a.b:80"), std::string("https://a.b:80"));
+  CHECK_EQ(auth::Gate::NormalizeOrigin(" 192.168.178.198:8081 "),
+           std::string("192.168.178.198:8081"));
+  // Pages on another port and a proxy named in csrf-allow-origins pass,
+  // in any spelling; another proxy does not.
   {
     auth::Settings proxied = f.gate->settings();
-    proxied.csrf_allow_origins = {"https://gufo.proxy.local"};
+    proxied.AllowOrigins({"HTTPS://Gufo.Proxy.Local:443/",
+                          "http://192.168.178.198:8096", ""});
+    CHECK_EQ(proxied.csrf_allow_origins.size(), std::size_t(2));
     auth::Gate behind(proxied, f.store, {});
     // Sessions live in the gate: sign in at this one.
     const std::string admin_behind = CookieOf(behind.Serve(
@@ -1530,6 +1591,16 @@ void TestUsersApi() {
                           {"Host", "192.168.178.198:8081"}}),
                      f.next);
     CHECK_EQ(r.status, 403);
+    r = behind.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                         {{"Cookie", admin_behind}, {"Origin", "https://gufo.proxy.local:443"},
+                          {"Host", "192.168.178.198:8081"}}),
+                     f.next);
+    CHECK_EQ(r.status, 200);
+    r = behind.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                         {{"Cookie", admin_behind}, {"Origin", "http://192.168.178.198:8096"},
+                          {"Host", "192.168.178.198:8081"}}),
+                     f.next);
+    CHECK_EQ(r.status, 200);
   }
   r = f.Serve(Req("DELETE", "/router/users/film-56/tokens/csrf", "127.0.0.1"));
   CHECK_EQ(r.status, 200);
@@ -1623,6 +1694,9 @@ void TestModes() {
     CHECK(!f.store->Find("csrf").has_value());
     r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
                     {{"Origin", "http://127.0.0.1:8096"}, {"Host", "127.0.0.1:8081"}}));
+    CHECK_EQ(r.status, 403);  // another port of this machine: another site
+    r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                    {{"Origin", "http://127.0.0.1:8081"}, {"Host", "127.0.0.1:8081"}}));
     CHECK_EQ(r.status, 200);
     r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}"));
     CHECK_EQ(r.status, 200);
