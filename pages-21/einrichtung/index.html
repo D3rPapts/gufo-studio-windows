@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="de" data-seite="einrichtung">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="../gemeinsam/logo/gufo-studio-icon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="../gemeinsam/logo/gufo-studio-icon-32.png">
+<link rel="apple-touch-icon" href="../gemeinsam/logo/gufo-studio-logo-180.png">
+<title data-t="seitentitel">gufo Einrichtung</title>
+<script src="../gemeinsam/sprache.js"></script>
+<!-- Kein anmeldung.js: im Einrichtungs-Zustand (noch kein Admin) antwortet /router/me mit 401 + setup:true, und
+     anmeldung.js würde zur Anmeldeseite schicken. Diese Seite liest /router/me selbst (siehe meLesen()). -->
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --text:#1d1d1f; --muted:#6b6b70; --line:#dcdcd7; --accent:#5b4fc4; --ok:#1e7a3c; --warn:#a15c00; --err:#b3261e; --chip:#efeef8; --on-accent:#fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; --on-accent:#1d1d1f; } }
+  :root[data-theme="dark"] { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; --on-accent:#1d1d1f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  h2 { font-size:17px; margin:18px 0 8px; }
+  h3 { font-size:15px; margin:14px 0 6px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:0 0 10px; }
+  .m { color:var(--muted); } .ok { color:var(--ok); font-weight:600; } .warn { color:var(--warn); font-weight:600; } .err { color:var(--err); font-weight:600; }
+  .klein { font-size:12.5px; color:var(--muted); }
+  code { font-size:12.5px; background:var(--chip); padding:0 4px; border-radius:4px; overflow-wrap:anywhere; }
+  .hinweis { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:10px; padding:10px 14px; font-size:14px; margin:0 0 12px; }
+  .hinweis.warn { border-left-color:var(--warn); } .hinweis.err { border-left-color:var(--err); } .hinweis.ok { border-left-color:var(--ok); }
+  /* Schritte-Leiste: sechs Knöpfe, auf dem Handy nur Nummern (Name steht dann über dem Schritt). */
+  .schritte { display:flex; gap:4px; margin:12px 0 14px; }
+  .schritte button { flex:1 1 0; min-width:0; min-height:44px; font:inherit; font-size:13.5px; padding:4px 6px; border-radius:8px; cursor:pointer; background:var(--card); color:var(--text); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; gap:6px; }
+  .schritte button b { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:50%; border:1px solid var(--muted); font-size:12.5px; flex:none; }
+  .schritte button span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .schritte button[aria-current="step"] { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:600; }
+  .schritte button[aria-current="step"] b { border-color:var(--on-accent); }
+  .schritte button.fertig b { background:var(--ok); border-color:var(--ok); color:#fff; }
+  .schritte button:disabled { opacity:.5; cursor:default; }
+  @media (max-width:640px) { .schritte button span { display:none; } .schritte button { padding:4px 2px; } }
+  section[data-schritt] { display:none; } section[data-schritt].aktiv { display:block; }
+  .knoepfe { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:12px 0 0; }
+  button { font:inherit; font-size:14px; min-height:40px; padding:6px 14px; border-radius:8px; cursor:pointer; background:transparent; color:var(--text); border:1px solid var(--line); }
+  button:hover:not(:disabled) { border-color:var(--muted); } button:disabled { opacity:.5; cursor:default; }
+  button.haupt { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:600; }
+  button.gefahr { color:var(--err); }
+  @media (max-width:640px), (pointer:coarse) { button { min-height:44px; } }
+  .wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12.5px; }
+  .punkt { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:6px; vertical-align:-1px; background:var(--muted); }
+  .punkt.ok { background:var(--ok); } .punkt.warn { background:var(--warn); } .punkt.err { background:var(--err); }
+  .kennzahlen { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap:8px; margin:0 0 10px; }
+  .kennzahl { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .kennzahl .wert { font-size:19px; font-weight:600; } .kennzahl .name { font-size:12.5px; color:var(--muted); }
+  /* Bausteine: Kacheln mit Haken, darin die Modelle (Pflicht fest, optionale mit Haken). */
+  .kacheln { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap:10px; }
+  .kachel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  .kachel.an { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .kachel > label { display:flex; align-items:flex-start; gap:10px; cursor:pointer; min-height:44px; }
+  .kachel > label input { width:20px; height:20px; margin-top:3px; flex:none; }
+  .kachel .titel { font-size:16px; font-weight:600; } .kachel .gb { color:var(--muted); font-size:13px; }
+  .kachel .beschreibung { font-size:13px; color:var(--muted); margin:2px 0 6px; }
+  .modelle { margin:6px 0 0; padding:0; list-style:none; font-size:13.5px; }
+  .modelle li { display:flex; align-items:flex-start; gap:8px; padding:4px 0; border-top:1px solid var(--line); }
+  .modelle input { width:18px; height:18px; margin-top:3px; flex:none; }
+  .modelle .mname { flex:1; min-width:0; }
+  .chip { display:inline-block; padding:0 6px; margin:1px 2px 1px 0; border-radius:6px; background:var(--chip); font-size:12px; white-space:nowrap; }
+  .chip.warn { background:color-mix(in srgb, var(--warn) 22%, transparent); } .chip.err { background:color-mix(in srgb, var(--err) 22%, transparent); } .chip.ok { background:color-mix(in srgb, var(--ok) 18%, transparent); }
+  .summe { position:sticky; bottom:0; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:8px 12px; margin:12px 0 0; font-size:14px; display:flex; flex-wrap:wrap; gap:4px 16px; }
+  .lizenzen label { display:flex; gap:8px; align-items:flex-start; padding:6px 0; border-top:1px solid var(--line); font-size:13.5px; min-height:40px; }
+  .lizenzen label input { width:18px; height:18px; margin-top:3px; flex:none; }
+  form.gitter { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; }
+  form.gitter .voll { grid-column:1 / -1; }
+  @media (max-width:700px) { form.gitter { grid-template-columns:1fr; } }
+  label { display:block; font-size:13px; color:var(--muted); margin:4px 0 2px; }
+  label .hint { display:block; font-size:12px; line-height:1.35; color:var(--muted); font-weight:400; }
+  input[type=text], input[type=password], input[type=number], input[type=url], select { width:100%; font:inherit; font-size:15px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); min-height:40px; }
+  .kaestchen label { display:inline-flex; align-items:center; gap:6px; color:var(--text); font-size:14px; min-height:36px; margin:0 14px 0 0; }
+  .kaestchen input { width:18px; height:18px; }
+  progress { width:100%; height:12px; border-radius:6px; }
+  .dl { font-size:13.5px; } .dl li { display:grid; grid-template-columns:1fr auto; gap:2px 10px; padding:6px 0; border-top:1px solid var(--line); list-style:none; }
+  .dl li .pfad { overflow-wrap:anywhere; } .dl li progress { grid-column:1 / -1; height:8px; }
+  .dl { padding:0; margin:0; }
+  pre.text { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12.5px; overflow:auto; max-height:420px; margin:0; white-space:pre; }
+  .meldung { font-size:14px; min-height:20px; margin:8px 0 0; }
+  .meldung.err { color:var(--err); font-weight:600; } .meldung.warn { color:var(--warn); } .meldung.ok { color:var(--ok); font-weight:600; }
+  .tests li { list-style:none; display:flex; gap:8px; align-items:flex-start; padding:6px 0; border-top:1px solid var(--line); font-size:14px; }
+  .tests { padding:0; margin:0; } .tests .dauer { margin-left:auto; color:var(--muted); white-space:nowrap; }
+</style>
+</head>
+<body>
+<main>
+<h1 data-t="titel">Einrichtung – gufo auf diesem Rechner</h1>
+<p class="sub"><span data-t="sub">Sechs Schritte: Rechner prüfen, Bausteine wählen, Speicherort, Herunterladen, Einstellungen und Preset, Selbsttest. Alles läuft über den Router auf diesem Rechner; nur vom Rechner selbst (127.0.0.1) oder als Admin.</span> <span id="stand" class="m"></span></p>
+
+<div class="hinweis err" id="zuAlt" hidden data-t="zualt.html">Dieser Router kennt die Einrichtung noch nicht (<code>/router/setup/…</code> fehlt). Die Seite braucht <b>gufo-studio-windows ab 2.1</b>. Bitte die neue Version entpacken und <code>gufo-einrichten.cmd</code> starten.</div>
+<div class="hinweis err" id="weg" hidden data-t="weg.html">Router nicht erreichbar. Läuft <code>gufo-einrichten.cmd</code>? Die Seite versucht es alle 5 Sekunden erneut.</div>
+<div class="hinweis err" id="gesperrt" hidden data-t="gesperrt.html">Diese Seite ist nur vom Rechner selbst (<code>127.0.0.1</code>) oder in einer Admin-Sitzung erreichbar. Bitte als Admin anmelden: <a href="/login/?zurueck=/einrichtung/">Anmelden</a>.</div>
+<div class="hinweis warn" id="setupHinweis" hidden data-t="setup.html">Noch kein Admin-Konto. Du legst es in <b>Schritt 5</b> an; bei „Heimnetz“ ist es Pflicht, bei „nur dieser Rechner“ ein Angebot.</div>
+
+<nav class="schritte" id="schritte" aria-label="Schritte">
+  <button type="button" data-ziel="1"><b>1</b><span data-t="s1.kurz">Rechner</span></button>
+  <button type="button" data-ziel="2"><b>2</b><span data-t="s2.kurz">Bausteine</span></button>
+  <button type="button" data-ziel="3"><b>3</b><span data-t="s3.kurz">Speicherort</span></button>
+  <button type="button" data-ziel="4"><b>4</b><span data-t="s4.kurz">Herunterladen</span></button>
+  <button type="button" data-ziel="5"><b>5</b><span data-t="s5.kurz">Preset</span></button>
+  <button type="button" data-ziel="6"><b>6</b><span data-t="s6.kurz">Selbsttest</span></button>
+</nav>
+
+<!-- Schritt 1: Rechner prüfen -->
+<section data-schritt="1">
+  <h2 data-t="s1.titel">Schritt 1 – Rechner prüfen</h2>
+  <p class="klein" data-t="s1.sub">Grün = passt, Gelb = Hinweis, Rot = so startet gufo nicht. Daten aus <code>/router/status</code> und <code>/router/setup/pruefen</code>.</p>
+  <div class="kennzahlen" id="kennzahlen"></div>
+  <div class="wrap"><table data-karten id="pruefung">
+    <thead><tr><th data-t="s1.sp.punkt">Prüfpunkt</th><th data-t="s1.sp.ergebnis">Ergebnis</th><th data-t="s1.sp.tun">Was zu tun ist</th></tr></thead>
+    <tbody id="pruefungBody"><tr><td colspan="3" class="m" data-t="lade">wird gelesen …</td></tr></tbody>
+  </table></div>
+  <div class="knoepfe"><button type="button" id="s1Neu" data-t="s1.neu">Neu prüfen</button><span class="meldung" id="s1Meldung" aria-live="polite"></span></div>
+</section>
+
+<!-- Schritt 2: Bausteine wählen -->
+<section data-schritt="2">
+  <h2 data-t="s2.titel">Schritt 2 – Bausteine wählen</h2>
+  <p class="klein" data-t="s2.sub">Je Kachel: Platz auf der Platte, Lizenz in einem Satz, Vorgabe nach Speichergröße. Pflichtmodelle eines Bausteins kommen immer; optionale einzeln ankreuzen.</p>
+  <div class="card kaestchen">
+    <label><span data-t="s2.ram">Speicher des Rechners:</span></label>
+    <label><input type="radio" name="ram" value="64"> 64 GB</label>
+    <label><input type="radio" name="ram" value="128"> 128 GB</label>
+    <span class="klein" id="ramHinweis"></span>
+  </div>
+  <div class="kacheln" id="kacheln"><div class="m" data-t="lade">wird gelesen …</div></div>
+  <h3 data-t="s2.lizenzen">Lizenzen, die du bestätigen musst</h3>
+  <div class="card lizenzen" id="lizenzen"><span class="m" data-t="s2.lizenzen.keine">Keine – die gewählten Modelle brauchen keine Bestätigung.</span></div>
+  <div class="summe" id="summe"></div>
+</section>
+
+<!-- Schritt 3: Speicherort -->
+<section data-schritt="3">
+  <h2 data-t="s3.titel">Schritt 3 – Speicherort</h2>
+  <p class="klein" data-t="s3.sub.html">Modelle liegen im Baum <code>modelle\&lt;Hersteller&gt;\&lt;Modell&gt;</code>, auf jedem eingerichteten Rechner gleich. Vorgabe: das Laufwerk mit dem meisten freien Platz.</p>
+  <form class="gitter card" id="s3Form" autocomplete="off">
+    <div><label for="pfModelle" data-t="s3.modelle">Ordner für Modelle</label><input type="text" id="pfModelle" spellcheck="false" placeholder="D:\gufo\modelle"></div>
+    <div><label for="pfDaten" data-t="s3.daten">Ordner für Ablage, Aufträge und Caches</label><input type="text" id="pfDaten" spellcheck="false" placeholder="D:\gufo"></div>
+    <div><label for="pfApp" data-t="s3.app">Programmordner (gufo.exe)</label><input type="text" id="pfApp" spellcheck="false" readonly></div>
+    <div><label for="rechner" data-t="s3.rechner">Name dieses Rechners (für Preset und Pool)</label><input type="text" id="rechner" spellcheck="false" placeholder="evo-1"></div>
+    <div class="voll" id="laufwerke"></div>
+    <div class="voll knoepfe"><button type="button" id="s3Pruefen" data-t="s3.pruefen">Ordner prüfen</button><span class="meldung" id="s3Meldung" aria-live="polite"></span></div>
+  </form>
+</section>
+
+<!-- Schritt 4: Herunterladen -->
+<section data-schritt="4">
+  <h2 data-t="s4.titel">Schritt 4 – Herunterladen</h2>
+  <p class="klein" data-t="s4.sub">Der Router lädt selbst von Hugging Face: höchstens zwei Dateien gleichzeitig, mit Fortsetzen nach Abbruch und Prüfsumme. Dateien, die schon da sind, werden übersprungen.</p>
+  <div class="card">
+    <div class="kennzahlen">
+      <div class="kennzahl"><div class="wert" id="dlGesamt">–</div><div class="name" data-t="s4.gesamt">gesamt</div></div>
+      <div class="kennzahl"><div class="wert" id="dlGeladen">–</div><div class="name" data-t="s4.geladen">geladen</div></div>
+      <div class="kennzahl"><div class="wert" id="dlRate">–</div><div class="name" data-t="s4.rate">Geschwindigkeit</div></div>
+      <div class="kennzahl"><div class="wert" id="dlRest">–</div><div class="name" data-t="s4.rest">Rest etwa</div></div>
+    </div>
+    <progress id="dlBalken" max="100" value="0"></progress>
+    <label for="hfToken" data-t="s4.token">Hugging-Face-Token (nur, wenn ein Modell es verlangt; wird nicht gespeichert)</label>
+    <input type="password" id="hfToken" autocomplete="off" spellcheck="false">
+    <div class="knoepfe">
+      <button type="button" class="haupt" id="dlStart" data-t="s4.start">Herunterladen starten</button>
+      <button type="button" id="dlPause" hidden data-t="s4.pause">Pause</button>
+      <button type="button" id="dlWeiter" hidden data-t="s4.weiter">Weiter</button>
+      <button type="button" class="gefahr" id="dlAbbrechen" hidden data-t="s4.abbrechen">Abbrechen</button>
+      <span class="meldung" id="s4Meldung" aria-live="polite"></span>
+    </div>
+  </div>
+  <ul class="dl" id="dlListe"></ul>
+</section>
+
+<!-- Schritt 5: Einstellungen, Admin-Konto, Preset -->
+<section data-schritt="5">
+  <h2 data-t="s5.titel">Schritt 5 – Einstellungen und Preset</h2>
+  <form class="gitter card" id="s5Form" autocomplete="off">
+    <div><label for="port" data-t="s5.port">Port</label><input type="number" id="port" min="1" max="65535" value="8081"></div>
+    <div><label data-t="s5.erreichbarkeit">Erreichbarkeit</label>
+      <div class="kaestchen"><label><input type="radio" name="erreichbarkeit" value="nur-dieser-rechner" checked> <span data-t="s5.nur">nur dieser Rechner</span></label>
+      <label><input type="radio" name="erreichbarkeit" value="heimnetz"> <span data-t="s5.heimnetz">Heimnetz (Firewall-Regel)</span></label></div></div>
+    <div><label for="idle" data-t="s5.idle">Leerlauf: Modelle entladen nach (Sekunden)</label><input type="number" id="idle" min="60" step="60" value="1800"></div>
+    <div><label for="adresse" data-t="s5.adresse">Eigene IPv4-Adresse (nur für den zweiten Rechner nötig)</label><input type="text" id="adresse" spellcheck="false" placeholder="192.168.100.56"></div>
+    <div class="voll kaestchen"><label><input type="checkbox" id="autostart" checked> <span data-t="s5.autostart">Autostart als geplante Aufgabe (braucht Admin-Rechte von Windows)</span></label></div>
+    <div class="voll" id="partnerBlock" hidden>
+      <label for="partnerUrl" data-t="s5.partner">Zweiter Rechner (Pool): Adresse <span class="hint">http://IPv4:Port – nur IPv4, der Router verlangt es.</span></label>
+      <input type="url" id="partnerUrl" spellcheck="false" placeholder="http://192.168.100.198:8081">
+    </div>
+  </form>
+
+  <div class="card" id="adminKarte" hidden>
+    <h3 data-t="s5.admin.titel">Admin-Konto anlegen</h3>
+    <p class="klein" data-t="s5.admin.sub">Noch kein Admin auf diesem Router. Mit dem Konto meldest du dich später an jeder Seite an; bei „Heimnetz“ ist es Pflicht.</p>
+    <form class="gitter" id="adminForm" autocomplete="off">
+      <div><label for="adminName" data-t="s5.admin.name">Name (a–z, 0–9, . _ -)</label><input type="text" id="adminName" autocapitalize="none" spellcheck="false" pattern="[a-z0-9._-]{1,32}"></div>
+      <div><label for="adminPasswort" data-t="s5.admin.passwort">Passwort (mind. 4 Zeichen)</label><input type="password" id="adminPasswort" autocomplete="new-password"></div>
+      <div class="voll knoepfe"><button type="submit" id="adminAnlegen" data-t="s5.admin.anlegen">Admin anlegen</button><span class="meldung" id="adminMeldung" aria-live="polite"></span></div>
+    </form>
+  </div>
+
+  <div class="knoepfe">
+    <button type="button" id="presetVorschau" data-t="s5.vorschau">Vorschau erzeugen</button>
+    <button type="button" class="haupt" id="presetSchreiben" disabled data-t="s5.schreiben">Preset schreiben</button>
+    <span class="meldung" id="s5Meldung" aria-live="polite"></span>
+  </div>
+  <h3 data-t="s5.preset">gufo-router.ini (Vorschau)</h3>
+  <pre class="text" id="presetText" data-t="s5.preset.leer">(noch keine Vorschau – oben „Vorschau erzeugen“)</pre>
+  <h3 data-t="s5.bericht">Bericht</h3>
+  <pre class="text" id="berichtText"></pre>
+</section>
+
+<!-- Schritt 6: Selbsttest -->
+<section data-schritt="6">
+  <h2 data-t="s6.titel">Schritt 6 – Selbsttest</h2>
+  <p class="klein" data-t="s6.sub">Der Router startet mit dem neuen Preset und lässt je Baustein eine kleine Anfrage laufen (ein Satz Text, ein 512er-Bild, drei Sekunden Stimme, eine Sekunde Video, ein 3D-Objekt). Nacheinander, weil immer nur ein Modell im Speicher ist.</p>
+  <div class="knoepfe">
+    <button type="button" class="haupt" id="testStart" data-t="s6.start">Selbsttest starten</button>
+    <a id="fertigLink" class="haupt" hidden href="/start/" style="display:inline-flex;align-items:center;min-height:40px;padding:6px 14px;border-radius:8px;background:var(--ok);color:#fff;text-decoration:none;font-weight:600" data-t="s6.fertig">Fertig – Startseite öffnen</a>
+    <span class="meldung" id="s6Meldung" aria-live="polite"></span>
+  </div>
+  <ul class="tests" id="tests"></ul>
+</section>
+
+<div class="knoepfe" id="navi">
+  <button type="button" id="zurueck" data-t="zurueck">Zurück</button>
+  <button type="button" class="haupt" id="weiter" data-t="weiter">Weiter</button>
+  <span class="klein" id="naviHinweis"></span>
+</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const T = (k, d, v) => window.gufoT ? gufoT(k, d, v) : d.replace(/\{(\w+)\}/g, (m, n) => (v && n in v ? v[n] : m));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const gb = b => (Number(b || 0) / 1e9).toLocaleString(document.documentElement.lang === 'en' ? 'en-US' : 'de-DE', { maximumFractionDigits: 1 }) + ' GB';
+const REIHENFOLGE = ['chat', 'bilder', 'stimme', 'video', 'musik', '3d', 'werkzeuge', 'zweiter-rechner'];
+const SCHRITTE = 6;
+
+// ---------------------------------------------------------------------------------------------- Zustand
+// `antworten` hat genau die Form von antworten.json (einrichtung\einrichten.py), damit POST /router/setup/preset
+// dieselbe Eingabe bekommt wie das unbeaufsichtigte Skript. Wird im Browser zwischengespeichert (Neuladen tut nicht weh).
+let antworten = {
+  rechner: '', ram_gb: 128, bausteine: ['chat'], modelle_optional: [], modelle_weglassen: [],
+  pfade: { modelle: '', app: '', daten: '' },
+  router: { port: 8081, erreichbarkeit: 'nur-dieser-rechner', adresse: '', idle_seconds: 1800, reserve_mib: 2048, webhook_allow: '127.0.0.1' },
+  schalter: {}, partner: { url: '', modelle: 'alle-lokalen' }, lizenzen_bestaetigt: [], autostart: true
+};
+let katalog = null;            // GET /router/setup/katalog
+let pruefung = null;           // GET /router/setup/pruefen
+let me = null;                 // GET /router/me (setup, auth, quelle)
+let schritt = 1;
+let fertig = new Set();        // abgeschlossene Schritte
+let dlTimer = null, testTimer = null, wegTimer = null;
+let presetOk = false;
+
+const speicher = {
+  laden() { try { const s = localStorage.getItem('gufo-einrichtung'); if (s) { const d = JSON.parse(s); antworten = Object.assign(antworten, d.antworten || {}); schritt = d.schritt || 1; fertig = new Set(d.fertig || []); } } catch (e) {} },
+  sichern() { try { localStorage.setItem('gufo-einrichtung', JSON.stringify({ antworten, schritt, fertig: [...fertig] })); } catch (e) {} }
+};
+
+// ---------------------------------------------------------------------------------------------- Router-Schicht
+// Alle Aufrufe gehen hier durch. 404 auf /router/setup/* heißt: Router ohne Einrichtung (vor 2.1) – die Seite zeigt
+// das einmal oben an und bricht nicht. Netzfehler: Hinweis „nicht erreichbar“ + Wiederholung alle 5 s.
+async function api(pfad, methode, body) {
+  let r;
+  try {
+    r = await fetch(pfad, { method: methode || 'GET', cache: 'no-store', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) {
+    $('weg').hidden = false;
+    if (!wegTimer) wegTimer = setTimeout(() => { wegTimer = null; start(); }, 5000);
+    const err = new Error(T('fehler.netz', 'Router nicht erreichbar.')); err.netz = true; throw err;
+  }
+  $('weg').hidden = true;
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 404 && pfad.indexOf('/router/setup/') === 0) {
+    // Der Router kennt den Pfad nicht (vor 2.1) – oder er versteckt die Admin-Pfade (nicht Loopback, kein Admin).
+    // Beides zeigt der Router als 404; der Unterschied: ein 2.1-Router sagt in /router/me "setup_api": true.
+    if (me && me.setup_api === true) $('gesperrt').hidden = false; else $('zuAlt').hidden = false;
+    const err = new Error(T('fehler.zualt', 'Router zu alt (Einrichtung ab 2.1).')); err.status = 404; err.zuAlt = true; throw err;
+  }
+  if (!r.ok) { const err = new Error((d.error && d.error.message) || ('HTTP ' + r.status)); err.status = r.status; err.code = d.error && d.error.code; err.daten = d; throw err; }
+  return d;
+}
+const melden = (el, text, art) => { el.textContent = text || ''; el.className = 'meldung' + (art ? ' ' + art : ''); };
+const fehlerText = e => e.zuAlt ? T('fehler.zualt', 'Router zu alt (Einrichtung ab 2.1).') : T('fehler', 'Fehler: {fehler}', { fehler: e.message });
+
+// /router/me: 200 (auth off / lokal = admin / Admin-Sitzung) oder 401 mit setup:true (auth = lan, noch kein Admin).
+async function meLesen() {
+  try {
+    const r = await fetch('/router/me', { cache: 'no-store' });
+    const d = await r.json().catch(() => ({}));
+    me = d;
+    if (r.status === 401 && !d.setup) { $('gesperrt').hidden = false; return false; }
+    $('setupHinweis').hidden = !d.setup;
+    $('adminKarte').hidden = !d.setup;
+    return true;
+  } catch (e) { $('weg').hidden = false; return false; }
+}
+
+// ---------------------------------------------------------------------------------------------- Schritte
+function zeigeSchritt(n) {
+  schritt = Math.max(1, Math.min(SCHRITTE, n));
+  document.querySelectorAll('section[data-schritt]').forEach(s => s.classList.toggle('aktiv', Number(s.dataset.schritt) === schritt));
+  document.querySelectorAll('#schritte button').forEach(b => {
+    const z = Number(b.dataset.ziel);
+    if (z === schritt) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+    b.classList.toggle('fertig', fertig.has(z));
+  });
+  $('zurueck').disabled = schritt === 1;
+  $('weiter').hidden = schritt === SCHRITTE;
+  $('naviHinweis').textContent = '';
+  speicher.sichern();
+  if (schritt === 1) s1Laden();
+  if (schritt === 2) s2Zeichnen();
+  if (schritt === 3) s3Zeichnen();
+  if (schritt === 4) s4Laden();
+  if (schritt === 5) s5Zeichnen();
+  if (schritt === 6) s6Laden();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+// Darf es weitergehen? Gibt null (ja) oder den Hinweistext zurück.
+function hindernis() {
+  if (schritt === 1 && pruefung && (pruefung.pruefungen || []).some(p => p.status === 'err')) return T('s1.rot', 'Ein roter Prüfpunkt: so startet gufo nicht. Bitte zuerst beheben (Weiter geht trotzdem, zum Ansehen).');
+  if (schritt === 2) {
+    if (!antworten.bausteine.length) return T('s2.leer', 'Bitte mindestens einen Baustein wählen.');
+    const offen = lizenzenOffen();
+    if (offen.length) return T('s2.lizenz.offen', 'Noch nicht bestätigt: {n} Lizenz(en).', { n: offen.length });
+  }
+  if (schritt === 3 && !(antworten.pfade.modelle && antworten.pfade.daten)) return T('s3.leer', 'Bitte beide Ordner angeben.');
+  if (schritt === 5 && !presetOk) return T('s5.offen', 'Zuerst das Preset schreiben.');
+  return null;
+}
+$('weiter').onclick = () => {
+  s3Uebernehmen(); s5Uebernehmen();
+  const h = hindernis();
+  if (h && schritt !== 1) { $('naviHinweis').textContent = h; return; }
+  if (h) $('naviHinweis').textContent = h;
+  fertig.add(schritt);
+  zeigeSchritt(schritt + 1);
+};
+$('zurueck').onclick = () => { s3Uebernehmen(); s5Uebernehmen(); zeigeSchritt(schritt - 1); };
+$('schritte').addEventListener('click', ev => { const b = ev.target.closest('button'); if (b) { s3Uebernehmen(); s5Uebernehmen(); zeigeSchritt(Number(b.dataset.ziel)); } });
+
+// ---------------------------------------------------------------------------------------------- Schritt 1
+async function s1Laden() {
+  const body = $('pruefungBody');
+  try {
+    const [status, pr] = await Promise.all([api('/router/status'), api('/router/setup/pruefen')]);
+    pruefung = pr;
+    const mem = status.memory || {};
+    const kz = [];
+    if (pr.gpu) kz.push([pr.gpu.name || '?', T('s1.gpu', 'Grafik ({arch})', { arch: pr.gpu.arch || '?' })]);
+    if (mem.host_total_gb) kz.push([mem.host_total_gb + ' GB', T('s1.ram', 'Arbeitsspeicher für Windows')]);
+    if (mem.gpu_valid && mem.gpu_dedicated_total_gb) kz.push([mem.gpu_dedicated_total_gb + ' GB', T('s1.vram', 'Grafikspeicher (zugeteilt)')]);
+    for (const l of pr.laufwerke || []) kz.push([gb(l.frei_bytes), T('s1.platte', 'frei auf {l} von {g}', { l: l.laufwerk, g: gb(l.gesamt_bytes) })]);
+    $('kennzahlen').innerHTML = kz.map(([w, n]) => `<div class="kennzahl"><div class="wert">${esc(w)}</div><div class="name">${esc(n)}</div></div>`).join('');
+    // RAM-Größe (64/128) aus der Summe Windows-RAM + zugeteilter Grafikspeicher; der Nutzer kann sie in Schritt 2 ändern.
+    if (pr.ram_gb === 64 || pr.ram_gb === 128) antworten.ram_gb = pr.ram_gb;
+    if (pr.app && !antworten.pfade.app) antworten.pfade.app = pr.app;
+    // Ordner der eigenen Worker-Builds (3D, MOSS, TRELLIS.2, 35B): der Router kennt sie aus dem Paket; die Vorlagen
+    // brauchen {app_3d} usw. (einrichten.py: „Platzhalter ohne Wert“, wenn sie fehlen).
+    for (const [k, v] of Object.entries(pr.worker || {})) if (v && !antworten.pfade[k]) antworten.pfade[k] = v;
+    if (pr.rechner && !antworten.rechner) antworten.rechner = pr.rechner;
+    if (pr.adresse && !antworten.router.adresse) antworten.router.adresse = pr.adresse;
+    const liste = pr.pruefungen || [];
+    body.innerHTML = liste.length ? liste.map(p => `<tr><td><span class="punkt ${esc(p.status)}"></span>${esc(T('s1.p.' + p.id, p.titel || p.id))}</td><td>${esc(p.text || '')}</td><td class="${p.status === 'ok' ? 'm' : ''}">${esc(p.tun || '')}</td></tr>`).join('')
+                                  : `<tr><td colspan="3" class="m">${esc(T('s1.keine', 'Keine Prüfpunkte gemeldet.'))}</td></tr>`;
+    if (window.gufoTabellenKarten) gufoTabellenKarten();
+    melden($('s1Meldung'), T('stand', 'Stand: {t}', { t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }));
+    speicher.sichern();
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="3" class="err">${esc(fehlerText(e))}</td></tr>`;
+  }
+}
+$('s1Neu').onclick = s1Laden;
+
+// ---------------------------------------------------------------------------------------------- Schritt 2
+async function katalogLaden() {
+  if (katalog) return katalog;
+  katalog = await api('/router/setup/katalog');
+  return katalog;
+}
+function alleModelle() {
+  const out = {};
+  if (!katalog) return out;
+  for (const b of REIHENFOLGE) for (const m of ((katalog.bausteine[b] || {}).modelle || [])) out[m.id] = { baustein: b, m };
+  return out;
+}
+// Gewählte Modelle wie einrichten.py waehle_modelle(): Pflicht + RAM-Vorgabe + optional + Abhängigkeiten.
+function gewaehlteModelle() {
+  const alle = alleModelle(), g = new Set();
+  for (const b of antworten.bausteine) for (const m of ((katalog.bausteine[b] || {}).modelle || []))
+    if (m.pflicht || m.vorgabe_ram === antworten.ram_gb || antworten.modelle_optional.includes(m.id)) g.add(m.id);
+  for (const id of antworten.modelle_weglassen) g.delete(id);
+  let neu = true;
+  while (neu) { neu = false; for (const id of [...g]) for (const dep of (alle[id] ? alle[id].m.benoetigt || [] : [])) if (!g.has(dep)) { g.add(dep); neu = true; } }
+  return [...g].filter(id => alle[id]);
+}
+function lizenzenNoetig() {
+  const alle = alleModelle(), out = [];
+  for (const id of gewaehlteModelle()) {
+    const m = alle[id].m;
+    if (m.lizenz && m.lizenz.bestaetigen) out.push({ id, lizenz: m.lizenz });
+    if (m.lizenz_zusatz && m.lizenz_zusatz.bestaetigen) out.push({ id: id + '#zusatz', lizenz: m.lizenz_zusatz });
+  }
+  return out;
+}
+const lizenzenOffen = () => lizenzenNoetig().filter(l => !antworten.lizenzen_bestaetigt.includes(l.id.replace(/#zusatz$/, '')));
+function summeBytes() {
+  const alle = alleModelle(), seen = new Set(); let b = 0;
+  for (const id of gewaehlteModelle()) for (const d of alle[id].m.dateien || []) { const k = d.hardlink_auf || d.pfad; if (!seen.has(k)) { seen.add(k); b += d.bytes || 0; } }
+  return b;
+}
+function s2Summe() {
+  const bytes = summeBytes();
+  const frei = pruefung && pruefung.laufwerke ? Math.max.apply(null, pruefung.laufwerke.map(l => l.frei_bytes || 0).concat([0])) : 0;
+  const min = Math.round(bytes / 50e6 / 60);
+  const teile = [T('s2.summe', 'Gewählt: {gb}', { gb: gb(bytes) })];
+  if (frei) teile.push(T('s2.summe.frei', 'frei: {gb}', { gb: gb(frei) }));
+  teile.push(T('s2.summe.zeit', 'Download bei 50 MB/s: {min} min', { min }));
+  if (frei && bytes > frei) teile.push('<span class="err">' + esc(T('s2.summe.voll', 'Das passt nicht auf die Platte.')) + '</span>');
+  const zuviel = gewaehlteModelle().filter(id => alleModelle()[id].m.passt_64gb === 'nur-128');
+  if (antworten.ram_gb === 64 && zuviel.length) teile.push('<span class="warn">' + esc(T('s2.nur128', 'Nur für 128 GB: {m}', { m: zuviel.join(', ') })) + '</span>');
+  $('summe').innerHTML = teile.map(t => '<span>' + (t.indexOf('<span') === 0 ? t : esc(t)) + '</span>').join('');
+}
+function s2Lizenzen() {
+  const noetig = lizenzenNoetig(), box = $('lizenzen');
+  if (!noetig.length) { box.innerHTML = `<span class="m">${esc(T('s2.lizenzen.keine', 'Keine – die gewählten Modelle brauchen keine Bestätigung.'))}</span>`; return; }
+  box.innerHTML = noetig.map(l => { const id = l.id.replace(/#zusatz$/, ''); return `<label><input type="checkbox" data-lizenz="${esc(id)}"${antworten.lizenzen_bestaetigt.includes(id) ? ' checked' : ''}><span><b>${esc(id)}</b> – ${esc(l.lizenz.name)}<br><span class="m">${esc(l.lizenz.satz || '')}</span></span></label>`; }).join('');
+}
+async function s2Zeichnen() {
+  try { await katalogLaden(); } catch (e) { $('kacheln').innerHTML = `<div class="err">${esc(fehlerText(e))}</div>`; return; }
+  document.querySelectorAll('input[name=ram]').forEach(r => { r.checked = Number(r.value) === antworten.ram_gb; });
+  $('ramHinweis').textContent = antworten.ram_gb === 64 ? T('s2.ram.64', 'Vorgabe 64 GB: Flash-Next als Q3; MiniMax H3 und Flash-Next Q4 brauchen 128 GB.') : T('s2.ram.128', 'Vorgabe 128 GB: Flash-Next als Q4 (gemessen auf 64 GB nur mit 24-GB-Cache).');
+  const gew = new Set(gewaehlteModelle());
+  $('kacheln').innerHTML = REIHENFOLGE.filter(b => katalog.bausteine[b]).map(b => {
+    const k = katalog.bausteine[b], an = antworten.bausteine.includes(b);
+    const modelle = (k.modelle || []).map(m => {
+      const auto = m.pflicht || m.vorgabe_ram === antworten.ram_gb;
+      const art = m.pflicht ? T('s2.pflicht', 'Pflicht') : m.vorgabe_ram ? T('s2.vorgabe', 'Vorgabe {ram} GB', { ram: m.vorgabe_ram }) : T('s2.optional', 'optional');
+      const chips = [];
+      if (m.passt_64gb === 'nur-128') chips.push(`<span class="chip warn">${esc(T('s2.chip.128', 'nur 128 GB'))}</span>`);
+      if (m.lizenz && m.lizenz.bestaetigen) chips.push(`<span class="chip warn">${esc(T('s2.chip.lizenz', 'Lizenz bestätigen'))}</span>`);
+      if (!(m.quellen || []).some(q => q.hf_repo)) chips.push(`<span class="chip">${esc(T('s2.chip.keinequelle', 'keine Download-Quelle'))}</span>`);
+      return `<li><input type="checkbox" data-modell="${esc(m.id)}" data-baustein="${esc(b)}"${gew.has(m.id) ? ' checked' : ''}${m.pflicht || !an ? ' disabled' : ''}>
+        <span class="mname"><b>${esc(m.name)}</b> <span class="m">· ${esc(gb(m.bytes))} · ${esc(art)}</span><br><span class="m">${esc(m.lizenz ? m.lizenz.name : '')}</span> ${chips.join('')}${m.hinweis ? `<br><span class="klein">${esc(m.hinweis)}</span>` : ''}</span></li>`;
+    }).join('');
+    return `<div class="kachel${an ? ' an' : ''}"><label><input type="checkbox" data-baustein-wahl="${esc(b)}"${an ? ' checked' : ''}><span><span class="titel">${esc(k.titel)}</span> <span class="gb">${esc(T('s2.kachel.gb', 'Pflicht {p}, alles {a}', { p: gb(k.summe_pflicht_bytes), a: gb(k.summe_bytes) }))}</span><div class="beschreibung">${esc(k.beschreibung || '')}</div></span></label>${modelle ? `<ul class="modelle">${modelle}</ul>` : ''}</div>`;
+  }).join('');
+  s2Lizenzen(); s2Summe();
+}
+$('kacheln').addEventListener('change', ev => {
+  const k = ev.target;
+  if (k.dataset.bausteinWahl) {
+    const b = k.dataset.bausteinWahl;
+    if (k.checked) { if (!antworten.bausteine.includes(b)) antworten.bausteine.push(b); }
+    else { antworten.bausteine = antworten.bausteine.filter(x => x !== b); antworten.modelle_optional = antworten.modelle_optional.filter(id => alleModelle()[id].baustein !== b); }
+    antworten.bausteine = REIHENFOLGE.filter(b2 => antworten.bausteine.includes(b2));
+  } else if (k.dataset.modell) {
+    const id = k.dataset.modell, m = alleModelle()[id].m;
+    const vorgabe = m.vorgabe_ram === antworten.ram_gb;
+    if (k.checked) { antworten.modelle_weglassen = antworten.modelle_weglassen.filter(x => x !== id); if (!vorgabe && !antworten.modelle_optional.includes(id)) antworten.modelle_optional.push(id); }
+    else { antworten.modelle_optional = antworten.modelle_optional.filter(x => x !== id); if (vorgabe && !antworten.modelle_weglassen.includes(id)) antworten.modelle_weglassen.push(id); }
+  }
+  speicher.sichern(); s2Zeichnen();
+});
+document.querySelectorAll('input[name=ram]').forEach(r => { r.onchange = () => { antworten.ram_gb = Number(r.value); antworten.modelle_weglassen = []; speicher.sichern(); s2Zeichnen(); }; });
+$('lizenzen').addEventListener('change', ev => {
+  const k = ev.target; if (!k.dataset.lizenz) return;
+  const id = k.dataset.lizenz;
+  antworten.lizenzen_bestaetigt = antworten.lizenzen_bestaetigt.filter(x => x !== id);
+  if (k.checked) antworten.lizenzen_bestaetigt.push(id);
+  speicher.sichern();
+});
+
+// ---------------------------------------------------------------------------------------------- Schritt 3
+function s3Zeichnen() {
+  const lw = (pruefung && pruefung.laufwerke) || [];
+  if (!antworten.pfade.modelle && lw.length) {
+    const best = lw.slice().sort((a, b) => (b.frei_bytes || 0) - (a.frei_bytes || 0))[0];
+    antworten.pfade.modelle = best.laufwerk + '\\gufo\\modelle'; antworten.pfade.daten = best.laufwerk + '\\gufo';
+  }
+  $('pfModelle').value = antworten.pfade.modelle; $('pfDaten').value = antworten.pfade.daten; $('pfApp').value = antworten.pfade.app; $('rechner').value = antworten.rechner;
+  $('laufwerke').innerHTML = lw.length ? `<span class="klein">${esc(T('s3.laufwerke', 'Laufwerke:'))} ${lw.map(l => `<span class="chip">${esc(l.laufwerk)} ${esc(gb(l.frei_bytes))} ${esc(T('s3.frei', 'frei'))}</span>`).join(' ')}</span>` : '';
+  $('partnerBlock').hidden = !antworten.bausteine.includes('zweiter-rechner');
+}
+function s3Uebernehmen() {
+  if (!$('pfModelle').value && !$('pfDaten').value) return;
+  antworten.pfade.modelle = $('pfModelle').value.trim(); antworten.pfade.daten = $('pfDaten').value.trim(); antworten.rechner = $('rechner').value.trim();
+  speicher.sichern();
+}
+$('s3Pruefen').onclick = async () => {
+  s3Uebernehmen();
+  melden($('s3Meldung'), T('laeuft', 'wird geprüft …'));
+  try {
+    const d = await api('/router/setup/pruefen', 'POST', { pfade: antworten.pfade });
+    const o = (d.ordner || []);
+    const schlecht = o.filter(x => !x.schreibbar);
+    melden($('s3Meldung'), schlecht.length ? T('s3.nichtschreibbar', 'Nicht beschreibbar: {o}', { o: schlecht.map(x => x.pfad).join(', ') })
+                                          : T('s3.ok', 'Beide Ordner sind beschreibbar; frei: {gb}.', { gb: gb(o.length ? o[0].frei_bytes : 0) }), schlecht.length ? 'err' : 'ok');
+  } catch (e) { melden($('s3Meldung'), fehlerText(e), 'err'); }
+};
+
+// ---------------------------------------------------------------------------------------------- Schritt 4
+// Stand aus GET /router/setup/downloads (Router 2.1, download.cpp): je Datei status wartet|laeuft|pause|fertig|fehler|
+// vorhanden|pruefung|abgebrochen, sha256_status offen|ok|falsch|unbekannt (sha256_quelle katalog|hf), fehler_code
+// no_source|gated|not_found|size_mismatch|http|network|sha256|disk|write, quelle {hf_repo, revision}, versuche.
+function dlZeichnen(d) {
+  const dateien = d.dateien || [];
+  const gesamt = d.gesamt_bytes || dateien.reduce((n, x) => n + (x.bytes || 0), 0);
+  const geladen = d.geladen_bytes || dateien.reduce((n, x) => n + (x.geladen || 0), 0);
+  $('dlGesamt').textContent = gb(gesamt); $('dlGeladen').textContent = gb(geladen);
+  $('dlRate').textContent = d.rate_bytes_s ? (d.rate_bytes_s / 1e6).toFixed(1) + ' MB/s' : '–';
+  $('dlRest').textContent = d.rate_bytes_s && gesamt > geladen ? Math.ceil((gesamt - geladen) / d.rate_bytes_s / 60) + ' min' : '–';
+  $('dlBalken').value = gesamt ? Math.round(geladen / gesamt * 100) : 0;
+  const status = s => T('s4.status.' + s, { wartet: 'wartet', laeuft: 'lädt', pause: 'Pause', fertig: 'fertig', fehler: 'Fehler', vorhanden: 'schon da', pruefung: 'Prüfsumme …', abgebrochen: 'abgebrochen' }[s] || s);
+  $('dlListe').innerHTML = dateien.map(x => {
+    const art = x.status === 'fehler' ? 'err' : x.status === 'fertig' || x.status === 'vorhanden' ? 'ok' : x.status === 'laeuft' ? '' : 'm';
+    const shaTitel = x.sha256_ist ? ` title="${esc(x.sha256_ist)}"` : '';
+    const sha = x.sha256_status === 'ok' ? ` <span class="chip ok"${shaTitel}>${esc(x.sha256_quelle === 'hf' ? T('s4.sha.hf', 'Prüfsumme stimmt (Hugging Face)') : T('s4.sha.ok', 'Prüfsumme stimmt'))}</span>`
+              : x.sha256_status === 'falsch' ? ` <span class="chip err"${shaTitel}>${esc(T('s4.sha.falsch', 'Prüfsumme falsch'))}</span>`
+              : x.sha256_status === 'unbekannt' ? ` <span class="chip"${shaTitel}>${esc(T('s4.sha.unbekannt', 'keine Prüfsumme bekannt'))}</span>` : '';
+    const quelle = x.quelle && x.quelle.hf_repo ? ` title="${esc(T('s4.quelle', 'Quelle: {q}', { q: x.quelle.hf_repo + '@' + (x.quelle.revision || 'main') }))}"` : '';
+    const versuch = x.status === 'laeuft' && x.versuche > 0 ? ` <span class="chip warn">${esc(T('s4.versuche', 'Versuch {n}', { n: x.versuche + 1 }))}</span>` : '';
+    const fehler = x.fehler ? `<br><span class="err">${esc(x.fehler)}</span>` : '';
+    const hinweis = x.fehler_code === 'gated' ? `<br><span class="warn">${esc(T('s4.gated', 'Hugging Face sperrt dieses Modell (gated): Zugang im Browser beantragen, den Token oben eintragen, dann „Weiter“.'))}</span>` : '';
+    const balken = x.status === 'laeuft' || x.status === 'pause' || x.status === 'pruefung' ? `<progress max="${x.bytes || 1}" value="${x.geladen || 0}"></progress>` : '';
+    return `<li><span class="pfad"${quelle}>${esc(x.pfad)} <span class="m">· ${esc(gb(x.bytes))}</span>${sha}${versuch}${fehler}${hinweis}</span><span class="${art}">${esc(status(x.status))}</span>${balken}</li>`;
+  }).join('');
+  const laeuft = !!d.laeuft, pause = !!d.pause;
+  $('dlStart').hidden = laeuft || pause; $('dlPause').hidden = !laeuft; $('dlWeiter').hidden = !pause; $('dlAbbrechen').hidden = !(laeuft || pause);
+  const offen = dateien.filter(x => x.status !== 'fertig' && x.status !== 'vorhanden');
+  const fehler = dateien.filter(x => x.status === 'fehler');
+  const ohneQuelle = fehler.filter(x => x.fehler_code === 'no_source');
+  const abgebrochen = dateien.filter(x => x.status === 'abgebrochen');
+  if (!dateien.length) melden($('s4Meldung'), T('s4.keine', 'Keine Dateien für die gewählten Modelle.'), 'warn');
+  else if (!offen.length) { melden($('s4Meldung'), T('s4.alles', 'Alle Dateien sind da.'), 'ok'); fertig.add(4); speicher.sichern(); }
+  else if (d.hinweis) melden($('s4Meldung'), d.hinweis, 'warn');
+  else if (laeuft) melden($('s4Meldung'), T('s4.laeuft', '{n} Dateien offen', { n: offen.length }));
+  else if (pause) melden($('s4Meldung'), T('s4.status.pause', 'Pause'), 'warn');
+  else if (abgebrochen.length) melden($('s4Meldung'), T('s4.abgebrochen', 'Abgebrochen – „Herunterladen starten“ setzt die angefangenen Dateien fort.'), 'warn');
+  else if (fehler.length && fehler.length === ohneQuelle.length) melden($('s4Meldung'), T('s4.ohnequelle', '{n} Datei(en) ohne Download-Quelle – von einem eingerichteten Rechner kopieren.', { n: ohneQuelle.length }), 'warn');
+  else if (fehler.length) melden($('s4Meldung'), T('s4.fehler', '{n} Dateien mit Fehler – „Weiter“ versucht es erneut.', { n: fehler.length }), 'err');
+  else melden($('s4Meldung'), '');
+  // Nach Fehlern ohne laufenden Download: "Weiter" setzt fehler/abgebrochen zurück und lädt erneut.
+  if (!laeuft && !pause && (fehler.length - ohneQuelle.length > 0 || abgebrochen.length)) $('dlWeiter').hidden = false;
+}
+async function s4Laden() {
+  clearInterval(dlTimer); dlTimer = null;
+  try {
+    let d = await api('/router/setup/downloads');
+    // Läuft nichts, wird der Plan aus der aktuellen Auswahl neu gebaut (billig; Prüfsummen fertiger Dateien kennt der
+    // Router aus <ziel>\.einrichtung-downloads.json).
+    if (!d.laeuft && !d.pause && antworten.pfade.modelle) d = await api('/router/setup/downloads', 'POST', { aktion: 'planen', modelle: gewaehlteModelle(), ziel: antworten.pfade.modelle });
+    dlZeichnen(d);
+    if (d.laeuft) dlTimer = setInterval(s4Tick, 2000);
+  } catch (e) { melden($('s4Meldung'), fehlerText(e), 'err'); }
+}
+async function s4Tick() {
+  if (document.visibilityState === 'hidden') return;
+  try { const d = await api('/router/setup/downloads'); dlZeichnen(d); if (!d.laeuft) { clearInterval(dlTimer); dlTimer = null; } }
+  catch (e) { clearInterval(dlTimer); dlTimer = null; melden($('s4Meldung'), fehlerText(e), 'err'); }
+}
+async function dlAktion(aktion) {
+  melden($('s4Meldung'), T('laeuft', 'wird geprüft …'));
+  try {
+    const body = { aktion, modelle: gewaehlteModelle(), ziel: antworten.pfade.modelle };
+    // Der Token geht nur in diese Anfrage; er wird weder in antworten noch im Browser-Speicher abgelegt.
+    if ($('hfToken').value) body.hf_token = $('hfToken').value;
+    const d = await api('/router/setup/downloads', 'POST', body);
+    dlZeichnen(d);
+    clearInterval(dlTimer); dlTimer = d.laeuft ? setInterval(s4Tick, 2000) : null;
+  } catch (e) {
+    if (e.code === 'disk_full' || e.code === 'insufficient_space') melden($('s4Meldung'), T('s4.platz', 'Zu wenig Platz: {fehlt} fehlen auf {l}.', { fehlt: gb(e.daten.fehlt_bytes), l: antworten.pfade.modelle }), 'err');
+    else if (e.code === 'download_running') s4Laden();
+    else melden($('s4Meldung'), fehlerText(e), 'err');
+  }
+}
+$('dlStart').onclick = () => dlAktion('start');
+$('dlPause').onclick = () => dlAktion('pause');
+$('dlWeiter').onclick = () => dlAktion('weiter');
+$('dlAbbrechen').onclick = () => { if (confirm(T('s4.frage.abbrechen', 'Herunterladen abbrechen? Angefangene Dateien bleiben liegen und werden beim nächsten Start fortgesetzt.'))) dlAktion('abbrechen'); };
+
+// ---------------------------------------------------------------------------------------------- Schritt 5
+function s5Zeichnen() {
+  $('port').value = antworten.router.port; $('idle').value = antworten.router.idle_seconds; $('adresse').value = antworten.router.adresse;
+  document.querySelectorAll('input[name=erreichbarkeit]').forEach(r => { r.checked = r.value === antworten.router.erreichbarkeit; });
+  $('autostart').checked = antworten.autostart !== false;
+  $('partnerBlock').hidden = !antworten.bausteine.includes('zweiter-rechner');
+  $('partnerUrl').value = antworten.partner.url || '';
+  $('presetSchreiben').disabled = true; presetOk = false;
+}
+function s5Uebernehmen() {
+  if (!$('port').value) return;
+  antworten.router.port = Number($('port').value) || 8081;
+  antworten.router.idle_seconds = Number($('idle').value) || 1800;
+  antworten.router.adresse = $('adresse').value.trim();
+  const e = document.querySelector('input[name=erreichbarkeit]:checked');
+  antworten.router.erreichbarkeit = e ? e.value : 'nur-dieser-rechner';
+  antworten.router.webhook_allow = antworten.router.erreichbarkeit === 'heimnetz' ? '192.168.0.0/16' : '127.0.0.1';
+  antworten.autostart = $('autostart').checked;
+  antworten.partner.url = $('partnerUrl').value.trim();
+  speicher.sichern();
+}
+async function preset(schreiben) {
+  s5Uebernehmen();
+  if (schreiben && antworten.router.erreichbarkeit === 'heimnetz' && me && me.setup) { melden($('s5Meldung'), T('s5.admin.pflicht', 'Bei „Heimnetz“ zuerst das Admin-Konto anlegen.'), 'err'); return; }
+  melden($('s5Meldung'), T('laeuft', 'wird geprüft …'));
+  $('presetVorschau').disabled = true; $('presetSchreiben').disabled = true;
+  try {
+    const d = await api('/router/setup/preset', 'POST', { antworten, schreiben: !!schreiben });
+    $('presetText').textContent = d.preset_text || '';
+    $('berichtText').textContent = d.bericht || '';
+    if (schreiben) { presetOk = true; fertig.add(5); melden($('s5Meldung'), T('s5.geschrieben', 'Geschrieben: {d}', { d: (d.geschrieben || []).join(' · ') }), 'ok'); }
+    else { melden($('s5Meldung'), (d.lizenzen_offen || []).length ? T('s5.lizenzen', 'Vorschau fertig; Lizenzen offen: {l}', { l: d.lizenzen_offen.join(', ') }) : T('s5.vorschau.ok', 'Vorschau fertig – prüfen, dann „Preset schreiben“.'), 'ok'); $('presetSchreiben').disabled = !!(d.lizenzen_offen || []).length; }
+  } catch (e) {
+    if (e.code === 'licenses_open') melden($('s5Meldung'), T('s5.lizenzen', 'Vorschau fertig; Lizenzen offen: {l}', { l: (e.daten.lizenzen_offen || []).join(', ') }), 'err');
+    else if (e.code === 'preset_invalid') melden($('s5Meldung'), T('s5.ungueltig', 'Der Router nimmt das Preset nicht an: {t}', { t: e.message }), 'err');
+    else melden($('s5Meldung'), fehlerText(e), 'err');
+  } finally { $('presetVorschau').disabled = false; }
+}
+$('presetVorschau').onclick = () => preset(false);
+$('presetSchreiben').onclick = () => preset(true);
+$('adminForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const name = $('adminName').value.trim().toLowerCase(), passwort = $('adminPasswort').value;
+  if (!/^[a-z0-9._-]{1,32}$/.test(name)) { melden($('adminMeldung'), T('s5.admin.name.falsch', 'Name: 1–32 Zeichen aus a–z, 0–9, . _ -'), 'err'); return; }
+  if (passwort.length < 4) { melden($('adminMeldung'), T('s5.admin.passwort.kurz', 'Das Passwort braucht mindestens 4 Zeichen.'), 'err'); return; }
+  $('adminAnlegen').disabled = true;
+  try {
+    await api('/router/setup/admin', 'POST', { name, passwort });
+    melden($('adminMeldung'), T('s5.admin.ok', 'Admin „{n}“ angelegt.', { n: name }), 'ok');
+    $('adminPasswort').value = '';
+    await meLesen();
+  } catch (e) {
+    melden($('adminMeldung'), e.code === 'admin_exists' ? T('s5.admin.gibtes', 'Es gibt schon einen Admin.') : fehlerText(e), 'err');
+  } finally { $('adminAnlegen').disabled = false; }
+});
+
+// ---------------------------------------------------------------------------------------------- Schritt 6
+function testsZeichnen(d) {
+  const tests = d.tests || [];
+  const status = s => T('s6.status.' + s, { wartet: 'wartet', laeuft: 'läuft', ok: 'ok', fehler: 'Fehler', uebersprungen: 'übersprungen' }[s] || s);
+  $('tests').innerHTML = tests.map(t => `<li><span class="punkt ${t.status === 'ok' ? 'ok' : t.status === 'fehler' ? 'err' : t.status === 'laeuft' ? 'warn' : ''}"></span><span><b>${esc(T('s2.b.' + t.baustein, t.baustein))}</b> · ${esc(t.modell || '')} · ${esc(status(t.status))}${t.hinweis ? `<br><span class="${t.status === 'fehler' ? 'err' : 'm'}">${esc(t.hinweis)}</span>` : ''}${t.log ? `<br><code>${esc(t.log)}</code>` : ''}</span><span class="dauer">${t.dauer_s != null ? esc(t.dauer_s + ' s') : ''}</span></li>`).join('');
+  const offen = tests.some(t => t.status === 'wartet' || t.status === 'laeuft');
+  $('testStart').hidden = !!d.laeuft;
+  if (tests.length && !offen) {
+    const rot = tests.filter(t => t.status === 'fehler').length;
+    melden($('s6Meldung'), rot ? T('s6.rot', '{n} Test(s) rot – Hinweis je Zeile.', { n: rot }) : T('s6.gruen', 'Alles grün.'), rot ? 'err' : 'ok');
+    $('fertigLink').hidden = false; fertig.add(6); speicher.sichern();
+  }
+}
+async function s6Laden() {
+  clearInterval(testTimer); testTimer = null;
+  try { const d = await api('/router/setup/selbsttest'); testsZeichnen(d); if (d.laeuft) testTimer = setInterval(s6Tick, 3000); }
+  catch (e) { if (e.code === 'no_preset') melden($('s6Meldung'), T('s6.kein.preset', 'Der Router läuft noch ohne Preset – „Selbsttest starten“ startet ihn mit dem neuen Preset neu.'), 'warn'); else melden($('s6Meldung'), fehlerText(e), 'err'); }
+}
+async function s6Tick() {
+  if (document.visibilityState === 'hidden') return;
+  try { const d = await api('/router/setup/selbsttest'); testsZeichnen(d); if (!d.laeuft) { clearInterval(testTimer); testTimer = null; } }
+  catch (e) { if (e.netz) melden($('s6Meldung'), T('s6.neustart', 'Router startet neu mit dem Preset …'), 'warn'); }
+}
+$('testStart').onclick = async () => {
+  melden($('s6Meldung'), T('laeuft', 'wird geprüft …'));
+  $('testStart').disabled = true;
+  try {
+    const d = await api('/router/setup/selbsttest', 'POST', { aktion: 'start', bausteine: antworten.bausteine });
+    if (d.neustart) melden($('s6Meldung'), T('s6.neustart', 'Router startet neu mit dem Preset …'), 'warn'); else testsZeichnen(d);
+    clearInterval(testTimer); testTimer = setInterval(s6Tick, 3000);
+  } catch (e) { melden($('s6Meldung'), fehlerText(e), 'err'); }
+  finally { $('testStart').disabled = false; }
+};
+
+// ---------------------------------------------------------------------------------------------- Start
+async function start() {
+  speicher.laden();
+  if (!(await meLesen())) return;
+  try { await katalogLaden(); } catch (e) { /* zuAlt/weg ist schon gesetzt */ }
+  zeigeSchritt(schritt);
+}
+window.addEventListener('gufo-sprache', () => { if (schritt === 2) s2Zeichnen(); if (schritt === 1) s1Laden(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (dlTimer) s4Tick(); if (testTimer) s6Tick(); } });
+start();
+</script>
+</body>
+</html>
