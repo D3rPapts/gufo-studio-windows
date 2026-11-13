@@ -1,17 +1,28 @@
-# gufo-studio-windows: Gufo as a creative AI studio on Windows 11 for AMD Strix Halo
+# gufo-studio-windows
 
-<p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
-</p>
+<p align="center"><img src="assets/gufo-studio-logo.png" alt="gufo-studio logo" width="220"></p>
 
-> **Download [2.0.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.2)**
-> (`gufo-studio-windows-2.0.2-windows-x64-gfx1151.zip`, branch `v2/v034-prep`): text,
-> images, speech, music, video and 3D from one OpenAI-compatible port on Windows 11, plus a
-> ComfyUI-compatible API and a two-machine pool (`/pool/`). Unpack it, edit `examples\router.ini`, run `start-router.cmd`;
-> models load on the first request. The ROCm runtime is included; FFmpeg is not
-> (`winget install Gyan.FFmpeg`). The release notes list what was tested.
-> Previous: [2.0.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.1), [2.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.0), [1.4.21](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.21), [1.4.8](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.8), [1.4.7](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.7), [1.4.5](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.5), [1.4.4](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.4), [1.4.3](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.3), [1.4.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.2), [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1), [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
-> This repository was called `gufo_windows` until 31 October 2026; old links still work.
+**Two Strix Halo PCs as one creative AI studio on Windows 11.** Text, images, video, voice,
+music and 3D run behind one OpenAI-compatible port; a second machine joins as a job pool
+(`/pool/`), and every job lands in one shared result store (`/ablage/`). Built on
+[gufo-org/gufo](https://github.com/gufo-org/gufo), measured on a 64 GB and a 128 GB GMKtec EVO-X2.
+
+> **[Download 2.0.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.2)** · unzip, edit `examples\router.ini`, run `start-router.cmd`.
+> ROCm runtime included; FFmpeg via `winget install Gyan.FFmpeg`. Models load on the first request.
+
+| What | Models | 64 GB EVO-X2, Windows 11, ROCm 10.0 |
+|---|---|---|
+| Chat | Qwen3.8-27B, Qwen3.8 Flash-Next (Q3/Q4), Qwen3.6-35B-A3B | 27B 14.7 tok/s, Flash-Next Q3 28.7 tok/s |
+| Images | Qwen-Image 2.1 + Turbo, LoRA, ControlNet, MOSS-Image | 1024² in ~20 s; 22 GB between jobs |
+| Video | Wan 2.2 5B, Wan 2.1 camera/VACE/InfiniteTalk, MiniMax H3 (128 GB) | Wan 2.2 640x352, 1 s: 45 s |
+| Voice | Qwen3-TTS (3 variants), Fish Drama-3, IndexTTS, VoxCPM2, Ming, ASR | RTF 0.4–0.8 |
+| Music | ACE-Step 1.5 (turbo/sft/base, all tasks), MOSS-Music captions | live preview while rendering |
+| 3D | TripoSG, TRELLIS.2 (textured GLB) | 136 s / 121 s |
+| Tools | Real-ESRGAN upscale, RIFE, Omni captioner, memory, job store | |
+| Two machines | job pool, capabilities, never-stuck fallback, `/pool/` page | partner down → local in 3 s |
+
+All numbers are from the release notes; nothing here is estimated.
+Previous releases: 2.0.1, 2.0.0, 1.4.21, 1.4.8 … 1.0.0 (see Releases). The repository was called `gufo_windows` until 31 October 2026.
 
 ### Focus
 
