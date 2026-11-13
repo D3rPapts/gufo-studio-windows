@@ -99,6 +99,12 @@ struct PresetModel {
 /// ("serve objekt" -> "image_to_3d"); "" when none is known.
 std::string CapabilityOf(const PresetModel& preset);
 
+/// The modality `/v1/models` and `/router/capabilities` report (2.0.5): the
+/// section's own, or for an `[external/<id>]` section the one its leading
+/// `args = serve <modality>` names ("llm", "image", "tts", ...); "external"
+/// stays when the command line does not say.
+std::string ReportedModality(const PresetModel& preset);
+
 /// The optional `[router]` section (2.0.3): users and access control,
 /// see docs/internal/server.md "Users and access". Values are kept as
 /// text; the router resolves them (users-file against the preset's
