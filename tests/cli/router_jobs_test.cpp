@@ -1936,6 +1936,8 @@ struct FakePartner {
   std::string pull_answer = R"({"job":"job_bbbbbbbbbbbbbbbbbbbbbbb2"})";
   int pull_status{200};
   int pulls{0};
+  /// Reads of the queued list (the runner's view of this partner).
+  int queued_reads{0};
   std::vector<HttpRequest> pull_requests;
   /// Polls of the pulled job before it completes.
   int polls_until_done{2};
@@ -1953,9 +1955,11 @@ struct FakePartner {
       return std::nullopt;
     }
     if (request.method == "GET" && request.path == "/v1/jobs" &&
-        request.query.find("status=queued") != std::string::npos)
+        request.query.find("status=queued") != std::string::npos) {
+      ++queued_reads;
       return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
                                     : queued);
+    }
     if (request.method == "GET" && request.path == "/v1/jobs" &&
         request.query.find("status=in_progress") != std::string::npos)
       return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
@@ -2272,7 +2276,9 @@ void TestPoolPullPinned() {
   const auto run = [](const char* name, const std::string& partner_queue,
                       bool expect_pull) {
     auto partner = std::make_shared<FakePartner>();
-    partner->queued = R"({"object":"list","data":[]})";
+    // The partner's list is there from the start: every decision of the
+    // runner (before the first job, before ours, after ours) sees it.
+    partner->queued = partner_queue;
     Harness h(name, false);
     partner->api = h.api;
     h.partner_name = "http://10.0.0.2:8081";
@@ -2290,22 +2296,29 @@ void TestPoolPullPinned() {
     const std::string first =
         h.Submit(ImageJob("SLOW first")).member_str("id");
     h.WaitFor(first, "in_progress");
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    h.WaitFor(mine, "queued");
+    int reads_before = 0;
     {
       const std::lock_guard<std::mutex> lock(partner->mutex);
-      partner->queued = partner_queue;
+      reads_before = partner->queued_reads;
     }
-    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     h.api->release.store(true);
     h.WaitFor(mine, "completed");
-    for (int i = 0; i < 30; ++i) {
+    // The runner looks at the partner's list once more after ours ran
+    // (and pulls then, if anything is there): wait for that read.
+    for (int i = 0; i < 400; ++i) {
       {
         const std::lock_guard<std::mutex> lock(partner->mutex);
-        if (partner->pulls >= 1)
+        // Expected pull: wait for it; none expected: two more looks at
+        // the list (the runner reads it again once ours ran) settle it.
+        if (expect_pull ? partner->pulls >= 1
+                        : partner->queued_reads >= reads_before + 2)
           break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
     const std::lock_guard<std::mutex> lock(h.api->mutex);
     const auto& calls = h.api->calls;
     std::ptrdiff_t pulled = -1;
