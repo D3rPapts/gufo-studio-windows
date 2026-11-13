@@ -117,9 +117,13 @@ published numbers use the Nix toolchain.
 
 ## Windows
 
-Windows x86-64 is a development target. Each release attaches
-`gufo-vX.Y.Z-windows-x86_64.zip`. Extract the whole ZIP and keep `gufo.exe`
-next to its DLLs and kernel folders. To build it yourself, see
+For upstream Gufo, Windows x86-64 is a development target. For
+gufo-studio-windows it is the production target: the fork is built,
+tested and run on Windows 11 on AMD Strix Halo (`gufo --version` reports
+the fork version, 2.0.4 at the time of writing), and its releases are
+published on GitHub (D3rPapts/gufo-studio-windows). Each release attaches a
+Windows ZIP; extract the whole ZIP and keep `gufo.exe` next to its DLLs and
+kernel folders. To build it yourself, see
 [building on Windows](../BUILD-WINDOWS.md).
 
 ## Model files
