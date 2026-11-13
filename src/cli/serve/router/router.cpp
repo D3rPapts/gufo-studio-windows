@@ -139,6 +139,9 @@ constexpr std::string_view kPresetGrammar =
     "      pool-secret-env = NAME       environment variable with the secret\n"
     "                                   both routers share; router-to-router\n"
     "                                   calls carry it as X-Gufo-Pool-Key\n"
+    "      csrf-allow-origins = LIST    comma list of origins (http://host:\n"
+    "                                   port) whose pages may write besides\n"
+    "                                   this router's own address (a proxy)\n"
     "    Users, roles (admin|nutzer|dienst), rights, tokens and the log:\n"
     "    /router/users, /verwaltung/ (loopback or admin only), docs/internal/\n"
     "    server.md \"Users and access\".\n\n";
@@ -1847,6 +1850,7 @@ public:
         yield_input.highest_waiting = HigherWaitingLocked(model_id, priority);
         yield_input.yielded =
             yield_clock.YieldedFor(yield_input.highest_waiting, now);
+        yield_input.total_yielded = yield_clock.Total(now);
         yield_input.forwarded = forwarded;
         if (router::PoolShouldYield(yield_input)) {
           if (yield_clock.Begin(yield_input.highest_waiting, now)) {
@@ -4009,6 +4013,13 @@ int RunRouter(std::span<const char* const> args) {
                     ? std::filesystem::absolute(preset_path).parent_path() /
                           router_section.users_file
                     : std::filesystem::path(router_section.users_file));
+  for (std::string origin : router::Split(router_section.csrf_allow_origins, ',')) {
+    origin = router::Lower(origin);
+    while (!origin.empty() && origin.back() == '/')
+      origin.pop_back();
+    if (!origin.empty())
+      auth_settings.csrf_allow_origins.push_back(origin);
+  }
   auth_settings.pool_secret_env = router_section.pool_secret_env;
   if (!auth_settings.pool_secret_env.empty()) {
     if (const char* secret = std::getenv(auth_settings.pool_secret_env.c_str());
@@ -4133,14 +4144,10 @@ int RunRouter(std::span<const char* const> args) {
     router::comfy::ModelIds comfy_ids;
     for (const auto& model : models)
       comfy_ids.available.push_back(model.id);
-    hooks.comfy_plan = [comfy_ids](const HttpRequest& req)
+    hooks.comfy_plan = [comfy_ids](const HttpRequest& req,
+                                   const json::Value& body)
         -> std::optional<std::vector<router::auth::WorkItem>> {
-      json::Value body;
-      try {
-        body = json::parse(req.body);
-      } catch (const std::exception&) {
-        return std::nullopt;
-      }
+      (void)req;  // the gate parsed the body once
       const json::Value* prompt = body.find("prompt");
       if (prompt == nullptr || !prompt->is_object())
         return std::nullopt;

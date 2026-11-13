@@ -573,6 +573,7 @@ void TestYieldClock() {
   CHECK(clock.Begin(5, at(0)));
   CHECK(!clock.Begin(5, at(100)));  // goes on, not a new stretch
   CHECK(clock.YieldedFor(5, at(1500)) == std::chrono::milliseconds(1500));
+  CHECK(clock.Total(at(1500)) == std::chrono::milliseconds(1500));
   // Both machines busy (kWait for a machine): the clock pauses, the time
   // waited for a machine never counts, but the budget toward the same
   // waiter keeps adding up over several frees.
@@ -584,15 +585,18 @@ void TestYieldClock() {
   in.priority = 0;
   in.highest_waiting = 5;
   in.yielded = clock.YieldedFor(5, at(60400));
+  in.total_yielded = clock.Total(at(60400));
   CHECK(PoolShouldYield(in));  // 1900 ms toward 5 so far
   in.yielded = clock.YieldedFor(5, at(60600));
+  in.total_yielded = clock.Total(at(60600));
   CHECK(!PoolShouldYield(in));  // 2100 ms: the same waiter got its 2 s
   clock.Pause(at(60600));
   CHECK(clock.total == std::chrono::milliseconds(2100));
   // Freed again, the same waiter still there: no further yielding.
   in.yielded = clock.YieldedFor(5, at(90000));
+  in.total_yielded = clock.Total(at(90000));
   CHECK(!PoolShouldYield(in));
-  // A different, higher priority shows up: a fresh budget for it.
+  // A different, higher priority shows up: its own budget.
   CHECK(clock.YieldedFor(9, at(90000)) == std::chrono::milliseconds(0));
   in.highest_waiting = 9;
   in.yielded = clock.YieldedFor(9, at(90000));
@@ -600,11 +604,30 @@ void TestYieldClock() {
   CHECK(clock.Begin(9, at(90000)));
   CHECK(clock.target == 9);
   CHECK(clock.YieldedFor(9, at(91000)) == std::chrono::milliseconds(1000));
-  in.yielded = clock.YieldedFor(9, at(92100));
-  CHECK(!PoolShouldYield(in));
-  clock.Pause(at(92100));
+  // Back to 5 while 9 is open: 5 keeps its spent budget, 9 keeps its own.
+  CHECK(clock.Begin(5, at(91000)));  // books 1000 ms toward 9
+  CHECK(clock.YieldedFor(9, at(91000)) == std::chrono::milliseconds(1000));
+  CHECK(clock.YieldedFor(5, at(91500)) == std::chrono::milliseconds(2600));
+  in.highest_waiting = 5;
+  in.yielded = clock.YieldedFor(5, at(91500));
+  in.total_yielded = clock.Total(at(91500));
+  CHECK(!PoolShouldYield(in));  // alternating 5/9 never reopens 5
+  clock.Pause(at(91500));
+  CHECK(clock.total == std::chrono::milliseconds(3600));
+  // The overall cap: with 3 x kPoolYieldMax booked, no priority gets more.
+  CHECK(clock.Begin(9, at(92000)));
+  clock.Pause(at(93000));  // 9: 2000 in all; total 4600
+  CHECK(clock.YieldedFor(9, at(93000)) == std::chrono::milliseconds(2000));
+  CHECK(clock.Begin(7, at(93000)));
+  clock.Pause(at(94400));  // 7: 1400; total 6000
+  CHECK(clock.total == std::chrono::milliseconds(6000));
+  in.highest_waiting = 8;
+  in.yielded = clock.YieldedFor(8, at(94400));
+  in.total_yielded = clock.Total(at(94400));
+  CHECK(in.yielded == std::chrono::milliseconds(0));
+  CHECK(!PoolShouldYield(in));  // a fresh priority, but the request is done yielding
   clock.Pause(at(99000));  // idempotent
-  CHECK(clock.total == std::chrono::milliseconds(2100));
+  CHECK(clock.total == std::chrono::milliseconds(6000));
 }
 
 int main() {
