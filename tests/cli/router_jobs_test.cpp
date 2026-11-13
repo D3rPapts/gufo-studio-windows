@@ -2276,9 +2276,7 @@ void TestPoolPullPinned() {
   const auto run = [](const char* name, const std::string& partner_queue,
                       bool expect_pull) {
     auto partner = std::make_shared<FakePartner>();
-    // The partner's list is there from the start: every decision of the
-    // runner (before the first job, before ours, after ours) sees it.
-    partner->queued = partner_queue;
+    partner->queued = R"({"object":"list","data":[]})";
     Harness h(name, false);
     partner->api = h.api;
     h.partner_name = "http://10.0.0.2:8081";
@@ -2296,13 +2294,18 @@ void TestPoolPullPinned() {
     const std::string first =
         h.Submit(ImageJob("SLOW first")).member_str("id");
     h.WaitFor(first, "in_progress");
-    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
-    h.WaitFor(mine, "queued");
+    // The partner's list appears while the runner is busy with first;
+    // every later decision (before ours, after ours) sees it. The runner
+    // reads it fresh after pull_poll (20 ms) since its last look, which
+    // WaitFor(queued) below has long passed by the time ours is next.
     int reads_before = 0;
     {
       const std::lock_guard<std::mutex> lock(partner->mutex);
+      partner->queued = partner_queue;
       reads_before = partner->queued_reads;
     }
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    h.WaitFor(mine, "queued");
     h.api->release.store(true);
     h.WaitFor(mine, "completed");
     // The runner looks at the partner's list once more after ours ran
