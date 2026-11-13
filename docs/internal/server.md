@@ -987,6 +987,114 @@ ids that `changed`. Errors: 400 `invalid_placement`, 404
   local ones. The placement is not saved: after a restart the preset's
   `placement` applies again.
 
+### Users and access
+
+Since 2.0.3 the router front can require a login (gufo-studio-windows
+only; upstream gufo has no authentication). Everything lives in the
+preset's optional `[router]` section and is off by default, so an
+existing preset behaves exactly as before.
+
+```ini
+[router]
+auth            = off        # off | lan | all
+auth-loopback   = admin      # admin | login
+users-file      = nutzer\nutzer.json
+pool-secret-env = GUFO_POOL_SECRET
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `auth` | `off` | `off`: everyone may use everything (today's behaviour); the users API and `/verwaltung/` answer from `127.0.0.1` only. `lan`: `127.0.0.1` is admin (see `auth-loopback`), everyone else logs in. `all`: the machine itself logs in too (strangers at the keyboard). |
+| `auth-loopback` | `admin` | With `auth = lan`: whether `127.0.0.1`/`::1` counts as the admin `lokal` without a login (`admin`) or must log in like the LAN (`login`). The users API and `/verwaltung/` stay open from `127.0.0.1` either way (emergency path: a forgotten admin password is reset at the machine). |
+| `users-file` | `nutzer\nutzer.json` next to the preset | The users file; a relative path resolves against the preset's directory. `nutzer\filter-woerter.txt` and `nutzer\zugriff.log` live beside it. |
+| `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
+
+Order per request: free paths (`/health`, `/ready`, `/login/` and its
+files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
+router's own calls (jobs runner, figure check, ComfyUI adapter: a
+per-process key on loopback), the partner (pool key), `Authorization:
+Bearer gufo_...` (API tokens), the `gufo_sitzung` cookie (HttpOnly,
+SameSite=Lax, 12 h; "stay signed in" 30 days, stored hashed in the users
+file so it survives a restart), and finally loopback as admin. Anything
+else gets `401 not_authenticated` (JSON) or, for a page, `302` to
+`/login/?zurueck=<page>`. A bearer that does not match any token is `401
+invalid_token`; after 5 failed logins from one address within a minute
+that address waits 60 s (`429 too_many_attempts`, `Retry-After`).
+
+Roles: `admin` (everything, including the users API, model load/unload,
+`POST /router/placement`, `/router/pool/pull` and every job), `nutzer`
+(the enabled areas, own jobs only) and `dienst` (programs: tokens only,
+no password login, rights like `nutzer`). Rights per user, all optional:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `bereiche` | all | Subset of `text`, `bild`, `video`, `stimme`, `musik`, `3d`, `ablage`, `pool`, `status`. A request outside the user's areas is `403 forbidden` ("Bereich bild ist für diesen Nutzer nicht freigegeben"); a page of a closed area is a small 403 page. |
+| `modelle` | all | Allowed model ids; another model is `403 model_forbidden`. |
+| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart): `400 content_filtered`. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
+| `tageslimit` | 0 (unlimited) | POST requests on generation endpoints per UTC day, videos count twice: `429 daily_limit`. Counted in memory (a restart resets it). |
+| `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`). |
+
+Areas by endpoint: text = chat, completions, responses, messages,
+embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*` and
+the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
+...); video = `/v1/videos*`; stimme = speech, transcriptions, convert,
+voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
+`/v1/3d/*`; ablage = `/v1/jobs*`; `/v1/previews/*` needs bild or video.
+`GET /v1/models`, `/router/status`, `/router/capabilities`, `GET
+/router/placement` and `/v1/names` are open to every signed-in user (the
+pages need them); `pool` and `status` gate the pages of those names
+(`/pool/`, `/speicher/`, `/status/`, ...).
+
+Jobs belong to a user: `POST /v1/jobs` stamps `metadata.nutzer`, a job's
+inner request is checked like a direct one (area, model, filter, limit),
+`GET /v1/jobs` lists only the user's jobs, a read, file, patch or delete
+of another user's job is `404`, bulk delete is admin only. Admins and the
+partner see everything. Relayed and pulled requests carry `X-Gufo-User`
+and `X-Gufo-Rights` (`rolle=...;bereiche=...;modelle=...;filter=...;
+tageslimit=...;pool=...`) set by the entry router; the partner trusts
+them when the pool key is valid, so the second machine needs no copy of
+the users file, and a job it runs is stored under that user. The entry
+router's own jobs runner runs each job as its owner (the job header).
+
+Endpoints (JSON):
+
+| Endpoint | Who | What |
+| --- | --- | --- |
+| `GET /router/me` | anyone | `{auth, name, rolle, quelle, bereiche, modelle, filter, tageslimit, pool, verwaltung, setup}`; `401` with `setup: true` while no admin exists. |
+| `POST /login` | anyone | `{"name", "passwort", "bleiben"}` -> `200` + `Set-Cookie`, `401 login_failed`, `403 login_not_allowed` (dienst), `429 too_many_attempts`. |
+| `POST /logout` | anyone | Ends the session, clears the cookie. |
+| `GET/POST /router/users` | loopback or admin | List (no hashes) / create `{"name", "rolle", "passwort", "rechte"}`. |
+| `GET/PUT/DELETE /router/users/<name>` | loopback or admin | Read / change `{rolle, rechte, passwort, gesperrt}` / block; `?loeschen=1` removes the user. |
+| `POST /router/users/<name>/tokens` | loopback or admin | `{"name", "tage"}` -> the token `gufo_<64 hex>` once; only its SHA-256 is stored. |
+| `DELETE /router/users/<name>/tokens/<token>` | loopback or admin | Revokes the token. |
+| `GET /router/zugriff?n=N` | loopback or admin | Last N lines of the access log. |
+
+Everyone else gets `404` on the users API and on `/verwaltung/`, so the
+pages are invisible from outside. The users file (`{"version": 1,
+"nutzer": [...]}`) holds per user the name, role, PBKDF2-SHA256 hash
+(600 000 rounds, 16-byte salt), rights, token hashes with name and
+expiry, remembered session hashes, timestamps and `gesperrt`; it is
+written whole after every change (temporary file + rename). Files from
+older builds without some fields load with defaults. The access log
+`nutzer\zugriff.log` has one tab-separated line per login, refusal and
+generation request (UTC time, user, address, method and path, model,
+result) and never a prompt; it rotates daily to `zugriff-<day>.log` and
+keeps 30 days.
+
+First setup: with `auth = lan` and no admin in the file the LAN gets the
+login page with the hint "no admin yet"; create the first admin from the
+machine itself (`/verwaltung/` on `http://127.0.0.1:<port>/` or `POST
+/router/users`), then create the users and the `dienst` tokens for the
+film pipeline and the watchdogs, set the pool secret on both machines and
+switch `auth` on in both presets. Stages: `off` (today), `lan`, `all`;
+TLS stays a reverse proxy's job.
+
+Pages: `/login/`, `/verwaltung/` (users, rights, passwords, tokens, log;
+de/en, dark mode) and `gemeinsam/anmeldung.js`, which every page loads
+after `sprache.js`: it reads `/router/me`, shows the name and "Abmelden",
+hides tiles and menu entries of closed areas and goes to `/login/` on
+`401`.
+
 
 ## Endpoint Set
 
