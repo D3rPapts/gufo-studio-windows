@@ -23,7 +23,8 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-Gufo ignores API keys. Supported fields behave as documented here; fields Gufo
+`gufo serve` ignores API keys (the router can check them, see
+[exposure](#exposure)). Supported fields behave as documented here; fields Gufo
 can't honor return 400 instead of being silently dropped. The
 [server reference](internal/server.md) lists every field.
 
@@ -172,6 +173,20 @@ Errors use the OpenAI error object:
 | 429 | Queue full; retry later |
 | 503 | Model loading, or the GPU was lost (`device_lost`) |
 
+The router of gufo-studio-windows (`gufo router`) adds:
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Not signed in: `not_authenticated`, `no_admin`, `invalid_token`, `login_failed` |
+| 403 | Signed in but not allowed: `forbidden` (area), `model_forbidden`, `csrf_rejected` |
+| 415 | `json_required`: users API called without `Content-Type: application/json` |
+| 502 | `upstream_unavailable`: the worker did not start; `partner_unreachable`: job relay to the partner failed |
+| 504 | `load_timeout`: the model did not load within `--load-timeout-seconds` |
+| 507 | `insufficient_memory`: not enough free memory to load the model |
+| 508 | `remote_loop`: the request was already relayed by the partner router |
+
+The [server reference](internal/server.md#errors) explains each code.
+
 A stream that fails after it started ends with an error event instead.
 
 ## Health and restarts
@@ -215,10 +230,15 @@ because loading and reading the disk cache take a while.
 
 ## Exposure
 
-> **Warning:** Gufo has no authentication. Anyone who can reach the port can
-> run the model and read its metrics. It listens on `127.0.0.1` by default;
-> before changing `--host`, put a reverse proxy with TLS and access control in
-> front.
+> **Warning:** `gufo serve` has no authentication. Anyone who can reach the
+> port can run the model and read its metrics. It listens on `127.0.0.1` by
+> default; before changing `--host`, put a reverse proxy with TLS and access
+> control in front.
+
+The router of gufo-studio-windows (`gufo router`) can require a login
+(`[router] auth = lan` in the preset): users with roles, areas and daily
+limits, API tokens `Authorization: Bearer gufo_...`, and a cookie login page.
+It is off by default. See [Users and access](internal/server.md#users-and-access).
 
 Gufo never logs prompts or replies, and never runs tool calls, commands or
 generated code. Only the opt-in [`--trace`](troubleshooting.md#content-trace)

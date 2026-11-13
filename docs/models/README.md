@@ -19,6 +19,9 @@ to run the model and what speed to expect.
 | Wan 2.2 TI2V 5B and Wan 2.1 14B (Uni3C camera, VACE, InfiniteTalk) | Diffusers Wan 2.2 directory or gufo-camera/vace/talk.json bundles; text, image, audio and video conditioning | [Extension manifest (no user guide yet)](../../src/models/wan22/extension.json) |
 <!-- END GENERATED MODEL TABLE -->
 
+Fork pages outside the generated table: [Qwen3-Omni captioner](qwen3-omni-captioner.md),
+[RIFE](rife/README.md), [Real-ESRGAN](realesrgan/README.md).
+
 Gufo doesn't ship weights; download them from Hugging Face as each page shows.
 Every speed on these pages was measured on Strix Halo with 128 GB of memory,
 on the date given next to it.

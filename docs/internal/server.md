@@ -453,29 +453,101 @@ cache snapshots. HTTP handlers do not implement model kernels.
 ## Model router
 
 `gufo router` exposes one OpenAI-compatible front door for several preset
-models across the five `serve` modalities. It spawns `gufo serve
-<modality>` workers on loopback on demand, reverse-proxies HTTP, SSE,
-WebSocket and multipart traffic to them, and unloads workers that have
-been idle or are displaced by `--models-max`.
+models across the `serve` modalities. It spawns `gufo serve
+<modality>` workers (or, for `[external/<id>]` sections, any other
+program) on loopback on demand, reverse-proxies HTTP, SSE, WebSocket and
+multipart traffic to them, and unloads workers that have been idle or are
+displaced by `--models-max`.
+
+The options as `gufo router --help` of 2.0.4 prints them:
 
 ```text
-gufo router --models-preset <FILE>
-            [--models-dir <DIR>]
-            [--models-max N]            default 2; 0 = unlimited
-            [--sleep-idle-seconds SEC]  default 900; 0 disables idle unload
-            [--load-timeout-seconds S]  default 600; 0 = unlimited wait
-            [--autoload]                preload preset models at startup
-            [--remote-allow LIST]       routers [remote/<id>] may name
-            [--host IP] [--port N] [--api-key KEY]
-            [--max-connections N] [--max-request-bytes N]
-            [--log-level LEVEL] [-v]
+gufo router [OPTIONS]
+
+Router:
+  --models-preset <FILE>        Preset file listing the models to multiplex (required)
+  --models-dir <DIR>            Base directory that resolves relative model paths
+  --pages-dir <DIR>             Serve static pages: GET /<name>/ returns DIR/<name>/index.html;
+                                GET / redirects to /start/ when DIR/start/index.html exists
+  --comfy-dir <DIR>             Serve a ComfyUI-compatible API (/prompt, /history, /view,
+                                /upload/image, /ws); DIR holds input/, output/, temp/ and history.json
+  --comfy-ffmpeg <FILE>         ffmpeg for the ComfyUI API: FLAC audio, PNG frames from videos,
+                                non-WAV voice references; also POST /v1/videos/concat
+                                (ffprobe is expected next to it)
+  --names-file <FILE>           Serve GET /v1/names and /v1/names/origins from FILE
+                                (UTF-8 lines kind<TAB>name<TAB>origin<TAB>gender, kind nach|vor)
+  --ccip-model-dir <DIR>        CCIP character fingerprints for POST /v1/figuren "verfahren": "ccip"
+  --ccip-face-dir <DIR>         Anime face detector for "verfahren": "ccip"
+  --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
+  --remote-allow <LIST>         Remote routers [remote/<id>] sections may name: IPv4 addresses or
+                                a.b.c.d/n ranges, each with an optional :port. Default: none,
+                                remote sections are refused
+  --models-max <N>              Maximum concurrently loaded workers (default: 2; 0 = unlimited)
+  --sleep-idle-seconds <SEC>    Unload a worker idle for this long (default: 900; 0 disables)
+  --load-timeout-seconds <SEC>  Bound for one full cold load (default: 600; 0 = unlimited)
+  --autoload                    Preload preset models in the background after startup, in
+                                section order (with --memory-guard only the first one); a failed
+                                load is listed as failed and retried
+  --autoload-retry-seconds <LIST>  Waits before retrying a failed --autoload, comma separated;
+                                the last one repeats (default: 30,60,120,300)
+
+Jobs:
+  --jobs-dir <DIR>              Serve the job API (/v1/jobs): wrapped image, video, audio and
+                                chat requests run in the background; DIR holds jobs.json and
+                                the results
+  --jobs-parallel <N>           Jobs running at the same time (default: 1)
+  --jobs-webhook-allow <LIST>   Webhook targets jobs may name (host names, IPv4 addresses or
+                                a.b.c.d/n ranges, each with an optional :port, or *).
+                                Default: none, webhooks off
+  --jobs-webhook-secret <SECRET>  Sign webhooks like Standard Webhooks (HMAC-SHA256)
+  --jobs-webhook-retry-seconds <LIST>  Waits before retrying a failed webhook (default: 5,30,120,600)
+  --jobs-webhook-timeout-seconds <SEC>  Time one webhook attempt may take (default: 10)
+  --jobs-expire-hours <N>       Delete the result media of a finished job N hours after it
+                                finished unless it is kept (PATCH /v1/jobs/{id} {"keep": true});
+                                the record, request.body and response.json stay. 0 = never
+                                (default: 12)
+
+Memory:
+  --memory-guard                Admit cold loads by live free GPU/host memory: keep loaded
+                                models beside a new one while it fits, evict idle ones least
+                                recently used first, wait for busy ones, and stop a load when
+                                memory runs critically low. Combine with --models-max 0. Preset
+                                keys router-gpu-gb, router-host-gb, router-exclusive and
+                                router-idle-seconds tune single models
+  --memory-report               Print one memory probe sample as JSON and exit
+  --memory-file <FILE>          Learned per-model memory peaks (JSON; default: the preset path
+                                with .memory.json)
+  --memory-factor <X>           Safety factor on estimates and learned peaks (default: 1.15)
+  --memory-learned-factor <X>   Safety factor on measured (learned) peaks (default: 1.05)
+  --memory-reserve-gpu-gb <GB>  GPU memory always kept free (default: 3)
+  --memory-reserve-host-gb <GB>  Host RAM always kept free (default: 4)
+  --memory-abort-host-gb <GB>   Watchdog: stop the newest load below this free host RAM (default: 1.5)
+  --memory-abort-gpu-gb <GB>    Watchdog: stop the newest load below this free GPU memory
+                                (dedicated + shared; default: 0.5)
+  --memory-reserve-commit-gb <GB>  Windows commit (RAM + page file; GPU memory counts too)
+                                always kept free below the commit limit (default: 3)
+  --memory-abort-commit-gb <GB>  Watchdog: stop the newest load below this free commit
+                                (Windows; default: 1)
+
+Server:
+  -i, --host <IP>               Bind address
+  -p, --port <N>                Port to listen on
+  --max-connections <N>         Maximum simultaneous HTTP connections
+  --max-request-bytes <N>       Maximum HTTP request body bytes
+
+Logging:
+  --log-level <LEVEL>           error, warn, info or debug (default: info)
+  -v, --verbose                 Shorthand for --log-level=debug
 ```
 
 Front server options use the same names and defaults as `serve`, including
 the `HOST`, `PORT`, `GUFO_HOST` and `GUFO_PORT` environment fallbacks. The
 router injects `GUFO_HOST=127.0.0.1` and a reserved loopback `GUFO_PORT`
-into every child, so workers bind loopback and run keyless; the front
-enforces `--api-key` and never forwards a client `Authorization` header.
+into every child, so workers bind loopback and run keyless. The router has
+no `--api-key`: access control is the preset's `[router]` section
+([Users and access](#users-and-access)), which reads `Authorization:
+Bearer gufo_...` as an API token; a client `Authorization` header is never
+forwarded to a worker.
 `gufo router --help` prints the preset grammar plus, per modality, the
 accepted keys generated from the same option registrations that render
 `gufo serve <modality> --help`.
@@ -501,16 +573,27 @@ model = /models/qwen3-asr
 ```
 
 - The section header is `[<modality>/<model-id>]` with modality in
-  `llm|image|video|tts|asr`. `model-id` is the routing key, must be unique
-  across the file, and becomes the worker's `--served-model-name` default
-  except for `video`, whose server has no such option.
+  `llm|image|video|tts|asr|embedding|omni|external|remote`
+  (`src/cli/serve/router/preset.cpp`, `kModalities`); the keyless
+  `[router]` section is the access-control block (see
+  [Users and access](#users-and-access)). `llm|image|video|tts|asr|
+  embedding|omni` start a `gufo serve <modality>` worker of this
+  executable (`omni` only in a fork build with `gufo serve omni`; on the
+  plain upstream base such a section is refused at startup).
+  `external` starts another program (below), `remote` names a model
+  of another router ([Remote models](#remote-models)). `model-id` is the
+  routing key, must be unique across the file, and becomes the worker's
+  `--served-model-name` default except for `video`, whose server has no
+  such option, and for `external`.
 - A body line `key = value` maps to worker argv `--key value` verbatim.
   Boolean flags use `key = true|false`: `true` passes the bare flag,
   `false` omits it. Keys are validated against that modality's registered
   long options only, so a new `gufo serve` option becomes available in the
   preset file without any router change.
 - `host`, `port` and `api-key` are router-managed and rejected in
-  sections.
+  sections (`IsReservedKey`).
+- Keys starting with `router-` are not passed to the worker; they are
+  residency hints for the router itself (below).
 - Relative path values resolve against `--models-dir`, or against the
   router's working directory when it is unset.
 - Startup validation feeds every section through the modality's real
@@ -520,6 +603,58 @@ model = /models/qwen3-asr
   `1`; with `--autoload`, presets beyond the limit are not an error: the
   first `--models-max` sections preload in section order and the rest load
   on demand.
+
+### External sections and router hints
+
+`[external/<id>]` (gufo-studio-windows) runs any program as the worker of
+a model id: another gufo build, a `gufo` of this build with a modality
+this binary does not start itself, or a foreign server such as
+`llama-server`. The production preset of the two Strix Halo machines
+consists almost only of such sections. Rules from
+`src/cli/serve/router/preset.cpp`:
+
+```ini
+[external/qwen3-tts]
+command = D:\llm-modelle\gufo\app\gufo-2.0.4-2026-11-13\gufo.exe
+args = serve tts
+model = D:\llm-modelle\gufo\modelle\Qwen\Qwen3-TTS-12Hz-1.7B-CustomVoice
+served-model-name = qwen3-tts
+max-request-bytes = 67108864
+router-gpu-gb = 1
+router-host-gb = 1
+```
+
+- `command` (required) is the program; a relative value resolves against
+  `--models-dir` like a `model` path, and the router refuses to start
+  when the file does not exist (`command '...' not found`).
+- `args` holds leading positional arguments, space separated, no
+  quoting (`serve tts`, `serve llm`, `serve upscale --device gpu ...`).
+  They go in front of the generated options.
+- Every other `key = value` becomes `--key value` as in a normal
+  section (`true` = bare flag, `false` = omitted; `host`, `port`,
+  `api-key` rejected). The keys are **not** validated against a
+  modality's option registry: the program's options are its own
+  business. For the same reason the router does not add
+  `--served-model-name <id>` on its own and does not turn
+  `served-model-name` values into alias ids; put the id in the section
+  explicitly, as above. The router still injects `GUFO_HOST`/`GUFO_PORT`
+  for the worker's bind address.
+- `GET /v1/models` reports such a model with `"modality": "external"`,
+  not the modality the program serves.
+
+Router hints `router-*` are read by the router itself in every local
+section (`ParseHint`) and never reach the worker. They tune
+`--memory-guard` and the idle unload per model:
+
+| Key | Value | Effect |
+| --- | --- | --- |
+| `router-gpu-gb` | number >= 0 | Expected GPU memory of the loaded worker in GB; replaces the memory guard's estimate for this id (preset keys win over the learned `.memory.json` values). |
+| `router-host-gb` | number >= 0 | Expected host RAM in GB; used together with `router-gpu-gb` (without it the value is not applied). |
+| `router-exclusive` | `true` or `false` | `true`: nothing else may stay loaded beside this model; the guard evicts the others first. |
+| `router-idle-seconds` | number >= 0 | Idle unload for this model instead of `--sleep-idle-seconds`. |
+
+Any other `router-*` key is `unknown router key` and stops the start.
+In `[remote/<id>]` sections router hints are rejected.
 
 ### Routing and proxying
 
@@ -927,7 +1062,7 @@ max-request-bytes = 67108864
 | --- | --- |
 | `url` | `http://<IPv4>:<port>` of the remote router; no host names, https or path. Required |
 | `modality` | `llm`, `image`, `video`, `tts`, `asr`, `embedding` or `omni`, as `/v1/models` lists it. Required |
-| `api-key-env` | Environment variable holding the remote router's `--api-key`; sent as `Authorization: Bearer`. Unset variable: exit 2 |
+| `api-key-env` | Environment variable with a bearer key for a 1.x remote router (those had `--api-key`); sent as `Authorization: Bearer`. Unset variable: exit 2. A 2.0.3+ partner is reached with the shared pool secret (`[router] pool-secret-env`) instead |
 | `connect-timeout-seconds` | Connect bound (default 3, 1..300) |
 | `head-timeout-seconds` | Response-head deadline after the request is sent (default 0 = none) |
 | `gpu-slot` | Remote models sharing the name run one GPU-starting request at a time |
@@ -1009,7 +1144,9 @@ The answer lists every switchable model (`placement`, `local_status`,
 `local_busy`, `remote_busy`, `remote_url`, `remote_reachable`) and the
 ids that `changed`. Errors: 400 `invalid_placement`, 404
 `model_not_found`, 409 `not_switchable`. The endpoint is protected like
-`/models/load`: by the router's `--api-key` when one is set.
+`/models/load`: with `[router] auth = lan|all` only an admin (or the
+machine itself with `auth-loopback = admin`) may post it; see
+[Users and access](#users-and-access).
 
 - New requests follow the placement at once. Nothing running is cut off:
   local requests, WebSockets and jobs finish on the local worker, relays
@@ -2130,6 +2267,35 @@ Use appropriate HTTP status codes:
 - `499` internally recorded client cancellation
 - `500` internal failure
 - `503` model or backend unavailable, or GPU context lost (`device_lost`)
+
+The router front (gufo-studio-windows) adds these; the `code` strings
+are from `src/cli/serve/router/{auth,router,jobs,remote}.cpp`:
+
+- `401` not signed in (`[router] auth = lan|all`): `not_authenticated`
+  (login required), `no_admin` (no admin user exists yet; create one
+  from the machine itself), `invalid_token` (unknown or expired bearer
+  token), `pool_key_invalid` (partner call with a missing or wrong
+  `X-Gufo-Pool-Key`), `login_failed` (wrong name or password on
+  `POST /router/login`). Type `authentication_error`.
+- `403` signed in but not allowed: `forbidden` (area not enabled for
+  the user), `model_forbidden` (model not in the user's list),
+  `csrf_rejected` (browser write from another origin or scheme);
+  the password-change codes are listed under
+  [Users and access](#users-and-access). Type `permission_error`.
+- `415` `json_required`: a write to the users API without
+  `Content-Type: application/json`.
+- `502` `upstream_unavailable`: the worker failed to spawn or start, or
+  the router is shutting down; `partner_unreachable`: a job relay to the
+  partner router failed.
+- `504` `load_timeout`: the worker did not load within
+  `--load-timeout-seconds`; `objekt_timeout`: a 3D job exceeded its
+  deadline.
+- `507` `insufficient_memory`: `--memory-guard` stopped or gave up the
+  load because free GPU, host or commit memory ran low (the message
+  names what is needed and what is free).
+- `508` `remote_loop`: a request relayed by the partner (`X-Gufo-Forwarded`)
+  arrived at a router where the model is remote as well; it is not
+  relayed again.
 
 Generation stops at the request budget or context capacity and reports a
 length finish reason when either limit is reached.
