@@ -18,6 +18,8 @@ add_library(gufo_router STATIC
   src/cli/serve/router/auth.cpp
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/download.cpp
+  src/cli/serve/router/einrichtung.cpp
   src/cli/serve/router/figuren.cpp
   src/cli/serve/router/figuren_ccip.cpp
   src/cli/serve/router/jobs.cpp
@@ -31,6 +33,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/residency.cpp
   src/cli/serve/router/rgba_image.cpp
   src/cli/serve/router/router.cpp
+  src/cli/serve/router/selbsttest.cpp
   src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
 )
@@ -73,7 +76,7 @@ if (BUILD_TESTING)
       router_preset_test router_registry_test router_memory_test
       router_names_test router_figuren_test router_proxy_remote_test
       router_jobs_test router_pool_test router_figuren_ccip_endpoint_test
-      router_auth_test router_mcp_test)
+      router_auth_test router_mcp_test router_einrichtung_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
@@ -81,6 +84,15 @@ if (BUILD_TESTING)
     set_tests_properties(${router_test} PROPERTIES LABELS "cpu;router"
       TIMEOUT 60)
   endforeach()
+  # The setup assistant's test reads the real catalogue and templates and,
+  # where python3 is found, compares against einrichtung/einrichten.py.
+  target_compile_definitions(router_einrichtung_test PRIVATE
+    GUFO_EINRICHTUNG_DIR="${PROJECT_SOURCE_DIR}/einrichtung")
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if (Python3_EXECUTABLE)
+    target_compile_definitions(router_einrichtung_test PRIVATE
+      GUFO_PYTHON3="${Python3_EXECUTABLE}")
+  endif()
 
   # The ComfyUI graph translator alone: no server library needed.
   foreach (router_test IN ITEMS router_comfy_graph_test

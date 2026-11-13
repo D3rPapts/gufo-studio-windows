@@ -192,6 +192,7 @@ def werte_fuer(a, reihe, alle):
 def flags_fuer(a):
     f = {str(a["ram_gb"])}
     f |= {k for k, v in a["schalter"].items() if v}
+    f.add(a["router"]["erreichbarkeit"])   # heimnetz | nur-dieser-rechner: [router]-Abschnitt in router.ini
     return f
 
 def partner_modelle(a, reihe, alle):
@@ -214,7 +215,9 @@ def baue_preset(a, reihe, alle, werte, flags):
     if pm:
         bl = lies_vorlage("zweiter-rechner")[0]
         for mid in pm:
-            out += fuelle(bl["zeilen"], dict(werte, id=mid), flags) + [""]
+            # [remote/<id>] muss den lokalen Abschnitt treffen (moss-music-8b -> [external/moss-music]).
+            sid = (alle[mid][1].get("abschnitt") or mid).split("/")[-1]
+            out += fuelle(bl["zeilen"], dict(werte, id=sid), flags) + [""]
     return "\n".join(out) + "\n", pm
 
 def fremde_bloecke(alt_text):

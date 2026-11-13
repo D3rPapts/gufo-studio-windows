@@ -153,6 +153,10 @@ public:
   /// parse is an error.
   [[nodiscard]] bool Load(std::string* error);
   [[nodiscard]] bool Save(std::string* error) const;
+  /// Points the store at another file and loads it (the setup assistant
+  /// of a router started with --einrichtung learns the data folder, and
+  /// with it the users file, from the page's step 3).
+  [[nodiscard]] bool Relocate(std::filesystem::path file, std::string* error);
   [[nodiscard]] const std::filesystem::path& path() const { return file_; }
   [[nodiscard]] std::filesystem::path dir() const {
     return file_.parent_path();
@@ -286,7 +290,9 @@ struct Route {
     kMe,           // GET /router/me
     kPasswort,     // POST /router/me/passwort (own password)
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
-    kAdminPage,    // /verwaltung/: loopback or admin, else 404
+    kAdminPage,    // /verwaltung/, /einrichtung/: loopback or admin, else 404
+    kSetup,        // /router/setup/* (2.1 setup assistant): loopback or
+                   // admin, else 404; the router answers (einrichtung.cpp)
     kPage,         // GET /<page>/...: login (302), then the page's area
     kAnyUser,      // any authenticated user (model list, status reads)
     kAdminControl, // model load/unload, placement: admin

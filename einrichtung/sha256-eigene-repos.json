@@ -1,0 +1,39 @@
+{
+ "hinweis": "SHA-256 der Dateien in unseren eigenen Hugging-Face-Repos (huggingface.co/D3rPapst), gelesen von katalog_bauen.py. 'hf-upload' = aus .cache\\huggingface\\upload\\<datei>.metadata (hf upload-large-folder, 13.11.2026; Zeile 4 = SHA-256 = LFS-oid auf Hugging Face, Zeilen 7/8 hochgeladen/committed = 1), gesichert am 14.11.2026, bevor die .cache-Ordner geloescht werden. 'lokal' = sha256sum auf der .198 am 13.11.2026 ueber genau die hochgeladene Datei (hf-upload\\doku-entwurf\\katalog-hf.patch.md). hf_etag_geprueft = Datum, an dem der X-Linked-ETag von https://huggingface.co/<repo>/resolve/<rev>/<datei> (HEAD) mit dem Wert hier verglichen wurde und gleich war.",
+ "repos": {
+  "ACE-Step\\gufo": {"hf_repo": "D3rPapst/ace-step-1.5-gufo", "hf_revision": "", "commit_log": "Karten-Commit 32069b4a; Gewichte-Commit von upload-large-folder nicht gedruckt, darum Revision leer = main"},
+  "OpenMOSS-Team\\moss-music-gufo": {"hf_repo": "D3rPapst/moss-music-8b-gufo", "hf_revision": "", "commit_log": "Karten-Commit cec7cc64; Gewichte-Commit nicht gedruckt, Revision leer = main"},
+  "microsoft\\gufo-trellis2": {"hf_repo": "D3rPapst/trellis2-gufo", "hf_revision": "", "commit_log": "Karten-Commit e1d90499; Gewichte-Commit nicht gedruckt, Revision leer = main"},
+  "VAST-AI\\TripoSG\\gufo": {"hf_repo": "D3rPapst/triposg-gufo", "hf_revision": "3477fc000d52fc42a6126e67bf64593984389c97", "commit_log": "Gewichte-Commit, Log Zeile 9063"},
+  "upscale": {"hf_repo": "D3rPapst/realesrgan-srvgg-gufo", "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5", "commit_log": "Gewichte-Commit, Log Zeile 915"},
+  "rife": {"hf_repo": "D3rPapst/rife-ifnet-gufo", "hf_revision": "f22306090db92290648c4fc87e2be18424591482", "commit_log": "Gewichte-Commit, Log Zeile 287"}
+ },
+ "dateien": {
+  "ACE-Step\\gufo\\dit.safetensors": {"bytes": 9974719892, "sha256": "86a1afb0a1f711f0e3304ff65d874df3ae6783db683dcf982513fb9b6d14ae71", "sha256_status": "hf-upload", "hf_pfad": "dit.safetensors"},
+  "ACE-Step\\gufo\\dit-sft.safetensors": {"bytes": 9974720044, "sha256": "fbe389cbe9f05181a30c8fbf3f2600a6b9606ac2c6b332f161c09bbb8f948ab7", "sha256_status": "hf-upload", "hf_pfad": "dit-sft.safetensors"},
+  "ACE-Step\\gufo\\dit-base.safetensors": {"bytes": 9974720044, "sha256": "3f465fdaf91cc9ed8218c90bdc0819273d4d565e96753490348e8ade9ca7d227", "sha256_status": "hf-upload", "hf_pfad": "dit-base.safetensors"},
+  "ACE-Step\\gufo\\lm.safetensors": {"bytes": 8379154232, "sha256": "ffe5ffb855086c2ab55e467e9859fb01894781020a0376484dd19de166b79873", "sha256_status": "hf-upload", "hf_pfad": "lm.safetensors"},
+  "ACE-Step\\gufo\\lm-0.6b.safetensors": {"bytes": 1325804168, "sha256": "cb08bbd967437524438129650673b09293117702eb926ef5c1ede50b441728d5", "sha256_status": "hf-upload", "hf_pfad": "lm-0.6b.safetensors"},
+  "ACE-Step\\gufo\\lm-1.7b.safetensors": {"bytes": 3708523512, "sha256": "b4778c453dfa5118182d65490df88d94f575e03de85e3b3da3332af357783b86", "sha256_status": "hf-upload", "hf_pfad": "lm-1.7b.safetensors"},
+  "ACE-Step\\gufo\\text_encoder.safetensors": {"bytes": 1191588248, "sha256": "fd4590c82153b8ddb67e15a2e7aaa8afa8b83a858c8a9b82a4831063156aa7a7", "sha256_status": "hf-upload", "hf_pfad": "text_encoder.safetensors"},
+  "ACE-Step\\gufo\\vae.safetensors": {"bytes": 337431388, "sha256": "da17edb604c40deaf09e9b24974e590d1ca83a374070e5d0884cfa4bed9a99b0", "sha256_status": "hf-upload", "hf_pfad": "vae.safetensors"},
+  "ACE-Step\\gufo\\silence_latent.safetensors": {"bytes": 3840088, "sha256": "1e3f263c000e7b29439cebb9b611b58500ed382a0e49ef5821ac6b10758672c2", "sha256_status": "hf-upload", "hf_pfad": "silence_latent.safetensors"},
+  "ACE-Step\\gufo\\tokenizer.json": {"bytes": 11423705, "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a", "sha256_status": "hf-upload", "hf_pfad": "tokenizer.json"},
+  "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.llm-Q8_0.gguf": {"bytes": 8709518144, "sha256": "eeeb19b6f78342cc93708564f1fba18be49d5e7ca060c83f8db44782e6a49807", "sha256_status": "hf-upload", "hf_pfad": "moss-music-8b.llm-Q8_0.gguf"},
+  "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.audio.gguf": {"bytes": 1724490048, "sha256": "653e9ae67f35ba5ed3d4df8b34381ca03aea92c16d92449a131d4f1a8a65763e", "sha256_status": "hf-upload", "hf_pfad": "moss-music-8b.audio.gguf"},
+  "microsoft\\gufo-trellis2\\trellis2-shape_dec.safetensors": {"bytes": 948852556, "sha256": "feee6a80f41e230cd9c67ceada3ec72abccc113b51b8c489c3ad81136f03534f", "sha256_status": "hf-upload", "hf_pfad": "trellis2-shape_dec.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-shape_flow_512.safetensors": {"bytes": 2587225304, "sha256": "739e4a5bbf66862e1c6a194c6934cf6ba4aee3f2594fb9f9c4100122b102e485", "sha256_status": "hf-upload", "hf_pfad": "trellis2-shape_flow_512.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-ss_dec.safetensors": {"bytes": 147604500, "sha256": "22031a15458152b13479be13784df2aacee35e89b27c58ad88abfe665f37ba31", "sha256_status": "hf-upload", "hf_pfad": "trellis2-ss_dec.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-ss_flow.safetensors": {"bytes": 2586930280, "sha256": "d1a7adb3761a5a7222bd0a3b9e401d5b64b311cb6018cf356b72cfa8562c9d41", "sha256_status": "hf-upload", "hf_pfad": "trellis2-ss_flow.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-tex_dec.safetensors": {"bytes": 948789952, "sha256": "82140d40e10dca03124f95e2f43e89ef46d069833e6f0000d8b4fbea92f6928e", "sha256_status": "hf-upload", "hf_pfad": "trellis2-tex_dec.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-tex_flow_512.safetensors": {"bytes": 2587225304, "sha256": "b7800ed58a69c82caab6688d2f31e40291b98f2571393c9308783773973f31f4", "sha256_status": "hf-upload", "hf_pfad": "trellis2-tex_flow_512.safetensors"},
+  "microsoft\\gufo-trellis2\\trellis2-dinov3.safetensors": {"bytes": 1212638136, "sha256": "", "sha256_status": "fehlt", "hf_pfad": null, "hinweis": "nicht im HF-Repo (DINOv3-Lizenz): facebook/dinov3-vitl16-pretrain-lvd1689m selbst laden und mit tools/trellis2/convert_hf_to_gufo.py --parts dinov3 wandeln"},
+  "microsoft\\gufo-trellis2\\LICENSE-DINOv3.md": {"bytes": 7503, "sha256": "", "sha256_status": "fehlt", "hf_pfad": null, "hinweis": "nicht im HF-Repo; kommt mit der DINOv3-Umwandlung"},
+  "VAST-AI\\TripoSG\\gufo\\triposg.safetensors": {"bytes": 3923957740, "sha256": "570159920a91fdf9cc68d489521a3d890a12050f1d8626815e83fe25cd7caad9", "sha256_status": "lokal", "hf_pfad": "triposg.safetensors"},
+  "upscale\\realesr-general-x4v3.safetensors": {"bytes": 4861400, "sha256": "6b217ff50258cc7823169f074d2af7fa52d03bb8c9da615cb16b439576bde838", "sha256_status": "lokal", "hf_pfad": "realesr-general-x4v3.safetensors"},
+  "upscale\\realesr-general-wdn-x4v3.safetensors": {"bytes": 4861400, "sha256": "29edd79d26ee6f7290736c8c76be7c6a163709e1f96520ee4457abdd122d8328", "sha256_status": "lokal", "hf_pfad": "realesr-general-wdn-x4v3.safetensors"},
+  "upscale\\realesr-animevideov3.safetensors": {"bytes": 2490040, "sha256": "c5a3177446372b9181f99a4015fffcecfbbb67b3e8507aca716391d8c66a7c9e", "sha256_status": "lokal", "hf_pfad": "realesr-animevideov3.safetensors"},
+  "upscale\\weights\\Real-ESRGAN-LICENSE.txt": {"bytes": 1519, "sha256": "", "sha256_status": "fehlt", "hf_pfad": "LICENSE", "hinweis": "im Repo als LICENSE (gleicher BSD-3-Text, 1519 Bytes laut X-Linked-Size 14.11.2026); keine LFS-Datei, darum kein SHA-256-ETag"},
+  "rife\\weights\\rife49.safetensors": {"bytes": 21312128, "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f", "sha256_status": "lokal", "hf_pfad": "rife49.safetensors"}
+ }
+}
