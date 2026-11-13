@@ -513,33 +513,50 @@ struct PoolYieldInput {
          in.yielded < kPoolYieldMax;
 }
 
-/// How long a request has actually yielded: only the stretches in which
-/// it stood back for a higher priority count, never the time it waited
-/// because both machines were busy, so "at most kPoolYieldMax in a row"
-/// holds for every later higher-priority arrival too.
+/// How long a request has actually yielded to the priority now waiting:
+/// only the stretches in which it stood back count (never the time both
+/// machines were busy), they add up per target priority, and the budget
+/// starts over only when a different, higher priority shows up. So one
+/// waiter above us gets at most kPoolYieldMax of our time however often
+/// the machine frees up, and a later arrival of a yet higher priority
+/// gets its own kPoolYieldMax.
 struct PoolYieldClock {
   using Clock = std::chrono::steady_clock;
+  /// Booked yield time toward `target`.
   std::chrono::milliseconds total{0};
   Clock::time_point began{};
+  /// The waiting priority the budget belongs to (-1 = none yet).
+  int target{-1};
 
   [[nodiscard]] bool yielding() const { return began != Clock::time_point{}; }
-  /// The open stretch so far (0 when not yielding): the budget is per
-  /// stretch, a later higher-priority arrival gets a fresh one. `total`
-  /// keeps the sum for the log.
+  /// Yielded toward `target` so far, the open stretch included.
   [[nodiscard]] std::chrono::milliseconds Yielded(Clock::time_point now) const {
-    return yielding() ? std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - began)
-                      : std::chrono::milliseconds(0);
+    return total + (yielding() ? std::chrono::duration_cast<
+                                     std::chrono::milliseconds>(now - began)
+                               : std::chrono::milliseconds(0));
   }
-  /// A yield starts (or goes on). True when it just started.
-  bool Begin(Clock::time_point now) {
+  /// What the budget would be for `highest` now: fresh when it is another
+  /// priority than the one yielded to so far.
+  [[nodiscard]] std::chrono::milliseconds YieldedFor(int highest,
+                                                     Clock::time_point now) const {
+    return highest == target ? Yielded(now) : std::chrono::milliseconds(0);
+  }
+  /// A yield toward `highest` starts or goes on. True when a stretch just
+  /// started (for the log).
+  bool Begin(int highest, Clock::time_point now) {
+    if (highest != target) {
+      total = std::chrono::milliseconds(0);
+      target = highest;
+      began = now;
+      return true;
+    }
     if (yielding())
       return false;
     began = now;
     return true;
   }
   /// The request no longer yields (it waits for a machine, or runs): the
-  /// open stretch is booked and the clock stops.
+  /// open stretch is booked toward `target`, the clock stops.
   void Pause(Clock::time_point now) {
     if (!yielding())
       return;

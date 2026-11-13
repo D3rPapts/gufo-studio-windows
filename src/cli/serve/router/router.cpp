@@ -1845,10 +1845,11 @@ public:
         router::PoolYieldInput yield_input;
         yield_input.priority = priority;
         yield_input.highest_waiting = HigherWaitingLocked(model_id, priority);
-        yield_input.yielded = yield_clock.Yielded(now);
+        yield_input.yielded =
+            yield_clock.YieldedFor(yield_input.highest_waiting, now);
         yield_input.forwarded = forwarded;
         if (router::PoolShouldYield(yield_input)) {
-          if (yield_clock.Begin(now)) {
+          if (yield_clock.Begin(yield_input.highest_waiting, now)) {
             ++pool_[model_id].yields;
             Logger::Info("router",
                          "event=pool_yield model=" + model_id +
@@ -4167,15 +4168,21 @@ int RunRouter(std::span<const char* const> args) {
                                                   router::comfy::SpeechTask>) {
                 item.area = "stimme";
                 item.model = spec.model;
+                item.texts = {spec.text, spec.instructions};
               } else if constexpr (std::is_same_v<Spec,
                                                   router::comfy::DialogueTask>) {
                 item.area = "stimme";
                 if (!spec.lines.empty())
                   item.model = spec.lines.front().model;
+                for (const auto& line : spec.lines) {
+                  item.texts.push_back(line.text);
+                  item.texts.push_back(line.instructions);
+                }
               } else if constexpr (std::is_same_v<Spec,
                                                   router::comfy::MusicTask>) {
                 item.area = "musik";
                 item.model = spec.model;
+                item.texts = {spec.tags, spec.lyrics};
               } else {
                 item.area = "musik";  // foley
                 item.model = spec.model;
