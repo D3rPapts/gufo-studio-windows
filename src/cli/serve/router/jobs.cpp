@@ -1832,8 +1832,14 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
   if (job->idempotency_key.size() > kMaxIdempotencyKey)
     return Err(400, "Bad Request", "Idempotency-Key is longer than 255",
                "invalid_idempotency_key");
+  // Keys are per owner (2.0.3): another user with the same key never
+  // sees or collides with this job.
+  const std::string owner = job->metadata.member_str("nutzer");
+  if (!job->idempotency_key.empty() && !owner.empty())
+    job->idempotency_key = owner + "\x1f" + job->idempotency_key;
   {
     json::Value fingerprint = json::Value::object();
+    fingerprint["owner"] = owner;
     fingerprint["path"] = job->path;
     fingerprint["content_type"] = job->content_type;
     fingerprint["body"] = crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -2873,6 +2879,10 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
         } else if (item.member_str("status") != "queued") {
           continue;
         }
+        // A job pinned to the partner (its user may not use the pool,
+        // 2.0.3) is never handed out: not a candidate, not in the order.
+        if (item.member_str("pinned") == "local")
+          continue;
         PartnerJob job;
         job.id = item.member_str("id");
         job.waiting = waiting;

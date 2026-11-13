@@ -2265,6 +2265,120 @@ void TestPoolPinLocal() {
   CHECK(allowed && allowed->status == 202);
 }
 
+void TestPoolPullPinned() {
+  // Requester: a partner job pinned to the partner (its user may not use
+  // the pool) is no pull candidate: it neither orders ahead of ours nor
+  // causes empty pull round trips.
+  const auto run = [](const char* name, const std::string& partner_queue,
+                      bool expect_pull) {
+    auto partner = std::make_shared<FakePartner>();
+    partner->queued = R"({"object":"list","data":[]})";
+    Harness h(name, false);
+    partner->api = h.api;
+    h.partner_name = "http://10.0.0.2:8081";
+    h.self_name = "http://10.0.0.1:8081";
+    h.capabilities = CapsA;
+    h.partner_capabilities = [] {
+      return std::optional<json::Value>(CapsB());
+    };
+    h.relay = [partner](const HttpRequest& request,
+                        std::chrono::milliseconds a,
+                        std::chrono::milliseconds b, std::string* error) {
+      return (*partner)(request, a, b, error);
+    };
+    h.Open(true);
+    const std::string first =
+        h.Submit(ImageJob("SLOW first")).member_str("id");
+    h.WaitFor(first, "in_progress");
+    {
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      partner->queued = partner_queue;
+    }
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    h.api->release.store(true);
+    h.WaitFor(mine, "completed");
+    for (int i = 0; i < 30; ++i) {
+      {
+        const std::lock_guard<std::mutex> lock(partner->mutex);
+        if (partner->pulls >= 1)
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const auto& calls = h.api->calls;
+    std::ptrdiff_t pulled = -1;
+    std::ptrdiff_t ours = -1;
+    int posts = 0;
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(calls.size()); ++i) {
+      if (calls[i] == "PULL" && pulled < 0)
+        pulled = i;
+      if (calls[i] == "POST /v1/images/generations" && ++posts == 2)
+        ours = i;
+    }
+    CHECK(ours >= 0);
+    if (expect_pull) {
+      CHECK(pulled >= 0);
+      CHECK(ours < pulled);  // the unpinned one is newer and normal
+    } else {
+      CHECK(pulled < 0);  // only a pinned job there: no round trip
+    }
+  };
+  const std::string pinned_head =
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":4102444800,"priority":9,"pinned":"local",)"
+      R"("request":{"model":"qwen-image","loras":[]}})";
+  const std::string unpinned =
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb3","status":"queued","created_at":4102444801,"priority":0,)"
+      R"("request":{"model":"qwen-image","loras":[]}})";
+  run("pull-pinned-head", R"({"object":"list","data":[)" + pinned_head + "," +
+                              unpinned + "]}",
+      true);
+  run("pull-pinned-only", R"({"object":"list","data":[)" + pinned_head + "]}",
+      false);
+}
+
+void TestIdempotencyPerOwner() {
+  // Idempotency keys are per owner (X-Gufo-User): another user with the
+  // same key gets its own job, never a replay or a 409 of the first.
+  Harness h("idempotency-owner", false);
+  h.Open(false);
+  const auto submit = [&h](const std::string& body, const std::string& user) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = body;
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back("Idempotency-Key", "k1");
+    if (!user.empty())
+      request.headers.emplace_back("X-Gufo-User", user);
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer.has_value());
+    return answer ? *answer : HttpResponse{};
+  };
+  HttpResponse a = submit(ImageJob("a"), "anna");
+  CHECK(a.status == 202);
+  const std::string a_id = json::parse(a.body).member_str("id");
+  HttpResponse b = submit(ImageJob("a"), "ben");
+  CHECK(b.status == 202);
+  CHECK(json::parse(b.body).member_str("id") != a_id);
+  CHECK(json::parse(b.body).find("metadata")->member_str("nutzer") == "ben");
+  HttpResponse again = submit(ImageJob("a"), "anna");
+  CHECK(again.status == 200);
+  CHECK(json::parse(again.body).member_str("id") == a_id);
+  HttpResponse other = submit(ImageJob("b"), "ben");
+  CHECK(other.status == 409);
+  // Without a user (auth off): one shared key space, as before.
+  HttpResponse none = submit(ImageJob("a"), "");
+  CHECK(none.status == 202);
+  CHECK(submit(ImageJob("a"), "").status == 200);
+  // The split survives a restart.
+  h.queue->Stop();
+  h.Open(false);
+  CHECK(submit(ImageJob("a"), "anna").status == 200);
+  CHECK(json::parse(submit(ImageJob("a"), "anna").body).member_str("id") == a_id);
+}
+
 void TestPoolPullOwner() {
   // Router B: POST /router/pool/pull hands out the oldest queued job the
   // requester can run, never one a runner took, never twice, not one
@@ -2847,6 +2961,8 @@ int main() {
   TestPoolWaitTakeover();
   TestPoolPullWaitingRequester();
   TestPoolPinLocal();
+  TestPoolPullPinned();
+  TestIdempotencyPerOwner();
   TestPriorityOrder();
   TestPriorityFile();
   TestPoolPullPriority();
