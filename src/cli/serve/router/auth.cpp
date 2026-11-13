@@ -602,6 +602,7 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
   if (list == nullptr)
     list = doc.find("users");
   std::vector<User> users;
+  std::vector<std::size_t> reserved_names;
   if (list != nullptr && list->is_array()) {
     for (const json::Value& item : list->items()) {
       if (!item.is_object())
@@ -612,15 +613,9 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
         *error = "users file: bad user name '" + user.name + "'";
         return false;
       }
-      bool reserved = false;
-      if (IsReservedName(user.name)) {
-        // A file from before the names were reserved: the router starts,
-        // the account is blocked (the name means the router itself or
-        // the partner from now on).
-        reserved = true;
-        Logger::Warn("router", "event=users_file_reserved_name name=" +
-                                   user.name + " action=blocked");
-      }
+      // A file from before the names were reserved: the router starts;
+      // decided below, once every user is read.
+      const bool reserved = IsReservedName(user.name);
       user.rolle = item.member_str("rolle", "nutzer");
       if (!IsRole(user.rolle))
         user.rolle = "nutzer";
@@ -665,9 +660,26 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
           g != nullptr && g->is_bool())
         user.gesperrt = g->as_bool();
       if (reserved)
-        user.gesperrt = true;
+        reserved_names.push_back(users.size());
       users.push_back(std::move(user));
     }
+  }
+  // A reserved name (the router itself, the partner) is blocked, unless it
+  // is the only working admin: then it stays, so the file still opens the
+  // door (the name clashes only with the placeholders' owner rules).
+  for (const std::size_t index : reserved_names) {
+    bool other_admin = false;
+    for (std::size_t j = 0; j < users.size(); ++j)
+      if (j != index && users[j].admin() && !users[j].gesperrt &&
+          !users[j].hash_hex.empty() && !IsReservedName(users[j].name))
+        other_admin = true;
+    const bool block = other_admin || !users[index].admin() ||
+                       users[index].gesperrt || users[index].hash_hex.empty();
+    if (block)
+      users[index].gesperrt = true;
+    Logger::Warn("router", "event=users_file_reserved_name name=" +
+                               users[index].name +
+                               (block ? " action=blocked" : " action=kept"));
   }
   const std::lock_guard<std::mutex> lock(mutex_);
   users_ = std::move(users);
@@ -1629,22 +1641,43 @@ bool Gate::CountDaily(const Identity& who, int weight, long long limit) {
 
 namespace {
 /// Takes or confirms `key` for `name` (state mutex held).
+/// Takes (`reserved`: for a request in flight) or confirms `key` for
+/// `name`, one lookup; false when another user holds it live. Over
+/// `limit` entries the expired ones go, then the oldest confirmed ones
+/// (half of all); reservations in flight always stay.
 bool TakeOwnerLocked(std::map<std::string, Gate::OwnerEntry>* owners,
                      std::string_view key, std::string_view name,
-                     long long now, bool reserved) {
+                     long long now, bool reserved, std::size_t limit) {
   if (const auto it = owners->find(std::string(key)); it != owners->end()) {
-    if (it->second.at >= now - 86400 && it->second.name != name)
+    Gate::OwnerEntry& entry = it->second;
+    const bool live = entry.at >= now - 86400;
+    if (live && entry.name != name)
       return false;  // the first owner keeps it
-    it->second = {std::string(name), now, reserved};
+    if (!reserved) {
+      entry = {std::string(name), now, false, 0};  // confirmed
+    } else if (live && entry.reserved) {
+      ++entry.in_flight;  // one more request of the same user
+    } else if (!live) {
+      entry = {std::string(name), now, true, 1};
+    }  // else: confirmed for this user already, nothing to reserve
     return true;
   }
-  if (owners->size() >= 20000) {
+  if (owners->size() >= limit) {
     for (auto it = owners->begin(); it != owners->end();)
       it = it->second.at < now - 86400 ? owners->erase(it) : std::next(it);
-    if (owners->size() >= 20000)
-      owners->clear();  // a day's worth of ids is gone: unknown = open
+    if (owners->size() >= limit) {
+      std::vector<std::pair<long long, std::string>> confirmed;
+      for (const auto& [k, entry] : *owners)
+        if (!entry.reserved && entry.in_flight <= 0)
+          confirmed.emplace_back(entry.at, k);
+      std::sort(confirmed.begin(), confirmed.end());
+      const std::size_t drop = std::min(confirmed.size(), owners->size() / 2);
+      for (std::size_t i = 0; i < drop; ++i)
+        owners->erase(confirmed[i].second);
+    }
   }
-  (*owners)[std::string(key)] = {std::string(name), now, reserved};
+  (*owners)[std::string(key)] = {std::string(name), now, reserved,
+                                 reserved ? 1 : 0};
   return true;
 }
 }  // namespace
@@ -1654,7 +1687,8 @@ bool Gate::RememberOwner(std::string_view key, std::string_view name) {
     return true;
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
-  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/false);
+  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/false,
+                         owner_limit_);
 }
 
 bool Gate::ReserveOwner(std::string_view key, std::string_view name) {
@@ -1662,18 +1696,8 @@ bool Gate::ReserveOwner(std::string_view key, std::string_view name) {
     return true;
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
-  const auto it = owners_.find(std::string(key));
-  if (it != owners_.end() && it->second.at >= now - 86400) {
-    if (it->second.name != name)
-      return false;  // held: only by this user
-    if (it->second.reserved)
-      ++it->second.in_flight;  // one more request of the same user
-    return true;
-  }
-  if (!TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true))
-    return false;
-  owners_[std::string(key)].in_flight = 1;
-  return true;
+  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true,
+                         owner_limit_);
 }
 
 void Gate::ReleaseOwner(std::string_view key, std::string_view name) {
@@ -1720,7 +1744,9 @@ std::string Gate::NormalizeOrigin(std::string_view text) {
   std::string origin = Lower(Trim(text));
   while (!origin.empty() && origin.back() == '/')
     origin.pop_back();
-  std::string scheme;
+  if (origin.empty())
+    return origin;
+  std::string scheme = "http";  // what a browser means without one
   if (const auto at = origin.find("://"); at != std::string::npos) {
     scheme = origin.substr(0, at);
     origin.erase(0, at + 3);
@@ -1733,7 +1759,7 @@ std::string Gate::NormalizeOrigin(std::string_view text) {
   if (!default_port.empty() && origin.ends_with(default_port) &&
       origin.size() > default_port.size())
     origin.resize(origin.size() - default_port.size());
-  return scheme.empty() ? origin : scheme + "://" + origin;
+  return scheme + "://" + origin;
 }
 
 void Settings::AllowOrigins(const std::vector<std::string>& origins) {
@@ -1758,13 +1784,17 @@ std::optional<HttpResponse> Gate::CsrfCheck(const HttpRequest& req) const {
     return std::nullopt;
   // Exactly this router (host and port): the pages on another port of
   // this machine (8096, 8090) are other sites and need csrf-allow-origins.
+  std::string scheme = "http";
   std::string origin_host = origin;
-  if (const auto at = origin_host.find("://"); at != std::string::npos)
+  if (const auto at = origin_host.find("://"); at != std::string::npos) {
+    scheme = origin_host.substr(0, at);
     origin_host.erase(0, at + 3);
-  // The Host header, normalised the same way (the router speaks http:
-  // ":80" is its default port too).
-  std::string host = NormalizeOrigin("http://" + req.header("Host"));
-  host.erase(0, std::string("http://").size());
+  }
+  // The Host header, normalised with the Origin's scheme (a TLS proxy
+  // sends Host: host:443 for https://host).
+  std::string host = NormalizeOrigin(scheme + "://" + req.header("Host"));
+  if (const auto at = host.find("://"); at != std::string::npos)
+    host.erase(0, at + 3);
   if (host.empty() || origin_host != host)
     return AuthError(403, "Forbidden",
                      "cross-site request refused (Origin " + origin +
@@ -2116,11 +2146,10 @@ void Gate::Rewrite(HttpRequest* req, const Identity& who) {
 }
 
 void Gate::After(const HttpRequest& req, const Route& route,
-                 const Identity& who, HttpResponse* response,
-                 const json::Value* body) {
+                 const Identity& who, HttpResponse* response) {
   const bool pool_user = who.relayed_user();
-  (void)body;  // a reserved prompt id is confirmed below by the answer
-                // that carries it; Serve releases what was not confirmed
+  // A reserved prompt id is confirmed below by the answer that carries
+  // it; Serve releases what was not confirmed.
   // Owners of ComfyUI prompts and direct video jobs come from the answer
   // (never for a placeholder: the router itself, loopback, the partner).
   if (req.method == "POST" && response->status < 300 && !who.placeholder &&
@@ -2611,7 +2640,22 @@ HttpResponse Gate::Serve(
       // The job API / the adapter answers the parse error.
     }
   }
-  if (auto refusal = Refuse(req, route, who, submit_body)) {
+  // A client-chosen prompt id is taken only now, after every check, and
+  // given back on any way out of here (the adapter refused, used another
+  // id, threw) unless the answer confirmed it (After).
+  struct Reservation {
+    Gate* gate;
+    std::string key;
+    std::string name;
+    ~Reservation() {
+      if (!key.empty())
+        gate->ReleaseOwner(key, name);
+    }
+  } reservation{this, {}, who.name};
+  std::optional<HttpResponse> refusal = Refuse(req, route, who, submit_body);
+  if (!refusal.has_value() && submit_body != nullptr && req.path == "/prompt")
+    refusal = ReservePrompt(who, *submit_body, &reservation.key);
+  if (refusal.has_value()) {
     std::string model;
     if (hooks_.model_of && route.kind == Route::Kind::kWork)
       model = hooks_.model_of(req);
@@ -2627,28 +2671,10 @@ HttpResponse Gate::Serve(
     }
     return std::move(*refusal);
   }
-  // A client-chosen prompt id is taken only now, after every check, and
-  // given back on any way out of here (the adapter refused, used another
-  // id, threw) unless the answer confirmed it (After).
-  struct Reservation {
-    Gate* gate;
-    std::string key;
-    std::string name;
-    ~Reservation() {
-      if (!key.empty())
-        gate->ReleaseOwner(key, name);
-    }
-  } reservation{this, {}, who.name};
-  if (submit_body != nullptr && req.path == "/prompt") {
-    if (auto refusal = ReservePrompt(who, *submit_body, &reservation.key)) {
-      Log(req, who, "abgelehnt:prompt_id_taken");
-      return std::move(*refusal);
-    }
-  }
   HttpRequest copy = req;
   Rewrite(&copy, who);
   HttpResponse response = next(copy);
-  After(req, route, who, &response, submit_body);
+  After(req, route, who, &response);
   if (req.method != "GET" && req.method != "HEAD" &&
       (route.kind == Route::Kind::kWork || route.kind == Route::Kind::kJobs ||
        route.kind == Route::Kind::kAdminControl)) {

@@ -398,11 +398,10 @@ public:
   /// owner from it), pins the pool side. Never touches the body.
   void Rewrite(server::HttpRequest* req, const Identity& who);
   /// A user's job list shows only its own jobs; its job reads 404 for
-  /// others' jobs. `body` (may be null) is the parsed request body the
-  /// caller holds (a ComfyUI prompt).
+  /// others' jobs; the answer to a prompt or a direct video names its
+  /// owner.
   void After(const server::HttpRequest& req, const Route& route,
-             const Identity& who, server::HttpResponse* response,
-             const json::Value* body = nullptr);
+             const Identity& who, server::HttpResponse* response);
 
   /// Login/logout/me/users endpoints; nullopt when `req` is none of them.
   [[nodiscard]] std::optional<server::HttpResponse> AuthEndpoint(
@@ -432,6 +431,9 @@ public:
   void SetClock(std::function<long long()> now) { now_ = std::move(now); }
   /// Daily count of a user (tests).
   [[nodiscard]] long long DailyCount(std::string_view name);
+  /// Test hook: how many owner entries are kept before the oldest
+  /// confirmed ones go (default 20000).
+  void SetOwnerLimit(std::size_t limit) { owner_limit_ = limit; }
 
   struct OwnerEntry {
     std::string name;
@@ -508,6 +510,7 @@ private:
   std::map<std::string, std::deque<long long>> failures_;
   std::map<std::string, std::pair<std::string, long long>> daily_;
   std::map<std::string, OwnerEntry> owners_;
+  std::size_t owner_limit_{20000};
   std::mutex log_mutex_;
   std::string log_day_;
 };

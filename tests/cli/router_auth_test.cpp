@@ -385,6 +385,18 @@ void TestOldFileFormat() {
   CHECK_EQ(ohne->rolle, std::string("nutzer"));
   CHECK(ohne->hash_hex.empty());
   CHECK(!store.Verify("ohne", "x").has_value());
+  // When such an account is the only working admin it stays (the file
+  // must keep opening the door).
+  {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << "{\"nutzer\": [{\"name\": \"lokal\", \"rolle\": \"admin\", "
+           "\"passwort\": {\"salz\": \"00\", \"hash\": \"ff\", \"runden\": 1}},"
+           " {\"name\": \"ohne\"}]}";
+  }
+  CHECK(store.Load(&error));
+  CHECK(store.Find("lokal").has_value());
+  CHECK(!store.Find("lokal")->gesperrt);
+  CHECK(store.HasAdmin());
   // Unknown document shape: an error, not a crash.
   {
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
@@ -1226,7 +1238,7 @@ void TestFilterAndLimit() {
       // The second request fails at the adapter and goes: the id stays
       // tim's while the first is still in flight.
       HttpResponse failed{.status = 400, .reason = "Bad Request", .body = "{}"};
-      c.gate->After(first_req, route, tim_id, &failed, &body);
+      c.gate->After(first_req, route, tim_id, &failed);
       c.gate->ReleaseOwner(key_b, tim_id.name);
       CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
       CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
@@ -1234,7 +1246,7 @@ void TestFilterAndLimit() {
       // its release is a no-op.
       HttpResponse kept{.status = 200, .reason = "OK",
                         .body = "{\"prompt_id\":\"p-neu\"}"};
-      c.gate->After(first_req, route, tim_id, &kept, &body);
+      c.gate->After(first_req, route, tim_id, &kept);
       c.gate->ReleaseOwner(key_a, tim_id.name);
       CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
       CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
@@ -1247,6 +1259,36 @@ void TestFilterAndLimit() {
       CHECK(!c.gate->OwnerOf("prompt:p-frei").has_value());
       CHECK(!c.gate->ReservePrompt(anna_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_anna).has_value());
       c.gate->ReleaseOwner(key_anna, anna_id.name);
+    }
+    // Over the limit the oldest confirmed entries go, never a reservation
+    // in flight.
+    {
+      Fixture p;
+      p.gate->SetOwnerLimit(4);
+      long long now = auth::NowUnix();
+      p.gate->SetClock([&now] { return now; });
+      std::string k1;
+      std::string k2;
+      auth::Identity tim_like;
+      tim_like.source = auth::Identity::Source::kCookie;
+      tim_like.name = "tim";
+      tim_like.rolle = "nutzer";
+      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r1\"}"), &k1).has_value());
+      now += 1;
+      CHECK(p.gate->RememberOwner("prompt:c1", "anna"));
+      now += 1;
+      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r2\"}"), &k2).has_value());
+      now += 1;
+      CHECK(p.gate->RememberOwner("prompt:c2", "anna"));
+      now += 1;
+      CHECK(p.gate->RememberOwner("prompt:c3", "anna"));  // the fifth: purge
+      CHECK(p.gate->OwnerOf("prompt:r1") == std::optional<std::string>("tim"));
+      CHECK(p.gate->OwnerOf("prompt:r2") == std::optional<std::string>("tim"));
+      CHECK(p.gate->OwnerOf("prompt:c3") == std::optional<std::string>("anna"));
+      CHECK(!p.gate->OwnerOf("prompt:c1").has_value());  // oldest confirmed
+      CHECK(!p.gate->OwnerOf("prompt:c2").has_value());
+      p.gate->ReleaseOwner(k1, "tim");
+      p.gate->ReleaseOwner(k2, "tim");
     }
     // Placeholders (the router itself, loopback) own nothing, by source:
     // their answers are not remembered.
@@ -1567,7 +1609,17 @@ void TestUsersApi() {
            std::string("http://a.b:8080"));
   CHECK_EQ(auth::Gate::NormalizeOrigin("https://a.b:80"), std::string("https://a.b:80"));
   CHECK_EQ(auth::Gate::NormalizeOrigin(" 192.168.178.198:8081 "),
-           std::string("192.168.178.198:8081"));
+           std::string("http://192.168.178.198:8081"));
+  CHECK_EQ(auth::Gate::NormalizeOrigin(""), std::string(""));
+  // A TLS proxy: Host carries the https default port.
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "https://192.168.178.198"},
+                   {"Host", "192.168.178.198:443"}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "https://192.168.178.198"},
+                   {"Host", "192.168.178.198:80"}}));
+  CHECK_EQ(r.status, 403);
   // Pages on another port and a proxy named in csrf-allow-origins pass,
   // in any spelling; another proxy does not.
   {

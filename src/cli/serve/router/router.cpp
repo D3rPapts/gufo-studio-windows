@@ -4211,6 +4211,13 @@ int RunRouter(std::span<const char* const> args) {
                      " admin=" + (users->HasAdmin() ? "yes" : "no") +
                      " pool_secret=" +
                      (auth_settings.pool_secret.empty() ? "none" : "set"));
+    if (auth_settings.mode != router::auth::Mode::kOff &&
+        auth_settings.csrf_allow_origins.empty())
+      Logger::Info("router",
+                   "event=auth csrf_allow_origins=0 hint=\"pages on other "
+                   "ports of this machine (8096, 8090) cannot write with a "
+                   "cookie session; list them in [router] "
+                   "csrf-allow-origins\"");
     if (auth_settings.mode != router::auth::Mode::kOff && !users->HasAdmin())
       Logger::Warn("router",
                    "event=auth_no_admin hint=\"create the first admin from "
