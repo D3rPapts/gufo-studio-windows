@@ -12,13 +12,18 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/mmaudio/clip.hpp"
-#include "src/models/mmaudio/network.hpp"
-#include "src/models/mmaudio/synchformer.hpp"
 #include "src/models/mmaudio/tokenizer.hpp"
-#include "src/models/mmaudio/vocoder.hpp"
 
 namespace gufo::models::mmaudio {
+
+// The device stages are only declared here, so this header (and FoleyRequest
+// for the serve and video-input code) builds without HIP; include their
+// headers where the stages are used.
+class ClipEncoder;
+class Synchformer;
+class FlowNetwork;
+class VaeDecoder;
+class BigVgan;
 
 inline constexpr int kSampleRate = 44100;
 
@@ -65,6 +70,9 @@ class FoleyPipeline {
 public:
   [[nodiscard]] static std::unique_ptr<FoleyPipeline> Load(
       const ModelPaths& paths, std::string* error);
+  ~FoleyPipeline();
+  FoleyPipeline(const FoleyPipeline&) = delete;
+  FoleyPipeline& operator=(const FoleyPipeline&) = delete;
 
   /// Generates mono audio (44.1 kHz, latent * 1024 samples, as
   /// ComfyUI-MMAudio returns it). `progress(fraction, stage)` returns false

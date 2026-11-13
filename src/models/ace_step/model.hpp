@@ -76,9 +76,23 @@ public:
                      std::span<const float> context, int frames,
                      std::string* error);
 
-  /// Flow velocity [frames, 64] at time t for x_t [frames, 64].
+  /// Flow velocity [frames, 64] at time t for x_t [frames, 64]. With
+  /// `unconditional` the cross-attention reads the model's null condition
+  /// (`null_condition_emb`) instead of the set conditions, for
+  /// classifier-free guidance.
   bool Velocity(std::span<const float> xt, float t, std::vector<float>* v,
-                DitProbes* probes, std::string* error);
+                DitProbes* probes, std::string* error,
+                bool unconditional = false);
+
+  /// 5 Hz audio codes (0..63999) of latents [frames, 64]: the audio
+  /// tokenizer (acoustic projection, attention pooler over windows of 5
+  /// frames, FSQ quantizer as ComfyUI / gufo's CodeHints define the
+  /// codebook). The last window is padded with the first frames of
+  /// `silence` [>= 4, 64] as the official `tokenize` does; ceil(frames / 5)
+  /// codes.
+  bool Tokenize(std::span<const float> latents, int frames,
+                std::span<const float> silence, std::vector<int>* codes,
+                std::string* error);
 
   /// Source latents [frames, 64] from 5 Hz audio codes (0..63999): FSQ
   /// codebook, quantizer projection and the detokenizer (5 latents per
@@ -102,10 +116,12 @@ struct CodeSampling {
   std::uint64_t seed{0};
 };
 
-/// The 5 Hz audio-code language model of ACE-Step 1.5 (ComfyUI
-/// `qwen_4b_ace15`: Qwen3-4B with 64000 audio-code tokens from id 151669,
-/// tied embeddings). Samples codes with classifier-free guidance between a
-/// conditional and an unconditional prompt (two KV caches).
+/// The 5 Hz audio-code language model of ACE-Step 1.5: a Qwen3 decoder
+/// (0.6B, 1.7B or 4B; width, heads, layers and FFN size are read from the
+/// weights) with 64000 audio-code tokens from id 151669, tied embeddings
+/// unless the file has `lm_head.weight`. Samples codes with
+/// classifier-free guidance between a conditional and an unconditional
+/// prompt (two KV caches).
 class CodeLm {
 public:
   static constexpr std::uint32_t kFirstCode = 151669;
@@ -135,7 +151,8 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-/// Turbo schedule (shift 3, 8 steps) of the official pipeline.
+/// The first `steps` values of MusicTimesteps (sampler.hpp): the turbo
+/// schedule (shift 3, 8 steps) without the final 0.
 std::vector<float> TurboTimesteps(int steps, float shift);
 
 }  // namespace gufo::models::ace_step

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "mmaudio",
+  "target": "gufo_mmaudio",
+  "kind": "static",
+  "purpose": "MMAudio large_44k_v2 video/text to audio (gufo-studio-windows): CLIP, Synchformer, flow network, VAE decoder, BigVGAN vocoder and the foley pipeline.",
+  "consumers": [],
+  "checks": []
+}

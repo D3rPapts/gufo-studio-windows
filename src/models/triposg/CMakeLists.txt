@@ -27,10 +27,13 @@ if (OpenMP_CXX_FOUND)
   target_link_libraries(gufo_triposg_cpu PRIVATE OpenMP::OpenMP_CXX)
 endif()
 if (ENGINE_ENABLE_HIP)
-  # The safetensors reader lives in gufo_wan22 in HIP builds.
-  target_link_libraries(gufo_triposg_cpu PUBLIC gufo_wan22)
+  # The safetensors reader lives in the Wan extension's HIP library (2.1:
+  # gufo_wan22_hip, src/models/wan22/extension.cmake) in HIP builds.
+  target_link_libraries(gufo_triposg_cpu PUBLIC gufo_wan22_hip)
 else()
   target_sources(gufo_triposg_cpu PRIVATE ${PROJECT_SOURCE_DIR}/src/models/wan22/tensor_file.cpp)
+  # tensor_file.cpp reads <gufo/ext/json.hpp> (2.1).
+  target_link_libraries(gufo_triposg_cpu PUBLIC gufo_ext_runtime)
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -39,7 +42,9 @@ if (ENGINE_ENABLE_HIP)
   target_compile_options(gufo_triposg PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffp-contract=off>)
   target_compile_definitions(gufo_triposg PUBLIC GUFO_TRIPOSG_HIP=1)
-  target_link_libraries(gufo_triposg PUBLIC gufo_triposg_cpu gufo_qwen_image_21 hip::host roc::rocblas)
+  # dit.hip uses the Qwen-Image HIP runtime (2.1: gufo_qwen_image_21_hip).
+  target_link_libraries(gufo_triposg PUBLIC gufo_triposg_cpu gufo_qwen_image_21
+    gufo_qwen_image_21_hip hip::host roc::rocblas)
 endif()
 
 # Server runner without a GPU: reports the missing HIP build.

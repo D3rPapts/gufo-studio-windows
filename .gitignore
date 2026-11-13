@@ -44,6 +44,9 @@ build/
 Build/
 build-*/
 
+# Cargo output when the Rust workspace is built outside CMake
+/target/
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
@@ -120,8 +123,3 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
-/dist/
-
-# Local worktrees and SDD scratch
-.worktrees/
-.superpowers/

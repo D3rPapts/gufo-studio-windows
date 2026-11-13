@@ -11,7 +11,8 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include "src/models/ace_step/parallel_read.hpp"
 
 namespace gufo::models::ace_step {
 
@@ -81,6 +82,10 @@ public:
   /// Waits until the uploads issued so far have completed.
   bool Finish(std::string* error);
   [[nodiscard]] std::size_t uploaded_bytes() const { return uploaded_; }
+  /// String members of the header's `__metadata__` (empty when absent).
+  [[nodiscard]] const std::map<std::string, std::string>& metadata() const {
+    return metadata_;
+  }
 
 private:
   bool Read(std::uint64_t offset, std::size_t bytes, int slot,
@@ -89,6 +94,7 @@ private:
   std::filesystem::path path_;
   platform::PlatformFile file_{};
   std::map<std::string, Tensor, std::less<>> tensors_;
+  std::map<std::string, std::string> metadata_;
   hipStream_t stream_{nullptr};
   void* staging_[2]{};
   DeviceBuffer staging_device_[2];

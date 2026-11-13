@@ -1,5 +1,7 @@
 #include "src/cli/serve/http_server.hpp"
 
+#include <gufo/http.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -29,16 +32,13 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/decision_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
+#include "src/cli/serve/preview.hpp"
 #include "src/cli/serve/logging.hpp"
-#include "src/cli/serve/music_api.hpp"
-#include "src/cli/serve/foley_api.hpp"
-#include "src/cli/serve/upscale_api.hpp"
-#include "src/cli/serve/objekt_service.hpp"
-#include "src/cli/serve/omni_api.hpp"
-#include "src/cli/serve/omni_service.hpp"
+#include "src/cli/serve/media/media_service.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
@@ -48,12 +48,12 @@
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/serve/websocket.hpp"
-#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/core/rust/callback.hpp"
 #include "src/core/utf8.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 
 namespace gufo::server {
 namespace {
@@ -84,19 +84,50 @@ private:
 // Socket I/O helpers
 // ---------------------------------------------------------------------------
 
-bool ReadUntil(std::string& out, int fd, std::string_view delim) {
+// Reads until the Rust parser finds a complete request head or rejects it
+// (GUFO_HTTP_MALFORMED, or GUFO_HTTP_TOO_MANY_FIELDS beyond 100 fields);
+// GUFO_HTTP_PARTIAL when the connection ends first or more than 16 MiB arrive
+// without one. `out` keeps the body bytes read with the head. On
+// GUFO_HTTP_COMPLETE, `request` has the head's header fields. A failure on the
+// server's side (memory, a parser bug) throws, so the caller answers 500.
+GufoHttpParse ReadHead(std::string& out, int fd, HttpRequest& request,
+                       GufoHttpHead& head) {
+  struct FieldContext {
+    HttpRequest* request;
+    core::ffi::CallbackFailure failure;
+  } context{&request, {}};
+  const GufoHttpFieldFn add_field =
+      [](void* opaque, const std::uint8_t* name, std::size_t name_len,
+         const std::uint8_t* value, std::size_t value_len) noexcept -> int {
+    auto& context = *static_cast<FieldContext*>(opaque);
+    return context.failure.Guard(1, [&] {
+      context.request->headers.emplace_back(
+          std::string(reinterpret_cast<const char*>(name), name_len),
+          std::string(reinterpret_cast<const char*>(value), value_len));
+      return 0;
+    });
+  };
   char buf[4096];
-  while (out.find(delim) == std::string::npos) {
+  std::size_t known_partial = 0;
+  while (true) {
     const std::intptr_t n = net::Receive(fd, buf, sizeof(buf), 0);
     if (n < 0 && net::IsSocketInterrupted())
       continue;
     if (n <= 0)
-      return false;
+      return GUFO_HTTP_PARTIAL;
     out.append(buf, static_cast<std::size_t>(n));
     if (out.size() > (static_cast<std::size_t>(16) * 1024 * 1024))
-      return false;
+      return GUFO_HTTP_PARTIAL;
+    const GufoHttpParse parsed = gufo_http_parse_head(
+        reinterpret_cast<const std::uint8_t*>(out.data()), out.size(),
+        known_partial, &head, add_field, &context);
+    context.failure.Rethrow();
+    if (parsed == GUFO_HTTP_INTERNAL)
+      throw std::runtime_error("Rust HTTP request parser failed internally");
+    if (parsed != GUFO_HTTP_PARTIAL)
+      return parsed;
+    known_partial = out.size();
   }
-  return true;
 }
 
 bool ReadN(std::string& out, int fd, std::size_t n) {
@@ -169,104 +200,6 @@ std::string ToLower(std::string_view s) {
   return out;
 }
 
-std::string UrlDecode(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if (c == '+') {
-      out += ' ';
-    } else if (c == '%' && i + 2 < s.size()) {
-      auto hexval = [](char h) {
-        if (h >= '0' && h <= '9')
-          return h - '0';
-        if (h >= 'a' && h <= 'f')
-          return h - 'a' + 10;
-        if (h >= 'A' && h <= 'F')
-          return h - 'A' + 10;
-        return -1;
-      };
-      const int high = hexval(s[i + 1]);
-      const int low = hexval(s[i + 2]);
-      if (high >= 0 && low >= 0) {
-        out += static_cast<char>((high << 4) | low);
-        i += 2;
-      } else {
-        out += c;
-      }
-    } else {
-      out += c;
-    }
-  }
-  return out;
-}
-
-std::optional<std::size_t> ParseContentLength(const HttpRequest& request) {
-  std::optional<std::size_t> length;
-  for (const auto& [name, value] : request.headers) {
-    const auto lowered = ToLower(name);
-    // Chunked transfer is not implemented. Never interpret its encoded bytes
-    // as an empty or partial inference request.
-    if (lowered == "transfer-encoding") {
-      return std::nullopt;
-    }
-    if (lowered != "content-length") {
-      continue;
-    }
-    std::size_t parsed = 0;
-    const auto [end, error] =
-        std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (error != std::errc{} || end != value.data() + value.size() ||
-        (length.has_value() && *length != parsed)) {
-      return std::nullopt;
-    }
-    length = parsed;
-  }
-  return length.value_or(0);
-}
-
-/// RFC 9110 10.1.1: a client that sends "Expect: 100-continue" (curl does for
-/// bodies over 1 MiB) waits for an interim 100 response before the body.
-bool ExpectsContinue(const HttpRequest& request) {
-  return std::ranges::any_of(request.headers, [](const auto& header) {
-    return ToLower(header.first) == "expect" &&
-           ToLower(header.second) == "100-continue";
-  });
-}
-
-std::string CredentialHash(std::string_view value) {
-  return crypto::Sha256Hex(std::span(
-      reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
-}
-
-bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
-  if (key_hash.empty()) {
-    return true;
-  }
-  std::string_view credential;
-  bool found = false;
-  for (const auto& [name, value] : request.headers) {
-    if (ToLower(name) == "authorization") {
-      if (found) {
-        return false;
-      }
-      found = true;
-      credential = value;
-    }
-  }
-  const auto space = credential.find(' ');
-  if (space == std::string_view::npos ||
-      ToLower(credential.substr(0, space)) != "bearer") {
-    return false;
-  }
-  credential.remove_prefix(space + 1);
-  while (credential.starts_with(' ')) {
-    credential.remove_prefix(1);
-  }
-  // Comparing digests does not disclose matching prefixes of the API key.
-  return CredentialHash(credential) == key_hash;
-}
-
 bool HasHeader(const HttpResponse& response, std::string_view name) {
   const std::string lowered = ToLower(name);
   return std::ranges::any_of(response.headers, [&](const auto& header) {
@@ -326,6 +259,8 @@ std::string BuildResponseHead(const HttpResponse& resp,
   }
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\n";
+  // Authorization is accepted (and ignored) so browser SDKs that always send
+  // it still pass their CORS preflight.
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   // Pages on the partner machine read the preview and job headers (C7).
   out += "Access-Control-Expose-Headers: Content-Disposition, Content-Length, "
@@ -764,12 +699,20 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
+// The primary ID followed by its accepted aliases, in listing order.
+std::vector<std::string> ServedIds(const std::string& primary,
+                                   const std::vector<std::string>& aliases) {
+  std::vector<std::string> ids{primary};
+  ids.insert(ids.end(), aliases.begin(), aliases.end());
+  return ids;
+}
+
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
                         const ImageService* images,
                         const EmbeddingService* embeddings,
-                        const OmniService* omni) {
+                        const DecisionService* decisions) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -792,86 +735,111 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["architecture"] = std::move(architecture);
     data.push_back(std::move(model));
   }
-  if (video_jobs != nullptr && video_jobs->ready() &&
-      video_jobs->family() != VideoModelFamily::kMinimaxH3) {
-    json::Value model = json::Value::object();
-    model["id"] = video_jobs->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-wan";
-    model["capability"] = "video";
-    data.push_back(std::move(model));
-  } else if (video_jobs != nullptr && video_jobs->ready()) {
+  if (video_jobs != nullptr && video_jobs->ready()) {
+    // The provider's canonical name; MiniMax H3 adds its preset variants.
+    const std::string root_id = video_jobs->model_id();
+    const bool h3 = root_id == "minimax-h3";
+    const std::string owner =
+        h3 ? "operator-supplied-minimax" : "operator-supplied";
     json::Value root_model = json::Value::object();
-    root_model["id"] = "minimax-h3";
+    root_model["id"] = root_id;
     root_model["object"] = "model";
     root_model["created"] = Now();
-    root_model["owned_by"] = "operator-supplied-minimax";
+    root_model["owned_by"] = owner;
     root_model["capability"] = "video";
     data.push_back(std::move(root_model));
     for (const std::string_view preset :
          {"minimax-h3-exact", "minimax-h3-fast", "minimax-h3-aggressive",
           "minimax-h3-dev", "minimax-h3-fullres"}) {
+      if (!h3) {
+        break;
+      }
       json::Value model = json::Value::object();
       model["id"] = std::string(preset);
       model["object"] = "model";
       model["created"] = Now();
-      model["owned_by"] = "operator-supplied-minimax";
-      model["root"] = "minimax-h3";
+      model["owned_by"] = owner;
+      model["root"] = root_id;
+      model["capability"] = "video";
+      data.push_back(std::move(model));
+    }
+    // Configured `--served-model-name` aliases of the root model (#957).
+    for (const auto& alias : video_jobs->model_aliases()) {
+      json::Value model = json::Value::object();
+      model["id"] = alias;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = owner;
+      model["root"] = root_id;
       model["capability"] = "video";
       data.push_back(std::move(model));
     }
   }
   if (tts != nullptr && tts->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = tts->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "audio_tts";
-    data.push_back(std::move(model));
+    for (const auto& id : ServedIds(tts->model_id(), tts->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "audio_tts";
+      data.push_back(std::move(model));
+    }
   }
   if (asr != nullptr && asr->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = asr->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "audio_asr";
-    data.push_back(std::move(model));
+    for (const auto& id : ServedIds(asr->model_id(), asr->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "audio_asr";
+      data.push_back(std::move(model));
+    }
   }
   if (images != nullptr) {
-    auto model = json::Value::object();
-    model["id"] = images->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "image";
-    data.push_back(std::move(model));
+    for (const auto& id :
+         ServedIds(images->model_id(), images->model_aliases())) {
+      auto model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "image";
+      data.push_back(std::move(model));
+    }
   }
   if (embeddings != nullptr && embeddings->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = embeddings->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-gemma";
-    model["capability"] = "embedding";
-    data.push_back(std::move(model));
+    for (const auto& id :
+         ServedIds(embeddings->model_id(), embeddings->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-gemma";
+      model["capability"] = "embedding";
+      data.push_back(std::move(model));
+    }
   }
-  if (omni != nullptr && omni->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = omni->model_id();
+  for (const auto& decision_id :
+       decisions != nullptr
+           ? ServedIds(decisions->model_id, decisions->model_aliases)
+           : std::vector<std::string>{}) {
+    auto model = json::Value::object();
+    model["id"] = decision_id;
     model["object"] = "model";
     model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "audio_caption";
-    if (omni->context_tokens() > 0)
-      model["context_length"] = omni->context_tokens();
-    json::Value input_modalities = json::Value::array();
-    input_modalities.push_back("audio");
-    json::Value architecture = json::Value::object();
-    architecture["input_modalities"] = std::move(input_modalities);
-    model["architecture"] = std::move(architecture);
+    model["owned_by"] = "gufo";
+    model["capability"] = "decision";
+    auto modalities = json::Value::array();
+    modalities.push_back("text");
+    if (decisions->multimodal) {
+      modalities.push_back("image");
+      modalities.push_back("audio");
+    }
+    auto architecture = json::Value::object();
+    architecture["input_modalities"] = modalities;
+    model["architecture"] = architecture;
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -1140,29 +1108,19 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse OpenAiResponses(const HttpRequest& req,
-                             TextGenerationBackend& b) try {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  ChatRequest chat;
-  chat.reasoning = b.reasoning_defaults();
-  if (auto error = ParseOpenAiResponseControls(body, &chat))
-    return std::move(*error);
-  std::size_t max_tokens = 0;
-  sampling::SamplingConfig sampling_config;
+std::optional<HttpResponse> ReadOpenAiResponseChat(
+    const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
+    std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
+  chat->reasoning = b.reasoning_defaults();
+  if (auto error = ParseOpenAiResponseControls(body, chat))
+    return error;
   if (auto error = ReadCompatibilityOptions(
-          body, b, "max_output_tokens", &max_tokens, &sampling_config,
-          chat.reasoning.enabled,
+          body, b, "max_output_tokens", max_tokens, sampling_config,
+          chat->reasoning.enabled,
           {.stream = true, .response_controls = true})) {
-    return std::move(*error);
+    return error;
   }
-  if (const auto error = ParseResponsesLogprobs(body, &sampling_config))
+  if (const auto error = ParseResponsesLogprobs(body, sampling_config))
     return Err(400, "Bad Request", error->message.c_str(),
                "invalid_request_error", error->code.c_str());
 
@@ -1185,12 +1143,57 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
     return InvalidCompatibilityRequest(input_error);
   }
 
-  chat.messages = std::move(messages);
+  chat->messages = std::move(messages);
+  return std::nullopt;
+}
+
+HttpResponse OpenAiResponses(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
       body.find("stream") != nullptr && body.find("stream")->as_bool(),
       RequestedModel(body, b));
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
+}
+
+HttpResponse OpenAiResponsesInputTokens(const HttpRequest& req,
+                                        TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
+  chat.client_id = req.client_id;
+  return CountOpenAiInputTokens(chat, b);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1376,6 +1379,46 @@ HttpResponse AnthropicCountTokens(const HttpRequest& req,
 } catch (const std::invalid_argument& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "invalid_prompt");
+}
+
+// llama-server's /tokenize at its defaults: raw text, control-token spellings
+// parsed and nothing prepended, as /completion tokenizes a prompt. The options
+// that would change that are refused rather than ignored.
+HttpResponse LlamaTokenize(const HttpRequest& req, TextGenerationBackend& b) {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+  const auto* content = body.find("content");
+  if (content == nullptr || !content->is_string()) {
+    return InvalidCompatibilityRequest("'content' must be a string");
+  }
+  for (const auto& [field, supported] :
+       {std::pair{"add_special", false}, std::pair{"parse_special", true},
+        std::pair{"with_pieces", false}}) {
+    const auto* value = body.find(field);
+    if (value == nullptr || value->is_null())
+      continue;
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'" + std::string(field) +
+                                         "' must be a boolean");
+    if (value->as_bool() != supported)
+      return InvalidCompatibilityRequest("'" + std::string(field) +
+                                         "' is supported only as " +
+                                         (supported ? "true" : "false"));
+  }
+  const auto tokens = b.tokenize(content->str());
+  if (!tokens)
+    return NotImplemented(req, b);
+  json::Value ids = json::Value::array();
+  for (const auto token : *tokens)
+    ids.push_back(static_cast<std::size_t>(token));
+  json::Value resp = json::Value::object();
+  resp["tokens"] = std::move(ids);
+  return Ok(resp);
 }
 
 HttpResponse LlamaCompletion(const HttpRequest& req,
@@ -1647,6 +1690,21 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
          "tokens over sessions times context; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
+  if (const auto budget = b.prompt_admission_budget()) {
+    out << "# HELP gufo_prompt_state_budget_bytes Host RAM prompt state may "
+           "claim before admission refuses\n"
+        << "# TYPE gufo_prompt_state_budget_bytes gauge\n"
+        << "gufo_prompt_state_budget_bytes " << budget->budget_bytes << "\n"
+        << "# HELP gufo_prompt_state_reserved_bytes Host prompt state charged "
+           "to in-flight requests\n"
+        << "# TYPE gufo_prompt_state_reserved_bytes gauge\n"
+        << "gufo_prompt_state_reserved_bytes " << budget->used_bytes << "\n"
+        << "# HELP gufo_prompt_state_available_bytes Remaining host prompt "
+           "state budget\n"
+        << "# TYPE gufo_prompt_state_available_bytes gauge\n"
+        << "gufo_prompt_state_available_bytes " << budget->available_bytes
+        << "\n";
+  }
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),
@@ -1852,22 +1910,24 @@ bool IsListenAddress(const std::string& host) {
 // ---------------------------------------------------------------------------
 
 std::string HttpRequest::query_param(const std::string& key) const {
-  std::string_view remaining = query;
-  while (!remaining.empty()) {
-    const auto end = remaining.find('&');
-    const auto parameter = remaining.substr(0, end);
-    const auto equals = parameter.find('=');
-    if (UrlDecode(parameter.substr(0, equals)) == key) {
-      return equals == std::string_view::npos
-                 ? ""
-                 : UrlDecode(parameter.substr(equals + 1));
-    }
-    if (end == std::string_view::npos) {
-      break;
-    }
-    remaining.remove_prefix(end + 1);
-  }
-  return "";
+  struct Found {
+    std::string value;
+    core::ffi::CallbackFailure failure;
+  } found;
+  const GufoHttpBytesFn keep = [](void* opaque, const std::uint8_t* data,
+                                  std::size_t len) noexcept {
+    auto& out = *static_cast<Found*>(opaque);
+    out.failure.Guard(
+        [&] { out.value.assign(reinterpret_cast<const char*>(data), len); });
+  };
+  const int status = gufo_http_query_param(
+      reinterpret_cast<const std::uint8_t*>(query.data()), query.size(),
+      reinterpret_cast<const std::uint8_t*>(key.data()), key.size(), keep,
+      &found);
+  found.failure.Rethrow();
+  if (status < 0)
+    throw std::logic_error("Rust query parser failed internally");
+  return found.value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,7 +1951,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
                        std::shared_ptr<ImageService> images,
-                       std::shared_ptr<EmbeddingService> embeddings)
+                       std::shared_ptr<EmbeddingService> embeddings,
+                       std::shared_ptr<DecisionService> decisions)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1900,16 +1961,14 @@ HttpServer::HttpServer(std::string host, int port,
       asr_(std::move(asr)),
       images_(std::move(images)),
       embeddings_(std::move(embeddings)),
+      decisions_(std::move(decisions)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
   }
-  if (!options_.api_key.empty()) {
-    api_key_hash_ = CredentialHash(options_.api_key);
-  }
-  if (!options_.dispatcher) {
+  // The router front (options_.dispatcher) serves its own routes.
+  if (!options_.dispatcher)
     register_routes();
-  }
 }
 
 HttpServer::~HttpServer() {
@@ -1931,7 +1990,9 @@ void HttpServer::register_routes() {
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", HandleOpenAiChat);
+  add("POST", "/v1/chat/completions/input_tokens", HandleOpenAiChatInputTokens);
   add("POST", "/v1/responses", OpenAiResponses);
+  add("POST", "/v1/responses/input_tokens", OpenAiResponsesInputTokens);
   add("POST", "/v1/embeddings", NotImplemented);
 
   // ---- Anthropic ----
@@ -1945,6 +2006,7 @@ void HttpServer::register_routes() {
   add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
   add("POST", "/apply-template", HandleApplyTemplate);
+  add("POST", "/tokenize", LlamaTokenize);
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
@@ -1983,9 +2045,9 @@ bool HttpServer::start(std::string* error) {
       *error = "socket() failed";
     return false;
   }
-  // Exclusive on Windows: a second gufo on the same port fails at bind()
-  // instead of sharing the listener silently (11.11.: four test routers
-  // answered 8099 in turns).
+  // Exclusive on Windows, where SO_REUSEADDR alone lets a second server bind
+  // a port this one still serves; its bind() fails instead. POSIX keeps
+  // SO_REUSEADDR, so a restart binds through TIME_WAIT as before.
   (void)net::SetExclusiveListenerReuse(listen_fd_);
   // `::` serves IPv4 clients too. Set it explicitly: the kernel default
   // follows net.ipv6.bindv6only, which differs between hosts.
@@ -2003,8 +2065,9 @@ bool HttpServer::start(std::string* error) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_) +
                " (error " + std::to_string(code) + ")";
       if (net::IsAddressInUseError(code))
-        *error += ": the port is already in use, another server (gufo?) "
-                  "listens on it";
+        *error +=
+            ": the port is already in use, another server (gufo?) "
+            "listens on it";
     }
     net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
@@ -2057,7 +2120,6 @@ void HttpServer::run(bool handle_signals) {
           " address=http://" +
           (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
           ":" + std::to_string(port_) +
-          " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
@@ -2071,11 +2133,10 @@ void HttpServer::run(bool handle_signals) {
         // its own drain; stop() would shut their descriptors down and cut
         // in-flight streams mid-relay. The destructor stops them once the
         // drain has ended.
-        if (options_.graceful_shutdown) {
+        if (options_.graceful_shutdown)
           stop_listening();
-        } else {
+        else
           stop();
-        }
         platform::NotifyShutdownHandled();
         break;
       }
@@ -2137,8 +2198,8 @@ void HttpServer::run(bool handle_signals) {
 }
 
 void HttpServer::stop_listening() {
-  stopped_.store(true, std::memory_order_release);
-  if (listen_fd_ >= 0) {
+  const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
+  if (!was_stopped && listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
     (void)net::ShutdownSocket(listen_fd_, net::ShutdownHow::kReadWrite);
@@ -2177,20 +2238,25 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
-  if (!IsAuthorized(req, api_key_hash_)) {
-    auto response = Err(401, "Unauthorized", "missing or invalid API key",
-                        "authentication_error", "invalid_api_key");
-    response.headers.emplace_back("WWW-Authenticate", "Bearer");
-    return response;
-  }
-  if (options_.dispatcher) {
+  if (options_.dispatcher)
     return options_.dispatcher(req);
+  // The voice page holds no data; it opens its WebSocket when the user
+  // connects.
+  if (req.method == "GET" && req.path == "/voice" && asr_ &&
+      asr_->supports_voice()) {
+    HttpResponse page{
+        .status = 200, .reason = "OK", .body = std::string(VoicePage())};
+    page.headers.emplace_back("Content-Type", "text/html; charset=utf-8");
+    page.headers.emplace_back("Cache-Control", "no-store");
+    return page;
   }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe
-  // configuration works unmodified.
+  // configuration works unmodified. `GET /` answers like `/health` so
+  // llama-swap's Load button and startup preload, which request the upstream
+  // root, report success once the loading gate has released (#957).
   if (req.method == "GET" &&
-      (req.path == "/health" || req.path == "/v1/health" ||
+      (req.path == "/" || req.path == "/health" || req.path == "/v1/health" ||
        req.path == "/healthz")) {
     if (device_lost())
       return DeviceLost();
@@ -2207,12 +2273,10 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (tts_ != nullptr && tts_->ready()) ||
                        (asr_ != nullptr && asr_->ready()) ||
                        (embeddings_ != nullptr && embeddings_->ready()) ||
-                       (omni_ != nullptr && omni_->ready()) ||
-                       (music_ != nullptr && music_->ready()) ||
-                       (foley_ != nullptr && foley_->ready()) ||
-                       (upscale_ != nullptr && upscale_->ready()) ||
-                       (objekt_ != nullptr && objekt_->ready()) ||
-                       images_ != nullptr;
+                       images_ != nullptr || decisions_ != nullptr ||
+                       std::ranges::any_of(options_.media, [](const auto& m) {
+                         return m != nullptr && m->ready();
+                       });
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2223,27 +2287,24 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = backend_->model_id();
     } else if (asr_ != nullptr && asr_->ready()) {
       body["model"] = asr_->model_id();
-    } else if (omni_ != nullptr && omni_->ready()) {
-      body["model"] = omni_->model_id();
-    } else if (music_ != nullptr && music_->ready()) {
-      body["model"] = music_->model_id();
-    } else if (foley_ != nullptr && foley_->ready()) {
-      body["model"] = foley_->model_id();
-    } else if (upscale_ != nullptr && upscale_->ready()) {
-      body["model"] = upscale_->model_id();
-      body["device"] = upscale_->engine().device;
-    } else if (objekt_ != nullptr && objekt_->ready()) {
-      body["model"] = objekt_->model_id();
-      body["capability"] = "image_to_3d";
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
       body["model"] = embeddings_->model_id();
+    } else if (decisions_ != nullptr) {
+      body["model"] = decisions_->model_id;
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
+    } else if (video_jobs_ != nullptr && video_jobs_->ready()) {
+      body["model"] = video_jobs_->model_id();
+    } else if (const auto media = std::ranges::find_if(
+                   options_.media,
+                   [](const auto& m) { return m != nullptr && m->ready(); });
+               media != options_.media.end()) {
+      body["model"] = (*media)->model_id();
+      (*media)->Describe(&body, true);
     } else {
-      body["model"] = video_jobs_ != nullptr ? video_jobs_->model_id()
-                                             : std::string("minimax-h3");
+      body["model"] = "minimax-h3";
     }
     return Ok(body);
   }
@@ -2251,95 +2312,68 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       (req.path == "/v1/models" || req.path == "/models")) {
     HttpResponse listed =
         ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                   images_.get(), embeddings_.get(), omni_.get());
-    if (music_ != nullptr && music_->ready()) {
-      json::Value models = json::parse(listed.body);
-      json::Value model = json::Value::object();
-      model["id"] = music_->model_id();
-      model["object"] = "model";
-      model["created"] = Now();
-      model["owned_by"] = "operator-supplied-ace-step";
-      model["capability"] = "music";
-      models["data"].push_back(std::move(model));
-      listed.body = models.dump();
-    }
-    if (foley_ != nullptr && foley_->ready()) {
-      json::Value models = json::parse(listed.body);
-      json::Value model = json::Value::object();
-      model["id"] = foley_->model_id();
-      model["object"] = "model";
-      model["created"] = Now();
-      model["owned_by"] = "operator-supplied-mmaudio";
-      model["capability"] = "foley";
-      models["data"].push_back(std::move(model));
-      listed.body = models.dump();
-    }
-    if (upscale_ != nullptr && upscale_->ready()) {
-      json::Value models = json::parse(listed.body);
-      for (const std::string& name : upscale_->engine().model_names) {
-        json::Value model = json::Value::object();
-        model["id"] = name;
-        model["object"] = "model";
-        model["created"] = Now();
-        model["owned_by"] = "operator-supplied-realesrgan";
-        model["capability"] = "upscale";
-        model["device"] = upscale_->engine().device;
-        model["runtime"] = upscale_->engine().runtime;
-        models["data"].push_back(std::move(model));
-      }
-      listed.body = models.dump();
-    }
-    if (objekt_ != nullptr && objekt_->ready()) {
-      json::Value models = json::parse(listed.body);
-      for (const std::string& id : objekt_->model_ids()) {
+                   images_.get(), embeddings_.get(), decisions_.get());
+    // gufo-studio-windows media services (src/cli/serve/media).
+    bool media_listed = false;
+    json::Value models;
+    for (const auto& media : options_.media) {
+      if (media == nullptr || !media->ready())
+        continue;
+      if (!media_listed)
+        models = json::parse(listed.body);
+      media_listed = true;
+      for (const std::string& id : media->model_ids()) {
         json::Value model = json::Value::object();
         model["id"] = id;
         model["object"] = "model";
         model["created"] = Now();
-        model["owned_by"] = "operator-supplied-" + id;
-        model["capability"] = "image_to_3d";
-        model["note"] = objekt_->capability_note(id);
-        if (const std::string credit = objekt_->attribution(id); !credit.empty())
-          model["attribution"] = credit;
+        model["owned_by"] = std::string(media->owned_by());
+        model["capability"] = std::string(media->capability());
+        media->Describe(&model, false);
         models["data"].push_back(std::move(model));
       }
-      listed.body = models.dump();
     }
+    if (media_listed)
+      listed.body = models.dump();
     return listed;
   }
-  if (objekt_ != nullptr && IsObjektApiPath(req.path)) {
-    if (!objekt_->ready())
-      return Err(503, "Service Unavailable", "3D service is not ready",
-                 "server_error", "objekt_service_unavailable");
-    return objekt_->Handle(req);
-  }
-  if (upscale_ != nullptr && IsUpscaleApiPath(req.path)) {
-    if (!upscale_->ready())
-      return Err(503, "Service Unavailable", "upscaler is not ready",
-                 "server_error", "upscale_service_unavailable");
-    return upscale_->Handle(req);
-  }
-  if (foley_ != nullptr && IsFoleyApiPath(req.path)) {
-    if (!foley_->ready())
-      return Err(503, "Service Unavailable", "MMAudio foley is not ready",
-                 "server_error", "foley_service_unavailable");
-    return foley_->Handle(req);
-  }
-  if (music_ != nullptr && IsMusicApiPath(req.path)) {
-    if (!music_->ready())
-      return Err(503, "Service Unavailable", "ACE-Step music is not ready",
-                 "server_error", "music_service_unavailable");
-    return music_->Handle(req);
-  }
-  if (backend_ == nullptr && omni_ != nullptr && IsOmniApiPath(req.path)) {
-    if (!omni_->ready())
+  if (req.path == "/v1/systemone") {
+    if (req.method != "POST")
+      return Err(405, "Method Not Allowed", "use POST", "invalid_request_error",
+                 "method_not_allowed");
+    if (!decisions_ || !decisions_->decide)
       return Err(503, "Service Unavailable",
-                 "Qwen3-Omni captioner is not ready", "server_error",
-                 "omni_service_unavailable");
-    return HandleOmniApiRequest(req, *omni_);
+                 "decision service is not configured", "server_error",
+                 "decision_service_unavailable");
+    json::Value payload;
+    try {
+      payload = json::parse(req.body);
+    } catch (const std::exception& e) {
+      return Err(400, "Bad Request", e.what(), "invalid_request_error",
+                 "invalid_json");
+    }
+    try {
+      if (const auto* model = payload.find("model");
+          model &&
+          (!model->is_string() || !ServesModel(*decisions_, model->str())))
+        return Err(404, "Not Found", "unknown decision model",
+                   "invalid_request_error", "model_not_found");
+      auto result = decisions_->decide(payload);
+      result["model"] = decisions_->model_id;
+      return Ok(result);
+    } catch (const std::invalid_argument& e) {
+      return Err(400, "Bad Request", e.what(), "invalid_request_error",
+                 "invalid_request");
+    } catch (const std::exception& e) {
+      return Err(500, "Internal Server Error", e.what(), "server_error",
+                 "decision_failed");
+    }
   }
+  // Live previews (gufo-studio-windows, changes/0.2/live-previews.md).
   if (IsPreviewPath(req.path) && (images_ || video_jobs_))
     return HandlePreviewRequest(req, PreviewHub::Global());
+  if (req.path == "/sdapi/v1/loras" && images_ != nullptr)
+    return HandleImageLorasRequest(req, *images_);
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
       return Err(503, "Service Unavailable", "image service is not configured",
@@ -2359,6 +2393,16 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return Err(503, "Service Unavailable", "ASR is not configured",
                  "server_error", "asr_service_unavailable");
     return HandleAsrWebSocket(req, *asr_);
+  }
+  for (const auto& media : options_.media) {
+    if (media == nullptr || !media->HandlesPath(req.path))
+      continue;
+    if (!media->ready())
+      return Err(503, "Service Unavailable",
+                 std::string(media->unavailable_message()).c_str(),
+                 "server_error",
+                 std::string(media->unavailable_code()).c_str());
+    return media->Handle(req);
   }
   if (IsVideoApiPath(req.path)) {
     if (video_jobs_ == nullptr || !video_jobs_->ready()) {
@@ -2414,8 +2458,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 
 bool HttpServer::device_lost() {
   const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
-                    (embeddings_ != nullptr && embeddings_->device_lost()) ||
-                    (images_ != nullptr && images_->device_lost());
+                    (embeddings_ != nullptr && embeddings_->device_lost());
   if (!lost)
     return false;
   if (options_.on_device_lost &&
@@ -2466,89 +2509,41 @@ void HttpServer::handle_connection(int client_fd,
   try {
     bool ok = false;
     bool payload_too_large = false;
+    bool too_many_fields = false;
     {
       std::string buffer;
-      if (ReadUntil(buffer, client_fd, "\r\n\r\n")) {
-        // ReadUntil over-reads: `buffer` holds the headers, the blank line, and
-        // possibly some body bytes already. Split at the blank line and carry
-        // the over-read body bytes forward so we only read the remainder from
-        // the socket.
-        const auto delim_pos = buffer.find("\r\n\r\n");
-        const std::string headers = buffer.substr(0, delim_pos);
-        std::string body = buffer.substr(delim_pos + 4);
+      GufoHttpHead head{};
+      const GufoHttpParse parsed = ReadHead(buffer, client_fd, req, head);
+      too_many_fields = parsed == GUFO_HTTP_TOO_MANY_FIELDS;
+      if (parsed == GUFO_HTTP_COMPLETE) {
+        // ReadHead over-reads: `buffer` holds the head and possibly some body
+        // bytes already. Carry those forward so we only read the remainder
+        // from the socket.
+        std::string body = buffer.substr(head.len);
+        const auto text = [](GufoHttpSlice slice) {
+          return std::string(reinterpret_cast<const char*>(slice.data),
+                             slice.len);
+        };
+        req.method = text(head.method);
+        req.path = text(head.path);
+        req.query = text(head.query);
+        http11 = head.http11 != 0;
 
-        const auto eol = headers.find("\r\n");
-        const std::string line =
-            (eol == std::string::npos) ? headers : headers.substr(0, eol);
-        std::istringstream ls(line);
-        std::string target;
-        std::string version;
-        std::string extra;
-        ls >> req.method >> target >> version;
-        http11 = version == "HTTP/1.1";
-        bool valid_headers = !req.method.empty() && target.starts_with('/') &&
-                             (version == "HTTP/1.0" || version == "HTTP/1.1") &&
-                             !(ls >> extra);
-        const auto qpos = target.find('?');
-        if (qpos != std::string::npos) {
-          req.query = target.substr(qpos + 1);
-          req.path = target.substr(0, qpos);
-        } else {
-          req.path = target;
-        }
-
-        std::size_t cursor =
-            eol == std::string::npos ? headers.size() : eol + 2;
-        while (cursor < headers.size()) {
-          const std::size_t next = headers.find("\r\n", cursor);
-          const std::size_t line_end =
-              next == std::string::npos ? headers.size() : next;
-          const std::string_view header_line(headers.data() + cursor,
-                                             line_end - cursor);
-          const std::size_t colon = header_line.find(':');
-          // RFC 9112 5.1: reject whitespace before the colon and obsolete
-          // line folding instead of storing a name no lookup would match.
-          const auto token = [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) != 0 ||
-                   std::string_view("!#$%&'*+-.^_`|~").find(c) !=
-                       std::string_view::npos;
-          };
-          if (colon != std::string_view::npos && colon > 0 &&
-              std::ranges::all_of(header_line.substr(0, colon), token)) {
-            std::string name(header_line.substr(0, colon));
-            std::string_view raw_value = header_line.substr(colon + 1);
-            while (!raw_value.empty() &&
-                   std::isspace(
-                       static_cast<unsigned char>(raw_value.front())) != 0) {
-              raw_value.remove_prefix(1);
-            }
-            while (!raw_value.empty() &&
-                   std::isspace(static_cast<unsigned char>(raw_value.back())) !=
-                       0) {
-              raw_value.remove_suffix(1);
-            }
-            req.headers.emplace_back(std::move(name), std::string(raw_value));
-          } else {
-            valid_headers = false;
-          }
-          if (next == std::string::npos) {
-            break;
-          }
-          cursor = next + 2;
-        }
-
-        const auto parsed_length = ParseContentLength(req);
-        const std::size_t content_length = parsed_length.value_or(0);
+        const bool framing_valid =
+            head.framing_valid != 0 &&
+            std::in_range<std::size_t>(head.content_length);
+        const std::size_t content_length =
+            framing_valid ? static_cast<std::size_t>(head.content_length) : 0;
         const std::size_t remaining =
             content_length > body.size() ? content_length - body.size() : 0;
-        if (!valid_headers || !parsed_length.has_value()) {
+        if (!framing_valid) {
           ok = false;
         } else if (content_length > options_.max_request_body_bytes) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
             // A HTTP/1.0 request's expectation is ignored (RFC 9110 10.1.1).
-            ok = (!http11 || !ExpectsContinue(req) ||
+            ok = (!http11 || head.expect_continue == 0 ||
                   SendAll(client_fd, "HTTP/1.1 100 Continue\r\n\r\n")) &&
                  ReadN(body, client_fd, remaining);
           } else {
@@ -2595,15 +2590,17 @@ void HttpServer::handle_connection(int client_fd,
     if (payload_too_large) {
       resp = Err(413, "Payload Too Large", "request body is too large",
                  "invalid_request_error", "payload_too_large");
+    } else if (too_many_fields) {
+      resp = Err(431, "Request Header Fields Too Large",
+                 "request has more than 100 header fields",
+                 "invalid_request_error", "request_header_fields_too_large");
     } else if (!ok) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {
-      // A client without the API key cannot write into the trace.
-      traced = Trace::Enabled() && IsTracedRoute(req) &&
-               IsAuthorized(req, api_key_hash_);
+      traced = Trace::Enabled() && IsTracedRoute(req);
       if (traced) {
         TraceRequest(req);
       }
@@ -2730,18 +2727,8 @@ void HttpServer::handle_connection(int client_fd,
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
-    const char* reason = "Service Unavailable";
-    if (exception.http_status() == 408) {
-      reason = "Request Timeout";
-    } else if (exception.http_status() == 429) {
-      reason = "Too Many Requests";
-    }
-    HttpResponse resp = Err(exception.http_status(), reason, exception.what(),
-                            "server_error", exception.stable_code());
+    HttpResponse resp = TextGenerationErrorResponse(exception);
     resp.headers.emplace_back("X-Request-ID", req.request_id);
-    if (exception.retryable()) {
-      resp.headers.emplace_back("Retry-After", "1");
-    }
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
                        duration_ms,

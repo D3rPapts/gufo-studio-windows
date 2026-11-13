@@ -29,7 +29,8 @@ def write_preset(path, remote_port, python):
     with open(path, "w") as handle:
         handle.write(
             "[external/twin]\ncommand = %s\nargs = %s --fake-worker\n"
-            "served-model-name = twin\n\n"
+            "served-model-name = twin\n"
+            "lora = a=/l/a.safetensors;b=/l/b.safetensors\n\n"
             "[remote/twin]\nurl = http://127.0.0.1:%d\napi-key-env = %s\n"
             "queue-timeout-seconds = 20\nplacement = pool\n"
             % (python, rp.THIS, remote_port, rr.KEY_ENV))
@@ -99,6 +100,9 @@ def check_both_busy_waits(router, remote):
     waiting, waiting_result = rp.in_background(lambda: rp.chat(router, "twin"))
     time.sleep(0.5)
     assert router.status()["remote"]["models"]["twin"]["pool"]["waiting"] == 1
+    # What the partner's probe reads: the waiting request apart from busy.
+    activity = router.models()["twin"]["activity"]
+    assert activity["waiting"] == 1 and activity["busy"] is True, activity
     waiting.join(15)
     code, answer = waiting_result["value"]
     assert code == 200, (code, answer)
@@ -125,7 +129,8 @@ def check_remote_activity(router, remote):
     for flags in ({"busy": True, "gpu_busy": False, "others_busy": False},
                   {"busy": False, "gpu_busy": True, "others_busy": True}):
         remote.activity["twin"] = flags
-        rr.wait_for(lambda: router_entry(router, remote)["activity"].get("twin") == flags,
+        rr.wait_for(lambda: same_flags(router_entry(router, remote)["activity"].get("twin"),
+                                       flags),
                     15, "the probe to read %s" % flags)
         remote.clear()
         running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
@@ -136,9 +141,90 @@ def check_remote_activity(router, remote):
         assert time.monotonic() - began >= 1, "did not wait for the local worker"
         assert remote_chats(remote) == 0, flags
         running.join(10)
+    # Requests that only wait there for a machine do not occupy it: the
+    # partner reports them as "waiting", not "busy" (12.11.: mutual wait).
+    flags = {"busy": False, "waiting": 2, "gpu_busy": False, "others_busy": False}
+    remote.activity["twin"] = flags
+    rr.wait_for(lambda: same_flags(router_entry(router, remote)["activity"].get("twin"),
+                                   flags),
+                15, "the probe to read %s" % flags)
+    remote.clear()
+    running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+    time.sleep(0.5)
+    began = time.monotonic()
+    code, answer = rp.chat(router, "twin")
+    assert code == 200 and rp.where(answer) == "remote", (code, answer)
+    assert time.monotonic() - began < 1, "waited although the remote was free"
+    running.join(10)
     remote.activity.clear()
     rr.wait_for(lambda: router_entry(router, remote)["activity"] == {}, 15,
                 "the probe to clear the activity")
+
+
+def same_flags(seen, flags):
+    """The probe's copy of an activity object ("waiting" defaults to 0)."""
+    if seen is None:
+        return False
+    return all(seen.get(key, 0) == value for key, value in flags.items()) and \
+        seen.get("waiting", 0) == flags.get("waiting", 0)
+
+
+def lora_chat(router, lora, headers=None):
+    return router.json("POST", "/v1/chat/completions",
+                       {"model": "twin", "prompt": "", "loras": [{"name": lora}],
+                        "messages": [{"role": "user", "content": "x"}]},
+                       headers)
+
+
+def check_lora_side(router, remote):
+    # One "lora = a=..;b=.." line registers both names (gufo 2.0 form).
+    code, caps = router.json("GET", "/router/capabilities")
+    assert code == 200 and caps["models"]["twin"]["loras"] == ["a", "b"], caps
+    assert caps["models"]["twin"]["available"] is True, caps
+    assert "unavailable" not in caps["models"]["twin"], caps
+    remote.clear()
+    code, answer = lora_chat(router, "b")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    code, answer = lora_chat(router, "b", {"X-Gufo-Pool": "local"})
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    # Not here, partner unknown (no capabilities route): goes remote ...
+    code, answer = lora_chat(router, "zzz")
+    assert code == 200 and rp.where(answer) == "remote", (code, answer)
+    # ... unless the client pins this side: then 400, never silently remote.
+    remote.clear()
+    code, answer = lora_chat(router, "zzz", {"X-Gufo-Pool": "local"})
+    assert code == 400, (code, answer)
+    assert answer["error"]["code"] == "pool_side_cannot_run", answer
+    assert "zzz" in answer["error"]["message"], answer
+    assert remote_chats(remote) == 0
+
+
+def check_remote_failure_retries_local(router, remote):
+    # The partner answers 502 (its worker did not start) while the local
+    # worker is busy: the request is served here once the local worker is
+    # free instead of handing the 502 to the client, and the partner gets
+    # no request of this model for 60 s.
+    remote.clear()
+    remote.chat_fail = 502
+    try:
+        running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+        time.sleep(0.5)
+        code, answer = rp.chat(router, "twin")
+        assert code == 200 and rp.where(answer) == "local", (code, answer)
+        assert remote_chats(remote) == 1, remote.entries()
+        running.join(10)
+        pool = router.status()["remote"]["models"]["twin"]["pool"]
+        assert "remote_failed_s_ago" in pool and pool["retried_local"] >= 1, pool
+    finally:
+        remote.chat_fail = None
+    # Held: local busy again, the next request waits for the local worker.
+    remote.clear()
+    running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 2"))
+    time.sleep(0.5)
+    code, answer = rp.chat(router, "twin")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    assert remote_chats(remote) == 0, remote.entries()
+    running.join(10)
 
 
 def check_remote_gone(router, remote):
@@ -177,6 +263,9 @@ def main():
                 ("forwarded stays local",
                  lambda: check_forwarded_stays_local(router, remote)),
                 ("remote activity", lambda: check_remote_activity(router, remote)),
+                ("lora side", lambda: check_lora_side(router, remote)),
+                ("remote failure retries local",
+                 lambda: check_remote_failure_retries_local(router, remote)),
                 ("remote gone", lambda: check_remote_gone(router, remote))):
             case()
             print("router_pool_test: %s ok" % name, flush=True)

@@ -1,28 +1,30 @@
 #include "src/cli/serve/image_api.hpp"
 
+#include <png.h>
+
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <map>
-#include <optional>
 #include <random>
-#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
+#include <variant>
 
+#include "gufo/ext/registry.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/preview.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
+#include "src/ext/image.hpp"
 
 namespace gufo::server {
 namespace {
-
-namespace image = models::qwen_image_21;
 
 json::Value ParseJson(std::string_view text) {
   try {
@@ -44,7 +46,6 @@ HttpResponse Error(int status, const std::string& message,
   return {.status = status,
           .reason = status == 400   ? "Bad Request"
                     : status == 404 ? "Not Found"
-                    : status == 503 ? "Service Unavailable"
                                     : "Internal Server Error",
           .body = body.dump(),
           .headers = {{"Content-Type", "application/json"}}};
@@ -125,33 +126,148 @@ std::string Parameter(std::string_view value, std::string_view key) {
   return {};
 }
 
-struct Parsed {
-  json::Value fields = json::Value::object();
-  std::vector<image::Image> images;
-  std::optional<image::Image> init_image;
-  std::optional<image::Image> mask;
-  /// "region_image[]" parts in order; gufo.regions[i].images counts them.
-  std::vector<image::Image> region_images;
-  std::optional<image::Image> control_image;
+void CheckImage(const ext::ImageBuffer& image) {
+  if (image.width <= 0 || image.height <= 0 ||
+      static_cast<std::uint64_t>(image.width) * image.height >
+          core::kMaxImagePixels ||
+      image.rgba.size() !=
+          static_cast<std::size_t>(image.width) * image.height * 4)
+    throw std::invalid_argument("invalid RGBA image dimensions");
+}
+
+struct PngOutput {
+  std::vector<std::uint8_t> bytes;
+  std::size_t used{0};
 };
 
-constexpr std::array<std::string_view, 17> kExtensionFields{
-    "negative_prompt",  "guidance",         "strength",      "init_image",
-    "preview",          "mask",             "mask_channel",  "mask_composite",
-    "mask_feather",     "mask_blur",        "regions",       "base_strength",
-    "control_image",    "control_strength", "control_start", "control_end",
-    "control_inpaint"};
+void WritePng(png_structp png, png_bytep data, png_size_t size) {
+  auto& output = *static_cast<PngOutput*>(png_get_io_ptr(png));
+  if (size > output.bytes.size() - output.used)
+    png_error(png, "output PNG exceeds its allocation");
+  std::memcpy(output.bytes.data() + output.used, data, size);
+  output.used += size;
+}
+
+ext::ImageBuffer DecodeImage(std::span<const std::uint8_t> bytes) {
+  if (bytes.size() > core::kMaxEncodedImageBytes || bytes.size() < 8)
+    throw std::invalid_argument("invalid or oversized input image");
+  if (png_sig_cmp(bytes.data(), 0, 8) != 0) {
+    const auto rgb = core::DecodeImage(bytes);
+    ext::ImageBuffer image{
+        static_cast<int>(rgb.width), static_cast<int>(rgb.height), {}};
+    image.rgba.resize(static_cast<std::size_t>(rgb.width) * rgb.height * 4);
+    for (std::size_t i = 0; i < image.rgba.size() / 4; ++i) {
+      std::memcpy(image.rgba.data() + 4 * i, rgb.pixels.data() + 3 * i, 3);
+      image.rgba[4 * i + 3] = 255;
+    }
+    return image;
+  }
+  png_image png{};
+  png.version = PNG_IMAGE_VERSION;
+  if (!png_image_begin_read_from_memory(&png, bytes.data(), bytes.size()))
+    throw std::invalid_argument("cannot decode PNG image");
+  const auto cleanup = std::unique_ptr<png_image, decltype(&png_image_free)>(
+      &png, png_image_free);
+  if (!png.width || !png.height ||
+      static_cast<std::uint64_t>(png.width) * png.height >
+          core::kMaxImagePixels)
+    throw std::invalid_argument("PNG image dimensions exceed limits");
+  png.format = PNG_FORMAT_RGBA;
+  ext::ImageBuffer image{
+      static_cast<int>(png.width), static_cast<int>(png.height), {}};
+  image.rgba.resize(PNG_IMAGE_SIZE(png));
+  if (!png_image_finish_read(&png, nullptr, image.rgba.data(), 0, nullptr))
+    throw std::invalid_argument("invalid PNG image data");
+  return image;
+}
+
+std::vector<std::uint8_t> EncodePng(const ext::ImageBuffer& image) {
+  CheckImage(image);
+  png_image geometry{};
+  geometry.width = image.width;
+  geometry.height = image.height;
+  geometry.format = PNG_FORMAT_RGBA;
+  const auto output = std::make_unique<PngOutput>();
+  output->bytes.resize(PNG_IMAGE_PNG_SIZE_MAX(geometry));
+  auto png = png_create_write_struct(
+      PNG_LIBPNG_VER_STRING, nullptr,
+      [](png_structp p, png_const_charp) { png_longjmp(p, 1); }, nullptr);
+  if (!png)
+    throw std::runtime_error("cannot allocate PNG encoder");
+  auto info = png_create_info_struct(png);
+  if (!info) {
+    png_destroy_write_struct(&png, nullptr);
+    throw std::runtime_error("cannot allocate PNG metadata");
+  }
+  if (setjmp(png_jmpbuf(png))) {
+    png_destroy_write_struct(&png, &info);
+    throw std::runtime_error("cannot encode output PNG");
+  }
+  png_set_write_fn(png, output.get(), WritePng, nullptr);
+  png_set_IHDR(png, info, image.width, image.height, 8, PNG_COLOR_TYPE_RGBA,
+               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+               PNG_FILTER_TYPE_DEFAULT);
+  png_set_sRGB(png, info, PNG_sRGB_INTENT_PERCEPTUAL);
+  png_set_compression_level(png, 1);
+  png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
+  png_write_info(png, info);
+  for (int row = 0; row < image.height; ++row)
+    png_write_row(png, const_cast<png_bytep>(image.rgba.data() +
+                                             static_cast<std::size_t>(row) *
+                                                 image.width * 4));
+  png_write_end(png, info);
+  png_destroy_write_struct(&png, &info);
+  output->bytes.resize(output->used);
+  return std::move(output->bytes);
+}
+
+void ValidateRequest(const ext::ImageRequest& request) {
+  if (request.prompt.size() > (64U << 10U))
+    throw std::invalid_argument("image prompt exceeds 64 KiB");
+  if (request.width < 32 || request.height < 32 || request.width % 32 ||
+      request.height % 32 || request.width > 4096 || request.height > 4096 ||
+      static_cast<std::uint64_t>(request.width) * request.height > 4194304)
+    throw std::invalid_argument(
+        "image size must be multiples of 32, at most 4096 per side and 4 "
+        "megapixels");
+  if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
+    throw std::invalid_argument("image steps must be between 2 and 100");
+  if (request.images.size() > 10)
+    throw std::invalid_argument(
+        "image edits accept at most 10 reference images");
+  std::size_t pixels = 0;
+  for (const auto& image : request.images) {
+    CheckImage(image);
+    pixels += static_cast<std::size_t>(image.width) * image.height;
+  }
+  if (pixels > core::kMaxImagePixels)
+    throw std::invalid_argument(
+        "reference images exceed 32 megapixels combined");
+}
+
+struct Parsed {
+  json::Value fields = json::Value::object();
+  std::vector<ext::ImageBuffer> images;
+  /// Multipart image parts for the provider (ext::ImageRequest::named_images).
+  std::vector<std::pair<std::string, ext::ImageBuffer>> named_images;
+};
 
 /// The "gufo" field carries regional masks; other text fields stay small.
 constexpr std::size_t kMaxGufoFieldBytes = 8U << 20U;
 
-// Form fields "gufo.<name>" whose value is JSON (numbers, booleans, objects).
+// Form fields "gufo.<name>" whose value is JSON (numbers, booleans, objects);
+// the others are strings. Keys are the Qwen-Image-2.1 extension's.
 bool JsonFormField(std::string_view key) {
   return key == "guidance" || key == "strength" || key == "preview" ||
          key == "mask_composite" || key == "mask_feather" ||
          key == "mask_blur" || key == "regions" || key == "base_strength" ||
          key == "control_strength" || key == "control_start" ||
          key == "control_end" || key == "control_inpaint";
+}
+
+bool NamedImagePart(std::string_view name) {
+  return name == "init_image" || name == "mask" || name == "control_image" ||
+         name == "region_image[]";
 }
 
 Parsed Multipart(const HttpRequest& request) {
@@ -226,49 +342,35 @@ Parsed Multipart(const HttpRequest& request) {
     body.remove_prefix(end + delimiter.size());
     if (++fields > 32)
       throw std::invalid_argument("too many multipart fields");
-    if (name == "image" || name == "image[]" || name == "init_image" ||
-        name == "mask" || name == "region_image[]" ||
-        name == "control_image") {
-      const bool init = name == "init_image", mask = name == "mask";
-      const bool region = name == "region_image[]";
-      if (name == "control_image") {
-        // Structure image for the ControlNet, not a reference.
-        if (parsed.control_image)
-          throw std::invalid_argument("duplicate field " + name);
-        if (data.size() > core::kMaxEncodedImageBytes - image_bytes)
-          throw std::invalid_argument("image inputs exceed 10 images or 20 MiB");
-        image_bytes += data.size();
-        const auto& decoded = parsed.control_image.emplace(image::DecodeImage(
-            std::span(reinterpret_cast<const std::uint8_t*>(data.data()),
-                      data.size())));
-        image_pixels +=
-            static_cast<std::size_t>(decoded.width) * decoded.height;
-        if (image_pixels > core::kMaxImagePixels)
-          throw std::invalid_argument(
-              "reference images exceed 32 megapixels combined");
-        continue;
+    if (name == "image" || name == "image[]" || NamedImagePart(name)) {
+      const bool reference = name == "image" || name == "image[]";
+      if (!reference && name != "region_image[]")
+        for (const auto& [part, image] : parsed.named_images) {
+          (void)image;
+          if (part == name)
+            throw std::invalid_argument("duplicate field " + name);
+        }
+      std::size_t references = parsed.images.size();
+      for (const auto& [part, image] : parsed.named_images) {
+        (void)image;
+        references += part == "region_image[]";
       }
-      if ((init && parsed.init_image) || (mask && parsed.mask))
-        throw std::invalid_argument("duplicate field " + name);
-      if ((!init && !mask && !region && parsed.images.size() == 10) ||
-          (region && parsed.images.size() + parsed.region_images.size() >=
-                         image::kMaxReferenceImages) ||
+      if ((reference && parsed.images.size() == 10) ||
+          (name == "region_image[]" && references >= 20) ||
           data.size() > core::kMaxEncodedImageBytes - image_bytes)
         throw std::invalid_argument(
             "image inputs exceed 10 images (20 with regions) or 20 MiB");
       image_bytes += data.size();
-      auto decoded_image = image::DecodeImage(std::span(
+      auto decoded = DecodeImage(std::span(
           reinterpret_cast<const std::uint8_t*>(data.data()), data.size()));
-      // OpenAI mask: transparent pixels mark the area to edit.
-      const auto& decoded =
-          init     ? parsed.init_image.emplace(std::move(decoded_image))
-          : mask   ? parsed.mask.emplace(std::move(decoded_image))
-          : region ? parsed.region_images.emplace_back(std::move(decoded_image))
-                   : parsed.images.emplace_back(std::move(decoded_image));
       image_pixels += static_cast<std::size_t>(decoded.width) * decoded.height;
       if (image_pixels > core::kMaxImagePixels)
         throw std::invalid_argument(
             "reference images exceed 32 megapixels combined");
+      if (reference)
+        parsed.images.push_back(std::move(decoded));
+      else
+        parsed.named_images.emplace_back(name, std::move(decoded));
     } else {
       if (parsed.fields.contains(name))
         throw std::invalid_argument("duplicate field " + name);
@@ -283,35 +385,19 @@ Parsed Multipart(const HttpRequest& request) {
         auto& extension = parsed.fields["gufo"];
         if (!extension.is_object() || extension.contains(key))
           throw std::invalid_argument("duplicate field " + name);
-        extension[key] =
-            JsonFormField(key) ? ParseJson(data) : json::Value(std::string(data));
-      } else if (name == "gufo") {
-        if (parsed.fields.contains(name))
-          throw std::invalid_argument("duplicate field " + name);
-        parsed.fields[name] = ParseJson(data);
-      } else if (name == "n" || name == "seed" || name == "steps" ||
-                 name == "stream" || name == "loras") {
+        extension[key] = JsonFormField(key) ? ParseJson(data)
+                                            : json::Value(std::string(data));
+      } else if (name == "gufo" || name == "n" || name == "seed" ||
+                 name == "steps" || name == "stream" || name == "loras") {
         parsed.fields[name] = ParseJson(data);
       } else {
         parsed.fields[name] = std::string(data);
       }
     }
   }
-  if (parsed.images.empty() && !parsed.init_image &&
-      parsed.region_images.empty())
+  if (parsed.images.empty() && parsed.named_images.empty())
     throw std::invalid_argument("image edit requires an image");
   return parsed;
-}
-
-double Real(const json::Value& fields, const char* name, double fallback,
-            double low, double high) {
-  const auto* value = fields.find(name);
-  if (!value)
-    return fallback;
-  if (!value->is_number() || !std::isfinite(value->as_double()) ||
-      value->as_double() < low || value->as_double() > high)
-    throw std::invalid_argument(std::string("invalid gufo.") + name);
-  return value->as_double();
 }
 
 std::uint64_t Number(const json::Value& fields, const char* name,
@@ -338,273 +424,97 @@ std::string String(const json::Value& fields, const char* name,
   return value->str();
 }
 
-std::vector<std::uint8_t> DecodeBase64(std::string_view text) {
-  std::vector<std::uint8_t> out;
-  out.reserve(text.size() / 4 * 3);
-  std::uint32_t word = 0;
-  int bits = 0;
-  for (const char c : text) {
-    int value;
-    if (c >= 'A' && c <= 'Z')
-      value = c - 'A';
-    else if (c >= 'a' && c <= 'z')
-      value = c - 'a' + 26;
-    else if (c >= '0' && c <= '9')
-      value = c - '0' + 52;
-    else if (c == '+')
-      value = 62;
-    else if (c == '/')
-      value = 63;
-    else if (c == '=')
-      break;
-    else
-      throw std::invalid_argument("invalid base64 in gufo.regions");
-    word = (word << 6) | static_cast<std::uint32_t>(value);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push_back(static_cast<std::uint8_t>((word >> bits) & 0xFF));
-    }
-  }
-  return out;
-}
-
-image::Image InlineImage(const json::Value& value, const char* what) {
-  // Inline data only: base64 or a data URL, never a server-side fetch.
-  if (!value.is_string() || value.str().starts_with("http"))
-    throw std::invalid_argument(std::string("gufo.regions ") + what +
-                                " must be base64 or a data URL");
-  const auto& text = value.str();
-  return image::DecodeImage(core::ReadImageUrl(
-      text.starts_with("data:") ? text : "data:image/png;base64," + text));
-}
-
-/// gufo.regions: [{prompt, strength, area {x, y, width, height, unit "px" |
-/// "fraction"}, mask {width, height, data: base64 bytes 0..255} or
-/// mask_image (+ mask_channel, mask_invert), mask_bounds, images}] where
-/// images is a count of the next "region_image[]" parts (multipart) or an
-/// array of data URLs.
-std::vector<image::Region> ParseRegions(const json::Value& value,
-                                        std::vector<image::Image>& uploaded) {
-  if (!value.is_array() || value.size() > image::kMaxRegions)
-    throw std::invalid_argument("gufo.regions must be an array of at most " +
-                                std::to_string(image::kMaxRegions) +
-                                " objects");
-  static const std::set<std::string> kKeys{
-      "prompt",       "strength",    "area",        "mask", "mask_image",
-      "mask_channel", "mask_invert", "mask_bounds", "images"};
-  std::vector<image::Region> regions;
-  std::size_t next = 0;
-  for (const auto& entry : value.items()) {
-    if (!entry.is_object())
-      throw std::invalid_argument("gufo.regions entries must be objects");
-    for (const auto& [key, member] : entry.members()) {
-      (void)member;
-      if (!kKeys.contains(key))
-        throw std::invalid_argument("unsupported region parameter: " + key);
-    }
-    auto& region = regions.emplace_back();
-    region.prompt = String(entry, "prompt", "");
-    region.strength = static_cast<float>(Real(entry, "strength", 1, 0, 10));
-    if (const auto* area = entry.find("area")) {
-      if (!area->is_object())
-        throw std::invalid_argument("region area must be an object");
-      const auto unit = String(*area, "unit", "px");
-      if (unit != "px" && unit != "fraction")
-        throw std::invalid_argument("region area unit must be px or fraction");
-      const bool fraction = unit == "fraction";
-      const double high = fraction ? 1 : 16384;
-      region.area = image::RegionArea{
-          .x = Real(*area, "x", 0, 0, high),
-          .y = Real(*area, "y", 0, 0, high),
-          .width = Real(*area, "width", fraction ? 1 : 0, 0, high),
-          .height = Real(*area, "height", fraction ? 1 : 0, 0, high),
-          .fraction = fraction};
-    }
-    const auto* mask = entry.find("mask");
-    const auto* mask_image = entry.find("mask_image");
-    if (mask && mask_image)
-      throw std::invalid_argument("a region takes mask or mask_image");
-    if (mask) {
-      if (!mask->is_object())
-        throw std::invalid_argument("region mask must be an object");
-      const auto width = static_cast<int>(Number(*mask, "width", 0, 1, 16384));
-      const auto height =
-          static_cast<int>(Number(*mask, "height", 0, 1, 16384));
-      if (static_cast<std::uint64_t>(width) * height > (16ULL << 20))
-        throw std::invalid_argument("region mask exceeds 16 M values");
-      const auto bytes = DecodeBase64(String(*mask, "data", ""));
-      if (bytes.size() != static_cast<std::size_t>(width) * height)
-        throw std::invalid_argument(
-            "region mask data must hold width x height bytes");
-      image::RegionMask grid{width, height, std::vector<float>(bytes.size())};
-      for (std::size_t i = 0; i < bytes.size(); ++i)
-        grid.values[i] = static_cast<float>(bytes[i]) / 255.0F;
-      region.mask = std::move(grid);
-    } else if (mask_image) {
-      bool invert = false;
-      if (const auto* flag = entry.find("mask_invert")) {
-        if (!flag->is_bool())
-          throw std::invalid_argument("region mask_invert must be a boolean");
-        invert = flag->as_bool();
-      }
-      region.mask = image::RegionMaskFromImage(
-          InlineImage(*mask_image, "mask_image"),
-          image::ParseMaskChannel(String(entry, "mask_channel", "auto")),
-          invert);
-    } else if (entry.contains("mask_channel") ||
-               entry.contains("mask_invert")) {
-      throw std::invalid_argument("mask_channel needs a region mask_image");
-    }
-    if (const auto* bounds = entry.find("mask_bounds")) {
-      if (!bounds->is_bool())
-        throw std::invalid_argument("region mask_bounds must be a boolean");
-      region.mask_bounds = bounds->as_bool();
-    }
-    if (const auto* images = entry.find("images")) {
-      if (images->is_array()) {
-        for (const auto& item : images->items())
-          region.images.push_back(InlineImage(item, "images"));
-      } else {
-        const auto count = Number(entry, "images", 0, 0, 10);
-        if (next + count > uploaded.size())
-          throw std::invalid_argument(
-              "gufo.regions names more images than region_image[] parts");
-        for (std::uint64_t i = 0; i < count; ++i)
-          region.images.push_back(std::move(uploaded[next++]));
-      }
-    }
-  }
-  if (next != uploaded.size())
-    throw std::invalid_argument(
-        "region_image[] parts must all belong to gufo.regions");
-  return regions;
-}
-
-std::vector<image::Lora> ParseLoras(const json::Value& fields,
-                                    const ImageService& service) {
-  const auto* value = fields.find("loras");
-  if (!value)
-    return service.loras().defaults;
-  if (!value->is_array())
-    throw std::invalid_argument("loras must be an array");
-  std::vector<image::Lora> loras;
-  for (const auto& entry : value->items()) {
-    if (!entry.is_object())
-      throw std::invalid_argument("loras entries must be objects");
-    for (const auto& [key, member] : entry.members()) {
-      (void)member;
-      if (key != "name" && key != "scale")
-        throw std::invalid_argument("unsupported LoRA parameter: " + key);
-    }
-    const auto* name = entry.find("name");
-    if (!name || !name->is_string())
-      throw std::invalid_argument("LoRA name must be a string");
-    if (!service.HasLora(name->str()))
-      throw std::invalid_argument("unknown LoRA adapter: " + name->str());
-    auto& lora = loras.emplace_back(image::Lora{name->str()});
-    if (const auto* scale = entry.find("scale")) {
-      if (!scale->is_number())
-        throw std::invalid_argument("LoRA scale must be a number");
-      // Converting an out-of-range double to float is undefined.
-      const double value = scale->as_double();
-      if (!std::isfinite(value) || std::abs(value) > 10)
-        throw std::invalid_argument(
-            "LoRA scale must be finite and at most 10 in magnitude");
-      lora.scale = static_cast<float>(value);
-    }
-  }
-  return loras;
-}
-
-std::string LoraList(const std::vector<image::Lora>& loras) {
-  std::ostringstream list;
-  for (const auto& lora : loras)
-    if (lora.scale != 0)
-      list << (list.tellp() > 0 ? "," : "") << lora.name << ':' << lora.scale;
-  return list.tellp() > 0 ? list.str() : "none";
-}
-
 }  // namespace
 
-ImageService::ImageService(const std::filesystem::path& root,
-                           std::string model_id, Runner runner,
-                           image::SamplingConfig sampling,
-                           ImageLoraOptions loras)
-    : model_id_(std::move(model_id)),
-      sampling_(std::move(sampling)),
-      runner_(std::move(runner)),
-      loras_(std::move(loras)) {
-  if (model_id_.empty())
-    throw std::invalid_argument("image model ID must not be empty");
-  for (const auto& [name, path] : loras_.files) {
-    (void)path;
-    if (name.empty() || name.size() > 64 ||
-        name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs"
-                               "tuvwxyz0123456789._-") != std::string::npos)
-      throw std::invalid_argument("LoRA name '" + name +
-                                  "' must be 1-64 of [A-Za-z0-9._-]");
-    if (!lora_info_.emplace(name, image::LoraInfo{}).second)
-      throw std::invalid_argument("duplicate --lora name '" + name + "'");
+const ext::ImageProvider& SelectImageProvider(
+    const ext::Registry& registry, const std::filesystem::path& root,
+    const ext::ParsedOptions& options) {
+  const auto* provider = ext::ProbeImageProvider(root.string());
+  if (!provider) {
+    provider = ext::FindImageProvider("qwen-image-21");
   }
-  for (const auto& lora : loras_.defaults)
-    if (!HasLora(lora.name))
-      throw std::invalid_argument("--lora-default names unknown adapter '" +
-                                  lora.name + "'");
-  Request defaults;
-  defaults.loras = loras_.defaults;
-  image::ValidateRequest(defaults);
-  if (!runner_) {
-#if defined(ENGINE_ENABLE_HIP)
-    model_ = std::make_unique<image::Model>(root);
-    model_->SetLog(
-        [](const std::string& line) { Logger::Info("image", line); });
-    sampling_ = model_->sampling();
-    if (!loras_.controlnet.empty()) {
-      const auto layout = model_->SetControlnet(loras_.controlnet);
-      Logger::Info("image", "event=controlnet_registered file=" +
-                                loras_.controlnet.filename().string() +
-                                " blocks=" + std::to_string(layout.blocks) +
-                                " mib=" + std::to_string(layout.bytes >> 20));
-    }
-    for (const auto& [name, path] : loras_.files) {
-      const auto& info = lora_info_[name] = model_->AddLora(name, path);
-      Logger::Info("image", "event=lora_registered name=" + name +
-                                " file=" + path.filename().string() +
-                                " format=" + info.format +
-                                " targets=" + std::to_string(info.targets) +
-                                " rank=" + std::to_string(info.min_rank) + '-' +
-                                std::to_string(info.max_rank));
-    }
-    runner_ = [this](const Request& request,
-                     const CancellationCheck& cancelled) {
-      return model_->Generate(request, cancelled);
-    };
-#else
-    (void)root;
-    throw std::runtime_error("Qwen-Image requires the HIP build");
-#endif
+  if (!provider) {
+    provider = ext::FindImageProvider("qwen-image-2.1");
   }
+  if (!provider) {
+    throw std::runtime_error("extension 'qwen_image_21' is not registered");
+  }
+  if (options.empty())
+    return *provider;
+  // Explicit options must belong to the provider that claims the model; the
+  // parser accepted the union of every available provider's declarations.
+  const auto& info = registry.Provider(provider->id);
+  ext::ValidateSelectedOptions(registry, ext::kImageServeCommand, info,
+                               options);
+  for (const auto& [name, value] : options) {
+    const auto spec =
+        std::ranges::find_if(info.options, [&](const ext::OptionSpec& option) {
+          return option.name == name &&
+                 ext::OptionApplies(option, ext::kImageServeCommand);
+        });
+    if (spec == info.options.end() || spec->type != ext::OptionType::kPath)
+      continue;
+    const auto& path = std::get<std::string>(value);
+    std::error_code error;
+    if (path.empty() || !std::filesystem::exists(path, error))
+      throw std::invalid_argument(name + " does not exist: " + path);
+  }
+  return *provider;
 }
 
-ImageService::ImageService(const std::filesystem::path& root,
-                           std::string model_id, Runner runner,
-                           ImageLoraOptions loras)
-    : ImageService(root, std::move(model_id), std::move(runner),
-                   image::SamplingConfig{}, std::move(loras)) {}
+std::shared_ptr<ext::ImageRunner> CreateImageRunner(
+    const ext::ImageProvider& provider, const std::filesystem::path& root,
+    const ext::ParsedOptions& options) {
+  std::string error;
+  std::unique_ptr<ext::ImageRunner> runner;
+  if (provider.create_with_options) {
+    runner = provider.create_with_options(
+        {.model_root = root.string(), .options = options}, &error);
+  } else if (!options.empty()) {
+    throw std::runtime_error("image provider " + provider.id +
+                             " declares startup options but has no "
+                             "options-aware factory");
+  } else if (provider.create) {
+    runner = provider.create(root.string(), &error);
+  } else {
+    throw std::runtime_error("image provider " + provider.id +
+                             " cannot run in this build");
+  }
+  if (!runner) {
+    throw std::runtime_error("failed to create runner for " + root.string() +
+                             (error.empty() ? "" : ": " + error));
+  }
+  return runner;
+}
+
+ImageService::ImageService(std::shared_ptr<ext::ImageRunner> runner,
+                           std::string model_id,
+                           std::vector<std::string> model_aliases,
+                           std::string preview_latent)
+    : model_id_(std::move(model_id)),
+      model_aliases_(std::move(model_aliases)),
+      model_(std::move(runner)) {
+  if (model_id_.empty())
+    throw std::invalid_argument("image model ID must not be empty");
+  if (!model_)
+    throw std::invalid_argument("image service requires a runner");
+  capabilities_ = model_->Capabilities();
+  preview_latent_ = std::move(preview_latent);
+}
 
 ImageService::~ImageService() = default;
 
-bool ImageService::HasLora(std::string_view name) const {
-  return lora_info_.contains(name);
-}
-
-const image::LoraInfo& ImageService::lora_info(std::string_view name) const {
-  return lora_info_.find(name)->second;
-}
-
-std::vector<image::Lora> ImageService::ActiveLoras() const {
-  return model_ ? model_->ActiveLoras() : std::vector<image::Lora>{};
+void ImageService::Validate(const Request& request) const {
+  if (!request.images.empty() && !capabilities().edits)
+    throw std::invalid_argument("model " + model_id_ +
+                                " does not support image edits");
+  if (request.background == ext::ImageBackground::kTransparent &&
+      !capabilities().transparent_background)
+    throw std::invalid_argument(
+        "model " + model_id_ +
+        " does not support transparent backgrounds; use background auto or "
+        "opaque");
+  model_->ValidateRequest(request);
 }
 
 ImageService::Result ImageService::Generate(
@@ -615,7 +525,19 @@ ImageService::Result ImageService::Generate(
       throw std::runtime_error("image request cancelled");
   if (cancelled && cancelled())
     throw std::runtime_error("image request cancelled");
-  return runner_(request, cancelled);
+  if (!capabilities_ &&
+      request.background == ext::ImageBackground::kTransparent) {
+    auto legacy = request;
+    legacy.prompt =
+        "This is an RGBA image with transparency. " + request.prompt +
+        " The image has alpha channel and the background is transparent.";
+    return model_->Generate(legacy, cancelled);
+  }
+  return model_->Generate(request, cancelled);
+}
+
+std::string ImageService::Query(std::string_view topic) const {
+  return model_ ? model_->Query(topic) : std::string();
 }
 
 HttpResponse HandleImageApiRequest(const HttpRequest& request,
@@ -625,6 +547,10 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
   try {
     Parsed parsed;
     const bool edit = request.path == "/v1/images/edits";
+    // Reject before decoding uploads when the model cannot edit at all.
+    if (edit && !service.capabilities().edits)
+      throw std::invalid_argument("model " + service.model_id() +
+                                  " does not support image edits");
     if (edit)
       parsed = Multipart(request);
     else {
@@ -636,19 +562,26 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
     const auto& fields = parsed.fields;
     if (!fields.is_object())
       throw std::invalid_argument("request must be a JSON object");
-    const std::set<std::string> allowed{
-        "prompt",        "model",   "n",          "size", "response_format",
-        "output_format", "quality", "background", "user", "seed",
-        "steps",         "stream",  "gufo",          "loras"};
-    for (const auto& [name, value] : fields.members()) {
-      (void)value;
-      if (!allowed.contains(name))
-        throw std::invalid_argument("unsupported image parameter: " + name);
+    // As in the other OpenAI-compatible servers, unknown members are ignored.
+    // gufo-studio-windows: name each ignored member in the log, so a typo
+    // (1.4.x answered 400) still shows up.
+    {
+      static constexpr std::string_view kKnown[] = {
+          "prompt", "model", "n", "size", "response_format", "output_format",
+          "quality", "background", "user", "seed", "steps", "stream", "gufo",
+          "loras", "image", "image[]", "mask"};
+      for (const auto& [name, value] : fields.members()) {
+        (void)value;
+        if (std::find(std::begin(kKnown), std::end(kKnown), name) ==
+            std::end(kKnown))
+          Logger::Warn("image", "request=" + request.request_id +
+                                    " event=ignored_parameter name=" + name);
+      }
     }
     if (!fields.contains("prompt"))
       throw std::invalid_argument("prompt is required");
     const auto model = String(fields, "model", service.model_id().c_str());
-    if (model != service.model_id())
+    if (!service.serves_model(model))
       return Error(404, "requested image model is not loaded",
                    "model_not_found");
     if (String(fields, "response_format", "b64_json") != "b64_json" ||
@@ -665,159 +598,36 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       throw std::invalid_argument("streaming image responses are unsupported");
     (void)String(fields, "user", "");
     const auto background = String(fields, "background", "auto");
-    if (background != "auto" && background != "transparent" &&
-        background != "opaque")
-      throw std::invalid_argument("invalid image background");
-    image::Request generation;
+    ext::ImageRequest generation;
+    if (background == "auto")
+      generation.background = ext::ImageBackground::kAuto;
+    else if (background == "opaque")
+      generation.background = ext::ImageBackground::kOpaque;
+    else if (background == "transparent")
+      generation.background = ext::ImageBackground::kTransparent;
+    else
+      throw std::invalid_argument(
+          "background must be auto, opaque or transparent");
+    // The prompt reaches the provider unchanged; model-specific conditioning
+    // for the requested background belongs to the provider.
     generation.prompt = String(fields, "prompt", "");
-    if (background == "transparent")
-      generation.prompt =
-          "This is an RGBA image with transparency. " + generation.prompt +
-          " The image has alpha channel and the background is transparent.";
     generation.images = std::move(parsed.images);
-    // Extensions (JSON "gufo": {...} or form fields "gufo.<name>"):
-    // negative_prompt + guidance > 1 enable true CFG; strength < 1 with an
-    // input image is image to image (ComfyUI KSampler denoise).
-    const auto* extension = fields.find("gufo");
-    if (extension) {
-      if (!extension->is_object())
-        throw std::invalid_argument("gufo must be an object");
-      for (const auto& [name, value] : extension->members()) {
-        (void)value;
-        if (std::find(kExtensionFields.begin(), kExtensionFields.end(), name) ==
-            kExtensionFields.end())
-          throw std::invalid_argument("unsupported image parameter: gufo." +
-                                      name);
-      }
-      generation.negative_prompt = String(*extension, "negative_prompt", "");
-      generation.guidance =
-          static_cast<float>(Real(*extension, "guidance", 1, 0, 20));
-      generation.strength = Real(*extension, "strength", 1, 0.01, 1);
-      if (const auto* init = extension->find("init_image")) {
-        // Inline data only: base64 or a data URL, never a server-side fetch.
-        if (parsed.init_image || !init->is_string() ||
-            init->str().starts_with("http"))
-          throw std::invalid_argument(
-              "gufo.init_image must be base64 or a data URL, given once");
-        const auto& text = init->str();
-        const auto bytes = core::ReadImageUrl(
-            text.starts_with("data:") ? text : "data:image/png;base64," + text);
-        parsed.init_image = image::DecodeImage(bytes);
-      }
-      if (const auto* mask = extension->find("mask")) {
-        if (parsed.mask || !mask->is_string() ||
-            mask->str().starts_with("http"))
-          throw std::invalid_argument(
-              "gufo.mask must be base64 or a data URL, given once");
-        const auto& text = mask->str();
-        parsed.mask = image::DecodeImage(core::ReadImageUrl(
-            text.starts_with("data:") ? text : "data:image/png;base64," + text));
-      }
-      generation.mask_channel =
-          image::ParseMaskChannel(String(*extension, "mask_channel", "auto"));
-      if (const auto* composite = extension->find("mask_composite")) {
-        if (!composite->is_bool())
-          throw std::invalid_argument("gufo.mask_composite must be a boolean");
-        generation.mask_composite = composite->as_bool();
-      }
-      generation.mask_feather = static_cast<int>(Number(
-          *extension, "mask_feather", image::kDefaultMaskFeather, 0, 64));
-      generation.mask_blur = static_cast<int>(
-          Number(*extension, "mask_blur", image::kDefaultMaskBlur, 0, 4));
-      if (const auto* regions = extension->find("regions"))
-        generation.regions = ParseRegions(*regions, parsed.region_images);
-      generation.base_strength =
-          static_cast<float>(Real(*extension, "base_strength", 1, 0, 10));
-      if (const auto* control = extension->find("control_image")) {
-        if (parsed.control_image || !control->is_string() ||
-            control->str().starts_with("http"))
-          throw std::invalid_argument(
-              "gufo.control_image must be base64 or a data URL, given once");
-        const auto& text = control->str();
-        parsed.control_image = image::DecodeImage(core::ReadImageUrl(
-            text.starts_with("data:") ? text : "data:image/png;base64," + text));
-      }
+    // Provider extension (changes/0.2/image-request-extension): "gufo" and
+    // "loras" pass through as JSON text, image parts as named images.
+    {
+      auto extension = json::Value::object();
+      for (const char* member : {"gufo", "loras"})
+        if (const auto* value = fields.find(member))
+          extension[member] = *value;
+      if (extension.size() > 0)
+        generation.extension_json = extension.dump();
     }
-    // Fun ControlNet-Union: a ready structure image (pose skeleton, depth,
-    // canny, lineart ...); gufo does no preprocessing. "control_inpaint":
-    // true without a control image runs the inpaint channels alone (control
-    // channels zero, as ComfyUI ZImageFunControlnet without "image").
-    const json::Value* inpaint_only =
-        extension && !parsed.control_image
-            ? extension->find("control_inpaint")
-            : nullptr;
-    if (inpaint_only && inpaint_only->is_bool() && inpaint_only->as_bool()) {
-      if (!service.has_controlnet())
-        throw std::invalid_argument(
-            "gufo.control_inpaint needs a server started with --controlnet");
-      image::ControlInput control;
-      control.inpaint = true;
-      control.strength =
-          static_cast<float>(Real(*extension, "control_strength", 1, 0, 2));
-      control.start = Real(*extension, "control_start", 0, 0, 1);
-      control.end = Real(*extension, "control_end", 1, 0, 1);
-      generation.control = std::move(control);
-    } else if (parsed.control_image) {
-      if (!service.has_controlnet())
-        throw std::invalid_argument(
-            "gufo.control_image needs a server started with --controlnet");
-      image::ControlInput control;
-      control.image = std::move(*parsed.control_image);
-      if (extension) {
-        control.strength = static_cast<float>(
-            Real(*extension, "control_strength", 1, 0, 2));
-        control.start = Real(*extension, "control_start", 0, 0, 1);
-        control.end = Real(*extension, "control_end", 1, 0, 1);
-        if (const auto* inpaint = extension->find("control_inpaint")) {
-          if (!inpaint->is_bool())
-            throw std::invalid_argument(
-                "gufo.control_inpaint must be a boolean");
-          control.inpaint = inpaint->as_bool();
-        }
-      }
-      generation.control = std::move(control);
-    } else if (extension) {
-      for (const char* key : {"control_strength", "control_start",
-                              "control_end", "control_inpaint"})
-        if (extension->contains(key))
-          throw std::invalid_argument(std::string("gufo.") + key +
-                                      " needs gufo.control_image or "
-                                      "gufo.control_inpaint true");
-    }
-    if (!parsed.region_images.empty() &&
-        (!extension || !extension->contains("regions")))
-      throw std::invalid_argument("region_image[] needs gufo.regions");
-    if (extension && extension->contains("strength") && !parsed.init_image) {
-      // A single uploaded "image" is the start image, not a reference.
-      if (generation.images.size() != 1)
-        throw std::invalid_argument(
-            "gufo.strength needs init_image or exactly one image");
-      parsed.init_image = std::move(generation.images.front());
-      generation.images.clear();
-    }
-    if (parsed.mask && !parsed.init_image) {
-      // Like OpenAI, the mask edits the first image, which stays a reference
-      // (the edit model sees the whole original).
-      if (generation.images.empty())
-        throw std::invalid_argument("a mask needs an image to edit");
-      parsed.init_image = generation.images.front();
-    }
-    generation.init_image = std::move(parsed.init_image);
-    generation.mask = std::move(parsed.mask);
+    generation.named_images = std::move(parsed.named_images);
     const auto size = String(fields, "size", "auto");
+    generation.size_auto = size == "auto";
     if (size == "auto") {
-      if (generation.init_image) {
-        // Keep the start image's canvas, rounded to the 32-pixel grid.
-        const auto grid = [](int v) {
-          return std::max(32, static_cast<int>(std::nearbyint(v / 32.0)) * 32);
-        };
-        generation.width = grid(generation.init_image->width);
-        generation.height = grid(generation.init_image->height);
-      } else if (!generation.images.empty() || generation.control) {
-        // The last reference, or the control image, sets the aspect ratio.
-        const auto& last = generation.images.empty()
-                               ? generation.control->image
-                               : generation.images.back();
+      if (!generation.images.empty()) {
+        const auto& last = generation.images.back();
         const double ratio = static_cast<double>(last.width) / last.height;
         const double w = std::sqrt(1024.0 * 1024 * ratio);
         generation.width = static_cast<int>(std::nearbyint(w / 32)) * 32;
@@ -838,18 +648,18 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       generation.width = parse(std::string_view(size).substr(0, separator));
       generation.height = parse(std::string_view(size).substr(separator + 1));
     }
-    generation.steps = service.sampling().ResolveSteps(static_cast<int>(
-        Number(fields, "steps", service.sampling().DefaultSteps(), 2, 100)));
+    // Omitted steps keep zero so the runner applies its checkpoint default.
+    generation.steps = static_cast<int>(Number(fields, "steps", 0, 2, 100));
     std::random_device entropy;
     generation.seed =
         Number(fields, "seed",
                (static_cast<std::uint64_t>(entropy()) << 21) ^ entropy(), 0,
                (1ULL << 53) - 1);
-    generation.loras = ParseLoras(fields, service);
     const auto count = Number(fields, "n", 1, 1, 10);
-    image::ValidateRequest(generation);
+    ValidateRequest(generation);
+    service.Validate(generation);
     // Live preview ("gufo": {"preview": {"id": ...}}): rendered while someone
-    // watches /v1/previews/{id} (or always, when asked).
+    // watches /v1/previews/{id} (or always, when asked); 1.4.9 behaviour.
     struct PreviewScope {
       std::string id;
       bool ok{false};
@@ -858,22 +668,30 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
           PreviewHub::Global().End(id, ok);
       }
     } preview;
-    if (const auto* options =
-            extension != nullptr ? extension->find("preview") : nullptr) {
-      PreviewOptions preview_options;
-      const auto id = ParsePreviewRequest(*options, &preview_options);
-      if (id.empty())
-        throw std::invalid_argument("gufo.preview needs an id");
-      generation.preview = PreviewHub::Global().Begin(
-          id, service.preview_format(), preview_options);
-      preview.id = id;
+    if (const auto* extension = fields.find("gufo");
+        extension != nullptr && extension->is_object()) {
+      if (const auto* options = extension->find("preview")) {
+        PreviewOptions preview_options;
+        const auto id = ParsePreviewRequest(*options, &preview_options);
+        if (id.empty())
+          throw std::invalid_argument("gufo.preview needs an id");
+        const auto& latent = service.preview_latent();
+        if (latent == "qwen_image_21" || latent == "flux2_patched") {
+          generation.preview = PreviewHub::Global().Begin(
+              id,
+              latent == "flux2_patched" ? LatentFormat::kFlux2Patched
+                                        : LatentFormat::kQwenImage21,
+              preview_options);
+          preview.id = id;
+        }
+      }
     }
     auto body = json::Value::object();
     body["created"] = static_cast<double>(std::time(nullptr));
     auto data = json::Value::array();
     for (std::uint64_t i = 0; i < count; ++i) {
       auto result = service.Generate(generation, request.is_cancelled);
-      if (background == "opaque") {
+      if (generation.background == ext::ImageBackground::kOpaque) {
         for (std::size_t p = 0; p < result.image.rgba.size(); p += 4) {
           const int a = result.image.rgba[p + 3];
           for (int c = 0; c < 3; ++c)
@@ -883,7 +701,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
         }
       }
       auto item = json::Value::object();
-      item["b64_json"] = Base64(image::EncodePng(result.image));
+      item["b64_json"] = Base64(EncodePng(result.image));
       data.push_back(std::move(item));
       std::ostringstream details;
       details << "request=" << request.request_id
@@ -891,37 +709,11 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
               << " seed=" << generation.seed << " size=" << generation.width
               << 'x' << generation.height
               << " references=" << generation.images.size()
-              << " steps=" << generation.steps
-              << " guidance=" << generation.guidance
-              << " strength=" << generation.strength
-              << " init_image=" << (generation.init_image ? 1 : 0)
-              << " mask=" << (generation.mask ? 1 : 0);
-      if (!generation.regions.empty())
-        details << " regions=" << generation.regions.size()
-                << " base_strength=" << generation.base_strength
-                << " region_rows=" << result.metrics.region_condition_rows
-                << " region_passes=" << result.metrics.region_passes;
-      if (generation.mask)
-        details << " mask_composite=" << (generation.mask_composite ? 1 : 0)
-                << " mask_feather=" << generation.mask_feather
-                << " mask_blur=" << generation.mask_blur;
-      if (!service.loras().files.empty())
-        details << " loras=" << LoraList(generation.loras)
-                << " lora_ms=" << result.metrics.lora_ms;
-      if (generation.control)
-        details << " control=1 control_strength=" << generation.control->strength
-                << " control_range=" << generation.control->start << '-'
-                << generation.control->end
-                << " control_inpaint=" << (generation.control->inpaint ? 1 : 0)
-                << " control_turbo=" << (service.sampling().IsTurbo() ? 1 : 0);
-      details << " prompt_ms=" << result.metrics.prompt_ms
+              << " steps=" << result.metrics.steps
+              << " prompt_ms=" << result.metrics.prompt_ms
               << " denoise_ms=" << result.metrics.denoise_ms
               << " vae_ms=" << result.metrics.vae_ms
               << " total_ms=" << result.metrics.total_ms
-              << " condition_rows=" << result.metrics.condition_rows
-              << " negative_rows=" << result.metrics.negative_condition_rows
-              << " released_text_encoder="
-              << (result.metrics.released_text_encoder ? 1 : 0)
               << " resident_weight_mib="
               << result.metrics.resident_weight_bytes / (1024 * 1024);
       if (!preview.id.empty()) {
@@ -942,7 +734,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
             .headers = {{"Content-Type", "application/json"}}};
   } catch (const std::invalid_argument& error) {
     return Error(400, error.what(), "invalid_request");
-  } catch (const image::InsufficientMemory& error) {
+  } catch (const ext::ImageResourceError& error) {
     return Error(503, error.what(), "insufficient_gpu_memory");
   } catch (const std::exception& error) {
     return Error(500, error.what(), "image_generation_failed");
@@ -953,44 +745,13 @@ HttpResponse HandleImageLorasRequest(const HttpRequest& request,
                                      const ImageService& service) {
   if (request.method != "GET")
     return Error(400, "/sdapi/v1/loras requires GET", "invalid_method");
-  const auto active = service.ActiveLoras();
-  const auto scale = [](const std::vector<image::Lora>& loras,
-                        const std::string& name) -> json::Value {
-    for (const auto& lora : loras)
-      if (lora.name == name) {
-        // Shortest float text, so 0.8 is listed as 0.8.
-        char text[32];
-        const auto end =
-            std::to_chars(text, text + sizeof(text), lora.scale).ptr;
-        double value = lora.scale;
-        std::from_chars(text, end, value);
-        return value;
-      }
-    return nullptr;
-  };
-  auto body = json::Value::array();
-  for (const auto& [name, path] : service.loras().files) {
-    const auto& info = service.lora_info(name);
-    auto metadata = json::Value::object();
-    metadata["format"] = info.format;
-    metadata["targets"] = info.targets;
-    metadata["rank"] =
-        std::to_string(info.min_rank) + '-' + std::to_string(info.max_rank);
-    auto item = json::Value::object();
-    item["name"] = name;
-    item["alias"] = name;
-    item["path"] = path.filename().string();
-    item["metadata"] = std::move(metadata);
-    item["default_scale"] = scale(service.loras().defaults, name);
-    item["active_scale"] = scale(active, name);
-    body.push_back(std::move(item));
-  }
+  auto body = service.Query("loras");
+  if (body.empty())
+    body = "[]";
   return {.status = 200,
           .reason = "OK",
-          .body = body.dump(),
-          .headers = {{"Content-Type", "application/json"}},
-          .streaming_body = {},
-          .log_details = {}};
+          .body = std::move(body),
+          .headers = {{"Content-Type", "application/json"}}};
 }
 
 }  // namespace gufo::server

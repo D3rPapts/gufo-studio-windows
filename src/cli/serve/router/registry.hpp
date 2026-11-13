@@ -33,6 +33,9 @@ public:
                     std::function<Clock::time_point()> now = nullptr);
 
   [[nodiscard]] const PresetModel* Find(std::string_view model_id) const;
+  /// The section id that serves `name`: `name` itself for a preset id, the
+  /// owning id for a `served-model-name` alias (#957), "" when unknown.
+  [[nodiscard]] std::string CanonicalId(std::string_view name) const;
   /// Section order, loaded (ready) flag per model.
   [[nodiscard]] std::vector<std::pair<std::string, bool>> Listing() const;
   /// Section order with the llama.cpp router's status names:

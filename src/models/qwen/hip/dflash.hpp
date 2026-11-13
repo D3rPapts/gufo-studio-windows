@@ -5,20 +5,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/draft_backend.hpp>
+#include <gufo/ext/gguf_reader.hpp>
+#include <gufo/ext/prompt_lookup.hpp>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
-#include "src/core/speculative/draft_backend.hpp"
-#include "src/core/speculative/prompt_lookup.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/dflash/prompt_lookup_27b.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -52,6 +53,8 @@ struct QwenDFlashBlockRequest {
   std::span<const float> uniforms;
   DFlashTrace trace;
   const sampling::SamplerState* sampler{nullptr};
+  /// Score the executor's draft vocabulary instead of the full head.
+  bool draft_subset{false};
 };
 
 class QwenDFlashGpuSnapshot final {
@@ -115,6 +118,10 @@ public:
       const noexcept {
     return weights_.dflash_config;
   }
+  /// A DSpine draft: causal block, code bridge, serial refinement.
+  [[nodiscard]] bool IsDSpine() const noexcept {
+    return weights_.dspine.has_value();
+  }
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
       const noexcept {
     return target_model_->GetTokenizer();
@@ -122,6 +129,21 @@ public:
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
   }
+
+  /// Draft vocabulary (draft_vocab.hpp): the head's leading rows, scored in
+  /// place. Zero when every draft scores the full head.
+  [[nodiscard]] std::uint32_t DraftPrefixRows() const noexcept {
+    return draft_prefix_rows_;
+  }
+  /// Special tokens above the prefix; they open every request's table.
+  [[nodiscard]] std::span<const std::int32_t> DraftSpecials() const noexcept {
+    return draft_specials_;
+  }
+  [[nodiscard]] std::size_t DraftRowBytes() const noexcept {
+    return draft_row_bytes_;
+  }
+  /// In the prefix or special: never needs a table row.
+  [[nodiscard]] bool InDraftSubset(tokenization::TokenId token) const;
 
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
@@ -135,6 +157,9 @@ private:
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
+  std::uint32_t draft_prefix_rows_{0};
+  std::vector<std::int32_t> draft_specials_;
+  std::size_t draft_row_bytes_{0};
 };
 
 /// Session executor for GPU DFlash / DFlash-2 parallel block drafting.
@@ -173,7 +198,13 @@ public:
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
       std::vector<float>* out_candidate_probabilities = nullptr,
       const DFlashTrace& trace = {},
-      const sampling::SamplerState* sampler = nullptr);
+      const sampling::SamplerState* sampler = nullptr,
+      bool draft_subset = false);
+
+  /// Clears the draft table from slot `first`: the slots score -inf.
+  void ClearDraftRows(std::uint32_t first);
+  /// Copies the head rows of `ids` into the draft table from slot `first`.
+  void AppendDraftRows(std::uint32_t first, std::span<const std::int32_t> ids);
 
   /// Shared projections with independent attention, convolution and selector
   /// boundaries. A single request retains the ordinary block execution.
@@ -230,6 +261,16 @@ private:
   void RunInjectGemm(const models::QwenTensorRef& weight, const float* input,
                      float* output, std::size_t num_tokens,
                      std::size_t output_size, std::size_t input_size);
+  /// DSpine: the code bridge write after `layer`, on `rows` block rows. The
+  /// last layer writes out of place (d_fused_features_), keeping the
+  /// pre-write rows in d_block_hidden_ for the refinement.
+  void RunDSpineBridge(std::size_t layer, std::uint32_t rows);
+  /// DSpine tail after the output norm: head logits, top-k candidates, the
+  /// last-write refinement, the transition tables and the chain walk.
+  void DraftDSpine(std::uint32_t draft_count, float temperature,
+                   std::span<const float> uniforms, const DFlashTrace& trace);
+  /// The draft table as a head of speculative::kDraftVocabExtraRows rows.
+  [[nodiscard]] models::QwenTensorRef DraftTable() const noexcept;
 
   std::shared_ptr<const QwenDFlashGpuModel> model_;
   std::uint32_t max_context_{4096};
@@ -266,6 +307,30 @@ private:
   float* d_confidences_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
   hip_bfloat16* d_bf16_input_{nullptr};
+  // The request's draft table (draft_vocab.hpp): head rows, their IDs (-1:
+  // empty) and one block of their scores. Rebuilt from the token history.
+  std::uint8_t* d_draft_rows_{nullptr};
+  std::int32_t* d_draft_ids_{nullptr};
+  float* d_draft_logits_{nullptr};
+  std::vector<std::int32_t> draft_upload_;
+  // DSpine scratch, carved from one allocation (null for DFlash-2): per row
+  // rms, codes, [G;P;A] c and the anchor's code; the candidate IDs (row 0 =
+  // anchor); per (proposal, lane) messages, sender codes, [P;A] e, write
+  // deltas, candidate head rows and the transition tables.
+  float* d_dspine_scratch_{nullptr};
+  float* d_dspine_rms_{nullptr};
+  float* d_dspine_codes_{nullptr};
+  float* d_dspine_packed_{nullptr};
+  float* d_dspine_anchor_code_{nullptr};
+  std::uint32_t* d_dspine_ids_{nullptr};
+  float* d_dspine_message_{nullptr};
+  float* d_dspine_senders_{nullptr};
+  float* d_dspine_sender_gates_{nullptr};
+  float* d_dspine_delta_{nullptr};
+  float* d_dspine_heads_{nullptr};
+  float* d_dspine_table_{nullptr};
+  /// Split draft attention scores, [block row x head][history + block].
+  float* d_dspine_scores_{nullptr};
   std::size_t scratch_bytes_{0};
   void* d_batch_scratch_{nullptr};
   std::size_t batch_scratch_bytes_{0};
@@ -276,12 +341,19 @@ struct QwenDFlashGpuDraftConfig {
   std::uint32_t max_draft_tokens{7};
   speculative::DFlashDraftPolicy policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+  /// Verification rows (anchor included) a prompt-lookup copy of a request
+  /// decoding alone may grow to; at most max_draft_tokens + 1 disables it.
+  std::uint32_t max_copy_rows{0};
 };
 
 /// Adapts the GPU DFlash executor to the repository's IDraftBackend speculative
 /// interface.
 class QwenDFlashGpuDraftBackend final : public speculative::IDraftBackend {
 public:
+  /// Committed target rows the draft leaves pending for its next proposal,
+  /// as continuation snapshots expect (an ordinary verification's rows).
+  static constexpr std::size_t kMaxPendingRows = 8;
+
   ~QwenDFlashGpuDraftBackend() override = default;
 
   [[nodiscard]] static std::unique_ptr<QwenDFlashGpuDraftBackend> Create(
@@ -347,6 +419,7 @@ public:
       CheckContinuation();
       controller_.Reset();
       lookup_.BeginRequest();
+      ResetCopyWidth();
     } catch (...) {
       if (continuation_hooks_)
         continuation_hooks_->WriteFailed();
@@ -362,9 +435,19 @@ public:
   [[nodiscard]] std::uint32_t GetInjectedContextLength() const noexcept {
     return executor_->GetInjectedContextLength();
   }
+  /// Neural drafts that scored the draft vocabulary (draft_vocab.hpp).
+  [[nodiscard]] std::uint64_t DraftSubsetBlocks() const noexcept {
+    return draft_subset_blocks_;
+  }
 
 private:
   void InjectPendingFeatures(std::uint32_t position);
+  /// Brings the request's draft table up to its committed history and
+  /// returns whether this block, anchored on `tokens.back()`, drafts through
+  /// it. `allowed` is speculative::DraftSubsetAllowed for this step.
+  [[nodiscard]] bool UseDraftSubset(
+      std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+      bool allowed);
   friend class models::qwen::ContinuationAdapter;
   void CheckContinuation() const {
     if (continuation_hooks_)
@@ -374,14 +457,32 @@ private:
   [[nodiscard]] std::uint32_t PendingFeatureCount(std::uint32_t position) const;
   QwenDFlashGpuDraftBackend(std::unique_ptr<QwenDFlashGpuExecutor> executor,
                             QwenDFlashGpuDraftConfig config);
+  /// `wide`: the proposal is verified alone (ProposeForRequest), so a copy
+  /// may use the current copy width instead of max_draft_tokens.
   [[nodiscard]] speculative::DraftProposal ProposeImpl(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
-      std::uint64_t* rng_state,
-      const sampling::SamplerState* sampler = nullptr);
+      std::uint64_t* rng_state, const sampling::SamplerState* sampler = nullptr,
+      bool wide = false);
+  [[nodiscard]] static std::vector<speculative::DraftProposal> ProposeEach(
+      std::span<const speculative::DraftProposalRequest> requests);
   [[nodiscard]] std::optional<speculative::DraftProposal> TryLookup(
       std::span<const tokenization::TokenId> tokens, std::uint32_t position,
-      std::uint32_t limit, bool sampled);
+      std::uint32_t limit, bool sampled, std::uint32_t cap);
+  [[nodiscard]] std::uint32_t OrdinaryRows() const noexcept {
+    return config_.max_draft_tokens + 1;
+  }
+  void ResetCopyWidth() noexcept {
+    copy_rows_ = 0;
+    copy_streak_ = 0;
+    lookup_wide_ = false;
+  }
+  /// Applies the copy width rule after feedback on a wide-eligible copy.
+  void ObserveCopyWidth(std::size_t rows, std::size_t kept) noexcept;
+  /// Injects all but the last pending row once a wide keep leaves more than
+  /// an ordinary verification's rows pending, as snapshots and batched
+  /// cycles expect.
+  void CatchUpPendingFeatures();
 
   std::unique_ptr<QwenDFlashGpuExecutor> executor_;
   QwenDFlashGpuDraftConfig config_;
@@ -392,10 +493,23 @@ private:
   speculative::PromptLookup<tokenization::TokenId> lookup_;
   std::size_t lookup_start_{0};
   bool lookup_proposal_{false};
+  /// The pending copy may verify wider than an ordinary block.
+  bool lookup_wide_{false};
+  /// Rows (anchor included) the next wide-eligible copy may verify; 0 means
+  /// OrdinaryRows(). Two whole copies in a row at this width double it, up to
+  /// max_copy_rows; a rejected copy returns it to OrdinaryRows().
+  std::uint32_t copy_rows_{0};
+  std::uint32_t copy_streak_{0};
   std::vector<float> pending_target_features_;
   std::vector<tokenization::TokenId> proposed_tokens_;
   bool primed_{false};
   bool proposal_active_{false};
+  /// This request's draft vocabulary; the executor's table follows it.
+  speculative::DraftVocab draft_vocab_;
+  /// After the token history is replaced: the table restarts from it.
+  bool draft_vocab_stale_{true};
+  std::vector<std::int32_t> draft_added_;
+  std::uint64_t draft_subset_blocks_{0};
 };
 
 }  // namespace gufo::hip

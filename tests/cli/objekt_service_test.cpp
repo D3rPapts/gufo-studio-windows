@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-#include "src/cli/serve/objekt_service.hpp"
+#include "src/cli/serve/media/objekt_service.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 

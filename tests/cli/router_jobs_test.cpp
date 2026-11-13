@@ -28,6 +28,7 @@
 
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/jobs.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/core/json.hpp"
 
 namespace json = gufo::json;
@@ -194,6 +195,12 @@ struct FakeApi {
   std::atomic<bool> release{false};
   int video_polls{0};
   bool video_deleted{false};
+  bool objekt_deleted = false;
+  int objekt_polls = 0;
+  /// 3D status polls answered 503 before the real answer (a reloading
+  /// worker), and the X-Gufo-Job header of every 3D poll and cancel.
+  int objekt_flaky = 0;
+  std::vector<std::string> objekt_job_headers;
   int unreachable_calls{0};
   /// Music: the async job stays in_progress while set.
   std::atomic<bool> music_hold{false};
@@ -201,6 +208,10 @@ struct FakeApi {
   int music_polls{0};
   /// X-Gufo-Pool of every POST, by image prompt / speech input.
   std::map<std::string, std::string> sides;
+  /// X-Gufo-Priority of every POST, by prompt / input ("" = none).
+  std::map<std::string, std::string> priorities;
+  /// The prompts / inputs of every POST, in arrival order.
+  std::vector<std::string> prompts;
   /// Image requests with "WAIT" in the prompt stay here (as the router's
   /// pool does while both machines are busy) until released or redirected
   /// (then 503 pool_redirected); the job ids come from X-Gufo-Job.
@@ -248,8 +259,11 @@ struct FakeApi {
           const std::string key = body.member_str("prompt").empty()
                                       ? body.member_str("input")
                                       : body.member_str("prompt");
-          if (!key.empty())
+          if (!key.empty()) {
             sides[key] = request.header(jobs::kPoolSideHeader);
+            priorities[key] = request.header(gufo::router::kPriorityHeader);
+            prompts.push_back(key);
+          }
         } catch (const std::exception&) {
         }
       }
@@ -398,6 +412,55 @@ struct FakeApi {
       result.body = "FAKEMP4";
       return result;
     }
+    // gufo serve objekt (TripoSG): 202, two polls, then GLB + preview.
+    if (request.method == "POST" && request.path == "/v1/3d/generations") {
+      result.status = 202;
+      result.body = R"({"id":"obj_1","object":"3d.generation","status":"queued","progress":0})";
+      return result;
+    }
+    // The router can only route these by the model query (no body): a
+    // missing query is the 1.4.23 bug ("no route for this path").
+    if (request.path.starts_with("/v1/3d/generations/obj_1") &&
+        request.query != "model=triposg") {
+      result.status = 404;
+      result.body = R"({"error":{"message":"no route for this path","code":"not_found"}})";
+      return result;
+    }
+    if (request.path.starts_with("/v1/3d/generations/obj_1")) {
+      const std::lock_guard<std::mutex> lock(mutex);
+      objekt_job_headers.push_back(request.header(jobs::kJobHeader));
+    }
+    if (request.method == "DELETE" && request.path == "/v1/3d/generations/obj_1") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      objekt_deleted = true;
+      result.body = R"({"id":"obj_1","deleted":true})";
+      return result;
+    }
+    if (request.method == "GET" && request.path == "/v1/3d/generations/obj_1") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (objekt_flaky > 0) {
+        --objekt_flaky;
+        result.status = 503;
+        result.body = R"({"error":{"message":"loading","code":"model_loading"}})";
+        return result;
+      }
+      ++objekt_polls;
+      result.body =
+          release.load() || objekt_polls < 3
+              ? R"({"id":"obj_1","status":"in_progress","progress":55,"phase":"decode"})"
+              : R"({"id":"obj_1","status":"completed","progress":100,"phase":"done","data":[{"format":"glb","vertices":4,"faces":4,"closed":true}]})";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/content") {
+      result.content_type = "model/gltf-binary";
+      result.body = "glTFfake";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/preview") {
+      result.content_type = "image/png";
+      result.body = "PNGfake";
+      return result;
+    }
     result.status = 404;
     result.body = R"({"error":{"message":"no route"}})";
     return result;
@@ -453,6 +516,10 @@ struct Harness {
   std::function<std::optional<json::Value>()> partner_capabilities;
   std::string self_name;
   std::chrono::milliseconds pull_hold{std::chrono::seconds(60)};
+  /// Set before Open(true): the router's GPU gate for pulls (empty = any).
+  std::function<bool(const std::string&, std::string*)> may_pull;
+  /// Set before Open(true): the 3D poll limit (zero keeps the default).
+  std::chrono::milliseconds objekt_deadline{0};
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -469,7 +536,8 @@ struct Harness {
     options.fetch = [api_ref](const HttpRequest& request) {
       return (*api_ref)(request);
     };
-    options.models = {"qwen-image", "minimax-h3", "qwen3-tts", "ace-step"};
+    options.models = {"qwen-image", "minimax-h3", "qwen3-tts", "ace-step",
+                      "triposg"};
     options.expire_after = expire_after;
     std::string error;
     jobs::ParseAllowList("192.168.1.0/24", &options.webhook_allow, &error);
@@ -498,6 +566,9 @@ struct Harness {
     options.self_name = self_name;
     options.pull_poll = std::chrono::milliseconds(20);
     options.pull_hold = pull_hold;
+    options.may_pull = may_pull;
+    if (objekt_deadline.count() > 0)
+      options.objekt_deadline = objekt_deadline;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -732,6 +803,90 @@ void TestVideo() {
   CHECK(h.Call("GET", files[0].member_str("url")).body == "FAKEMP4");
   CHECK(done.find("result")->find("response")->member_str("status") ==
         "completed");
+}
+
+// /v1/3d/generations (gufo serve objekt): 202 + polling like videos, result
+// files model.glb (model/gltf-binary), preview.png and response.json.
+void TestObjekt() {
+  Harness h("objekt");
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"data:image/png;base64,AAAA","steps":50}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_double("progress") == 100);
+  const auto& files = done.find("result")->find("files")->items();
+  CHECK(files.size() == 3);
+  CHECK(files[0].member_str("name") == "model.glb");
+  CHECK(files[0].member_str("content_type") == "model/gltf-binary");
+  CHECK(h.Call("GET", files[0].member_str("url")).body == "glTFfake");
+  CHECK(files[1].member_str("name") == "preview.png");
+  CHECK(h.Call("GET", files[1].member_str("url")).body == "PNGfake");
+  CHECK(files[2].member_str("name") == "response.json");
+  CHECK(done.find("result")->member_str("content_type") == "model/gltf-binary");
+  const json::Value* response = done.find("result")->find("response");
+  CHECK(response->member_str("status") == "completed");
+  CHECK(response->find("data")->items()[0].member_double("faces") == 4);
+}
+
+void TestObjektCancel() {
+  Harness h("objekt-cancel");
+  h.api->release.store(true);  // the fake 3D job never completes
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  for (int i = 0; i < 400; ++i) {
+    const json::Value job = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+    if (job.member_double("progress", -1) == 55)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  h.Call("DELETE", "/v1/jobs/" + id);
+  h.WaitFor(id, "cancelled");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->objekt_deleted);
+  // Polls and the cancel carry the job header like Call() (1.4.24, M2).
+  CHECK(!h.api->objekt_job_headers.empty());
+  for (const std::string& header : h.api->objekt_job_headers)
+    CHECK(header == id);
+}
+
+// 1.4.24 (M1): a few 503 status answers (worker reloading) are tolerated.
+void TestObjektTransient() {
+  Harness h("objekt-transient", false);
+  h.api->objekt_flaky = 3;
+  h.queue->Start();
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  h.WaitFor(id, "completed");
+}
+
+// More 503 answers in a row than tolerated fail the job.
+void TestObjektTransientGivesUp() {
+  Harness h("objekt-giveup", false);
+  h.api->objekt_flaky = 100;
+  h.queue->Start();
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  const json::Value failed = h.WaitFor(id, "failed");
+  CHECK(failed.find("error")->member_str("code") == "model_loading");
+}
+
+// 1.4.24 (M1): a worker stuck on in_progress fails the job at the deadline
+// and gets the cancel.
+void TestObjektDeadline() {
+  Harness h("objekt-deadline", false);
+  h.objekt_deadline = std::chrono::milliseconds(200);
+  h.Open(true);
+  h.api->release.store(true);  // never completes
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA"}}})")
+          .member_str("id");
+  const json::Value failed = h.WaitFor(id, "failed");
+  CHECK(failed.find("error")->member_str("code") == "objekt_timeout");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->objekt_deleted);
 }
 
 void TestVideoCancel() {
@@ -1680,6 +1835,18 @@ void TestLoraNamesAndCanRun() {
   CHECK(why.find("none registered") != std::string::npos);
   // The "models" object alone works too.
   CHECK(jobs::CanRun(*CapsB().find("models"), "qwen-image", {"winkel"}));
+  // "available": false (a load failure holds): capable, but not now.
+  const json::Value failed = json::parse(
+      R"({"models":{"qwen-image":{"placement":"pool","loras":["anime"],)"
+      R"("available":false,"unavailable":"local load failed"},)"
+      R"("minimax-h3":{"placement":"pool","loras":[],"available":true}}})");
+  CHECK(jobs::CanRun(failed, "qwen-image", {"anime"}, &why));
+  CHECK(!jobs::CanRun(failed, "qwen-image", {"anime"}, &why, /*now=*/true));
+  CHECK(why.find("cannot load model 'qwen-image' now (local load failed)") !=
+        std::string::npos);
+  CHECK(jobs::CanRun(failed, "minimax-h3", {}, &why, /*now=*/true));
+  // Older routers send no field: may run.
+  CHECK(jobs::CanRun(CapsA(), "qwen-image", {"anime"}, &why, /*now=*/true));
 }
 
 void TestCapabilityRouting() {
@@ -1769,6 +1936,8 @@ struct FakePartner {
   std::string pull_answer = R"({"job":"job_bbbbbbbbbbbbbbbbbbbbbbb2"})";
   int pull_status{200};
   int pulls{0};
+  /// Reads of the queued list (the runner's view of this partner).
+  int queued_reads{0};
   std::vector<HttpRequest> pull_requests;
   /// Polls of the pulled job before it completes.
   int polls_until_done{2};
@@ -1786,9 +1955,11 @@ struct FakePartner {
       return std::nullopt;
     }
     if (request.method == "GET" && request.path == "/v1/jobs" &&
-        request.query.find("status=queued") != std::string::npos)
+        request.query.find("status=queued") != std::string::npos) {
+      ++queued_reads;
       return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
                                     : queued);
+    }
     if (request.method == "GET" && request.path == "/v1/jobs" &&
         request.query.find("status=in_progress") != std::string::npos)
       return JsonAnswer(200, pulled ? R"({"object":"list","data":[]})"
@@ -1913,6 +2084,55 @@ void TestPoolPullRequester() {
   }
 }
 
+void TestPoolPullGpuBusy() {
+  // A free runner whose GPU is busy (ComfyUI queue, another heavy model,
+  // a pool request waiting here) pulls nothing: 12.11. 17:34 and 17:50
+  // the .56 pulled while ComfyUI and the film ran, and the pulled request
+  // waited 900 s. Once the GPU is free, the pull follows.
+  auto partner = std::make_shared<FakePartner>();
+  partner->queued =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":1001,"request":{"model":"qwen-image","loras":[]}}]})";
+  Harness h("pull-gpu-busy", false);
+  partner->api = h.api;
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = CapsA;
+  auto gpu_busy = std::make_shared<std::atomic<bool>>(true);
+  auto asked = std::make_shared<std::atomic<int>>(0);
+  h.may_pull = [gpu_busy, asked](const std::string& model, std::string* why) {
+    ++*asked;
+    if (gpu_busy->load()) {
+      *why = "comfy queue 1";
+      return false;
+    }
+    return model == "qwen-image";
+  };
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 0);
+  }
+  CHECK(asked->load() > 0);
+  CHECK(h.queue->PoolQueueStatus().member_double("pulled") == 0);
+  gpu_busy->store(false);
+  for (int i = 0; i < 200; ++i) {
+    {
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      if (partner->pulls > 0)
+        break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const std::lock_guard<std::mutex> lock(partner->mutex);
+  CHECK(partner->pulls == 1);
+}
+
 void TestPoolPullOldPartner() {
   // The partner answers 404 on the pull route (older version): pulling
   // pauses for pull_hold, the local job runs as before, and a later
@@ -1960,6 +2180,221 @@ void TestPoolPullOldPartner() {
   CHECK(h.queue->PoolQueueStatus().find("partner")->is_null());
 }
 
+void TestPoolPinLocal() {
+  // A job submitted with X-Gufo-Pool: local (the access gate sets it for
+  // a user without the pool right) stays on this router: never handed
+  // out on /router/pool/pull, runs with side local, keeps the pin over a
+  // requeue and a restart; the owner comes from X-Gufo-User.
+  Harness h("pin-local", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const auto submit = [&h](const std::string& body, bool pin,
+                           const std::string& user) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = body;
+    request.headers.emplace_back("Content-Type", "application/json");
+    if (pin)
+      request.headers.emplace_back(jobs::kPoolSideHeader, "local");
+    if (!user.empty())
+      request.headers.emplace_back("X-Gufo-User", user);
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer.has_value());
+    if (answer && answer->status != 202)
+      std::cerr << "submit: HTTP " << answer->status << " " << answer->body
+                << "\n";
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  const std::string first =
+      submit(ImageJob("SLOW first"), false, "").member_str("id");
+  h.WaitFor(first, "in_progress");
+  json::Value pinned = submit(
+      ImageJob("pinned second", R"(,"metadata":{"nutzer":"fremd","titel":"t"})"),
+      true, "tim");
+  const std::string second = pinned.member_str("id");
+  CHECK(pinned.member_str("pinned") == "local");
+  CHECK(pinned.find("metadata")->member_str("nutzer") == "tim");  // header wins
+  CHECK(pinned.find("metadata")->member_str("titel") == "t");
+  const std::string third = submit(ImageJob("free third"), false, "").member_str("id");
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + third).body).find("pinned") == nullptr);
+  const auto pull = [&h] {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body = R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":)"
+                   R"({"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  // The partner gets the free job, never the pinned one.
+  CHECK(pull().member_str("job") == third);
+  CHECK(pull().find("job")->is_null());
+  h.api->release = true;  // the SLOW first job ends, the runner takes second
+  h.WaitFor(second, "completed");
+  CHECK(h.api->SideOf("pinned second") == "local");
+  // The pin survives a restart of the queue (jobs.json).
+  h.queue->Stop();
+  h.Open(false);
+  json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + second).body);
+  CHECK(view.member_str("pinned") == "local");
+  CHECK(view.find("metadata")->member_str("nutzer") == "tim");
+  // Only the partner could run it (a LoRA this router lacks): refused.
+  Harness g("pin-local-refused", false);
+  g.capabilities = CapsA;
+  g.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  g.partner_name = "http://10.0.0.2:8081";
+  g.relay = [](const HttpRequest&, std::chrono::milliseconds,
+               std::chrono::milliseconds,
+               std::string*) -> std::optional<HttpResponse> {
+    return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
+  };
+  g.Open(true);
+  HttpRequest request;
+  request.method = "POST";
+  request.path = "/v1/jobs";
+  request.body = LoraImageJob("needs winkel", "winkel");
+  request.headers.emplace_back("Content-Type", "application/json");
+  request.headers.emplace_back(jobs::kPoolSideHeader, "local");
+  const auto refused = g.queue->Handle(request);
+  CHECK(refused && refused->status == 400);
+  CHECK(refused && json::parse(refused->body).find("error")->member_str("code") ==
+                       "pool_not_allowed");
+  request.headers.pop_back();
+  const auto allowed = g.queue->Handle(request);
+  CHECK(allowed && allowed->status == 202);
+}
+
+void TestPoolPullPinned() {
+  // Requester: a partner job pinned to the partner (its user may not use
+  // the pool) is no pull candidate: it neither orders ahead of ours nor
+  // causes empty pull round trips.
+  const auto run = [](const char* name, const std::string& partner_queue,
+                      bool expect_pull) {
+    auto partner = std::make_shared<FakePartner>();
+    partner->queued = R"({"object":"list","data":[]})";
+    Harness h(name, false);
+    partner->api = h.api;
+    h.partner_name = "http://10.0.0.2:8081";
+    h.self_name = "http://10.0.0.1:8081";
+    h.capabilities = CapsA;
+    h.partner_capabilities = [] {
+      return std::optional<json::Value>(CapsB());
+    };
+    h.relay = [partner](const HttpRequest& request,
+                        std::chrono::milliseconds a,
+                        std::chrono::milliseconds b, std::string* error) {
+      return (*partner)(request, a, b, error);
+    };
+    h.Open(true);
+    const std::string first =
+        h.Submit(ImageJob("SLOW first")).member_str("id");
+    h.WaitFor(first, "in_progress");
+    // The partner's list appears while the runner is busy with first;
+    // every later decision (before ours, after ours) sees it. The runner
+    // reads it fresh after pull_poll (20 ms) since its last look, which
+    // WaitFor(queued) below has long passed by the time ours is next.
+    int reads_before = 0;
+    {
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      partner->queued = partner_queue;
+      reads_before = partner->queued_reads;
+    }
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    h.WaitFor(mine, "queued");
+    h.api->release.store(true);
+    h.WaitFor(mine, "completed");
+    // The runner looks at the partner's list once more after ours ran
+    // (and pulls then, if anything is there): wait for that read.
+    for (int i = 0; i < 400; ++i) {
+      {
+        const std::lock_guard<std::mutex> lock(partner->mutex);
+        // Expected pull: wait for it; none expected: two more looks at
+        // the list (the runner reads it again once ours ran) settle it.
+        if (expect_pull ? partner->pulls >= 1
+                        : partner->queued_reads >= reads_before + 2)
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const auto& calls = h.api->calls;
+    std::ptrdiff_t pulled = -1;
+    std::ptrdiff_t ours = -1;
+    int posts = 0;
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(calls.size()); ++i) {
+      if (calls[i] == "PULL" && pulled < 0)
+        pulled = i;
+      if (calls[i] == "POST /v1/images/generations" && ++posts == 2)
+        ours = i;
+    }
+    CHECK(ours >= 0);
+    if (expect_pull) {
+      CHECK(pulled >= 0);
+      CHECK(ours < pulled);  // the unpinned one is newer and normal
+    } else {
+      CHECK(pulled < 0);  // only a pinned job there: no round trip
+    }
+  };
+  const std::string pinned_head =
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":4102444800,"priority":9,"pinned":"local",)"
+      R"("request":{"model":"qwen-image","loras":[]}})";
+  const std::string unpinned =
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb3","status":"queued","created_at":4102444801,"priority":0,)"
+      R"("request":{"model":"qwen-image","loras":[]}})";
+  run("pull-pinned-head", R"({"object":"list","data":[)" + pinned_head + "," +
+                              unpinned + "]}",
+      true);
+  run("pull-pinned-only", R"({"object":"list","data":[)" + pinned_head + "]}",
+      false);
+}
+
+void TestIdempotencyPerOwner() {
+  // Idempotency keys are per owner (X-Gufo-User): another user with the
+  // same key gets its own job, never a replay or a 409 of the first.
+  Harness h("idempotency-owner", false);
+  h.Open(false);
+  const auto submit = [&h](const std::string& body, const std::string& user) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = body;
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back("Idempotency-Key", "k1");
+    if (!user.empty())
+      request.headers.emplace_back("X-Gufo-User", user);
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer.has_value());
+    return answer ? *answer : HttpResponse{};
+  };
+  HttpResponse a = submit(ImageJob("a"), "anna");
+  CHECK(a.status == 202);
+  const std::string a_id = json::parse(a.body).member_str("id");
+  HttpResponse b = submit(ImageJob("a"), "ben");
+  CHECK(b.status == 202);
+  CHECK(json::parse(b.body).member_str("id") != a_id);
+  CHECK(json::parse(b.body).find("metadata")->member_str("nutzer") == "ben");
+  HttpResponse again = submit(ImageJob("a"), "anna");
+  CHECK(again.status == 200);
+  CHECK(json::parse(again.body).member_str("id") == a_id);
+  HttpResponse other = submit(ImageJob("b"), "ben");
+  CHECK(other.status == 409);
+  // Without a user (auth off): one shared key space, as before.
+  HttpResponse none = submit(ImageJob("a"), "");
+  CHECK(none.status == 202);
+  CHECK(submit(ImageJob("a"), "").status == 200);
+  // The split survives a restart.
+  h.queue->Stop();
+  h.Open(false);
+  CHECK(submit(ImageJob("a"), "anna").status == 200);
+  CHECK(json::parse(submit(ImageJob("a"), "anna").body).member_str("id") == a_id);
+}
+
 void TestPoolPullOwner() {
   // Router B: POST /router/pool/pull hands out the oldest queued job the
   // requester can run, never one a runner took, never twice, not one
@@ -1990,6 +2425,12 @@ void TestPoolPullOwner() {
   };
   // A requester without the model gets nothing.
   CHECK(pull(R"({"models":{"minimax-h3":{"placement":"pool","loras":[]}}})")
+            .find("job")
+            ->is_null());
+  // Nor one whose own load of the model just failed (12.11. 17:51: the
+  // .198 pulled a qwen-image job 72 s after its own load failed with 502).
+  CHECK(pull(R"({"models":{"qwen-image":{"placement":"pool","loras":[],)"
+             R"("available":false,"unavailable":"local load failed"}}})")
             .find("job")
             ->is_null());
   // Without the winkel LoRA: the second job (the first is running).
@@ -2240,6 +2681,258 @@ void TestPoolPullWaitingRequester() {
 
 }  // namespace
 
+/// GET /v1/jobs?scope=pool positions by job id.
+std::map<std::string, double> Positions(Harness& h) {
+  std::map<std::string, double> positions;
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  for (const json::Value& job : listed.find("data")->items()) {
+    const json::Value* position = job.find("position");
+    positions[job.member_str("id")] =
+        position == nullptr || position->is_null() ? 0
+                                                   : position->as_double();
+  }
+  return positions;
+}
+
+void TestPriorityOrder() {
+  // 2.0.3: the queue runs the highest priority first, then first in first
+  // out; the priority comes from the header (wins), the submit body or
+  // the wrapped body; every request of the job carries the header.
+  Harness h("priority-order");
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string a = h.Submit(ImageJob("a")).member_str("id");
+  const std::string b =
+      h.Submit(ImageJob("b", R"(,"priority":5)")).member_str("id");
+  const std::string c = h.Submit(ImageJob("c")).member_str("id");
+  std::string d;
+  {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = ImageJob("d", R"(,"priority":2)");
+    request.headers.emplace_back(gufo::router::kPriorityHeader, "9");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 202);
+    const json::Value view = json::parse(answer->body);
+    d = view.member_str("id");
+    CHECK(view.member_double("priority") == 9);  // the header wins
+  }
+  // The wrapped body's member counts too (a page that sends it inside).
+  const std::string e =
+      h.Submit(R"({"request":{"path":"/v1/images/generations","body":{"model":"qwen-image","prompt":"e","size":"64x64","priority":"5"}}})")
+          .member_str("id");
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + a).body)
+            .member_double("priority") == 0);
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + b).body)
+            .member_double("priority") == 5);
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + e).body)
+            .member_double("priority") == 5);
+  // Positions: d (9), b (5), e (5, newer), a, c.
+  std::map<std::string, double> positions = Positions(h);
+  CHECK(positions[d] == 1);
+  CHECK(positions[b] == 2);
+  CHECK(positions[e] == 3);
+  CHECK(positions[a] == 4);
+  CHECK(positions[c] == 5);
+  CHECK(positions[first] == 0);
+  // Invalid values: 400 invalid_priority, nothing queued.
+  json::Value refused = h.Submit(ImageJob("bad", R"(,"priority":12)"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  refused = h.Submit(ImageJob("bad", R"(,"priority":"hoch")"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  refused = h.Submit(ImageJob("bad", R"(,"priority":1.5)"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = ImageJob("bad");
+    request.headers.emplace_back(gufo::router::kPriorityHeader, "10");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 400);
+    CHECK(answer && ErrorCodeOf(*answer) == "invalid_priority");
+  }
+  CHECK(Positions(h).size() == 6);
+  // Run order after the first job ends: d, b, e, a, c.
+  h.api->release.store(true);
+  for (const std::string& id : {first, d, b, e, a, c})
+    h.WaitFor(id, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const std::vector<std::string> want = {"SLOW first", "d", "b",
+                                           "e",          "a", "c"};
+    CHECK(h.api->prompts == want);
+    CHECK(h.api->priorities["d"] == "9");
+    CHECK(h.api->priorities["b"] == "5");
+    CHECK(h.api->priorities["a"].empty());  // normal: no header
+  }
+}
+
+void TestPriorityFile() {
+  // jobs.json keeps the priority; a file written before 2.0.3 has none and
+  // reads as 0; queued jobs come back in run order.
+  const std::string name = "priority-file";
+  std::filesystem::path dir;
+  std::string normal;
+  std::string high;
+  {
+    Harness h(name, false);
+    dir = h.dir;
+    normal = h.Submit(ImageJob("normal")).member_str("id");
+    high = h.Submit(ImageJob("high", R"(,"priority":7)")).member_str("id");
+    const std::map<std::string, double> positions = Positions(h);
+    CHECK(positions.at(high) == 1);
+    CHECK(positions.at(normal) == 2);
+  }
+  const std::filesystem::path file = dir / "jobs.json";
+  std::string text = ReadFile(file);
+  CHECK(text.find("\"priority\":7") != std::string::npos);
+  {
+    Harness h(name, false, /*keep_dir=*/true);
+    CHECK(json::parse(h.Call("GET", "/v1/jobs/" + high).body)
+              .member_double("priority") == 7);
+    CHECK(Positions(h).at(high) == 1);
+  }
+  // Drop the member as an older router wrote the file.
+  {
+    const json::Value parsed = json::parse(text);
+    json::Value records = json::Value::array();
+    for (const json::Value& record : parsed.find("jobs")->items()) {
+      json::Value copy = json::Value::object();
+      for (const auto& [key, value] : record.members())
+        if (key != "priority")
+          copy[key] = value;
+      records.push_back(copy);
+    }
+    json::Value rewritten = json::Value::object();
+    rewritten["jobs"] = std::move(records);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << rewritten.dump();
+  }
+  {
+    Harness h(name, false, /*keep_dir=*/true);
+    const json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + high).body);
+    CHECK(view.member_str("status") == "queued");
+    CHECK(view.member_double("priority") == 0);
+    CHECK(Positions(h).at(normal) == 1);
+    CHECK(Positions(h).at(high) == 2);
+  }
+}
+
+void TestPoolPullPriority() {
+  // Requester: the partner's newer job with a higher priority is pulled
+  // before our own older job; a newer job of the same priority is not.
+  const auto run = [](const char* name, int partner_priority,
+                      bool expect_pull_first) {
+    auto partner = std::make_shared<FakePartner>();
+    partner->queued = R"({"object":"list","data":[]})";
+    Harness h(name, false);
+    partner->api = h.api;
+    h.partner_name = "http://10.0.0.2:8081";
+    h.self_name = "http://10.0.0.1:8081";
+    h.capabilities = CapsA;
+    h.partner_capabilities = [] {
+      return std::optional<json::Value>(CapsB());
+    };
+    h.relay = [partner](const HttpRequest& request,
+                        std::chrono::milliseconds a,
+                        std::chrono::milliseconds b, std::string* error) {
+      return (*partner)(request, a, b, error);
+    };
+    h.Open(true);
+    // The runner is busy while the partner's job and ours queue up.
+    const std::string first =
+        h.Submit(ImageJob("SLOW first")).member_str("id");
+    h.WaitFor(first, "in_progress");
+    {
+      // created_at in the year 2100: newer than anything submitted here.
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      partner->queued =
+          R"({"object":"list","data":[)"
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":4102444800,"priority":)" +
+          std::to_string(partner_priority) +
+          R"(,"request":{"model":"qwen-image","loras":[]}}]})";
+    }
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    // The runner's view of the partner's queue is cached pull_poll (20 ms
+    // here): let it age so the runner reads the new list.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    h.api->release.store(true);
+    h.WaitFor(mine, "completed");
+    // Once ours ran and nothing is queued here, the partner's job is
+    // pulled anyway (as before).
+    for (int i = 0; i < 200; ++i) {
+      {
+        const std::lock_guard<std::mutex> lock(partner->mutex);
+        if (partner->pulls >= 1)
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const auto& calls = h.api->calls;
+    const auto at = [&calls](const std::string& what, int nth) {
+      std::ptrdiff_t index = 0;
+      for (; index < static_cast<std::ptrdiff_t>(calls.size()); ++index)
+        if (calls[index] == what && --nth == 0)
+          break;
+      return index;
+    };
+    const std::ptrdiff_t pulled = at("PULL", 1);
+    const std::ptrdiff_t ours = at("POST /v1/images/generations", 2);
+    CHECK(pulled < static_cast<std::ptrdiff_t>(calls.size()));
+    CHECK(ours < static_cast<std::ptrdiff_t>(calls.size()));
+    if (expect_pull_first)
+      CHECK(pulled < ours);
+    else
+      CHECK(ours < pulled);
+  };
+  run("pull-priority-high", 5, true);
+  run("pull-priority-same", 0, false);
+
+  // Owner: POST /router/pool/pull hands out the queued job that runs
+  // first (priority, then age), and names its priority.
+  Harness h("pull-priority-owner", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string second = h.Submit(ImageJob("second")).member_str("id");
+  const std::string third =
+      h.Submit(ImageJob("third", R"(,"priority":9)")).member_str("id");
+  const std::string fourth =
+      h.Submit(ImageJob("fourth", R"(,"priority":9)")).member_str("id");
+  const auto pull = [&h] {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body =
+        R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":{"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  json::Value handed = pull();
+  CHECK(handed.member_str("job") == third);
+  CHECK(handed.member_double("priority") == 9);
+  handed = pull();
+  CHECK(handed.member_str("job") == fourth);
+  handed = pull();
+  CHECK(handed.member_str("job") == second);
+  CHECK(handed.member_double("priority") == 0);
+  h.api->release.store(true);
+  for (const std::string& id : {first, second, third, fourth})
+    h.WaitFor(id, "completed");
+  // The pushed jobs' requests carried the priority to the pool.
+  CHECK(h.api->priorities["third"] == "9");
+  CHECK(h.api->priorities["second"].empty());
+}
+
 int main() {
   TestParseWebhookUrl();
   TestAllowList();
@@ -2253,6 +2946,11 @@ int main() {
   TestCancel();
   TestVideo();
   TestVideoCancel();
+  TestObjekt();
+  TestObjektCancel();
+  TestObjektTransient();
+  TestObjektTransientGivesUp();
+  TestObjektDeadline();
   TestWebhook();
   TestWebhookGivesUp();
   TestIdempotency();
@@ -2272,11 +2970,18 @@ int main() {
   TestCapabilityRouting();
   TestPoolPullRequester();
   TestPoolPullOldPartner();
+  TestPoolPullGpuBusy();
   TestPoolPullOwner();
   TestReachableUrl();
   TestPoolPullBindAddress();
   TestPoolWaitTakeover();
   TestPoolPullWaitingRequester();
+  TestPoolPinLocal();
+  TestPoolPullPinned();
+  TestIdempotencyPerOwner();
+  TestPriorityOrder();
+  TestPriorityFile();
+  TestPoolPullPriority();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;

@@ -6,26 +6,19 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
-#include <cstdlib>
-#include <exception>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <optional>
-#include <stdexcept>
-#include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <utility>
 #include <vector>
 
+#include "gufo/ext/registry.hpp"
 #include "src/cli/arg_parser.hpp"
-#include "src/core/image.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
-#include "src/models/minimax_h3/audio_input.hpp"
-#include "src/models/minimax_h3/prompt_vision.hpp"
-#include "src/models/minimax_h3/sha256.hpp"
+#include "src/ext/video.hpp"
 
 #ifndef GUFO_H3_SOURCE_MANIFEST
 #define GUFO_H3_SOURCE_MANIFEST \
@@ -71,35 +64,7 @@ struct VideoOverrides {
   std::optional<int> frames, steps, blocks, reuse;
   bool no_audio = false;
   bool no_mux = false;
-  std::filesystem::path first_frame;
-  std::filesystem::path last_frame;
-  // --guide-frame FRAME:IMAGE and --audio-guide FILE[@FRAME], repeatable.
-  std::vector<std::pair<int, std::filesystem::path>> guide_frames;
-  std::vector<std::pair<int, std::filesystem::path>> audio_guides;
-  std::string lora_strength = "1";
 };
-
-// "FRAME:PATH" (guide frames) or "PATH@FRAME" (audio guides, frame optional).
-bool ParseGuide(std::string_view value, bool frame_first, int* frame,
-                std::filesystem::path* path) {
-  if (frame_first) {
-    const std::size_t colon = value.find(':');
-    if (colon == std::string_view::npos || colon == 0 ||
-        !ParseInteger(value.substr(0, colon), frame)) {
-      return false;
-    }
-    *path = std::filesystem::path(std::string(value.substr(colon + 1)));
-    return !path->empty();
-  }
-  *frame = 0;
-  const std::size_t at = value.rfind('@');
-  if (at != std::string_view::npos && at + 1 < value.size() &&
-      ParseInteger(value.substr(at + 1), frame)) {
-    value = value.substr(0, at);
-  }
-  *path = std::filesystem::path(std::string(value));
-  return !path->empty();
-}
 
 void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
                           VideoOverrides& overrides) {
@@ -114,54 +79,6 @@ void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
       "Model & Output", &overrides.preset);
   parser.AddOption("", "--seed", "N", "Noise RNG seed (default: 42)",
                    "Denoising", &request.seed);
-  parser.AddOption("", "--first-frame", "IMAGE",
-                   "FL2VA: PNG/JPEG/WebP the video starts on", "Keyframes",
-                   &overrides.first_frame);
-  parser.AddOption("", "--last-frame", "IMAGE",
-                   "FL2VA: PNG/JPEG/WebP the video ends on", "Keyframes",
-                   &overrides.last_frame);
-  parser.AddCustomOption(
-      "", "--guide-frame", "FRAME:IMAGE",
-      "Guide image anchored at a pixel frame (negative counts from the end); "
-      "repeatable",
-      "Keyframes",
-      [&overrides](std::string_view flag, std::string_view value,
-                   std::string* error) {
-        int frame = 0;
-        std::filesystem::path path;
-        if (!ParseGuide(value, true, &frame, &path)) {
-          SetError(error, std::string(flag) + " expects FRAME:IMAGE");
-          return false;
-        }
-        overrides.guide_frames.emplace_back(frame, std::move(path));
-        return true;
-      });
-  parser.AddCustomOption(
-      "", "--audio-guide", "AUDIO[@FRAME]",
-      "Audio (WAV/FLAC/Ogg/MP3) anchored at a pixel frame (default 0), e.g. "
-      "the voice as sound anchor; repeatable",
-      "Keyframes",
-      [&overrides](std::string_view flag, std::string_view value,
-                   std::string* error) {
-        int frame = 0;
-        std::filesystem::path path;
-        if (!ParseGuide(value, false, &frame, &path)) {
-          SetError(error, std::string(flag) + " expects AUDIO[@FRAME]");
-          return false;
-        }
-        overrides.audio_guides.emplace_back(frame, std::move(path));
-        return true;
-      });
-  parser.AddOption("", "--lora", "SAFETENSORS",
-                   "Transformer LoRA merged at load (e.g. the Turbo LoRA)",
-                   "LoRA", &request.lora_path);
-  parser.AddOption("", "--vision-projector", "GGUF",
-                   "Qwen3-VL vision tower (mmproj with deepstack) for the "
-                   "keyframes' <Picture i> prompt blocks",
-                   "Keyframes", &request.vision_projector);
-  parser.AddOption("", "--lora-strength", "F",
-                   "LoRA strength multiplier (default: 1)", "LoRA",
-                   &overrides.lora_strength);
   const auto integer_override = [&](std::string_view name,
                                     std::string_view description,
                                     std::optional<int>* target) {
@@ -291,12 +208,52 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
 }
 
 std::string PromptSha256(std::string_view prompt) {
-  return minimax_h3::Sha256(std::span(
-      reinterpret_cast<const unsigned char*>(prompt.data()), prompt.size()));
+  return crypto::Sha256Hex(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t*>(prompt.data()), prompt.size()));
+}
+
+std::optional<ext::VideoParameters> ResolveGenerationPreset(
+    std::string_view preset, std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->resolve_preset) {
+    return provider->resolve_preset(preset, error);
+  }
+  if (error)
+    *error = "video provider 'minimax-h3' not available";
+  return std::nullopt;
+}
+
+bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
+                                  std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->validate_parameters) {
+    return provider->validate_parameters(parameters, error);
+  }
+  if (error)
+    *error = "video provider 'minimax-h3' not available";
+  return false;
+}
+
+std::string GenerationParametersJson(const ext::VideoParameters& parameters,
+                                     std::uint64_t seed,
+                                     std::string_view prompt_sha256) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->parameters_json) {
+    return provider->parameters_json(parameters, seed, prompt_sha256);
+  }
+  return "{}";
+}
+
+std::string GenerationTelemetryJson(const ext::VideoTelemetry& telemetry) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->telemetry_json) {
+    return provider->telemetry_json(telemetry);
+  }
+  return "{}";
 }
 
 struct CliProgress {
-  minimax_h3::CancellationToken* cancellation{nullptr};
+  std::atomic<bool>* cancellation{nullptr};
   bool profile{false};
 };
 
@@ -307,7 +264,7 @@ void PrintProgress(std::string_view phase, int completed, int total,
     return;
   }
   if (g_cancel_requested != 0 && state->cancellation != nullptr) {
-    state->cancellation->Cancel();
+    state->cancellation->store(true, std::memory_order_relaxed);
   }
   if (state->profile) {
     std::cerr << "h3: " << phase << ' ' << completed << '/' << total << '\n';
@@ -348,8 +305,7 @@ std::optional<VideoCliOptions> ParseVideoOptions(
   if (!parser.Parse(args, error) || parser.IsHelpRequested()) {
     return std::nullopt;
   }
-  auto parameters =
-      minimax_h3::ResolveGenerationPreset(overrides.preset, error);
+  auto parameters = ResolveGenerationPreset(overrides.preset, error);
   if (!parameters)
     return std::nullopt;
   auto& p = *parameters;
@@ -378,71 +334,6 @@ std::optional<VideoCliOptions> ParseVideoOptions(
     p.selected_frames = std::move(*frames);
   }
   options.request.parameters = std::move(p);
-  for (const auto& [path, anchor] :
-       {std::pair{overrides.first_frame, minimax_h3::KeyframeAnchor::kFirst},
-        std::pair{overrides.last_frame, minimax_h3::KeyframeAnchor::kLast}}) {
-    if (path.empty()) {
-      continue;
-    }
-    try {
-      core::Image image = core::DecodeImage(core::ReadImageFile(path));
-      options.request.keyframes.push_back(
-          {.anchor = anchor,
-           .width = static_cast<int>(image.width),
-           .height = static_cast<int>(image.height),
-           .rgb = std::move(image.pixels)});
-    } catch (const std::exception& exception) {
-      SetError(error, "cannot read keyframe " + path.string() + ": " +
-                          exception.what());
-      return std::nullopt;
-    }
-  }
-  for (const auto& [frame, path] : overrides.guide_frames) {
-    try {
-      core::Image image = core::DecodeImage(core::ReadImageFile(path));
-      options.request.keyframes.push_back(
-          {.anchor = minimax_h3::KeyframeAnchor::kFirst,
-           .width = static_cast<int>(image.width),
-           .height = static_cast<int>(image.height),
-           .rgb = std::move(image.pixels),
-           .frame = frame,
-           .vision = false});
-    } catch (const std::exception& exception) {
-      SetError(error, "cannot read guide frame " + path.string() + ": " +
-                          exception.what());
-      return std::nullopt;
-    }
-  }
-  for (const auto& [frame, path] : overrides.audio_guides) {
-    std::ifstream input(path, std::ios::binary);
-    const std::vector<std::uint8_t> bytes(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-    minimax_h3::GenerationAudioGuide guide{.frame = frame};
-    std::string audio_error;
-    const bool decoded =
-        !bytes.empty() &&
-        minimax_h3::DecodeGuideAudio(bytes, &guide.waveform, &audio_error);
-    if (!decoded) {
-      if (audio_error.empty()) {
-        audio_error = "cannot read file";
-      }
-      SetError(error,
-               "cannot read audio guide " + path.string() + ": " + audio_error);
-      return std::nullopt;
-    }
-    options.request.audio_guides.push_back(std::move(guide));
-  }
-  try {
-    std::size_t used = 0;
-    options.request.lora_strength = std::stof(overrides.lora_strength, &used);
-    if (used != overrides.lora_strength.size()) {
-      throw std::invalid_argument("trailing characters");
-    }
-  } catch (const std::exception&) {
-    SetError(error, "--lora-strength must be a number");
-    return std::nullopt;
-  }
   if (options.request.model_root.empty() || options.request.prompt.empty()) {
     SetError(error, "MiniMax H3 video requires --model and a prompt");
     return std::nullopt;
@@ -461,8 +352,7 @@ std::optional<VideoCliOptions> ParseVideoOptions(
     SetError(error, "the selected H3 preset requires --output");
     return std::nullopt;
   }
-  if (!minimax_h3::ValidateGenerationParameters(options.request.parameters,
-                                                error)) {
+  if (!ValidateGenerationParameters(options.request.parameters, error)) {
     return std::nullopt;
   }
   const std::filesystem::path report_base =
@@ -478,9 +368,26 @@ std::optional<VideoCliOptions> ParseVideoOptions(
 }
 
 int RunVideo(std::span<const char* const> args) {
-  // Internal: H3 vision + text encoding in a short-lived child process.
-  if (args.size() == 3 && std::string_view(args[0]) == "--h3-prompt-child") {
-    return minimax_h3::RunPromptChild(args[1], args[2]);
+  // The video command does not go through serve: register the built-in
+  // extensions here, or FindVideoProvider("minimax-h3") finds nothing.
+  static const bool registered = [] {
+    static ext::Registry registry;
+    ext::RegisterBuiltExtensions(registry);
+    return true;
+  }();
+  (void)registered;
+  // Internal helper processes of video providers (gufo-studio-windows):
+  // MiniMax H3 encodes vision + text in "video --h3-prompt-child req resp".
+  if (!args.empty() && std::string_view(args[0]) == "--h3-prompt-child") {
+    if (const ext::VideoProvider* provider =
+            ext::FindVideoProvider("minimax-h3");
+        provider != nullptr && provider->child_entry != nullptr) {
+      const int code = provider->child_entry(args);
+      if (code != -1)
+        return code;
+    }
+    std::cerr << "Error: this build has no MiniMax H3 prompt child" << std::endl;
+    return 2;
   }
   std::string error;
   auto options = ParseVideoOptions(args, &error);
@@ -494,7 +401,7 @@ int RunVideo(std::span<const char* const> args) {
     return 2;
   }
   if (!WriteAtomic(options->parameters_path,
-                   minimax_h3::GenerationParametersJson(
+                   GenerationParametersJson(
                        options->request.parameters, options->request.seed,
                        PromptSha256(options->request.prompt)),
                    &error)) {
@@ -508,48 +415,40 @@ int RunVideo(std::span<const char* const> args) {
     interrupt_guard.emplace(HandleInterrupt);
   } catch (const std::system_error&) {
   }
-  minimax_h3::CancellationToken cancellation;
+  std::atomic<bool> cancellation{false};
   std::jthread interrupt_watcher([&cancellation](const std::stop_token& stop) {
     while (!stop.stop_requested()) {
       if (g_cancel_requested != 0) {
-        cancellation.Cancel();
+        cancellation.store(true, std::memory_order_relaxed);
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   });
   CliProgress progress{&cancellation, options->profile};
-  minimax_h3::GenerationTelemetry telemetry;
-  // Name an escaping exception instead of a bare abort.
-  std::set_terminate([] {
-    if (const std::exception_ptr current = std::current_exception()) {
-      try {
-        std::rethrow_exception(current);
-      } catch (const std::exception& exception) {
-        std::cerr << "Error: uncaught exception: " << exception.what()
-                  << std::endl;
-      } catch (...) {
-        std::cerr << "Error: uncaught non-standard exception" << std::endl;
-      }
-    }
-    std::abort();
-  });
-  bool generated = false;
-  try {
-    generated = minimax_h3::GenerateTextVideo(options->request, &cancellation,
-                                              PrintProgress, &progress,
-                                              &telemetry, &error);
-  } catch (const std::exception& exception) {
-    error = std::string("unexpected exception: ") + exception.what();
+  ext::VideoTelemetry telemetry;
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (!provider || !provider->create) {
+    std::cerr << "Error: MiniMax H3 video provider not registered\n";
+    return 1;
   }
+  auto runner = provider->create(options->request.model_root.string(), &error);
+  if (!runner) {
+    std::cerr << "Error: " << error << '\n';
+    return 1;
+  }
+  const bool generated = runner->Generate(
+      options->request,
+      [&] { return cancellation.load(std::memory_order_relaxed); },
+      PrintProgress, &progress, &telemetry, &error);
   interrupt_watcher.request_stop();
   interrupt_watcher.join();
   interrupt_guard.reset();
   if (!generated) {
     std::cerr << "Error: " << error << '\n';
-    return cancellation.IsCancelled() ? 130 : 1;
+    return cancellation.load(std::memory_order_relaxed) ? 130 : 1;
   }
-  const std::string report = minimax_h3::GenerationTelemetryJson(telemetry);
+  const std::string report = GenerationTelemetryJson(telemetry);
   if (!WriteAtomic(options->telemetry_path, report, &error)) {
     std::cerr << "Error: " << error << '\n';
     return 1;

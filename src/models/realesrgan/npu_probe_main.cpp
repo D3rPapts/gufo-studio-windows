@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 #include "src/models/realesrgan/ort_upscaler.hpp"
 
 namespace re = gufo::models::realesrgan;

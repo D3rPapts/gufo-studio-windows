@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="de" data-seite="pool">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="../gemeinsam/logo/gufo-studio-icon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="../gemeinsam/logo/gufo-studio-icon-32.png">
+<link rel="apple-touch-icon" href="../gemeinsam/logo/gufo-studio-logo-180.png">
+<title data-t="seitentitel">gufo Pool</title>
+<script src="../gemeinsam/sprache.js"></script>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --text:#1d1d1f; --muted:#6b6b70; --line:#dcdcd7; --accent:#5b4fc4; --ok:#1e7a3c; --warn:#a15c00; --err:#b3261e; --chip:#efeef8; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; } }
+  :root[data-theme="dark"] { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  h2 { font-size:16px; margin:24px 0 8px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .zwei { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width:700px) { .zwei { grid-template-columns:1fr; } }
+  .rechner h3 { margin:0 0 6px; font-size:17px; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .rechner div { font-size:13.5px; overflow-wrap:anywhere; }
+  .rechner.weg { border:2px solid var(--err); }
+  .weg-zeile { color:var(--err); font-weight:600; font-size:15px !important; }
+  .m { color:var(--muted); } .ok { color:var(--ok); font-weight:600; } .warn { color:var(--warn); font-weight:600; } .err { color:var(--err); font-weight:600; }
+  .klein { font-size:12px; color:var(--muted); }
+  .wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12.5px; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  tr.summe td { font-weight:700; }
+  .chip { display:inline-block; padding:0 6px; margin:1px 2px 1px 0; border-radius:6px; background:var(--chip); font-size:12px; white-space:nowrap; }
+  .chip.ok { background:color-mix(in srgb, var(--ok) 18%, transparent); }
+  .chip.warn { background:color-mix(in srgb, var(--warn) 22%, transparent); }
+  .chip.err { background:color-mix(in srgb, var(--err) 22%, transparent); }
+  .leiste { display:flex; gap:12px; flex-wrap:wrap; align-items:center; font-size:13px; color:var(--muted); margin:6px 0; }
+  .leiste label { display:inline-flex; gap:6px; align-items:center; min-height:36px; }
+  .hinweis { font-size:12.5px; color:var(--muted); margin:6px 0 0; }
+  .erkl { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:10px; padding:12px 16px; }
+  .erkl h3 { margin:14px 0 4px; font-size:15px; } .erkl h3:first-child { margin-top:0; }
+  .erkl ul { margin:4px 0; padding-left:20px; } .erkl li { margin:4px 0; }
+  code { font-size:12.5px; background:var(--chip); padding:0 4px; border-radius:4px; overflow-wrap:anywhere; }
+  /* Handy: Tabellen als Karten (table[data-karten], gemeinsam/sprache.js) */
+  @media (max-width:639px) { .wrap { overflow:visible; } td.num { text-align:left; white-space:normal; } }
+</style>
+</head>
+<body>
+<main>
+<h1 data-t="titel">Pool – Aufträge auf beiden Rechnern</h1>
+<p class="sub"><span data-t="sub">Wie viele Aufträge im gemeinsamen Pool sind, wie sie auf die beiden Rechner verteilt sind und was bei einem Ausfall passiert. Die Seite liest nur (GET) bei beiden Routern, alle 5 s.</span> <span data-t="stand">Stand:</span> <span id="zeit">–</span></p>
+
+<h2 data-t="h.rechner">Die beiden Router</h2>
+<div class="zwei" id="rechner"><div class="card m" data-t="lade">wird gelesen …</div></div>
+
+<h2 data-t="h.summen">Summen</h2>
+<div class="wrap"><table data-karten id="summen">
+  <thead><tr><th data-t="sp.rechner">Rechner</th><th data-t="sp.wartend">wartend</th><th data-t="sp.laufend">laufend</th><th data-t="sp.fertig">fertig letzte Stunde</th><th data-t="sp.fehler">Fehler letzte Stunde</th></tr></thead>
+  <tbody id="summenBody"></tbody>
+</table></div>
+<p class="hinweis" data-t="summen.hinweis">„wartend“ und „fertig/Fehler“ zählen beim Besitzer (dem Rechner, an den der Auftrag ging), „laufend“ dort, wo gerechnet wird. „wartend“ umfasst auch Aufträge, die schon gestartet sind, aber im Pool auf einen freien Rechner warten.</p>
+
+<h2 data-t="h.jobs">Aufträge im Pool</h2>
+<div class="leiste"><span id="jobinfo"></span><label><input type="checkbox" id="mitFertig" checked> <span data-t="mit.fertig">fertige der letzten Stunde zeigen</span></label></div>
+<div class="wrap"><table data-karten id="jobs">
+  <thead><tr><th data-t="sp.pos">Pos.</th><th data-t="sp.prio">Prio</th><th data-t="sp.modell">Modell</th><th data-t="sp.art">Art</th><th data-t="sp.status">Status</th><th data-t="sp.besitzer">Besitzer</th><th data-t="sp.auf">läuft auf</th><th data-t="sp.warte">Wartezeit</th><th data-t="sp.lauf">Laufzeit</th></tr></thead>
+  <tbody id="jobsBody"></tbody>
+</table></div>
+<p class="hinweis" data-t="jobs.hinweis.html">Position = Reihenfolge aller wartenden Aufträge beider Rechner, wie der Router sie bildet (2.0.3): zuerst nach Vorrang (Prio 9 … 1, „–“ = normal), bei gleichem Vorrang nach Eingangszeit (1 = kommt als Nächstes). Den Vorrang wählt man auf den Seiten beim Abschicken (Feld „Vorrang“: normal / hoch 5 / sofort 9). Mit <code>--jobs-parallel 2</code> beginnt die Laufzeit schon, wenn ein Auftrag in den Pool geht; die Wartezeit im Pool steckt dann in der Laufzeit.</p>
+
+<h2 data-t="h.faehig">Was kann welcher Rechner?</h2>
+<div class="leiste"><label><input type="checkbox" id="nurPool" checked> <span data-t="nur.pool">nur Pool-Modelle</span></label><span data-t="legende">kann · geladen · belegt · wartet · Fehler</span></div>
+<div class="wrap"><table data-karten id="faehig">
+  <thead><tr><th data-t="sp.modell">Modell</th><th data-t="sp.art">Art</th><th data-t="sp.platz">Platz</th><th id="capA" data-t="hier">hier</th><th id="capB" data-t="partner">Partner</th><th data-t="sp.loras">LoRAs</th></tr></thead>
+  <tbody id="faehigBody"></tbody>
+</table></div>
+
+<h2 data-t="h.ausfall">Was passiert, wenn ein Rechner ausfällt?</h2>
+<div class="erkl">
+<h3 data-t="erkl.kurz">Kurz gesagt</h3>
+<ul>
+<li data-t="erkl.k1.html"><b>Zusammengelegt?</b> Nur halb. Jeder Router hat seine eigene Auftragsliste und Datei <code>jobs.json</code>; der Rechner, an den ein Auftrag geschickt wurde, bleibt sein <b>Besitzer</b> (Ergebnis, Dateien, Fortschritt). Gemeinsam sind die Reihenfolge (ältester Auftrag beider Rechner zuerst) und das Rechnen: ein freier Rechner holt sich den ältesten wartenden Auftrag des anderen (<code>POST /router/pool/pull</code>, jobs.cpp:2734–2736), und ein Pool-Modell geht je Anfrage an den Rechner, der frei ist (pool.hpp:105–151).</li>
+<li data-t="erkl.k2.html"><b>Wie viel passt rein?</b> Die Warteschlange hat keine Obergrenze. Gleichzeitig rechnen je Router höchstens so viele Aufträge, wie <code>--jobs-parallel</code> erlaubt (auf der .198: 2; Standard 1, router.cpp:3584), und je Pool-Modell schickt ein Router nur eine Anfrage zur Zeit an den anderen (pool.hpp:49). Praktisch rechnet jeder Rechner ein großes GPU-Modell zur Zeit, der Rest wartet.</li>
+<li data-t="erkl.k3.html"><b>Ausfall?</b> Der andere Rechner macht allein weiter. Wartende Aufträge des ausgefallenen Rechners liegen in seiner <code>jobs.json</code> und laufen erst nach seinem Neustart weiter – der andere kann sie nicht übernehmen.</li>
+</ul>
+<h3 data-t="erkl.einzeln">Im Einzelnen (aus dem Code, gufo 2.0-int)</h3>
+<ul>
+<li data-t="erkl.e1.html"><b>Merken:</b> Jeder Router fragt den anderen alle 5 s ab (2 s Zeitgrenze). Antwortet er nicht, gehen Anfragen an ihn sofort mit <code>503 remote_unavailable</code> zurück (router.cpp:128, 2281–2308), und der Pool rechnet alles selbst – auch wenn hier gerade GPU-Arbeit läuft (pool.hpp:113–121: ein Rechner, der weg ist, hält nichts zurück).</li>
+<li data-t="erkl.e2.html"><b>Aufträge des Ausgefallenen:</b> Beim Neustart liest der Router <code>jobs.json</code>. Wartende Aufträge kommen zurück in die Warteschlange (jobs.cpp:2682–2684). Laufende werden <b>nicht</b> neu gerechnet, sondern als Fehler <code>router_restarted</code> markiert (jobs.cpp:2685–2696). Achtung: Mit <code>--jobs-parallel 2</code> steht ein Auftrag sofort auf „läuft“, auch wenn er nur im Pool auf einen Rechner wartet – auch so einer endet nach einem Neustart als Fehler.</li>
+<li data-t="erkl.e3.html"><b>Auftrag, den der Ausgefallene gerade für den anderen rechnete</b> (geholt oder vom Pool hingeschickt): Der Besitzer bekommt keine Antwort → <code>503 remote_unavailable</code> → der Auftrag geht <b>einmal</b> an den Anfang seiner Warteschlange und wird dann beim Besitzer neu gerechnet (jobs.cpp:3410–3432). Video, Musik und 3D, die der Worker schon angenommen hatte, werden nicht wiederholt, sondern schlagen fehl.</li>
+<li data-t="erkl.e4.html"><b>Fällt der Besitzer aus,</b> während der andere seinen Auftrag rechnet: Der Holende fragt alle 2 s nach; nach 5 Fehlversuchen gibt er auf (<code>pool_pull_lost</code>, jobs.cpp:2944–2955) und nimmt wieder eigene Aufträge. Das Ergebnis kommt beim Besitzer nicht an.</li>
+<li data-t="erkl.e5.html"><b>Beide belegt:</b> Eine Anfrage wartet im Pool höchstens 900 s (<code>queue-timeout-seconds</code>), dann <code>503 pool_busy</code> (router.cpp:1813–1836). Ein Auftrag geht danach einmal zurück in die Warteschlange, beim zweiten Mal ist er ein Fehler.</li>
+<li data-t="erkl.e6.html"><b>Umleiten:</b> Wartet ein Auftrag im Pool und der andere Rechner holt ihn, bekommt die wartende Anfrage <code>503 pool_redirected</code>, und der Besitzer schickt sie mit <code>X-Gufo-Pool: remote</code> neu (router.cpp:1681–1697). Was schon beim Worker ist, wird nie umgeleitet – nichts läuft doppelt.</li>
+<li data-t="erkl.e7.html"><b>Platzierung</b> (local/remote/pool) wird nicht gespeichert; nach einem Neustart gilt wieder das Preset.</li>
+</ul>
+<h3 data-t="erkl.schwach">Bekannte Schwächen (Pool-Analyse 12.11.) und was 2.0.2 bringt</h3>
+<ul>
+<li data-t="erkl.b1.html"><b>B1</b> Die LoRA „winkel“ aus der <code>;</code>-Zeile wurde nicht erkannt → <code>400 no_capable_router</code> auf beiden Rechnern; der Kopf <code>X-Gufo-Pool</code> wurde still überschrieben. <b>2.0.2:</b> alle LoRAs gelesen (pool.hpp:162), der Kopf gewinnt.</li>
+<li data-t="erkl.b2.html"><b>B2</b> Antwortete der andere mit 502/503/504, bekam der Nutzer den Fehler, obwohl hier frei war. <b>2.0.2:</b> einmal hier versuchen und den anderen 60 s für das Modell sperren (pool.hpp:59, router.cpp:1764–1795).</li>
+<li data-t="erkl.b3.html"><b>B3</b> Gegenseitiges Warten bis 900 s: wartende Anfragen galten als „belegt“, und geholt wurde, sobald ein Auftrags-Platz frei war, auch bei voller GPU. <b>2.0.2:</b> „busy“ und „waiting“ getrennt (pool.hpp:194), Holen nur bei freier GPU (jobs.cpp:2859).</li>
+<li data-t="erkl.b4.html"><b>B4</b> Geholt wurde auch ein Modell, das hier gerade nicht laden konnte. <b>2.0.2:</b> <code>available:false</code> in <code>/router/capabilities</code>, Holen beachtet das.</li>
+<li data-t="erkl.offen.html"><b>Offen:</b> B5 Verteilung ohne Blick auf freien Speicher (die .56 schiebt qwen-image oft auf die knappere .198), B6 ein Ladefehler blockiert bis 10 min, B7 falscher Name „0.0.0.0“ beim Abgeben. Und: Die Filmarbeit der .56 geht meist direkt oder über ComfyUI, nicht über die Auftragsliste – Holen und Abgeben erreichen sie kaum, dort wirkt nur die Pool-Entscheidung je Anfrage.</li>
+<li data-t="erkl.fix.html">Die Karten oben zeigen, ob ein Router den 2.0.2-Stand hat (erkannt am Feld <code>available</code> in <code>/router/capabilities</code>).</li>
+</ul>
+</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const T = (k, d, v) => window.gufoT ? gufoT(k, d, v) : d.replace(/\{(\w+)\}/g, (m, n) => (v && n in v ? v[n] : m));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const jetzt = () => Date.now() / 1000;
+const uhr = ms => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const dauer = s => { if (s == null || !isFinite(s) || s < 0) return '–'; s = Math.round(s); if (s < 60) return s + ' s'; if (s < 3600) return Math.floor(s / 60) + ' min ' + (s % 60) + ' s'; return Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min'; };
+const speicher = { get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                   set: (k, v) => { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} } };
+// Router-Adresse -> Anzeigename: http://192.168.100.56:8081 -> ".56" (gleich für Kabel- und WLAN-Adresse)
+const nameVon = u => { const m = String(u || '').match(/\d+\.\d+\.\d+\.(\d+)/); return m ? '.' + m[1] : ''; };
+const partnerAdresse = u => window.gufoPartnerUrl ? gufoPartnerUrl(u) : u;
+
+async function holen(url) {
+  const ac = new AbortController(); const t = setTimeout(() => ac.abort(), 3000);
+  try {
+    const r = await fetch(url, { signal: ac.signal, cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch (e) { throw new Error(e.name === 'AbortError' ? T('weg.timeout', 'keine Antwort in 3 s') : e.message); }
+  finally { clearTimeout(t); }
+}
+
+// Zwei Router: "hier" (relativ, gleiche Herkunft) und der Partner (URL aus /router/capabilities "partner",
+// sonst /router/placement remote_url bzw. /router/status remote.routers). Die Seite läuft auf beiden Rechnern gleich.
+const rechner = { hier: { basis: '', daten: null }, partner: { basis: null, daten: null } };
+const seitDa = Date.now();
+let partnerUrlRoh = null;      // wie der Router den Partner nennt (Kabeladresse)
+
+async function lesen(rolle) {
+  const r = rechner[rolle];
+  const alt = r.daten || {};
+  const d = { ok: false, caps: alt.caps || null, capsZeit: alt.capsZeit || 0 };
+  if (rolle === 'partner' && r.basis == null) { r.daten = { ok: false, keiner: true }; return; }
+  try {
+    d.status = await holen(r.basis + '/router/status');
+    const [placement, jq, ji, jn] = await Promise.all([
+      holen(r.basis + '/router/placement').catch(() => null),
+      holen(r.basis + '/v1/jobs?status=queued&limit=1000').catch(() => null),
+      holen(r.basis + '/v1/jobs?status=in_progress&limit=1000').catch(() => null),
+      holen(r.basis + '/v1/jobs?limit=200').catch(() => null)]);
+    d.placement = placement;
+    const nachId = new Map();
+    for (const l of [jn, ji, jq]) for (const j of ((l && l.data) || [])) nachId.set(j.id, j);
+    d.jobs = [...nachId.values()];
+    if (!d.caps || Date.now() - d.capsZeit > 30000) {
+      d.capsZeit = Date.now();
+      d.caps = await holen(r.basis + '/router/capabilities').catch(() => alt.caps || null);
+    }
+    d.ok = true;
+    speicher.set('gufo-pool-weg-' + rolle, null);
+  } catch (e) {
+    d.fehler = e.message;
+    let seit = Number(speicher.get('gufo-pool-weg-' + rolle));
+    if (!seit) { seit = Date.now(); speicher.set('gufo-pool-weg-' + rolle, String(seit)); d.seitUnsicher = !alt.ok && Date.now() - seitDa < 8000; }
+    else d.seitUnsicher = !!alt.seitUnsicher;
+    d.seit = seit;
+  }
+  r.daten = d;
+}
+
+function partnerFinden() {
+  const d = rechner.hier.daten;
+  if (!d || !d.ok) return;
+  let u = d.caps && typeof d.caps.partner === 'string' ? d.caps.partner : null;
+  if (!u && d.placement) u = (Object.values(d.placement.models || {}).find(m => m.remote_url) || {}).remote_url || null;
+  if (!u && d.status && d.status.remote) u = (Object.values(d.status.remote.routers || {})[0] || {}).url || null;
+  if (u) { partnerUrlRoh = u.replace(/\/+$/, ''); rechner.partner.basis = partnerAdresse(partnerUrlRoh); }
+}
+
+// Anzeigenamen aus self/partner (".198", ".56"); ohne Angabe "hier"/"Partner".
+function namen() {
+  const h = rechner.hier.daten, p = rechner.partner.daten;
+  let hier = h && h.caps ? nameVon(h.caps.self) : '';
+  if (!hier && p && p.caps) hier = nameVon(p.caps.partner);
+  if (!hier) hier = nameVon(location.hostname) && !/^\.(1|0)$/.test(nameVon(location.hostname)) && location.hostname !== '127.0.0.1' ? nameVon(location.hostname) : T('hier', 'hier');
+  let partner = nameVon(partnerUrlRoh) || (p && p.caps ? nameVon(p.caps.self) : '') || T('partner', 'Partner');
+  return { hier, partner };
+}
+
+const ARTEN = [['/v1/images', 'art.bild', 'Bild'], ['/v1/audio/music', 'art.musik', 'Musik'], ['/v1/audio/speech', 'art.stimme', 'Stimme'],
+  ['/v1/audio/trans', 'art.transkript', 'Transkript'], ['/v1/videos', 'art.video', 'Video'], ['/v1/3d', 'art.3d', '3D'],
+  ['/v1/chat', 'art.text', 'Text'], ['/v1/responses', 'art.text', 'Text'], ['/v1/completions', 'art.text', 'Text']];
+const art = p => { const a = ARTEN.find(([v]) => String(p || '').startsWith(v)); return a ? T(a[1], a[2]) : T('art.sonst', 'Sonstiges'); };
+
+// Alle Aufträge beider Router; Besitzer = der Router, der sie listet; "läuft auf" aus running_on (Sicht des Besitzers).
+function alleJobs(nm) {
+  const liste = [];
+  for (const rolle of ['hier', 'partner']) {
+    const d = rechner[rolle].daten;
+    if (!d || !d.ok) continue;
+    const besitzer = nm[rolle];
+    for (const j of d.jobs || []) {
+      const lauf = j.status === 'in_progress' && !j.pool_wait;
+      const r = j.running_on;
+      liste.push(Object.assign({}, j, {
+        besitzer, rolle,
+        auf: !lauf ? null : (r == null || r === 'local') ? besitzer : (nameVon(r) || r),
+        wartet: j.status === 'queued' || (j.status === 'in_progress' && !!j.pool_wait),
+        laeuft: lauf }));
+    }
+  }
+  // Reihenfolge wie der Router (2.0.3): höherer Vorrang zuerst, bei gleichem der ältere Auftrag; ohne Feld (älterer Router) = 0.
+  liste.filter(j => j.wartet).sort((a, b) => ((Number(b.priority) || 0) - (Number(a.priority) || 0)) || (a.created_at - b.created_at)).forEach((j, i) => { j.pos = i + 1; });
+  return liste;
+}
+
+function karte(rolle, nm) {
+  const r = rechner[rolle], d = r.daten, name = nm[rolle];
+  if (!d) return `<div class="card rechner"><h3>${esc(name)}</h3><div class="m">${T('lade', 'wird gelesen …')}</div></div>`;
+  if (d.keiner) return `<div class="card rechner"><h3>${esc(name)}</h3><div class="m">${T('kein.partner', 'kein Partner eingetragen (Router ohne Pool)')}</div></div>`;
+  if (!d.ok) {
+    const andere = rolle === 'hier' ? 'partner' : 'hier', da = rechner[andere].daten;
+    let sicht = '';
+    if (da && da.ok && da.status && da.status.remote) {
+      const rr = Object.values(da.status.remote.routers || {}).find(x => nameVon(x.url) === name);
+      if (rr) sicht = '<div class="m">' + (rr.reachable
+        ? T('weg.sicht.ok', 'Router {a} sieht {b}: erreichbar (nur der Browser kommt nicht hin – WLAN?)', { a: esc(nm[andere]), b: esc(name) })
+        : T('weg.sicht.weg', 'Router {a} sieht {b}: nicht erreichbar {fehler}', { a: esc(nm[andere]), b: esc(name), fehler: rr.error ? '(' + esc(rr.error) + ')' : '' })) + '</div>';
+    }
+    const v = { zeit: uhr(d.seit), dauer: dauer((Date.now() - d.seit) / 1000) };
+    return `<div class="card rechner weg"><h3>${esc(name)} <span class="err">${T('weg.titel', 'nicht erreichbar')}</span></h3>
+      <div class="weg-zeile">${d.seitUnsicher ? T('weg.seit.min', 'nicht erreichbar seit mindestens {zeit} ({dauer})', v) : T('weg.seit', 'nicht erreichbar seit {zeit} ({dauer})', v)}</div>
+      <div class="m">${esc(r.basis || location.origin)} · ${esc(d.fehler)}</div>${sicht}
+      <div class="m">${T('weg.allein', 'Der andere Rechner rechnet jetzt allein. Aufträge, die hier warteten, laufen erst nach dem Neustart weiter (siehe unten).')}</div></div>`;
+  }
+  const st = d.status || {}, pq = st.pool_queue, mem = st.memory || {};
+  const n = v => Number(v) || 0;
+  const zeilen = [];
+  if (pq) {
+    let z = '<b>' + T('pq.zeile', '{n} wartend hier', { n: n(pq.local) }) + '</b>';
+    if (n(pq.local_waiting)) z += ' ' + T('pq.impool', '(davon {n} im Pool)', { n: n(pq.local_waiting) });
+    z += ' · ' + T('pq.tausch', 'geholt {k} · abgegeben {k2}', { k: n(pq.pulled), k2: n(pq.pushed) });
+    if (pq.enabled === false) z += ' · <span class="warn">' + T('pq.aus', 'Austausch aus') + '</span>';
+    if (pq.pull_hold_s != null) z += ' · ' + T('pq.halt', 'Holen pausiert {s}', { s: dauer(pq.pull_hold_s) });
+    zeilen.push('<div>' + z + '</div>');
+    const ids = a => (a || []).map(x => esc(typeof x === 'string' ? x : (x && (x.id || x.job_id)) || '')).join(', ');
+    if ((pq.pulling || []).length) zeilen.push('<div class="m">' + T('pq.fuer', 'rechnet gerade für den anderen: {ids}', { ids: ids(pq.pulling) }) + '</div>');
+    if ((pq.pushed_active || []).length) zeilen.push('<div class="m">' + T('pq.uns', 'der andere rechnet für uns: {ids}', { ids: ids(pq.pushed_active) }) + '</div>');
+  } else zeilen.push('<div class="m">' + T('pq.alt', 'keine gemeinsame Warteschlange (Router älter als 1.4.20)') + '</div>');
+  const modelle = (st.models || []).filter(m => m.state && m.state !== 'unloaded');
+  const ml = modelle.length ? modelle.map(m => {
+    const busy = m.busy || m.state === 'busy', laedt = m.state === 'loading';
+    return `<span class="chip ${busy || laedt ? 'warn' : 'ok'}">${esc(m.id)}${busy ? ' · ' + T('arbeitet', 'arbeitet') : laedt ? ' · ' + T('laedt', 'lädt') : ''}</span>`;
+  }).join('') : '<span class="m">' + T('nichts', 'nichts geladen') + '</span>';
+  const mz = [];
+  if (mem.gpu_valid && mem.gpu_dedicated_total_gb) mz.push(T('gpu', 'GPU {a} von {b} GB belegt', { a: (mem.gpu_dedicated_total_gb - mem.gpu_dedicated_free_gb).toFixed(1), b: Number(mem.gpu_dedicated_total_gb).toFixed(1) }));
+  if (mem.host_total_gb) mz.push(T('ram', 'RAM frei {a} GB', { a: Number(mem.host_free_gb).toFixed(1) }));
+  if (mem.commit_free_gb != null) mz.push(T('commit', 'Commit frei {a} GB', { a: Number(mem.commit_free_gb).toFixed(1) }));
+  const gruende = new Set();
+  for (const m of Object.values((d.placement && d.placement.models) || {})) if (m.pool && m.pool.local_gpu_busy_reason) gruende.add(m.pool.local_gpu_busy_reason);
+  const sicht = Object.values((st.remote && st.remote.routers) || {}).map(x => esc(nameVon(x.url) || x.url) + ' ' + (x.reachable
+    ? '<span class="ok">' + T('erreichbar', 'erreichbar') + '</span>'
+    : '<span class="err">' + T('weg.titel', 'nicht erreichbar') + '</span>' + (x.error ? ' (' + esc(x.error) + ')' : ''))).join(' · ');
+  const caps = d.caps && d.caps.models ? Object.values(d.caps.models) : [];
+  const fix = !caps.length ? '' : caps.some(m => m && 'available' in m)
+    ? '<span class="ok">' + T('fix.ja', 'Pool-Fix B1–B4 da (2.0.2)') + '</span>'
+    : '<span class="warn">' + T('fix.nein', 'ohne Pool-Fix B1–B4 (vor 2.0.2)') + '</span>';
+  return `<div class="card rechner"><h3>${esc(name)} <span class="ok">${T('erreichbar', 'erreichbar')}</span> <span class="klein">${esc(r.basis || location.origin)}</span></h3>
+    ${zeilen.join('')}
+    <div style="margin-top:4px">${ml}</div>
+    <div class="m">${mz.join(' · ')}</div>
+    ${gruende.size ? '<div class="warn">' + T('gpu.belegt', 'GPU belegt: {g} – Pool-Anfragen gehen dann an den anderen', { g: [...gruende].map(esc).join(', ') }) + '</div>' : ''}
+    ${sicht ? '<div class="m">' + T('sicht', 'sieht über Kabel: {s}', { s: sicht }) + '</div>' : ''}
+    ${fix ? '<div class="klein">' + fix + '</div>' : ''}</div>`;
+}
+
+function statusText(j) {
+  if (j.status === 'queued') return '<span class="warn">' + T('st.wartet', 'wartet') + '</span>';
+  if (j.wartet) return '<span class="warn">' + T('st.poolwait', 'wartet auf freien Rechner') + '</span>';
+  if (j.laeuft) return '<span class="ok">' + T('st.laeuft', 'läuft') + '</span>' + (j.progress != null ? ' ' + Math.round(j.progress) + ' %' + (j.progress_estimated ? ' ' + T('st.geschaetzt', '(geschätzt)') : '') : '');
+  if (j.status === 'completed') return T('st.fertig', 'fertig');
+  if (j.status === 'failed') return '<span class="err">' + T('st.fehler', 'Fehler') + '</span>' + (j.error && j.error.code ? ' <span class="klein">' + esc(j.error.code) + '</span>' : '');
+  if (j.status === 'cancelled') return '<span class="m">' + T('st.abgebrochen', 'abgebrochen') + '</span>';
+  if (j.status === 'expired') return '<span class="m">' + T('st.abgelaufen', 'abgelaufen') + '</span>';
+  return esc(j.status);
+}
+
+function zeichnen() {
+  const nm = namen(), n = jetzt(), stunde = n - 3600;
+  $('zeit').textContent = uhr(Date.now());
+  $('rechner').innerHTML = karte('hier', nm) + karte('partner', nm);
+  $('capA').textContent = nm.hier; $('capB').textContent = nm.partner;
+  const jobs = alleJobs(nm);
+  const da = ['hier', 'partner'].filter(r => rechner[r].daten && rechner[r].daten.ok);
+  const sum = name => ({
+    w: jobs.filter(j => j.wartet && (!name || j.besitzer === name)).length,
+    l: jobs.filter(j => j.laeuft && (!name || j.auf === name)).length,
+    f: jobs.filter(j => j.status === 'completed' && j.completed_at >= stunde && (!name || j.besitzer === name)).length,
+    e: jobs.filter(j => j.status === 'failed' && j.completed_at >= stunde && (!name || j.besitzer === name)).length });
+  const zeile = (titel, s, cls) => `<tr class="${cls || ''}"><td>${titel}</td><td class="num">${s.w}</td><td class="num">${s.l}</td><td class="num">${s.f}</td><td class="num">${s.e ? '<span class="err">' + s.e + '</span>' : 0}</td></tr>`;
+  $('summenBody').innerHTML = ['hier', 'partner'].map(rolle => {
+    const d = rechner[rolle].daten;
+    if (!d || !d.ok) return `<tr><td>${esc(nm[rolle])}</td><td colspan="4" class="err">${T('summe.weg', 'nicht erreichbar – Zahlen fehlen')}</td></tr>`;
+    return zeile(esc(nm[rolle]), sum(nm[rolle]));
+  }).join('') + zeile(T('summe.pool', 'Pool') + (da.length < 2 ? ' ' + T('summe.nur', '(nur {n})', { n: da.map(r => esc(nm[r])).join(', ') || '–' }) : ''), sum(null), 'summe');
+  const mitFertig = $('mitFertig').checked;
+  const wart = jobs.filter(j => j.wartet).sort((a, b) => a.pos - b.pos);
+  const lauf = jobs.filter(j => j.laeuft).sort((a, b) => (a.started_at || 0) - (b.started_at || 0));
+  const fertig = mitFertig ? jobs.filter(j => !j.wartet && !j.laeuft && j.completed_at >= stunde).sort((a, b) => b.completed_at - a.completed_at) : [];
+  const zeigen = wart.concat(lauf, fertig.slice(0, 40));
+  let info = T('jobinfo', '{w} wartend · {l} laufend · {f} fertig in der letzten Stunde', { w: wart.length, l: lauf.length, f: fertig.length });
+  if (fertig.length > 40) info += ' ' + T('jobinfo.gekuerzt', '(40 gezeigt)');
+  if (da.length === 1) info += ' ' + T('jobinfo.nur', '· nur Aufträge von {n}', { n: nm[da[0]] });
+  $('jobinfo').textContent = info;
+  $('jobsBody').innerHTML = zeigen.length ? zeigen.map(j => {
+    const req = j.request || {}, meta = j.metadata || {};
+    const warte = j.wartet ? n - j.created_at : (j.started_at ? j.started_at - j.created_at : null);
+    const laufzeit = j.laeuft ? n - j.started_at : (j.completed_at && j.started_at ? j.completed_at - j.started_at : null);
+    const fremd = j.auf && j.auf !== j.besitzer;
+    const titel = meta.titel || meta.seite || '';
+    return `<tr><td class="num">${j.pos || '–'}</td><td class="num">${Number(j.priority) > 0 ? Number(j.priority) : '–'}</td>
+      <td>${esc(req.model || '?')}${titel ? '<div class="klein">' + esc(titel) + '</div>' : ''}</td>
+      <td>${art(req.path)}</td><td>${statusText(j)}</td><td>${esc(j.besitzer)}</td>
+      <td>${j.auf ? esc(j.auf) + (fremd ? ' <span class="chip warn">' + T('fuer', 'für {n}', { n: esc(j.besitzer) }) + '</span>' : '') : '–'}</td>
+      <td class="num">${dauer(warte)}</td><td class="num">${dauer(laufzeit)}</td></tr>`;
+  }).join('') : `<tr><td colspan="9" class="m">${da.length ? (mitFertig ? T('keine.jobs.stunde', 'keine Aufträge in der letzten Stunde') : T('keine.jobs', 'keine wartenden oder laufenden Aufträge')) : T('kein.router', 'kein Router erreichbar')}</td></tr>`;
+  faehigkeiten();
+  if (window.gufoTabellenKarten) gufoTabellenKarten();
+}
+
+function capVon(rolle, id) { const d = rechner[rolle].daten; return d && d.caps && d.caps.models ? d.caps.models[id] || null : null; }
+function zelle(rolle, id) {
+  const d = rechner[rolle].daten;
+  if (!d || !d.caps) return '<span class="m">?</span>';
+  const cm = capVon(rolle, id);
+  if (!cm) return '<span class="m">–</span>';
+  if (!d.ok) return '<span class="err">' + T('cap.weg', 'Rechner weg') + '</span>';
+  const c = [];
+  c.push(cm.placement === 'remote' ? '<span class="chip">' + T('cap.weiter', 'nur weiterleiten') + '</span>' : '<span class="chip">' + T('cap.kann', 'kann') + '</span>');
+  const sm = ((d.status && d.status.models) || []).find(m => m.id === id);
+  const zustand = sm ? sm.state : cm.status;
+  if (zustand === 'loading') c.push('<span class="chip warn">' + T('laedt', 'lädt') + '</span>');
+  else if (cm.loaded || (zustand && zustand !== 'unloaded')) c.push('<span class="chip ok">' + T('cap.geladen', 'geladen') + '</span>');
+  if (sm && (sm.busy || sm.state === 'busy')) c.push('<span class="chip warn">' + T('cap.belegt', 'belegt') + '</span>');
+  const pl = d.placement && d.placement.models && d.placement.models[id] && d.placement.models[id].pool;
+  if (pl && pl.waiting > 0) c.push('<span class="chip warn">' + T('cap.wartet', 'wartet {n}', { n: pl.waiting }) + '</span>');
+  const af = d.status && d.status.autoload_failed && d.status.autoload_failed[id];
+  if (cm.available === false) c.push('<span class="chip err">' + T('cap.fehler', 'Fehler') + '</span>' + (cm.unavailable ? '<div class="klein">' + esc(cm.unavailable) + '</div>' : ''));
+  else if (pl && pl.local_failed_s_ago != null && pl.local_failed_s_ago < 60) c.push('<span class="chip err">' + T('cap.ladefehler', 'Ladefehler vor {s} s', { s: pl.local_failed_s_ago }) + '</span>');
+  else if (af) c.push('<span class="chip err">' + T('cap.autoload', 'Autoload-Fehler') + '</span>');
+  if (pl && pl.remote_failed_s_ago != null && pl.remote_failed_s_ago < 60) c.push('<span class="chip err" title="' + esc(pl.remote_failed || '') + '">' + T('cap.gesperrt', 'anderer gesperrt ({s} s)', { s: pl.remote_failed_s_ago }) + '</span>');
+  return c.join('');
+}
+
+function faehigkeiten() {
+  const nurPool = $('nurPool').checked, nm = namen();
+  const ids = new Map();
+  for (const rolle of ['hier', 'partner']) {
+    const d = rechner[rolle].daten;
+    for (const [id, m] of Object.entries((d && d.caps && d.caps.models) || {})) if (!ids.has(id)) ids.set(id, m);
+  }
+  const liste = [...ids.entries()].filter(([id]) => !nurPool || ['hier', 'partner'].some(r => (capVon(r, id) || {}).placement === 'pool'))
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  if (!liste.length) { $('faehigBody').innerHTML = '<tr><td colspan="6" class="m">' + T('cap.keine', 'keine Fähigkeiten gelesen (Router ab 1.4.20 nötig)') + '</td></tr>'; return; }
+  const beide = (werte) => werte[1] == null || werte[0] === werte[1] ? (werte[0] || '') : [nm.hier + ': ' + (werte[0] || '–'), nm.partner + ': ' + (werte[1] || '–')].join(' · ');
+  $('faehigBody').innerHTML = liste.map(([id, m]) => {
+    const platz = ['hier', 'partner'].map(r => (capVon(r, id) || {}).placement || null);
+    const loras = ['hier', 'partner'].map(r => { const c = capVon(r, id); return c ? (c.loras || []).join(', ') : null; });
+    return `<tr><td>${esc(id)}</td><td>${esc(m.capability || m.modality || '')}</td><td>${esc(beide(platz))}</td>
+      <td>${zelle('hier', id)}</td><td>${zelle('partner', id)}</td><td class="klein">${esc(beide(loras)) || '–'}</td></tr>`;
+  }).join('');
+}
+
+let laeuft = false;
+async function tick() {
+  if (laeuft || document.visibilityState === 'hidden') return;
+  laeuft = true;
+  try {
+    await lesen('hier');
+    partnerFinden();
+    await lesen('partner');
+    zeichnen();
+  } finally { laeuft = false; }
+}
+const merken = (id, key) => { const v = speicher.get(key); if (v != null) $(id).checked = v === '1'; $(id).onchange = () => { speicher.set(key, $(id).checked ? '1' : '0'); zeichnen(); }; };
+merken('nurPool', 'gufo-pool-nurpool'); merken('mitFertig', 'gufo-pool-fertig');
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
+window.addEventListener('gufo-sprache', zeichnen);
+tick(); setInterval(tick, 5000);
+</script>
+</body>
+</html>

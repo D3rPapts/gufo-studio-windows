@@ -12,7 +12,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/preview_hook.hpp"
+#include "src/models/qwen_image_21/preview_hook.hpp"
 
 namespace gufo::models::qwen_image_21 {
 
@@ -236,12 +236,16 @@ struct Metrics {
   /// the negative prompt's own rows (references are shared).
   int condition_rows{0};
   int negative_condition_rows{0};
-  /// The text encoder left GPU memory for this request's caches.
+  /// The text encoder left GPU memory after this request's prompts were
+  /// encoded (by default always; with --keep-text-encoder only when a large
+  /// request's caches do not fit beside it).
   bool released_text_encoder{false};
   double lora_ms{0};  // adapter switch, before prompt encoding
   /// Regional prompts: their condition rows and transformer passes.
   int region_condition_rows{0};
   int region_passes{0};
+  /// Denoising steps executed after resolving the default (ext metrics).
+  int steps{0};
 };
 
 struct Result {
@@ -276,6 +280,14 @@ struct Observer {
 };
 
 void ValidateRequest(const Request& request);
+/// Model prompt for the caller's prompt and background intent. Transparent
+/// requests receive the RGBA framing Qwen-Image-2.1 needs for alpha output;
+/// auto and opaque requests keep the prompt unchanged.
+std::string ConditionPrompt(std::string_view prompt,
+                            ext::ImageBackground background);
+/// Qwen-Image-2.1 accepts reference images and transparent backgrounds.
+inline constexpr ext::ImageCapabilities kCapabilities{
+    .edits = true, .transparent_background = true};
 std::vector<float> FlowSigmas(int steps, int image_tokens);
 /// `steps` + 1 sigmas: FlowSigmas for full strength, otherwise the last
 /// `steps` + 1 of FlowSigmas(int(steps / strength)) as in ComfyUI KSampler.
@@ -289,6 +301,17 @@ struct SamplingConfig {
   int ResolveSteps(int requested) const;
   std::vector<float> Sigmas(int requested, int image_tokens) const;
 };
+
+/// Whether the text encoder (Qwen2.5-VL, about 16 GB BF16) leaves GPU memory
+/// once a request's prompts are encoded. GPU memory of an APU is host memory
+/// and counts against the commit charge, so by default it always leaves and
+/// the next request uploads it again from the mapped files (identical
+/// weights, identical images). `keep_resident` (--keep-text-encoder) keeps it
+/// unless a `large` request's caches do not fit beside it (`fits_beside`).
+constexpr bool ReleasesTextEncoder(bool keep_resident, bool large,
+                                   bool fits_beside) {
+  return !keep_resident || (large && !fits_beside);
+}
 
 class Model {
 public:
@@ -307,6 +330,8 @@ public:
   bool DeviceLost() const;
   /// Diagnostic lines (memory per phase, memory checks).
   void SetLog(std::function<void(const std::string&)> log);
+  /// --keep-text-encoder: see ReleasesTextEncoder. Set before serving.
+  void SetKeepTextEncoder(bool keep);
   const SamplingConfig& sampling() const;
   /// Validate and register an adapter before serving; requests select it by
   /// name.

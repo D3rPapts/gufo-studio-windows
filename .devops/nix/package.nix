@@ -10,13 +10,25 @@
   libpng,
   libjpeg,
   libwebp,
+  libopus,
   libsndfile,
   soxr,
   openssl,
   ffmpeg-headless,
   ccache,
+  rustToolchain,
+  rustPlatform,
   rocmPackages,
+  libuuid,
+  # XRT with the amdxdna plugin (.devops/nix/xrt): the NPU runtime. Null
+  # only for revisions that predate it (the CI timing baseline).
+  xrt ? null,
+  # The IRON toolchain (.devops/nix/iron), passed through for development
+  # images that compile NPU designs; the package itself never uses it.
+  iron ? null,
   releaseVersion ? null,
+  extensionsFromLock ? false,
+  extensions ? [ ],
   revision,
   sourceRoot ? ../..,
 }:
@@ -28,9 +40,49 @@ let
   rocmRuntime = rocmPackages.rocm-runtime.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr-rocm10.patch ];
   });
+  # The CI timing baseline builds an older revision with this definition; before
+  # the Cargo workspace, the lockfile sat next to the PNG decoder.
+  cargoSetup = import ./rust-cargo.nix {
+    inherit lib rustPlatform;
+    lockFile =
+      if builtins.pathExists (sourceRoot + "/Cargo.lock") then
+        sourceRoot + "/Cargo.lock"
+      else
+        sourceRoot + "/src/core/png_decode/Cargo.lock";
+  };
+  # The CI timing baseline builds an older revision with this definition;
+  # before the Rust audio decoder, EmbeddingGemma 2 linked libsndfile and soxr.
+  hasRustAudio = builtins.pathExists (sourceRoot + "/src/core/audio_decode/Cargo.toml");
+  # A store path has no Git metadata. A flake input or fetcher result still
+  # names its commit (`dirtyRev` ends in "-dirty") or at least the hash of its
+  # tree; a plain path names nothing.
+  extensionRevision =
+    ext:
+    let
+      revision =
+        if builtins.isAttrs ext then
+          ext.rev or ext.dirtyRev or ext.narHash or ext.outputHash or "unknown"
+        else
+          "unknown";
+    in
+    if builtins.isString revision && revision != "" && !(lib.hasInfix ";" revision) then
+      revision
+    else
+      "unknown";
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
     if releaseVersion == null then "0-unstable-${revision}" else releaseVersion;
+  # The CI timing baseline builds an older revision with this definition.
+  # Revisions before model extensions have no extensions.lock, keep the eval
+  # fixture under the DeepSeek tests and report no extension selection.
+  hasExtensions = builtins.pathExists (sourceRoot + "/extensions.lock");
+  # Revisions before extension modules have no SDK to install.
+  hasExtensionSdk = builtins.pathExists (sourceRoot + "/cmake/GufoExtensionSdk.cmake");
+  evalFixture =
+    if hasExtensions then
+      "tests/fixtures/eval/antirez-ds4.json"
+    else
+      "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
   productionSource = lib.cleanSourceWith {
     src = sourceRoot;
     filter =
@@ -41,18 +93,33 @@ let
         relativePath = lib.removePrefix "${root}/" pathString;
       in
       pathString == root
-      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" ]
+      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" "extensions.lock" "rust-toolchain.toml" "Cargo.toml" "Cargo.lock" ]
       || relativePath == "licenses"
       || lib.hasPrefix "licenses/" relativePath
       || relativePath == "cmake"
       || lib.hasPrefix "cmake/" relativePath
-      || relativePath == "src"
-      || lib.hasPrefix "src/" relativePath
-      || relativePath == "tests"
-      || relativePath == "tests/models"
-      || relativePath == "tests/models/deepseek_v4_flash"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
+      || relativePath == "schemas"
+      || lib.hasPrefix "schemas/" relativePath
+      || relativePath == "include"
+      || lib.hasPrefix "include/" relativePath
+      || (
+        (relativePath == "src" || lib.hasPrefix "src/" relativePath)
+        && !(
+          lib.hasInfix "/tests/" "/${relativePath}"
+          || lib.hasSuffix "/tests" relativePath
+          || lib.hasInfix "/functional/" "/${relativePath}"
+          || lib.hasSuffix "/functional" relativePath
+          || lib.hasInfix "/tools/" "/${relativePath}"
+          || lib.hasSuffix "/tools" relativePath
+          || lib.hasInfix "/fixtures/" "/${relativePath}"
+          || lib.hasSuffix "/fixtures" relativePath
+        )
+      )
+      # `gufo eval` reads its default dataset at run time and that dataset is
+      # core-owned, so exactly one test-tree file is admitted: the core eval
+      # fixture. No model test file enters the production derivation.
+      || relativePath == evalFixture
+      || lib.hasPrefix "${relativePath}/" evalFixture;
   };
 in
 assert lib.versions.majorMinor rocmPackages.clr.version == "10.1";
@@ -60,12 +127,16 @@ stdenv.mkDerivation {
   pname = "gufo";
   version = packageVersion;
   src = productionSource;
+  # The extension SDK pins the build toolchain, so it lives in its own output:
+  # the runtime closure stays free of compilers and development libraries.
+  outputs = [ "out" ] ++ lib.optional hasExtensionSdk "sdk";
 
   nativeBuildInputs = [
     cmake
     ninja
     pkg-config
     makeWrapper
+    rustToolchain
     rocmPackages.clr
   ];
 
@@ -75,8 +146,7 @@ stdenv.mkDerivation {
     libpng
     libjpeg
     libwebp
-    libsndfile
-    soxr
+    libopus
     openssl
     ffmpeg-headless
     rocmPackages.clr
@@ -86,23 +156,35 @@ stdenv.mkDerivation {
     rocmPackages.rocprim
     rocmPackages.rocwmma
     rocmPackages.rocblas
+  ] ++ lib.optionals (!hasRustAudio) [
+    libsndfile
+    soxr
+  ] ++ lib.optionals (xrt != null) [
+    xrt
+    libuuid
   ];
 
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
+    "-DGUFO_EXTENSIONS_FROM_LOCK=${if extensionsFromLock then "ON" else "OFF"}"
     "-DGUFO_RELEASE_VERSION=${versionLabel}"
     "-DGUFO_REVISION=${revision}"
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
+  ] ++ lib.optional (xrt != null) "-DXRT_DIR=${xrt}/opt/xilinx/xrt/share/cmake/XRT"
+  ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
+  ++ lib.optionals (extensions != [ ]) [
+    "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}"
+    "-DGUFO_EXTENSION_DIR_REVISIONS=${lib.concatMapStringsSep ";" extensionRevision extensions}"
   ];
 
   # CI exposes a persistent /tmp/gufo-ccache through extra-sandbox-paths for
   # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
   # whose included headers ccache 4.13.6 does not record. A header-only change
   # can then reuse a stale HIP object, including one from the timing baseline.
-  preConfigure = ''
+  preConfigure = cargoSetup + ''
     ccache_dir=/tmp/gufo-ccache
     if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
       export CCACHE_DIR="$ccache_dir"
@@ -126,25 +208,40 @@ stdenv.mkDerivation {
   postFixup = ''
     # HIP loads ROCr transitively. Select the patched ABI-compatible runtime
     # without rebuilding the unchanged HIP/BLAS compiler and kernel libraries.
+    # XRT locates its amdxdna plugin beside libxrt_coreutil, which the
+    # executable's RUNPATH finds in the merged XRT package.
     wrapProgram "$out/bin/gufo" \
       --prefix LD_LIBRARY_PATH : "${rocmRuntime}/lib"
   '';
   installCheckPhase = ''
     runHook preInstallCheck
 
-    test "$($out/bin/gufo --version)" = "gufo version ${versionLabel} (${revision})"
+    test "$($out/bin/gufo --version | head -n 1)" = "gufo version ${versionLabel} (${revision})"
+  '' + lib.optionalString hasExtensions ''
+    $out/bin/gufo --version | grep -Fx "Extension selection: ${if extensionsFromLock then "lock" else "discovery"}"
+    $out/bin/gufo diagnose --section extensions --json > extensions.json
+  '' + ''
     $out/bin/gufo --help >/dev/null
-    test "$($out/bin/gufo-server --version)" = "gufo version ${versionLabel} (${revision})"
+    test "$($out/bin/gufo-server --version | head -n 1)" = "gufo version ${versionLabel} (${revision})"
     $out/bin/gufo-server --help >/dev/null
     test ! -e $out/bin/gufo-kernel-bench
     test -f $out/share/licenses/gufo/LICENSE
     test -f $out/share/licenses/gufo/third-party/LICENSE.ds4
+  '' + lib.optionalString hasExtensionSdk ''
+    test ! -e $out/lib/gufo/sdk
+    test -f $sdk/lib/gufo/sdk/profile.cmake
+    GUFO_SDK_DIR=$sdk/lib/gufo/sdk GUFO_EXTENSIONS_DIR=$TMPDIR/extensions \
+      $out/bin/gufo extension list --json > extension-list.json
+  '' + ''
 
     runHook postInstallCheck
   '';
 
   passthru = {
-    inherit releaseVersion revision rocmPackages rocmRuntime;
+    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock xrt iron;
+    extensionMetadata = import ./extension-metadata.nix {
+      inherit lib sourceRoot extensions extensionsFromLock;
+    };
     toolchain = {
       targetPlatform = "x86_64-linux";
       targetGpu = "gfx1151";

@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "name": "ccip",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_ccip": {
+      "requires": []
+    },
+    "ccip_oracle_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "reference/"
+    ]
+  },
+  "docs": {
+    "title": "CCIP character fingerprints + anime face detector",
+    "inputs": "converted safetensors + JSON (reference/convert_weights.py) of deepghs ccip-caformer-24-randaug-pruned and face_detect_v1.4_n; RGB8 pixels",
+    "guide": "README.md"
+  },
+  "tests": [],
+  "test_labels": [
+    "ccip"
+  ],
+  "fixtures": "reference/"
+}

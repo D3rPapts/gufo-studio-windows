@@ -13,10 +13,16 @@ import pefile
 
 # Windows 11 inbox libraries, not development tools, CRT or GPU SDK runtimes.
 SYSTEM_DLLS = frozenset(
-    """advapi32.dll bcrypt.dll cfgmgr32.dll crypt32.dll gdi32.dll iphlpapi.dll
-    kernel32.dll ncrypt.dll ntdll.dll ole32.dll oleaut32.dll psapi.dll secur32.dll setupapi.dll
-    shell32.dll shlwapi.dll user32.dll version.dll winmm.dll ws2_32.dll""".split()
+    """advapi32.dll bcrypt.dll bcryptprimitives.dll cfgmgr32.dll crypt32.dll gdi32.dll
+    iphlpapi.dll kernel32.dll ncrypt.dll ntdll.dll ole32.dll oleaut32.dll psapi.dll secur32.dll
+    setupapi.dll shell32.dll shlwapi.dll user32.dll userenv.dll version.dll winmm.dll
+    ws2_32.dll""".split()
 )
+
+# Installed by a device driver with plugins it loads from the driver's own
+# folder: a bundled copy cannot find them. Gufo must delay-load these, so it
+# starts without the driver, and the bundle must not ship them.
+DRIVER_DLLS = frozenset({"xrt_coreutil.dll"})  # AMD NPU driver (XRT)
 
 
 def is_system_dll(name):
@@ -24,14 +30,17 @@ def is_system_dll(name):
     return name in SYSTEM_DLLS or name.startswith(("api-ms-win-", "ext-ms-win-"))
 
 
-def imported_dlls(path):
+def imported_dlls(path, delayed_only=False):
+    directories = ["DIRECTORY_ENTRY_DELAY_IMPORT"]
+    if not delayed_only:
+        directories.append("DIRECTORY_ENTRY_IMPORT")
     with pefile.PE(str(path), fast_load=True) as pe:
         if pe.FILE_HEADER.Machine != 0x8664:
             raise ValueError(f"{path.name}: expected an x86-64 PE image")
         pe.parse_data_directories(directories=[1, 13])  # import, delay import
         return {
             entry.dll.decode("ascii").lower()
-            for directory in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT")
+            for directory in directories
             for entry in getattr(pe, directory, [])
         }
 
@@ -57,9 +66,15 @@ def check_bundle(directory):
             if name.lower() not in images:
                 missing.append(f"video runtime requires unbundled {name.lower()}")
 
+    for name in sorted(DRIVER_DLLS & images.keys()):
+        missing.append(f"bundle ships {name}, which must come from its driver")
+
     for name, path in sorted(images.items()):
         for dependency in sorted(imported_dlls(path)):
-            if dependency not in images and not is_system_dll(dependency):
+            if dependency in DRIVER_DLLS:
+                if dependency not in imported_dlls(path, delayed_only=True):
+                    missing.append(f"{name} must delay-load driver library {dependency}")
+            elif dependency not in images and not is_system_dll(dependency):
                 missing.append(f"{name} requires unbundled {dependency}")
     return missing
 
@@ -74,7 +89,8 @@ def main():
         parser.exit(1, f"{error}\n")
     if missing:
         parser.exit(1, "\n".join(missing) + "\n")
-    print("All imported non-system DLLs are bundled (including delay imports).")
+    print("All imported non-system DLLs are bundled (including delay imports), "
+          "except delay-loaded driver DLLs.")
 
 
 if __name__ == "__main__":

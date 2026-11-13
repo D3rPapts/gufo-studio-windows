@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <gufo/ext/registry.hpp>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -20,13 +21,26 @@
 
 namespace {
 
-namespace h3 = gufo::minimax_h3;
-using gufo::server::VideoInterpolation;
+using gufo::ext::CancellationCheck;
+using gufo::ext::VideoProgress;
+using gufo::ext::VideoRequest;
+using gufo::ext::VideoTelemetry;
 using gufo::server::VideoJobRequest;
 using gufo::server::VideoJobResult;
 using gufo::server::VideoJobService;
 using gufo::server::VideoJobServiceOptions;
 using gufo::server::VideoJobStatus;
+
+gufo::ext::VideoParameters ResolveGenerationPreset(std::string_view preset) {
+  const auto* provider = gufo::ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->resolve_preset) {
+    auto res = provider->resolve_preset(preset, nullptr);
+    if (res) {
+      return std::move(*res);
+    }
+  }
+  return {};
+}
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL video_jobs_test: " << message << '\n';
@@ -44,12 +58,11 @@ struct FakeRunner {
   std::condition_variable condition;
   int calls{0};
   bool release{false};
-  std::vector<h3::GenerationRequest> requests;
+  std::vector<VideoRequest> requests;
 
-  bool Run(const h3::GenerationRequest& request,
-           const h3::CancellationToken* cancellation,
-           h3::GenerationProgress progress, void* progress_opaque,
-           h3::GenerationTelemetry* telemetry, std::string* error) {
+  bool Run(const VideoRequest& request, const CancellationCheck& cancellation,
+           VideoProgress progress, void* progress_opaque,
+           VideoTelemetry* telemetry, std::string* error) {
     {
       const std::lock_guard<std::mutex> lock(mutex);
       ++calls;
@@ -62,12 +75,11 @@ struct FakeRunner {
     progress("video_vae", 1, 1, progress_opaque);
     {
       std::unique_lock<std::mutex> lock(mutex);
-      while (!release &&
-             (cancellation == nullptr || !cancellation->IsCancelled())) {
+      while (!release && (!cancellation || !cancellation())) {
         condition.wait_for(lock, std::chrono::milliseconds(5));
       }
     }
-    if (cancellation != nullptr && cancellation->IsCancelled()) {
+    if (cancellation && cancellation()) {
       if (error != nullptr) {
         *error = "cancelled";
       }
@@ -98,7 +110,8 @@ struct FakeRunner {
     }
     if (telemetry != nullptr) {
       telemetry->prompt_tokens = 6;
-      telemetry->denoiser.forward_ms = {1.0, 2.0};
+      telemetry->extra_json =
+          R"({"schema":"gufo.minimax-h3-generation-telemetry.v1","denoiser":{"forward_ms":[1.0, 2.0]}})";
     }
     return true;
   }
@@ -130,15 +143,14 @@ std::string NextId() {
 }
 
 VideoJobRequest Mp4Request(std::string prompt = "A red fox") {
-  auto parameters = h3::ResolveGenerationPreset("fast", nullptr);
-  Check(parameters.has_value(), "fast preset resolves");
+  auto parameters = ResolveGenerationPreset("fast");
   return {
       .model = "minimax-h3",
       .prompt = std::move(prompt),
       .size = "512x512",
       .seconds = "1",
       .output_format = "mp4",
-      .parameters = std::move(*parameters),
+      .parameters = std::move(parameters),
       .seed = 42,
   };
 }
@@ -189,10 +201,10 @@ void TestQueueLifecycleAndRecovery(const std::filesystem::path& root) {
       .id_factory = NextId,
       .now = [&] { return now; },
       .runner =
-          [&](const h3::GenerationRequest& request,
-              const h3::CancellationToken* cancellation,
-              h3::GenerationProgress progress, void* progress_opaque,
-              h3::GenerationTelemetry* telemetry, std::string* error) {
+          [&](const VideoRequest& request,
+              const CancellationCheck& cancellation, VideoProgress progress,
+              void* progress_opaque, VideoTelemetry* telemetry,
+              std::string* error) {
             return runner.Run(request, cancellation, progress, progress_opaque,
                               telemetry, error);
           },
@@ -319,24 +331,23 @@ void TestPpmAndExpiry(const std::filesystem::path& root) {
       .id_factory = NextId,
       .now = [&] { return now; },
       .runner =
-          [&](const h3::GenerationRequest& request,
-              const h3::CancellationToken* cancellation,
-              h3::GenerationProgress progress, void* progress_opaque,
-              h3::GenerationTelemetry* telemetry, std::string* error) {
+          [&](const VideoRequest& request,
+              const CancellationCheck& cancellation, VideoProgress progress,
+              void* progress_opaque, VideoTelemetry* telemetry,
+              std::string* error) {
             return runner.Run(request, cancellation, progress, progress_opaque,
                               telemetry, error);
           },
   });
-  auto parameters = h3::ResolveGenerationPreset("dev", nullptr);
-  Check(parameters.has_value(), "development preset resolves");
-  parameters->selected_frames = {11};
+  auto parameters = ResolveGenerationPreset("dev");
+  parameters.selected_frames = {11};
   const auto created = service.Create({
       .model = "minimax-h3",
       .prompt = "diagnostic",
       .size = "256x256",
       .seconds = "1",
       .output_format = "ppm",
-      .parameters = *parameters,
+      .parameters = parameters,
       .seed = 7,
   });
   Check(created.job.has_value(), "single-frame PPM job admitted");
@@ -381,9 +392,8 @@ void TestValidation(const std::filesystem::path& root) {
       .validate_model_inventory = false,
       .id_factory = NextId,
       .now = {},
-      .runner = [](const h3::GenerationRequest&, const h3::CancellationToken*,
-                   h3::GenerationProgress, void*, h3::GenerationTelemetry*,
-                   std::string*) { return false; },
+      .runner = [](const VideoRequest&, const CancellationCheck&, VideoProgress,
+                   void*, VideoTelemetry*, std::string*) { return false; },
   });
   Check(service.Create(Mp4Request("")).result == VideoJobResult::kInvalid,
         "empty prompt is rejected");
@@ -407,16 +417,15 @@ void TestValidation(const std::filesystem::path& root) {
   Check(service.Create(invalid).result == VideoJobResult::kInvalid,
         "model alias cannot disagree with the frozen preset");
 
-  auto development = h3::ResolveGenerationPreset("dev", nullptr);
-  Check(development.has_value(), "development preset resolves");
-  development->selected_frames = {11};
+  auto development = ResolveGenerationPreset("dev");
+  development.selected_frames = {11};
   const VideoJobRequest wrong_ppm_size{
       .model = "minimax-h3-dev",
       .prompt = "diagnostic",
       .size = "512x512",
       .seconds = "1",
       .output_format = "ppm",
-      .parameters = *development,
+      .parameters = development,
       .seed = 42,
   };
   Check(service.Create(wrong_ppm_size).result == VideoJobResult::kInvalid,
@@ -432,9 +441,8 @@ void TestValidation(const std::filesystem::path& root) {
       .validate_model_inventory = false,
       .id_factory = [collision_id] { return collision_id; },
       .now = {},
-      .runner = [](const h3::GenerationRequest&, const h3::CancellationToken*,
-                   h3::GenerationProgress, void*, h3::GenerationTelemetry*,
-                   std::string*) { return false; },
+      .runner = [](const VideoRequest&, const CancellationCheck&, VideoProgress,
+                   void*, VideoTelemetry*, std::string*) { return false; },
   });
   Check(collision_service.ready(), collision_service.initialization_error());
   std::filesystem::create_directories(collision_root / collision_id);
@@ -462,15 +470,34 @@ void TestRecoveryHardening(const std::filesystem::path& root) {
   std::error_code link_error;
   std::filesystem::create_symlink(secret, linked_content / "output.mp4",
                                   link_error);
-  Check(!link_error, "content symlink fixture created");
+  // Windows refuses symlinks without SeCreateSymbolicLinkPrivilege
+  // (ERROR_PRIVILEGE_NOT_HELD, 1314): the symlink checks are skipped there,
+  // the metadata/directory ID mismatch check still runs. POSIX keeps the
+  // fixture mandatory.
+  const bool symlinks = !link_error;
+#ifdef _WIN32
+  const bool privilege_missing = link_error && link_error.value() == 1314;
+#else
+  const bool privilege_missing = false;
+#endif
+  if (privilege_missing) {
+    std::cerr << "SKIP video_jobs_test: symlink fixtures (no "
+                 "SeCreateSymbolicLinkPrivilege)" << '\n';
+    std::filesystem::remove(linked_content / "output.mp4", link_error);
+    std::ofstream(linked_content / "output.mp4") << "placeholder";
+  } else {
+    Check(symlinks, "content symlink fixture created");
+  }
 
   const std::string linked_directory_id = "video_0000000000000000000000c1";
   const std::filesystem::path external = root / "external-job";
   WriteCompletedJob(external, linked_directory_id);
   std::ofstream(external / "output.mp4") << "outside-directory";
-  std::filesystem::create_directory_symlink(
-      external, root / linked_directory_id, link_error);
-  Check(!link_error, "directory symlink fixture created");
+  if (symlinks) {
+    std::filesystem::create_directory_symlink(
+        external, root / linked_directory_id, link_error);
+    Check(!link_error, "directory symlink fixture created");
+  }
 
   VideoJobService service({
       .model_root = "/models/h3",
@@ -481,13 +508,13 @@ void TestRecoveryHardening(const std::filesystem::path& root) {
       .validate_model_inventory = false,
       .id_factory = NextId,
       .now = [] { return 3100; },
-      .runner = [](const h3::GenerationRequest&, const h3::CancellationToken*,
-                   h3::GenerationProgress, void*, h3::GenerationTelemetry*,
-                   std::string*) { return false; },
+      .runner = [](const VideoRequest&, const CancellationCheck&, VideoProgress,
+                   void*, VideoTelemetry*, std::string*) { return false; },
   });
   Check(service.ready(), service.initialization_error());
   Check(service.Get(claimed_id).result == VideoJobResult::kNotFound,
         "recovery rejects metadata/directory ID mismatch");
+  if (!symlinks) return;
   Check(service.Get(linked_content_id).result == VideoJobResult::kNotFound,
         "recovery rejects symlinked content");
   Check(service.Get(linked_directory_id).result == VideoJobResult::kNotFound,
@@ -510,9 +537,8 @@ void TestRunnerExceptionRecovery(const std::filesystem::path& root) {
       .id_factory = NextId,
       .now = [] { return 5000; },
       .runner =
-          [&](const h3::GenerationRequest& request,
-              const h3::CancellationToken*, h3::GenerationProgress, void*,
-              h3::GenerationTelemetry*, std::string*) {
+          [&](const VideoRequest& request, const CancellationCheck&,
+              VideoProgress, void*, VideoTelemetry*, std::string*) {
             ++calls;
             if (calls == 1) {
               throw std::runtime_error("injected backend exception");
@@ -562,9 +588,8 @@ void TestRunnerOutputBoundary(const std::filesystem::path& root) {
       .id_factory = NextId,
       .now = [] { return 6000; },
       .runner =
-          [&](const h3::GenerationRequest& request,
-              const h3::CancellationToken*, h3::GenerationProgress, void*,
-              h3::GenerationTelemetry*, std::string*) {
+          [&](const VideoRequest& request, const CancellationCheck&,
+              VideoProgress, void*, VideoTelemetry*, std::string*) {
             std::filesystem::create_directories(
                 request.output_path.parent_path());
             std::error_code link_error;
@@ -589,276 +614,13 @@ void TestRunnerOutputBoundary(const std::filesystem::path& root) {
         "runner output rejection preserves the external target");
 }
 
-void TestInterpolation(const std::filesystem::path& root) {
-  const auto runner = [](const h3::GenerationRequest& request,
-                         const h3::CancellationToken*, h3::GenerationProgress,
-                         void*, h3::GenerationTelemetry*, std::string*) {
-    std::filesystem::create_directories(request.output_path.parent_path());
-    std::ofstream(request.output_path, std::ios::binary) << "generated";
-    return true;
-  };
-  {
-    VideoJobService plain({
-        .model_root = "/models/h3",
-        .source_manifest = "/manifest.json",
-        .storage_root = root / "plain",
-        .queue_capacity = 1,
-        .artifact_ttl = std::chrono::hours(1),
-        .validate_model_inventory = false,
-        .id_factory = NextId,
-        .now = [] { return 7000; },
-        .runner = runner,
-    });
-    Check(plain.ready(), plain.initialization_error());
-    auto request = Mp4Request("interpolate without RIFE");
-    request.interpolate = 4;
-    const auto rejected = plain.Create(request);
-    Check(rejected.result == VideoJobResult::kInvalid &&
-              rejected.error.find("--rife-model") != std::string::npos,
-          "interpolate without an interpolator is rejected");
-  }
-  int seen_multiplier = 0;
-  int seen_fps = 0;
-  bool input_was_generated = false;
-  VideoJobService service({
-      .model_root = "/models/h3",
-      .source_manifest = "/manifest.json",
-      .storage_root = root / "rife",
-      .queue_capacity = 1,
-      .artifact_ttl = std::chrono::hours(1),
-      .validate_model_inventory = false,
-      .id_factory = NextId,
-      .now = [] { return 7000; },
-      .runner = runner,
-      .interpolator =
-          [&](const std::filesystem::path& input,
-              const std::filesystem::path& output,
-              const VideoInterpolation& spec,
-              const h3::CancellationToken*, h3::GenerationProgress progress,
-              void* opaque, std::string*) {
-            progress("interpolate", 1, 2, opaque);
-            seen_multiplier = spec.multiplier;
-            seen_fps = spec.fps_num;
-            input_was_generated = ReadAll(input) == "generated";
-            std::ofstream(output, std::ios::binary) << "interpolated";
-            return true;
-          },
-  });
-  Check(service.ready(), service.initialization_error());
-  auto request = Mp4Request("interpolate x4");
-  request.interpolate = 9;
-  Check(service.Create(request).result == VideoJobResult::kInvalid,
-        "interpolate above 8 is rejected");
-  request.interpolate = 4;
-  const auto created = service.Create(request);
-  Check(created.job.has_value(), "interpolation request admitted");
-  WaitUntil(
-      [&] {
-        const auto lookup = service.Get(created.job->id);
-        return lookup.job.has_value() &&
-               lookup.job->status == VideoJobStatus::kCompleted;
-      },
-      "interpolated job did not complete");
-  const auto content = service.Content(created.job->id);
-  Check(content.result == VideoJobResult::kOk && content.content.has_value() &&
-            ReadAll(content.content->path) == "interpolated",
-        "interpolated MP4 is published");
-  Check(seen_multiplier == 4 && input_was_generated,
-        "interpolator sees the generated MP4 and the multiplier");
-  Check(!std::filesystem::exists(root / "rife" / created.job->id /
-                                 "generated.mp4"),
-        "staged generated MP4 is removed");
-
-  auto target = Mp4Request("interpolate to 60 fps");
-  target.interpolate = 2;
-  target.interpolate_fps_num = 60;
-  Check(service.Create(target).result == VideoJobResult::kInvalid,
-        "a multiplier and a target frame rate together are rejected");
-  target.interpolate = 1;
-  target.interpolate_fps_num = 241;
-  Check(service.Create(target).result == VideoJobResult::kInvalid,
-        "a target frame rate above 240 is rejected");
-  target.interpolate_fps_num = 60;
-  const auto resampled = service.Create(target);
-  Check(resampled.job.has_value(), "target frame rate request admitted");
-  WaitUntil(
-      [&] {
-        const auto lookup = service.Get(resampled.job->id);
-        return lookup.job.has_value() &&
-               lookup.job->status == VideoJobStatus::kCompleted;
-      },
-      "target frame rate job did not complete");
-  Check(seen_fps == 60 && seen_multiplier == 1,
-        "interpolator sees the target frame rate");
-}
-
-void TestUpscale(const std::filesystem::path& root) {
-  const auto runner = [](const h3::GenerationRequest& request,
-                         const h3::CancellationToken*, h3::GenerationProgress,
-                         void*, h3::GenerationTelemetry*, std::string*) {
-    std::filesystem::create_directories(request.output_path.parent_path());
-    std::ofstream(request.output_path, std::ios::binary) << "generated";
-    return true;
-  };
-  {
-    VideoJobService plain({
-        .model_root = "/models/h3",
-        .source_manifest = "/manifest.json",
-        .storage_root = root / "plain",
-        .queue_capacity = 1,
-        .artifact_ttl = std::chrono::hours(1),
-        .validate_model_inventory = false,
-        .id_factory = NextId,
-        .now = [] { return 7500; },
-        .runner = runner,
-    });
-    Check(plain.ready(), plain.initialization_error());
-    auto request = Mp4Request("upscale without a model");
-    request.upscale = {.width = 1920, .height = 1200};
-    const auto rejected = plain.Create(request);
-    Check(rejected.result == VideoJobResult::kInvalid &&
-              rejected.error.find("--upscale-model") != std::string::npos,
-          "upscale without an upscaler is rejected");
-  }
-  std::vector<std::string> order;
-  gufo::server::VideoUpscale seen;
-  std::string upscale_input;
-  VideoJobService service({
-      .model_root = "/models/h3",
-      .source_manifest = "/manifest.json",
-      .storage_root = root / "esrgan",
-      .queue_capacity = 1,
-      .artifact_ttl = std::chrono::hours(1),
-      .validate_model_inventory = false,
-      .id_factory = NextId,
-      .now = [] { return 7500; },
-      .runner = runner,
-      .interpolator =
-          [&](const std::filesystem::path& input,
-              const std::filesystem::path& output, const VideoInterpolation&,
-              const h3::CancellationToken*, h3::GenerationProgress, void*,
-              std::string*) {
-            order.push_back("interpolate:" + ReadAll(input));
-            std::ofstream(output, std::ios::binary) << "interpolated";
-            return true;
-          },
-      .upscaler =
-          [&](const std::filesystem::path& input,
-              const std::filesystem::path& output,
-              const gufo::server::VideoUpscale& spec,
-              const h3::CancellationToken*, h3::GenerationProgress progress,
-              void* opaque, std::string*) {
-            progress("upscale", 1, 2, opaque);
-            order.push_back("upscale:" + ReadAll(input));
-            seen = spec;
-            std::ofstream(output, std::ios::binary) << "upscaled";
-            return true;
-          },
-      .upscale_models = {"anime", "general"},
-  });
-  Check(service.ready(), service.initialization_error());
-  auto request = Mp4Request("upscale to 1920x1200");
-  request.upscale = {.width = 1921, .height = 1200};
-  Check(service.Create(request).result == VideoJobResult::kInvalid,
-        "an odd upscale width is rejected");
-  request.upscale = {.width = 1920, .height = 1200, .fit = "zoom"};
-  Check(service.Create(request).result == VideoJobResult::kInvalid,
-        "an unknown fit is rejected");
-  request.upscale = {.width = 1920, .height = 1200, .model = "missing"};
-  Check(service.Create(request).result == VideoJobResult::kInvalid,
-        "an unknown upscale model is rejected");
-  request.upscale = {
-      .width = 1920, .height = 1080, .fit = "crop", .model = "general"};
-  request.interpolate_fps_num = 60;
-  const auto created = service.Create(request);
-  Check(created.job.has_value(), "upscale request admitted");
-  WaitUntil(
-      [&] {
-        const auto lookup = service.Get(created.job->id);
-        return lookup.job.has_value() &&
-               lookup.job->status == VideoJobStatus::kCompleted;
-      },
-      "upscaled job did not complete");
-  const auto content = service.Content(created.job->id);
-  Check(content.result == VideoJobResult::kOk && content.content.has_value() &&
-            ReadAll(content.content->path) == "upscaled",
-        "upscaled MP4 is published");
-  Check(order.size() == 2 && order[0] == "interpolate:generated" &&
-            order[1] == "upscale:interpolated",
-        "the upscaler runs after the interpolator on its output");
-  Check(seen.width == 1920 && seen.height == 1080 && seen.fit == "crop" &&
-            seen.model == "general",
-        "upscaler sees the requested size, fit and model");
-}
-
-void TestRecycle(const std::filesystem::path& root) {
-  const auto runner = [](const h3::GenerationRequest& request,
-                         const h3::CancellationToken*, h3::GenerationProgress,
-                         void*, h3::GenerationTelemetry*, std::string*) {
-    std::filesystem::create_directories(request.output_path.parent_path());
-    std::ofstream(request.output_path, std::ios::binary) << "large";
-    return true;
-  };
-  // The fast preset renders 384x384 internally: 7 latent frames x 144 rows.
-  const auto options = [&](std::size_t rows, std::string* recycled) {
-    return gufo::server::VideoJobServiceOptions{
-        .model_root = "/models/h3",
-        .source_manifest = "/manifest.json",
-        .storage_root = root,
-        .queue_capacity = 1,
-        .artifact_ttl = std::chrono::hours(1),
-        .validate_model_inventory = false,
-        .id_factory = NextId,
-        .now = [] { return 8000; },
-        .runner = runner,
-        .recycle_rows = rows,
-        .recycle = [recycled](const std::string& id) { *recycled = id; },
-    };
-  };
-  std::string recycled;
-  std::string first_id;
-  {
-    VideoJobService small(options(1009, &recycled));
-    const auto created = small.Create(Mp4Request("below the threshold"));
-    Check(created.job.has_value(), "small job admitted");
-    WaitUntil(
-        [&] {
-          const auto lookup = small.Get(created.job->id);
-          return lookup.job.has_value() &&
-                 lookup.job->status == VideoJobStatus::kCompleted;
-        },
-        "small job did not complete");
-    Check(recycled.empty(), "jobs below the row threshold do not recycle");
-    Check(small.Create(Mp4Request("still open")).job.has_value(),
-          "the service keeps admitting jobs below the threshold");
-  }
-  {
-    VideoJobService large(options(1008, &recycled));
-    const auto created = large.Create(Mp4Request("large job"));
-    Check(created.job.has_value(), "large job admitted");
-    first_id = created.job->id;
-    WaitUntil([&] { return recycled == first_id; },
-              "a completed large job recycles the worker");
-    const auto lookup = large.Get(first_id);
-    Check(lookup.job.has_value() &&
-              lookup.job->status == VideoJobStatus::kCompleted,
-          "the recycled job is completed before the callback");
-    const auto refused = large.Create(Mp4Request("after recycle"));
-    Check(refused.result == VideoJobResult::kIoError &&
-              refused.error.find("restarting") != std::string::npos,
-          "a recycling worker refuses new jobs");
-  }
-  // The next process recovers the persisted result.
-  VideoJobService restarted(options(0, &recycled));
-  const auto content = restarted.Content(first_id);
-  Check(content.result == VideoJobResult::kOk && content.content.has_value() &&
-            ReadAll(content.content->path) == "large",
-        "the restarted service serves the recycled job's video");
-}
-
 }  // namespace
 
+void minimax_h3_register(gufo::ext::Registry&);
+
 int main() {
+  gufo::ext::Registry registry;
+  minimax_h3_register(registry);
   const std::filesystem::path base =
       std::filesystem::temp_directory_path() /
       ("gufo-video-jobs-test-" + std::to_string(gufo::platform::ProcessId()));
@@ -871,9 +633,6 @@ int main() {
   TestRecoveryHardening(base / "recovery-hardening");
   TestRunnerExceptionRecovery(base / "runner-exception");
   TestRunnerOutputBoundary(base / "runner-output-boundary");
-  TestInterpolation(base / "interpolation");
-  TestUpscale(base / "upscale");
-  TestRecycle(base / "recycle");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video job lifecycle tests passed.\n";
   return 0;

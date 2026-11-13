@@ -32,7 +32,13 @@
 #include <vector>
 
 #include "src/core/json.hpp"
-#include "src/models/preview_hook.hpp"
+#include "src/ext/image.hpp"
+
+namespace gufo::models {
+// The live-preview hook of 1.x is the extension API's PreviewSink in 2.0.
+using LatentPreview = ext::LatentPreview;
+using PreviewHook = ext::PreviewSink;
+}  // namespace gufo::models
 
 namespace gufo::server {
 

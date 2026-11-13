@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "wan22",
+  "target": "gufo_wan22",
+  "kind": "static",
+  "purpose": "Wan 2.2 TI2V 5B and Wan 2.1 14B video generation extension (gufo-studio-windows): request parsing, Uni3C camera, VACE and InfiniteTalk pipelines.",
+  "consumers": [],
+  "checks": []
+}

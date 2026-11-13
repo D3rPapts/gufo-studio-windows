@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 
 namespace gufo::models::fish_drama3 {
 

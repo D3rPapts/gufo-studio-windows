@@ -10,7 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 
 namespace gufo::models::fish_drama3 {
 namespace {

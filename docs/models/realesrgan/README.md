@@ -76,13 +76,28 @@ the default model with `pad`. Width and height must be even (at most
 size, then every output frame upscaled) and reports progress phase `upscale`.
 Without `--upscale-model` the request is rejected with 400.
 
-## Images on the NPU, GPU or CPU (`gufo serve upscale`)
+## Images and videos on the NPU, GPU or CPU (`gufo serve upscale`)
 
 ```
 gufo serve upscale --device npu --model realesr-animevideov3=body896q_h288_h3.onnx \
                    [--model realesr-animevideov3=body512q_h280_h3.onnx] \
                    [--npu-cache DIR] --port 8095
+gufo serve upscale --device gpu --served-model-name gufo-upscale \
+                   --model realesr-general-x4v3.safetensors \
+                   --model realesr-general-wdn-x4v3.safetensors \
+                   --model realesr-animevideov3.safetensors --port 8095
 ```
+
+Every weight file carries a **variant** read from its file name: `general`
+(realesr-general-x4v3, 32 body convolutions), `wdn` (realesr-general-wdn-x4v3,
+32, weaker denoising) and `anime` (realesr-animevideov3, 16). Files given
+without `NAME=` share the public model id (`--served-model-name`, else the
+file stem) and are chosen per request with `"variant"`; a variant name alone
+also works as `model` on the worker itself. On the GPU the safetensors header
+is checked on the host at start-up (tensor names and shapes against the
+`__metadata__`), so a wrong file fails with a clear message before anything
+is uploaded; `GET /v1/models` lists the variants with their convolution
+count.
 
 - `--device npu` runs a Real-ESRGAN **body** ONNX (the convolutions before
   the pixel shuffle, int8 QDQ from AMD Quark, fixed input size) on the AMD
@@ -107,20 +122,76 @@ columns 15..1934 -> 1920x1200 (`fit: "crop"`). `pad` and `stretch` use the
 same area filter. One model name may have several files, one per frame
 width; the request's frame picks the file.
 
-`POST /v1/images/upscale`
+### `POST /v1/images/upscale`
 
 ```json
-{"model": "realesr-animevideov3", "image": "data:image/png;base64,...",
- "size": "1920x1080", "fit": "crop", "response_format": "b64_json"}
+{"model": "gufo-upscale", "variant": "general",
+ "image": "data:image/png;base64,...",
+ "scale": 4, "fit": "crop", "output": "png", "response_format": "b64_json"}
 ```
 
-returns `{created, model, device, model_file, width, height, fit,
-data: [{b64_json}], cost: {seconds, queue_seconds, body_seconds,
-post_seconds, png_seconds}}` and a `Server-Timing` header;
-`"response_format": "png"` returns the PNG itself. Without `size` (or
-`width`/`height`) the x4 picture is returned. Requests run one at a time;
-more than 8 waiting give 429. As a router section (the router forwards
-`/v1/images/upscale` by the body's `model`, here the section id):
+- `image`: data URL, raw base64, public https URL or `file:` path.
+- `scale`: 4 (native) or 2 (the x4 picture resized to half: Lanczos-3 on
+  the GPU, OpenCV-exact `INTER_AREA` on the NPU / CPU). `size: "WxH"` or
+  `width` + `height` (at most 8192 on a side) replace the scale and use
+  `fit` (`crop` default, `pad`, `stretch`).
+- `output`: `png` (default) or `jpg` (`quality` 1..100, default 90).
+- `response_format`: `b64_json` (default) wraps the encoded image in JSON,
+  `png` / `jpg` return the bytes.
+- `async: true` answers at once with a job object; read it at
+  `GET /v1/images/upscale/{id}` and fetch the result (bytes or the same
+  JSON as the sync answer) at `GET /v1/images/upscale/{id}/content`.
+
+The sync answer is `{created, model, variant, device, model_file, width,
+height, input, scale, fit, format, data: [{b64_json}], cost: {seconds,
+queue_seconds, body_seconds, post_seconds, encode_seconds}}` with a
+`Server-Timing` header. Requests run one at a time; more than 8 waiting give
+429.
+
+### `POST /v1/videos/upscale`
+
+```json
+{"model": "gufo-upscale", "variant": "anime",
+ "video": "data:video/mp4;base64,...", "scale": 2,
+ "fit": "pad", "crf": 18, "keep_audio": true}
+```
+
+An async job (`"async": false` waits and returns the MP4): FFmpeg decodes
+the upload to RGB24 frames, every frame runs through the network (between
+any sync image requests), FFmpeg encodes H.264 at the input frame rate with
+the first audio stream copied unchanged. `scale` 2 | 4 keeps the aspect
+ratio; `size` / `width` + `height` (even, at most 8192) use `fit`. The
+answer is a video-job object `{id, object: "video", status: queued |
+in_progress | completed | failed | cancelled, progress (0..100), model,
+variant, size, input, upscale: {frames, frames_done, fps, audio, crf},
+cost, error}` (202 + `Location`); `GET /v1/videos/{id}` reads it,
+`GET /v1/videos/{id}/content` returns the MP4 (409 while running) and
+`DELETE /v1/videos/{id}` cancels a running job or drops a finished result.
+Up to 8 jobs queue; finished results stay for an hour (at most 8). Uploads
+are limited to 512 MiB.
+
+### Router section
+
+The router forwards `/v1/images/upscale` and `/v1/videos/upscale` by the
+body's `model` (the section id) and records the job id of a
+`/v1/videos/upscale` answer like a `/v1/videos` job, so the status, content
+and cancel reads reach the same worker; async image jobs are tracked like
+music jobs (`/v1/images/upscale/{id}`). Every `model =` / `--model` file
+without `NAME=` takes the served name, so the three variants sit behind one
+id:
+
+```ini
+[external/gufo-upscale]
+command = D:\llm-modelle\gufo\app\gufo-1.4.9-2026-11-08\gufo.exe
+args = serve upscale --device gpu --model D:\llm-modelle\upscale\realesr-general-wdn-x4v3.safetensors --model D:\llm-modelle\upscale\realesr-animevideov3.safetensors
+model = D:\llm-modelle\upscale\realesr-general-x4v3.safetensors
+served-model-name = gufo-upscale
+max-request-bytes = 134217728
+router-gpu-gb = 1
+router-host-gb = 1
+```
+
+The NPU variant stays as before:
 
 ```ini
 [external/realesr-npu]

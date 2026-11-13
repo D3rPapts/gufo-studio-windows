@@ -93,6 +93,11 @@ public:
   std::uint32_t max_context() const override { return 65536; }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;
+  std::optional<PromptAdmissionBudget> prompt_admission_budget()
+      const override {
+    return prompt_budget;
+  }
+  std::optional<PromptAdmissionBudget> prompt_budget;
   std::string model_path() const override { return served_path; }
   std::string build_info() const override { return served_build; }
   std::string served_path;
@@ -104,6 +109,10 @@ public:
       std::string_view client_id,
       const std::vector<std::string>& stop_sequences, bool return_progress,
       bool cache_prompt, bool cache_persist) override {
+    if (reject_memory)
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kInsufficientMemory,
+          "prompt exceeds host headroom", 4096, 512);
     last_ignore_eos = ignore_eos;
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_complete(
@@ -116,6 +125,10 @@ public:
       const gufo::server::ChatRequest& request, std::size_t max_tokens,
       const gufo::sampling::SamplingConfig& sampling,
       const CancellationCheck& cancellation, bool stream) override {
+    if (reject_memory)
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kInsufficientMemory,
+          "prompt exceeds host headroom", 4096, 512);
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_chat(request, max_tokens, sampling,
                                           cancellation, stream),
@@ -123,6 +136,7 @@ public:
   }
   SamplingDefaults sampling_defaults() const override { return defaults; }
   SamplingDefaults defaults;
+  bool reject_memory{false};
   gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning;
   }
@@ -136,11 +150,18 @@ public:
   }
   std::optional<std::size_t> count_chat_tokens(
       const gufo::server::ChatRequest& request) const override {
+    counted_chat = request;
     counted_messages = request.messages.size();
     counted_tools = request.tools.size();
+    if (count_failure == 1)
+      throw std::invalid_argument("invalid counting prompt");
+    if (count_failure == 2)
+      throw std::length_error("counting prompt too large");
     return chat_token_count;
   }
   std::optional<std::size_t> chat_token_count;
+  int count_failure{0};
+  mutable gufo::server::ChatRequest counted_chat;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
   std::optional<std::string> render_chat_prompt(
@@ -153,6 +174,13 @@ public:
   std::optional<std::string> rendered_prompt;
   std::optional<std::string> render_error;
   mutable gufo::server::ChatRequest rendered_chat;
+  std::optional<std::vector<std::uint32_t>> tokenize(
+      std::string_view text) const override {
+    tokenized_text = std::string(text);
+    return token_ids;
+  }
+  std::optional<std::vector<std::uint32_t>> token_ids;
+  mutable std::string tokenized_text;
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
                   const CancellationCheck& cancel, const TokenCallback& token,

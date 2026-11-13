@@ -187,7 +187,7 @@ int main() {
     }
     namespace quant = gufo::quant;
     const Format formats[] = {
-        {18, "IQ3_XXS", 256, sizeof(quant::block_iq3_xxs),
+        {18, "IQ3_XXS", 256, std::size_t{98} /* IQ3_XXS block */,
          quant::DequantizeIQ3_XXS},
         {23, "IQ4_XS", 256, sizeof(quant::block_iq4_xs),
          quant::DequantizeIQ4_XS},

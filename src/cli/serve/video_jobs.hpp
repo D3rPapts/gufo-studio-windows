@@ -6,15 +6,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "src/cli/serve/media/video_postprocess.hpp"
 #include "src/cli/serve/preview.hpp"
-#include "src/models/minimax_h3/generation.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
 
@@ -38,176 +38,29 @@ enum class VideoJobResult : std::uint8_t {
   kIoError,
 };
 
-// Which model family a video service runs. MiniMax H3 is validated against
-// its pinned source manifest; Wan 2.2 TI2V-5B is a Diffusers directory
-// (model_index.json names WanPipeline) and reuses GenerationParameters with
-// preset "wan22": output size, frames and evaluations (= sampling steps).
-enum class VideoModelFamily : std::uint8_t {
-  kMinimaxH3,
-  kWan22,
-  kWan21Uni3C,
-  kWan21Vace,
-  kWan21Talk,
-};
-
-inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
-inline constexpr std::string_view kWan22Preset = "wan22";
-// Wan 2.1 I2V 14B + lightx2v + Uni3C camera control (+ MoGe-2 camera paths).
-inline constexpr std::string_view kWan21ModelId = "wan2.1-uni3c";
-inline constexpr std::string_view kWan21Preset = "wan21";
-
-// Wan 2.1 I2V 14B + lightx2v + InfiniteTalk (audio-driven talking video,
-// one or two speakers), 25 fps; see video_talk.hpp.
-inline constexpr std::string_view kWan21TalkModelId = "wan2.1-infinitetalk-14b";
-inline constexpr std::string_view kWan21TalkPreset = "wan21-talk";
-
-/// An InfiniteTalk bundle: `gufo-talk.json` in the root names its parts.
-[[nodiscard]] bool IsWan21TalkDirectory(const std::filesystem::path& root);
-/// Size as Wan 2.1 camera jobs, 1..1500 frames (60 s at 25 fps), 1..20
-/// steps.
-[[nodiscard]] bool ValidateWan21TalkParameters(
-    const minimax_h3::GenerationParameters& parameters,
-    std::string* error = nullptr);
-/// 25 fps: round(seconds * 25) frames for 0.04..60 seconds.
-[[nodiscard]] std::optional<int> ResolveWan21TalkDurationFrames(
-    std::string_view seconds, std::string* error = nullptr);
-
-/// A Wan 2.1 camera bundle: `gufo-camera.json` in the root names its parts
-/// (see video_wan21.hpp).
-[[nodiscard]] bool IsWan21CameraDirectory(const std::filesystem::path& root);
-[[nodiscard]] bool ValidateWan21Parameters(
-    const minimax_h3::GenerationParameters& parameters,
-    std::string* error = nullptr);
-/// 16 fps: 4k + 1 frames for 0.25..5 seconds (at most 81).
-[[nodiscard]] std::optional<int> ResolveWan21DurationFrames(
-    std::string_view seconds, std::string* error = nullptr);
-
-// Wan 2.1 VACE 14B (T2V 14B + VACE module, video editing with a control
-// video, masks and reference images), 16 fps like the camera family.
-inline constexpr std::string_view kWan21VaceModelId = "wan2.1-vace-14b";
-inline constexpr std::string_view kWan21VacePreset = "wan21-vace";
-/// A VACE bundle: `gufo-vace.json` in the root names its parts (see
-/// video_vace.hpp).
-[[nodiscard]] bool IsWan21VaceDirectory(const std::filesystem::path& root);
-/// Multiples of 16, 256..1280 per side, at most 1280 * 720 pixels; frames
-/// 4k + 1 in 5..81; 1..50 steps.
-[[nodiscard]] bool ValidateWan21VaceParameters(
-    const minimax_h3::GenerationParameters& parameters,
-    std::string* error = nullptr);
-
-// True when `root/model_index.json` describes a Wan 2.2 TI2V-5B pipeline.
-[[nodiscard]] bool IsWan22ModelDirectory(const std::filesystem::path& root);
-
-// Wan 2.2 request shape: multiples of 32, 256..1280 per side and at most
-// 1280 * 704 pixels; 4k + 1 frames up to 121; 1..100 steps.
-[[nodiscard]] bool ValidateWan22Parameters(
-    const minimax_h3::GenerationParameters& parameters,
-    std::string* error = nullptr);
-// Frames at 24 fps for an HTTP duration of 1..5 seconds, snapped to 4k + 1.
-[[nodiscard]] std::optional<int> ResolveWan22DurationFrames(
-    std::string_view seconds, std::string* error = nullptr);
-// Parses "WxH".
-[[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
-                                  int* height);
-
-// RIFE post-processing of a finished MP4 ("gufo.interpolate"): a whole-number
-// multiplier (frames (n - 1) * m + 1 at m times the rate) or, when fps_num >
-// 0, a target frame rate at the same speed (e.g. 60 from 24 or 16 fps).
-struct VideoInterpolation {
-  int multiplier{1};  // 1 = off, 2..8
-  int fps_num{0};     // > 0 replaces the multiplier
-  int fps_den{1};
-  [[nodiscard]] bool enabled() const { return fps_num > 0 || multiplier > 1; }
-};
-
-// Real-ESRGAN post-processing of a finished MP4 ("gufo.upscale"), after any
-// interpolation: every frame upscaled into width x height (both even), the
-// picture fitted by `fit` ("pad": keep the aspect ratio with black bars,
-// "crop": keep it and centre-crop, "stretch").
-struct VideoUpscale {
-  int width{0};  // 0 = off
-  int height{0};
-  std::string fit{"pad"};
-  // A name registered with --upscale-model; empty: the first registered.
-  std::string model;
-  [[nodiscard]] bool enabled() const { return width > 0 || height > 0; }
-};
-
-// A MiniMax H3 guide clip as uploaded (MiniMaxH3AddGuide with a frame batch,
-// e.g. LoadVideo -> GetVideoComponents): MP4 bytes anchored at pixel frame
-// `frame` (negative counts from the end). The worker decodes it with FFmpeg.
-struct VideoGuideUpload {
-  int frame{0};
-  std::vector<std::uint8_t> mp4;
-};
-
 struct VideoJobRequest {
   std::string model{"minimax-h3"};
   std::string prompt;
   std::string size{"512x512"};
   std::string seconds{"1"};
   std::string output_format{"mp4"};
-  minimax_h3::GenerationParameters parameters;
+  ext::VideoParameters parameters;
   std::uint64_t seed{42};
-  // FL2VA keyframes and guide frames (decoded RGB8), one per pixel frame.
-  std::vector<minimax_h3::GenerationKeyframe> keyframes;
-  // Audio guides (decoded 32 kHz stereo), e.g. the voice at frame 0.
-  std::vector<minimax_h3::GenerationAudioGuide> audio_guides;
-  // Guide clips (MP4); each counts as one of the eight image guides.
-  std::vector<VideoGuideUpload> h3_guide_videos;
-  // Name of a LoRA registered with the service; empty for none.
-  std::string lora;
-  std::optional<double> lora_strength;
-  // False lets a registered LoRA choose its own step count.
-  bool steps_explicit{false};
-  // Wan 2.2 only: image-to-video first frame (decoded RGB8 at its own size,
-  // empty for text-to-video), negative prompt and guidance scale.
-  int first_frame_width{0};
-  int first_frame_height{0};
-  std::vector<std::uint8_t> first_frame;
-  std::string negative_prompt;
-  double guidance{5.0};
-  // RIFE frame multiplier for the finished MP4 (1 = off, 2..8) or, when
-  // interpolate_fps_num > 0, its target frame rate; needs
-  // VideoJobServiceOptions::interpolator.
-  int interpolate{1};
-  int interpolate_fps_num{0};
-  int interpolate_fps_den{1};
-  // Upscaling of the finished (interpolated) MP4; needs
-  // VideoJobServiceOptions::upscaler.
-  VideoUpscale upscale;
-  // Wan 2.1 camera: the "gufo.camera" object as JSON (type/amount/speed/ease
-  // or poses), and an uploaded guide video (MP4 bytes) instead.
-  std::string camera_json;
-  std::vector<std::uint8_t> guide_video;
-  // Post-processing only (MP4 bytes, e.g. ComfyUI LoadVideo -> RIFE VFI): no
-  // generation, the upload is interpolated and/or upscaled. Needs
-  // `interpolate` or `upscale`; the model, prompt and size are not used.
+  /// Provider-owned options and inputs (`VideoProvider::prepare_request`).
+  std::string options_json;
+  std::vector<ext::VideoAttachment> attachments;
+  /// gufo-studio-windows post-steps after the runner (RIFE, Real-ESRGAN);
+  /// need VideoJobServiceOptions::postprocessors.
+  VideoPostProcess post;
+  /// Post-processing only (MP4 bytes, e.g. ComfyUI LoadVideo -> RIFE VFI):
+  /// nothing is generated, the upload is interpolated and/or upscaled. Needs
+  /// a post-step; prompt, size and parameters are not used.
   std::vector<std::uint8_t> source_video;
-  // Wan 2.1 VACE: "gufo.vace" options as JSON; the control video is
-  // `guide_video`, the reference images `keyframes` (RGB8, vision false);
-  // the mask as file bytes with its extension (".mp4" video, or ".ppm": a
-  // binary P6 still, decoded by the API, used for every frame).
-  std::string vace_json;
-  std::vector<std::uint8_t> mask_file;
-  std::string mask_extension;
-  // Wan 2.1 InfiniteTalk: the speakers' audio in `audio_guides` (frame =
-  // speaker index), the "gufo.talk" options as JSON, and one mask image per
-  // speaker when there are two (decoded RGB8 at its own size).
-  std::string talk_json;
-  std::vector<minimax_h3::GenerationKeyframe> speaker_masks;
-  // Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
-  // every second step by default, every step of a MiniMax H3 schedule with
-  // at most 16 steps (Turbo) ("gufo": {"preview": {...}}).
+  /// Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
+  /// every second step by default ("gufo": {"preview": {...}}), for providers
+  /// with `preview_latent` (gufo-studio-windows, as 1.4.9).
   PreviewOptions preview{
       .always = false, .every = 2, .dense_up_to = 16, .max_side = 320};
-};
-
-/// A LoRA the operator registered under a name (`--lora NAME=PATH[,...]`).
-struct VideoLora {
-  std::filesystem::path path;
-  int steps{0};  // 0 keeps the preset's evaluations
-  float strength{1.0F};
 };
 
 struct VideoJobSnapshot {
@@ -232,52 +85,31 @@ struct VideoJobContent {
 };
 
 struct VideoJobServiceOptions {
-  VideoModelFamily family{VideoModelFamily::kMinimaxH3};
-  // Public model id of a Wan 2.2 service (empty: kWan22ModelId).
-  std::string model_id;
+  /// Video provider id; empty: the provider whose probe accepts
+  /// `model_root` (highest `probe_priority`), else `minimax-h3`.
+  std::string provider_id;
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
   std::filesystem::path storage_root;
   std::size_t queue_capacity{1};
   std::chrono::seconds artifact_ttl{std::chrono::hours(1)};
+  /// Additional IDs accepted from requests. They behave as the root
+  /// `minimax-h3` name; the preset-selecting variants stay fixed (#957).
+  std::vector<std::string> model_aliases;
   bool validate_model_inventory{true};
   std::function<std::string()> id_factory;
   std::function<std::int64_t()> now;
-  std::function<bool(const minimax_h3::GenerationRequest&,
-                     const minimax_h3::CancellationToken*,
-                     minimax_h3::GenerationProgress, void*,
-                     minimax_h3::GenerationTelemetry*, std::string*)>
+  std::function<bool(const ext::VideoRequest&, const ext::CancellationCheck&,
+                     ext::VideoProgress, void*, ext::VideoTelemetry*,
+                     std::string*)>
       runner;
-  std::map<std::string, VideoLora, std::less<>> loras;
-  // Qwen3-VL vision tower for keyframe prompt blocks; empty disables them.
-  std::filesystem::path vision_projector;
-  // Frame interpolation of a finished MP4 (input, output, multiplier or
-  // target rate); empty rejects interpolation requests. Progress phase
-  // "interpolate".
-  std::function<bool(const std::filesystem::path&, const std::filesystem::path&,
-                     const VideoInterpolation&,
-                     const minimax_h3::CancellationToken*,
-                     minimax_h3::GenerationProgress, void*, std::string*)>
-      interpolator;
-  // Upscaling of a finished MP4 after any interpolation (input, output,
-  // request); empty rejects upscale requests. `upscale_models` lists the
-  // accepted model names (the first is the default). Progress phase
-  // "upscale".
-  std::function<bool(const std::filesystem::path&, const std::filesystem::path&,
-                     const VideoUpscale&, const minimax_h3::CancellationToken*,
-                     minimax_h3::GenerationProgress, void*, std::string*)>
-      upscaler;
-  std::vector<std::string> upscale_models;
-  // MiniMax H3 worker recycling. After a large job the process keeps GPU
-  // memory that a following large job (e.g. 832x512, 124 frames) cannot do
-  // without, and that job fails with a device fault. When a completed job's
-  // denoiser had at least `recycle_rows` video rows and no other job waits,
-  // `recycle` is called once (with the job id) after the result is
-  // persisted; new requests are then refused with 503 until the process
-  // exits. Completed jobs are recovered from storage by the next process.
-  // 0 or an empty callback disables recycling.
-  std::size_t recycle_rows{0};
-  std::function<void(const std::string& job_id)> recycle;
+  /// gufo-studio-windows: RIFE / Real-ESRGAN post-steps; empty members
+  /// reject requests that ask for them.
+  VideoPostProcessors postprocessors;
+  /// gufo-studio-windows: the provider's own `serve video` options in
+  /// command-line order (`--lora`, `--vision-projector` for MiniMax H3),
+  /// passed to `VideoProvider::create_with_options`.
+  std::vector<std::pair<std::string, std::string>> provider_options;
 };
 
 struct VideoJobCreateResult {
@@ -309,10 +141,18 @@ public:
   VideoJobService& operator=(VideoJobService&&) = delete;
 
   [[nodiscard]] bool ready() const noexcept;
-  [[nodiscard]] VideoModelFamily family() const noexcept;
-  // Public model id: "minimax-h3" or the Wan 2.2 id.
-  [[nodiscard]] std::string model_id() const;
   [[nodiscard]] std::string initialization_error() const;
+  /// The provider this service runs (nullptr when initialization failed).
+  [[nodiscard]] const ext::VideoProvider* provider() const noexcept;
+  /// Canonical model name: the provider id of a provider with
+  /// `prepare_request`, else `minimax-h3`.
+  [[nodiscard]] std::string model_id() const;
+  /// True for a canonical `minimax-h3` name or a configured alias (#957).
+  [[nodiscard]] bool serves_model(std::string_view name) const;
+  /// The request name as a canonical model: aliases map to the root
+  /// `minimax-h3`, unknown names are returned unchanged for rejection.
+  [[nodiscard]] std::string normalize_model(std::string_view name) const;
+  [[nodiscard]] const std::vector<std::string>& model_aliases() const;
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);
   [[nodiscard]] VideoJobContentResult Content(std::string_view id);

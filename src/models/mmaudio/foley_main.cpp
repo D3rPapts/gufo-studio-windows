@@ -13,8 +13,12 @@
 #include <string>
 #include <vector>
 
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 #include "src/models/mmaudio/pipeline.hpp"
+#include "src/models/mmaudio/clip.hpp"
+#include "src/models/mmaudio/network.hpp"
+#include "src/models/mmaudio/synchformer.hpp"
+#include "src/models/mmaudio/vocoder.hpp"
 #include "src/models/mmaudio/preprocess.hpp"
 #include "src/models/mmaudio/video_input.hpp"
 

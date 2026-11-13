@@ -1,0 +1,110 @@
+{
+  "schema": 1,
+  "name": "indextts",
+  "version": "0.2.0",
+  "api_version": ">= 0.3.0",
+  "entry": "indextts_register",
+  "registration_target": "gufo_indextts",
+  "depends": [
+    "ming_tts",
+    "voxcpm2"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "indextts",
+      "capability": "speech_synthesis",
+      "keys": [
+        "manifest:IndexTTS-2.5"
+      ],
+      "model_ids": [
+        "indextts-2.5-german",
+        "indextts-2.5",
+        "indextts"
+      ],
+      "target": "gufo_indextts_provider",
+      "entry": "indextts_provider_register",
+      "serving": {
+        "voices": true
+      }
+    }
+  ],
+  "targets": {
+    "gufo_indextts": {
+      "requires": []
+    },
+    "gufo_indextts_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "gufo_indextts_provider": {
+      "requires": []
+    },
+    "indextts_request_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "indextts_oracle_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "indextts_provider_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
+    "indextts_hip_test": {
+      "role": "test",
+      "requires": [
+        "hip",
+        "testing"
+      ]
+    }
+  },
+  "packages": [
+    {
+      "pkg_config": "soxr",
+      "nix": "soxr",
+      "windows": "soxr"
+    }
+  ],
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "reference/"
+    ]
+  },
+  "docs": {
+    "title": "IndexTTS-2.5 (German)",
+    "inputs": "IndexTTS-2.5 bundle (config.yaml, german/gpt.pth, s2mel.pth, codec.pth, w2v-bert-2.0, campplus, BigVGAN); German text, reference voice; 8-value emotion vector or emotion names in instructions",
+    "guide": "README.md"
+  },
+  "tests": [
+    {
+      "target": "indextts_request_test",
+      "ctest": "indextts.request",
+      "check_pr": true,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "indextts"
+  ],
+  "fixtures": "reference/"
+}

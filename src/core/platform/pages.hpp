@@ -56,11 +56,6 @@ void VisitMappedChunks(
 void PopulateWritablePages(void* data, std::size_t bytes,
                            std::size_t worker_limit = 4) noexcept;
 
-/// Asks the OS to drop this process's resident pages it can reload later
-/// (file-backed mapping pages after their upload, for instance). Windows keeps
-/// such pages in the working set until memory runs out; elsewhere a no-op.
-void TrimResidentPages() noexcept;
-
 /// Returns a human-readable summary of resident pages in `[data, data +
 /// bytes)`.
 std::string DescribeResidentPages(void* data, std::size_t bytes);
@@ -71,6 +66,12 @@ SharedTempMapping CreateSharedTempMapping(std::size_t bytes) noexcept;
 
 /// Releases a mapping created by CreateSharedTempMapping().
 void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept;
+
+/// Asks the OS to drop this process's resident pages it can reload later
+/// (file-backed mapping pages after their upload, for instance). Windows keeps
+/// such pages in the working set until memory runs out; elsewhere a no-op.
+/// gufo-studio-windows (Fish Drama-3 loader).
+void TrimResidentPages() noexcept;
 
 }  // namespace gufo::platform
 

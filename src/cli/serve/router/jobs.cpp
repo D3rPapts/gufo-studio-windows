@@ -28,7 +28,9 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/proxy.hpp"
+#include "src/cli/serve/router/strings.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::router::jobs {
@@ -80,6 +82,12 @@ struct JobQueue::Job {
   std::string pulled_by;
   /// X-Gufo-Pool for the job's requests ("local", "remote", "" = any).
   std::string side;
+  /// Submitted with X-Gufo-Pool: local (a user without the pool right,
+  /// 2.0.3): runs here only, never handed to the partner; survives a
+  /// requeue and a restart.
+  bool pin_local{false};
+  /// 0..kPriorityMax, higher runs first (with created_at the run order).
+  int priority{0};
   std::atomic<bool> cancel{false};
   /// The cancel came from Stop(), not from a client.
   std::atomic<bool> shutdown{false};
@@ -172,13 +180,6 @@ bool ValidJobId(std::string_view id) {
     if (!std::isxdigit(static_cast<unsigned char>(c)))
       return false;
   return true;
-}
-
-std::string Lower(std::string_view text) {
-  std::string out(text);
-  for (char& c : out)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return out;
 }
 
 bool ValidHostName(std::string_view host) {
@@ -1441,7 +1442,8 @@ std::vector<std::string> LoraNames(const json::Value& body) {
 }
 
 bool CanRun(const json::Value& capabilities, const std::string& model,
-            const std::vector<std::string>& loras, std::string* why) {
+            const std::vector<std::string>& loras, std::string* why,
+            bool now) {
   const json::Value* models = capabilities.find("models");
   if (models == nullptr || !models->is_object())
     models = &capabilities;
@@ -1455,6 +1457,19 @@ bool CanRun(const json::Value& capabilities, const std::string& model,
     if (why != nullptr)
       *why = "has model '" + model + "' placed remote";
     return false;
+  }
+  if (now) {
+    // A load failure holds there (older routers send no field: may).
+    const json::Value* available = entry->find("available");
+    if (available != nullptr && available->is_bool() &&
+        !available->as_bool()) {
+      if (why != nullptr) {
+        const std::string reason = entry->member_str("unavailable");
+        *why = "cannot load model '" + model + "' now" +
+               (reason.empty() ? "" : " (" + reason + ")");
+      }
+      return false;
+    }
   }
   const json::Value* have = entry->find("loras");
   for (const std::string& need : loras) {
@@ -1666,6 +1681,8 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
   auto job = std::make_shared<Job>();
   job->path = path;
   std::string payload;
+  // A multipart form field "priority" (edits, upscale).
+  std::string priority_part;
   const json::Value* json_body = inner->find("body");
   const json::Value* raw_body = inner->find("body_base64");
   if ((json_body != nullptr) == (raw_body != nullptr))
@@ -1706,6 +1723,8 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       for (const auto& part : parts) {
         if (part.name == "model")
           job->model = part.data;
+        if (part.name == "priority")
+          priority_part = part.data;
         if (part.name == "loras") {
           // The ComfyUI adapter sends the LoRA list as a JSON part.
           try {
@@ -1732,6 +1751,22 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
       }
     }
   }
+  // Priority (2.0.3): the header wins, then the submit body's "priority",
+  // then the wrapped body's (JSON member or multipart field).
+  {
+    std::string header = request.header(kPriorityHeader);
+    const json::Value* member = nullptr;
+    if (header.empty()) {
+      member = body.find("priority");
+      if (member == nullptr && json_body != nullptr)
+        member = json_body->find("priority");
+      if (member == nullptr && !priority_part.empty())
+        header = priority_part;
+    }
+    std::string why;
+    if (!ParsePriority(header, member, &job->priority, &why))
+      return Err(400, "Bad Request", why, "invalid_priority");
+  }
   // The video concat runs on the router itself (ffmpeg), without a model.
   const bool needs_model = job->path != kConcatPath;
   if (needs_model && job->model.empty())
@@ -1742,14 +1777,24 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
           options_.models.end())
     return Err(404, "Not Found", "unknown model '" + job->model + "'",
                "model_not_found");
+  // X-Gufo-Pool: local on the submit (the access gate sets it for a user
+  // without the pool right): the job stays on this machine for good.
+  job->pin_local = PoolSideOf(request.header(kPoolSideHeader)) == "local";
+  if (job->pin_local)
+    job->side = "local";
   if (needs_model) {
     // Neither router can run it (model placed remote on both, a LoRA no
     // machine has): say so now instead of failing the job later.
     json::Value refusal;
-    SideFor(*job, &refusal);
+    const std::string side = SideFor(*job, &refusal);
     if (!refusal.is_null())
       return Err(400, "Bad Request", refusal.member_str("message"),
                  refusal.member_str("code"));
+    if (job->pin_local && side == "remote")
+      return Err(400, "Bad Request",
+                 "only the partner router can run this job, but this user "
+                 "may not use the partner (pool = aus)",
+                 "pool_not_allowed");
   }
   if (const json::Value* metadata = body.find("metadata");
       metadata != nullptr && !metadata->is_null()) {
@@ -1758,6 +1803,15 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
                  "metadata must be a JSON object of at most 16 KiB",
                  "invalid_metadata");
     job->metadata = *metadata;
+  }
+  // The owner (2.0.3): the access gate names the user on every request
+  // it lets through (X-Gufo-User, a client's own copy is dropped there);
+  // the partner's relays carry the entry router's user the same way.
+  if (const std::string owner = request.header("X-Gufo-User");
+      !owner.empty()) {
+    if (!job->metadata.is_object())
+      job->metadata = json::Value::object();
+    job->metadata["nutzer"] = owner;
   }
   if (const json::Value* webhook = body.find("webhook_url");
       webhook != nullptr && !webhook->is_null()) {
@@ -1778,8 +1832,14 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
   if (job->idempotency_key.size() > kMaxIdempotencyKey)
     return Err(400, "Bad Request", "Idempotency-Key is longer than 255",
                "invalid_idempotency_key");
+  // Keys are per owner (2.0.3): another user with the same key never
+  // sees or collides with this job.
+  const std::string owner = job->metadata.member_str("nutzer");
+  if (!job->idempotency_key.empty() && !owner.empty())
+    job->idempotency_key = owner + "\x1f" + job->idempotency_key;
   {
     json::Value fingerprint = json::Value::object();
+    fingerprint["owner"] = owner;
     fingerprint["path"] = job->path;
     fingerprint["content_type"] = job->content_type;
     fingerprint["body"] = crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -1816,13 +1876,16 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
   jobs_[job->id] = job;
   if (!job->idempotency_key.empty())
     idempotency_[job->idempotency_key] = job->id;
-  pending_.push_back(job);
+  InsertPendingLocked(job, /*front=*/false);
   PersistLocked();
   const json::Value view = ViewLocked(*job);
   lock.unlock();
   wake_.notify_all();
   Logger::Info("jobs", "event=job_queued id=" + job->id + " path=" + job->path +
                            " model=" + job->model +
+                           (job->priority > 0
+                                ? " priority=" + std::to_string(job->priority)
+                                : "") +
                            (job->webhook_url.empty() ? "" : " webhook=yes"));
   HttpResponse accepted = JsonResponse(202, "Accepted", view);
   accepted.headers.emplace_back("Location", "/v1/jobs/" + job->id);
@@ -1853,6 +1916,18 @@ HttpResponse JobQueue::List(const HttpRequest& request) {
   body["object"] = "list";
   body["data"] = std::move(data);
   return JsonResponse(200, "OK", body);
+}
+
+void JobQueue::InsertPendingLocked(const std::shared_ptr<Job>& job,
+                                   bool front) {
+  // Run order: the highest priority first, then the oldest (first in, first
+  // out). A requeued job goes back to the front of its priority.
+  auto it = pending_.begin();
+  while (it != pending_.end() &&
+         (front ? (*it)->priority > job->priority
+                : (*it)->priority >= job->priority))
+    ++it;
+  pending_.insert(it, job);
 }
 
 bool JobQueue::MatchesLocked(const Job& job, const Filter& filter) const {
@@ -2319,8 +2394,13 @@ HttpResponse JobQueue::PoolList(const HttpRequest& request) {
     }
     std::stable_sort(queued.begin(), queued.end(),
                      [&merged](std::size_t a, std::size_t b) {
-                       return merged[a].member_double("created_at") <
-                              merged[b].member_double("created_at");
+                       return RunsBefore(
+                           PriorityOfView(merged[a]),
+                           static_cast<long long>(
+                               merged[a].member_double("created_at")),
+                           PriorityOfView(merged[b]),
+                           static_cast<long long>(
+                               merged[b].member_double("created_at")));
                      });
     for (json::Value& job : merged)
       job["position"] = nullptr;
@@ -2471,6 +2551,9 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   else
     view["running_on"] = "local";
   view["pool_wait"] = pool_state == "wait";
+  if (job.pin_local)
+    view["pinned"] = "local";
+  view["priority"] = static_cast<long long>(job.priority);
   view["created_at"] = job.created_at;
   view["started_at"] =
       job.started_at > 0 ? json::Value(job.started_at) : json::Value();
@@ -2553,6 +2636,8 @@ json::Value JobQueue::RecordLocked(const Job& job) const {
   record["metadata"] = job.metadata;
   record["idempotency_key"] = job.idempotency_key;
   record["request_hash"] = job.request_hash;
+  record["priority"] = static_cast<long long>(job.priority);
+  record["pin_local"] = job.pin_local;
   record["created_at"] = job.created_at;
   record["started_at"] = job.started_at;
   record["completed_at"] = job.completed_at;
@@ -2639,6 +2724,13 @@ void JobQueue::Load() {
     job->request_hash = record.member_str("request_hash");
     job->created_at =
         static_cast<long long>(record.member_double("created_at", 0));
+    // A file written before 2.0.3 has no priority: normal.
+    job->priority = PriorityOfView(record);
+    if (const json::Value* pin = record.find("pin_local");
+        pin != nullptr && pin->is_bool())
+      job->pin_local = pin->as_bool();
+    if (job->pin_local)
+      job->side = "local";
     job->started_at =
         static_cast<long long>(record.member_double("started_at", 0));
     job->completed_at =
@@ -2666,7 +2758,7 @@ void JobQueue::Load() {
         if (name.is_string() && !name.str().empty())
           job->loras.push_back(name.str());
     if (job->status == "queued") {
-      pending_.push_back(job);
+      InsertPendingLocked(job, /*front=*/false);
       ++requeued;
     } else if (job->status == "in_progress") {
       // The worker request died with the old router: report it, never
@@ -2703,6 +2795,7 @@ void JobQueue::RunnerMain() {
   for (;;) {
     std::shared_ptr<Job> job;
     long long mine = 0;
+    int mine_priority = 0;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       const auto ready = [this] { return stopping_ || !pending_.empty(); };
@@ -2713,12 +2806,14 @@ void JobQueue::RunnerMain() {
       if (stopping_)
         return;
       ReapPulledLocked();
-      if (!pending_.empty())
+      if (!pending_.empty()) {
         mine = pending_.front()->created_at;
+        mine_priority = pending_.front()->priority;
+      }
     }
-    // Global order: the partner's oldest queued job goes first when it is
-    // older than ours and this machine can run it.
-    if (may_pull && TryPull(mine))
+    // Global order: the partner's first queued job (priority, then age)
+    // goes first when it runs before ours and this machine can run it.
+    if (may_pull && TryPull(mine_priority, mine))
       continue;
     {
       const std::lock_guard<std::mutex> lock(mutex_);
@@ -2784,11 +2879,16 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
         } else if (item.member_str("status") != "queued") {
           continue;
         }
+        // A job pinned to the partner (its user may not use the pool,
+        // 2.0.3) is never handed out: not a candidate, not in the order.
+        if (item.member_str("pinned") == "local")
+          continue;
         PartnerJob job;
         job.id = item.member_str("id");
         job.waiting = waiting;
         job.created_at =
             static_cast<long long>(item.member_double("created_at", 0));
+        job.priority = PriorityOfView(item);
         if (const json::Value* request = item.find("request");
             request != nullptr && request->is_object()) {
           job.model = request->member_str("model");
@@ -2808,11 +2908,13 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
   }
   std::optional<std::vector<PartnerJob>> result;
   if (ok) {
-    // The lists come newest first; the shared queue wants the oldest.
+    // The lists come newest first; the shared queue wants the run order
+    // (highest priority first, then the oldest).
     std::reverse(list.begin(), list.end());
     std::stable_sort(list.begin(), list.end(),
                      [](const PartnerJob& a, const PartnerJob& b) {
-                       return a.created_at < b.created_at;
+                       return RunsBefore(a.priority, a.created_at, b.priority,
+                                         b.created_at);
                      });
     result = std::move(list);
   }
@@ -2822,7 +2924,7 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
   return result;
 }
 
-bool JobQueue::TryPull(long long mine_created_at) {
+bool JobQueue::TryPull(int mine_priority, long long mine_created_at) {
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (std::chrono::steady_clock::now() < pull_hold_until_)
@@ -2834,12 +2936,20 @@ bool JobQueue::TryPull(long long mine_created_at) {
   const json::Value mine = options_.capabilities();
   const PartnerJob* pick = nullptr;
   for (const PartnerJob& candidate : *queued) {
-    if (mine_created_at > 0 && candidate.created_at >= mine_created_at)
-      break;  // ours is older: it goes first
-    if (CanRun(mine, candidate.model, candidate.loras)) {
-      pick = &candidate;
-      break;
-    }
+    if (mine_created_at > 0 &&
+        !RunsBefore(candidate.priority, candidate.created_at, mine_priority,
+                    mine_created_at))
+      break;  // ours goes first (higher priority, or as old and ours)
+    if (!CanRun(mine, candidate.model, candidate.loras, nullptr,
+                /*now=*/true))
+      continue;
+    // The runner is free, but the GPU may not be (12.11.: the .56 pulled
+    // while ComfyUI and the film ran there).
+    std::string busy_why;
+    if (options_.may_pull && !options_.may_pull(candidate.model, &busy_why))
+      continue;
+    pick = &candidate;
+    break;
   }
   if (pick == nullptr)
     return false;
@@ -3013,16 +3123,23 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
         ++waiting_count;
       }
     }
+    // Run order: the highest priority first, within it the submit order.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const auto& a, const auto& b) {
+                       return a.first->priority > b.first->priority;
+                     });
     for (const auto& [job, waiting] : candidates) {
       if (job->path == kConcatPath || job->cancel.load())
         continue;  // runs on this router's ffmpeg
+      if (job->pin_local)
+        continue;  // its user may not use the partner
       // Only a model this router has in the pool can be moved: the
       // request runs through the pool decision with X-Gufo-Pool: remote.
       const json::Value* entry = models->find(job->model);
       if (entry == nullptr || !entry->is_object() ||
           entry->member_str("placement") != "pool")
         continue;
-      if (!CanRun(*caps, job->model, job->loras))
+      if (!CanRun(*caps, job->model, job->loras, nullptr, /*now=*/true))
         continue;
       if (waiting) {
         // The router redirects the waiting request (503 pool_redirected)
@@ -3061,6 +3178,7 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     out["job"] = picked->id;
     out["model"] = picked->model;
     out["created_at"] = picked->created_at;
+    out["priority"] = static_cast<long long>(picked->priority);
     out["was_waiting"] = picked_waiting;
     Logger::Info("jobs", "event=pool_pushed id=" + picked->id + " model=" +
                              picked->model + " to=" + requester +
@@ -3207,6 +3325,10 @@ FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
     const std::lock_guard<std::mutex> lock(mutex_);
     if (!job->side.empty())
       request.headers.emplace_back(kPoolSideHeader, job->side);
+    // The pool decision (here and on the partner) sees the priority.
+    if (job->priority > 0)
+      request.headers.emplace_back(kPriorityHeader,
+                                   std::to_string(job->priority));
   }
   request.request_id = job->id;
   request.is_cancelled = [job] { return job->cancel.load(); };
@@ -3400,8 +3522,8 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->progress = -1;
           job->preview_id.clear();
           job->pulled_by.clear();
-          job->side.clear();
-          pending_.push_front(job);
+          job->side = job->pin_local ? "local" : "";
+          InsertPendingLocked(job, /*front=*/true);
           PersistLocked();
           requeued = true;
         }
@@ -3534,6 +3656,13 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
   if (objekt_id.empty())
     throw JobFailure("the 3D response has no id", "upstream_error",
                      created.status);
+  // The id goes into the request path: word characters only (the worker's
+  // ids are obj_<24 hex>).
+  if (!std::all_of(objekt_id.begin(), objekt_id.end(), [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '_' || c == '-';
+      }))
+    throw JobFailure("the 3D response has an invalid id", "upstream_error",
+                     created.status);
   const std::string base_path = "/v1/3d/generations/" + objekt_id;
   // Status, content and cancel carry no model in the body: the router routes
   // them to the worker by the `model` query (like the music jobs), otherwise
@@ -3545,33 +3674,92 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     job->progress = 0;
     PersistLocked();
   }
+  // The cancel carries the job and pool-side headers like Call() (1.4.24);
+  // it is built here because Call() aborts at once for a cancelled job.
+  const auto cancel_worker = [&] {
+    HttpRequest cancel;
+    cancel.method = "DELETE";
+    cancel.path = base_path;
+    cancel.query = query;
+    cancel.request_id = job->id;
+    cancel.headers.emplace_back(kJobHeader, job->id);
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!job->side.empty())
+        cancel.headers.emplace_back(kPoolSideHeader, job->side);
+    }
+    try {
+      (void)options_.fetch(cancel);
+    } catch (const std::exception&) {
+    }
+  };
+  const auto started = std::chrono::steady_clock::now();
+  // Transient status answers in a row (5xx while the worker reloads or a
+  // relay hiccups, a connection error, a body that is no JSON).
+  int transient = 0;
   json::Value final_status;
   for (;;) {
     const auto until = std::chrono::steady_clock::now() + options_.video_poll;
     while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     if (job->cancel.load()) {
-      HttpRequest cancel;
-      cancel.method = "DELETE";
-      cancel.path = base_path;
-      cancel.query = query;
-      cancel.request_id = job->id;
-      try {
-        (void)options_.fetch(cancel);
-      } catch (const std::exception&) {
-      }
+      cancel_worker();
       throw Cancelled();
     }
-    HttpRequest poll;
-    poll.method = "GET";
-    poll.path = base_path;
-    poll.query = query;
-    poll.request_id = job->id;
-    const FetchResult state = options_.fetch(poll);
-    if (state.status != 200)
-      throw JobFailure("3D status failed: " + ErrorMessage(state),
-                       ErrorCode(state), state.status);
-    json::Value parsed = json::parse(state.body);
+    if (options_.objekt_deadline.count() > 0 &&
+        std::chrono::steady_clock::now() - started >=
+            options_.objekt_deadline) {
+      // A worker stuck on in_progress must not hold the job forever.
+      cancel_worker();
+      throw JobFailure(
+          "the 3D job did not finish within " +
+              std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                 options_.objekt_deadline)
+                                 .count()) +
+              " s",
+          "objekt_timeout", 504);
+    }
+    // Over Call(): job and pool-side headers, and a cancel interrupts a
+    // poll that hangs.
+    FetchResult state;
+    std::string problem;
+    json::Value parsed;
+    try {
+      state = Call(job, "GET", base_path, query, "", "");
+      if (state.status >= 500) {
+        problem = "status " + std::to_string(state.status) + ": " +
+                  ErrorMessage(state);
+      } else if (state.status != 200) {
+        throw JobFailure("3D status failed: " + ErrorMessage(state),
+                         ErrorCode(state), state.status);
+      } else {
+        try {
+          parsed = json::parse(state.body);
+        } catch (const std::exception& error) {
+          problem = std::string("no JSON status: ") + error.what();
+        }
+      }
+    } catch (const Cancelled&) {
+      cancel_worker();
+      throw;
+    } catch (const JobFailure&) {
+      throw;
+    } catch (const std::exception& error) {
+      problem = error.what();
+    }
+    if (!problem.empty()) {
+      if (++transient > options_.objekt_poll_retries)
+        throw JobFailure("3D status failed " + std::to_string(transient) +
+                             " times in a row: " + problem,
+                         state.status >= 500 ? ErrorCode(state)
+                                             : std::string("upstream_error"),
+                         state.status >= 500 ? state.status : 502);
+      Logger::Warn("jobs", "event=objekt_poll_retry job=" + job->id +
+                               " attempt=" + std::to_string(transient) +
+                               " detail=\"" + problem + "\"");
+      continue;
+    }
+    transient = 0;
     const std::string status = parsed.member_str("status");
     {
       const std::lock_guard<std::mutex> lock(mutex_);

@@ -1,17 +1,16 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/core/ttft_trace.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <gufo/ext/experimental/dispatch_telemetry.hpp>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <utility>
 
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/core/hip/hip_utils.hpp"
+#include "src/families/qwen/kernels/copy_27b.hpp"
+#include "src/families/qwen/kernels/sample_27b.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
-#include "src/models/qwen/hip/kernels/copy_27b.hpp"
-#include "src/models/qwen/hip/kernels/sample_27b.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -134,8 +133,6 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
 }
 
 void QwenGpuExecutor::Reset() noexcept {
-  const bool trace = ttft::TraceEnabled();
-  const auto trace_start = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   try {
     if (continuation_hooks_)
       continuation_hooks_->BeforeReset();
@@ -151,26 +148,15 @@ void QwenGpuExecutor::Reset() noexcept {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
-  const auto trace_hooks = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   try {
     arena_.Reset();
-    if (trace)
-      (void)hipStreamSynchronize(arena_.stream);
     if (continuation_hooks_)
       continuation_hooks_->AfterReset();
     reset_failure_ = nullptr;
   } catch (...) {
     reset_failure_ = std::current_exception();
   }
-  const auto trace_arena = trace ? ttft::Clock::now() : ttft::Clock::time_point{};
   graph_executor_.Reset();
-  if (trace)
-    std::fprintf(stderr,
-                 "ttft-trace target-reset before_hooks_ms=%.1f arena_ms=%.1f "
-                 "graph_ms=%.1f\n",
-                 ttft::MsBetween(trace_start, trace_hooks),
-                 ttft::MsBetween(trace_hooks, trace_arena),
-                 ttft::MsBetween(trace_arena, ttft::Clock::now()));
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
@@ -284,7 +270,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
     for (std::uint32_t offset = 0; offset < count;) {
       const auto start = position + offset;
       const auto until_wrap = static_cast<std::uint32_t>(
-          kSsmReplayCapacity - (start % kSsmReplayCapacity));
+          arena_.replay_capacity_ - (start % arena_.replay_capacity_));
       const auto rows =
           std::min({count - offset, until_wrap, arena_.GetMaxBatch()});
       LaunchSSMConvRecurrenceRows(

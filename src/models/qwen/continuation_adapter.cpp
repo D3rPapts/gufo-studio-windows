@@ -4,12 +4,11 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <gufo/ext/snapshot_copy.hpp>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
-
-#include "src/core/hip/snapshot_copy.hpp"
 
 namespace gufo::models::qwen {
 namespace {
@@ -385,6 +384,13 @@ void ContinuationAdapter::RollbackPrefill(cache::Slot& slot) {
   state.logits_valid = state.prefill_logits;
   state.failed = false;
   FinishPrefill(slot);
+}
+std::optional<cache::CostEstimate> ContinuationAdapter::Cost() const {
+  // Fixed least-squares fit of the retained gfx1151 depth sweep; see this
+  // model's BENCHMARKS.md. Restore rates are shared measured hardware controls.
+  return bool(draft_model_)
+             ? cache::CostEstimate{0.001803122153, 0.001717645411, 96e9, 3.3e9}
+             : cache::CostEstimate{0.001546656847, 0.001801318560, 96e9, 3.3e9};
 }
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
   return {.continuation = true, .persistent_encoding = true};
@@ -953,6 +959,8 @@ bool ContinuationAdapter::Validate(
       draft.primed_ = draft_metadata.primed;
       draft.proposal_active_ = false;
       draft.proposed_tokens_.clear();
+      // The restore replaces the token history: the table restarts from it.
+      draft.draft_vocab_stale_ = true;
     }
     struct Scope {
       bool& flag;

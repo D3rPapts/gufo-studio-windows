@@ -46,6 +46,13 @@ struct MusicOutputFormat {
                                const MusicOutputFormat& format,
                                std::string* encoded, std::string* error);
 
+/// Decodes any FFmpeg-readable audio (mp3, m4a, flac, ogg, ...) into a 48 kHz
+/// stereo 16-bit WAV through FFmpeg, the same way EncodeMusic transcodes
+/// (temporary files, no shell). `*error` starts with "audio decoding needs
+/// ffmpeg" when FFmpeg is missing or fails.
+[[nodiscard]] bool DecodeAudioWithFfmpeg(const std::string& bytes,
+                                         std::string* wav, std::string* error);
+
 }  // namespace gufo::server
 
 #endif  // GUFO_SERVER_MUSIC_ENCODE_HPP_

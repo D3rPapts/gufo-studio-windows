@@ -1,85 +1,112 @@
 #ifndef GUFO_SERVER_IMAGE_API_HPP_
 #define GUFO_SERVER_IMAGE_API_HPP_
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/preview.hpp"
-#include "src/models/qwen_image_21/model.hpp"
+#include "src/ext/image.hpp"
+
+namespace gufo::ext {
+class Registry;
+}
 
 namespace gufo::server {
 
 struct HttpRequest;
 struct HttpResponse;
 
-/// Adapters registered at startup and the set applied when a request omits
-/// `loras`.
-struct ImageLoraOptions {
-  std::vector<std::pair<std::string, std::filesystem::path>> files;
-  std::vector<models::qwen_image_21::Lora> defaults;
-  /// Fun ControlNet-Union file (--controlnet); requests then accept
-  /// gufo.control_image. Empty: no control.
-  std::filesystem::path controlnet;
+/// Adapts a callback to `ext::ImageRunner` with explicit capabilities; used to
+/// inject runners in tests and embeddings without a registered provider.
+class CallbackImageRunner final : public ext::ImageRunner {
+public:
+  using Callback = std::function<ext::ImageResult(
+      const ext::ImageRequest&, const ext::CancellationCheck&)>;
+  CallbackImageRunner(Callback callback, ext::ImageCapabilities capabilities)
+      : callback_(std::move(callback)), capabilities_(capabilities) {}
+  ext::ImageResult Generate(const ext::ImageRequest& request,
+                            const ext::CancellationCheck& cancelled) override {
+    return callback_(request, cancelled);
+  }
+  std::optional<ext::ImageCapabilities> Capabilities() const override {
+    return capabilities_;
+  }
+
+private:
+  Callback callback_;
+  ext::ImageCapabilities capabilities_;
 };
+
+/// Selects the image provider for a model directory: the provider whose probe
+/// claims it, else the built-in Qwen-Image provider (historical default).
+/// Explicit startup options are then validated against the selected provider:
+/// options of another provider, a missing provider registration and `path`
+/// values that do not exist throw `std::invalid_argument`. No weights load.
+const ext::ImageProvider& SelectImageProvider(
+    const ext::Registry& registry, const std::filesystem::path& root,
+    const ext::ParsedOptions& options);
+
+/// Creates the runner through the provider's factory, forwarding only the
+/// validated options. Throws `std::runtime_error` when the factory fails or
+/// the provider has no execution factory in this build.
+std::shared_ptr<ext::ImageRunner> CreateImageRunner(
+    const ext::ImageProvider& provider, const std::filesystem::path& root,
+    const ext::ParsedOptions& options);
 
 class ImageService {
 public:
-  using Request = models::qwen_image_21::Request;
-  using Result = models::qwen_image_21::Result;
-  using CancellationCheck = models::qwen_image_21::CancellationCheck;
-  using Runner =
-      std::function<Result(const Request&, const CancellationCheck&)>;
+  using Request = ext::ImageRequest;
+  using Result = ext::ImageResult;
+  using CancellationCheck = ext::CancellationCheck;
 
-  explicit ImageService(const std::filesystem::path& model_root,
+  /// `preview_latent`: the provider's `ImageProvider::preview_latent` (latent
+  /// space of its live previews), empty when it publishes none.
+  explicit ImageService(std::shared_ptr<ext::ImageRunner> runner,
                         std::string model_id = "Qwen-Image-2.1",
-                        Runner runner = {},
-                        models::qwen_image_21::SamplingConfig sampling = {},
-                        ImageLoraOptions loras = {});
-  /// Adapters without an explicit sampling config (a loaded model takes it
-  /// from its checkpoint).
-  ImageService(const std::filesystem::path& model_root, std::string model_id,
-               Runner runner, ImageLoraOptions loras);
+                        std::vector<std::string> model_aliases = {},
+                        std::string preview_latent = {});
   ~ImageService();
   const std::string& model_id() const { return model_id_; }
-  const models::qwen_image_21::SamplingConfig& sampling() const {
-    return sampling_;
+  /// True for the primary ID or a configured alias (#957).
+  bool serves_model(std::string_view name) const {
+    return name == model_id_ ||
+           std::find(model_aliases_.begin(), model_aliases_.end(),
+                     std::string(name)) != model_aliases_.end();
   }
-  const ImageLoraOptions& loras() const { return loras_; }
-  bool HasLora(std::string_view name) const;
-  /// A ControlNet is registered (with an injected runner: one was named).
-  bool has_controlnet() const { return !loras_.controlnet.empty(); }
-  /// Empty with an injected runner (no files are read).
-  const models::qwen_image_21::LoraInfo& lora_info(std::string_view name) const;
-  std::vector<models::qwen_image_21::Lora> ActiveLoras() const;
+  const std::vector<std::string>& model_aliases() const {
+    return model_aliases_;
+  }
+  ext::ImageCapabilities capabilities() const {
+    return capabilities_.value_or(ext::ImageCapabilities{true, true});
+  }
+  /// Capability and provider validation; throws `std::invalid_argument`.
+  void Validate(const Request& request) const;
   Result Generate(const Request& request, const CancellationCheck& cancelled);
-  /// The model's GPU context failed; the server must restart.
-  bool device_lost() const { return model_ && model_->DeviceLost(); }
-  /// Latent layout for live previews (MOSS-Image: kFlux2Patched).
-  LatentFormat preview_format() const { return preview_format_; }
-  void set_preview_format(LatentFormat format) { preview_format_ = format; }
+  /// Provider state as JSON text (ext::ImageRunner::Query), empty if none.
+  std::string Query(std::string_view topic) const;
+  /// Latent space of the provider's live previews (ImageProvider::
+  /// preview_latent), empty when it publishes none.
+  const std::string& preview_latent() const { return preview_latent_; }
 
 private:
   std::string model_id_;
-  models::qwen_image_21::SamplingConfig sampling_;
-  Runner runner_;
-  ImageLoraOptions loras_;
-  std::map<std::string, models::qwen_image_21::LoraInfo, std::less<>>
-      lora_info_;
-  std::unique_ptr<models::qwen_image_21::Model> model_;
+  std::vector<std::string> model_aliases_;
+  std::shared_ptr<ext::ImageRunner> model_;
+  std::optional<ext::ImageCapabilities> capabilities_;
+  std::string preview_latent_;
   std::timed_mutex gate_;
-  LatentFormat preview_format_{LatentFormat::kQwenImage21};
 };
 
 HttpResponse HandleImageApiRequest(const HttpRequest& request,
                                    ImageService& service);
-/// `GET /sdapi/v1/loras`: registered adapters in registration order.
+/// `GET /sdapi/v1/loras`: the provider's registered adapters ("loras" query).
 HttpResponse HandleImageLorasRequest(const HttpRequest& request,
                                      const ImageService& service);
 

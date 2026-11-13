@@ -1,4 +1,4 @@
-#include "src/core/image.hpp"
+#include <gufo/ext/image.hpp>
 
 #include <png.h>
 
@@ -10,7 +10,7 @@
 #include <numbers>
 #include <stdexcept>
 
-#include "src/core/crypto/sha256.hpp"
+#include <gufo/ext/sha256.hpp>
 #include "src/models/qwen_image_21/control.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 
@@ -544,6 +544,16 @@ void ValidateRequest(const Request& request) {
   }
   if (request.control)
     ValidateControl(*request.control, request);
+}
+
+std::string ConditionPrompt(std::string_view prompt,
+                            ext::ImageBackground background) {
+  if (background != ext::ImageBackground::kTransparent)
+    return std::string(prompt);
+  // Qwen-Image-2.1 produces RGBA output when the prompt names the alpha
+  // channel; the framing is model-specific, so it lives in this provider.
+  return "This is an RGBA image with transparency. " + std::string(prompt) +
+         " The image has alpha channel and the background is transparent.";
 }
 
 namespace {
