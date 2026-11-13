@@ -412,7 +412,13 @@ granted bytes; the same remedies restore the full budget.
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
 A positive value replaces the automatic budget and may exceed it: it trades the
 free half of host RAM for retention, but always leaves 4 GiB to the OS and other
-processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
+processes. gufo-studio-windows: the environment variable
+`GUFO_HOST_RESERVE_MIB` (512..16384, read once per process;
+`src/ext/host_budget.cpp`, `HostSnapshotHeadroomBytes`) replaces that 4 GiB
+reserve for hosts whose Windows RAM is small next to the GPU carve-out; a
+value outside the range or not a whole number keeps the 4 GiB. Every "4 GiB
+reserve" on this page means this value. For an 8 GiB cap, use
+`--cache-ram-bytes 8589934592`. The startup
 line reports the selected `capacity_bytes`, the `automatic_bytes` budget and
 the `max_bytes` an explicit value may claim. With a DFlash2 draft, each
 Qwen3.8-27B session also pins about 400 MiB of prompt capture at startup,
@@ -486,7 +492,7 @@ Qwen27B and Flash-Next use the same options with these meanings:
 | --- | --- |
 | `--cache-ram-bytes` | The automatic and explicit sizing above, as a cap. Pinned 64 KiB pages for up to about 89% of it are committed as captures need them, in equal steps of about 1 GiB, and stay committed; the rest is reserved for cache metadata, which grows with use. The pages hold checkpoint state, KV rows, partial tails and idle-session spill. There is no separate spill budget. |
 | `--cache-disk-bytes` | Counts referenced, temporary and orphaned files. A lower budget at startup removes temporaries and orphans, then the oldest checkpoints by creation order: use history does not survive a restart. |
-| `--cache-disk-staging-bytes` | Ignored, with an `event=option_ignored` warning. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed, and a larger value only took pinned RAM and device heap. |
+| `--cache-disk-staging-bytes` | Ignored, with an `event=option_ignored` warning (`src/cli/serve/component_text_cache.cpp`; in 2.0.4 that warning is the only reader of the value). Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed, and a larger value only took pinned RAM and device heap. The option text of `gufo serve llm --help` still describes an older meaning (a Flash-Next transfer buffer, a RAM limit for other models); this table is what the code does. |
 | `--cache-disk DIR` | Owned by one server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory.  model's server sharing it. |
 
 The 128-record limit stays internal. The following measured sizes and timings
