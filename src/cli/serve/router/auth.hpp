@@ -286,7 +286,9 @@ struct Route {
     kMe,           // GET /router/me
     kPasswort,     // POST /router/me/passwort (own password)
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
-    kAdminPage,    // /verwaltung/: loopback or admin, else 404
+    kAdminPage,    // /verwaltung/, /einrichtung/: loopback or admin, else 404
+    kSetup,        // /router/setup/* (2.1 setup assistant): loopback or
+                   // admin, else 404; the router answers (einrichtung.cpp)
     kPage,         // GET /<page>/...: login (302), then the page's area
     kAnyUser,      // any authenticated user (model list, status reads)
     kAdminControl, // model load/unload, placement: admin
