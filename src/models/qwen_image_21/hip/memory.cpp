@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <sstream>
 
-#include "src/core/platform/os_info.hpp"
+#include <gufo/ext/platform/os_info.hpp>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX

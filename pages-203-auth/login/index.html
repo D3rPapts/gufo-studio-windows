@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="de" data-seite="login">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="../gemeinsam/logo/gufo-studio-icon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="../gemeinsam/logo/gufo-studio-icon-32.png">
+<link rel="apple-touch-icon" href="../gemeinsam/logo/gufo-studio-logo-180.png">
+<title data-t="seitentitel">gufo Anmeldung</title>
+<script src="../gemeinsam/sprache.js"></script>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --text:#1d1d1f; --muted:#6b6b70; --line:#dcdcd7; --accent:#5b4fc4; --ok:#1e7a3c; --warn:#a15c00; --err:#b3261e; --on-accent:#fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --on-accent:#1d1d1f; } }
+  :root[data-theme="dark"] { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --on-accent:#1d1d1f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  /* Ohne Anmeldung gibt es nichts zu sehen: Menüpunkte und Statusleiste bleiben hier weg (sie würden nur 401 zeigen). */
+  .gufo-navi-links, .gufo-status, .gufo-navi-knopf { display:none !important; }
+  main { max-width:420px; margin:0 auto; padding:32px 16px 48px; }
+  .kopfzeile { display:flex; align-items:center; gap:10px; margin-bottom:6px; } .kopfzeile h1 { margin:0; font-size:22px; } .kopfzeile .logo { width:64px; height:53px; }
+  .sub { color:var(--muted); margin:0 0 18px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 16px; }
+  label { display:block; font-size:13.5px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], input[type=password] { width:100%; font:inherit; font-size:16px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); min-height:44px; }
+  input:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  .zeile { display:flex; align-items:center; gap:8px; margin:12px 0; font-size:14px; } .zeile input { width:20px; height:20px; }
+  button.haupt { width:100%; font:inherit; font-size:16px; font-weight:600; min-height:46px; border-radius:10px; border:0; background:var(--accent); color:var(--on-accent); cursor:pointer; margin-top:6px; }
+  button.haupt:disabled { opacity:.6; cursor:default; }
+  .meldung { margin:12px 0 0; font-size:14px; min-height:20px; }
+  .meldung.err { color:var(--err); font-weight:600; } .meldung.warn { color:var(--warn); } .meldung.ok { color:var(--ok); }
+  .hinweis { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--warn); border-radius:10px; padding:10px 14px; margin-bottom:14px; font-size:14px; }
+  .hinweis code { font-size:12.5px; background:var(--bg); padding:0 4px; border-radius:4px; }
+  .klein { font-size:12.5px; color:var(--muted); margin-top:14px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<div class="kopfzeile"><img class="logo" src="../gemeinsam/logo/gufo-studio-logo.svg" alt="gufo-studio" width="64" height="53"><h1 data-t="titel">Anmelden</h1></div>
+<p class="sub" data-t="sub">Name und Passwort, wie vom Admin angelegt. Programme nutzen stattdessen einen Token (Authorization: Bearer gufo_…).</p>
+
+<div class="hinweis" id="setup" hidden data-t="setup.html">Noch kein Admin eingerichtet. Bitte am Rechner selbst anlegen: die Seite <code>/verwaltung/</code> auf <code>http://127.0.0.1:8081/</code> öffnen (oder <code>POST /router/users</code>).</div>
+<div class="hinweis" id="aus" hidden data-t="aus.html">Die Anmeldung ist auf diesem Router ausgeschaltet (<code>auth = off</code>): alle Seiten sind ohne Anmeldung erreichbar. <a href="/start/">Zur Startseite</a></div>
+
+<form class="card" id="form" autocomplete="on">
+  <label for="name" data-t="name">Name</label>
+  <input type="text" id="name" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+  <label for="passwort" data-t="passwort">Passwort</label>
+  <input type="password" id="passwort" name="password" autocomplete="current-password" required>
+  <div class="zeile"><input type="checkbox" id="bleiben"><label for="bleiben" style="margin:0;color:var(--text)" data-t="bleiben">Angemeldet bleiben (30 Tage)</label></div>
+  <button class="haupt" type="submit" id="knopf" data-t="knopf">Anmelden</button>
+  <p class="meldung" id="meldung" aria-live="polite"></p>
+</form>
+<p class="klein" data-t="klein">Nach der Anmeldung geht es zurück zur Seite, von der du kamst. Sitzung: 12 Stunden, mit „angemeldet bleiben“ 30 Tage.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const T = (k, d, v) => window.gufoT ? gufoT(k, d, v) : d.replace(/\{(\w+)\}/g, (m, n) => (v && n in v ? v[n] : m));
+// Rücksprungziel: nur eigene Pfade (/seite/…), nie fremde Adressen.
+const zurueck = (() => {
+  const z = new URLSearchParams(location.search).get('zurueck') || '/start/';
+  return /^\/(?!\/)/.test(z) && !/^\/login\/?/.test(z) ? z : '/start/';
+})();
+const melden = (text, art) => { const m = $('meldung'); m.textContent = text; m.className = 'meldung' + (art ? ' ' + art : ''); };
+
+async function stand() {
+  try {
+    const r = await fetch('/router/me', { cache: 'no-store' });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) {
+      if (d.auth === 'off') { $('aus').hidden = false; return; }
+      // Schon angemeldet (Cookie, Token oder lokal = admin): direkt weiter.
+      location.replace(zurueck);
+      return;
+    }
+    if (r.status === 401 && d.setup) { $('setup').hidden = false; }
+  } catch (e) {
+    melden(T('fehler.netz', 'Router nicht erreichbar.'), 'err');
+  }
+}
+
+$('form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const knopf = $('knopf');
+  knopf.disabled = true;
+  melden(T('laeuft', 'wird geprüft …'));
+  try {
+    const r = await fetch('/login', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: $('name').value.trim(), passwort: $('passwort').value, bleiben: $('bleiben').checked }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) { melden(T('ok', 'Angemeldet als {name}.', { name: d.name || '' }), 'ok'); location.replace(zurueck); return; }
+    const code = d.error && d.error.code;
+    if (r.status === 429) melden(T('fehler.gesperrt', 'Zu viele Fehlversuche. Bitte {s} Sekunden warten.', { s: r.headers.get('Retry-After') || 60 }), 'err');
+    else if (code === 'login_not_allowed') melden(T('fehler.dienst', 'Dienstkonten melden sich nur mit Token an.'), 'err');
+    else if (r.status === 401) { melden(T('fehler.falsch', 'Name oder Passwort falsch.'), 'err'); if (d.setup) $('setup').hidden = false; }
+    else melden(T('fehler.sonst', 'Fehler {status}: {text}', { status: r.status, text: (d.error && d.error.message) || '' }), 'err');
+  } catch (e) {
+    melden(T('fehler.netz', 'Router nicht erreichbar.'), 'err');
+  } finally { knopf.disabled = false; }
+});
+stand();
+$('name').focus();
+</script>
+</body>
+</html>

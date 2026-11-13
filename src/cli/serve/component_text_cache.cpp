@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -53,6 +56,10 @@ std::size_t PayloadBytes(const cache::DiskManifest& manifest) {
   }
   return bytes;
 }
+class FrontierHeadroomRefused final : public std::runtime_error {
+public:
+  FrontierHeadroomRefused() : std::runtime_error("frontier capture headroom") {}
+};
 struct DurableCapture {
   cache::ResourceCharge metadata;
   std::shared_ptr<const void> branch;
@@ -60,7 +67,7 @@ struct DurableCapture {
   cache::DiskManifest manifest;
   std::vector<cache::PersistenceSource> sources;
 };
-class ComponentSnapshot final : public TextRunnerSnapshot {
+class ComponentSnapshot final : public ContinuationSnapshot {
 public:
   std::shared_ptr<const cache::Checkpoint> checkpoint;
   std::shared_ptr<DurableCapture> durable;
@@ -94,6 +101,22 @@ bool Published(const cache::PrefixCandidate& candidate) {
          !candidate.availability->components.empty() &&
          std::ranges::all_of(candidate.availability->components,
                              &cache::ComponentAvailability::durable);
+}
+bool SpacedCheckpoint(const cache::PrefixCandidate& candidate) {
+  if (candidate.checkpoint &&
+      (candidate.checkpoint->Purpose() ==
+           cache::CheckpointPurpose::kGenerated ||
+       candidate.checkpoint->Purpose() == cache::CheckpointPurpose::kLearned ||
+       candidate.checkpoint->Purpose() == cache::CheckpointPurpose::kGrid))
+    return false;
+  if (candidate.durable && (candidate.durable->Manifest().purpose ==
+                                cache::CheckpointPurpose::kGenerated ||
+                            candidate.durable->Manifest().purpose ==
+                                cache::CheckpointPurpose::kLearned ||
+                            candidate.durable->Manifest().purpose ==
+                                cache::CheckpointPurpose::kGrid))
+    return false;
+  return true;
 }
 bool SameOwner(const std::shared_ptr<const void>& a,
                const std::shared_ptr<const void>& b) {
@@ -150,6 +173,7 @@ public:
               std::to_string(static_cast<unsigned>(e.action)) +
               " reason=" + std::to_string(static_cast<unsigned>(e.reason)) +
               " tokens=" + std::to_string(e.boundary) +
+              " purpose=" + std::to_string(static_cast<unsigned>(e.purpose)) +
               " rank=" + std::to_string(e.rank) +
               " unique_bytes_freed=" + std::to_string(e.unique_bytes_freed) +
               " ledger_bytes=" + std::to_string(e.ledger_bytes));
@@ -157,8 +181,23 @@ public:
     }
   }
 };
-}  // namespace
 
+std::string HostReserveMessage(std::size_t sessions, std::size_t requested,
+                               std::size_t available) {
+  constexpr std::size_t kMiB = std::size_t{1} << 20;
+  return std::to_string(sessions) +
+         (sessions == 1 ? " session leaves " : " sessions leave ") +
+         std::to_string(available / kMiB) +
+         " MiB for the RAM cache above the " +
+         std::to_string(ext::HostSnapshotHeadroomBytes() / kMiB) +
+         " MiB host reserve" +
+         (requested
+              ? " (" + std::to_string(requested / kMiB) + " MiB requested)"
+              : std::string()) +
+         ". Use fewer --sessions, a smaller --context, or --cache-ram-bytes "
+         "off to serve without RAM checkpoints";
+}
+}  // namespace
 struct ComponentTextCache::Impl {
   struct Entry {
     // Guard fallbacks outlive their slots. Idle pieces and capture/load work
@@ -174,9 +213,15 @@ struct ComponentTextCache::Impl {
     // The live frontier's prompt, to tell whether any checkpoint covers it.
     std::vector<cache::Token> live_tokens;
     cache::Identity live_input;
+    // Edges of replies within live_tokens, where a chat template trims
+    // whitespace from message content: where a reply begins, and where it
+    // ends or its final token begins. Kept across live continuations.
+    std::vector<std::size_t> reply_starts, reply_ends;
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
     bool busy{};
+    bool frontier_active{};
+    std::thread frontier_worker;
   };
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
@@ -191,6 +236,7 @@ struct ComponentTextCache::Impl {
   cache::PrefixIndex index;
   cache::RetentionPolicy retention;
   mutable std::mutex mutex;
+  std::condition_variable frontier_ready;
   std::vector<std::unique_ptr<Entry>> entries;
   std::uint64_t clock{};
   std::unique_ptr<cache::DiskCatalog> catalog;
@@ -207,6 +253,10 @@ struct ComponentTextCache::Impl {
       pending;
   std::array<std::shared_ptr<DurableCapture>, 2 * kPersistenceDepth>
       pending_durable;
+  // At most one pressure demotion may hold payload beyond logical removal.
+  // A full queue or this occupied slot drops further victims immediately.
+  std::shared_ptr<const cache::Checkpoint> demotion;
+  cache::CheckpointId demotion_id{};
   std::size_t disk_capacity{}, disk_step{};
   // The cache's own RAM budget. The ledger limit adds what the slots pinned.
   // Zero when the RAM cache is off.
@@ -224,9 +274,17 @@ struct ComponentTextCache::Impl {
         // Disk transfers lease one fixed pinned staging buffer. Its size does
         // not change restore or write speed (#562), and a larger one only
         // takes pinned RAM and device heap from the cache and the sessions.
-        ledger({slot_ceiling + (options ? cache::kDefaultDiskStagingBytes : 0),
-                slot_ceiling, options ? cache::kDefaultDiskStagingBytes : 0,
-                slot_ceiling}),
+        // Off disables checkpoint retention, not metadata accounting. Disk
+        // recovery and publication must admit their bookkeeping from startup.
+        // Persistence pins remain bounded by the disk-capture backing pool.
+        ledger([&]() -> cache::ResourceLimits {
+          const auto staging = options ? cache::kDefaultDiskStagingBytes : 0;
+          if (ram_on)
+            return {slot_ceiling + staging, slot_ceiling, staging,
+                    slot_ceiling};
+          const auto unlimited = std::numeric_limits<std::size_t>::max();
+          return {unlimited, unlimited, staging, kDiskOnlyBackingBytes};
+        }()),
         resources(this->runner->CreateComponentCacheResources(ledger, ram)),
         identity(resources->adapter->CompatibilityIdentity()),
         index(ledger),
@@ -277,7 +335,7 @@ struct ComponentTextCache::Impl {
     }
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     // RAM cache limit for a runner that pins its slots; computed before the
-    // branch below so a host short of its reserve can fall back to off.
+    // branch below so a short host refuses the load before anything commits.
     std::size_t pinned{}, limit{};
     if (ram_enabled && resources->commit_backing) {
       const auto claim = this->runner->ResourceClaim();
@@ -295,6 +353,7 @@ struct ComponentTextCache::Impl {
       // Staging is pinned host memory too, so the host keeps its reserve
       // only if both fit under the ceiling.
       const auto staging = ledger.Limits().staging_bytes;
+      const auto requested = ram;
       max_bytes = ceiling > staging ? ceiling - staging : 0;
       ram = std::min(ram, max_bytes);
       if (automatic_ram)
@@ -302,39 +361,30 @@ struct ComponentTextCache::Impl {
       // Within the host ceiling and the limit the slots allocated under. Other
       // charges above the budget are refused here, as without pins.
       limit = std::min({ram + pinned, max_bytes, ledger.Limits().ram_bytes});
-      // The ceiling is measured after the weights loaded. On a host that
-      // keeps less than its reserve it falls below what the slots already
-      // pinned and charged, and constraining the ledger to it would fail the
-      // whole load with ResourceExhausted ("bad allocation"). The slots exist
-      // either way, so serve as with --cache-ram-bytes off: the disk cache
-      // still works, and its backing grows only above the host reserve. An
-      // explicit budget below the other charges is still refused below: that
-      // is the operator's setting, not the host's state.
-      if (const auto charged = ledger.Snapshot().ram_bytes;
-          max_bytes < charged) {
-        Logger::Warn("cache",
-                     "schema=component-cache-v1 event=ram_cache_disabled "
-                     "reason=host_reserve charged_bytes=" +
-                         std::to_string(charged) +
-                         " limit_bytes=" + std::to_string(limit) +
-                         " max_bytes=" + std::to_string(max_bytes) +
-                         " slot_pinned_bytes=" + std::to_string(pinned));
-        ram_enabled = false;
-      }
+      const auto charged = ledger.Snapshot().ram_bytes;
+      const auto granted = std::min(ram, limit > pinned ? limit - pinned : 0);
+      // The ceiling is measured after the slots allocated. When they leave
+      // no RAM for the cache above the host reserve, refuse the load with
+      // the remedies instead of serving without the cache the user expects
+      // (#1053). An explicit budget below the other charges is the
+      // operator's setting, not the host's state.
+      const bool host_bound = automatic_ram || ram < requested;
+      if (max_bytes < charged || !granted || (limit < charged && host_bound))
+        throw std::runtime_error(HostReserveMessage(
+            count, requested, max_bytes > pinned ? max_bytes - pinned : 0));
+      if (limit < charged)
+        throw std::runtime_error(
+            "--cache-ram-bytes " + std::to_string(requested) +
+            " is below the " + std::to_string(charged) +
+            " bytes the cache already holds for its sessions and metadata");
     }
     if (!ram_enabled) {
       // Only disk captures copy through backing, so without a disk cache no
-      // pool exists. The ledger admits what the slots already charged, that
-      // backing, and request metadata.
+      // pool exists.
       ram = options ? kDiskOnlyBackingBytes : 0;
       disk_backing = ram;
       slot_pinned_bytes =
           resources->pinned_bytes ? resources->pinned_bytes() : 0;
-      const auto staging = ledger.Limits().staging_bytes;
-      const auto limit =
-          std::min(ledger.Limits().ram_bytes,
-                   ledger.Snapshot().ram_bytes + ram + kOffMetadataBytes);
-      ledger.ConstrainLimits({limit + staging, limit, staging, limit});
       if (resources->commit_backing) {
         if (ram) {
           resources->commit_backing(ram);
@@ -362,7 +412,8 @@ struct ComponentTextCache::Impl {
     }
     budget = ram_enabled ? ram : 0;
     if (options) {
-      catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index);
+      catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index,
+                                                     options->capacity_bytes);
       for (const auto& durable : disk->Entries()) {
         cache::ExecutionHistory::ObserveDurableId(
             durable.Manifest().checkpoint);
@@ -407,6 +458,9 @@ struct ComponentTextCache::Impl {
           },
           [this](cache::CheckpointId id, bool success) {
             const std::lock_guard lock(mutex);
+            const bool was_demoted = id == demotion_id;
+            if (was_demoted)
+              demotion_id = {};
             for (auto& checkpoint : pending)
               if (checkpoint && checkpoint->Id() == id)
                 checkpoint.reset();
@@ -446,11 +500,29 @@ struct ComponentTextCache::Impl {
               }
               if (!attached)
                 (void)index.Insert(identity, description);
+              std::size_t prior = 0;
+              for (const auto& candidate : found.candidates)
+                if (candidate.boundary <
+                        description->Manifest().tokens.size() &&
+                    Published(candidate) && SpacedCheckpoint(candidate))
+                  prior = std::max(
+                      prior, static_cast<std::size_t>(candidate.boundary));
+              const bool spacing_exempt =
+                  description->Manifest().purpose ==
+                      cache::CheckpointPurpose::kGenerated ||
+                  description->Manifest().purpose ==
+                      cache::CheckpointPurpose::kLearned ||
+                  (was_demoted && prior &&
+                   description->Manifest().tokens.size() - prior < disk_step);
               Logger::Info(
                   "cache",
                   "schema=component-cache-v1 event=published tokens=" +
                       std::to_string(description->Manifest().tokens.size()) +
                       " checkpoint_id=" + std::to_string(id.value) +
+                      " purpose=" +
+                      std::to_string(static_cast<unsigned>(
+                          description->Manifest().purpose)) +
+                      " spacing_exempt=" + std::to_string(spacing_exempt) +
                       " payload_bytes=" +
                       std::to_string(PayloadBytes(description->Manifest())));
             }
@@ -476,6 +548,14 @@ struct ComponentTextCache::Impl {
             return catalog->EvictOne();
           });
     }
+    if (queue && ram_enabled)
+      retention.SetDemotion([this](auto checkpoint) {
+        if (!demotion_id.value &&
+            checkpoint->Purpose() != cache::CheckpointPurpose::kGrid) {
+          demotion_id = checkpoint->Id();
+          demotion = std::move(checkpoint);
+        }
+      });
     Logger::Info("cache",
                  "schema=component-cache-v1 event=configured sessions=" +
                      std::to_string(count) +
@@ -490,6 +570,11 @@ struct ComponentTextCache::Impl {
                      " disk_backing_bytes=" + std::to_string(disk_backing));
   }
   ~Impl() {
+    for (auto& entry : entries)
+      if (entry->frontier_worker.joinable())
+        entry->frontier_worker.join();
+    retention.SetDemotion({});
+    DrainDemotion();
     // Settle immutable-source readers before slots/resources/index unwind.
     if (queue)
       queue->Drain();
@@ -516,7 +601,8 @@ struct ComponentTextCache::Impl {
     std::copy_n(bytes.begin(), file.size(), file.begin());
     return file;
   }
-  std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint) {
+  std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint,
+                      bool demoting = false) {
     // Grid captures support RAM edits during prefill. Persist semantic prompt
     // and learned boundaries: an early grid must not consume the spacing
     // allowance of the first complete turn.
@@ -530,22 +616,30 @@ struct ComponentTextCache::Impl {
                std::equal(tokens.begin(), tokens.end(),
                           checkpoint->Tokens().begin());
       };
-      if (checkpoint->Purpose() != cache::CheckpointPurpose::kLearned) {
+      if (!demoting &&
+          checkpoint->Purpose() != cache::CheckpointPurpose::kLearned &&
+          checkpoint->Purpose() != cache::CheckpointPurpose::kGenerated) {
         auto found = index.Lookup({identity, checkpoint->Tokens(),
                                    cache::InputIdentity(checkpoint->Boundary(),
                                                         checkpoint->Input())});
         std::size_t prior = 0;
         for (const auto& candidate : found.candidates)
-          if (Published(candidate))
+          if (Published(candidate) && SpacedCheckpoint(candidate))
             prior =
                 std::max(prior, static_cast<std::size_t>(candidate.boundary));
         for (const auto& queued : pending)
-          if (queued && compatible_prefix(queued->Tokens(), queued->Input()))
+          if (queued && compatible_prefix(queued->Tokens(), queued->Input()) &&
+              queued->Purpose() != cache::CheckpointPurpose::kGenerated &&
+              queued->Purpose() != cache::CheckpointPurpose::kLearned)
             prior =
                 std::max(prior, static_cast<std::size_t>(queued->Boundary()));
         for (const auto& queued : pending_durable)
-          if (queued && compatible_prefix(queued->manifest.tokens,
-                                          queued->manifest.input))
+          if (queued &&
+              compatible_prefix(queued->manifest.tokens,
+                                queued->manifest.input) &&
+              queued->manifest.purpose !=
+                  cache::CheckpointPurpose::kGenerated &&
+              queued->manifest.purpose != cache::CheckpointPurpose::kLearned)
             prior = std::max(prior, queued->manifest.tokens.size());
         if (prior && checkpoint->Boundary() - prior < disk_step) {
           Logger::Info(
@@ -640,6 +734,54 @@ struct ComponentTextCache::Impl {
     }
     return bytes;
   }
+  void DiscardUnusedFrontierWrites() {
+    if (!queue)
+      return;
+    // Select under serving serialization, but discard/callback outside it.
+    // An active write is left alone; foreground work never drains disk I/O.
+    const auto discard = [&](const auto& jobs, const auto& select) {
+      for (std::size_t i = 0; i < jobs.size(); ++i) {
+        cache::CheckpointId id{};
+        {
+          const std::lock_guard lock(mutex);
+          if (jobs[i])
+            id = select(*jobs[i]);
+        }
+        if (id.value)
+          (void)queue->DiscardPending(id);
+      }
+    };
+    discard(pending, [&](const auto& checkpoint) {
+      return retention.IsUnusedFrontier(checkpoint.Id())
+                 ? checkpoint.Id()
+                 : cache::CheckpointId{};
+    });
+    discard(pending_durable, [](const auto& capture) {
+      return capture.manifest.purpose == cache::CheckpointPurpose::kGenerated
+                 ? capture.manifest.checkpoint
+                 : cache::CheckpointId{};
+    });
+  }
+
+  void DrainDemotion() noexcept {
+    std::shared_ptr<const cache::Checkpoint> checkpoint;
+    {
+      const std::lock_guard lock(mutex);
+      checkpoint = std::move(demotion);
+    }
+    if (!checkpoint)
+      return;
+    bool queued = false;
+    try {
+      queued = Persist(checkpoint, true) != 0;
+    } catch (...) {
+    }
+    if (!queued) {
+      const std::lock_guard lock(mutex);
+      if (demotion_id == checkpoint->Id())
+        demotion_id = {};
+    }
+  }
   bool WithinDiskStep(std::span<const cache::Token> tokens,
                       const cache::Identity& input) {
     const std::lock_guard lock(mutex);
@@ -647,19 +789,23 @@ struct ComponentTextCache::Impl {
         {identity, tokens, cache::InputIdentity(tokens.size(), input)});
     std::size_t prior = 0;
     for (const auto& candidate : found.candidates)
-      if (Published(candidate))
+      if (Published(candidate) && SpacedCheckpoint(candidate))
         prior = std::max(prior, static_cast<std::size_t>(candidate.boundary));
     const auto compatible = [&](auto prefix, const auto& prefix_input) {
       return prefix_input == input && prefix.size() <= tokens.size() &&
              std::equal(prefix.begin(), prefix.end(), tokens.begin());
     };
     for (const auto& checkpoint : pending)
-      if (checkpoint && compatible(checkpoint->Tokens(), checkpoint->Input()))
+      if (checkpoint && compatible(checkpoint->Tokens(), checkpoint->Input()) &&
+          checkpoint->Purpose() != cache::CheckpointPurpose::kGenerated &&
+          checkpoint->Purpose() != cache::CheckpointPurpose::kLearned)
         prior =
             std::max(prior, static_cast<std::size_t>(checkpoint->Boundary()));
     for (const auto& capture : pending_durable)
       if (capture &&
-          compatible(capture->manifest.tokens, capture->manifest.input))
+          compatible(capture->manifest.tokens, capture->manifest.input) &&
+          capture->manifest.purpose != cache::CheckpointPurpose::kGenerated &&
+          capture->manifest.purpose != cache::CheckpointPurpose::kLearned)
         prior = std::max(prior, capture->manifest.tokens.size());
     return prior && tokens.size() - prior < disk_step;
   }
@@ -667,7 +813,8 @@ struct ComponentTextCache::Impl {
     if (capture->sources.empty())
       return 0;
     if (WithinDiskStep(capture->manifest.tokens, capture->manifest.input) &&
-        capture->manifest.purpose != cache::CheckpointPurpose::kLearned)
+        capture->manifest.purpose != cache::CheckpointPurpose::kLearned &&
+        capture->manifest.purpose != cache::CheckpointPurpose::kGenerated)
       return 0;
     auto job = cache::PersistenceJob(
         ledger, File(1, capture->manifest.checkpoint.value), capture->manifest,
@@ -704,6 +851,7 @@ struct ComponentTextCache::Lease::Impl {
   bool disk_hit{}, active{true}, preserve_source{};
   // False keeps every checkpoint this lease captures in RAM only.
   bool persist{true};
+  bool generated_frontier{false};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -711,23 +859,27 @@ struct ComponentTextCache::Lease::Impl {
   cache::ResourceCharge edit_metadata;
   SnapshotPurpose purpose{SnapshotPurpose::kContinuation};
   std::vector<cache::Token> capture_tokens;
+  // Reply edges of the live frontier this lease continues.
+  std::vector<std::size_t> reply_starts, reply_ends;
   ContinuationLookup lookup_result;
   ComponentCacheMetrics metrics;
   Impl(ComponentTextCache::Impl* cache, ComponentTextCache::Impl::Entry* entry,
-       cache::SlotLease slot, std::span<const cache::Token> prompt,
+       cache::SlotLease&& slot, std::span<const cache::Token> prompt,
        cache::InputIdentity input, std::size_t stable)
       : cache(cache),
         entry(entry),
-        slot(std::move(slot)),
-        state(cache->runner->BindComponentState(*cache->resources->adapter,
-                                                this->slot.Execution())),
         input(std::move(input)),
         prompt(prompt.begin(), prompt.end()),
         stable(stable),
         edit_metadata(cache->ledger
                           .Reserve(cache::ResourceCategory::kMetadata,
                                    sizeof(edit_boundaries))
-                          .Convert()) {}
+                          .Convert()) {
+    // Leave the caller's lease intact until all fallible setup is complete.
+    state = cache->runner->BindComponentState(*cache->resources->adapter,
+                                              slot.Execution());
+    this->slot = std::move(slot);
+  }
   cache::RetentionRequest Retain(
       std::span<const cache::Token> tokens,
       std::optional<std::size_t> new_payload_bytes = {}) const {
@@ -747,18 +899,22 @@ struct ComponentTextCache::Lease::Impl {
         .protected_checkpoints =
             std::span(edit_boundaries).first(edit_boundary_count),
         .reused = cached != 0,
-        .reused_tokens = cached};
+        .reused_tokens = cached,
+        .turn = entry->used,
+        .persistable = persist,
+        .optional_frontier = generated_frontier};
   }
-  std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
+  std::unique_ptr<ContinuationSnapshot> CaptureDurable();
 };
 
-std::unique_ptr<TextRunnerSnapshot>
+std::unique_ptr<ContinuationSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
   if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
-  const auto capture_input = At(input, capture_tokens.size());
-  if (purpose != SnapshotPurpose::kBranchPoint &&
+  const auto capture_input =
+      At(input, std::min(capture_tokens.size(), prompt.size()));
+  if (!generated_frontier && purpose != SnapshotPurpose::kBranchPoint &&
       cache->WithinDiskStep(capture_tokens, capture_input))
     return {};
   const auto positions = cache->resources->adapter->Positions(slot.Execution());
@@ -777,7 +933,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       throw std::logic_error("incomplete durable capture positions");
     pieces += d.kind == cache::ComponentKind::kPrivateState
                   ? 1
-                  : p->valid_rows / d.rows_per_chunk +
+                  : (p->valid_rows - cache::FirstChunkRow(d, p->valid_rows)) /
+                            d.rows_per_chunk +
                         bool(p->valid_rows % d.rows_per_chunk);
   }
   // Admit metadata before vectors/owners. No append payload allocation is
@@ -817,7 +974,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   manifest.compatibility = cache->digest;
   manifest.input = capture_input;
   manifest.tokens = capture_tokens;
-  manifest.purpose = purpose == SnapshotPurpose::kBranchPoint
+  manifest.purpose = generated_frontier ? cache::CheckpointPurpose::kGenerated
+                     : purpose == SnapshotPurpose::kBranchPoint
                          ? cache::CheckpointPurpose::kLearned
                          : cache::CheckpointPurpose::kPrompt;
   manifest.components.reserve(descriptors.size());
@@ -829,31 +987,41 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         std::ranges::find(positions, d.id, &cache::ComponentPosition::id);
     cache::DiskComponent component{.descriptor = d, .position = *p};
     const auto completed =
-        d.kind == cache::ComponentKind::kAppendRows
+        cache::HasRows(d.kind)
             ? p->valid_rows / d.rows_per_chunk * d.rows_per_chunk
             : 0;
-    cache::Rows inherited = 0;
-    if (completed && ancestor) {
+    // Window components start at their first retained chunk, not row 0.
+    const auto start = cache::FirstChunkRow(d, p->valid_rows);
+    cache::Rows inherited = start;
+    if (completed > start && ancestor) {
       const auto& components = ancestor->Manifest().components;
       const auto previous = std::ranges::find_if(
           components, [&](const auto& c) { return c.descriptor.id == d.id; });
       if (previous != components.end()) {
-        const auto chunks = std::min<std::size_t>(previous->chunks.size(),
-                                                  completed / d.rows_per_chunk);
-        component.chunks.assign(previous->chunks.begin(),
-                                previous->chunks.begin() + chunks);
-        inherited = chunks * d.rows_per_chunk;
+        // The ancestor's chunk j covers row previous_first + j rows_per_chunk;
+        // its window never starts past this capture's.
+        const auto previous_first =
+            cache::FirstChunkRow(d, previous->position.valid_rows);
+        const auto skip =
+            std::min<std::size_t>(previous->chunks.size(),
+                                  (start - previous_first) / d.rows_per_chunk);
+        const auto chunks =
+            std::min<std::size_t>(previous->chunks.size() - skip,
+                                  (completed - start) / d.rows_per_chunk);
+        component.chunks.assign(previous->chunks.begin() + skip,
+                                previous->chunks.begin() + skip + chunks);
+        inherited = start + chunks * d.rows_per_chunk;
       }
     }
     std::shared_ptr<cache::BorrowedRows> rows;
-    if (completed) {
+    if (completed > start) {
       if (inherited != completed) {
         auto view = cache->resources->adapter->BorrowRowsView(
             slot.Execution(), d.id, inherited, completed);
         if (!view.empty())
           rows = slot.Observe(d.id, inherited, completed, view);
       }
-      component.chunks.reserve(completed / d.rows_per_chunk);
+      component.chunks.reserve((completed - start) / d.rows_per_chunk);
     }
     const auto capture = [&](cache::Rows first, cache::Rows end,
                              bool private_file) {
@@ -933,8 +1101,14 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     } catch (const cache::ResourceExhausted&) {
       for (auto& copy : copies)
         copy.buffer = {};
-      const std::lock_guard lock(cache->mutex);
-      if (!cache->retention.Reclaim(retain))
+      cache->DiscardUnusedFrontierWrites();
+      bool reclaimed;
+      {
+        const std::lock_guard lock(cache->mutex);
+        reclaimed = cache->retention.Reclaim(retain);
+      }
+      cache->DrainDemotion();
+      if (!reclaimed)
         throw;
     }
   }
@@ -993,10 +1167,13 @@ ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
 }
+std::size_t ComponentTextCache::ram_budget() const noexcept {
+  return impl_->budget;
+}
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::span<const ContinuationToken> prompt,
-    const ContinuationCache::CancellationCheck& cancelled,
+    const std::function<bool()>& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
     std::size_t stable, bool stop_at_eos, bool persist) {
   if (cancelled && cancelled())
@@ -1005,9 +1182,16 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   cache::PrefixLookup found;
   Impl::Entry* entry = nullptr;
   std::optional<cache::BorrowedLocation> live;
+  std::vector<std::size_t> reply_starts, reply_ends;
   std::size_t common = 0;
   {
-    const std::lock_guard lock(impl_->mutex);
+    std::unique_lock lock(impl_->mutex);
+    impl_->frontier_ready.wait(lock, [&] {
+      return std::ranges::none_of(
+          impl_->entries, [](const auto& e) { return e->frontier_active; });
+    });
+    if (cancelled && cancelled())
+      return {};
     if (impl_->catalog)
       impl_->catalog->Reconcile();
     found =
@@ -1127,9 +1311,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->live.reset();
       entry->live_tokens.clear();
     }
+    if (live) {
+      reply_starts = std::move(entry->reply_starts);
+      reply_ends = std::move(entry->reply_ends);
+    }
+    entry->reply_starts.clear();
+    entry->reply_ends.clear();
   }
   std::unique_ptr<Lease> lease;
   try {
+    if (entry->frontier_worker.joinable())
+      entry->frontier_worker.join();
     auto slot = entry->slot->Acquire(live);
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
@@ -1143,24 +1335,48 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     // an unusable live frontier) can require another reset before cold use.
     bool clean = !live;
     // A frontier captured between prefill passes cannot select the next token
-    // of a prompt that ends there; serve that prompt from a shallower boundary.
+    // of a prompt that ends there, and a runner may refuse other prompts; serve
+    // those from a shallower boundary.
     const auto decodable = [&](std::size_t boundary) {
-      return boundary < prompt.size() ||
-             impl_->runner->HasDecodeFrontier(*request.state);
+      return (boundary < prompt.size() ||
+              impl_->runner->HasDecodeFrontier(*request.state)) &&
+             impl_->runner->CanContinue(*request.state, prompt.size());
     };
-    if (live && !decodable(found.selected->boundary)) {
+    // Prefill must not resume inside an indivisible input of this prompt,
+    // which a checkpoint from another prompt with the same tokens can do.
+    const auto whole_inputs = [&](std::size_t boundary) {
+      return !context || context->PrefillStop(boundary, false) == boundary;
+    };
+    if (live && (!decodable(found.selected->boundary) ||
+                 !whole_inputs(found.selected->boundary))) {
       live.reset();
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
     }
     bool restored = bool(live);
-    if (live)
+    if (live) {
       request.cached = found.selected->boundary;
+      request.reply_starts = std::move(reply_starts);
+      request.reply_ends = std::move(reply_ends);
+    }
+    // Prefill continues a checkpoint exactly only from an aligned position.
+    // The complete prompt stays off the alignment for an unchanged retry,
+    // which continues it without prefill; a longer prompt takes an aligned
+    // boundary instead (TextRunnerCapabilities::prefill_alignment).
+    const std::size_t alignment = std::max<std::size_t>(
+        1, impl_->runner->Descriptor().capabilities.prefill_alignment);
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
-      if (candidate.live)
+      const bool generated =
+          (candidate.checkpoint && candidate.checkpoint->Purpose() ==
+                                       cache::CheckpointPurpose::kGenerated) ||
+          (candidate.durable && candidate.durable->Manifest().purpose ==
+                                    cache::CheckpointPurpose::kGenerated);
+      if (candidate.live || !whole_inputs(candidate.boundary) ||
+          (!generated && candidate.boundary % alignment != 0 &&
+           candidate.boundary < prompt.size()))
         continue;
       try {
         if (candidate.checkpoint) {
@@ -1380,6 +1596,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                     : "none") +
                      " selected_tokens=" + std::to_string(request.cached) +
                      " restored_bytes=" + std::to_string(request.restored));
+    if (const auto estimate = impl_->resources->adapter->Cost())
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=cost_estimate from=" +
+              std::to_string(request.cached) +
+              " to=" + std::to_string(prompt.size()) + " prefill_ms=" +
+              std::to_string(1000 * estimate->PrefillSeconds(request.cached,
+                                                             prompt.size())) +
+              " restore_ms=" +
+              std::to_string(1000 * estimate->RestoreSeconds(
+                                        request.restored, request.disk_hit)));
     return lease;
   } catch (...) {
     if (lease)
@@ -1398,6 +1625,8 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
   if (!impl_->queue)
     return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
+  const std::size_t alignment = std::max<std::size_t>(
+      1, impl_->runner->Descriptor().capabilities.prefill_alignment);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
@@ -1410,7 +1639,10 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
     if (checkpoint_id && id != checkpoint_id)
       continue;
     const auto& tokens = capture->manifest.tokens;
+    // Acquire skips an unaligned checkpoint below the prompt end.
     if (tokens.size() > prompt.size() ||
+        (capture->manifest.purpose != cache::CheckpointPurpose::kGenerated &&
+         tokens.size() % alignment != 0 && tokens.size() < prompt.size()) ||
         capture->manifest.input != At(input, tokens.size()) ||
         !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
       continue;
@@ -1434,6 +1666,262 @@ std::size_t ComponentTextCache::CachedPrefixTokens(
   const cache::PrefixQuery query{impl_->identity, prompt, input};
   return common ? impl_->index.CommonPrefixTokens(query)
                 : impl_->index.CachedPrefixTokens(query);
+}
+
+namespace {
+// Unicode White_Space and the separators Python's str.strip also removes:
+// what chat templates trim from the ends of message content.
+bool TrimmedWhitespace(std::string_view text) {
+  if (text.empty())
+    return false;
+  for (std::size_t i = 0; i < text.size();) {
+    const auto lead = static_cast<unsigned char>(text[i]);
+    char32_t cp = lead;
+    std::size_t length = 1;
+    if (lead >= 0x80) {
+      // No whitespace needs four bytes.
+      if ((lead & 0xE0) == 0xC0) {
+        cp = lead & 0x1F;
+        length = 2;
+      } else if ((lead & 0xF0) == 0xE0) {
+        cp = lead & 0x0F;
+        length = 3;
+      } else {
+        return false;
+      }
+      if (i + length > text.size())
+        return false;
+      for (std::size_t k = 1; k < length; ++k) {
+        const auto next = static_cast<unsigned char>(text[i + k]);
+        if ((next & 0xC0) != 0x80)
+          return false;
+        cp = (cp << 6) | (next & 0x3F);
+      }
+    }
+    if (!((cp >= 0x09 && cp <= 0x0D) || cp == 0x20 ||
+          (cp >= 0x1C && cp <= 0x1F) || cp == 0x85 || cp == 0xA0 ||
+          cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
+          cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000))
+      return false;
+    i += length;
+  }
+  return true;
+}
+
+struct FrontierEnd {
+  // Prompt tokens the frontier's text covers.
+  std::size_t prompt{};
+  // Bytes of the last of them past the frontier's end, when it ends inside
+  // one, as a reply cut off by the token limit can.
+  std::string partial;
+  // Frontier tokens whose text the prompt covers: all of them, or fewer when
+  // the whole prompt is byte-identical text ending at a frontier token
+  // boundary (an unchanged retry of a prompt that was itself aligned).
+  std::size_t frontier{};
+};
+
+// Where a chat template may have trimmed whitespace from a reply in
+// `frontier`: at the start of a reply, or at its end or before its final
+// (end-of-turn) token. Without a template nothing was trimmed.
+struct TrimEdges {
+  std::span<const std::size_t> starts, ends;
+};
+
+// Where the text of all of `frontier` ends in `prompt`, or nothing when the
+// texts differ first. A prompt whose whole text exactly equals a longer prefix
+// of the frontier, ending at one of its token boundaries, covers that prefix.
+// Only tokens past an ID mismatch are decoded; equal IDs at a shared boundary
+// are skipped as they are. The template trims whitespace
+// around message content, so frontier whitespace the prompt lacks matches
+// only at the edges of a reply, where the frontier ends or both continue with
+// the same token. Whitespace a client removed elsewhere is an edit.
+std::optional<FrontierEnd> FrontierTextEnd(
+    std::span<const ContinuationToken> frontier,
+    std::span<const ContinuationToken> prompt, std::size_t common,
+    const TextModelRunner& runner, TrimEdges edges) {
+  const auto piece = [&](ContinuationToken token) {
+    return runner.Decode(std::span<const ContinuationToken>(&token, 1));
+  };
+  std::size_t f = common, p = common;
+  // Bytes one side has consumed past the other's last token boundary.
+  std::string ahead;
+  bool frontier_ahead = false;
+  // Whitespace was just dropped at a reply edge. A prompt ending there would
+  // gain whitespace it never had, unless later text follows the edge.
+  bool trimmed = false;
+  for (;;) {
+    if (ahead.empty()) {
+      if (f == frontier.size())
+        return FrontierEnd{p, {}, f};
+      if (p == prompt.size()) {
+        if (trimmed || f == common)
+          return std::nullopt;
+        return FrontierEnd{p, {}, f};
+      }
+      if (frontier[f] == prompt[p]) {
+        ++f;
+        ++p;
+        trimmed = false;
+        continue;
+      }
+      trimmed = false;
+      ahead = piece(frontier[f++]);
+      frontier_ahead = true;
+      if (ahead.empty())
+        return std::nullopt;
+    }
+    const auto lagging = frontier_ahead ? prompt : frontier;
+    auto& at = frontier_ahead ? p : f;
+    if (at == lagging.size()) {
+      if (frontier_ahead)
+        return std::nullopt;
+      return FrontierEnd{p, std::move(ahead), f};
+    }
+    const auto next = piece(lagging[at++]);
+    const auto n = std::min(ahead.size(), next.size());
+    if (next.empty() || ahead.compare(0, n, next, 0, n) != 0) {
+      --at;
+      if (!frontier_ahead || !TrimmedWhitespace(ahead))
+        return std::nullopt;
+      // `ahead` is the rest of frontier token f - 1; all of it when the
+      // whitespace starts at that token.
+      const auto first = f - 1;
+      const bool whole = ahead.size() == piece(frontier[first]).size();
+      while (f < frontier.size() && frontier[f] != prompt[p] &&
+             TrimmedWhitespace(piece(frontier[f])))
+        ++f;
+      if (f < frontier.size() && frontier[f] != prompt[p])
+        return std::nullopt;
+      if (std::ranges::find(edges.ends, f) == edges.ends.end() &&
+          (!whole ||
+           std::ranges::find(edges.starts, first) == edges.starts.end()))
+        return std::nullopt;
+      trimmed = true;
+      ahead.clear();
+      continue;
+    }
+    if (next.size() <= ahead.size()) {
+      ahead.erase(0, n);
+    } else {
+      ahead = next.substr(n);
+      frontier_ahead = !frontier_ahead;
+    }
+  }
+}
+}  // namespace
+
+bool ComponentTextCache::AlignToLiveFrontier(
+    std::vector<ContinuationToken>& prompt, std::size_t& stable,
+    std::size_t max_tokens, bool trimmed) const {
+  const std::lock_guard lock(impl_->mutex);
+  std::span<const ContinuationToken> selected;
+  std::size_t seam = 0, exact_depth = 0, aligned_stable = 0;
+  // The prompt's own tokens already begin a frontier, as an unchanged retry
+  // does. Rewriting it to an older frontier's tokens would only change what
+  // the identical request samples.
+  bool covered = false;
+  // Tokens for the rest of a prompt token the frontier ends inside.
+  std::vector<ContinuationToken> rest;
+  const auto consider = [&](std::span<const ContinuationToken> frontier,
+                            TrimEdges edges) {
+    const auto common = static_cast<std::size_t>(
+        std::ranges::mismatch(frontier, prompt).in1 - frontier.begin());
+    if (common == prompt.size()) {
+      covered = true;
+      return;
+    }
+    if (common == frontier.size()) {
+      exact_depth = std::max(exact_depth, frontier.size());
+      return;
+    }
+    if (common == 0 ||
+        (!selected.empty() && frontier.size() <= selected.size()) ||
+        frontier.size() <= exact_depth)
+      return;
+    auto end = FrontierTextEnd(frontier, prompt, common, *impl_->runner, edges);
+    if (!end)
+      return;
+    std::size_t mapped = 0;
+    if (end->frontier < frontier.size()) {
+      // A prompt ending inside the frontier gains only from a checkpoint
+      // exactly at that end: an unchanged retry of an aligned prompt, whose
+      // fresh tokenization would otherwise diverge from the retained one.
+      frontier = frontier.first(end->frontier);
+      const cache::PrefixQuery query{impl_->identity, frontier,
+                                     Inputs(frontier.size(), nullptr)};
+      if (impl_->index.CachedPrefixTokens(query) != frontier.size())
+        return;
+      // The whole prompt is rewritten, so its stable boundary moves to the
+      // frontier token boundary ending the same text, if there is one.
+      mapped = stable;
+      if (stable > common) {
+        const auto at =
+            FrontierTextEnd(frontier, std::span(prompt).first(stable), common,
+                            *impl_->runner, edges);
+        if (!at || !at->partial.empty() || at->prompt != stable)
+          return;
+        mapped = at->frontier;
+      }
+      if ((!selected.empty() && frontier.size() <= selected.size()) ||
+          frontier.size() <= exact_depth)
+        return;
+    } else if (stable != 0 && stable < end->prompt) {
+      return;
+    } else if (stable != 0) {
+      mapped = stable - end->prompt + frontier.size();
+    }
+    std::vector<ContinuationToken> tail;
+    if (!end->partial.empty()) {
+      // A fragment that does not tokenize back to its own bytes (a split
+      // UTF-8 sequence, say) cannot follow the frontier.
+      try {
+        tail = impl_->runner->Tokenize(end->partial);
+      } catch (const std::exception&) {
+        return;
+      }
+      if (tail.empty() || impl_->runner->Decode(tail) != end->partial)
+        return;
+    }
+    if (frontier.size() + tail.size() + (prompt.size() - end->prompt) >=
+        max_tokens)
+      return;
+    selected = frontier;
+    seam = end->prompt;
+    aligned_stable = stable != 0 ? mapped + tail.size() : 0;
+    rest = std::move(tail);
+  };
+  for (const auto& entry : impl_->entries) {
+    const auto& frontier = entry->live_tokens;
+    // Positions of image inputs would move with the rewrite.
+    if (!entry->live || entry->busy || frontier.empty() ||
+        !entry->live_input.empty())
+      continue;
+    consider(frontier, trimmed
+                           ? TrimEdges{entry->reply_starts, entry->reply_ends}
+                           : TrimEdges{});
+  }
+  impl_->index.VisitGenerated(impl_->identity, [&](auto frontier) {
+    // Retained checkpoints have no template whitespace-edge metadata. Only
+    // byte-identical text may be rewritten after a cold assignment/restart.
+    consider(frontier, {});
+  });
+  if (covered || selected.empty() || exact_depth >= selected.size())
+    return false;
+  if (Logger::Enabled(LogLevel::kDebug))
+    Logger::Debug("cache",
+                  "event=frontier_aligned frontier_tokens=" +
+                      std::to_string(selected.size()) +
+                      " prompt_seam=" + std::to_string(seam) +
+                      " split_tokens=" + std::to_string(rest.size()) +
+                      " prompt_tokens=" + std::to_string(prompt.size()));
+  stable = aligned_stable;
+  std::vector<ContinuationToken> aligned;
+  aligned.reserve(selected.size() + rest.size() + prompt.size() - seam);
+  aligned.assign(selected.begin(), selected.end());
+  aligned.insert(aligned.end(), rest.begin(), rest.end());
+  aligned.insert(aligned.end(), prompt.begin() + seam, prompt.end());
+  prompt = std::move(aligned);
+  return true;
 }
 ComponentTextCache::Lease::Lease(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
@@ -1520,7 +2008,7 @@ std::size_t ComponentTextCache::Lease::CaptureBytes(
       impl_->cache->resources->adapter->PrefillCheckpointPositions(
           impl_->slot.Execution(), boundary));
 }
-std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
+std::unique_ptr<ContinuationSnapshot> ComponentTextCache::Lease::Capture() {
   auto& request = *impl_;
   auto& cache = *request.cache;
   auto positions =
@@ -1551,8 +2039,14 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
     }
   }
   const auto reclaim = [&] {
-    const std::lock_guard lock(cache.mutex);
-    return cache.retention.Reclaim(retain);
+    cache.DiscardUnusedFrontierWrites();
+    bool reclaimed;
+    {
+      const std::lock_guard lock(cache.mutex);
+      reclaimed = cache.retention.Reclaim(retain);
+    }
+    cache.DrainDemotion();
+    return reclaimed;
   };
   std::shared_ptr<const cache::Checkpoint> checkpoint;
   std::size_t captured_capacity = 0;
@@ -1568,7 +2062,8 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       checkpoint = request.entry->history->Capture(
           {request.capture_tokens,
            request.input.Through(request.capture_tokens.size()), positions,
-           request.purpose == SnapshotPurpose::kHistory
+           request.generated_frontier ? cache::CheckpointPurpose::kGenerated
+           : request.purpose == SnapshotPurpose::kHistory
                ? cache::CheckpointPurpose::kGrid
            : request.purpose == SnapshotPurpose::kBranchPoint
                ? cache::CheckpointPurpose::kLearned
@@ -1605,6 +2100,21 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             });
             while (true) {
               try {
+                if (request.generated_frontier &&
+                    cache.resources->can_capture) {
+                  auto metadata = cache.ledger.Reserve(
+                      cache::ResourceCategory::kMetadata,
+                      2 * payloads.size() * sizeof(cache::PayloadRequest));
+                  std::vector<cache::PayloadRequest> with_headroom(
+                      payloads.begin(), payloads.end());
+                  with_headroom.insert(with_headroom.end(), payloads.begin(),
+                                       payloads.end());
+                  if (!cache.resources->can_capture(with_headroom)) {
+                    if (reclaim())
+                      continue;
+                    throw FrontierHeadroomRefused();
+                  }
+                }
                 if (cache.resources->can_capture &&
                     !cache.resources->can_capture(payloads))
                   throw cache::ResourceExhausted();
@@ -1678,6 +2188,11 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             transfers.Finish();
           });
       break;
+    } catch (const FrontierHeadroomRefused&) {
+      // Do not bypass the foreground reserve through optional disk staging.
+      // The live frontier remains usable until its eventual reassignment.
+      Logger::Info("cache", "event=frontier_capture_refused reason=headroom");
+      return {};
     } catch (const cache::ResourceExhausted&) {
       if (!reclaim()) {
         if (cache.queue && request.purpose != SnapshotPurpose::kHistory) {
@@ -1735,6 +2250,7 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     admitted = impl_->cache->retention.Admit(
         retain, [&] { return component->checkpoint; });
   }
+  impl_->cache->DrainDemotion();
   if (!admitted)
     return 0;
   if (retain.purpose == cache::RetentionPurpose::kHistory) {
@@ -1769,12 +2285,67 @@ std::size_t ComponentTextCache::Lease::Commit(
     Invalidate();
     return bytes;
   }
+  // Optional frontier capture runs after commit when the device is idle.
+  // Concurrent foreground leases keep the existing exclusive capture path;
+  // an idle task must never race their execution or a new slot admission.
+  bool async_frontier = false;
+  const bool capture_frontier =
+      live.size() > impl_->prompt.size() &&
+      (impl_->cache->ram_enabled || (impl_->persist && impl_->cache->queue));
+  // Clear admission's barrier even if commit bookkeeping fails before launch.
+  struct FrontierBarrier {
+    ComponentTextCache::Impl* cache;
+    ComponentTextCache::Impl::Entry* entry;
+    bool armed{};
+    ~FrontierBarrier() {
+      if (armed) {
+        const std::lock_guard lock(cache->mutex);
+        entry->frontier_active = false;
+        cache->frontier_ready.notify_all();
+      }
+    }
+  } barrier{impl_->cache, impl_->entry};
+  if (capture_frontier) {
+    const std::lock_guard lock(impl_->cache->mutex);
+    async_frontier =
+        std::ranges::none_of(impl_->cache->entries, [&](const auto& e) {
+          return e.get() != impl_->entry && (e->busy || e->frontier_active);
+        });
+    if (async_frontier) {
+      impl_->entry->frontier_active = true;
+      barrier.armed = true;
+    }
+  }
+  if (capture_frontier && !async_frontier) {
+    try {
+      impl_->generated_frontier = true;
+      impl_->capture_tokens = live;
+      impl_->capture_boundary = live.size();
+      impl_->purpose = SnapshotPurpose::kContinuation;
+      impl_->preserve_source = false;
+      if (auto frontier = Capture())
+        (void)PublishSnapshot(live, std::move(frontier), false);
+    } catch (const std::exception& error) {
+      Logger::Info(
+          "cache",
+          std::string("event=frontier_capture_refused reason=") + error.what());
+    }
+  }
   auto positions =
       impl_->cache->resources->adapter->Positions(impl_->slot.Execution());
   const auto location = impl_->slot.Location();
   impl_->slot.Commit();
   {
     const std::lock_guard lock(impl_->cache->mutex);
+    auto& starts = impl_->entry->reply_starts;
+    auto& ends = impl_->entry->reply_ends;
+    starts = std::move(impl_->reply_starts);
+    ends = std::move(impl_->reply_ends);
+    if (live.size() > impl_->prompt.size()) {
+      starts.push_back(impl_->prompt.size());
+      ends.push_back(live.size() - 1);
+      ends.push_back(live.size());
+    }
     impl_->entry->live_tokens = live;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
@@ -1783,6 +2354,62 @@ std::size_t ComponentTextCache::Lease::Commit(
     impl_->entry->busy = false;
   }
   impl_->active = false;
+  if (async_frontier) {
+    auto* cache = impl_->cache;
+    auto* entry = impl_->entry;
+    try {
+      // Publish the joinable handle before completion can wake admission.
+      const std::lock_guard launch_lock(cache->mutex);
+      // All task inputs are independent of the completed request facade.
+      // Teardown joins the bounded per-slot task before draining disk jobs.
+      entry->frontier_worker =
+          std::thread([cache, entry, location, input = impl_->input,
+                       prompt = impl_->prompt, stable = impl_->stable,
+                       cached = impl_->cached, source = impl_->source,
+                       persist = impl_->persist, live = entry->live_tokens] {
+            try {
+              auto slot = entry->slot->Acquire(location);
+              std::unique_ptr<Impl> request;
+              try {
+                request = std::make_unique<Impl>(cache, entry, std::move(slot),
+                                                 prompt, input, stable);
+              } catch (...) {
+                slot.Commit();
+                throw;
+              }
+              Lease task(std::move(request));
+              task.impl_->active = false;
+              try {
+                task.impl_->persist = persist;
+                task.impl_->cached = cached;
+                task.impl_->source = source;
+                task.impl_->generated_frontier = true;
+                task.impl_->capture_tokens = live;
+                task.impl_->capture_boundary = live.size();
+                if (auto frontier = task.Capture())
+                  (void)task.PublishSnapshot(live, std::move(frontier), false);
+              } catch (...) {
+                task.impl_->slot.Commit();
+                throw;
+              }
+              task.impl_->slot.Commit();
+            } catch (const std::exception& error) {
+              Logger::Info(
+                  "cache",
+                  std::string("event=frontier_capture_refused reason=") +
+                      error.what());
+            }
+            {
+              const std::lock_guard lock(cache->mutex);
+              entry->frontier_active = false;
+            }
+            cache->frontier_ready.notify_all();
+          });
+      barrier.armed = false;
+    } catch (...) {
+      // The barrier releases admission; the live frontier stays reusable.
+    }
+  }
   return bytes;
 }
 void ComponentTextCache::Lease::Invalidate() noexcept {
@@ -1802,15 +2429,20 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
 }
 
 std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
-    std::size_t stable, std::vector<std::size_t>* cached) const {
+    std::size_t stable) const {
   // Off with no disk cache keeps no checkpoint, so skip the planning.
   if (!impl_->cache->ram_enabled && !impl_->cache->queue)
     return {};
   const auto& adapter = *impl_->cache->resources->adapter;
+  // Each grid checkpoint keeps its private state and at most a window plus a
+  // partial leading chunk. Checkpoints closer than a window share those rows,
+  // so this bound can only plan fewer captures than RAM holds.
   std::size_t private_bytes = 0;
   for (const auto& d : adapter.Components())
     if (d.kind == cache::ComponentKind::kPrivateState)
       private_bytes += d.state_bytes;
+    else if (d.kind == cache::ComponentKind::kWindowRows)
+      private_bytes += (d.window_rows + d.rows_per_chunk - 1) * d.row_bytes;
   const auto plan = cache::PlanCaptures(
       adapter, impl_->slot.Execution(),
       {impl_->prompt.size(),
@@ -1822,22 +2454,13 @@ std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
        {},
        cache::GridLimit(impl_->cache->budget, private_bytes)});
   std::vector<std::size_t> boundaries;
-  for (const auto& capture : plan) {
-    if (capture.required)
-      continue;
-    if (!HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
+  for (const auto& capture : plan)
+    if (!capture.required &&
+        !HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
                             .first(capture.boundary)))
       boundaries.push_back(capture.boundary);
-    else if (cached != nullptr)
-      cached->push_back(capture.boundary);
-  }
   return boundaries;
 }
-std::vector<std::size_t> ServingCacheLease::PlannedCaptures(
-    std::size_t stable, std::vector<std::size_t>* cached) const {
-  return component_->PlannedCaptures(stable, cached);
-}
-
 ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {
   auto report = impl_->metrics;
   report.ledger = impl_->cache->ledger.Snapshot();
@@ -1856,62 +2479,5 @@ ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {
   }
   return report;
 }
-std::optional<ComponentCacheMetrics> ServingCacheLease::Metrics() const {
-  return component_ ? std::optional(component_->Metrics()) : std::nullopt;
-}
 
-#define FORWARD_RESULT(type, name, qualifiers, args, call)         \
-  type ServingCacheLease::name args qualifiers {                   \
-    return component_ ? component_->name call : legacy_.name call; \
-  }
-FORWARD_RESULT(ContinuationState&, state, const, (), ())
-FORWARD_RESULT(bool, cache_hit, const noexcept, (), ())
-FORWARD_RESULT(std::size_t, cached_tokens, const noexcept, (), ())
-FORWARD_RESULT(std::size_t, restored_snapshot_bytes, const noexcept, (), ())
-FORWARD_RESULT(double, restore_ms, const noexcept, (), ())
-FORWARD_RESULT(bool, restored_from_disk, const noexcept, (), ())
-FORWARD_RESULT(ContinuationLookup, lookup, const noexcept, (), ())
-FORWARD_RESULT(bool, HasSnapshotFor, const,
-               (std::span<const ContinuationToken> tokens), (tokens))
-FORWARD_RESULT(bool, TryReserveSnapshot, ,
-               (std::size_t bytes, std::size_t boundary, bool preserve,
-                SnapshotPurpose purpose,
-                std::span<const ContinuationToken> tokens),
-               (bytes, boundary, preserve, purpose, tokens))
-FORWARD_RESULT(void, SkipSnapshot, noexcept,
-               (SnapshotEventReason reason, std::size_t bytes,
-                std::size_t boundary),
-               (reason, bytes, boundary))
-FORWARD_RESULT(std::size_t, PublishSnapshot, ,
-               (std::vector<ContinuationToken> tokens,
-                std::shared_ptr<const ContinuationSnapshot> snapshot,
-                bool preserve),
-               (std::move(tokens), std::move(snapshot), preserve))
-FORWARD_RESULT(std::size_t, Commit, ,
-               (std::vector<ContinuationToken> tokens,
-                std::shared_ptr<const ContinuationSnapshot> snapshot,
-                std::vector<ContinuationToken> live),
-               (std::move(tokens), std::move(snapshot), std::move(live)))
-FORWARD_RESULT(void, Invalidate, noexcept, (), ())
-#undef FORWARD_RESULT
-void ServingCacheLease::AdoptRestoredPrefix(std::size_t tokens,
-                                            std::size_t bytes, double ms) {
-  if (component_)
-    throw std::logic_error("component restore is owned by the component cache");
-  legacy_.AdoptRestoredPrefix(tokens, bytes, ms);
-}
-void ServingCacheLease::PreparePrefill(std::size_t tokens) {
-  if (component_)
-    component_->PreparePrefill(tokens);
-}
-
-std::size_t ServingCacheLease::CaptureBytes() const {
-  return component_->CaptureBytes();
-}
-std::size_t ServingCacheLease::CaptureBytes(std::size_t boundary) const {
-  return component_->CaptureBytes(boundary);
-}
-std::unique_ptr<TextRunnerSnapshot> ServingCacheLease::Capture() {
-  return component_->Capture();
-}
 }  // namespace gufo::server

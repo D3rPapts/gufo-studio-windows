@@ -90,8 +90,20 @@
 //  - View: every job carries "request.loras" and "running_on" ("local",
 //    the partner's url while it runs there or the pool sent it there,
 //    null while it waits or does not run); scope=pool items add
-//    "position" (1 = the oldest queued or waiting job of both routers).
+//    "position" (1 = the next queued or waiting job of both routers).
 //    /router/status gets "pool_queue".
+//  - Priority (2.0.3): every job carries "priority" 0..9 (0 = normal, the
+//    default; higher runs first). Given on POST /v1/jobs as the header
+//    X-Gufo-Priority (wins), the member "priority" of the submit body,
+//    the member "priority" of the wrapped request body or a multipart
+//    form field "priority"; anything else 400 invalid_priority. The
+//    queue runs the highest priority first and among equal priorities
+//    the oldest job (first in, first out); a free runner pulls the
+//    partner's job only when (priority, created_at) puts it before its
+//    own next job; the owner hands out its best candidate in the same
+//    order; "position" follows it. Every request of a job carries the
+//    header, so the partner's pool decision knows it (pool.hpp,
+//    X-Gufo-Priority). jobs.json keeps it; an older file reads as 0.
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -258,6 +270,13 @@ struct Options {
   Resolver resolve;
   Deliver deliver;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// Whole-job limit of a 3D job's status polls (gufo serve objekt; up to
+  /// ~2 min per object measured): past it the worker job is cancelled and
+  /// the job fails with objekt_timeout. Zero = no limit.
+  std::chrono::milliseconds objekt_deadline{std::chrono::minutes(30)};
+  /// Transient 3D status answers (5xx, a connection error, a non-JSON body)
+  /// tolerated in a row before the job fails.
+  int objekt_poll_retries{5};
   /// Preview poll for the progress of image jobs.
   std::chrono::milliseconds progress_poll{std::chrono::seconds(1)};
   /// Result media of finished, not kept jobs are deleted this long after
@@ -306,6 +325,11 @@ struct Options {
   /// it again with X-Gufo-Pool: remote. False when the request waits no
   /// longer (then the job is not handed out).
   std::function<bool(const std::string& job_id)> redirect_waiting;
+  /// Whether this machine's GPU may take a job of `model` from the
+  /// partner now (the router: the model not busy here, no other GPU work,
+  /// no pool request claimed or waiting); a free runner alone says nothing
+  /// about the GPU. Empty = always. Called without the queue's lock held.
+  std::function<bool(const std::string& model, std::string* why)> may_pull;
 };
 
 /// Set on every request relayed to the partner; never relayed on.
@@ -321,6 +345,25 @@ inline constexpr const char* kJobHeader = "X-Gufo-Job";
 /// Error code the router answers a redirected waiting request with.
 inline constexpr const char* kPoolRedirected = "pool_redirected";
 
+/// True when `url` names no host another machine can reach: empty, no host,
+/// or a bind-all address (0.0.0.0, ::, [::]). A router started with
+/// --host 0.0.0.0 would otherwise name itself "http://0.0.0.0:8081".
+bool IsUnreachableUrl(std::string_view url);
+
+/// `url`, or `fallback` when IsUnreachableUrl(url).
+std::string ReachableUrl(std::string_view url, std::string_view fallback);
+
+/// "http://<address>:<port>" with the local address a connection toward
+/// `toward` ("http://host:port", e.g. the pool partner) leaves from (UDP
+/// connect + getsockname, nothing is sent), else with the computer's name;
+/// "" when neither is known.
+std::string LocalUrlToward(std::string_view toward, int port);
+
+/// The frame rate of a video file (ffprobe, r_frame_rate else
+/// avg_frame_rate); 0 with *error when it cannot be read.
+double ProbeFrameRate(const std::filesystem::path& ffprobe,
+                      const std::filesystem::path& video, std::string* error);
+
 /// The LoRA names a request body asks for: "loras"[].name (images) and
 /// "gufo"."lora" (videos, a string); empty for anything else.
 std::vector<std::string> LoraNames(const json::Value& body);
@@ -329,9 +372,13 @@ std::vector<std::string> LoraNames(const json::Value& body);
 /// /router/capabilities, or the whole answer) can run a job: the model is
 /// served there, not placed remote, and every LoRA is registered. *why
 /// (optional) gets the reason ("no model 'x'", "no LoRA 'winkel'").
+/// `now` (pulls of the shared queue): also not while the router reports
+/// the model `"available": false` (a load failure holds). Without it the
+/// answer is about capability only (submit, pool LoRA check), so a
+/// passing failure never refuses a job with 400.
 bool CanRun(const json::Value& capabilities, const std::string& model,
             const std::vector<std::string>& loras,
-            std::string* why = nullptr);
+            std::string* why = nullptr, bool now = false);
 
 // ------------------------------------------------- video concat helpers
 
@@ -474,6 +521,8 @@ private:
     std::string id;
     std::string model;
     long long created_at{0};
+    /// "priority" of its view (0 for a partner older than 2.0.3).
+    int priority{0};
     std::vector<std::string> loras;
     /// in_progress but waiting in the partner's pool ("pool_wait").
     bool waiting{false};
@@ -481,10 +530,12 @@ private:
   /// The partner's queued jobs (oldest first), cached pull_poll; nullopt
   /// when the partner did not answer.
   std::optional<std::vector<PartnerJob>> PartnerQueued();
-  /// Runner side: pulls the partner's oldest queued job when it is older
-  /// than `mine_created_at` (0 = nothing queued here) and runs here; waits
-  /// for it to end. True when a job was pulled (the runner looks again).
-  bool TryPull(long long mine_created_at);
+  /// Runner side: pulls the partner's first queued job (priority, then
+  /// age) when it runs before this router's next one (`mine_priority`,
+  /// `mine_created_at`; created 0 = nothing queued here) and runs here;
+  /// waits for it to end. True when a job was pulled (the runner looks
+  /// again).
+  bool TryPull(int mine_priority, long long mine_created_at);
   /// Waits (polling the partner) until the pulled job `id` left the
   /// requester's worker, or the partner stopped answering.
   void WaitForPulled(const std::string& id);
@@ -510,11 +561,17 @@ private:
   /// Drops the job from every index (mutex held); the caller removes its
   /// folder after unlocking.
   void ForgetLocked(const std::shared_ptr<Job>& job);
+  /// Puts a queued job into pending_ at its place in the run order (mutex
+  /// held): after every job of the same or a higher priority, or (`front`,
+  /// a requeued job) before every job of its priority.
+  void InsertPendingLocked(const std::shared_ptr<Job>& job, bool front);
   bool MatchesLocked(const Job& job, const Filter& filter) const;
 
   void RunnerMain();
   void Execute(const std::shared_ptr<Job>& job);
   void RunVideo(const std::shared_ptr<Job>& job, const FetchResult& created);
+  void RunObjekt(const std::shared_ptr<Job>& job,
+                 const FetchResult& created);
   void RunMusic(const std::shared_ptr<Job>& job, const FetchResult& created);
   void RunConcat(const std::shared_ptr<Job>& job, const std::string& payload);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
@@ -542,6 +599,8 @@ private:
   std::vector<std::shared_ptr<Job>> order_;
   std::map<std::string, std::shared_ptr<Job>> jobs_;
   std::map<std::string, std::string> idempotency_;
+  /// Queued jobs in run order: the highest priority first, then the oldest
+  /// (InsertPendingLocked keeps it so).
   std::deque<std::shared_ptr<Job>> pending_;
   /// Learned seconds per "<path> <model>" for the estimated progress.
   std::map<std::string, double> durations_;

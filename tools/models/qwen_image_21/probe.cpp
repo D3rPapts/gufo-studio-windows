@@ -14,10 +14,9 @@ int main(int argc, char** argv) {
   using namespace gufo::models::qwen_image_21;
   if (argc < 3) {
     std::cerr << "usage: qwen_image_21_probe MODEL_DIR OUTPUT_DIR [PROMPT] "
-                 "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N] "
-                 "[--negative TEXT] [--guidance X] [--init IMAGE --strength S] "
-                 "[--width N] [--height N] [--image IMAGE ...] "
-                 "[--lora NAME=PATH]... [--lora-default NAME:SCALE]...\n";
+                 "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N] [--width "
+                 "N] [--height N] [--image IMAGE ...] [--lora NAME=PATH]... "
+                 "[--lora-default NAME:SCALE]...\n";
     return 2;
   }
   try {
@@ -45,14 +44,6 @@ int main(int argc, char** argv) {
       const std::string_view option(argv[i]);
       if (option == "--trajectory") {
         trajectory = true;
-      } else if (option == "--negative" && i + 1 < argc) {
-        request.negative_prompt = argv[++i];
-      } else if (option == "--guidance" && i + 1 < argc) {
-        request.guidance = std::stof(argv[++i]);
-      } else if (option == "--strength" && i + 1 < argc) {
-        request.strength = std::stod(argv[++i]);
-      } else if (option == "--init" && i + 1 < argc) {
-        request.init_image = DecodeImage(gufo::core::ReadImageFile(argv[++i]));
       } else if ((option == "--width" || option == "--height") &&
                  i + 1 < argc) {
         const int value = std::stoi(argv[++i]);
@@ -108,10 +99,7 @@ int main(int argc, char** argv) {
     Observer observer;
     observer.include = [trajectory](std::string_view name) {
       return !trajectory || name == "noise" || name == "sigmas" ||
-             name == "vae.decoded" || name.starts_with("latent.") ||
-             name == "init.latent" || name == "init.vae.encoded" ||
-             name.ends_with(".guided") || name == "dit.0.output" ||
-             name == "negative.dit.0.output";
+             name == "vae.decoded" || name.starts_with("latent.");
     };
     observer.write = [&](std::string_view name, std::span<const float> values,
                          int rows, int cols) {

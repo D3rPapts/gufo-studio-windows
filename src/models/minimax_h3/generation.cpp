@@ -12,7 +12,7 @@
 #include <system_error>
 #include <utility>
 
-#include "src/core/platform/os_info.hpp"
+#include <gufo/ext/platform/os_info.hpp>
 #include "src/models/minimax_h3/lora.hpp"
 #include "src/models/minimax_h3/prompt_vision.hpp"
 #include "src/models/minimax_h3/sampling.hpp"

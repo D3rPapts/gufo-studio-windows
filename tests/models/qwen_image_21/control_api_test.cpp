@@ -1,9 +1,12 @@
 // HTTP contract of the Qwen-Image Fun ControlNet fields (gufo.control_*) on
 // /v1/images/generations and /v1/images/edits, with an injected runner (no
-// model, no GPU).
+// model, no GPU). 2.0: the host passes the extension through
+// (changes/0.2/image-request-extension); the runner applies the provider's
+// BuildRequest as the qwen_image_21 runner does.
 
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,6 +14,7 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/models/qwen_image_21/model.hpp"
+#include "src/models/qwen_image_21/request.hpp"
 
 namespace {
 
@@ -56,18 +60,28 @@ int main() {
   const auto start_png = EncodePng(Solid(64, 64, 200));
   Request seen;
   int calls = 0;
-  const auto runner = [&](const Request& request, const CancellationCheck&) {
-    seen = request;
-    ++calls;
-    return Result{.image = Solid(2, 2, 7)};
+  const auto runner_for = [&](bool controlnet) {
+    ProviderState state;
+    state.controlnet = controlnet;
+    return [&, state](const gufo::ext::ImageRequest& request,
+                      const gufo::ext::CancellationCheck&) {
+      seen = BuildRequest(request, state);
+      ++calls;
+      const auto pixels = Solid(2, 2, 7);
+      return gufo::ext::ImageResult{
+          .image = {.width = pixels.width,
+                    .height = pixels.height,
+                    .rgba = pixels.rgba}};
+    };
   };
-  gufo::server::ImageLoraOptions with_controlnet;
-  with_controlnet.controlnet = "Qwen-Image-2.1-Fun-Controlnet-Union.safetensors";
-  gufo::server::ImageService service({}, "image-test", runner,
-                                     with_controlnet);
-  gufo::server::ImageService plain({}, "image-test", runner,
-                                   gufo::server::ImageLoraOptions{});
-  Check(service.has_controlnet() && !plain.has_controlnet(), "flag");
+  // 2.0: the service takes an ext::ImageRunner; the callback is wrapped with
+  // the provider's capabilities (edits for /v1/images/edits).
+  const auto runner = [&](bool controlnet) {
+    return std::make_shared<gufo::server::CallbackImageRunner>(
+        runner_for(controlnet), kCapabilities);
+  };
+  gufo::server::ImageService service(runner(true), "image-test");
+  gufo::server::ImageService plain(runner(false), "image-test");
 
   gufo::server::HttpRequest http;
   http.method = "POST";

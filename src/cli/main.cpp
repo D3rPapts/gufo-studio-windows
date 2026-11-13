@@ -5,15 +5,22 @@
 
 #include "src/cli/banner.hpp"
 #include "src/cli/bench/bench.hpp"
+#include "src/cli/decide/decide.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
+#include "src/cli/extension/extension.hpp"
+#include "src/cli/extension_diagnostics.hpp"
 #include "src/cli/prompt/prompt.hpp"
 #include "src/cli/serve/router/router.hpp"
 #include "src/cli/serve/serve.hpp"
+#include "src/cli/speak/speak.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
+#if defined(ENGINE_ENABLE_HIP)
+// gufo-studio-windows RIFE / Real-ESRGAN drivers (src/cli/serve/media).
 #include "src/cli/video/video_interpolate.hpp"
 #include "src/cli/video/video_upscale.hpp"
+#endif
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -29,7 +36,8 @@ namespace {
 
 void print_version() {
   std::cout << "gufo version " << kGufoReleaseVersion << " (" << kGufoRevision
-            << ")\n";
+            << ")\n"
+            << gufo::cli::ExtensionDiagnostics(false);
 }
 
 void print_help(std::string_view program_name) {
@@ -46,10 +54,19 @@ void print_help(std::string_view program_name) {
       << "  bench          Benchmark prompt processing and token generation\n"
       << "  eval           Evaluate an OpenAI-compatible text server\n"
       << "  video          Generate MiniMax H3 text-to-video\n"
+#if defined(ENGINE_ENABLE_HIP)
       << "  video-interpolate  RIFE frame interpolation of an MP4\n"
       << "  video-upscale  Real-ESRGAN upscaling of an MP4 or image\n"
-      << "  transcribe     Transcribe WAV audio with Qwen3-ASR-1.7B\n"
+#endif
+      << "  transcribe     Transcribe WAV audio with a speech recognition "
+         "model\n"
+      << "  speak          Synthesize speech or voice-chat with a speech "
+         "model\n"
+      << "  decide         Answer typed decision questions with a decision "
+         "model\n"
       << "  diagnose       Inspect system hardware, memory, and drivers\n"
+      << "  extension      Install, list, rebuild and remove extension "
+         "modules\n"
       << "  help           Print help for a specific command\n\n"
       << "Run '" << program_name << " help <COMMAND>' or '" << program_name
       << " <COMMAND> --help' for details on a command\n\n"
@@ -114,14 +131,22 @@ int run(std::span<const char* const> args) {
     if (sub == "video") {
       return gufo::cli::RunVideo(help_flag);
     }
+#if defined(ENGINE_ENABLE_HIP)
     if (sub == "video-interpolate") {
       return gufo::cli::RunVideoInterpolate(help_flag);
     }
     if (sub == "video-upscale") {
       return gufo::cli::RunVideoUpscale(help_flag);
     }
+#endif
     if (sub == "transcribe") {
       return gufo::cli::RunTranscribe(help_flag);
+    }
+    if (sub == "speak") {
+      return gufo::cli::RunSpeak(help_flag);
+    }
+    if (sub == "decide") {
+      return gufo::cli::RunDecide(help_flag);
     }
     if (sub == "chat") {
       return gufo::cli::RunChat(help_flag);
@@ -143,6 +168,9 @@ int run(std::span<const char* const> args) {
     return gufo::cli::RunProbe(options.subspan(1));
   }
 
+  if (first_arg == "extension") {
+    return gufo::cli::RunExtension(options.subspan(1));
+  }
   if (first_arg == "diagnose") {
     return gufo::cli::RunDiagnose(options);
   }
@@ -162,17 +190,23 @@ int run(std::span<const char* const> args) {
   if (first_arg == "video") {
     return gufo::cli::RunVideo(options.subspan(1));
   }
-
+#if defined(ENGINE_ENABLE_HIP)
   if (first_arg == "video-interpolate") {
     return gufo::cli::RunVideoInterpolate(options.subspan(1));
   }
-
   if (first_arg == "video-upscale") {
     return gufo::cli::RunVideoUpscale(options.subspan(1));
   }
+#endif
 
   if (first_arg == "transcribe") {
     return gufo::cli::RunTranscribe(options.subspan(1));
+  }
+  if (first_arg == "speak") {
+    return gufo::cli::RunSpeak(options.subspan(1));
+  }
+  if (first_arg == "decide") {
+    return gufo::cli::RunDecide(options.subspan(1));
   }
 
   if (first_arg == "chat") {

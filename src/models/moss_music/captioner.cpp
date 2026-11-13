@@ -17,7 +17,7 @@
 #include "src/models/moss_music/hip/audio_encoder.hpp"
 #include "src/models/moss_music/hip/llm.hpp"
 #include "src/models/moss_music/model.hpp"
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen3_asr/audio.hpp"
 
 namespace gufo::models::moss_music {

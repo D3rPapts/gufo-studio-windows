@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
 #include "src/models/fish_drama3/tensor.hpp"
 
 namespace gufo::models::fish_drama3 {

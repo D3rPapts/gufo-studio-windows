@@ -22,7 +22,7 @@ inline constexpr std::chrono::milliseconds kPersistenceYieldLimit{500};
     std::span<const ComponentDescriptor> components) {
   std::size_t bytes = 1;
   for (const auto& d : components)
-    if (d.kind == ComponentKind::kAppendRows)
+    if (HasRows(d.kind))
       bytes = std::max(bytes, d.row_bytes);
   return bytes;
 }
@@ -164,6 +164,10 @@ public:
   PersistenceQueue(const PersistenceQueue&) = delete;
   PersistenceQueue& operator=(const PersistenceQueue&) = delete;
   bool TrySubmit(PersistenceJob);
+  // Discard one queued (never active) write and release its source pins.
+  // Reports false completion outside the queue lock before returning; counted
+  // as superseded work. Drain also waits for this completion callback.
+  bool DiscardPending(CheckpointId);
   void Drain();
   void Stop();
   [[nodiscard]] PersistenceQueueStats Stats() const;

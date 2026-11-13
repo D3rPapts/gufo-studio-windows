@@ -28,6 +28,8 @@ public:
   bool SendBinary(std::string_view bytes);
   void Close(std::uint16_t code = 1000);
   bool cancelled() const { return closed_.load(); }
+  // gufo-studio-windows router (ws_relay): hand the socket and any bytes
+  // already buffered over to a raw relay, and mark it closed afterwards.
   bool MarkClosed();
   bool DetachForRelay(int* fd, std::string* pending);
 

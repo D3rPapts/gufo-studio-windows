@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
+#include <gufo/ext/gguf_reader.hpp>
 
 /// Qwen3-Omni-30B-A3B-Captioner: the thinker of Qwen3-Omni fine-tuned to
 /// describe one audio clip. Weights come as llama.cpp GGUFs: the text model

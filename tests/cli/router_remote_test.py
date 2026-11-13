@@ -108,6 +108,9 @@ class FakeRemote:
         self.videos = {}  # id -> status
         self.music = {}  # id -> [status, hold]
         self.load_delay = 0.0
+        # Status a POST /v1/chat/completions answers with instead of a chat
+        # ("worker failed to start"); None = normal answer.
+        self.chat_fail = None
         self.server = None
         self.port = port or free_port()
         self.start()
@@ -260,6 +263,11 @@ class FakeRemote:
                                                   else "completed")
                         return self.send(202, {"id": job, "object": "video",
                                                "status": "queued"})
+                    if path == "/v1/chat/completions" and remote.chat_fail:
+                        return self.send(remote.chat_fail, {"error": {
+                            "message": "worker failed to start",
+                            "type": "server_error",
+                            "code": "upstream_unavailable"}})
                     if path == "/v1/chat/completions":
                         return self.send(200, {"object": "chat.completion",
                                                "model": fields.get("model")})

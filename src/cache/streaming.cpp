@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "src/cache/prefetch_cursor.hpp"
 #include "src/cache/slot.hpp"
 
 namespace gufo::cache {
@@ -118,7 +119,7 @@ public:
   void Reading(std::size_t index) {
     {
       const std::lock_guard lock(mutex_);
-      reader_ = index;
+      cursor_.Reading(index);
     }
     wake_.notify_all();
   }
@@ -130,12 +131,10 @@ private:
       std::size_t i;
       {
         std::unique_lock lock(mutex_);
-        if (!wake_.wait(lock, stop, [&] {
-              return next_ < items_.size() &&
-                     offsets_[next_] - offsets_[reader_] < kWindowBytes;
-            }))
+        if (!wake_.wait(lock, stop,
+                        [&] { return cursor_.Ready(offsets_, kWindowBytes); }))
           return;
-        i = next_++;
+        i = cursor_.Take();
       }
       try {
         disk_.PrefetchPayload(snapshot_, items_[i].private_file,
@@ -151,7 +150,7 @@ private:
   std::vector<std::uint64_t> offsets_;
   std::mutex mutex_;
   std::condition_variable_any wake_;
-  std::size_t next_{}, reader_{};
+  detail::PrefetchCursor cursor_;
   std::array<std::jthread, 4> threads_;
 };
 bool SameJob(const DiskManifest& a, const DiskManifest& b) {
@@ -167,14 +166,15 @@ bool SameJob(const DiskManifest& a, const DiskManifest& b) {
         x.descriptor.kind != y.descriptor.kind ||
         x.descriptor.row_bytes != y.descriptor.row_bytes ||
         x.descriptor.rows_per_chunk != y.descriptor.rows_per_chunk ||
-        x.descriptor.state_bytes != y.descriptor.state_bytes)
+        x.descriptor.state_bytes != y.descriptor.state_bytes ||
+        x.descriptor.window_rows != y.descriptor.window_rows)
       return false;
   }
   return true;
 }
 bool Extends(const DiskManifest& next, const DiskManifest& prior) {
   return next.compatibility == prior.compatibility &&
-         next.input == prior.input &&
+         (next.input == prior.input || next.lineage == prior.lineage) &&
          prior.tokens.size() < next.tokens.size() &&
          std::equal(prior.tokens.begin(), prior.tokens.end(),
                     next.tokens.begin());
@@ -479,7 +479,8 @@ bool StreamedStore::Restore(
           descriptor->row_bytes != c.descriptor.row_bytes ||
           descriptor->rows_per_chunk != c.descriptor.rows_per_chunk ||
           descriptor->state_bytes != c.descriptor.state_bytes ||
-          (descriptor->kind == ComponentKind::kAppendRows &&
+          descriptor->window_rows != c.descriptor.window_rows ||
+          (HasRows(descriptor->kind) &&
            descriptor->row_bytes > impl_->staging.bytes.size()))
         throw std::invalid_argument("checkpoint component layout mismatch");
       positions.push_back(c.position);
@@ -498,10 +499,10 @@ bool StreamedStore::Restore(
     Prefetcher prefetch(*impl_->disk, *snapshot, std::move(items));
     std::size_t reading{};
     for (const auto& c : manifest.components) {
-      Rows first{};
+      Rows first = FirstChunkRow(c.descriptor, c.position.valid_rows);
       std::size_t staged{};
       auto rows = impl_->staging.bytes;
-      if (c.descriptor.kind == ComponentKind::kAppendRows)
+      if (HasRows(c.descriptor.kind))
         rows = rows.first(rows.size() / c.descriptor.row_bytes *
                           c.descriptor.row_bytes);
       const auto flush = [&] {
@@ -638,6 +639,7 @@ struct PersistenceQueue::Impl {
   std::unique_ptr<PersistenceJob> active;
   PersistenceQueueStats stats;
   bool stopped{};
+  std::size_t discard_callbacks{};
   std::uint64_t sequence{};
   std::jthread worker;
   Impl(ResourceReservation reservation, StreamedStore& streams,
@@ -754,6 +756,26 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
         if (!other || other->manifest_.purpose == CheckpointPurpose::kLearned ||
             !Extends(job.manifest_, other->manifest_))
           return false;
+        // A generated frontier must not coalesce away the prompt checkpoint
+        // that an edit or a retry of this request needs. Likewise preserve
+        // two recent generated frontiers before treating them as redundant.
+        if (job.manifest_.purpose == CheckpointPurpose::kGenerated &&
+            other->manifest_.purpose != CheckpointPurpose::kGenerated)
+          return false;
+        if (other->manifest_.purpose == CheckpointPurpose::kGenerated) {
+          std::size_t newer =
+              job.manifest_.purpose == CheckpointPurpose::kGenerated;
+          for (const auto& peer : impl_->pending)
+            newer += peer && peer.get() != other.get() &&
+                     peer->manifest_.purpose == CheckpointPurpose::kGenerated &&
+                     Extends(peer->manifest_, other->manifest_);
+          newer += impl_->active &&
+                   impl_->active->manifest_.purpose ==
+                       CheckpointPurpose::kGenerated &&
+                   Extends(impl_->active->manifest_, other->manifest_);
+          if (newer < 2)
+            return false;
+        }
         // Keep the first pending boundary until its write starts. A busy
         // writer may belong to another conversation; replacing this anchor
         // would leave only a deep checkpoint after graceful shutdown.
@@ -767,6 +789,22 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
                            });
       });
   const bool redundant = replacement != impl_->pending.end();
+  // Exact frontiers are optional write-through work. They must not displace
+  // an unrelated conversation's pending prompt anchor when the queue is full,
+  // nor may they consume more than half of the queue's pinned byte budget.
+  const std::size_t frontier_budget = impl_->max_bytes / 2;
+  const bool full =
+      impl_->stats.pending == impl_->pending.size() ||
+      job.pinned_bytes_ > impl_->max_bytes - impl_->stats.pinned_bytes ||
+      (job.manifest_.purpose == CheckpointPurpose::kGenerated &&
+       job.pinned_bytes_ >
+           frontier_budget -
+               std::min(frontier_budget, impl_->stats.pinned_bytes));
+  if (!redundant && full &&
+      job.manifest_.purpose == CheckpointPurpose::kGenerated) {
+    ++impl_->stats.skipped;
+    return false;
+  }
   if (!redundant &&
       (impl_->stats.pending == impl_->pending.size() ||
        job.pinned_bytes_ > impl_->max_bytes - impl_->stats.pinned_bytes)) {
@@ -775,7 +813,13 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
                    job.manifest_.purpose != CheckpointPurpose::kLearned))
         continue;
       if (replacement == impl_->pending.end() ||
-          (*it)->submitted_ < (*replacement)->submitted_)
+          ((*it)->manifest_.purpose == CheckpointPurpose::kGenerated &&
+           (*replacement)->manifest_.purpose !=
+               CheckpointPurpose::kGenerated) ||
+          (((*it)->manifest_.purpose == CheckpointPurpose::kGenerated) ==
+               ((*replacement)->manifest_.purpose ==
+                CheckpointPurpose::kGenerated) &&
+           (*it)->submitted_ < (*replacement)->submitted_))
         replacement = it;
     }
   }
@@ -784,6 +828,13 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   if ((impl_->stats.pending == impl_->pending.size() && !released) ||
       job.pinned_bytes_ >
           impl_->max_bytes - (impl_->stats.pinned_bytes - released)) {
+    ++impl_->stats.skipped;
+    return false;
+  }
+  if (job.manifest_.purpose == CheckpointPurpose::kGenerated &&
+      job.pinned_bytes_ >
+          frontier_budget -
+              std::min(frontier_budget, impl_->stats.pinned_bytes - released)) {
     ++impl_->stats.skipped;
     return false;
   }
@@ -828,9 +879,42 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   impl_->wake.notify_all();
   return accepted;
 }
+bool PersistenceQueue::DiscardPending(CheckpointId id) {
+  std::unique_ptr<PersistenceJob> discarded;
+  {
+    std::lock_guard guard(impl_->mutex);
+    for (auto& job : impl_->pending) {
+      if (!job || job->manifest_.checkpoint != id)
+        continue;
+      impl_->stats.pinned_bytes -= job->pinned_bytes_;
+      --impl_->stats.pending;
+      ++impl_->stats.superseded;
+      ++impl_->discard_callbacks;
+      discarded = std::move(job);
+      break;
+    }
+  }
+  if (!discarded)
+    return false;
+  discarded.reset();
+  if (impl_->completed) {
+    try {
+      impl_->completed(id, false);
+    } catch (...) {
+    }
+  }
+  {
+    std::lock_guard guard(impl_->mutex);
+    --impl_->discard_callbacks;
+  }
+  impl_->wake.notify_all();
+  return true;
+}
 void PersistenceQueue::Drain() {
   std::unique_lock guard(impl_->mutex);
-  impl_->wake.wait(guard, [&] { return impl_->stats.pending == 0; });
+  impl_->wake.wait(guard, [&] {
+    return impl_->stats.pending == 0 && impl_->discard_callbacks == 0;
+  });
 }
 void PersistenceQueue::Stop() {
   // Joining a jthread is not concurrently safe. Keep lifecycle serialization

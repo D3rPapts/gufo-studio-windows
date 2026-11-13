@@ -1,34 +1,27 @@
 #include "src/cli/serve/tts_service.hpp"
 
 #include <algorithm>
-#include <numeric>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "src/core/cancellable_gate.hpp"
-#include "src/models/indextts/synthesis.hpp"
-#include "src/models/fish_drama3/config.hpp"
-#include "src/models/fish_drama3/hip/synthesis_runtime.hpp"
-#include "src/models/ming_tts/config.hpp"
-#include "src/models/ming_tts/synthesis.hpp"
-#include "src/models/qwen3_tts/config.hpp"
-#include "src/models/qwen3_tts/hip/synthesis_runtime.hpp"
-#include "src/models/voxcpm2/config.hpp"
-#include "src/models/voxcpm2/synthesis.hpp"
 
 namespace gufo::server {
 namespace {
 
-std::string ModelId(models::qwen3_tts::ModelVariant variant) {
+constexpr std::uint32_t kMaximumSampleRate = 192000;
+
+std::string ModelId(ext::TtsVariant variant) {
   switch (variant) {
-    case models::qwen3_tts::ModelVariant::kBase:
+    case ext::TtsVariant::kBase:
       return "qwen3-tts-12hz-1.7b-base";
-    case models::qwen3_tts::ModelVariant::kVoiceDesign:
+    case ext::TtsVariant::kVoiceDesign:
       return "qwen3-tts-12hz-1.7b-voice-design";
-    case models::qwen3_tts::ModelVariant::kCustomVoice:
+    case ext::TtsVariant::kCustomVoice:
       return "qwen3-tts-12hz-1.7b-customvoice";
-    case models::qwen3_tts::ModelVariant::kUnsupported:
+    case ext::TtsVariant::kUnsupported:
       break;
   }
   return {};
@@ -38,130 +31,106 @@ std::string ModelId(models::qwen3_tts::ModelVariant variant) {
 
 struct TtsService::Impl {
   explicit Impl(TtsServiceOptions supplied) : options(std::move(supplied)) {
-    if (!options.model_root.empty() &&
-        models::indextts::LooksLikeIndexTts25(options.model_root)) {
-      InitIndexTts();
-      return;
+    const ext::TtsProvider* provider = nullptr;
+    if (!options.model_root.empty()) {
+      provider = ext::ProbeTtsProvider(options.model_root.string());
     }
-    if (!options.model_root.empty() &&
-        models::voxcpm2::LooksLikeVoxCpm2(options.model_root.string())) {
-      InitVoxCpm2();
-      return;
-    }
-    if (!options.model_root.empty() &&
-        models::ming_tts::LooksLikeMingTts(options.model_root.string())) {
-      InitMing();
-      return;
-    }
-    if (!options.model_root.empty() &&
-        models::fish_drama3::LooksLikeFishDrama3(options.model_root.string())) {
-      is_drama3 = true;
-      sample_rate = 44100;
-      options.variant = models::qwen3_tts::ModelVariant::kBase;
-      if (options.model_id.empty()) {
-        options.model_id = "fish-drama-3";
-      }
-      if (options.voices.empty()) {
-        options.voices.push_back("default");
-        options.voices.push_back("voice-clone");
-      }
-      for (const auto& [name, unused] : options.voice_presets) {
-        (void)unused;
-        if (std::ranges::find(options.voices, name) == options.voices.end()) {
-          options.voices.push_back(name);
-        }
-      }
-      if (!options.runner) {
-        drama3_runtime = models::fish_drama3::hip::SynthesisHipRuntime::Create(
-            options.model_root.string(), options.native_context_tokens,
-            &initialization_error);
-        if (drama3_runtime == nullptr) {
-          return;
-        }
-        options.runner =
-            [this](const models::qwen3_tts::SynthesisRequest& request,
-                   const models::qwen3_tts::CancellationCheck& is_cancelled,
-                   models::qwen3_tts::SynthesisResult* result,
-                   std::string* error) {
-              models::fish_drama3::SynthesisRequest d3_req;
-              d3_req.text = request.text;
-              d3_req.reference_audio_mono = request.reference_audio.samples;
-              d3_req.reference_sample_rate =
-                  request.reference_audio.sample_rate > 0
-                      ? request.reference_audio.sample_rate
-                      : 44100U;
-              d3_req.reference_text = request.reference_text;
-              d3_req.sampling.temperature = request.sampling.temperature;
-              d3_req.sampling.top_p = request.sampling.top_p;
-              d3_req.sampling.top_k = static_cast<int>(request.sampling.top_k);
-              d3_req.sampling.seed =
-                  static_cast<std::uint32_t>(request.sampling.seed);
-              d3_req.sampling.max_new_frames = request.max_new_tokens;
-              d3_req.on_audio = request.on_audio;
-
-              models::fish_drama3::SynthesisResult d3_res;
-              if (!drama3_runtime->Generate(d3_req, is_cancelled, &d3_res,
-                                            error)) {
-                return false;
-              }
-              if (result != nullptr) {
-                result->sample_rate = d3_res.sample_rate;
-                result->code_groups = d3_res.code_groups;
-                result->samples = std::move(d3_res.samples);
-                result->sample_count = d3_res.sample_count;
-                const auto frames = static_cast<std::size_t>(
-                    std::max<std::int64_t>(0, d3_res.codes.frames));
-                const auto groups = static_cast<std::size_t>(
-                    std::max<std::int64_t>(0, d3_res.codes.codebooks));
-                result->codes.resize(frames * groups);
-                for (std::size_t f = 0; f < frames; ++f) {
-                  for (std::size_t g = 0; g < groups; ++g) {
-                    result->codes[f * groups + g] =
-                        d3_res.codes.codes[g * frames + f];
-                  }
-                }
-              }
-              return true;
-            };
-      }
-      std::ranges::sort(options.voices);
-      ready = true;
-      return;
+    if (!provider && !options.model_id.empty()) {
+      provider = ext::FindTtsProvider(options.model_id);
     }
 
-    std::optional<models::qwen3_tts::ModelConfig> config;
     if (options.validate_model) {
-      config = models::qwen3_tts::LoadModelConfigFromPath(
-          options.model_root.string());
-      if (!config.has_value() ||
-          !models::qwen3_tts::IsSupportedModelConfig(*config)) {
+      if (!provider || !provider->probe ||
+          !provider->probe(options.model_root.string())) {
         initialization_error =
-            "TTS service requires a supported Qwen3-TTS 1.7B or Fish Drama-3 "
-            "model";
+            "Qwen3-TTS service requires a supported 1.7B model";
         return;
       }
-      options.variant = config->variant;
-      if (options.voices.empty() &&
-          options.variant == models::qwen3_tts::ModelVariant::kCustomVoice) {
-        for (const auto& [name, unused] : config->talker.spk_id) {
-          (void)unused;
-          options.voices.push_back(name);
-        }
-      }
     }
+
+    if (!options.runner) {
+      if (!provider || (!provider->create && !provider->create_with_options)) {
+        initialization_error = "TTS provider not available for model: " +
+                               options.model_root.string();
+        return;
+      }
+      if (provider->create_with_options)
+        native_runtime = provider->create_with_options(
+            {.model_root = options.model_root.string(),
+             .maximum_context_tokens = options.native_context_tokens,
+             .projector_path = options.projector_path.string(),
+             .provider_options = options.provider_options},
+            &initialization_error);
+      else if (!options.projector_path.empty())
+        initialization_error =
+            "this TTS model does not take a projector sidecar";
+      else
+        native_runtime = provider->create(options.model_root.string(),
+                                          options.native_context_tokens,
+                                          &initialization_error);
+      if (native_runtime == nullptr) {
+        return;
+      }
+      options.sample_rate = native_runtime->SampleRate();
+      options.variant = native_runtime->Variant();
+      if (!options.conditioning.has_value()) {
+        options.conditioning = native_runtime->Conditioning();
+      }
+      options.concurrent = options.concurrent || native_runtime->Concurrent();
+      if (options.model_id.empty())
+        options.model_id = native_runtime->ModelId();
+      if (options.voices.empty()) {
+        options.voices = native_runtime->Voices();
+      }
+      options.runner = [this](const ext::SynthesisRequest& request,
+                              const ext::CancellationCheck& is_cancelled,
+                              ext::SynthesisResult* result,
+                              std::string* error) {
+        return native_runtime->Synthesize(request, is_cancelled, result, error);
+      };
+    }
+
+    if (options.sample_rate == 0 || options.sample_rate > kMaximumSampleRate) {
+      initialization_error = "invalid TTS output sample rate";
+      return;
+    }
+    if (!options.conditioning.has_value()) {
+      options.conditioning =
+          ext::DefaultTtsConditioningCapabilities(options.variant);
+    }
+    const auto& cond = *options.conditioning;
+    if (!cond.unconditioned &&
+        cond.reference_audio == ext::TtsConditioningMode::kUnsupported &&
+        !cond.reference_presets) {
+      initialization_error =
+          "TTS provider does not support any synthesis conditioning mode";
+      return;
+    }
+    if (cond.unconditioned &&
+        cond.reference_audio == ext::TtsConditioningMode::kRequired) {
+      initialization_error =
+          "TTS provider cannot require reference audio when unconditioned "
+          "synthesis is enabled";
+      return;
+    }
+
     if (options.model_id.empty()) {
       options.model_id = ModelId(options.variant);
     }
     if (options.voices.empty()) {
-      if (options.variant == models::qwen3_tts::ModelVariant::kVoiceDesign) {
+      if (!cond.default_voice.empty()) {
+        options.voices.push_back(cond.default_voice);
+      } else if (cond.instructions == ext::TtsConditioningMode::kRequired) {
         options.voices.push_back("voice-design");
-      } else if (options.variant == models::qwen3_tts::ModelVariant::kBase) {
+      } else if (cond.reference_audio !=
+                 ext::TtsConditioningMode::kUnsupported) {
         options.voices.push_back("voice-clone");
       }
     }
-    if (!options.voice_presets.empty() &&
-        options.variant != models::qwen3_tts::ModelVariant::kBase) {
-      initialization_error = "voice presets require a Base checkpoint";
+    if (!options.voice_presets.empty() && !cond.reference_presets) {
+      initialization_error =
+          "voice presets require a TTS model that supports reference "
+          "presets";
       return;
     }
     for (const auto& [name, unused] : options.voice_presets) {
@@ -169,298 +138,15 @@ struct TtsService::Impl {
       if (std::ranges::find(options.voices, name) == options.voices.end()) {
         options.voices.push_back(name);
       }
-    }
-    if (!options.runner) {
-      native_runtime = models::qwen3_tts::hip::SynthesisHipRuntime::Create(
-          options.model_root.string(), options.native_context_tokens,
-          options.variant, &initialization_error);
-      if (native_runtime == nullptr) {
-        return;
-      }
-      options.runner =
-          [this](const models::qwen3_tts::SynthesisRequest& request,
-                 const models::qwen3_tts::CancellationCheck& is_cancelled,
-                 models::qwen3_tts::SynthesisResult* result,
-                 std::string* error) {
-            return native_runtime->Generate(request, is_cancelled, result,
-                                            error);
-          };
-    }
-    std::ranges::sort(options.voices);
-    ready = true;
-  }
-
-  // Ming-3.0-tts: speaker-embedding cloning (CAM++), EMOTION labels and
-  // free-text instructions; CPU reference runtime.
-  void InitMing() {
-    is_ming = true;
-    sample_rate = 44100;
-    options.variant = models::qwen3_tts::ModelVariant::kBase;
-    if (options.model_id.empty()) {
-      options.model_id = "ming-3.0-tts-0.5b";
-    }
-    if (options.voices.empty()) {
-      options.voices.push_back("default");
-      options.voices.push_back("voice-clone");
-    }
-    for (const auto& [name, unused] : options.voice_presets) {
-      (void)unused;
-      if (std::ranges::find(options.voices, name) == options.voices.end()) {
-        options.voices.push_back(name);
-      }
-    }
-    if (!options.runner) {
-      ming_engine = models::ming_tts::Engine::Create(options.model_root.string(),
-                                                     &initialization_error);
-      if (ming_engine == nullptr) {
-        return;
-      }
-      options.runner =
-          [this](const models::qwen3_tts::SynthesisRequest& request,
-                 const models::qwen3_tts::CancellationCheck& is_cancelled,
-                 models::qwen3_tts::SynthesisResult* result,
-                 std::string* error) {
-            models::ming_tts::SynthesisRequest ming;
-            ming.text = request.text;
-            ming.language = request.language;
-            ming.emotion = request.emotion;
-            ming.instruction = request.instruct;
-            ming.speed = request.tempo;
-            ming.pitch = request.pitch;
-            ming.volume = request.volume;
-            ming.dialect = request.dialect;
-            ming.reference_text = request.reference_text;
-            const auto& audio = request.reference_audio;
-            if (!audio.samples.empty() && audio.channels > 0) {
-              const std::size_t frames = audio.samples.size() / audio.channels;
-              ming.reference_audio.resize(frames);
-              for (std::size_t f = 0; f < frames; ++f) {
-                double sum = 0.0;
-                for (std::uint32_t c = 0; c < audio.channels; ++c) {
-                  sum += audio.samples[f * audio.channels + c];
-                }
-                ming.reference_audio[f] =
-                    static_cast<float>(sum / static_cast<double>(audio.channels));
-              }
-              ming.reference_sample_rate = audio.sample_rate;
-            }
-            ming.seed = request.sampling.seed;
-            ming.max_decode_steps = static_cast<std::int32_t>(
-                std::min<std::size_t>(request.max_new_tokens, 1000));
-            ming.on_audio = request.on_audio;
-            models::ming_tts::SynthesisResult ming_result;
-            if (!ming_engine->Generate(ming, is_cancelled, &ming_result, error)) {
-              return false;
-            }
-            if (result != nullptr) {
-              result->sample_rate = ming_result.sample_rate;
-              result->code_groups = 1;
-              result->codes.assign(
-                  static_cast<std::size_t>(std::accumulate(
-                      ming_result.fragment_steps.begin(),
-                      ming_result.fragment_steps.end(), std::int64_t{0})),
-                  0);
-              result->sample_count = ming_result.samples.size();
-              result->samples = std::move(ming_result.samples);
-            }
-            return true;
-          };
-    }
-    std::ranges::sort(options.voices);
-    ready = true;
-  }
-
-  // VoxCPM2: reference-voice cloning (isolated prefix), "ultimate" cloning
-  // with a transcript (reference + continuation prompt), zero-shot without a
-  // voice, and the style/emotion instruction as a "(...)" text prefix.
-  void InitVoxCpm2() {
-    is_voxcpm2 = true;
-    sample_rate = 48000;
-    options.variant = models::qwen3_tts::ModelVariant::kBase;
-    if (options.model_id.empty()) {
-      options.model_id = "voxcpm2";
-    }
-    if (options.voices.empty()) {
-      options.voices.push_back("default");
-      options.voices.push_back("voice-clone");
-    }
-    for (const auto& [name, unused] : options.voice_presets) {
-      (void)unused;
-      if (std::ranges::find(options.voices, name) == options.voices.end()) {
-        options.voices.push_back(name);
-      }
-    }
-    if (!options.runner) {
-      voxcpm2_engine = models::voxcpm2::Engine::Create(options.model_root.string(),
-                                                       &initialization_error);
-      if (voxcpm2_engine == nullptr) {
-        return;
-      }
-      options.runner =
-          [this](const models::qwen3_tts::SynthesisRequest& request,
-                 const models::qwen3_tts::CancellationCheck& is_cancelled,
-                 models::qwen3_tts::SynthesisResult* result,
-                 std::string* error) {
-            models::voxcpm2::SynthesisRequest vox;
-            vox.text = request.text;
-            // "emotion" and "instructions" are both free text for VoxCPM2.
-            vox.instruction = request.emotion;
-            if (!request.instruct.empty()) {
-              vox.instruction += (vox.instruction.empty() ? "" : ", ") + request.instruct;
-            }
-            const auto& audio = request.reference_audio;
-            if (!audio.samples.empty() && audio.channels > 0) {
-              const std::size_t frames = audio.samples.size() / audio.channels;
-              vox.reference_audio.resize(frames);
-              for (std::size_t f = 0; f < frames; ++f) {
-                double sum = 0.0;
-                for (std::uint32_t c = 0; c < audio.channels; ++c) {
-                  sum += audio.samples[f * audio.channels + c];
-                }
-                vox.reference_audio[f] =
-                    static_cast<float>(sum / static_cast<double>(audio.channels));
-              }
-              vox.reference_sample_rate = audio.sample_rate;
-              if (!request.reference_text.empty() && !request.speaker_embedding_only) {
-                // "Ultimate cloning": the same clip also continues as prompt.
-                vox.prompt_audio = vox.reference_audio;
-                vox.prompt_sample_rate = audio.sample_rate;
-                vox.prompt_text = request.reference_text;
-              }
-            }
-            vox.seed = request.sampling.seed;
-            vox.max_len = static_cast<std::int32_t>(
-                std::min<std::size_t>(request.max_new_tokens, 4096));
-            vox.on_audio = request.on_audio;
-            models::voxcpm2::SynthesisResult vox_result;
-            if (!voxcpm2_engine->Generate(vox, is_cancelled, &vox_result, error)) {
-              return false;
-            }
-            if (result != nullptr) {
-              result->sample_rate = vox_result.sample_rate;
-              result->code_groups = 1;
-              result->codes.assign(static_cast<std::size_t>(vox_result.steps), 0);
-              result->sample_count = vox_result.samples.size();
-              result->samples = std::move(vox_result.samples);
-            }
-            return true;
-          };
-    }
-    std::ranges::sort(options.voices);
-    ready = true;
-  }
-
-  // IndexTTS-2.5 with the German GPT fine-tune: reference-voice cloning
-  // (CAM++ + w2v-BERT conditioning of the clip), emotion as the 8-value
-  // emo_vector or emotion names, German text frontend; 22.05 kHz output.
-  void InitIndexTts() {
-    is_indextts = true;
-    sample_rate = static_cast<std::uint32_t>(models::indextts::kOutputRate);
-    options.variant = models::qwen3_tts::ModelVariant::kBase;
-    if (options.model_id.empty()) {
-      options.model_id = "indextts-2.5-german";
-    }
-    if (options.voices.empty()) {
-      options.voices.push_back("voice-clone");
-    }
-    for (const auto& [name, unused] : options.voice_presets) {
-      (void)unused;
-      if (std::ranges::find(options.voices, name) == options.voices.end()) {
-        options.voices.push_back(name);
-      }
-    }
-    if (!options.runner) {
-      indextts_engine = models::indextts::Engine::Create(options.model_root, &initialization_error);
-      if (indextts_engine == nullptr) {
-        return;
-      }
-      options.runner =
-          [this](const models::qwen3_tts::SynthesisRequest& request,
-                 const models::qwen3_tts::CancellationCheck& is_cancelled,
-                 models::qwen3_tts::SynthesisResult* result,
-                 std::string* error) {
-            models::indextts::SynthesisRequest req;
-            req.text = request.text;
-            if (!request.language.empty()) {
-              req.language = request.language;
-            }
-            if (!models::indextts::ParseEmotionSpec(request.emotion, &req.emotion, error)) {
-              return false;
-            }
-            const auto& audio = request.reference_audio;
-            if (audio.samples.empty() || audio.channels == 0) {
-              if (error != nullptr) {
-                *error = "IndexTTS-2.5 needs a reference voice";
-              }
-              return false;
-            }
-            const std::size_t frames = audio.samples.size() / audio.channels;
-            req.reference.resize(frames);
-            for (std::size_t f = 0; f < frames; ++f) {
-              double sum = 0.0;
-              for (std::uint32_t c = 0; c < audio.channels; ++c) {
-                sum += audio.samples[f * audio.channels + c];
-              }
-              req.reference[f] = static_cast<float>(sum / static_cast<double>(audio.channels));
-            }
-            req.reference_rate = audio.sample_rate;
-            req.seed = request.sampling.seed;
-            req.sampling.temperature = request.sampling.temperature;
-            req.sampling.top_k = static_cast<std::int32_t>(request.sampling.top_k);
-            req.sampling.top_p = request.sampling.top_p;
-            req.sampling.repetition_penalty = request.sampling.repetition_penalty;
-            req.sampling.max_tokens = static_cast<std::int32_t>(
-                std::min<std::size_t>(request.max_new_tokens, 1500));
-            // int16 -> float so that the API's truncating PCM16 encoder
-            // reproduces the exact int16 samples of the reference pipeline.
-            const auto to_float = [](std::int16_t s) {
-              return s == 0 ? 0.0F
-                            : (static_cast<float>(s) + (s > 0 ? 0.25F : -0.25F)) / 32767.0F;
-            };
-            bool stopped = false;
-            models::indextts::Engine::ChunkFn on_chunk;
-            if (request.on_audio) {
-              on_chunk = [&](std::span<const std::int16_t> pcm) {
-                std::vector<float> chunk(pcm.size());
-                std::transform(pcm.begin(), pcm.end(), chunk.begin(), to_float);
-                if (!stopped && !request.on_audio(chunk)) {
-                  stopped = true;
-                }
-              };
-            }
-            const auto cancelled = [&] { return stopped || (is_cancelled && is_cancelled()); };
-            models::indextts::SynthesisResult res;
-            if (!indextts_engine->Generate(req, cancelled, on_chunk, &res, error)) {
-              return false;
-            }
-            if (result != nullptr) {
-              result->sample_rate = static_cast<std::uint32_t>(models::indextts::kOutputRate);
-              result->code_groups = 1;
-              result->codes.assign(static_cast<std::size_t>(res.gpt_steps), 0);
-              result->samples.resize(res.samples.size());
-              std::transform(res.samples.begin(), res.samples.end(), result->samples.begin(), to_float);
-              result->sample_count = result->samples.size();
-            }
-            return true;
-          };
     }
     std::ranges::sort(options.voices);
     ready = true;
   }
 
   TtsServiceOptions options;
-  std::unique_ptr<models::voxcpm2::Engine> voxcpm2_engine;
-  std::unique_ptr<models::indextts::Engine> indextts_engine;
-  std::unique_ptr<models::ming_tts::Engine> ming_engine;
-  std::unique_ptr<models::qwen3_tts::hip::SynthesisHipRuntime> native_runtime;
-  std::unique_ptr<models::fish_drama3::hip::SynthesisHipRuntime> drama3_runtime;
+  std::unique_ptr<ext::TtsRunner> native_runtime;
   std::string initialization_error;
   core::CancellableGate generation_gate;
-  bool is_drama3{false};
-  bool is_ming{false};
-  bool is_voxcpm2{false};
-  bool is_indextts{false};
-  std::uint32_t sample_rate{24000};
   bool ready{false};
 };
 
@@ -481,22 +167,18 @@ std::string TtsService::model_id() const {
   return impl_->options.model_id;
 }
 
+bool TtsService::serves_model(std::string_view name) const {
+  return name == model_id() || name == "qwen3-tts" ||
+         std::find(impl_->options.model_aliases.begin(),
+                   impl_->options.model_aliases.end(),
+                   name) != impl_->options.model_aliases.end();
+}
+
+const std::vector<std::string>& TtsService::model_aliases() const {
+  return impl_->options.model_aliases;
+}
+
 std::string TtsService::backend_name() const {
-  if (impl_->is_indextts) {
-    return impl_->indextts_engine != nullptr
-               ? std::string("native-") + impl_->indextts_engine->backend_name()
-               : std::string("native-cpu");
-  }
-  if (impl_->is_voxcpm2) {
-    return impl_->voxcpm2_engine != nullptr
-               ? std::string("native-") + impl_->voxcpm2_engine->backend_name()
-               : std::string("native-cpu");
-  }
-  if (impl_->is_ming) {
-    return impl_->ming_engine != nullptr
-               ? std::string("native-") + impl_->ming_engine->backend_name()
-               : std::string("native-cpu");
-  }
   return "native-hip";
 }
 
@@ -509,47 +191,62 @@ const TtsVoicePreset* TtsService::voice_preset(const std::string& name) const {
   return found == impl_->options.voice_presets.end() ? nullptr : &found->second;
 }
 
-models::qwen3_tts::ModelVariant TtsService::variant() const noexcept {
+std::uint32_t TtsService::sample_rate() const noexcept {
+  return impl_->options.sample_rate;
+}
+
+ext::TtsVariant TtsService::variant() const noexcept {
   return impl_->options.variant;
 }
 
-bool TtsService::is_fish_drama3() const noexcept {
-  return impl_->is_drama3;
+const ext::TtsConditioningCapabilities& TtsService::conditioning()
+    const noexcept {
+  // Construction always fills `conditioning` before the service can become
+  // ready; the fallback only guards use on a service that failed to start.
+  static const ext::TtsConditioningCapabilities kNoneSupported{
+      /*unconditioned=*/false,
+      /*require_voice=*/false,
+      /*default_voice=*/{},
+      /*reference_audio=*/ext::TtsConditioningMode::kUnsupported,
+      /*reference_presets=*/false,
+      /*instructions=*/ext::TtsConditioningMode::kUnsupported};
+  return impl_->options.conditioning.has_value() ? *impl_->options.conditioning
+                                                 : kNoneSupported;
 }
 
-bool TtsService::is_ming_tts() const noexcept {
-  return impl_->is_ming;
-}
-
-bool TtsService::is_voxcpm2() const noexcept {
-  return impl_->is_voxcpm2;
-}
-
-bool TtsService::is_indextts() const noexcept {
-  return impl_->is_indextts;
-}
-
-std::uint32_t TtsService::sample_rate() const noexcept {
-  return impl_->sample_rate;
-}
-
-bool TtsService::Synthesize(
-    const models::qwen3_tts::SynthesisRequest& request,
-    const models::qwen3_tts::CancellationCheck& is_cancelled,
-    models::qwen3_tts::SynthesisResult* result, std::string* error) {
+bool TtsService::Synthesize(const ext::SynthesisRequest& request,
+                            const ext::CancellationCheck& is_cancelled,
+                            ext::SynthesisResult* result, std::string* error) {
   if (!impl_->ready) {
     if (error != nullptr) {
       *error = impl_->initialization_error;
     }
     return false;
   }
+  const auto run = [&] {
+    if (!impl_->options.runner(request, is_cancelled, result, error)) {
+      return false;
+    }
+    if (result == nullptr ||
+        result->sample_rate != impl_->options.sample_rate) {
+      if (error != nullptr) {
+        *error = kInvalidSynthesisResultError;
+      }
+      if (result)
+        *result = {};
+      return false;
+    }
+    return true;
+  };
+  if (impl_->options.concurrent)
+    return run();
   auto lease = impl_->generation_gate.Acquire(is_cancelled, error);
   if (!lease) {
     if (result)
       *result = {};
     return false;
   }
-  return impl_->options.runner(request, is_cancelled, result, error);
+  return run();
 }
 
 }  // namespace gufo::server

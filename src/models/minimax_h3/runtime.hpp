@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
 
 namespace gufo::minimax_h3 {
 

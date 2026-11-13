@@ -19,6 +19,19 @@ Adapted code includes:
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
 
+Ported models (license texts in licenses/, installed in third-party/):
+- Real-ESRGAN: Copyright (c) 2021, Xintao Wang. All rights reserved.
+  (BSD-3-Clause; licenses/realesrgan.txt)
+- ACE-Step 1.5: Copyright (c) 2026 ACEStep (MIT).
+- MMAudio: Copyright (c) 2024 Sony Research Inc. (MIT, code only; the
+  weights are CC BY-NC 4.0 and not included).
+- RIFE (Practical-RIFE): Copyright (c) 2021 hzwer (MIT).
+- ComfyUI-Frame-Interpolation: Copyright (c) 2023 Fannovel16 (MIT).
+- TripoSG: Copyright (c) 2025 VAST-AI-Research and contributors (MIT).
+- TRELLIS.2: Copyright (c) Microsoft Corporation (MIT).
+- TRELLIS.2 is Built with DINOv3 (Meta, DINOv3 License; licenses/dinov3.txt).
+TripoSG and TRELLIS.2 run in the separate `gufo serve objekt` worker build.
+
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp
 - Nathanw1014/strix-halo-llamacpp: https://github.com/Nathanw1014/strix-halo-llamacpp

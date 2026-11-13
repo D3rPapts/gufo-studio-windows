@@ -10,8 +10,9 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/json.hpp"
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/json.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
+#include "src/models/wan22/parallel_read.hpp"
 #include "src/models/wan22/attention.hip.hpp"
 #include "src/models/wan22/gemm.hpp"
 #include "src/models/wan22/transformer21.hpp"
@@ -482,7 +483,7 @@ const std::byte* ReadStaged(platform::PlatformFile file, std::byte* buffer,
   const std::uint64_t aligned = offset / kSector * kSector;
   const auto lead = static_cast<std::size_t>(offset - aligned);
   const std::size_t span = (lead + bytes + kSector - 1U) / kSector * kSector;
-  return platform::ReadFileParallel(file, buffer, span, aligned) >= lead + bytes
+  return ReadFileParallel(file, buffer, span, aligned) >= lead + bytes
              ? buffer + lead
              : nullptr;
 }

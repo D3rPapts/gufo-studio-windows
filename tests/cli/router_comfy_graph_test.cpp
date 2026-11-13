@@ -1173,6 +1173,81 @@ void TestRifeOnly() {
              .message.find("no generating node") != std::string::npos);
 }
 
+void TestRifeSourceFps() {
+  // Regie #56-719 (router 1.4.20/21): a 12 fps shot, RIFE x5, SaveImage and
+  // CreateVideo 60 fps -> SaveVideo. The adapter probes the file's rate, so
+  // 12 x 5 = 60 is the RIFE rate and both outputs agree. Before, 24 fps was
+  // assumed (x5 = 120 -> "resample to 60") and the SaveImage output of the
+  // same job differed -> "same RIFE interpolation".
+  const std::string text =
+      Replace(Replace(kRifeOnly, "\"multiplier\": 4", "\"multiplier\": 5"),
+              "\"fps\": 96.0", "\"fps\": 60.0");
+  const auto plan_with = [](const std::string& prompt, double source_fps) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(
+        json::parse(prompt), {}, &plan, &error,
+        [source_fps](const comfy::FileRef& file) {
+          assert(file.name == "life3_film_a1_s01_x01_roh.mp4" &&
+                 file.folder == "input");
+          return source_fps;
+        });
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return plan;
+  };
+  const comfy::Plan twelve = plan_with(text, 12);
+  assert(twelve.tasks.size() == 1 && twelve.tasks[0].outputs.size() == 2);
+  const auto& video = std::get<comfy::VideoTask>(twelve.tasks[0].spec);
+  assert(video.source_fps == 12 && video.interpolate == 5);
+  assert(video.fps_num == 0 && video.fps == 60);
+  assert(twelve.warnings.empty());
+  assert(comfy::VideoRequestBody(video)
+             .find("gufo")
+             ->find("interpolate")
+             ->as_double() == 5);
+  // 24 fps x5 -> CreateVideo 120: the same.
+  const comfy::Plan full = plan_with(
+      Replace(text, "\"fps\": 60.0", "\"fps\": 120.0"), 24);
+  const auto& at_24 = std::get<comfy::VideoTask>(full.tasks[0].spec);
+  assert(at_24.source_fps == 24 && at_24.interpolate == 5 &&
+         at_24.fps_num == 0 && at_24.fps == 120);
+  // Without a probe (no ffprobe) 24 fps is assumed: 60 is then a resample
+  // of the x5 frames; the SaveImage output of the job takes those frames,
+  // no conflict.
+  const comfy::Plan assumed = PlanOf(text.c_str());
+  const auto& as_24 = std::get<comfy::VideoTask>(assumed.tasks[0].spec);
+  assert(as_24.source_fps == 0 && as_24.interpolate == 5 &&
+         as_24.fps_num == 60 && as_24.fps == 60);
+  assert(assumed.tasks[0].outputs.size() == 2);
+  // fps rounding: 59.94 for 60, and a probed 11.988 (12000/1001) source.
+  const comfy::Plan ntsc =
+      plan_with(Replace(text, "\"fps\": 60.0", "\"fps\": 59.94"), 12);
+  assert(std::get<comfy::VideoTask>(ntsc.tasks[0].spec).fps_num == 0);
+  assert(std::get<comfy::VideoTask>(ntsc.tasks[0].spec).fps == 60);
+  const comfy::Plan probed = plan_with(text, 11.988);
+  assert(std::get<comfy::VideoTask>(probed.tasks[0].spec).fps_num == 0);
+  assert(std::get<comfy::VideoTask>(probed.tasks[0].spec).fps == 60);
+  // Still rejected: a second RIFE chain with another multiplier, and two
+  // video outputs asking for different rates.
+  const comfy::PlanError multiplier = ErrorOf(Replace(
+      text, " \"4\": {",
+      " \"7\": {\"class_type\": \"RIFE VFI\", \"inputs\": {\"frames\": "
+      "[\"2\", 0], \"multiplier\": 2}},\n \"8\": {\"class_type\": "
+      "\"PreviewImage\", \"inputs\": {\"images\": [\"7\", 0]}},\n \"4\": {"));
+  assert(multiplier.message.find("same RIFE") != std::string::npos);
+  assert(multiplier.message.find("multiplier x") != std::string::npos);
+  const comfy::PlanError rates = ErrorOf(Replace(
+      text, " \"4\": {",
+      " \"7\": {\"class_type\": \"CreateVideo\", \"inputs\": {\"images\": "
+      "[\"3\", 0], \"fps\": 48.0, \"codec\": \"h264\"}},\n \"8\": "
+      "{\"class_type\": \"SaveVideo\", \"inputs\": {\"video\": [\"7\", 0], "
+      "\"filename_prefix\": \"film/b\", \"format\": \"mp4\"}},\n \"4\": {"));
+  assert(rates.message.find("same RIFE") != std::string::npos);
+  assert(rates.message.find("frame rate") != std::string::npos);
+}
+
 constexpr const char* kDialogue = R"({
  "1": {"class_type": "LoadAudio", "inputs": {"audio": "anna.wav"}},
  "2": {"class_type": "LoadAudio", "inputs": {"audio": "ben.flac"}},
@@ -2229,6 +2304,7 @@ int main() {
   TestQwenTurbo();
   TestRife();
   TestRifeOnly();
+  TestRifeSourceFps();
   TestDialogue();
   TestAceStep();
   TestUni3C();

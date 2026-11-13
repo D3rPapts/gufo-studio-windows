@@ -3,8 +3,10 @@
 
 # Host side of the NPU / CPU path (`gufo serve upscale --device npu|cpu`):
 # tiling, pixel shuffle, residual and OpenCV-exact INTER_AREA fitting
-# (cpu_post), and the run-time loaded ONNX Runtime sessions (ort_upscaler).
-add_library(gufo_realesrgan_cpu STATIC cpu_post.cpp)
+# (cpu_post), the safetensors header / architecture check of the converted
+# weights (srvgg_weights), and the run-time loaded ONNX Runtime sessions
+# (ort_upscaler).
+add_library(gufo_realesrgan_cpu STATIC cpu_post.cpp srvgg_weights.cpp)
 target_include_directories(gufo_realesrgan_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -37,6 +39,23 @@ if (BUILD_TESTING)
   add_test(NAME realesrgan_cpu_post_test COMMAND realesrgan_cpu_post_test)
   set_tests_properties(realesrgan_cpu_post_test PROPERTIES
     LABELS "cpu;models;realesrgan")
+  # Tile plan of the HIP upscaler (header only) and the safetensors header /
+  # SRVGGNetCompact architecture check of the server's start-up.
+  add_executable(realesrgan_tile_plan_test
+    ${PROJECT_SOURCE_DIR}/tests/models/realesrgan/tile_plan_test.cpp)
+  target_include_directories(realesrgan_tile_plan_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  add_test(NAME realesrgan_tile_plan_test COMMAND realesrgan_tile_plan_test)
+  set_tests_properties(realesrgan_tile_plan_test PROPERTIES
+    LABELS "cpu;models;realesrgan")
+  add_executable(realesrgan_srvgg_weights_test
+    ${PROJECT_SOURCE_DIR}/tests/models/realesrgan/srvgg_weights_test.cpp)
+  target_link_libraries(realesrgan_srvgg_weights_test PRIVATE
+    gufo_realesrgan_cpu)
+  add_test(NAME realesrgan_srvgg_weights_test
+    COMMAND realesrgan_srvgg_weights_test)
+  set_tests_properties(realesrgan_srvgg_weights_test PROPERTIES
+    LABELS "cpu;models;realesrgan")
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -48,7 +67,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_realesrgan PUBLIC gufo_rife hip::host)
 
   # Standalone driver with the same options as `gufo video-upscale`.
-  add_executable(gufo-upscale EXCLUDE_FROM_ALL upscale_main.cpp
+  add_executable(gufo-upscale EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/src/cli/video/upscale_main.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/video/video_upscale.cpp)
   set_target_properties(gufo-upscale PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

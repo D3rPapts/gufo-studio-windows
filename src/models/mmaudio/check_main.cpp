@@ -15,6 +15,9 @@
 #include <vector>
 
 #include "src/models/mmaudio/pipeline.hpp"
+#include "src/models/mmaudio/clip.hpp"
+#include "src/models/mmaudio/network.hpp"
+#include "src/models/mmaudio/synchformer.hpp"
 #include "src/models/mmaudio/vocoder.hpp"
 
 namespace mm = gufo::models::mmaudio;

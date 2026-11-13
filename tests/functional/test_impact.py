@@ -34,7 +34,7 @@ class ImpactTest(unittest.TestCase):
         self.assertLessEqual({"cache", "long-context", "cache-edits", "discovery", "state-edges"}, names)
 
     def test_shared_qwen_is_not_private_qwen27(self):
-        result = impact.plan(self.manifest, ["src/models/qwen/tokenizer.cpp"])
+        result = impact.plan(self.manifest, ["src/families/qwen/text/tokenizer.cpp"])
         profiles = {row["profile"] for row in result["selected"]}
         self.assertIn("flash-next-q4/mtp", profiles)
         self.assertIn("qwen27-q8/dflash2", profiles)
@@ -58,7 +58,7 @@ class ImpactTest(unittest.TestCase):
         self.assertEqual(result["timing_qualification"], "not performed; candidate correctness only")
 
     def test_docs_select_nothing_but_graph_changes_expand(self):
-        self.assertFalse(impact.plan(self.manifest, ["docs/SERVER.md"])["groups"])
+        self.assertFalse(impact.plan(self.manifest, ["docs/server.md"])["groups"])
         self.assertTrue(impact.plan(self.manifest, ["tests/functional/impact.json"])["groups"])
 
     def test_deleted_and_renamed_paths_are_retained(self):

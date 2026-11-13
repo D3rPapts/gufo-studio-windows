@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/video_vae_encoder.hpp"
 

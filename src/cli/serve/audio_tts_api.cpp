@@ -12,11 +12,10 @@
 #include <string>
 #include <utility>
 
+#include "src/cli/serve/audio_buffer.hpp"
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
-#include "src/models/indextts/synthesis.hpp"
-#include "src/models/ming_tts/prompt.hpp"
-#include "src/models/qwen3_tts/audio.hpp"
+#include "src/ext/tts.hpp"
 
 namespace gufo::server {
 namespace {
@@ -25,12 +24,15 @@ constexpr std::string_view kSpeechPath = "/v1/audio/speech";
 constexpr std::string_view kVoicesPath = "/v1/audio/voices";
 constexpr std::size_t kMaximumInputBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 8192;
-// VoxCPM2 encodes the whole reference clip into its 8192-position context.
-constexpr std::size_t kMaximumVoxCpm2ReferenceSeconds = 60;
-// IndexTTS-2.5: inline reference clips (request 'reference_audio') may be up to
-// 10 s. Server-side presets (--voice name=wav) are not limited here: the
-// engine cuts every reference at 15 s like _load_and_cut_audio(spk, 15).
-constexpr std::size_t kMaximumIndexTtsReferenceSeconds = 10;
+
+std::uint64_t AudioDurationMs(std::size_t samples,
+                              std::uint32_t sample_rate) noexcept {
+  if (sample_rate == 0)
+    return 0;
+  const auto count = static_cast<std::uint64_t>(samples);
+  return (count / sample_rate) * 1000ULL +
+         ((count % sample_rate) * 1000ULL) / sample_rate;
+}
 
 bool ReadUnsigned(const json::Value& body, std::string_view name,
                   std::size_t default_value, std::size_t maximum,
@@ -64,6 +66,19 @@ bool ReadFloat(const json::Value& body, std::string_view name, float* output) {
   return std::isfinite(*output);
 }
 
+bool ValidSamplingOptions(const ext::TtsSamplingOptions& options) {
+  const auto temperature = [](float value) {
+    return std::isfinite(value) && value > 0.0F;
+  };
+  const auto top_p = [](float value) {
+    return std::isfinite(value) && value > 0.0F && value <= 1.0F;
+  };
+  return temperature(options.temperature) &&
+         temperature(options.predictor_temperature) &&
+         temperature(options.repetition_penalty) && top_p(options.top_p) &&
+         top_p(options.predictor_top_p);
+}
+
 HttpResponse Error(int status, std::string reason, std::string message,
                    std::string code) {
   json::Value root = json::Value::object();
@@ -79,13 +94,6 @@ HttpResponse Error(int status, std::string reason, std::string message,
       .headers = {},
       .streaming_body = {},
   };
-}
-
-bool HasOnlyMembers(const json::Value& value,
-                    std::initializer_list<std::string_view> allowed) {
-  return std::ranges::all_of(value.members(), [&](const auto& member) {
-    return std::ranges::find(allowed, member.first) != allowed.end();
-  });
 }
 
 void AppendU16(std::string* output, std::uint16_t value) {
@@ -176,36 +184,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     return Error(400, "Bad Request", "request body must be valid JSON",
                  "parse_error");
   }
-  if (!body.is_object() || !HasOnlyMembers(body, {"model",
-                                                  "input",
-                                                  "voice",
-                                                  "response_format",
-                                                  "speed",
-                                                  "language",
-                                                  "instructions",
-                                                  "emotion",
-                                                  "tempo",
-                                                  "pitch",
-                                                  "volume",
-                                                  "dialect",
-                                                  "seed",
-                                                  "max_new_tokens",
-                                                  "greedy",
-                                                  "reference_audio",
-                                                  "reference_text",
-                                                  "voice_clone_mode",
-                                                  "temperature",
-                                                  "top_k",
-                                                  "top_p",
-                                                  "repetition_penalty",
-                                                  "subtalker_dosample",
-                                                  "subtalker_temperature",
-                                                  "subtalker_top_k",
-                                                  "subtalker_top_p",
-                                                  "stream_format"})) {
-    return Error(400, "Bad Request",
-                 "request contains unsupported audio speech fields",
-                 "unsupported_field");
+  // As in vLLM and the other OpenAI-compatible servers, unknown members are
+  // ignored.
+  if (!body.is_object()) {
+    return Error(400, "Bad Request", "request body must be a JSON object",
+                 "invalid_body");
   }
   const json::Value* model = body.find("model");
   const json::Value* input = body.find("input");
@@ -217,13 +200,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "string when supplied",
                  "invalid_parameter_type");
   }
-  if (model->str() != service.model_id() && model->str() != "qwen3-tts" &&
-      !(service.is_fish_drama3() && model->str() == "fish-drama-3") &&
-      !(service.is_ming_tts() && model->str() == "ming-3.0-tts") &&
-      !(service.is_voxcpm2() && model->str() == "voxcpm2") &&
-      !(service.is_indextts() && (model->str() == "indextts-2.5" ||
-                                  model->str() == "indextts-2.5-german" ||
-                                  model->str() == "indextts"))) {
+  if (!service.serves_model(model->str())) {
     return Error(400, "Bad Request", "unsupported audio speech model",
                  "invalid_model");
   }
@@ -236,37 +213,61 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "audio speech input exceeds 16384 UTF-8 bytes",
                  "input_too_large");
   }
+  const auto& cond = service.conditioning();
   const std::vector<std::string> voices = service.voices();
-  if (service.variant() == models::qwen3_tts::ModelVariant::kCustomVoice &&
-      voice == nullptr) {
+  if (cond.require_voice && voice == nullptr) {
     return Error(400, "Bad Request",
-                 "CustomVoice requests require a 'voice' speaker",
-                 "missing_voice");
+                 "this TTS model requires a 'voice' speaker", "missing_voice");
+  }
+  std::string fallback_voice = cond.default_voice;
+  if ((fallback_voice.empty() ||
+       std::ranges::find(voices, fallback_voice) == voices.end()) &&
+      !voices.empty()) {
+    fallback_voice = voices.front();
   }
   const std::string selected_voice =
-      voice != nullptr ? voice->str()
-                       : (voices.empty() ? std::string{} : voices.front());
+      voice != nullptr ? voice->str() : fallback_voice;
   if (std::ranges::find(voices, selected_voice) == voices.end()) {
     return Error(400, "Bad Request", "unsupported Qwen3-TTS voice",
                  "invalid_voice");
   }
-  if (service.variant() == models::qwen3_tts::ModelVariant::kVoiceDesign &&
-      body.member_str("instructions").empty()) {
+  for (const std::string_view name : {"language", "instructions"}) {
+    const json::Value* value = body.find(std::string(name));
+    if (value != nullptr && !value->is_string()) {
+      return Error(400, "Bad Request",
+                   "'" + std::string(name) + "' must be a string",
+                   "invalid_parameter_type");
+    }
+  }
+  const std::string instructions = body.member_str("instructions");
+  if (cond.instructions == ext::TtsConditioningMode::kRequired &&
+      instructions.empty()) {
     return Error(400, "Bad Request",
                  "VoiceDesign requests require non-empty 'instructions'",
                  "missing_instruction");
   }
-  models::qwen3_tts::AudioBuffer reference_audio;
+  if (cond.instructions == ext::TtsConditioningMode::kUnsupported &&
+      body.find("instructions") != nullptr && !instructions.empty()) {
+    return Error(400, "Bad Request",
+                 "instructions are not supported by this TTS model",
+                 "unsupported_field");
+  }
+  const bool has_reference_fields = body.find("reference_audio") != nullptr ||
+                                    body.find("reference_text") != nullptr ||
+                                    body.find("voice_clone_mode") != nullptr;
+  AudioBuffer reference_audio;
   std::string reference_text;
   bool speaker_embedding_only = false;
   const TtsVoicePreset* preset = service.voice_preset(selected_voice);
-  if (service.variant() == models::qwen3_tts::ModelVariant::kBase &&
-      preset != nullptr) {
+  if (preset != nullptr) {
+    if (!cond.reference_presets) {
+      return Error(400, "Bad Request",
+                   "voice presets are not supported by this TTS model",
+                   "unsupported_field");
+    }
     // The named preset already carries the reference audio, so accepting
     // per-request reference fields too would leave which one wins ambiguous.
-    if (body.find("reference_audio") != nullptr ||
-        body.find("reference_text") != nullptr ||
-        body.find("voice_clone_mode") != nullptr) {
+    if (has_reference_fields) {
       return Error(400, "Bad Request",
                    "voice '" + selected_voice +
                        "' is a preset that already supplies reference audio",
@@ -275,17 +276,21 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     reference_audio = preset->reference_audio;
     reference_text = preset->reference_text;
     speaker_embedding_only = preset->speaker_embedding_only;
-  } else if (service.variant() == models::qwen3_tts::ModelVariant::kBase &&
-             ((!service.is_fish_drama3() && !service.is_ming_tts() &&
-               !service.is_voxcpm2()) ||
-              body.find("reference_audio") != nullptr ||
-              body.find("reference_text") != nullptr)) {
+  } else if (has_reference_fields ||
+             cond.reference_audio == ext::TtsConditioningMode::kRequired ||
+             !cond.unconditioned) {
+    if (cond.reference_audio == ext::TtsConditioningMode::kUnsupported) {
+      return Error(400, "Bad Request",
+                   "reference audio fields are not supported by this TTS "
+                   "model",
+                   "unsupported_field");
+    }
     const json::Value* encoded_audio = body.find("reference_audio");
     const json::Value* clone_text = body.find("reference_text");
     const json::Value* clone_mode = body.find("voice_clone_mode");
     if (encoded_audio == nullptr || !encoded_audio->is_string()) {
       return Error(400, "Bad Request",
-                   "Base voice cloning requires base64 WAV "
+                   "voice cloning requires base64 WAV "
                    "'reference_audio'",
                    "missing_reference_audio");
     }
@@ -298,19 +303,13 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                    "'speaker_embedding_only'",
                    "invalid_voice_clone_mode");
     }
-    // Ming-3.0-tts clones from the CAM++ speaker embedding alone.
-    // VoxCPM2 clones from the reference audio alone unless a transcript (or
-    // voice_clone_mode "icl") asks for the reference + continuation layout.
     speaker_embedding_only =
-        service.is_ming_tts() || service.is_indextts() ||
-        (clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only") ||
-        (service.is_voxcpm2() && clone_mode == nullptr &&
-         (clone_text == nullptr || !clone_text->is_string() || clone_text->str().empty()));
+        clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only";
     if (!speaker_embedding_only &&
         (clone_text == nullptr || !clone_text->is_string() ||
          clone_text->str().empty())) {
       return Error(400, "Bad Request",
-                   "Base ICL voice cloning requires non-empty "
+                   "ICL voice cloning requires non-empty "
                    "'reference_text'",
                    "missing_reference_text");
     }
@@ -319,18 +318,12 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                    "invalid_parameter_type");
     }
     std::string audio_error;
-    if (!models::qwen3_tts::DecodeBase64Wav(encoded_audio->str(),
-                                            &reference_audio, &audio_error)) {
+    if (!DecodeBase64Wav(encoded_audio->str(), &reference_audio,
+                         &audio_error)) {
       return Error(400, "Bad Request", std::move(audio_error),
                    "invalid_reference_audio");
     }
     reference_text = clone_text == nullptr ? std::string{} : clone_text->str();
-  } else if (body.find("reference_audio") != nullptr ||
-             body.find("reference_text") != nullptr ||
-             body.find("voice_clone_mode") != nullptr) {
-    return Error(400, "Bad Request",
-                 "reference audio fields are valid only for the Base model",
-                 "unsupported_field");
   }
   const auto* stream_format = body.find("stream_format");
   if (stream_format != nullptr &&
@@ -350,143 +343,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   if (sse && !pcm)
     return Error(400, "Bad Request", "SSE audio requires response_format 'pcm'",
                  "invalid_response_format");
-  // OpenAI "speed": a pitch-preserving time stretch of the finished
-  // waveform. 1.0 (the default) leaves the model's own speaking rate
-  // untouched, so default output is unchanged.
-  double speed = 1.0;
-  if (const json::Value* value = body.find("speed"); value != nullptr) {
-    if (!value->is_number() || !std::isfinite(value->as_double()) ||
-        value->as_double() < models::qwen3_tts::kMinimumSpeechSpeed ||
-        value->as_double() > models::qwen3_tts::kMaximumSpeechSpeed) {
-      return Error(400, "Bad Request", "'speed' must be between 0.25 and 4.0",
-                   "invalid_speed");
-    }
-    speed = value->as_double();
-  }
-  if (speed != 1.0 && pcm) {
+  if (const json::Value* speed = body.find("speed");
+      speed != nullptr && (!speed->is_number() || speed->as_double() != 1.0)) {
     return Error(400, "Bad Request",
-                 "'speed' other than 1.0 requires response_format 'wav'",
+                 "Qwen3-TTS currently supports speed 1.0 only",
                  "invalid_speed");
-  }
-  // IndexTTS-2.5: "emotion" may also be the 8-value emo_vector
-  // [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm] or an
-  // object {"Wut": 0.6, "Angst": 0.2}; both become the canonical string form.
-  std::string emotion_spec = body.member_str("emotion");
-  if (const json::Value* value = body.find("emotion");
-      service.is_indextts() && value != nullptr && !value->is_string()) {
-    std::string spec;
-    if (value->is_array() && value->size() == 8) {
-      for (const auto& item : value->items()) {
-        if (!item.is_number()) {
-          spec.clear();
-          break;
-        }
-        spec += (spec.empty() ? "" : ",") + std::to_string(item.as_double());
-      }
-    } else if (value->is_object() && !value->empty()) {
-      for (const auto& [name, weight] : value->members()) {
-        if (!weight.is_number()) {
-          spec.clear();
-          break;
-        }
-        spec += (spec.empty() ? "" : ",") + name + ":" + std::to_string(weight.as_double());
-      }
-    }
-    if (spec.empty()) {
-      return Error(400, "Bad Request",
-                   "'emotion' must be a name, an object of name weights or an array of 8 numbers",
-                   "invalid_emotion");
-    }
-    emotion_spec = std::move(spec);
-  }
-  for (const std::string_view name : {"language", "instructions", "emotion",
-                                       "tempo", "pitch", "volume", "dialect"}) {
-    const json::Value* value = body.find(std::string(name));
-    if (name == "emotion" && service.is_indextts()) {
-      continue;
-    }
-    if (value != nullptr && !value->is_string()) {
-      return Error(400, "Bad Request",
-                   "'" + std::string(name) + "' must be a string",
-                   "invalid_parameter_type");
-    }
-  }
-  if (!emotion_spec.empty() && !service.is_ming_tts() && !service.is_voxcpm2() &&
-      !service.is_indextts()) {
-    return Error(400, "Bad Request",
-                 "'emotion' is supported only by Ming-3.0-tts, VoxCPM2 and IndexTTS-2.5",
-                 "unsupported_field");
-  }
-  if (service.is_indextts()) {
-    std::optional<std::array<float, 8>> parsed;
-    std::string emotion_error;
-    if (!models::indextts::ParseEmotionSpec(emotion_spec, &parsed, &emotion_error)) {
-      return Error(400, "Bad Request", emotion_error, "invalid_emotion");
-    }
-    if (!body.member_str("instructions").empty()) {
-      return Error(400, "Bad Request",
-                   "IndexTTS-2.5 takes the style through 'emotion', not 'instructions'",
-                   "unsupported_field");
-    }
-    const std::string lang = body.member_str("language");
-    if (!lang.empty() && lang != "de" && lang != "german" && lang != "deutsch" &&
-        lang != "German" && lang != "Deutsch" && lang != "DE") {
-      return Error(400, "Bad Request", "IndexTTS-2.5-German supports language 'de' only",
-                   "invalid_language");
-    }
-  }
-  // VoxCPM2 takes any free-text style ("froehlich", "whispering ..."); Ming
-  // only knows its seven labels.
-  if (!body.member_str("emotion").empty() && service.is_ming_tts() &&
-      !models::ming_tts::EmotionLabel(body.member_str("emotion")).has_value()) {
-    return Error(400, "Bad Request",
-                 "'emotion' must be happy, sad, angry, fear, disgust, surprise "
-                 "or neutral",
-                 "invalid_emotion");
-  }
-  // Ming-3.0-tts BASIC task ("tempo", "pitch", "volume": slow/medium/fast,
-  // low/medium/high) and DIALECT task ("dialect"). "tempo" is the model's own
-  // speaking rate; the OpenAI "speed" time stretch stays separate.
-  const bool ming_basic = !body.member_str("tempo").empty() ||
-                          !body.member_str("pitch").empty() ||
-                          !body.member_str("volume").empty();
-  const bool ming_dialect = !body.member_str("dialect").empty();
-  if ((ming_basic || ming_dialect) && !service.is_ming_tts()) {
-    return Error(400, "Bad Request",
-                 "'tempo', 'pitch', 'volume' and 'dialect' are supported only "
-                 "by Ming-3.0-tts",
-                 "unsupported_field");
-  }
-  if (const std::string value = body.member_str("tempo");
-      !value.empty() && !models::ming_tts::SpeedLabel(value).has_value()) {
-    return Error(400, "Bad Request", "'tempo' must be slow, medium or fast",
-                 "invalid_tempo");
-  }
-  if (const std::string value = body.member_str("pitch");
-      !value.empty() && !models::ming_tts::PitchLabel(value).has_value()) {
-    return Error(400, "Bad Request", "'pitch' must be low, medium or high",
-                 "invalid_pitch");
-  }
-  if (const std::string value = body.member_str("volume");
-      !value.empty() && !models::ming_tts::VolumeLabel(value).has_value()) {
-    return Error(400, "Bad Request", "'volume' must be low, medium or high",
-                 "invalid_volume");
-  }
-  if (const std::string value = body.member_str("dialect");
-      !value.empty() && !models::ming_tts::DialectLabel(value).has_value()) {
-    return Error(400, "Bad Request",
-                 "'dialect' must be cantonese or chuanyu dialect",
-                 "invalid_dialect");
-  }
-  // One Ming task per request, as in the reference (tts_tasks).
-  if ((ming_basic && ming_dialect) ||
-      ((ming_basic || ming_dialect) &&
-       (!body.member_str("emotion").empty() ||
-        !body.member_str("instructions").empty()))) {
-    return Error(400, "Bad Request",
-                 "use only one of 'tempo'/'pitch'/'volume', 'dialect', "
-                 "'emotion' or 'instructions' per request",
-                 "conflicting_controls");
   }
   std::size_t max_new_tokens = 0;
   if (!ReadUnsigned(body, "max_new_tokens", 3000, kMaximumNewTokens,
@@ -509,14 +370,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     }
     greedy = value->as_bool();
   }
-  models::qwen3_tts::SamplingOptions sampling;
-  if (service.is_indextts()) {
-    // indextts_de.py defaults (num_beams 1)
-    sampling.temperature = 0.7F;
-    sampling.top_k = 30;
-    sampling.top_p = 0.8F;
-    sampling.repetition_penalty = 10.0F;
-  }
+  ext::TtsSamplingOptions sampling;
   sampling.seed = static_cast<std::uint32_t>(seed);
   sampling.sample = !greedy;
   sampling.predictor_sample = !greedy;
@@ -539,7 +393,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
       !ReadFloat(body, "subtalker_temperature",
                  &sampling.predictor_temperature) ||
       !ReadFloat(body, "subtalker_top_p", &sampling.predictor_top_p) ||
-      !models::qwen3_tts::ValidSamplingOptions(sampling)) {
+      !ValidSamplingOptions(sampling)) {
     return Error(400, "Bad Request", "invalid Qwen3-TTS sampling options",
                  "invalid_sampling");
   }
@@ -548,52 +402,24 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
   // callers from repeating it -- naming an Italian voice without a language
   // would otherwise synthesize it as English. An explicit request language
   // still wins, so one voice can be driven in another language on purpose.
-  if (service.is_voxcpm2() && !reference_audio.samples.empty() &&
-      reference_audio.sample_rate > 0 && reference_audio.channels > 0 &&
-      reference_audio.samples.size() / reference_audio.channels >
-          static_cast<std::size_t>(reference_audio.sample_rate) *
-              kMaximumVoxCpm2ReferenceSeconds) {
-    return Error(400, "Bad Request",
-                 "VoxCPM2 reference audio must not exceed " +
-                     std::to_string(kMaximumVoxCpm2ReferenceSeconds) + " seconds",
-                 "invalid_reference_audio");
-  }
-  if (service.is_indextts() && preset == nullptr && !reference_audio.samples.empty() &&
-      reference_audio.sample_rate > 0 && reference_audio.channels > 0 &&
-      reference_audio.samples.size() / reference_audio.channels >
-          static_cast<std::size_t>(reference_audio.sample_rate) *
-              kMaximumIndexTtsReferenceSeconds) {
-    return Error(400, "Bad Request",
-                 "IndexTTS-2.5 reference audio must not exceed " +
-                     std::to_string(kMaximumIndexTtsReferenceSeconds) + " seconds",
-                 "invalid_reference_audio");
-  }
   std::string language = body.member_str("language");
-  if (language.empty() && service.is_indextts()) {
-    language = "de";
-  } else if (language.empty() && (service.is_ming_tts() || service.is_voxcpm2())) {
-    // VoxCPM2 detects the language from the text and ignores this field.
-    // Ming's own default: no "Target language" line unless a preset sets one.
-    if (preset != nullptr) {
-      language = preset->language;
-    }
-  } else if (language.empty()) {
+  if (language.empty()) {
     language = (preset != nullptr && !preset->language.empty())
                    ? preset->language
                    : std::string("english");
   }
 
-  models::qwen3_tts::SynthesisRequest synthesis{
+  ext::SynthesisRequest synthesis{
       .text = input->str(),
       .speaker = selected_voice,
       .language = std::move(language),
-      .instruct = body.member_str("instructions"),
-      .emotion = std::move(emotion_spec),
-      .tempo = body.member_str("tempo"),
-      .pitch = body.member_str("pitch"),
-      .volume = body.member_str("volume"),
-      .dialect = body.member_str("dialect"),
-      .reference_audio = std::move(reference_audio),
+      .instruct = std::move(instructions),
+      .reference_audio =
+          ext::TtsAudioBuffer{
+              .sample_rate = reference_audio.sample_rate,
+              .channels = reference_audio.channels,
+              .samples = std::move(reference_audio.samples),
+          },
       .reference_text = std::move(reference_text),
       .speaker_embedding_only = speaker_embedding_only,
       .max_new_tokens = max_new_tokens,
@@ -609,72 +435,70 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
         {"Cache-Control", "no-cache"},
         {"X-Gufo-TTS-Backend", service.backend_name()}};
     response.stream_log = log;
-    response.streaming_body =
-        [&service, synthesis = std::move(synthesis),
-         cancelled = request.is_cancelled, log,
-         sse](const HttpResponse::BodyWriter& write) mutable {
-          const auto started = std::chrono::steady_clock::now();
-          std::size_t samples = 0;
-          bool disconnected = false;
-          bool invalid_audio = false;
-          synthesis.on_audio = [&](std::span<const float> chunk) {
-            if (cancelled && cancelled())
-              return false;
-            std::string bytes = EncodePcm16(chunk);
-            if (!chunk.empty() && bytes.empty()) {
-              invalid_audio = true;
-              return false;
-            }
-            if (sse) {
-              auto event = json::Value::object();
-              event["type"] = "speech.audio.delta";
-              event["audio"] = EncodeAudioBase64(bytes);
-              event["response_format"] = "pcm";
-              bytes =
-                  "event: speech.audio.delta\ndata: " + event.dump() + "\n\n";
-            }
-            disconnected = !write(bytes);
-            samples += chunk.size();
-            return !disconnected;
-          };
-          models::qwen3_tts::SynthesisResult result;
-          std::string error;
-          const auto check = [&] {
-            return disconnected || (cancelled && cancelled());
-          };
-          if (!service.Synthesize(synthesis, check, &result, &error)) {
-            log->error_code = invalid_audio ? "invalid_audio"
-                              : check()     ? "cancelled"
-                                            : "generation_failed";
-            if (invalid_audio)
-              error = "Qwen3-TTS produced invalid audio";
-            if (sse && !check()) {
-              auto event = json::Value::object();
-              event["type"] = "error";
-              event["message"] = error;
-              log->error_event_sent =
-                  write("event: error\ndata: " + event.dump() + "\n\n");
-            }
-          } else if (sse) {
-            (void)write(
-                "event: speech.audio.done\ndata: "
-                "{\"type\":\"speech.audio.done\"}\n\n");
-          }
-          synthesis.on_audio = {};
-          log->details =
-              "model=" + service.model_id() +
-              " stream=" + (sse ? "sse" : "pcm") + " audio_ms=" +
-              std::to_string(1000ULL * samples /
-                             std::max<std::uint64_t>(1, service.sample_rate())) +
-              " synthesis_ms=" +
-              std::to_string(
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - started)
-                      .count());
-        };
+    response
+        .streaming_body = [&service, synthesis = std::move(synthesis),
+                           cancelled = request.is_cancelled, log,
+                           sse](const HttpResponse::BodyWriter& write) mutable {
+      const auto started = std::chrono::steady_clock::now();
+      std::size_t samples = 0;
+      bool disconnected = false;
+      bool invalid_audio = false;
+      synthesis.on_audio = [&](std::span<const float> chunk) {
+        if (cancelled && cancelled())
+          return false;
+        std::string bytes = EncodePcm16(chunk);
+        if (!chunk.empty() && bytes.empty()) {
+          invalid_audio = true;
+          return false;
+        }
+        if (sse) {
+          auto event = json::Value::object();
+          event["type"] = "speech.audio.delta";
+          event["audio"] = EncodeAudioBase64(bytes);
+          event["response_format"] = "pcm";
+          bytes = "event: speech.audio.delta\ndata: " + event.dump() + "\n\n";
+        }
+        disconnected = !write(bytes);
+        samples += chunk.size();
+        return !disconnected;
+      };
+      ext::SynthesisResult result;
+      std::string error;
+      const auto check = [&] {
+        return disconnected || (cancelled && cancelled());
+      };
+      if (!service.Synthesize(synthesis, check, &result, &error)) {
+        const bool invalid_result = error == kInvalidSynthesisResultError;
+        log->error_code = (invalid_audio || invalid_result) ? "invalid_audio"
+                          : check()                         ? "cancelled"
+                                    : "generation_failed";
+        if (invalid_audio)
+          error = "Qwen3-TTS produced invalid audio";
+        if (sse && !check()) {
+          auto event = json::Value::object();
+          event["type"] = "error";
+          event["message"] = error;
+          log->error_event_sent =
+              write("event: error\ndata: " + event.dump() + "\n\n");
+        }
+      } else if (sse) {
+        (void)write(
+            "event: speech.audio.done\ndata: "
+            "{\"type\":\"speech.audio.done\"}\n\n");
+      }
+      synthesis.on_audio = {};
+      log->details =
+          "model=" + service.model_id() + " stream=" + (sse ? "sse" : "pcm") +
+          " audio_ms=" +
+          std::to_string(AudioDurationMs(samples, service.sample_rate())) +
+          " synthesis_ms=" +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count());
+    };
     return response;
   }
-  models::qwen3_tts::SynthesisResult result;
+  ext::SynthesisResult result;
   std::string error;
   const auto started = std::chrono::steady_clock::now();
   if (!service.Synthesize(synthesis, request.is_cancelled, &result, &error)) {
@@ -682,13 +506,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
       return Error(499, "Client Closed Request", "audio generation cancelled",
                    "cancelled");
     }
-    return Error(500, "Internal Server Error", std::move(error),
-                 "generation_failed");
-  }
-  if (speed != 1.0) {
-    result.samples = models::qwen3_tts::TimeStretchMono(
-        result.samples, result.sample_rate, speed);
-    result.sample_count = result.samples.size();
+    const std::string code = error == kInvalidSynthesisResultError
+                                 ? "invalid_audio"
+                                 : "generation_failed";
+    return Error(500, "Internal Server Error", std::move(error), code);
   }
   std::string wav = EncodeWav(result.samples, result.sample_rate);
   if (wav.empty()) {
@@ -714,8 +535,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
           std::to_string(result.codes.size() /
                          std::max<std::uint32_t>(1, result.code_groups)) +
           " audio_ms=" +
-          std::to_string(1000ULL * result.samples.size() /
-                         std::max(1U, result.sample_rate)) +
+          std::to_string(
+              AudioDurationMs(result.samples.size(), result.sample_rate)) +
           " synthesis_ms=" +
           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - started)

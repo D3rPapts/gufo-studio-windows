@@ -17,18 +17,18 @@
 #include <mutex>
 
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/rgba_image.hpp"
 #include "src/cli/serve/router/figuren_ccip.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/image.hpp"
-#include "src/models/ccip/ccip.hpp"
-#include "src/models/qwen_image_21/model.hpp"
+#include "ccip/ccip.hpp"
 
 namespace gufo::router::figuren {
 namespace {
 
 using server::HttpRequest;
 using server::HttpResponse;
-using RgbaImage = models::qwen_image_21::Image;
+using RgbaImage = image::RgbaImage;
 
 constexpr int kFrameSide = 1344;
 constexpr int kHeadSide = 768;
@@ -264,10 +264,10 @@ RgbaImage Crop(const RgbaImage& image, const Box& rect) {
 /// figuren.py data_url: at most `max_side` (Lanczos like Pillow), PNG.
 std::string DataUrl(const RgbaImage& image, int max_side) {
   const auto [width, height] = FitSize(image.width, image.height, max_side);
-  const std::vector<std::uint8_t> png = models::qwen_image_21::EncodePng(
+  const std::vector<std::uint8_t> png = ::gufo::router::image::EncodePng(
       width == image.width && height == image.height
           ? image
-          : models::qwen_image_21::ResizeImage(image, width, height));
+          : ::gufo::router::image::ResizeImage(image, width, height));
   return "data:image/png;base64," +
          comfy::Base64Encode(std::string_view(
              reinterpret_cast<const char*>(png.data()), png.size()));

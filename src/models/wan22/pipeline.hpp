@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/preview_hook.hpp"
+#include "src/models/wan22/preview_hook.hpp"
 #include "src/models/wan22/vae.hpp"
 
 namespace gufo::models::wan22 {

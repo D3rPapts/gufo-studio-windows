@@ -9,7 +9,7 @@
 #include <limits>
 #include <utility>
 
-#include "src/core/json.hpp"
+#include <gufo/ext/json.hpp>
 #include "src/models/mmaudio/kernels.hpp"
 
 namespace gufo::models::mmaudio {

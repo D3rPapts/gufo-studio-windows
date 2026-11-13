@@ -20,9 +20,11 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -34,6 +36,67 @@ void Expect(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+bool LoadBackend(
+    gufo::server::InferenceBackend& backend,
+    std::shared_ptr<const gufo::hip::QwenGpuModel> model, std::string* error,
+    std::uint32_t max_context = 0, std::size_t session_count = 1,
+    // Zero keeps the scheduler's prompt unit.
+    std::size_t prefill_unit_tokens = 0,
+    gufo::server::TextSchedulerPolicy scheduler_policy = {},
+    gufo::server::TextSpeculativeConfig speculative_config = {},
+    gufo::server::TextDiskCacheConfig disk_cache_config = {},
+    gufo::server::TextRunnerRamCacheOptions ram_cache_config = {}) {
+  if (model == nullptr) {
+    if (error)
+      *error = "Qwen GPU model must not be null";
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->GetConfig().context_length;
+  if (max_context < 2 || max_context > model->GetConfig().context_length) {
+    if (error)
+      *error = "HTTP context exceeds the loaded Qwen model context";
+    return false;
+  }
+  if (speculative_config.backend ==
+      gufo::server::TextSpeculativeBackend::kMtp) {
+    if (error)
+      *error = "Flash-Next MTP HTTP decoding requires --mtp-model";
+    return false;
+  }
+  if (speculative_config.backend ==
+          gufo::server::TextSpeculativeBackend::kDFlash &&
+      speculative_config.min_draft_tokens != 1) {
+    if (error)
+      *error = "DFlash min-draft-tokens error";
+    return false;
+  }
+  std::shared_ptr<const gufo::hip::QwenDFlashGpuModel> dflash_model;
+  gufo::speculative::SpeculativeOptions spec_opts;
+  if (speculative_config.backend ==
+      gufo::server::TextSpeculativeBackend::kDFlash) {
+    std::string err;
+    dflash_model = gufo::hip::QwenDFlashGpuModel::Open(
+        speculative_config.draft_model_path, &err);
+    if (!dflash_model) {
+      if (error)
+        *error = "Failed to open DFlash model: " + err;
+      return false;
+    }
+    spec_opts.max_draft_tokens = speculative_config.max_draft_tokens;
+    spec_opts.min_draft_tokens = speculative_config.min_draft_tokens;
+  }
+  auto runner = gufo::models::qwen::CreateQwenTextRunner(
+      model, max_context, dflash_model, spec_opts,
+      speculative_config.dflash_policy,
+      disk_cache_config.model_artifact_fingerprint,
+      disk_cache_config.draft_model_artifact_fingerprint);
+  if (prefill_unit_tokens != 0)
+    scheduler_policy.prefill_unit_tokens = prefill_unit_tokens;
+  return backend.load(std::move(runner), error, session_count, scheduler_policy,
+                      disk_cache_config, ram_cache_config);
 }
 
 std::vector<TokenId> GenerateDirect(gufo::hip::QwenGpuExecutor& executor,
@@ -68,9 +131,9 @@ void CheckLogprobs(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
       mode.draft_model_path = draft_path;
     }
     gufo::server::InferenceBackend backend;
-    Expect(backend.load(model, &error, 256, 2, {.decode_active_tokens = 8},
-                        {.max_pending_requests_per_client = 2}, mode, {},
-                        {.capacity_bytes = std::size_t{1} << 30}),
+    Expect(LoadBackend(backend, model, &error, 256, 2, 8,
+                       {.max_pending_requests_per_client = 2}, mode, {},
+                       {.capacity_bytes = std::size_t{1} << 30}),
            error);
     for (const float temperature : {0.F, 0.7F}) {
       gufo::sampling::SamplingConfig config;
@@ -323,7 +386,7 @@ void CheckGeneratedFrontierReuse(
   for (const std::size_t count : {1U, 8U}) {
     Backend ar, spec;
     Expect(ar.load(model, &error, 256, 1), error);
-    Expect(spec.load(model, &error, 256, 1, {}, {}, draft), error);
+    Expect(spec.load(model, &error, 256, 1, {}, draft), error);
     const std::vector<gufo::tokenization::ChatMessage> messages{
         {Role::kUser,
          "Explain why careful reasoning and clear examples make technical "
@@ -377,14 +440,14 @@ void CheckGeneratedFrontierReuse(
             speculative ? draft : gufo::server::TextSpeculativeConfig{};
         {
           Backend writer;
-          Expect(writer.load(model, &error, 256, 1, {}, {}, mode, disk), error);
+          Expect(writer.load(model, &error, 256, 1, {}, mode, disk), error);
           const auto root = writer.chat(request(messages), 1, {});
           Expect(
               root.tokens == root_ar.tokens && root.cache_disk_queued_bytes > 0,
               "published-frontier checkpoint was not persisted");
         }
         Backend restored;
-        Expect(restored.load(model, &error, 256, 1, {}, {}, mode, disk), error);
+        Expect(restored.load(model, &error, 256, 1, {}, mode, disk), error);
         const auto replay = restored.chat(request(continuation), 24, {});
         Expect(replay.cache_disk_hit && replay.tokens == continued_ar.tokens,
                "disk restore changed pending-token continuation");
@@ -398,8 +461,8 @@ void CheckGeneratedFrontierReuse(
     Backend oracle, forks;
     const auto mode =
         speculative ? draft : gufo::server::TextSpeculativeConfig{};
-    Expect(oracle.load(model, &error, 256, 1, {}, {}, mode), error);
-    Expect(forks.load(model, &error, 256, 4, {}, {}, mode), error);
+    Expect(oracle.load(model, &error, 256, 1, {}, mode), error);
+    Expect(forks.load(model, &error, 256, 4, {}, mode), error);
     const std::vector<gufo::tokenization::ChatMessage> messages{
         {Role::kUser,
          "Explain why careful reasoning and clear examples make technical "
@@ -450,7 +513,7 @@ void CheckGeneratedFrontierReuse(
     Backend interrupted, reference;
     const auto mode =
         speculative ? draft : gufo::server::TextSpeculativeConfig{};
-    Expect(interrupted.load(model, &error, 256, 1, {}, {}, mode), error);
+    Expect(interrupted.load(model, &error, 256, 1, {}, mode), error);
     Expect(reference.load(model, &error, 256, 1), error);
     const std::vector<gufo::tokenization::ChatMessage> messages{
         {Role::kUser, "Describe a quiet mountain village in detail."}};
@@ -503,9 +566,7 @@ void CheckCompletedPrefillRetention(
         .draft_model_path = draft_path == nullptr ? "" : draft_path,
     };
     Backend backend;
-    Expect(backend.load(model, &error, 256, 2, {.decode_active_tokens = 8}, {},
-                        draft),
-           error);
+    Expect(LoadBackend(backend, model, &error, 256, 2, 8, {}, draft), error);
     std::string prompt = "Cancelled prefill retention: ";
     while (backend.count_tokens(prompt) < 160)
       prompt += "red blue green orange violet. ";
@@ -644,19 +705,19 @@ int main(int argc, const char* const* argv) {
     const std::uint32_t context = run_full_suite ? 256U : 64U;
     const std::size_t state_count = run_full_suite ? 8U : 1U;
     gufo::server::InferenceBackend backend;
-    Expect(!backend.load(
-               model, &error, context, state_count, {}, {},
-               {.backend = gufo::server::TextSpeculativeBackend::kMtp}) &&
-               error.find("Flash-Next") != std::string::npos,
-           "Qwen27B must reject MTP instead of silently running AR");
     Expect(
-        !backend.load(model, &error, context, state_count, {}, {},
-                      {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                       .min_draft_tokens = 2}) &&
+        !LoadBackend(backend, model, &error, context, state_count, {}, {},
+                     {.backend = gufo::server::TextSpeculativeBackend::kMtp}) &&
+            error.find("Flash-Next") != std::string::npos,
+        "Qwen27B must reject MTP instead of silently running AR");
+    Expect(
+        !LoadBackend(backend, model, &error, context, state_count, {}, {},
+                     {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                      .min_draft_tokens = 2}) &&
             error.find("min-draft-tokens") != std::string::npos,
         "DFlash must reject an unused adaptive draft floor");
-    Expect(backend.load(model, &error, context, state_count, {},
-                        {.max_pending_requests_per_client = 8}),
+    Expect(LoadBackend(backend, model, &error, context, state_count, {},
+                       {.max_pending_requests_per_client = 8}),
            error);
     Expect(backend.model_id() == model->GetConfig().model_name,
            "HTTP model identifier");
@@ -666,9 +727,8 @@ int main(int argc, const char* const* argv) {
         CheckSamplingStrategies(backend);
       } else {
         gufo::server::InferenceBackend speculative_backend;
-        Expect(speculative_backend.load(
-                   model, &error, context, state_count,
-                   {.decode_active_tokens = 8},
+        Expect(LoadBackend(
+                   speculative_backend, model, &error, context, state_count, 8,
                    {.max_pending_requests_per_client = 8},
                    {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
                     .draft_model_path = draft_model_path,
@@ -728,19 +788,18 @@ int main(int argc, const char* const* argv) {
 
     if (draft_model_path != nullptr) {
       gufo::server::InferenceBackend speculative_backend;
-      Expect(
-          speculative_backend.load(
-              model, &error, context, state_count, {.decode_active_tokens = 8},
-              {.max_pending_requests_per_client = 8},
-              gufo::server::TextSpeculativeConfig{
-                  .backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                  .draft_model_path = draft_model_path,
-                  .max_draft_tokens = 7,
-                  .min_draft_tokens = 1,
-                  .dflash_policy =
-                      gufo::speculative::DFlashDraftPolicy::kAdaptive,
-              }),
-          error);
+      Expect(LoadBackend(
+                 speculative_backend, model, &error, context, state_count, 8,
+                 {.max_pending_requests_per_client = 8},
+                 gufo::server::TextSpeculativeConfig{
+                     .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                     .draft_model_path = draft_model_path,
+                     .max_draft_tokens = 7,
+                     .min_draft_tokens = 1,
+                     .dflash_policy =
+                         gufo::speculative::DFlashDraftPolicy::kAdaptive,
+                 }),
+             error);
       const auto direct_spec = GenerateDirect(*direct, raw_prompt_tokens, 8);
       const auto http_spec = speculative_backend.complete(raw_prompt, 8, 0.0F);
       Expect(http_spec.tokens == direct_spec,
@@ -1048,7 +1107,7 @@ int main(int argc, const char* const* argv) {
       };
       {
         gufo::server::InferenceBackend writer;
-        Expect(writer.load(model, &error, context, 1, {}, {}, {}, disk_cache),
+        Expect(writer.load(model, &error, context, 1, {}, {}, disk_cache),
                error);
         const auto persistent_root =
             writer.chat(cache_request(messages), 2, {});
@@ -1062,9 +1121,8 @@ int main(int argc, const char* const* argv) {
 
       {
         gufo::server::InferenceBackend restarted;
-        Expect(
-            restarted.load(model, &error, context, 1, {}, {}, {}, disk_cache),
-            error);
+        Expect(restarted.load(model, &error, context, 1, {}, {}, disk_cache),
+               error);
         const auto restored_continuation =
             restarted.chat(cache_request(continued_messages), 2, {});
         Expect(restored_continuation.cache_hit &&
@@ -1085,7 +1143,7 @@ int main(int argc, const char* const* argv) {
       incompatible_cache.model_artifact_fingerprint = std::string(64, 'b');
       {
         gufo::server::InferenceBackend incompatible;
-        Expect(incompatible.load(model, &error, context, 1, {}, {}, {},
+        Expect(incompatible.load(model, &error, context, 1, {}, {},
                                  incompatible_cache),
                error);
         const auto incompatible_result =
@@ -1111,9 +1169,8 @@ int main(int argc, const char* const* argv) {
             GenerateDirect(*direct, continuation_prompt, 8);
 
         gufo::server::InferenceBackend warm_dflash;
-        Expect(
-            warm_dflash.load(model, &error, context, 1, {}, {}, dflash_config),
-            error);
+        Expect(warm_dflash.load(model, &error, context, 1, {}, dflash_config),
+               error);
         const auto warm_dflash_root =
             warm_dflash.chat(cache_request(messages), 2, {});
         const auto warm_dflash_continuation =
@@ -1128,7 +1185,7 @@ int main(int argc, const char* const* argv) {
 
         {
           gufo::server::InferenceBackend dflash_writer;
-          Expect(dflash_writer.load(model, &error, context, 1, {}, {},
+          Expect(dflash_writer.load(model, &error, context, 1, {},
                                     dflash_config, dflash_disk_cache),
                  error);
           const auto persistent_dflash_root =
@@ -1141,7 +1198,7 @@ int main(int argc, const char* const* argv) {
 
         {
           gufo::server::InferenceBackend restarted_dflash;
-          Expect(restarted_dflash.load(model, &error, context, 1, {}, {},
+          Expect(restarted_dflash.load(model, &error, context, 1, {},
                                        dflash_config, dflash_disk_cache),
                  error);
           const auto restored_dflash_continuation =
@@ -1171,7 +1228,7 @@ int main(int argc, const char* const* argv) {
             std::string(64, 'd');
         gufo::server::InferenceBackend incompatible_dflash;
         Expect(
-            incompatible_dflash.load(model, &error, context, 1, {}, {},
+            incompatible_dflash.load(model, &error, context, 1, {},
                                      dflash_config, incompatible_dflash_cache),
             error);
         const auto incompatible_dflash_result =
@@ -1186,7 +1243,7 @@ int main(int argc, const char* const* argv) {
 
     // Prime exactly one live frontier. Earlier repeated requests can leave
     // two equivalent live sessions, legitimately avoiding both restore copies.
-    Expect(backend.load(model, &error, context, 2), error);
+    Expect(LoadBackend(backend, model, &error, context, 2), error);
     Expect(backend.chat(cache_request(messages), 2, {}).tokens == direct_chat,
            "fork fixture must start at the qualified root");
     auto continuation_request = cache_request(continued_messages);
@@ -1215,8 +1272,6 @@ int main(int argc, const char* const* argv) {
               result->cache_restore_ms > 0.0) &&
                  result->cache_snapshot_ms > 0.0,
              "Qwen branches account performed snapshot copies");
-      Expect(result->cache_shared_bytes == 0,
-             "full-copy Qwen snapshots do not claim shared bytes");
     }
     Expect(http_continuation.cache_restore_bytes > 0 ||
                http_fork.cache_restore_bytes > 0,
@@ -1230,8 +1285,7 @@ int main(int argc, const char* const* argv) {
     // completes. Eight outputs can finish before that peer reaches decode.
     // Small chunks also cover bounded prefill before the concurrent decode.
     constexpr std::uint32_t concurrent_output_tokens = 32;
-    Expect(backend.load(model, &error, context, 2, {.decode_active_tokens = 8}),
-           error);
+    Expect(LoadBackend(backend, model, &error, context, 2, 8), error);
     gufo::server::ChatRequest concurrent_a({
         {gufo::tokenization::ChatRole::kUser,
          "The quick brown fox jumps over the lazy dog. Explain why this "

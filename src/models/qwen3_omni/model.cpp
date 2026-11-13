@@ -6,8 +6,9 @@
 #include <string_view>
 #include <utility>
 
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
+#include "src/models/qwen3_omni/parallel_read.hpp"
 
 namespace gufo::models::qwen3_omni {
 namespace {
@@ -158,7 +159,7 @@ std::span<const std::byte> ReadWeightBytes(const core::GgufReader& reader,
     const auto start = reinterpret_cast<std::uintptr_t>(scratch->data());
     std::byte* buffer =
         scratch->data() + ((kSector - start % kSector) % kSector);
-    if (platform::ReadFileParallel(region.file_descriptor, buffer, span,
+    if (ReadFileParallel(region.file_descriptor, buffer, span,
                                    aligned) < lead + bytes) {
       throw std::runtime_error("cannot read a Qwen3-Omni weight from " +
                                region.source_path.string());

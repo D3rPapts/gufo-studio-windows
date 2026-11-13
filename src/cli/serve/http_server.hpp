@@ -24,11 +24,9 @@ class TtsService;
 class AsrService;
 class ImageService;
 class EmbeddingService;
-class OmniService;
-class MusicService;
-class FoleyService;
-class UpscaleService;
+struct DecisionService;
 class WebSocket;
+class MediaService;
 
 struct HttpRequest {
   std::string method;  // "GET" / "POST" / ...
@@ -97,21 +95,26 @@ using Handler =
 struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
-  std::string api_key;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
   /// Called once, on the listener or a request thread, when the text backend or
   /// the embedding service reports a lost device. Health, readiness and
   /// generation answer 503 `device_lost` from then on; the hook decides how the
   /// process exits.
   std::function<void()> on_device_lost{};
-  /// When set, handle_request returns dispatcher(request) immediately after
-  /// authentication; built-in health/model routes are skipped and the
-  /// constructor does not register model routes (null backend is then legal).
+  /// gufo-studio-windows router front (`gufo router`): when set,
+  /// handle_request returns dispatcher(request) for every request; built-in
+  /// health/model routes are skipped and the constructor registers no model
+  /// routes (a null backend is then legal).
   std::function<HttpResponse(const HttpRequest&)> dispatcher{};
-  /// The router front drains in-flight requests after a shutdown signal, so
-  /// the signal path only stops the listener there; established connections
-  /// stay usable until the caller's drain ends and the destructor stops.
+  /// gufo-studio-windows router front: the router drains in-flight requests
+  /// after a shutdown signal, so the signal path only stops the listener;
+  /// established connections stay usable until the caller's drain ends and
+  /// the destructor stops them.
   bool graceful_shutdown{false};
+  /// gufo-studio-windows media services without an upstream capability
+  /// (music, foley, image upscale; src/cli/serve/media). Asked before the
+  /// built-in routes and listed in /ready and /v1/models.
+  std::vector<std::shared_ptr<MediaService>> media{};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
@@ -128,7 +131,8 @@ public:
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
              std::shared_ptr<ImageService> images = nullptr,
-             std::shared_ptr<EmbeddingService> embeddings = nullptr);
+             std::shared_ptr<EmbeddingService> embeddings = nullptr,
+             std::shared_ptr<DecisionService> decisions = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -137,23 +141,6 @@ public:
   HttpServer& operator=(HttpServer&&) = delete;
 
   void add(const std::string& method, const std::string& path, Handler handler);
-
-  /// Serves the Qwen3-Omni captioner; call before start().
-  void set_omni(std::shared_ptr<OmniService> omni) { omni_ = std::move(omni); }
-  /// Serves ACE-Step text-to-music (/v1/audio/music); call before start().
-  void set_music(std::shared_ptr<MusicService> music) {
-    music_ = std::move(music);
-  }
-  /// Serves MMAudio video / text to audio (/v1/audio/foley); call before
-  /// start().
-  void set_foley(std::shared_ptr<FoleyService> foley) {
-    foley_ = std::move(foley);
-  }
-  /// Serves Real-ESRGAN image upscaling (/v1/images/upscale) on the NPU,
-  /// GPU or CPU; call before start().
-  void set_upscale(std::shared_ptr<UpscaleService> upscale) {
-    upscale_ = std::move(upscale);
-  }
 
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
@@ -164,9 +151,9 @@ public:
 
   void stop();
 
-  /// Stop accepting new connections only. When
-  /// HttpServerOptions::graceful_shutdown is set the shutdown-signal path
-  /// uses this instead of stop() so an external drain can keep serving the
+  /// Stop accepting new connections only. With
+  /// HttpServerOptions::graceful_shutdown the shutdown-signal path uses this
+  /// instead of stop() so an external drain (the router) can keep serving the
   /// established connections until it ends.
   void stop_listening();
 
@@ -189,12 +176,8 @@ private:
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
-  std::shared_ptr<OmniService> omni_;
-  std::shared_ptr<MusicService> music_;
-  std::shared_ptr<FoleyService> foley_;
-  std::shared_ptr<UpscaleService> upscale_;
+  std::shared_ptr<DecisionService> decisions_;
   HttpServerOptions options_;
-  std::string api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};

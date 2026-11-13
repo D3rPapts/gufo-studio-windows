@@ -433,4 +433,39 @@ bool EncodeMusic(const std::string& wav, const MusicOutputFormat& format,
   return true;
 }
 
+bool DecodeAudioWithFfmpeg(const std::string& bytes, std::string* wav,
+                           std::string* error) {
+  const std::string prefix = "audio decoding needs ffmpeg: ";
+  const fs::path base = TemporaryBase();
+  const fs::path in_path = base.string() + ".in";
+  const fs::path out_path = base.string() + ".wav";
+  const fs::path log_path = base.string() + ".log";
+  std::string detail;
+  if (!WriteFile(in_path, bytes, &detail)) {
+    *error = prefix + detail;
+    return false;
+  }
+  const std::vector<std::string> arguments = {
+      "-y",  "-hide_banner", "-nostdin", "-loglevel",  "error", "-i",
+      in_path.string(), "-vn", "-f", "wav", "-codec:a", "pcm_s16le",
+      "-ar", "48000", "-ac", "2", out_path.string()};
+  std::error_code ignored;
+  const bool ran = RunFfmpeg(arguments, log_path, &detail);
+  const std::string tail = ErrorTail(log_path);
+  bool ok = ran && fs::exists(out_path, ignored) &&
+            fs::file_size(out_path, ignored) > 44;
+  if (ok)
+    ok = ReadFile(out_path, wav, &detail);
+  else if (ran)
+    detail = "no output written";
+  if (!ok && !tail.empty())
+    detail += " (" + tail + ")";
+  fs::remove(in_path, ignored);
+  fs::remove(out_path, ignored);
+  fs::remove(log_path, ignored);
+  if (!ok)
+    *error = prefix + detail;
+  return ok;
+}
+
 }  // namespace gufo::server

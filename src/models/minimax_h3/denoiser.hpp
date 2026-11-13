@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/runtime.hpp"
-#include "src/models/preview_hook.hpp"
+#include "src/models/minimax_h3/preview_hook.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
 namespace gufo::minimax_h3 {

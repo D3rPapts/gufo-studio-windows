@@ -15,6 +15,9 @@
 
 namespace gufo::cache {
 inline constexpr std::uint32_t kDiskFormatVersion = 2;
+// Written only by manifests with window components, which also encode the
+// window size; version 2 manifests remain readable.
+inline constexpr std::uint32_t kDiskWindowFormatVersion = 3;
 inline constexpr std::size_t kMaxManifestBytes = std::size_t{16} * 1024 * 1024;
 class DiskCapacityExhausted : public ResourceExhausted {};
 using DiskFileId = std::array<std::uint8_t, 16>;
@@ -87,9 +90,9 @@ private:
   std::uint64_t epoch_{};
 };
 struct DiskStartupStats {
-  std::uint64_t manifest_bytes_read{}, legacy_probe_bytes_read{};
+  std::uint64_t manifest_bytes_read{};
   std::uint64_t dependency_stats{}, rejected_manifests{};
-  std::uint64_t managed_bytes{}, removed_legacy_bytes{};
+  std::uint64_t managed_bytes{};
 };
 // Host-buffer publication only; caller retains and admits immutable buffers
 // until Publish returns. Full chunks already referenced by a checkpoint can be
@@ -212,6 +215,10 @@ enum class DiskPublicationStep {
 // A directory above the budget (for example after lowering it) still opens;
 // publication refuses until retirement or orphan reclamation brings
 // Stats().managed_bytes back within the budget.
+struct DiskUseHistory {
+  std::uint64_t last_used{}, admitted_bytes{};
+  std::optional<std::uint64_t> reused_at;
+};
 class DiskStore {
 public:
   DiskStore(ResourceLedger&, const std::filesystem::path& directory,
@@ -248,6 +255,13 @@ public:
           consume,
       DiskReadStats* observation = nullptr);
   [[nodiscard]] DiskReadPin Pin(CheckpointId, std::uint64_t epoch = 0) const;
+  // Advisory use history, independently checksummed and budgeted. Invalid or
+  // absent history returns zero. Writing never waits for a busy store; failure
+  // leaves the checkpoint and its immutable dependencies unchanged.
+  [[nodiscard]] DiskUseHistory UseHistory(CheckpointId) const;
+  [[nodiscard]] std::uint64_t LastUse(CheckpointId) const;
+  [[nodiscard]] bool TryRecordUse(CheckpointId, std::uint64_t);
+  [[nodiscard]] bool TryRecordUse(CheckpointId, const DiskUseHistory&);
   // Short logical quarantine; keeps filesystem references until retirement.
   void Invalidate(CheckpointId, std::uint64_t epoch);
   // Includes provisional writers, without acquiring the I/O lock. New claims

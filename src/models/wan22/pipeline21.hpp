@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/preview_hook.hpp"
+#include "src/models/wan22/preview_hook.hpp"
 #include "src/models/wan22/camera_path.hpp"
 #include "src/models/wan22/vae.hpp"
 

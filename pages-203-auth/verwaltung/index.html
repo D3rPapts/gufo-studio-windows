@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="de" data-seite="verwaltung">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="../gemeinsam/logo/gufo-studio-icon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="../gemeinsam/logo/gufo-studio-icon-32.png">
+<link rel="apple-touch-icon" href="../gemeinsam/logo/gufo-studio-logo-180.png">
+<title data-t="seitentitel">gufo Verwaltung</title>
+<script src="../gemeinsam/sprache.js"></script>
+<script src="../gemeinsam/anmeldung.js"></script>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --text:#1d1d1f; --muted:#6b6b70; --line:#dcdcd7; --accent:#5b4fc4; --ok:#1e7a3c; --warn:#a15c00; --err:#b3261e; --chip:#efeef8; --on-accent:#fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; --on-accent:#1d1d1f; } }
+  :root[data-theme="dark"] { --bg:#161618; --card:#1f1f22; --text:#ececee; --muted:#9a9aa2; --line:#33333a; --accent:#a49bff; --ok:#6fd38f; --warn:#f0b65a; --err:#ff8a80; --chip:#2a2838; --on-accent:#1d1d1f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  h2 { font-size:16px; margin:24px 0 8px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .m { color:var(--muted); } .ok { color:var(--ok); font-weight:600; } .warn { color:var(--warn); font-weight:600; } .err { color:var(--err); font-weight:600; }
+  .klein { font-size:12px; color:var(--muted); }
+  .wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12.5px; }
+  td.aktionen { white-space:nowrap; }
+  .chip { display:inline-block; padding:0 6px; margin:1px 2px 1px 0; border-radius:6px; background:var(--chip); font-size:12px; white-space:nowrap; }
+  .chip.err { background:color-mix(in srgb, var(--err) 22%, transparent); }
+  .chip.ok { background:color-mix(in srgb, var(--ok) 18%, transparent); }
+  button { font:inherit; font-size:13px; min-height:36px; padding:4px 10px; border-radius:8px; cursor:pointer; background:transparent; color:var(--text); border:1px solid var(--line); margin:2px 2px 2px 0; }
+  button:hover { border-color:var(--muted); } button:disabled { opacity:.5; cursor:default; }
+  button.haupt { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:600; }
+  button.gefahr { color:var(--err); }
+  .hinweis { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:10px; padding:10px 14px; font-size:14px; margin:0 0 14px; }
+  .hinweis.warn { border-left-color:var(--warn); } .hinweis.err { border-left-color:var(--err); }
+  code { font-size:12.5px; background:var(--chip); padding:0 4px; border-radius:4px; overflow-wrap:anywhere; }
+  form.card { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; }
+  form.card .voll { grid-column:1 / -1; }
+  @media (max-width:700px) { form.card { grid-template-columns:1fr; } }
+  label { display:block; font-size:13px; color:var(--muted); margin:4px 0 2px; }
+  input[type=text], input[type=password], input[type=number], select { width:100%; font:inherit; font-size:15px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); min-height:40px; }
+  .kaestchen { display:flex; flex-wrap:wrap; gap:6px 14px; } .kaestchen label { display:inline-flex; align-items:center; gap:6px; color:var(--text); font-size:14px; min-height:36px; margin:0; }
+  .kaestchen input { width:18px; height:18px; }
+  .knoepfe { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .meldung { font-size:14px; min-height:20px; margin:8px 0 0; }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--text); padding:16px; max-width:min(520px, 92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.4); }
+  dialog h3 { margin:0 0 8px; font-size:16px; }
+  .token { font-family:ui-monospace, Consolas, monospace; font-size:13px; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; overflow-wrap:anywhere; user-select:all; }
+  .leiste { display:flex; gap:12px; flex-wrap:wrap; align-items:center; font-size:13px; color:var(--muted); margin:6px 0; }
+  pre.log { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12.5px; overflow:auto; max-height:420px; margin:0; white-space:pre; }
+  @media (max-width:639px) { .wrap { overflow:visible; } td.aktionen { white-space:normal; } }
+</style>
+</head>
+<body>
+<main>
+<h1 data-t="titel">Verwaltung – Nutzer und Zugriff</h1>
+<p class="sub"><span data-t="sub">Nutzer anlegen, Rollen und Rechte setzen, Passwörter zurücksetzen, sperren, Token für Programme erzeugen und das Zugriffsprotokoll ansehen. Nur vom Rechner selbst (127.0.0.1) oder als Admin erreichbar.</span> <span id="stand" class="m"></span></p>
+
+<div class="hinweis err" id="gesperrt" hidden data-t="gesperrt.html">Diese Seite ist nur vom Rechner selbst (<code>127.0.0.1</code>) oder in einer Admin-Sitzung erreichbar. Bitte als Admin anmelden: <a href="/login/?zurueck=/verwaltung/">Anmelden</a>.</div>
+<div class="hinweis warn" id="setup" hidden data-t="setup.html">Noch kein Admin eingerichtet. Lege unten den ersten Nutzer mit Rolle <b>admin</b> an (vom Rechner selbst). Erst danach kann im Preset <code>auth = lan</code> gesetzt werden, ohne dass das LAN ausgesperrt bleibt.</div>
+<div class="hinweis" id="modus" hidden></div>
+
+<h2 data-t="h.nutzer">Nutzer</h2>
+<div class="wrap"><table data-karten id="nutzer">
+  <thead><tr><th data-t="sp.name">Name</th><th data-t="sp.rolle">Rolle</th><th data-t="sp.bereiche">Bereiche</th><th data-t="sp.filter">Filter</th><th data-t="sp.limit">Tageslimit</th><th data-t="sp.pool">Pool</th><th data-t="sp.token">Token</th><th data-t="sp.anmeldung">Letzte Anmeldung</th><th data-t="sp.aktionen">Aktionen</th></tr></thead>
+  <tbody id="nutzerBody"><tr><td colspan="9" class="m" data-t="lade">wird gelesen …</td></tr></tbody>
+</table></div>
+<p class="klein" data-t="nutzer.hinweis.html">Rollen: <b>admin</b> darf alles, auch diese Seite; <b>nutzer</b> arbeitet in den freigegebenen Bereichen mit eigener Ablage; <b>dienst</b> ist ein Programm (Film-Pipeline, Regie, Überwacher): nur Token, keine Seiten-Anmeldung. Leere Bereiche = alle. Filter = Wortsperre auf Bild-/Video-Prompts (<code>nutzer\filter-woerter.txt</code>). Tageslimit 0 = unbegrenzt, Videos zählen doppelt.</p>
+
+<h2 id="formTitel" data-t="h.anlegen">Nutzer anlegen</h2>
+<form class="card" id="form" autocomplete="off">
+  <div><label for="fName" data-t="f.name">Name (a–z, 0–9, . _ -)</label><input type="text" id="fName" autocapitalize="none" spellcheck="false" required pattern="[a-z0-9._-]{1,32}"></div>
+  <div><label for="fRolle" data-t="f.rolle">Rolle</label><select id="fRolle"><option value="nutzer" data-t="rolle.nutzer">nutzer</option><option value="admin" data-t="rolle.admin">admin</option><option value="dienst" data-t="rolle.dienst">dienst</option></select></div>
+  <div><label for="fPasswort" data-t="f.passwort">Passwort (mind. 4 Zeichen; beim Bearbeiten leer = unverändert)</label><input type="password" id="fPasswort" autocomplete="new-password"></div>
+  <div><label for="fLimit" data-t="f.limit">Tageslimit (0 = unbegrenzt)</label><input type="number" id="fLimit" min="0" step="1" value="0"></div>
+  <div class="voll"><label data-t="f.bereiche">Bereiche (nichts angekreuzt = alle)</label><div class="kaestchen" id="fBereiche"></div></div>
+  <div><label for="fFilter" data-t="f.filter">Wortsperre (Filter)</label><select id="fFilter"><option value="" data-t="filter.rolle">wie die Rolle (admin aus, sonst an)</option><option value="an" data-t="filter.an">an</option><option value="aus" data-t="filter.aus">aus</option></select></div>
+  <div><label for="fModelle" data-t="f.modelle">Erlaubte Modelle (Kommaliste, leer = alle)</label><input type="text" id="fModelle" spellcheck="false" placeholder="qwen3.5-4b, qwen-image-2.1"></div>
+  <div class="voll kaestchen"><label><input type="checkbox" id="fPool" checked> <span data-t="f.pool">darf Aufträge auf den Partner-Rechner schicken (Pool)</span></label></div>
+  <div class="voll knoepfe"><button class="haupt" type="submit" id="fSpeichern" data-t="f.speichern">Anlegen</button><button type="button" id="fAbbrechen" hidden data-t="f.abbrechen">Abbrechen</button><span class="meldung" id="fMeldung" aria-live="polite"></span></div>
+</form>
+
+<h2 data-t="h.protokoll">Zugriffsprotokoll</h2>
+<div class="leiste"><button type="button" id="logLesen" data-t="log.lesen">Neu lesen</button><label><input type="checkbox" id="logNurAbgelehnt"> <span data-t="log.nur">nur Ablehnungen und Anmeldungen</span></label><span id="logInfo"></span></div>
+<pre class="log" id="log" data-t="lade">wird gelesen …</pre>
+<p class="klein" data-t="log.hinweis.html">Zeit (UTC), Nutzer, Adresse, Anfrage, Modell, Ergebnis. Keine Inhalte, keine Prompts. Datei <code>nutzer\zugriff.log</code>, täglich rotiert, 30 Tage.</p>
+
+<dialog id="tokenDialog">
+  <h3 data-t="t.titel">Token erzeugen</h3>
+  <p class="m" id="tokenFuer"></p>
+  <label for="tName" data-t="t.name">Name des Tokens (z. B. film-56, regie)</label>
+  <input type="text" id="tName" autocapitalize="none" spellcheck="false" pattern="[a-z0-9._-]{1,32}">
+  <label for="tTage" data-t="t.tage">Gültig in Tagen (0 = unbegrenzt)</label>
+  <input type="number" id="tTage" min="0" step="1" value="0">
+  <p class="meldung" id="tMeldung"></p>
+  <div id="tErgebnis" hidden>
+    <p data-t="t.einmal"><b>Nur jetzt sichtbar</b> – der Router speichert nur den Hash. Für Programme: <code>Authorization: Bearer &lt;Token&gt;</code> bzw. api_key im OpenAI-SDK.</p>
+    <div class="token" id="tToken"></div>
+  </div>
+  <div class="knoepfe" style="margin-top:10px"><button class="haupt" type="button" id="tErzeugen" data-t="t.erzeugen">Erzeugen</button><button type="button" id="tKopieren" hidden data-t="t.kopieren">Kopieren</button><button type="button" id="tZu" data-t="t.zu">Schließen</button></div>
+</dialog>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const T = (k, d, v) => window.gufoT ? gufoT(k, d, v) : d.replace(/\{(\w+)\}/g, (m, n) => (v && n in v ? v[n] : m));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const BEREICHE = ['text', 'bild', 'video', 'stimme', 'musik', '3d', 'ablage', 'pool', 'status'];
+const zeit = s => s ? new Date(s * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '–';
+let nutzer = [];                 // Liste vom Router
+let bearbeite = null;            // Name des Nutzers im Formular (null = anlegen)
+
+async function api(pfad, methode, body) {
+  const r = await fetch(pfad, { method: methode || 'GET', cache: 'no-store', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error((d.error && d.error.message) || ('HTTP ' + r.status)); e.status = r.status; e.code = d.error && d.error.code; throw e; }
+  return d;
+}
+const melden = (el, text, art) => { el.textContent = text; el.className = 'meldung' + (art ? ' ' + art : ''); };
+
+function bereichKaestchen() {
+  const box = $('fBereiche');
+  const vorher = new Set([...box.querySelectorAll('input:checked')].map(k => k.value));
+  box.innerHTML = BEREICHE.map(b => `<label><input type="checkbox" value="${b}"${vorher.has(b) ? ' checked' : ''}> <span data-t="bereich.${b}">${b}</span></label>`).join('');
+  if (window.gufoSprache) gufoSprache.apply(box);
+}
+
+function tabelle() {
+  const body = $('nutzerBody');
+  if (!nutzer.length) { body.innerHTML = `<tr><td colspan="9" class="m">${esc(T('keine', 'Noch keine Nutzer.'))}</td></tr>`; return; }
+  body.innerHTML = nutzer.map(u => {
+    const r = u.rechte || {};
+    const bereiche = (r.bereiche && r.bereiche.length) ? r.bereiche.map(b => `<span class="chip">${esc(T('bereich.' + b, b))}</span>`).join('') : `<span class="m">${esc(T('alle', 'alle'))}</span>`;
+    const filter = r.filter === true ? T('filter.an', 'an') : r.filter === false ? T('filter.aus', 'aus') : (u.rolle === 'admin' ? T('filter.aus', 'aus') : T('filter.an', 'an')) + ' (' + T('filter.rolle.kurz', 'Rolle') + ')';
+    const token = (u.token || []).map(t => `<span class="chip" title="${esc(T('token.tipp', 'erstellt {e}, läuft ab {a}', { e: zeit(t.erstellt), a: t.ablauf ? zeit(t.ablauf) : T('nie', 'nie') }))}">${esc(t.name)} <button type="button" class="gefahr" data-tok="${esc(u.name)}/${esc(t.name)}" style="min-height:24px;padding:0 6px;margin:0">✕</button></span>`).join('') || '–';
+    const gesperrt = u.gesperrt ? `<span class="chip err">${esc(T('gesperrt', 'gesperrt'))}</span>` : '';
+    const ohnePw = !u.passwort && u.rolle !== 'dienst' ? `<span class="chip err">${esc(T('ohne.passwort', 'kein Passwort'))}</span>` : '';
+    return `<tr${u.gesperrt ? ' class="m"' : ''}>
+      <td><b>${esc(u.name)}</b> ${gesperrt}${ohnePw}</td>
+      <td>${esc(T('rolle.' + u.rolle, u.rolle))}</td>
+      <td>${bereiche}${r.modelle && r.modelle.length ? `<div class="klein">${esc(T('modelle.kurz', 'Modelle: {m}', { m: r.modelle.join(', ') }))}</div>` : ''}</td>
+      <td>${esc(filter)}</td>
+      <td>${r.tageslimit ? r.tageslimit : '∞'}</td>
+      <td>${r.pool === false ? T('nein', 'nein') : T('ja', 'ja')}</td>
+      <td>${token}</td>
+      <td>${esc(zeit(u.letzte_anmeldung))}</td>
+      <td class="aktionen">
+        <button type="button" data-tun="bearbeiten" data-name="${esc(u.name)}">${esc(T('a.bearbeiten', 'Bearbeiten'))}</button>
+        <button type="button" data-tun="token" data-name="${esc(u.name)}">${esc(T('a.token', 'Token'))}</button>
+        <button type="button" data-tun="${u.gesperrt ? 'entsperren' : 'sperren'}" data-name="${esc(u.name)}">${esc(u.gesperrt ? T('a.entsperren', 'Entsperren') : T('a.sperren', 'Sperren'))}</button>
+        <button type="button" class="gefahr" data-tun="loeschen" data-name="${esc(u.name)}">${esc(T('a.loeschen', 'Löschen'))}</button>
+      </td></tr>`;
+  }).join('');
+  if (window.gufoTabellenKarten) gufoTabellenKarten();
+}
+
+async function lesen() {
+  try {
+    const d = await api('/router/users');
+    nutzer = d.users || [];
+    $('gesperrt').hidden = true;
+    $('setup').hidden = !d.setup;
+    const modus = $('modus');
+    modus.hidden = false;
+    modus.innerHTML = T('modus.html', 'Zugriff im Preset: <code>auth = {auth}</code>. Nutzerdatei <code>{datei}</code>, {n} Nutzer, {w} Wörter in der Sperrliste.',
+                        { auth: esc(d.auth), datei: esc(d.datei), n: nutzer.length, w: d.filter_woerter });
+    if (d.auth === 'off') modus.innerHTML += ' ' + T('modus.off.html', '<b>Stufe 0:</b> Jeder im LAN darf alles; Nutzer sind angelegt, aber nicht nötig. Einschalten: <code>[router] auth = lan</code> im Preset, dann Router neu starten.');
+    $('stand').textContent = T('stand', 'Stand: {t}', { t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+    tabelle();
+  } catch (e) {
+    if (e.status === 404) { $('gesperrt').hidden = false; $('nutzerBody').innerHTML = ''; $('log').textContent = ''; return; }
+    $('nutzerBody').innerHTML = `<tr><td colspan="9" class="err">${esc(T('fehler', 'Fehler: {fehler}', { fehler: e.message }))}</td></tr>`;
+  }
+}
+
+function formular(u) {
+  bearbeite = u ? u.name : null;
+  $('formTitel').textContent = u ? T('h.bearbeiten', 'Nutzer bearbeiten: {name}', { name: u.name }) : T('h.anlegen', 'Nutzer anlegen');
+  $('fSpeichern').textContent = u ? T('f.speichern.aendern', 'Speichern') : T('f.speichern', 'Anlegen');
+  $('fAbbrechen').hidden = !u;
+  $('fName').value = u ? u.name : ''; $('fName').readOnly = !!u;
+  $('fRolle').value = u ? u.rolle : 'nutzer';
+  $('fPasswort').value = '';
+  const r = (u && u.rechte) || {};
+  $('fLimit').value = r.tageslimit || 0;
+  $('fFilter').value = r.filter === true ? 'an' : r.filter === false ? 'aus' : '';
+  $('fModelle').value = (r.modelle || []).join(', ');
+  $('fPool').checked = r.pool !== false;
+  for (const k of $('fBereiche').querySelectorAll('input')) k.checked = !!(r.bereiche || []).includes(k.value);
+  melden($('fMeldung'), '');
+  if (u) $('form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+$('form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const name = $('fName').value.trim().toLowerCase();
+  const rechte = {
+    bereiche: [...$('fBereiche').querySelectorAll('input:checked')].map(k => k.value),
+    modelle: $('fModelle').value.split(',').map(s => s.trim()).filter(Boolean),
+    filter: $('fFilter').value === 'an' ? true : $('fFilter').value === 'aus' ? false : null,
+    tageslimit: Math.max(0, Number($('fLimit').value) || 0),
+    pool: $('fPool').checked };
+  const body = { rolle: $('fRolle').value, rechte };
+  if ($('fPasswort').value) body.passwort = $('fPasswort').value;
+  $('fSpeichern').disabled = true;
+  try {
+    if (bearbeite) await api('/router/users/' + encodeURIComponent(bearbeite), 'PUT', body);
+    else { body.name = name; await api('/router/users', 'POST', body); }
+    melden($('fMeldung'), T('gespeichert', 'Gespeichert.'), 'ok');
+    await lesen();
+    formular(null);
+    melden($('fMeldung'), T('gespeichert', 'Gespeichert.'), 'ok');
+  } catch (e) {
+    melden($('fMeldung'), T('fehler', 'Fehler: {fehler}', { fehler: e.message }), 'err');
+  } finally { $('fSpeichern').disabled = false; }
+});
+$('fAbbrechen').onclick = () => formular(null);
+
+$('nutzerBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  const name = b.dataset.name;
+  try {
+    if (b.dataset.tok) {
+      const [n, t] = b.dataset.tok.split('/');
+      if (!confirm(T('frage.token', 'Token „{t}“ von {n} widerrufen? Programme mit diesem Token verlieren sofort den Zugang.', { t, n }))) return;
+      await api('/router/users/' + encodeURIComponent(n) + '/tokens/' + encodeURIComponent(t), 'DELETE');
+    } else if (b.dataset.tun === 'bearbeiten') { formular(nutzer.find(u => u.name === name)); return; }
+    else if (b.dataset.tun === 'token') { tokenDialog(name); return; }
+    else if (b.dataset.tun === 'sperren') { await api('/router/users/' + encodeURIComponent(name), 'DELETE'); }
+    else if (b.dataset.tun === 'entsperren') { await api('/router/users/' + encodeURIComponent(name), 'PUT', { gesperrt: false }); }
+    else if (b.dataset.tun === 'loeschen') {
+      if (!confirm(T('frage.loeschen', 'Nutzer „{n}“ endgültig löschen (samt Token)? Seine Ablage-Einträge bleiben, sind aber keinem Nutzer mehr zugeordnet.', { n: name }))) return;
+      await api('/router/users/' + encodeURIComponent(name) + '?loeschen=1', 'DELETE');
+    }
+    await lesen();
+  } catch (e) { alert(T('fehler', 'Fehler: {fehler}', { fehler: e.message })); }
+});
+
+function tokenDialog(name) {
+  $('tokenFuer').textContent = T('t.fuer', 'für Nutzer {n}', { n: name });
+  $('tName').value = ''; $('tTage').value = '0';
+  $('tErgebnis').hidden = true; $('tKopieren').hidden = true; $('tErzeugen').hidden = false;
+  melden($('tMeldung'), '');
+  $('tErzeugen').onclick = async () => {
+    $('tErzeugen').disabled = true;
+    try {
+      const d = await api('/router/users/' + encodeURIComponent(name) + '/tokens', 'POST', { name: $('tName').value.trim().toLowerCase(), tage: Math.max(0, Number($('tTage').value) || 0) });
+      $('tToken').textContent = d.token; $('tErgebnis').hidden = false; $('tKopieren').hidden = false; $('tErzeugen').hidden = true;
+      await lesen();
+    } catch (e) { melden($('tMeldung'), T('fehler', 'Fehler: {fehler}', { fehler: e.message }), 'err'); }
+    finally { $('tErzeugen').disabled = false; }
+  };
+  $('tokenDialog').showModal();
+}
+$('tKopieren').onclick = async () => { const ok = window.gufoKopieren ? await gufoKopieren($('tToken').textContent) : false; melden($('tMeldung'), ok ? T('t.kopiert', 'Kopiert ✓') : T('t.nichtkopiert', 'Kopieren ging nicht – bitte markieren.'), ok ? 'ok' : 'warn'); };
+$('tZu').onclick = () => $('tokenDialog').close();
+
+async function logLesen() {
+  try {
+    const d = await api('/router/zugriff?n=400');
+    let zeilen = d.zeilen || [];
+    if ($('logNurAbgelehnt').checked) zeilen = zeilen.filter(z => /\t(abgelehnt|login|logout|nutzer_|token_)/.test(z));
+    $('log').textContent = zeilen.length ? zeilen.slice().reverse().join('\n') : T('log.leer', '(noch nichts)');
+    $('logInfo').textContent = T('log.info', '{n} Zeilen, neueste oben', { n: zeilen.length });
+  } catch (e) { $('log').textContent = e.status === 404 ? '' : T('fehler', 'Fehler: {fehler}', { fehler: e.message }); }
+}
+$('logLesen').onclick = logLesen;
+$('logNurAbgelehnt').onchange = logLesen;
+
+bereichKaestchen();
+formular(null);
+lesen().then(logLesen);
+window.addEventListener('gufo-sprache', () => {
+  tabelle(); bereichKaestchen();
+  $('formTitel').textContent = bearbeite ? T('h.bearbeiten', 'Nutzer bearbeiten: {name}', { name: bearbeite }) : T('h.anlegen', 'Nutzer anlegen');
+  $('fSpeichern').textContent = bearbeite ? T('f.speichern.aendern', 'Speichern') : T('f.speichern', 'Anlegen');
+});
+</script>
+</body>
+</html>

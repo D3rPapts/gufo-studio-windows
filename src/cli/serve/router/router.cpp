@@ -27,6 +27,7 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
@@ -37,6 +38,7 @@
 #include "src/cli/serve/router/registry.hpp"
 #include "src/cli/serve/router/remote.hpp"
 #include "src/cli/serve/router/residency.hpp"
+#include "src/cli/serve/router/strings.hpp"
 #include "src/cli/serve/router/workers.hpp"
 #include "src/cli/serve/router/ws_relay.hpp"
 #include "src/cli/serve/serve.hpp"
@@ -78,14 +80,17 @@ constexpr std::string_view kPresetGrammar =
     "                                   --remote-allow (required)\n"
     "      modality = image             llm|image|video|tts|asr|embedding|\n"
     "                                   omni, as listed (required)\n"
-    "      api-key-env = NAME           environment variable with the remote\n"
-    "                                   router's --api-key\n"
+    "      api-key-env = NAME           environment variable with a bearer\n"
+    "                                   key for a 1.x remote router\n"
     "      connect-timeout-seconds = 3  unreachable -> 503 remote_unavailable\n"
     "      head-timeout-seconds = 0     response head deadline (0 = none)\n"
     "      gpu-slot = NAME              remote models sharing NAME run one\n"
     "                                   GPU request (or video/music job) at\n"
     "                                   a time; others wait\n"
     "      queue-timeout-seconds = 900  longest wait, then 503 remote_busy\n"
+    "      pool-wait-seconds = 60       placement = pool: longest wait on the\n"
+    "                                   partner, then this machine (if it\n"
+    "                                   has the model and LoRAs)\n"
     "      busy-check-url = http://<IPv4>:<port>/queue  optional ComfyUI\n"
     "                                   queue; wait while it runs anything\n"
     "      max-request-bytes = N        413 above N bytes\n"
@@ -113,8 +118,33 @@ constexpr std::string_view kPresetGrammar =
     "    neither can), a free runner pulls the partner's older queued job\n"
     "    (POST /router/pool/pull) and runs it on its worker while the owner\n"
     "    keeps files and result; /router/status shows pool_queue.\n"
+    "    Priority (2.0.3): X-Gufo-Priority: 0..9 or \"priority\" in the\n"
+    "    body (0 = normal, higher first, then oldest first) orders the\n"
+    "    shared queue and the pull; a waiting pool request lets a higher\n"
+    "    one of its model go first (at most 2 s); invalid: 400\n"
+    "    invalid_priority.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
-    "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
+    "    others_busy} (read by the partner's probe) and \"inflight\".\n"
+    "\n"
+    "    [router]              users and access control (2.0.3), optional:\n"
+    "      auth = off                   off (default): everyone may use\n"
+    "                                   everything; lan: 127.0.0.1 is admin,\n"
+    "                                   everyone else logs in (cookie) or\n"
+    "                                   sends Authorization: Bearer gufo_...;\n"
+    "                                   all: the machine itself logs in too\n"
+    "      auth-loopback = admin        admin|login: whether 127.0.0.1 counts\n"
+    "                                   as admin without a login (auth = lan)\n"
+    "      users-file = PATH            users file (default: nutzer/\n"
+    "                                   nutzer.json next to the preset)\n"
+    "      pool-secret-env = NAME       environment variable with the secret\n"
+    "                                   both routers share; router-to-router\n"
+    "                                   calls carry it as X-Gufo-Pool-Key\n"
+    "      csrf-allow-origins = LIST    comma list of origins (http://host:\n"
+    "                                   port) whose pages may write besides\n"
+    "                                   this router's own address (a proxy)\n"
+    "    Users, roles (admin|nutzer|dienst), rights, tokens and the log:\n"
+    "    /router/users, /verwaltung/ (loopback or admin only), docs/internal/\n"
+    "    server.md \"Users and access\".\n\n";
 
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
@@ -215,6 +245,7 @@ std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                            : ext == ".css" ? "text/css; charset=utf-8"
                            : ext == ".png" ? "image/png"
                            : ext == ".svg" ? "image/svg+xml"
+                           : ext == ".ico" ? "image/x-icon"
                            : ext == ".jpg" ? "image/jpeg"
                            : ext == ".mp4" ? "video/mp4"
                            : ext == ".wav" ? "audio/wav"
@@ -451,7 +482,9 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // Real-ESRGAN on the NPU / GPU / CPU (gufo serve upscale).
       "/v1/images/upscale",
       // Voice conversion / stem separation (gufo serve voice, D5).
-      "/v1/audio/convert", "/v1/audio/separate"};
+      "/v1/audio/convert", "/v1/audio/separate",
+      // TripoSG image-to-3D jobs (gufo serve objekt), async via /v1/jobs.
+      "/v1/3d/generations"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
@@ -494,14 +527,25 @@ bool IsModelQueryGet(const HttpRequest& req) {
 }
 
 /// Job id from `/v1/audio/music/<id>` or `/v1/audio/music/<id>/content`,
-/// the async music reads music_api.cpp serves; empty for anything else.
+/// the async music reads music_api.cpp serves, and likewise from
+/// `/v1/images/upscale/<id>[/content]`, the async image reads of
+/// upscale_api.cpp (same bookkeeping: the create POST records the id, the
+/// content read releases it); empty for anything else.
 std::string MusicJobId(const std::string& path) {
-  constexpr std::string_view prefix = "/v1/audio/music/";
+  constexpr std::string_view kPrefixes[] = {"/v1/audio/music/",
+                                            "/v1/images/upscale/"};
   std::string_view remainder(path);
-  if (!remainder.starts_with(prefix)) {
+  bool matched = false;
+  for (std::string_view prefix : kPrefixes) {
+    if (remainder.starts_with(prefix)) {
+      remainder.remove_prefix(prefix.size());
+      matched = true;
+      break;
+    }
+  }
+  if (!matched) {
     return "";
   }
-  remainder.remove_prefix(prefix.size());
   // Status, the finished audio and the live preview (D3) all belong to the
   // worker that owns the job.
   for (std::string_view suffix : {"/content", "/preview"}) {
@@ -542,6 +586,38 @@ std::string VideoJobId(const std::string& path) {
   return std::string(remainder);
 }
 
+/// Job id from `/v1/3d/generations/<id>[/content|/preview]`, the async 3D
+/// reads and the cancel `gufo serve objekt` serves (1.4.23c); empty otherwise.
+std::string ObjektJobId(const std::string& path) {
+  constexpr std::string_view prefix = "/v1/3d/generations/";
+  std::string_view remainder(path);
+  if (!remainder.starts_with(prefix)) {
+    return "";
+  }
+  remainder.remove_prefix(prefix.size());
+  for (std::string_view suffix : {"/content", "/preview"}) {
+    if (remainder.ends_with(suffix)) {
+      remainder.remove_suffix(suffix.size());
+      break;
+    }
+  }
+  if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
+    return "";
+  }
+  return std::string(remainder);
+}
+
+/// Status path of a recorded job by its worker-assigned id: async music ids
+/// are music_N, 3D ids obj_<hex> (gufo serve objekt), everything else is a
+/// video job (video_<hex>).
+std::string JobStatusPath(const std::string& job_id) {
+  if (job_id.starts_with("music_"))
+    return "/v1/audio/music/" + job_id;
+  if (job_id.starts_with("obj_"))
+    return "/v1/3d/generations/" + job_id;
+  return "/v1/videos/" + job_id;
+}
+
 Resolution ResolveModel(const HttpRequest& req) {
   Resolution resolution;
   if (IsJsonModelPost(req)) {
@@ -571,6 +647,13 @@ Resolution ResolveModel(const HttpRequest& req) {
   }
   if (req.method == "GET" && !MusicJobId(req.path).empty()) {
     // Optional: without ?model= the job's recorded owner answers.
+    resolution.model_id = req.query_param("model");
+    return resolution;
+  }
+  if ((req.method == "GET" || req.method == "DELETE") &&
+      !ObjektJobId(req.path).empty()) {
+    // 3D status/content/preview reads and the cancel: `model` comes as a
+    // query (RunObjekt sends it); without it the recorded owner answers.
     resolution.model_id = req.query_param("model");
     return resolution;
   }
@@ -714,27 +797,26 @@ struct RemoteJob {
   std::shared_ptr<router::GpuSlots::Hold> slot;
 };
 
+/// A video job create: `POST /v1/videos` (generation) or `POST
+/// /v1/videos/upscale` (gufo serve upscale); both answer a job object
+/// whose id is read at `/v1/videos/<id>`.
 bool IsVideoCreate(const HttpRequest& req) {
-  return req.method == "POST" && req.path == "/v1/videos";
+  return req.method == "POST" &&
+         (req.path == "/v1/videos" || req.path == "/v1/videos/upscale");
 }
 
 bool IsMusicCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/audio/music";
 }
 
-/// A POST with a JSON object body (Content-Type application/json, or no
-/// type and a body that starts with '{'): the pool reads its LoRA names.
-bool IsJsonBody(const HttpRequest& req) {
-  if (req.method != "POST" || req.body.empty())
-    return false;
-  std::string type = req.header("Content-Type");
-  std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  if (type.starts_with("application/json"))
-    return true;
-  return type.empty() && req.body.front() == '{';
+/// POST /v1/3d/generations: gufo serve objekt answers 202 with an obj_ job
+/// the router records like a video job (1.4.24).
+bool IsObjektCreate(const HttpRequest& req) {
+  return req.method == "POST" && req.path == "/v1/3d/generations";
 }
+
+/// A POST with a JSON object body: the pool reads its LoRA names.
+using router::IsJsonBody;
 
 /// Job id of the status resource `/v1/videos/<id>`; empty for `/content` or
 /// any deeper path.
@@ -880,6 +962,35 @@ public:
   std::unique_ptr<router::names::NameService> names;
   /// POST /v1/figuren (figure check over the router's own vision chats).
   std::unique_ptr<router::figuren::FigurenService> figuren;
+  /// Users and access control (preset `[router]`, 2.0.3): the front hook
+  /// in front of Dispatch. Always set; with auth = off it only answers the
+  /// auth endpoints.
+  std::unique_ptr<router::auth::Gate> gate;
+  /// metadata.nutzer of a local job (the gate's owner check); nullopt when
+  /// the job API is off or the job is unknown here.
+  std::optional<std::string> JobOwner(const std::string& job_id) {
+    if (jobs == nullptr || job_id.empty())
+      return std::nullopt;
+    // Through the public handler; X-Gufo-Relay keeps an unknown id from
+    // being asked of the partner (then the owner is simply unknown).
+    HttpRequest ask;
+    ask.method = "GET";
+    ask.path = "/v1/jobs/" + job_id;
+    ask.client_id = "127.0.0.1";
+    ask.headers.emplace_back(router::jobs::kRelayHeader, "1");
+    const std::optional<HttpResponse> answer = jobs->Handle(ask);
+    if (!answer.has_value() || answer->status != 200 ||
+        answer->streaming_body)
+      return std::nullopt;
+    try {
+      const json::Value job = json::parse(answer->body);
+      if (const json::Value* metadata = job.find("metadata");
+          metadata != nullptr && metadata->is_object())
+        return metadata->member_str("nutzer");
+    } catch (const std::exception&) {
+    }
+    return std::string();
+  }
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
   /// Reachability and model states of the remote routers; null without
@@ -1022,6 +1133,32 @@ public:
     }
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
+    // Priority (2.0.3): X-Gufo-Priority (wins) or the top-level JSON
+    // member "priority"; read before the lock and checked on every
+    // request, used by the pool decision. Only that member is parsed (a
+    // large body is scanned once, never parsed whole; "priority" inside a
+    // chat text does not count).
+    int priority = 0;
+    {
+      json::Value member_value;
+      const json::Value* member = nullptr;
+      if (IsJsonBody(req)) {
+        if (const auto text = router::TopLevelMemberText(req.body, "priority");
+            text.has_value()) {
+          try {
+            member_value = json::parse(*text);
+            member = &member_value;
+          } catch (const std::exception&) {
+            // The worker answers a malformed body itself.
+          }
+        }
+      }
+      std::string why;
+      if (!router::ParsePriority(req.header(router::kPriorityHeader), member,
+                                 &priority, &why))
+        return Err(400, "Bad Request", why, "invalid_request_error",
+                   "invalid_priority");
+    }
     std::unique_lock<std::mutex> lock(mutex);
     if (req.method == "POST" &&
         (req.path == "/models/load" || req.path == "/models/unload")) {
@@ -1035,7 +1172,7 @@ public:
       return *front;
     }
     if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
-        req.method != "DELETE") {
+        req.method != "DELETE" && !IsVideoCreate(req)) {
       // Job subpaths have no verbs beyond the status/content reads the
       // front's video API answers: everything else is 405 regardless of job
       // state or body, mirroring HandleVideoApiRequest's precedence.
@@ -1081,6 +1218,18 @@ public:
                    "invalid_request_error", "not_found");
       }
     }
+    if (resolved.model_id.empty() &&
+        (req.method == "GET" || req.method == "DELETE")) {
+      // 3D reads/cancel without ?model=: the worker that answered the POST.
+      const std::string objekt_job = ObjektJobId(req.path);
+      if (!objekt_job.empty()) {
+        resolved.model_id = registry.JobOwner(objekt_job);
+        if (resolved.model_id.empty()) {
+          return Err(404, "Not Found", "unknown 3D job " + objekt_job,
+                     "invalid_request_error", "not_found");
+        }
+      }
+    }
     if (resolved.model_id.empty()) {
       // Nothing resolved the path to a model. Video paths mirror the front's
       // video API precedence: shape and method first (405 above), then the
@@ -1100,6 +1249,12 @@ public:
       return Err(404, "Not Found", "no route for this path",
                  "invalid_request_error", "not_found");
     }
+    // A `served-model-name` alias (#957) routes to its section; the body
+    // keeps the alias, which the upstream worker accepts.
+    if (std::string canonical = registry.CanonicalId(resolved.model_id);
+        !canonical.empty()) {
+      resolved.model_id = std::move(canonical);
+    }
     const std::string& model_id = resolved.model_id;
     const router::PresetModel* preset = registry.Find(model_id);
     if (preset == nullptr) {
@@ -1107,7 +1262,8 @@ public:
     }
     if (PooledLocked(*preset, req, music_job)) {
       // placement = pool: this machine or the remote, per request.
-      return DispatchPoolLocked(req, model_id, *preset, music_job, lock);
+      return DispatchPoolLocked(req, model_id, *preset, music_job, priority,
+                                lock);
     }
     if (RoutesRemoteLocked(*preset, req, music_job)) {
       // Another router owns the model: no admission, load or memory here.
@@ -1275,6 +1431,10 @@ public:
         (req.method == "GET" || req.method == "DELETE")) {
       job = VideoJobId(req.path);
     }
+    if (job.empty() && (req.method == "GET" || req.method == "DELETE")) {
+      // A 3D job stays on the machine it runs on (1.4.24).
+      job = ObjektJobId(req.path);
+    }
     if (!job.empty() && registry.JobOwner(job) == preset.id) {
       return registry.JobRemote(job);
     }
@@ -1288,15 +1448,27 @@ public:
     int local_claims{0};
     /// Pool requests waiting for a free machine.
     int waiting{0};
+    /// Of those, by priority (X-Gufo-Priority, 2.0.3).
+    int waiting_by_priority[router::kPriorityMax + 1]{};
+    /// Requests that let a waiting one of a higher priority go first.
+    long long yields{0};
     /// Last time the model was seen loaded here / on the remote router.
     std::chrono::steady_clock::time_point local_warm_at{};
     std::chrono::steady_clock::time_point remote_warm_at{};
     /// A local load or admission failed: kPoolLocalFailHold off the worker.
     bool local_failed{false};
     std::chrono::steady_clock::time_point local_failed_at{};
+    /// The partner answered 502/503/504 for this model: kPoolRemoteFailHold
+    /// off the partner (unless a request is pinned there).
+    bool remote_failed{false};
+    std::chrono::steady_clock::time_point remote_failed_at{};
+    std::string remote_failed_detail;
     long long local_picks{0};
     long long remote_picks{0};
     long long retried_local{0};
+    /// Requests that fell back to this machine (B5: partner gone, failed,
+    /// or waited on longer than pool-wait-seconds).
+    long long fallbacks{0};
     /// Last decision ("remote: warm").
     std::string last;
   };
@@ -1340,8 +1512,10 @@ public:
 
   /// Anything but `model_id` in flight here: another model's request,
   /// socket or job, the ComfyUI queue (unless `from_comfy`) or another pool
-  /// model's claimed or waiting request.
-  bool OthersBusyLocked(const std::string& model_id, bool from_comfy) const {
+  /// model's claimed request, and (`count_waiting`) another pool model's
+  /// request that waits for a machine.
+  bool OthersBusyLocked(const std::string& model_id, bool from_comfy,
+                        bool count_waiting = true) const {
     if (!from_comfy && comfy != nullptr && comfy->QueueRemaining() > 0)
       return true;
     for (const auto& [preset, status] : registry.Statuses()) {
@@ -1350,34 +1524,69 @@ public:
         return true;
     }
     for (const auto& [id, entry] : pool_) {
-      if (id != model_id && (entry.local_claims > 0 || entry.waiting > 0))
+      if (id != model_id &&
+          (entry.local_claims > 0 || (count_waiting && entry.waiting > 0)))
         return true;
     }
     return false;
   }
 
   /// GET /v1/models "activity" of a model served here: what the partner
-  /// router's pool reads from its probe.
+  /// router's pool reads from its probe. "busy" = work of the model runs
+  /// (or loads) here; "waiting" = pool requests of it that only wait for a
+  /// machine, reported apart so the partner does not count them as
+  /// occupied (12.11.: mutual 900 s wait). "others_busy" likewise leaves
+  /// out other models' waiting requests.
   json::Value ActivityLocked(const std::string& model_id) const {
     json::Value out = json::Value::object();
-    bool busy = registry.Busy(model_id);
-    if (const auto it = pool_.find(model_id); it != pool_.end())
-      busy = busy || it->second.local_claims > 0 || it->second.waiting > 0;
-    out["busy"] = busy;
+    int claims = 0;
+    int waiting = 0;
+    if (const auto it = pool_.find(model_id); it != pool_.end()) {
+      claims = it->second.local_claims;
+      waiting = it->second.waiting;
+    }
+    out["busy"] = router::PoolActivityBusy(registry.Busy(model_id), claims);
+    out["waiting"] = static_cast<long long>(waiting);
     std::string reason;
     const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
     out["gpu_busy"] = gpu_busy;
     if (gpu_busy)
       out["gpu_busy_reason"] = reason;
-    out["others_busy"] = OthersBusyLocked(model_id, false);
+    out["others_busy"] =
+        OthersBusyLocked(model_id, false, /*count_waiting=*/false);
     return out;
+  }
+
+  /// Whether this machine may pull a job of `model_id` from the partner
+  /// now (job store, shared queue): a free job runner says nothing about
+  /// the GPU. Not while the model is busy here, other GPU work runs
+  /// (ComfyUI queue, an image/video/music model) or a pool request here is
+  /// claimed or waits (12.11. 17:34 and 17:50 the .56 pulled while its GPU
+  /// ran ComfyUI and the film). *why gets the reason.
+  bool MayPull(const std::string& model_id, std::string* why) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (registry.Busy(model_id)) {
+      *why = model_id + " busy";
+      return false;
+    }
+    if (GpuBusyLocked(model_id, false, why))
+      return false;
+    for (const auto& [id, entry] : pool_) {
+      if (entry.local_claims > 0 || entry.waiting > 0) {
+        *why = "pool request of " + id +
+               (entry.local_claims > 0 ? " loading" : " waiting");
+        return false;
+      }
+    }
+    return true;
   }
 
   /// Both machines as the pool decision sees them (state mutex held).
   router::PoolInput PoolInputLocked(const router::PresetModel& preset,
                                     bool forwarded, bool from_comfy,
                                     bool remote_failed,
-                                    std::chrono::milliseconds waited) {
+                                    std::chrono::milliseconds waited,
+                                    bool ignore_remote_hold = false) {
     const auto now = std::chrono::steady_clock::now();
     const auto within = [now](std::chrono::steady_clock::time_point at) {
       return at != std::chrono::steady_clock::time_point{} &&
@@ -1412,24 +1621,21 @@ public:
     local.sticky = within(pool.local_warm_at);
 
     router::PoolSide& remote = in.remote;
-    if (remotes != nullptr && !remote_failed) {
+    const bool remote_held =
+        !ignore_remote_hold && pool.remote_failed &&
+        now - pool.remote_failed_at < router::kPoolRemoteFailHold;
+    if (remotes != nullptr && !remote_failed && !remote_held) {
       const router::RemoteEndpoint& url = preset.remote->url;
-      const router::RemoteHub::ModelView view = remotes->View(url, preset.id);
+      router::RemoteObservation seen;
+      seen.view = remotes->View(url, preset.id);
       std::string error;
-      remote.available = view.served && remotes->Reachable(url, &error);
-      remote.warm = view.status == "loaded" || view.status == "loading";
-      const std::size_t ours = registry.RemoteRequests(preset.id);
+      seen.reachable = remotes->Reachable(url, &error);
+      seen.ours = registry.RemoteRequests(preset.id);
+      seen.slot_idle = gpu_slots.Idle(preset.remote->gpu_slot);
       // A probe from before our last relay ended may still count it.
-      const bool stale =
-          view.checked_at <= registry.LastRemoteFinished(preset.id);
-      const bool theirs = view.has_activity && view.activity.busy && !stale;
-      remote.free =
-          ours < static_cast<std::size_t>(router::kPoolRemoteCapacity) &&
-          gpu_slots.Idle(preset.remote->gpu_slot) && !theirs;
-      remote.gpu_busy = view.has_activity && view.activity.gpu_busy;
-      remote.idle = remote.free && ours == 0 &&
-                    !(view.has_activity && view.activity.others_busy);
-      remote.empty = !view.others_loaded;
+      seen.stale =
+          seen.view.checked_at <= registry.LastRemoteFinished(preset.id);
+      remote = router::RemotePoolSide(seen);
       if (remote.available && remote.warm)
         pool.remote_warm_at = now;
       remote.sticky = within(pool.remote_warm_at);
@@ -1450,16 +1656,31 @@ public:
                                std::to_string(waited.count()));
   }
 
+  /// The highest priority among the waiting pool requests of `model_id`
+  /// above `priority`, or -1 (state mutex held).
+  int HigherWaitingLocked(const std::string& model_id, int priority) const {
+    const auto it = pool_.find(model_id);
+    if (it == pool_.end())
+      return -1;
+    for (int level = router::kPriorityMax; level > priority; --level)
+      if (it->second.waiting_by_priority[level] > 0)
+        return level;
+    return -1;
+  }
+
   /// placement = pool (see pool.hpp): picks this machine or the remote
   /// router for one new request, waits (lock released) while neither fits,
   /// up to the remote section's queue-timeout-seconds. A local load that
   /// fails sends the request to the remote when it fits; a relay that got
   /// no answer at all (connect failure, closed before the head) is decided
   /// again without the remote, once, unless it created a job.
+  /// Priority (2.0.3, X-Gufo-Priority or "priority"): a request that sees
+  /// a free machine lets a waiting request of the same model with a
+  /// higher priority go first, at most kPoolYieldMax in a row.
   HttpResponse DispatchPoolLocked(const HttpRequest& req,
                                   const std::string& model_id,
                                   const router::PresetModel& preset,
-                                  const std::string& music_job,
+                                  const std::string& music_job, int priority,
                                   std::unique_lock<std::mutex>& lock) {
     constexpr std::chrono::milliseconds kPoolPoll{200};
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
@@ -1468,9 +1689,14 @@ public:
     // The side the request must run on: the job store sets X-Gufo-Pool
     // when only one router can run a job; a direct request's LoRA names
     // are checked here against this preset and the partner's
-    // capabilities (neither: 400, both: as before).
+    // capabilities (neither: 400, both: as before). An explicit header
+    // wins over the LoRA check; 400 pool_side_cannot_run when that side
+    // lacks a LoRA.
     std::string forced =
         router::PoolSideOf(req.header(router::jobs::kPoolSideHeader));
+    // This router has every LoRA the request names (B5: only then may a
+    // request pinned to the partner fall back to this machine).
+    bool local_capable = true;
     if (!forwarded && IsJsonBody(req)) {
       std::vector<std::string> needs;
       try {
@@ -1487,6 +1713,7 @@ public:
             break;
           }
         const bool local_ok = missing.empty();
+        local_capable = local_ok;
         bool partner_ok = true;
         std::string why_partner;
         lock.unlock();
@@ -1508,14 +1735,40 @@ public:
                          "; partner " + partner_name + " " + why_partner,
                      "invalid_request_error", "no_capable_router");
         }
-        if (!local_ok)
+        // An explicit X-Gufo-Pool (client or job store) is never
+        // overridden: the side it names must have the LoRAs, else 400.
+        if (forced == "local" && !local_ok) {
+          std::string registered;
+          for (const std::string& name : have)
+            registered += (registered.empty() ? "" : ", ") + name;
+          return Err(400, "Bad Request",
+                     std::string("X-Gufo-Pool: local, but this router has "
+                                 "no LoRA '") +
+                         missing + "' for model '" + model_id + "'" +
+                         (registered.empty()
+                              ? " (none registered)"
+                              : " (registered: " + registered + ")"),
+                     "invalid_request_error", "pool_side_cannot_run");
+        }
+        if (forced == "remote" && !partner_ok)
+          return Err(400, "Bad Request",
+                     "X-Gufo-Pool: remote, but partner " + partner_name +
+                         " " + why_partner,
+                     "invalid_request_error", "pool_side_cannot_run");
+        if (forced.empty() && !local_ok)
           forced = "remote";
-        else if (!partner_ok)
+        else if (forced.empty() && !partner_ok)
           forced = "local";
       }
     }
-    const bool may_retry =
-        !IsVideoCreate(req) && !IsMusicCreate(req) && forced != "remote";
+    // B5: a request pinned to the partner may still run here when this
+    // router can (it has the LoRAs) and the partner failed or is gone.
+    const bool may_retry = !IsVideoCreate(req) && !IsMusicCreate(req) &&
+                           !IsObjektCreate(req) &&
+                           (forced != "remote" || local_capable);
+    const std::chrono::seconds pool_wait(preset.remote->pool_wait_seconds);
+    // Set once the request stopped counting on the partner (B5).
+    const char* fallback = nullptr;
     // The job this request belongs to (job store): its pool state is
     // reported and, while it waits, may be redirected to the partner.
     const std::string job_id =
@@ -1525,10 +1778,14 @@ public:
         began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
     bool remote_failed = false;
     bool waiting = false;
+    // How long this request has let a higher priority go first (2.0.3):
+    // only real yield stretches count, not busy waits in between.
+    router::PoolYieldClock yield_clock;
     std::optional<HttpResponse> local_failure;
     const auto stop_waiting = [&] {
       if (waiting) {
         --pool_[model_id].waiting;
+        --pool_[model_id].waiting_by_priority[priority];
         waiting = false;
       }
     };
@@ -1552,13 +1809,64 @@ public:
         }
       }
       router::PoolInput pool_input =
-          PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited);
+          PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited,
+                          /*ignore_remote_hold=*/forced == "remote");
+      // B5 "never stuck" (Fabian 13.11.): after pool-wait-seconds on the
+      // partner a request this router can run stops waiting for it.
+      if (fallback == nullptr) {
+        fallback = router::PoolFallbackReason(
+            {waited, pool_wait, forwarded, forced == "remote", local_capable});
+        if (fallback != nullptr) {
+          ++pool_[model_id].fallbacks;
+          Logger::Warn("router", "event=pool_fallback model=" + model_id +
+                                     " reason=\"" + fallback +
+                                     "\" waited_ms=" +
+                                     std::to_string(waited.count()));
+        }
+      }
+      if (fallback != nullptr)
+        pool_input = router::WithoutPartner(pool_input);
       // One side only (capabilities): the other is out, even when free.
-      if (forced == "remote")
+      // A remote pin ends once the partner failed this request or the
+      // fallback dropped it (local_capable: this side has the LoRAs).
+      if (forced == "remote" &&
+          !(local_capable && (remote_failed || fallback != nullptr)))
         pool_input.local.available = false;
       else if (forced == "local")
         pool_input.remote.available = false;
-      const router::PoolDecision decision = router::ChoosePool(pool_input);
+      router::PoolDecision decision = router::ChoosePool(pool_input);
+      // Priority (2.0.3): a free machine goes to a waiting request of this
+      // model with a higher priority first; this one yields, at most
+      // kPoolYieldMax in a row (never stuck: the higher one may be pinned
+      // to the other side).
+      if (decision.choice == router::PoolChoice::kWait) {
+        // Waiting for a machine, not for a higher priority: the yield
+        // stretch (if any) ends here and is booked.
+        yield_clock.Pause(std::chrono::steady_clock::now());
+      } else {
+        const auto now = std::chrono::steady_clock::now();
+        router::PoolYieldInput yield_input;
+        yield_input.priority = priority;
+        yield_input.highest_waiting = HigherWaitingLocked(model_id, priority);
+        yield_input.yielded =
+            yield_clock.YieldedFor(yield_input.highest_waiting, now);
+        yield_input.total_yielded = yield_clock.Total(now);
+        yield_input.forwarded = forwarded;
+        if (router::PoolShouldYield(yield_input)) {
+          if (yield_clock.Begin(yield_input.highest_waiting, now)) {
+            ++pool_[model_id].yields;
+            Logger::Info("router",
+                         "event=pool_yield model=" + model_id +
+                             " priority=" + std::to_string(priority) +
+                             " to_priority=" +
+                             std::to_string(yield_input.highest_waiting) +
+                             " waited_ms=" + std::to_string(waited.count()));
+          }
+          decision = {router::PoolChoice::kWait, "yields to a higher priority"};
+        } else {
+          yield_clock.Pause(now);
+        }
+      }
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
@@ -1612,22 +1920,52 @@ public:
         // its own idle residents, so it tries once itself instead of handing
         // the 507 to the client (10.11.: hemmingway 507 on .198 for an hour
         // while .56 kept an idle flash-next-q3 loaded).
-        const bool remote_refused_memory =
-            response.status == 507 && !forwarded;
         // A relayed 507 arrives with a lazy streaming body; nothing has
         // reached the client until it is written, so it can be dropped
         // (10.11. 07:31: the first 1.4.12 skipped the retry for this reason).
-        if (may_retry && !remote_failed &&
-            (remote_refused_memory ||
-             (!response.streaming_body && response.status == 503 &&
-              response.log_details.starts_with("remote_unavailable")))) {
+        // The same holds for a 502/503/504 of the partner (its worker did
+        // not start, its load timed out): 12.11. 21:00 the .56 answered 502
+        // "worker failed to start" while qwen-image was warm and free here,
+        // and the client got the 502.
+        const router::PoolRemoteAnswer answer =
+            router::ClassifyPoolRemoteAnswer(
+                response.status, static_cast<bool>(response.streaming_body),
+                response.log_details);
+        if (router::PoolRemoteHold(answer) && !forwarded) {
+          // Keep the next pool requests of this model off the partner too
+          // (B5: also when it could not be reached at all).
+          PoolEntry& pool = pool_[model_id];
+          pool.remote_failed = true;
+          pool.remote_failed_at = std::chrono::steady_clock::now();
+          pool.remote_failed_detail =
+              std::to_string(response.status) + " " + response.log_details;
+          Logger::Warn("router", "event=pool_remote_failed model=" + model_id +
+                                     " status=" +
+                                     std::to_string(response.status) +
+                                     " hold_s=" +
+                                     std::to_string(
+                                         router::kPoolRemoteFailHold.count()));
+        }
+        if (may_retry && !remote_failed && !forwarded &&
+            answer != router::PoolRemoteAnswer::kPass) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
           ++pool_[model_id].retried_local;
+          ++pool_[model_id].fallbacks;
           Logger::Warn("router", "event=pool_retry_local model=" + model_id +
                                      " detail=\"" + response.log_details +
                                      "\"");
+          Logger::Warn(
+              "router",
+              "event=pool_fallback model=" + model_id + " reason=\"" +
+                  (answer == router::PoolRemoteAnswer::kRetryUnreachable
+                       ? "partner unreachable"
+                   : answer == router::PoolRemoteAnswer::kRetryMemory
+                       ? "partner out of memory"
+                       : "partner failed") +
+                  "\" status=" + std::to_string(response.status) +
+                  " waited_ms=" + std::to_string(waited.count()));
           continue;
         }
         return response;
@@ -1646,6 +1984,7 @@ public:
       if (!waiting) {
         waiting = true;
         ++pool_[model_id].waiting;
+        ++pool_[model_id].waiting_by_priority[priority];
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "wait");
       }
@@ -1693,10 +2032,14 @@ public:
     if (const auto it = pool_.find(model_id); it != pool_.end()) {
       const PoolEntry& pool = it->second;
       out["waiting"] = static_cast<long long>(pool.waiting);
+      out["waiting_priority"] =
+          static_cast<long long>(HigherWaitingLocked(model_id, -1));
+      out["yields"] = pool.yields;
       out["local_claims"] = static_cast<long long>(pool.local_claims);
       out["local_picks"] = pool.local_picks;
       out["remote_picks"] = pool.remote_picks;
       out["retried_local"] = pool.retried_local;
+      out["fallbacks"] = pool.fallbacks;
       out["last"] = pool.last;
       if (pool.local_failed) {
         out["local_failed_s_ago"] = static_cast<long long>(
@@ -1704,10 +2047,18 @@ public:
                 std::chrono::steady_clock::now() - pool.local_failed_at)
                 .count());
       }
+      if (pool.remote_failed) {
+        out["remote_failed_s_ago"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - pool.remote_failed_at)
+                .count());
+        out["remote_failed"] = pool.remote_failed_detail;
+      }
     } else {
       out["waiting"] = 0LL;
       out["local_picks"] = 0LL;
       out["remote_picks"] = 0LL;
+      out["fallbacks"] = 0LL;
     }
     return out;
   }
@@ -1719,8 +2070,8 @@ public:
   /// requests, sockets and jobs already running finish where they started
   /// (never cut off), and a local worker left without local work is
   /// unloaded by the supervision tick. Answers the placements of all
-  /// switchable models and the ids that changed. Protected like
-  /// /models/load: the router's --api-key, when set. Not persisted: a
+  /// switchable models and the ids that changed. Unauthenticated like the
+  /// rest of the router since upstream #967 (trusted LAN). Not persisted: a
   /// restart starts from the preset's `placement` again.
   HttpResponse PlacementControl(const HttpRequest& req) {
     if (req.method != "GET" && req.method != "POST") {
@@ -2441,8 +2792,9 @@ public:
       target.head_timeout = kRemoteProbeTimeout;
       HttpRequest status;
       status.method = "GET";
-      status.path = (job.music ? "/v1/audio/music/" : "/v1/videos/") + job_id;
-      if (job.music)
+      status.path = job.music ? "/v1/audio/music/" + job_id
+                              : JobStatusPath(job_id);
+      if (job.music || job_id.starts_with("obj_"))
         status.query = "model=" + job.model_id;
       const auto deadline =
           std::chrono::steady_clock::now() + 2 * kRemoteProbeTimeout;
@@ -2545,11 +2897,10 @@ public:
     for (const Probe& probe : probes) {
       HttpRequest poll;
       poll.method = "GET";
-      // Async music ids are music_N; everything else is a video job.
-      poll.path = std::string(probe.job.starts_with("music_")
-                                  ? "/v1/audio/music/"
-                                  : "/v1/videos/") +
-                  probe.job;
+      // Async music ids are music_N, 3D ids obj_<hex>; everything else is a
+      // video job (a 3D job polled as a video answered 404 and was released
+      // as finished while the worker still computed it).
+      poll.path = JobStatusPath(probe.job);
       poll.request_id = "router-job-sweep";
       // A status read answers at once; a stuck worker must not hold up the
       // supervision tick.
@@ -2665,9 +3016,27 @@ public:
     }
   }
 
+  /// Why `model_id` cannot be loaded here right now (state mutex held):
+  /// a pool load or admission failure within kPoolLocalFailHold, or a
+  /// failed autoload still waiting for its retry; "" when it can.
+  std::string UnavailableLocked(const std::string& model_id,
+                                std::string_view status) const {
+    if (const auto it = pool_.find(model_id);
+        it != pool_.end() && it->second.local_failed &&
+        std::chrono::steady_clock::now() - it->second.local_failed_at <
+            router::kPoolLocalFailHold)
+      return "local load failed";
+    if (const auto it = autoload_failed.find(model_id);
+        it != autoload_failed.end() && status != "loaded")
+      return "autoload failed: " + it->second.error;
+    return "";
+  }
+
   /// GET /router/capabilities: what this router can run, for the partner's
   /// pool decision and shared queue: per model its modality, placement,
-  /// state and the LoRA names of its preset (`lora = name=path` lines).
+  /// state, the LoRA names of its preset (`lora = name=path` lines) and
+  /// whether it can be loaded now ("available"; false with "unavailable"
+  /// while a load failure holds, which the shared queue's pulls honour).
   json::Value Capabilities() {
     json::Value models = json::Value::object();
     {
@@ -2680,10 +3049,19 @@ public:
         model["switchable"] = preset->switchable;
         model["status"] = std::string(status);
         model["loaded"] = status == "loaded";
+        const std::string unavailable = UnavailableLocked(preset->id, status);
+        model["available"] = unavailable.empty();
+        if (!unavailable.empty())
+          model["unavailable"] = unavailable;
         json::Value loras = json::Value::array();
         for (const std::string& name : router::LoraNamesOf(*preset))
           loras.push_back(name);
         model["loras"] = std::move(loras);
+        // External workers with a known capability: `serve objekt` answers
+        // POST /v1/3d/generations (image -> GLB). Pages route by this field.
+        const std::string capability = router::CapabilityOf(*preset);
+        if (!capability.empty())
+          model["capability"] = capability;
         models[preset->id] = std::move(model);
       }
     }
@@ -3071,13 +3449,14 @@ private:
   }
 
   /// Job bookkeeping for proxied 2xx responses: the create response of a
-  /// video or async music job records the worker-assigned id against the
-  /// owning model; a terminal status read, a video DELETE or a music result
-  /// download releases it. Returns nullptr for every other request.
+  /// video, async music or 3D job records the worker-assigned id against the
+  /// owning model; a terminal status read, a video or 3D DELETE or a music
+  /// or 3D result download releases it. Returns nullptr for every other
+  /// request.
   std::shared_ptr<JobBodySniffer> MakeJobSniffer(const HttpRequest& req,
                                                  const std::string& model_id,
                                                  bool remote = false) {
-    if (IsVideoCreate(req) || IsMusicCreate(req)) {
+    if (IsVideoCreate(req) || IsMusicCreate(req) || IsObjektCreate(req)) {
       // A synchronous music answer is a WAV body: it never parses and
       // records nothing.
       return std::make_shared<JobBodySniffer>(
@@ -3096,6 +3475,20 @@ private:
     }
     if (req.method != "GET" && req.method != "DELETE") {
       return nullptr;
+    }
+    if (const std::string objekt_id = ObjektJobId(req.path);
+        !objekt_id.empty()) {
+      // 3D (1.4.24): status and DELETE like a video job, /content like a
+      // music download; /preview (a PNG, written with the result) records
+      // nothing.
+      if (req.path.ends_with("/preview"))
+        return nullptr;
+      return std::make_shared<JobBodySniffer>(
+          mutex, registry,
+          req.method == "DELETE"            ? JobBodySniffer::Kind::kDelete
+          : req.path.ends_with("/content") ? JobBodySniffer::Kind::kContent
+                                           : JobBodySniffer::Kind::kStatus,
+          model_id, objekt_id, remote);
     }
     const std::string job_id = VideoStatusJobId(req.path);
     if (job_id.empty()) {
@@ -3395,7 +3788,6 @@ int RunRouter(std::span<const char* const> args) {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
   ServerLogOptions log_options;
 
   ArgParser parser("gufo router",
@@ -3543,7 +3935,7 @@ int RunRouter(std::span<const char* const> args) {
                    "(Windows; default: 1)",
                    "Memory", &abort_commit_gb);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
-                   &max_request_body_bytes, &api_key, &log_options);
+                   &max_request_body_bytes, &log_options);
 
   // A bare `help` argument (e.g. `gufo router help`) prints the router help,
   // matching sibling commands; ArgParser only understands --help/-h.
@@ -3597,10 +3989,44 @@ int RunRouter(std::span<const char* const> args) {
   }
   std::vector<router::PresetModel> models;
   std::string preset_error;
-  if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error)) {
+  router::RouterSection router_section;
+  if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error,
+                          &router_section)) {
     std::cerr << "Error: " << preset_error << "\n";
     return 2;
   }
+  // Users and access control (2.0.3). The users file defaults to
+  // nutzer/nutzer.json next to the preset: the preset is the one file
+  // both machines always have (--jobs-dir is optional), and in production
+  // (D:\llm-modelle\gufo\gufo-router-combo7.ini, C:\gufo\...) that is
+  // exactly the nutzer\ folder the concept names.
+  router::auth::Settings auth_settings;
+  (void)router::auth::ParseMode(router_section.auth, &auth_settings.mode);
+  (void)router::auth::ParseLoopbackPolicy(router_section.auth_loopback,
+                                          &auth_settings.loopback);
+  auth_settings.users_file =
+      router_section.users_file.empty()
+          ? std::filesystem::absolute(preset_path).parent_path() / "nutzer" /
+                "nutzer.json"
+          : std::filesystem::absolute(
+                std::filesystem::path(router_section.users_file).is_relative()
+                    ? std::filesystem::absolute(preset_path).parent_path() /
+                          router_section.users_file
+                    : std::filesystem::path(router_section.users_file));
+  auth_settings.AllowOrigins(
+      router::Split(router_section.csrf_allow_origins, ','));
+  auth_settings.pool_secret_env = router_section.pool_secret_env;
+  if (!auth_settings.pool_secret_env.empty()) {
+    if (const char* secret = std::getenv(auth_settings.pool_secret_env.c_str());
+        secret != nullptr && *secret != '\0') {
+      auth_settings.pool_secret = secret;
+    } else {
+      std::cerr << "Warning: [router] pool-secret-env: "
+                << auth_settings.pool_secret_env
+                << " is not set; partner calls carry no pool key\n";
+    }
+  }
+  router::auth::SetPoolSecret(auth_settings.pool_secret);
 
   // Remote models reach only the routers --remote-allow names.
   std::vector<router::jobs::AllowEntry> remote_allow_list;
@@ -3692,24 +4118,131 @@ int RunRouter(std::span<const char* const> args) {
   }
   // The ComfyUI adapter and the job API call the router's own API.
   RouterState* const raw = state.get();
+  {
+    auto users = std::make_shared<router::auth::UserStore>(
+        auth_settings.users_file);
+    std::string users_error;
+    if (!users->Load(&users_error)) {
+      std::cerr << "Error: [router] users-file: " << users_error << "\n";
+      return 2;
+    }
+    router::auth::Gate::Hooks hooks;
+    hooks.model_of = [](const HttpRequest& req) {
+      return ResolveModel(req).model_id;
+    };
+    hooks.job_owner = [raw](const std::string& job_id) {
+      return raw->JobOwner(job_id);
+    };
+    // A ComfyUI graph resolves to the adapter's tasks; the gate checks
+    // each one (area, model, filter, daily count) before the adapter
+    // runs it as the router itself.
+    router::comfy::ModelIds comfy_ids;
+    for (const auto& model : models)
+      comfy_ids.available.push_back(model.id);
+    hooks.comfy_plan = [comfy_ids](const HttpRequest& req,
+                                   const json::Value& body)
+        -> std::optional<std::vector<router::auth::WorkItem>> {
+      (void)req;  // the gate parsed the body once
+      const json::Value* prompt = body.find("prompt");
+      if (prompt == nullptr || !prompt->is_object())
+        return std::nullopt;
+      router::comfy::Plan plan;
+      router::comfy::PlanError plan_error;
+      if (!router::comfy::BuildPlan(*prompt, comfy_ids, &plan, &plan_error))
+        return std::nullopt;
+      std::vector<router::auth::WorkItem> items;
+      for (const router::comfy::Task& task : plan.tasks) {
+        router::auth::WorkItem item;
+        std::visit(
+            [&item](const auto& spec) {
+              using Spec = std::decay_t<decltype(spec)>;
+              if constexpr (std::is_same_v<Spec, router::comfy::ImageTask>) {
+                item.area = "bild";
+                item.model = spec.model;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::VideoTask>) {
+                item.area = "video";
+                item.model = spec.model;
+                item.counts = 2;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::SpeechTask>) {
+                item.area = "stimme";
+                item.model = spec.model;
+                item.texts = {spec.text, spec.instructions};
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::DialogueTask>) {
+                item.area = "stimme";
+                if (!spec.lines.empty())
+                  item.model = spec.lines.front().model;
+                for (const auto& line : spec.lines) {
+                  item.texts.push_back(line.text);
+                  item.texts.push_back(line.instructions);
+                }
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::MusicTask>) {
+                item.area = "musik";
+                item.model = spec.model;
+                item.texts = {spec.tags, spec.lyrics};
+              } else {
+                item.area = "musik";  // foley
+                item.model = spec.model;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              }
+            },
+            task.spec);
+        items.push_back(std::move(item));
+      }
+      return items;
+    };
+    state->gate = std::make_unique<router::auth::Gate>(
+        auth_settings, users, std::move(hooks));
+    Logger::Info("router",
+                 "event=auth mode=" + std::string(router::auth::ModeName(
+                                          auth_settings.mode)) +
+                     " loopback=" +
+                     (auth_settings.loopback ==
+                              router::auth::LoopbackPolicy::kAdmin
+                          ? "admin"
+                          : "login") +
+                     " users_file=" + auth_settings.users_file.string() +
+                     " users=" + std::to_string(users->List().size()) +
+                     " admin=" + (users->HasAdmin() ? "yes" : "no") +
+                     " pool_secret=" +
+                     (auth_settings.pool_secret.empty() ? "none" : "set"));
+    if (auth_settings.csrf_allow_origins.empty())
+      Logger::Info("router",
+                   "event=auth csrf_allow_origins=0 hint=\"pages on other "
+                   "ports of this machine (8096, 8090) cannot write with a "
+                   "cookie session, nor through loopback to the users API "
+                   "and model control with auth = off; list them in "
+                   "[router] csrf-allow-origins\"");
+    if (auth_settings.mode != router::auth::Mode::kOff && !users->HasAdmin())
+      Logger::Warn("router",
+                   "event=auth_no_admin hint=\"create the first admin from "
+                   "127.0.0.1: POST /router/users\"");
+  }
   router::comfy::Fetch self_fetch;
-  if (api_key.empty()) {
+  {
     // Jobs go through the front like any client, so they show up in the
-    // request log and count as busy for idle checks.
+    // request log and count as busy for idle checks. (release/1.4 dispatched
+    // in process when --api-key was set; the router has no front key since
+    // upstream #967 dropped API-key auth.)
     const std::string self_host =
         host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
             ? "127.0.0.1"
             : host;
-    self_fetch = [self_host, port](const HttpRequest& request) {
+    const std::string internal_key = state->gate->internal_key();
+    self_fetch = [self_host, port, internal_key](const HttpRequest& request) {
       router::UpstreamTarget target;
       target.host = self_host;
       target.port = port;
+      // The gate admits the router's own calls by this key (loopback
+      // only), whatever `auth` says; a job runs for its owner.
+      target.extra_headers.emplace_back(router::auth::kInternalHeader,
+                                        internal_key);
       return CollectResponse(router::ProxyToWorker(target, request));
-    };
-  } else {
-    // The loopback relay drops Authorization; dispatch in process instead.
-    self_fetch = [raw](const HttpRequest& request) {
-      return CollectResponse(raw->Dispatch(request));
     };
   }
   {
@@ -3725,6 +4258,15 @@ int RunRouter(std::span<const char* const> args) {
     router::comfy::AdapterOptions comfy_options;
     comfy_options.root = comfy_dir;
     comfy_options.ffmpeg = comfy_ffmpeg;
+    if (!comfy_ffmpeg.empty()) {
+      // The frame rate of a LoadVideo file (RIFE of a loaded shot).
+      std::filesystem::path probe = comfy_ffmpeg;
+      probe.replace_filename(std::filesystem::path("ffprobe") +=
+                             comfy_ffmpeg.extension());
+      std::error_code probe_ec;
+      if (std::filesystem::is_regular_file(probe, probe_ec))
+        comfy_options.ffprobe = probe;
+    }
     // Graphs that need a model the preset lacks (Qwen-Image Turbo) fail
     // validation instead of running on another model.
     for (const auto& model : models)
@@ -3762,6 +4304,15 @@ int RunRouter(std::span<const char* const> args) {
           "http://" + router::EndpointKey(partner->remote->url);
     }
     state->self_name = "http://" + host + ":" + std::to_string(port);
+    if (router::jobs::IsUnreachableUrl(state->self_name)) {
+      // Bound to all interfaces: name the address the partner reaches us
+      // under (the route toward it), else the computer's name, so
+      // /router/capabilities "self" and a pull's "from" are no 0.0.0.0.
+      const std::string reachable =
+          router::jobs::LocalUrlToward(state->partner_name, port);
+      if (!reachable.empty())
+        state->self_name = reachable;
+    }
   }
   if (!jobs_dir.empty()) {
     router::jobs::Options jobs_options;
@@ -3772,6 +4323,9 @@ int RunRouter(std::span<const char* const> args) {
       return raw->PartnerCapabilities();
     };
     jobs_options.pool_states = [raw] { return raw->PoolJobStates(); };
+    jobs_options.may_pull = [raw](const std::string& model, std::string* why) {
+      return raw->MayPull(model, why);
+    };
     jobs_options.redirect_waiting = [raw](const std::string& job_id) {
       return raw->RedirectWaitingJob(job_id);
     };
@@ -3857,13 +4411,16 @@ int RunRouter(std::span<const char* const> args) {
   HttpServerOptions options;
   options.max_request_body_bytes = max_request_body_bytes;
   options.max_connections = max_connections;
-  options.api_key = api_key;
   // SIGTERM only stops the listener here; the drain below keeps established
   // connections (and their relays) alive until they finish or the drain
   // window ends, instead of the front severing them on the signal.
   options.graceful_shutdown = true;
   options.dispatcher = [state](const HttpRequest& request) {
-    return state->Dispatch(request);
+    // Users and access control first (auth = off: only /router/me, /login,
+    // /logout and the users API from loopback), then the routing.
+    return state->gate->Serve(request, [&state](const HttpRequest& checked) {
+      return state->Dispatch(checked);
+    });
   };
   HttpServer server(host, port, nullptr, nullptr, nullptr, nullptr,
                     std::move(options));

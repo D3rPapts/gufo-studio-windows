@@ -3,10 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -17,12 +15,10 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
+#include "src/cli/serve/multipart.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
-#include "src/models/qwen3_asr/audio.hpp"
-#include "src/models/qwen3_asr/subtitles.hpp"
 
 namespace gufo::server {
 namespace {
@@ -30,25 +26,13 @@ namespace {
 constexpr std::string_view kTranscriptionsPath = "/v1/audio/transcriptions";
 constexpr std::size_t kMaximumTextFieldBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 512;
+constexpr std::size_t kMaximumFields = 12;
 
 struct MultipartPart {
-  std::string filename;
   std::string body;
 };
 
 using Multipart = std::unordered_map<std::string, MultipartPart>;
-
-std::string_view Trim(std::string_view value) {
-  while (!value.empty() &&
-         std::isspace(static_cast<unsigned char>(value.front())) != 0) {
-    value.remove_prefix(1);
-  }
-  while (!value.empty() &&
-         std::isspace(static_cast<unsigned char>(value.back())) != 0) {
-    value.remove_suffix(1);
-  }
-  return value;
-}
 
 std::string Lower(std::string_view value) {
   std::string result(value);
@@ -76,124 +60,6 @@ HttpResponse Error(int status, std::string reason, std::string message,
   };
 }
 
-std::optional<std::string> Parameter(std::string_view value,
-                                     std::string_view name) {
-  const std::string target = Lower(name);
-  std::size_t begin = 0;
-  while (begin < value.size()) {
-    const std::size_t semicolon = value.find(';', begin);
-    const std::size_t end =
-        semicolon == std::string_view::npos ? value.size() : semicolon;
-    const std::string_view item = Trim(value.substr(begin, end - begin));
-    const std::size_t equals = item.find('=');
-    if (equals != std::string_view::npos &&
-        Lower(Trim(item.substr(0, equals))) == target) {
-      std::string_view parameter = Trim(item.substr(equals + 1U));
-      if (parameter.size() >= 2U && parameter.front() == '"' &&
-          parameter.back() == '"') {
-        parameter.remove_prefix(1);
-        parameter.remove_suffix(1);
-      }
-      if (parameter.find_first_of("\r\n") != std::string_view::npos) {
-        return std::nullopt;
-      }
-      return std::string(parameter);
-    }
-    if (semicolon == std::string_view::npos) {
-      break;
-    }
-    begin = semicolon + 1U;
-  }
-  return std::nullopt;
-}
-
-bool ExtractBoundary(std::string_view content_type, std::string* boundary) {
-  const std::size_t semicolon = content_type.find(';');
-  const std::string media_type = Lower(Trim(content_type.substr(0, semicolon)));
-  if (media_type != "multipart/form-data") {
-    return false;
-  }
-  const std::optional<std::string> parsed = Parameter(content_type, "boundary");
-  if (!parsed.has_value() || parsed->empty() || parsed->size() > 70U ||
-      parsed->find_first_of("\r\n") != std::string::npos) {
-    return false;
-  }
-  *boundary = *parsed;
-  return true;
-}
-
-bool ParseMultipart(std::string_view body, std::string_view boundary,
-                    Multipart* output, std::string* error) {
-  const std::string delimiter = "--" + std::string(boundary);
-  if (!body.starts_with(delimiter)) {
-    *error = "multipart body does not start with its boundary";
-    return false;
-  }
-  std::size_t cursor = delimiter.size();
-  while (true) {
-    if (body.substr(cursor, 2U) == "--") {
-      return true;
-    }
-    if (body.substr(cursor, 2U) != "\r\n") {
-      *error = "multipart boundary is malformed";
-      return false;
-    }
-    cursor += 2U;
-    const std::size_t headers_end = body.find("\r\n\r\n", cursor);
-    if (headers_end == std::string_view::npos ||
-        headers_end - cursor > kMaximumTextFieldBytes) {
-      *error = "multipart part headers are malformed";
-      return false;
-    }
-
-    std::string disposition;
-    for (std::size_t line_begin = cursor; line_begin < headers_end;) {
-      const std::size_t line_end = body.find("\r\n", line_begin);
-      const std::size_t bounded_end =
-          line_end == std::string_view::npos || line_end > headers_end
-              ? headers_end
-              : line_end;
-      const std::string_view line =
-          body.substr(line_begin, bounded_end - line_begin);
-      const std::size_t colon = line.find(':');
-      if (colon != std::string_view::npos &&
-          Lower(Trim(line.substr(0, colon))) == "content-disposition") {
-        disposition = std::string(Trim(line.substr(colon + 1U)));
-      }
-      if (bounded_end == headers_end) {
-        break;
-      }
-      line_begin = bounded_end + 2U;
-    }
-    const std::optional<std::string> name = Parameter(disposition, "name");
-    if (!name.has_value() || name->empty()) {
-      *error = "multipart part is missing a field name";
-      return false;
-    }
-
-    const std::size_t payload_begin = headers_end + 4U;
-    const std::string next_marker = "\r\n" + delimiter;
-    const std::size_t next = body.find(next_marker, payload_begin);
-    if (next == std::string_view::npos) {
-      *error = "multipart body is missing a closing boundary";
-      return false;
-    }
-    MultipartPart part{
-        .filename = Parameter(disposition, "filename").value_or(""),
-        .body = std::string(body.substr(payload_begin, next - payload_begin)),
-    };
-    if (!output->emplace(*name, std::move(part)).second) {
-      *error = "multipart field is duplicated: " + *name;
-      return false;
-    }
-    if (output->size() > 12U) {
-      *error = "multipart request contains too many fields";
-      return false;
-    }
-    cursor = next + 2U + delimiter.size();
-  }
-}
-
 const MultipartPart* Find(const Multipart& parts, std::string_view name) {
   const auto iterator = parts.find(std::string(name));
   return iterator == parts.end() ? nullptr : &iterator->second;
@@ -212,17 +78,7 @@ bool ParsePositiveSize(std::string_view value, std::size_t maximum,
   return true;
 }
 
-bool IsKnownField(std::string_view name) {
-  static constexpr std::string_view kKnown[] = {
-      "file",       "model",           "language",
-      "prompt",     "response_format", "temperature",
-      "max_tokens", "stream",          "timestamp_granularities[]",
-  };
-  return std::ranges::find(kKnown, name) != std::end(kKnown);
-}
-
-std::string ServerTiming(
-    const models::qwen3_asr::TranscriptionTimings& timings) {
+std::string ServerTiming(const ext::TranscriptionTimings& timings) {
   std::ostringstream value;
   value << "decode_audio;dur=" << timings.decode_audio_ms
         << ", features;dur=" << timings.feature_extraction_ms
@@ -231,228 +87,33 @@ std::string ServerTiming(
   return value.str();
 }
 
-double MillisecondsSince(std::chrono::steady_clock::time_point begin) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now() - begin)
-      .count();
-}
-
-std::uint64_t SamplesToMilliseconds(std::size_t samples) {
-  // 16 kHz: exactly 16 samples per millisecond, rounded to nearest.
-  return (static_cast<std::uint64_t>(samples) * 1000U +
-          models::qwen3_asr::kAudioSampleRate / 2U) /
-         models::qwen3_asr::kAudioSampleRate;
-}
-
-/// Subtitles and verbose_json: Qwen3-ASR has no timestamps, so speech is cut
-/// at measured pauses (SegmentSpeech) and every segment is transcribed on its
-/// own. Segment times are those sample boundaries, never estimates.
-/// verbose_json additionally runs the whole file once, exactly like `json`,
-/// and reports that transcript as `text` (with its language and duration), so
-/// `text` never depends on where the pauses fell; only `segments` come from
-/// the per-segment pass.
-HttpResponse TranscribeSegments(const HttpRequest& request,
-                                AsrService& service, const std::string& wav,
-                                const std::string& context,
-                                const std::optional<std::string>& language,
-                                std::size_t maximum_tokens,
-                                const std::string& format) {
-  namespace asr = models::qwen3_asr;
-  const auto decode_begin = std::chrono::steady_clock::now();
-  asr::AudioBuffer decoded;
-  std::string error;
-  if (!asr::DecodeWav(std::as_bytes(std::span(wav.data(), wav.size())),
-                      &decoded, &error)) {
-    return Error(400, "Bad Request", std::move(error), "invalid_audio");
-  }
-  const std::vector<float> waveform = asr::ResampleMono16k(decoded);
-  if (!std::ranges::all_of(waveform,
-                           [](float sample) { return std::isfinite(sample); })) {
-    return Error(400, "Bad Request", "audio samples must be finite",
-                 "invalid_audio");
-  }
-  const double decode_ms = MillisecondsSince(decode_begin);
-  const auto vad_begin = std::chrono::steady_clock::now();
-  const std::vector<asr::AudioChunk> segments = asr::SegmentSpeech(waveform);
-  const double vad_ms = MillisecondsSince(vad_begin);
-
-  struct Transcribed {
-    asr::AudioChunk chunk;
-    std::string text;
-    std::vector<std::uint32_t> tokens;
-  };
-  std::vector<Transcribed> transcribed;
-  asr::TranscriptionTimings timings;
-  timings.decode_audio_ms = decode_ms;
-  std::size_t audio_tokens = 0;
-  std::size_t generated_tokens = 0;
-  const auto failed = [&](std::string message) {
-    if (request.is_cancelled && request.is_cancelled()) {
-      return Error(499, "Client Closed Request", "transcription cancelled",
-                   "cancelled");
-    }
-    return Error(500, "Internal Server Error", std::move(message),
-                 "transcription_failed");
-  };
-
-  // The whole-file pass of verbose_json is the same request `json` makes.
-  std::optional<asr::TranscriptionResult> whole;
-  double whole_ms = 0.0;
-  if (format == "verbose_json") {
-    const auto whole_begin = std::chrono::steady_clock::now();
-    whole.emplace();
-    if (!service.Transcribe(
-            asr::TranscriptionRequest{
-                .wav = std::as_bytes(std::span(wav.data(), wav.size())),
-                .context = context,
-                .language = language,
-                .max_new_tokens = maximum_tokens,
-            },
-            request.is_cancelled, &*whole, &error)) {
-      return failed(std::move(error));
-    }
-    whole_ms = MillisecondsSince(whole_begin);
-    timings.feature_extraction_ms += whole->timings.feature_extraction_ms;
-    timings.audio_encoder_ms += whole->timings.audio_encoder_ms;
-    timings.text_decoder_ms += whole->timings.text_decoder_ms;
-    audio_tokens += whole->audio_tokens;
-    generated_tokens += whole->generated_ids.size();
-  }
-  for (const asr::AudioChunk& segment : segments) {
-    std::vector<float> pcm(
-        waveform.begin() + static_cast<std::ptrdiff_t>(segment.offset),
-        waveform.begin() +
-            static_cast<std::ptrdiff_t>(segment.offset + segment.samples));
-    // The runtime pads split tails to half a second; do the same here. The
-    // cue keeps the measured boundary, not the padded length.
-    if (pcm.size() < asr::kAudioSampleRate / 2U) {
-      pcm.resize(asr::kAudioSampleRate / 2U, 0.0F);
-    }
-    asr::TranscriptionResult result;
-    if (!service.Transcribe(
-            asr::TranscriptionRequest{
-                .wav = {},
-                .context = context,
-                .language = language,
-                .max_new_tokens = maximum_tokens,
-                .pcm16k = pcm,
-                .on_text = {},
-            },
-            request.is_cancelled, &result, &error)) {
-      return failed(std::move(error));
-    }
-    timings.feature_extraction_ms += result.timings.feature_extraction_ms;
-    timings.audio_encoder_ms += result.timings.audio_encoder_ms;
-    timings.text_decoder_ms += result.timings.text_decoder_ms;
-    audio_tokens += result.audio_tokens;
-    generated_tokens += result.generated_ids.size();
-    std::string text = asr::NormalizeSubtitleText(
-        core::Utf8Decoder{}.Push(result.text, true));
-    if (!text.empty()) {
-      transcribed.push_back(
-          {segment, std::move(text), std::move(result.generated_ids)});
-    }
-  }
-
-  HttpResponse response;
-  response.status = 200;
-  response.reason = "OK";
-  if (format == "srt" || format == "vtt") {
-    std::vector<asr::SubtitleCue> cues;
-    cues.reserve(transcribed.size());
-    for (const Transcribed& item : transcribed) {
-      cues.push_back({
-          .start_ms = SamplesToMilliseconds(item.chunk.offset),
-          .end_ms =
-              SamplesToMilliseconds(item.chunk.offset + item.chunk.samples),
-          .text = item.text,
-      });
-    }
-    if (format == "srt") {
-      response.body = asr::FormatSrt(cues);
-      response.headers.emplace_back("Content-Type",
-                                    "application/x-subrip; charset=utf-8");
-    } else {
-      response.body = asr::FormatWebVtt(cues);
-      response.headers.emplace_back("Content-Type", "text/vtt; charset=utf-8");
-    }
-  } else {
-    json::Value list = json::Value::array();
-    for (std::size_t i = 0; i < transcribed.size(); ++i) {
-      const Transcribed& item = transcribed[i];
-      json::Value segment = json::Value::object();
-      segment["id"] = static_cast<long long>(i);
-      // Whisper's seek counts 10-ms mel frames.
-      segment["seek"] =
-          static_cast<long long>(item.chunk.offset / asr::kAudioHopLength);
-      segment["start"] =
-          static_cast<double>(SamplesToMilliseconds(item.chunk.offset)) /
-          1000.0;
-      segment["end"] = static_cast<double>(SamplesToMilliseconds(
-                           item.chunk.offset + item.chunk.samples)) /
-                       1000.0;
-      segment["text"] = item.text;
-      json::Value tokens = json::Value::array();
-      for (const std::uint32_t token : item.tokens)
-        tokens.push_back(static_cast<long long>(token));
-      segment["tokens"] = std::move(tokens);
-      segment["temperature"] = 0.0;
-      list.push_back(std::move(segment));
-    }
-    // `text`, `language` and `duration` are those of the whole-file pass,
-    // identical to the `json` response for the same request.
-    json::Value body = json::Value::object();
-    body["task"] = "transcribe";
-    body["language"] = Lower(whole->language);
-    body["duration"] = static_cast<double>(whole->audio_samples) /
-                       std::max(1U, whole->sample_rate);
-    body["text"] = core::Utf8Decoder{}.Push(whole->text, true);
-    body["segments"] = std::move(list);
-    response.body = body.dump();
-  }
-  response.headers.emplace_back("X-Gufo-Schema",
-                                std::string(kAudioAsrApiSchema));
-  response.headers.emplace_back("X-Gufo-ASR-Backend", service.backend_name());
-  response.headers.emplace_back("X-Gufo-ASR-Timestamps", "vad-segments");
-  response.headers.emplace_back(
-      "Server-Timing",
-      ServerTiming(timings) + ", vad;dur=" + std::to_string(vad_ms) +
-          (whole ? ", whole_file;dur=" + std::to_string(whole_ms) : ""));
-  response.log_details =
-      "model=" + service.model_id() + " format=" + format +
-      " segments=" + std::to_string(segments.size()) +
-      " cues=" + std::to_string(transcribed.size()) +
-      " audio_tokens=" + std::to_string(audio_tokens) +
-      " generated_tokens=" + std::to_string(generated_tokens) +
-      " audio_ms=" + std::to_string(SamplesToMilliseconds(waveform.size())) +
-      " vad_ms=" + std::to_string(vad_ms) +
-      (whole ? " whole_file_ms=" + std::to_string(whole_ms) : "") +
-      " encoder_ms=" + std::to_string(timings.audio_encoder_ms) +
-      " decoder_ms=" + std::to_string(timings.text_decoder_ms);
-  return response;
-}
-
 HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
-  std::string boundary;
-  if (!ExtractBoundary(request.header("content-type"), &boundary)) {
+  Multipart parts;
+  MultipartResult form = ParseMultipart(
+      request.header("content-type"), request.body,
+      {.max_fields = kMaximumFields, .unique_names = true},
+      [&parts](const MultipartField& field) {
+        parts.emplace(std::string(field.name),
+                      MultipartPart{.body = std::string(field.content)});
+        return true;
+      });
+  if (form.status == MultipartStatus::kNotFormData ||
+      form.status == MultipartStatus::kBadBoundary) {
     return Error(400, "Bad Request",
                  "Content-Type must be multipart/form-data with a boundary",
                  "invalid_content_type");
   }
-  Multipart parts;
-  std::string parse_error;
-  if (!ParseMultipart(request.body, boundary, &parts, &parse_error)) {
-    return Error(400, "Bad Request", std::move(parse_error),
+  if (form.status == MultipartStatus::kTooManyFields) {
+    form.detail = "multipart request contains too many fields";
+  } else if (form.status == MultipartStatus::kDuplicateField) {
+    form.detail = "multipart field is duplicated: " + form.detail;
+  }
+  if (form.status != MultipartStatus::kComplete) {
+    return Error(400, "Bad Request", std::move(form.detail),
                  "invalid_multipart");
   }
-  for (const auto& [name, unused] : parts) {
-    (void)unused;
-    if (!IsKnownField(name)) {
-      return Error(400, "Bad Request",
-                   "unsupported transcription field: " + name,
-                   "unsupported_field");
-    }
-  }
+  // As in vLLM and the other OpenAI-compatible servers, unknown fields are
+  // ignored.
 
   const MultipartPart* file = Find(parts, "file");
   if (file == nullptr || file->body.empty()) {
@@ -460,8 +121,7 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                  "missing_file");
   }
   const MultipartPart* model = Find(parts, "model");
-  if (model != nullptr && model->body != service.model_id() &&
-      model->body != "qwen3-asr" && model->body != "qwen3-asr-1.7b") {
+  if (model != nullptr && !service.serves_model(model->body)) {
     return Error(400, "Bad Request", "unsupported transcription model",
                  "invalid_model");
   }
@@ -476,10 +136,9 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   const MultipartPart* response_format = Find(parts, "response_format");
   const std::string format =
       response_format == nullptr ? "json" : response_format->body;
-  if (format != "json" && format != "text" && format != "verbose_json" &&
-      format != "srt" && format != "vtt") {
+  if (format != "json" && format != "text" && format != "verbose_json") {
     return Error(400, "Bad Request",
-                 "response_format must be json, text, srt, verbose_json, or vtt",
+                 "response_format must be json, text, or verbose_json",
                  "invalid_response_format");
   }
   if (const MultipartPart* temperature = Find(parts, "temperature");
@@ -496,21 +155,15 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                    "invalid_temperature");
     }
   }
-  if (const MultipartPart* granularity =
-          Find(parts, "timestamp_granularities[]");
-      granularity != nullptr) {
-    // Segment times are measured pause boundaries; Qwen3-ASR has no word
-    // alignment, so word timestamps are refused instead of estimated.
-    if (granularity->body != "segment") {
-      return Error(400, "Bad Request",
-                   "only segment timestamps are supported (no word alignment)",
-                   "unsupported_option");
-    }
-    if (format != "verbose_json") {
-      return Error(400, "Bad Request",
-                   "timestamp_granularities requires verbose_json",
-                   "invalid_response_format");
-    }
+  if (Find(parts, "timestamp_granularities[]") != nullptr) {
+    return Error(400, "Bad Request",
+                 "timestamp granularities are not supported",
+                 "unsupported_option");
+  }
+  // `include[]` only requests logprobs, which this server cannot return.
+  if (Find(parts, "include[]") != nullptr) {
+    return Error(400, "Bad Request", "transcription logprobs are not supported",
+                 "unsupported_option");
   }
   bool stream = false;
   if (const auto* value = Find(parts, "stream")) {
@@ -571,7 +224,7 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
             published = text;
             return send(std::move(event));
           };
-          models::qwen3_asr::TranscriptionRequest input{
+          ext::TranscriptionRequest input{
               .wav = {reinterpret_cast<const std::byte*>(wav.data()),
                       wav.size()},
               .context = context,
@@ -579,7 +232,7 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
               .max_new_tokens = maximum_tokens,
               .on_text = progress,
           };
-          models::qwen3_asr::TranscriptionResult result;
+          ext::TranscriptionResult result;
           std::string error;
           const auto stop = [&] {
             return !connected || (cancelled && cancelled());
@@ -608,19 +261,10 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
         };
     return response;
   }
-  if (format == "srt" || format == "vtt" || format == "verbose_json") {
-    return TranscribeSegments(
-        request, service, file->body,
-        prompt == nullptr ? std::string{} : prompt->body,
-        language == nullptr || language->body.empty()
-            ? std::nullopt
-            : std::optional<std::string>(language->body),
-        maximum_tokens, format);
-  }
-  models::qwen3_asr::TranscriptionResult result;
+  ext::TranscriptionResult result;
   std::string error;
   if (!service.Transcribe(
-          models::qwen3_asr::TranscriptionRequest{
+          ext::TranscriptionRequest{
               .wav = std::span<const std::byte>(wav_data, file->body.size()),
               .context = prompt == nullptr ? std::string{} : prompt->body,
               .language = language == nullptr || language->body.empty()
@@ -646,6 +290,13 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   } else {
     json::Value body = json::Value::object();
     body["text"] = core::Utf8Decoder{}.Push(result.text, true);
+    if (format == "verbose_json") {
+      body["task"] = "transcribe";
+      body["language"] = Lower(result.language);
+      body["duration"] =
+          static_cast<double>(result.audio_samples) / result.sample_rate;
+      body["segments"] = json::Value::array();
+    }
     response.body = body.dump();
   }
   response.headers.emplace_back("X-Gufo-Schema",

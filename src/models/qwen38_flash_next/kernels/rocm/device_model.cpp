@@ -9,15 +9,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/weight_upload.hpp>
 #include <initializer_list>
 #include <utility>
 #include <vector>
 
-#include "src/core/hip/managed_alloc.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
-#include "src/core/hip/weight_upload.hpp"
-#include "src/core/platform/prefault.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -127,38 +125,9 @@ struct Uploader {
     return d;
   }
 
-  /// Uploads a narrow projection the quantized tier does not cover (the
-  /// hyper-connection inject) as F32. A Q8_0 tensor is uploaded as is and
-  /// expanded once the disk pipeline drains, so it runs the F32 kernels with
-  /// its dequantized values instead of quantizing their activations.
-  DeviceTensor CopyF32(const TensorRef& t) {
-    if (t.empty() || !ok || t.type != core::GgmlType::kQ8_0) {
-      return Copy(t);
-    }
-    DeviceTensor d = Copy(t);
-    const std::size_t count = t.cols * t.rows * t.experts;
-    void* f32 = nullptr;
-    if (!ok ||
-        Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
-      Fail("device allocation failed for " + std::string(t.name));
-      return {};
-    }
-    if (Measuring()) {
-      return {};
-    }
-    allocations.push_back(f32);
-    bytes += count * sizeof(float) + kTailMargin;
-    conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
-                         kTailMargin, nullptr);
-    d.data = f32;
-    d.type = core::GgmlType::kF32;
-    return d;
-  }
-
   /// A Q6_K output head (unsloth UD-Q3_K_XL) has no device kernel here: the
   /// upload requantizes it to Q8_0 once on the host, a chunk of rows at a
-  /// time (Q8_0 is finer than Q6_K, so the head loses no precision).
+  /// time (Q8_0 keeps more bits per weight than Q6_K).
   DeviceTensor CopyQ6KAsQ8(const TensorRef& t) {
     DeviceTensor d;
     if (t.empty() || !ok) {
@@ -209,9 +178,6 @@ struct Uploader {
         Fail("upload failed for " + std::string(t.name));
         return d;
       }
-      // This is the one weight read through the file view: drop the chunk's
-      // pages, or on Windows the whole head stays in the working set (#829).
-      platform::ReleaseMappedPages(src + r0 * src_row, n * src_row);
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
                          nullptr);
@@ -221,6 +187,74 @@ struct Uploader {
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = 1;
     max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
+    return d;
+  }
+
+  /// Uploads a narrow projection the quantized tier does not cover (the
+  /// hyper-connection inject) as F32. A Q8_0 tensor is uploaded as is and
+  /// expanded once the disk pipeline drains, so it runs the F32 kernels with
+  /// its dequantized values instead of quantizing their activations. A BF16
+  /// tensor is widened exactly on the host (see HcInjectUploadFor).
+  DeviceTensor CopyF32(const TensorRef& t) {
+    if (t.empty() || !ok) {
+      return {};
+    }
+    switch (HcInjectUploadFor(t.type)) {
+      case HcInjectUpload::kCopy:
+        return Copy(t);
+      case HcInjectUpload::kWidenBF16:
+        return UploadWidened(t);
+      case HcInjectUpload::kExpandQ8_0:
+        break;
+    }
+    DeviceTensor d = Copy(t);
+    const std::size_t count = t.cols * t.rows * t.experts;
+    void* f32 = nullptr;
+    if (!ok ||
+        Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name));
+      return {};
+    }
+    if (Measuring()) {
+      return {};
+    }
+    allocations.push_back(f32);
+    bytes += count * sizeof(float) + kTailMargin;
+    conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
+                         kTailMargin, nullptr);
+    d.data = f32;
+    d.type = core::GgmlType::kF32;
+    return d;
+  }
+
+  DeviceTensor UploadWidened(const TensorRef& t) {
+    DeviceTensor d;
+    const std::size_t count = t.cols * t.rows * t.experts;
+    void* f32 = nullptr;
+    if (Allocate(&f32, count * sizeof(float) + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for " + std::string(t.name));
+      return d;
+    }
+    if (Measuring()) {
+      return d;
+    }
+    allocations.push_back(f32);
+    bytes += count * sizeof(float) + kTailMargin;
+    std::vector<float> host(count);
+    WidenBF16(static_cast<const std::uint16_t*>(t.data), host.data(), count);
+    if (hipMemcpy(f32, host.data(), count * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(f32) + count * sizeof(float), 0,
+                  kTailMargin) != hipSuccess) {
+      Fail("upload failed for " + std::string(t.name));
+      return d;
+    }
+    d.data = f32;
+    d.type = core::GgmlType::kF32;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
     return d;
   }
 
@@ -477,9 +511,10 @@ struct Uploader {
                  std::uint32_t trunk_shards) {
     Uploaded u;
     u.token_embd = Copy(w.token_embd);
-    u.output = w.output.data == w.token_embd.data       ? u.token_embd
-               : w.output.type == core::GgmlType::kQ6_K ? CopyQ6KAsQ8(w.output)
-                                                        : Copy(w.output);
+    u.output = w.output.data == w.token_embd.data ? u.token_embd
+               : w.output.type == core::GgmlType::kQ6_K
+                   ? CopyQ6KAsQ8(w.output)
+                   : Copy(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     stream_layer = true;
@@ -531,6 +566,14 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
   draft_output_.rows = prefix_rows;
   draft_specials_ = std::move(specials);
   return true;
+}
+
+void WidenBF16(const std::uint16_t* src, float* dst,
+               std::size_t count) noexcept {
+  for (std::size_t i = 0; i < count; ++i) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+    std::memcpy(dst + i, &bits, sizeof(float));
+  }
 }
 
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
@@ -605,11 +648,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = uploaded.output.type == w.output.type
-                         ? w.output.SizeBytes()
-                         : std::size_t{uploaded.output.rows} *
-                               (uploaded.output.cols / 32) *
-                               sizeof(quant::block_q8_0);
+  m->output_bytes_ =
+      uploaded.output.type == w.output.type
+          ? w.output.SizeBytes()
+          : std::size_t{uploaded.output.rows} * (uploaded.output.cols / 32) *
+                sizeof(quant::block_q8_0);
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
