@@ -454,6 +454,86 @@ void TestFallback() {
   CHECK(!PoolRemoteHold(PoolRemoteAnswer::kPass));
 }
 
+void TestPriority() {
+  using gufo::router::kPoolYieldMax;
+  using gufo::router::ParsePriority;
+  using gufo::router::PoolShouldYield;
+  using gufo::router::PoolYieldInput;
+  using gufo::router::PriorityOfText;
+  using gufo::router::PriorityOfView;
+  using gufo::router::RunsBefore;
+  using gufo::json::Value;
+  using std::chrono::milliseconds;
+  // Text: one digit 0..9, spaces around it allowed.
+  CHECK(PriorityOfText("7") == 7);
+  CHECK(PriorityOfText(" 0 ") == 0);
+  CHECK(PriorityOfText("9") == 9);
+  CHECK(!PriorityOfText("10"));
+  CHECK(!PriorityOfText("-1"));
+  CHECK(!PriorityOfText(""));
+  CHECK(!PriorityOfText("a"));
+  CHECK(!PriorityOfText("3.5"));
+  // Header wins over the JSON member; absent = 0; bad values refused.
+  int priority = -1;
+  std::string error;
+  const Value five = gufo::json::parse("5");
+  CHECK(ParsePriority("", nullptr, &priority, &error) && priority == 0);
+  CHECK(ParsePriority("", &five, &priority, &error) && priority == 5);
+  CHECK(ParsePriority("8", &five, &priority, &error) && priority == 8);
+  CHECK(ParsePriority(" 2 ", nullptr, &priority, &error) && priority == 2);
+  const Value text = gufo::json::parse("\"6\"");
+  CHECK(ParsePriority("", &text, &priority, &error) && priority == 6);
+  const Value none = gufo::json::parse("null");
+  CHECK(ParsePriority("", &none, &priority, &error) && priority == 0);
+  const Value ten = gufo::json::parse("10");
+  CHECK(!ParsePriority("", &ten, &priority, &error));
+  CHECK(error.find("priority") != std::string::npos);
+  const Value half = gufo::json::parse("2.5");
+  CHECK(!ParsePriority("", &half, &priority, &error));
+  const Value negative = gufo::json::parse("-1");
+  CHECK(!ParsePriority("", &negative, &priority, &error));
+  const Value word = gufo::json::parse("\"hoch\"");
+  CHECK(!ParsePriority("", &word, &priority, &error));
+  const Value flag = gufo::json::parse("true");
+  CHECK(!ParsePriority("", &flag, &priority, &error));
+  CHECK(!ParsePriority("x", &five, &priority, &error));
+  CHECK(error.find("X-Gufo-Priority") != std::string::npos);
+  CHECK(!ParsePriority("10", nullptr, &priority, &error));
+  // A view without the member (partner older than 2.0.3) is normal.
+  CHECK(PriorityOfView(gufo::json::parse("{}")) == 0);
+  CHECK(PriorityOfView(gufo::json::parse("{\"priority\":4}")) == 4);
+  CHECK(PriorityOfView(gufo::json::parse("{\"priority\":40}")) == 9);
+  CHECK(PriorityOfView(gufo::json::parse("{\"priority\":-3}")) == 0);
+  // Order: the higher priority first, then the older; equal = neither.
+  CHECK(RunsBefore(5, 2000, 0, 1000));
+  CHECK(!RunsBefore(0, 1000, 5, 2000));
+  CHECK(RunsBefore(0, 1000, 0, 1001));
+  CHECK(!RunsBefore(0, 1001, 0, 1000));
+  CHECK(!RunsBefore(3, 1000, 3, 1000));
+  // Yield: only to a strictly higher waiting priority, never when
+  // forwarded, and at most kPoolYieldMax.
+  PoolYieldInput in;
+  in.priority = 0;
+  in.highest_waiting = 5;
+  CHECK(PoolShouldYield(in));
+  in.highest_waiting = 0;
+  CHECK(!PoolShouldYield(in));
+  in.highest_waiting = -1;
+  CHECK(!PoolShouldYield(in));
+  in.priority = 5;
+  in.highest_waiting = 5;
+  CHECK(!PoolShouldYield(in));
+  in.highest_waiting = 9;
+  CHECK(PoolShouldYield(in));
+  in.yielded = milliseconds(kPoolYieldMax) - milliseconds(1);
+  CHECK(PoolShouldYield(in));
+  in.yielded = milliseconds(kPoolYieldMax);
+  CHECK(!PoolShouldYield(in));
+  in.yielded = milliseconds(0);
+  in.forwarded = true;
+  CHECK(!PoolShouldYield(in));
+}
+
 }  // namespace
 
 int main() {
@@ -471,6 +551,7 @@ int main() {
   TestGpuSlotIdle();
   TestRegistryCounts();
   TestFallback();
+  TestPriority();
   if (failures != 0) {
     std::cerr << failures << " router pool checks failed\n";
     return 1;

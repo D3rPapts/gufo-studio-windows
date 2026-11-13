@@ -90,8 +90,20 @@
 //  - View: every job carries "request.loras" and "running_on" ("local",
 //    the partner's url while it runs there or the pool sent it there,
 //    null while it waits or does not run); scope=pool items add
-//    "position" (1 = the oldest queued or waiting job of both routers).
+//    "position" (1 = the next queued or waiting job of both routers).
 //    /router/status gets "pool_queue".
+//  - Priority (2.0.3): every job carries "priority" 0..9 (0 = normal, the
+//    default; higher runs first). Given on POST /v1/jobs as the header
+//    X-Gufo-Priority (wins), the member "priority" of the submit body,
+//    the member "priority" of the wrapped request body or a multipart
+//    form field "priority"; anything else 400 invalid_priority. The
+//    queue runs the highest priority first and among equal priorities
+//    the oldest job (first in, first out); a free runner pulls the
+//    partner's job only when (priority, created_at) puts it before its
+//    own next job; the owner hands out its best candidate in the same
+//    order; "position" follows it. Every request of a job carries the
+//    header, so the partner's pool decision knows it (pool.hpp,
+//    X-Gufo-Priority). jobs.json keeps it; an older file reads as 0.
 //   POST   /v1/videos/concat           {"videos": [2..20 result files of
 //                                      finished jobs of this router, as
 //                                      "/v1/jobs/{id}/files/video.mp4" or
@@ -509,6 +521,8 @@ private:
     std::string id;
     std::string model;
     long long created_at{0};
+    /// "priority" of its view (0 for a partner older than 2.0.3).
+    int priority{0};
     std::vector<std::string> loras;
     /// in_progress but waiting in the partner's pool ("pool_wait").
     bool waiting{false};
@@ -516,10 +530,12 @@ private:
   /// The partner's queued jobs (oldest first), cached pull_poll; nullopt
   /// when the partner did not answer.
   std::optional<std::vector<PartnerJob>> PartnerQueued();
-  /// Runner side: pulls the partner's oldest queued job when it is older
-  /// than `mine_created_at` (0 = nothing queued here) and runs here; waits
-  /// for it to end. True when a job was pulled (the runner looks again).
-  bool TryPull(long long mine_created_at);
+  /// Runner side: pulls the partner's first queued job (priority, then
+  /// age) when it runs before this router's next one (`mine_priority`,
+  /// `mine_created_at`; created 0 = nothing queued here) and runs here;
+  /// waits for it to end. True when a job was pulled (the runner looks
+  /// again).
+  bool TryPull(int mine_priority, long long mine_created_at);
   /// Waits (polling the partner) until the pulled job `id` left the
   /// requester's worker, or the partner stopped answering.
   void WaitForPulled(const std::string& id);
@@ -545,6 +561,10 @@ private:
   /// Drops the job from every index (mutex held); the caller removes its
   /// folder after unlocking.
   void ForgetLocked(const std::shared_ptr<Job>& job);
+  /// Puts a queued job into pending_ at its place in the run order (mutex
+  /// held): after every job of the same or a higher priority, or (`front`,
+  /// a requeued job) before every job of its priority.
+  void InsertPendingLocked(const std::shared_ptr<Job>& job, bool front);
   bool MatchesLocked(const Job& job, const Filter& filter) const;
 
   void RunnerMain();
@@ -579,6 +599,8 @@ private:
   std::vector<std::shared_ptr<Job>> order_;
   std::map<std::string, std::shared_ptr<Job>> jobs_;
   std::map<std::string, std::string> idempotency_;
+  /// Queued jobs in run order: the highest priority first, then the oldest
+  /// (InsertPendingLocked keeps it so).
   std::deque<std::shared_ptr<Job>> pending_;
   /// Learned seconds per "<path> <model>" for the estimated progress.
   std::map<std::string, double> durations_;
