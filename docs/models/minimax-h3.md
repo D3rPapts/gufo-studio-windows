@@ -79,9 +79,10 @@ gufo serve --host 127.0.0.1 --port 8080 video \
 
 ## First and last frames
 
-Pass `--first-frame FILE`, `--last-frame FILE` or both to `gufo video`, or
-`first_frame` and `last_frame` to `POST /v1/videos` as multipart file parts or
-base64 `data:` URLs. The server never fetches remote URLs. PNG, JPEG and WebP
+Pass `first_frame` and `last_frame` (or OpenAI's `input_reference` for the
+first frame) to `POST /v1/videos` as multipart file parts or base64 `data:`
+URLs; gufo-studio-windows adds `gufo.keyframes` for frames in between and
+`gufo.guide_video`. The `gufo video` CLI of this build has no keyframe flags. The server never fetches remote URLs. PNG, JPEG and WebP
 work.
 
 The first frame (or a lone last frame) sets the video's aspect ratio, between

@@ -56,8 +56,9 @@ Keyframe conditioning (issue #177) anchors the first frame, the last frame,
 or both. `first_frame` and `last_frame` carry a base64 image data URL
 (JSON) or a file part (multipart); remote URLs are rejected rather than
 fetched. PNG, JPEG, and WebP decode through the
-shared image reader in display orientation. The CLI mirrors this with
-`--first-frame FILE` and `--last-frame FILE`.
+shared image reader in display orientation. gufo-studio-windows keeps its
+own implementation (provider-owned request, `gufo.keyframes`, guide clips,
+LoRA); the `gufo video` CLI of this build has no keyframe flags.
 
 As in the released pipeline, the geometry anchor (the first keyframe, or a
 lone last one) sets the canvas aspect ratio. The preset's internal canvas
