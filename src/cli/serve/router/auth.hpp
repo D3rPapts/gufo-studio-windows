@@ -324,6 +324,10 @@ public:
   /// The first blocked word found in the request's prompt texts, "" when
   /// clean. `comfy` scans every string of the body (ComfyUI graphs).
   [[nodiscard]] std::string Hit(const server::HttpRequest& req, bool comfy);
+  /// The first blocked word in a chat request's user texts (2.0.5):
+  /// `prompt`, every user message of `messages` and every user item of
+  /// `input`, as a string or text parts; "" when clean.
+  [[nodiscard]] std::string HitChat(const server::HttpRequest& req);
   /// Every string of a parsed body (a ComfyUI graph).
   [[nodiscard]] std::string HitJson(const json::Value& body);
   [[nodiscard]] std::string HitText(std::string_view text);

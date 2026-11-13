@@ -468,7 +468,9 @@ void TestClassify() {
   CHECK(chat.kind == Kind::kWork);
   CHECK_EQ(chat.area, std::string("text"));
   CHECK_EQ(chat.counts, 1);
-  CHECK(!chat.filtered);
+  CHECK(chat.filtered);  // 2.0.5: chats are filtered on their user texts
+  CHECK(!auth::Classify(Req("GET", "/v1/chat/completions", "x")).filtered);
+  CHECK(!auth::Classify(Req("POST", "/v1/embeddings", "x")).filtered);
   const auto image = auth::Classify(Req("POST", "/v1/images/generations", "x"));
   CHECK_EQ(image.area, std::string("bild"));
   CHECK(image.filtered);
@@ -1137,7 +1139,7 @@ void TestFilterAndLimit() {
   CHECK_EQ(r.status, 200);
   r = image(admin, "{\"model\":\"m\",\"prompt\":\"nackt\"}");
   CHECK_EQ(r.status, 200);
-  // Videos and the ComfyUI graph are filtered too; chats are not.
+  // Videos, the ComfyUI graph and (2.0.5) chats are filtered too.
   r = f.Serve(Req("POST", "/v1/videos", "192.168.178.50",
                   "{\"model\":\"m\",\"prompt\":\"porno\"}", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 200);  // tim: filter off
@@ -1154,7 +1156,8 @@ void TestFilterAndLimit() {
   r = g.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
                   "{\"model\":\"m\",\"messages\":[{\"content\":\"nackt\"}]}",
                   {{"Cookie", kind2}}));
-  CHECK_EQ(r.status, 200);
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
   // Umlauts: "Töten" and "TÖTEN" meet "töt*" (UTF-8 aware lower case).
   CHECK_EQ(auth::LowerUtf8("TÖTEN Ärger ÜBER Straße ×"),
            std::string("töten ärger über straße ×"));
@@ -2293,6 +2296,85 @@ void TestWebhookRoles() {
   CHECK(logged);
 }
 
+void TestChatFilter() {
+  // 2.0.5: the word filter reads a chat's user texts (every user turn,
+  // text parts, `prompt`, `input`); the answer, code and log line are
+  // those of an image; admin and the machine itself are not filtered;
+  // a streaming request is refused before any stream; assistant and
+  // system texts are not read.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("kind", "nutzer", "kind-pw");
+  auth::Rights free_rights;
+  free_rights.filter = false;
+  f.AddUser("tim", "nutzer", "tim-pw", free_rights);
+  const std::string kind = f.LoginCookie("kind", "kind-pw");
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  const auto chat = [&f](const std::string& path, const std::string& cookie,
+                         const std::string& body) {
+    return f.Serve(Req("POST", path, "192.168.178.50", body,
+                       {{"Cookie", cookie}}));
+  };
+  HttpResponse r = chat("/v1/chat/completions", kind,
+                        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\","
+                        "\"content\":\"Ein Haus am See\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"stream\":true,\"messages\":[{\"role\":\"user\","
+           "\"content\":\"Eine NACKTE Frau\"}]}");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  CHECK(!r.streaming_body);
+  // An earlier user turn counts, text parts count, system/assistant not.
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"nackt\"},{\"role\":\"assistant\",\"content\":\"ok\"},"
+           "{\"role\":\"user\",\"content\":\"weiter\"}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "[{\"type\":\"text\",\"text\":\"ein nsfw bild\"}]}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":"
+           "\"nackt\"},{\"role\":\"assistant\",\"content\":\"nackt\"},"
+           "{\"role\":\"user\",\"content\":\"Hallo\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/completions", kind, "{\"model\":\"m\",\"prompt\":\"porno\"}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/completions", kind,
+           "{\"model\":\"m\",\"prompt\":[\"Haus\",\"porno\"]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind, "{\"model\":\"m\",\"input\":\"porno\"}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"input\":[{\"role\":\"user\",\"content\":"
+           "[{\"type\":\"input_text\",\"text\":\"porno\"}]}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind, "{\"model\":\"m\",\"input\":\"Haus\"}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/messages", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"porno\"}]}");
+  CHECK_EQ(r.status, 400);
+  // Filter off for tim, for admins, for the machine itself.
+  const std::string bad =
+      "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"nackt\"}]}";
+  CHECK_EQ(chat("/v1/chat/completions", tim, bad).status, 200);
+  CHECK_EQ(chat("/v1/chat/completions", admin, bad).status, 200);
+  r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1", bad));
+  CHECK_EQ(r.status, 200);
+  // Not JSON: the worker answers; no crash here.
+  r = chat("/v1/chat/completions", kind, "nackt");
+  CHECK_EQ(r.status, 200);
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(40))
+    logged = logged ||
+             line.find("abgelehnt:content_filtered") != std::string::npos;
+  CHECK(logged);
+}
+
 void TestViewOwner() {
   // 2.0.5: a ComfyUI result file answers 404 to another user; the owner
   // and an admin read it; a file no prompt names stays open.
@@ -2340,6 +2422,7 @@ int main() {
   TestModelArgsHidden();
   TestStatusJobsHidden();
   TestWebhookRoles();
+  TestChatFilter();
   TestViewOwner();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";

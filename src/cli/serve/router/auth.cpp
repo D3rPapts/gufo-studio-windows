@@ -1147,10 +1147,11 @@ Route Classify(const HttpRequest& req) {
     bool filtered;
   };
   static constexpr Prefix kWork[] = {
-      {"/v1/chat/completions", "text", 1, false},
-      {"/v1/completions", "text", 1, false},
-      {"/v1/responses", "text", 1, false},
-      {"/v1/messages", "text", 1, false},
+      // Chats are filtered on their user texts since 2.0.5 (HitChat).
+      {"/v1/chat/completions", "text", 1, true},
+      {"/v1/completions", "text", 1, true},
+      {"/v1/responses", "text", 1, true},
+      {"/v1/messages", "text", 1, true},
       {"/v1/embeddings", "text", 0, false},
       {"/embeddings", "text", 0, false},
       {"/embedding", "text", 0, false},
@@ -1372,6 +1373,73 @@ std::string WordFilter::Hit(const HttpRequest& req, bool comfy) {
     if (const std::string word = HitText(text); !word.empty())
       return word;
   }
+  return {};
+}
+
+namespace {
+
+/// The texts a chat request carries from the user (2.0.5): `prompt` (a
+/// string or strings: completions), every user message of `messages`
+/// (chat completions, Anthropic messages) and every user item of `input`
+/// (responses), each a string or parts with a `text`. Every user turn is
+/// read, not only the last one: a client may send any history.
+void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
+  const auto content = [out](const json::Value& value) {
+    if (value.is_string()) {
+      out->push_back(value.str());
+      return;
+    }
+    if (!value.is_array())
+      return;
+    for (const json::Value& part : value.items()) {
+      if (part.is_string()) {
+        out->push_back(part.str());
+      } else if (part.is_object()) {
+        if (const json::Value* text = part.find("text");
+            text != nullptr && text->is_string())
+          out->push_back(text->str());
+      }
+    }
+  };
+  if (const json::Value* prompt = body.find("prompt"))
+    content(*prompt);
+  for (const char* key : {"messages", "input"}) {
+    const json::Value* list = body.find(key);
+    if (list == nullptr)
+      continue;
+    if (list->is_string()) {
+      out->push_back(list->str());
+      continue;
+    }
+    if (!list->is_array())
+      continue;
+    for (const json::Value& item : list->items()) {
+      if (item.is_string()) {
+        out->push_back(item.str());
+        continue;
+      }
+      if (!item.is_object() || item.member_str("role", "user") != "user")
+        continue;
+      if (const json::Value* c = item.find("content"))
+        content(*c);
+    }
+  }
+}
+
+}  // namespace
+
+std::string WordFilter::HitChat(const HttpRequest& req) {
+  if (req.body.empty() || !IsJsonBody(req))
+    return {};
+  std::vector<std::string> texts;
+  try {
+    CollectChatTexts(json::parse(req.body), &texts);
+  } catch (const std::exception&) {
+    return {};  // the worker refuses what is not JSON
+  }
+  for (const std::string& text : texts)
+    if (const std::string word = HitText(text); !word.empty())
+      return word;
   return {};
 }
 
@@ -2169,7 +2237,9 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                              model + " is not enabled for this user)",
                          "model_forbidden");
       if (route.filtered && who.rechte.FilterOn(who.rolle)) {
-        const std::string word = filter_.Hit(req, req.path == "/prompt");
+        const std::string word = route.area == "text"
+                                     ? filter_.HitChat(req)
+                                     : filter_.Hit(req, req.path == "/prompt");
         if (!word.empty()) {
           Log(req, who, "abgelehnt:content_filtered", model);
           return AuthError(400, "Bad Request",
