@@ -29,13 +29,17 @@
 // here (loop guard); it only waits while this machine has GPU work.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/remote.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::router {
 
@@ -320,6 +324,108 @@ struct PoolFallbackInput {
   return preset.argv.size() >= 2 && preset.argv[0] == "serve" &&
          (preset.argv[1] == "image" || preset.argv[1] == "video" ||
           preset.argv[1] == "music" || preset.argv[1] == "objekt");
+}
+
+// ------------------------------------------------------------- priority
+
+/// Priority of a request or job in the two-router pool (2.0.3): 0 (normal,
+/// the default) to kPriorityMax; a higher value goes first, among equal
+/// values the older request or job. Given as the header X-Gufo-Priority
+/// (any request; it wins) or the JSON member "priority" of the body (a job
+/// submit, a direct request). The job store forwards a job's priority as
+/// the header on every request of the job, so the partner knows it.
+inline constexpr const char* kPriorityHeader = "X-Gufo-Priority";
+inline constexpr int kPriorityMax = 9;
+
+/// " 7 " -> 7; nullopt for anything but an integer 0..kPriorityMax.
+[[nodiscard]] inline std::optional<int> PriorityOfText(std::string_view text) {
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+    text.remove_prefix(1);
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+    text.remove_suffix(1);
+  if (text.size() != 1 || !std::isdigit(static_cast<unsigned char>(text[0])))
+    return std::nullopt;
+  const int value = text[0] - '0';
+  return value <= kPriorityMax ? std::optional<int>(value) : std::nullopt;
+}
+
+/// The priority a request names: the header when present (wins), else the
+/// JSON member `member` (nullptr or null = not given), else 0. False with
+/// *error when a value is given but is not an integer 0..kPriorityMax (as
+/// a number or a digit string).
+inline bool ParsePriority(std::string_view header, const json::Value* member,
+                          int* out, std::string* error) {
+  *out = 0;
+  if (!header.empty()) {
+    const auto value = PriorityOfText(header);
+    if (!value) {
+      *error = std::string(kPriorityHeader) + " must be an integer 0.." +
+               std::to_string(kPriorityMax) + ", got '" + std::string(header) +
+               "'";
+      return false;
+    }
+    *out = *value;
+    return true;
+  }
+  if (member == nullptr || member->is_null())
+    return true;
+  std::optional<int> value;
+  if (member->is_number()) {
+    const double number = member->as_double();
+    if (number == std::floor(number) && number >= 0 && number <= kPriorityMax)
+      value = static_cast<int>(number);
+  } else if (member->is_string()) {
+    value = PriorityOfText(member->str());
+  }
+  if (!value) {
+    *error = "'priority' must be an integer 0.." + std::to_string(kPriorityMax);
+    return false;
+  }
+  *out = *value;
+  return true;
+}
+
+/// The priority a job view or record carries ("priority", missing = 0),
+/// clamped to 0..kPriorityMax (a partner older than 2.0.3 sends none).
+[[nodiscard]] inline int PriorityOfView(const json::Value& view) {
+  const double value = view.member_double("priority", 0);
+  if (!(value >= 0))
+    return 0;
+  return static_cast<int>(std::min<double>(value, kPriorityMax));
+}
+
+/// Order of the shared queue: whether a job or request of (priority_a,
+/// created_a) runs before one of (priority_b, created_b): the higher
+/// priority first, then the older one. Equal pairs: false (neither first).
+[[nodiscard]] inline bool RunsBefore(int priority_a, long long created_a,
+                                     int priority_b, long long created_b) {
+  if (priority_a != priority_b)
+    return priority_a > priority_b;
+  return created_a < created_b;
+}
+
+/// Synchronous pool requests (no job) only poll the pool every 200 ms and
+/// take the first free machine they see, so there is no order among several
+/// waiting ones. The precedence rule: a request that sees a free machine
+/// lets a waiting request of the same model with a higher priority go
+/// first, but at most kPoolYieldMax in a row (the higher one may be pinned
+/// to the other side, or have left), so nothing waits forever (B5).
+inline constexpr std::chrono::seconds kPoolYieldMax{2};
+
+struct PoolYieldInput {
+  /// This request's priority.
+  int priority{0};
+  /// The highest priority among the model's waiting requests (-1 = none).
+  int highest_waiting{-1};
+  /// How long this request has already yielded.
+  std::chrono::milliseconds yielded{0};
+  /// Relayed here by the partner: it decided already, never yields.
+  bool forwarded{false};
+};
+
+[[nodiscard]] inline bool PoolShouldYield(const PoolYieldInput& in) {
+  return !in.forwarded && in.highest_waiting > in.priority &&
+         in.yielded < kPoolYieldMax;
 }
 
 }  // namespace gufo::router

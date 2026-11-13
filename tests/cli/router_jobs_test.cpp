@@ -28,6 +28,7 @@
 
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/jobs.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/core/json.hpp"
 
 namespace json = gufo::json;
@@ -207,6 +208,10 @@ struct FakeApi {
   int music_polls{0};
   /// X-Gufo-Pool of every POST, by image prompt / speech input.
   std::map<std::string, std::string> sides;
+  /// X-Gufo-Priority of every POST, by prompt / input ("" = none).
+  std::map<std::string, std::string> priorities;
+  /// The prompts / inputs of every POST, in arrival order.
+  std::vector<std::string> prompts;
   /// Image requests with "WAIT" in the prompt stay here (as the router's
   /// pool does while both machines are busy) until released or redirected
   /// (then 503 pool_redirected); the job ids come from X-Gufo-Job.
@@ -254,8 +259,11 @@ struct FakeApi {
           const std::string key = body.member_str("prompt").empty()
                                       ? body.member_str("input")
                                       : body.member_str("prompt");
-          if (!key.empty())
+          if (!key.empty()) {
             sides[key] = request.header(jobs::kPoolSideHeader);
+            priorities[key] = request.header(gufo::router::kPriorityHeader);
+            prompts.push_back(key);
+          }
         } catch (const std::exception&) {
         }
       }
@@ -2454,6 +2462,258 @@ void TestPoolPullWaitingRequester() {
 
 }  // namespace
 
+/// GET /v1/jobs?scope=pool positions by job id.
+std::map<std::string, double> Positions(Harness& h) {
+  std::map<std::string, double> positions;
+  const json::Value listed =
+      json::parse(h.Call("GET", "/v1/jobs?scope=pool").body);
+  for (const json::Value& job : listed.find("data")->items()) {
+    const json::Value* position = job.find("position");
+    positions[job.member_str("id")] =
+        position == nullptr || position->is_null() ? 0
+                                                   : position->as_double();
+  }
+  return positions;
+}
+
+void TestPriorityOrder() {
+  // 2.0.3: the queue runs the highest priority first, then first in first
+  // out; the priority comes from the header (wins), the submit body or
+  // the wrapped body; every request of the job carries the header.
+  Harness h("priority-order");
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string a = h.Submit(ImageJob("a")).member_str("id");
+  const std::string b =
+      h.Submit(ImageJob("b", R"(,"priority":5)")).member_str("id");
+  const std::string c = h.Submit(ImageJob("c")).member_str("id");
+  std::string d;
+  {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = ImageJob("d", R"(,"priority":2)");
+    request.headers.emplace_back(gufo::router::kPriorityHeader, "9");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 202);
+    const json::Value view = json::parse(answer->body);
+    d = view.member_str("id");
+    CHECK(view.member_double("priority") == 9);  // the header wins
+  }
+  // The wrapped body's member counts too (a page that sends it inside).
+  const std::string e =
+      h.Submit(R"({"request":{"path":"/v1/images/generations","body":{"model":"qwen-image","prompt":"e","size":"64x64","priority":"5"}}})")
+          .member_str("id");
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + a).body)
+            .member_double("priority") == 0);
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + b).body)
+            .member_double("priority") == 5);
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + e).body)
+            .member_double("priority") == 5);
+  // Positions: d (9), b (5), e (5, newer), a, c.
+  std::map<std::string, double> positions = Positions(h);
+  CHECK(positions[d] == 1);
+  CHECK(positions[b] == 2);
+  CHECK(positions[e] == 3);
+  CHECK(positions[a] == 4);
+  CHECK(positions[c] == 5);
+  CHECK(positions[first] == 0);
+  // Invalid values: 400 invalid_priority, nothing queued.
+  json::Value refused = h.Submit(ImageJob("bad", R"(,"priority":12)"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  refused = h.Submit(ImageJob("bad", R"(,"priority":"hoch")"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  refused = h.Submit(ImageJob("bad", R"(,"priority":1.5)"), 400);
+  CHECK(refused.find("error")->member_str("code") == "invalid_priority");
+  {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = ImageJob("bad");
+    request.headers.emplace_back(gufo::router::kPriorityHeader, "10");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 400);
+    CHECK(answer && ErrorCodeOf(*answer) == "invalid_priority");
+  }
+  CHECK(Positions(h).size() == 6);
+  // Run order after the first job ends: d, b, e, a, c.
+  h.api->release.store(true);
+  for (const std::string& id : {first, d, b, e, a, c})
+    h.WaitFor(id, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const std::vector<std::string> want = {"SLOW first", "d", "b",
+                                           "e",          "a", "c"};
+    CHECK(h.api->prompts == want);
+    CHECK(h.api->priorities["d"] == "9");
+    CHECK(h.api->priorities["b"] == "5");
+    CHECK(h.api->priorities["a"].empty());  // normal: no header
+  }
+}
+
+void TestPriorityFile() {
+  // jobs.json keeps the priority; a file written before 2.0.3 has none and
+  // reads as 0; queued jobs come back in run order.
+  const std::string name = "priority-file";
+  std::filesystem::path dir;
+  std::string normal;
+  std::string high;
+  {
+    Harness h(name, false);
+    dir = h.dir;
+    normal = h.Submit(ImageJob("normal")).member_str("id");
+    high = h.Submit(ImageJob("high", R"(,"priority":7)")).member_str("id");
+    const std::map<std::string, double> positions = Positions(h);
+    CHECK(positions.at(high) == 1);
+    CHECK(positions.at(normal) == 2);
+  }
+  const std::filesystem::path file = dir / "jobs.json";
+  std::string text = ReadFile(file);
+  CHECK(text.find("\"priority\":7") != std::string::npos);
+  {
+    Harness h(name, false, /*keep_dir=*/true);
+    CHECK(json::parse(h.Call("GET", "/v1/jobs/" + high).body)
+              .member_double("priority") == 7);
+    CHECK(Positions(h).at(high) == 1);
+  }
+  // Drop the member as an older router wrote the file.
+  {
+    const json::Value parsed = json::parse(text);
+    json::Value records = json::Value::array();
+    for (const json::Value& record : parsed.find("jobs")->items()) {
+      json::Value copy = json::Value::object();
+      for (const auto& [key, value] : record.members())
+        if (key != "priority")
+          copy[key] = value;
+      records.push_back(copy);
+    }
+    json::Value rewritten = json::Value::object();
+    rewritten["jobs"] = std::move(records);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << rewritten.dump();
+  }
+  {
+    Harness h(name, false, /*keep_dir=*/true);
+    const json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + high).body);
+    CHECK(view.member_str("status") == "queued");
+    CHECK(view.member_double("priority") == 0);
+    CHECK(Positions(h).at(normal) == 1);
+    CHECK(Positions(h).at(high) == 2);
+  }
+}
+
+void TestPoolPullPriority() {
+  // Requester: the partner's newer job with a higher priority is pulled
+  // before our own older job; a newer job of the same priority is not.
+  const auto run = [](const char* name, int partner_priority,
+                      bool expect_pull_first) {
+    auto partner = std::make_shared<FakePartner>();
+    partner->queued = R"({"object":"list","data":[]})";
+    Harness h(name, false);
+    partner->api = h.api;
+    h.partner_name = "http://10.0.0.2:8081";
+    h.self_name = "http://10.0.0.1:8081";
+    h.capabilities = CapsA;
+    h.partner_capabilities = [] {
+      return std::optional<json::Value>(CapsB());
+    };
+    h.relay = [partner](const HttpRequest& request,
+                        std::chrono::milliseconds a,
+                        std::chrono::milliseconds b, std::string* error) {
+      return (*partner)(request, a, b, error);
+    };
+    h.Open(true);
+    // The runner is busy while the partner's job and ours queue up.
+    const std::string first =
+        h.Submit(ImageJob("SLOW first")).member_str("id");
+    h.WaitFor(first, "in_progress");
+    {
+      // created_at in the year 2100: newer than anything submitted here.
+      const std::lock_guard<std::mutex> lock(partner->mutex);
+      partner->queued =
+          R"({"object":"list","data":[)"
+          R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":4102444800,"priority":)" +
+          std::to_string(partner_priority) +
+          R"(,"request":{"model":"qwen-image","loras":[]}}]})";
+    }
+    const std::string mine = h.Submit(ImageJob("mine")).member_str("id");
+    // The runner's view of the partner's queue is cached pull_poll (20 ms
+    // here): let it age so the runner reads the new list.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    h.api->release.store(true);
+    h.WaitFor(mine, "completed");
+    // Once ours ran and nothing is queued here, the partner's job is
+    // pulled anyway (as before).
+    for (int i = 0; i < 200; ++i) {
+      {
+        const std::lock_guard<std::mutex> lock(partner->mutex);
+        if (partner->pulls >= 1)
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    const auto& calls = h.api->calls;
+    const auto at = [&calls](const std::string& what, int nth) {
+      std::ptrdiff_t index = 0;
+      for (; index < static_cast<std::ptrdiff_t>(calls.size()); ++index)
+        if (calls[index] == what && --nth == 0)
+          break;
+      return index;
+    };
+    const std::ptrdiff_t pulled = at("PULL", 1);
+    const std::ptrdiff_t ours = at("POST /v1/images/generations", 2);
+    CHECK(pulled < static_cast<std::ptrdiff_t>(calls.size()));
+    CHECK(ours < static_cast<std::ptrdiff_t>(calls.size()));
+    if (expect_pull_first)
+      CHECK(pulled < ours);
+    else
+      CHECK(ours < pulled);
+  };
+  run("pull-priority-high", 5, true);
+  run("pull-priority-same", 0, false);
+
+  // Owner: POST /router/pool/pull hands out the queued job that runs
+  // first (priority, then age), and names its priority.
+  Harness h("pull-priority-owner", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const std::string first = h.Submit(ImageJob("SLOW first")).member_str("id");
+  h.WaitFor(first, "in_progress");
+  const std::string second = h.Submit(ImageJob("second")).member_str("id");
+  const std::string third =
+      h.Submit(ImageJob("third", R"(,"priority":9)")).member_str("id");
+  const std::string fourth =
+      h.Submit(ImageJob("fourth", R"(,"priority":9)")).member_str("id");
+  const auto pull = [&h] {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body =
+        R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":{"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  json::Value handed = pull();
+  CHECK(handed.member_str("job") == third);
+  CHECK(handed.member_double("priority") == 9);
+  handed = pull();
+  CHECK(handed.member_str("job") == fourth);
+  handed = pull();
+  CHECK(handed.member_str("job") == second);
+  CHECK(handed.member_double("priority") == 0);
+  h.api->release.store(true);
+  for (const std::string& id : {first, second, third, fourth})
+    h.WaitFor(id, "completed");
+  // The pushed jobs' requests carried the priority to the pool.
+  CHECK(h.api->priorities["third"] == "9");
+  CHECK(h.api->priorities["second"].empty());
+}
+
 int main() {
   TestParseWebhookUrl();
   TestAllowList();
@@ -2497,6 +2757,9 @@ int main() {
   TestPoolPullBindAddress();
   TestPoolWaitTakeover();
   TestPoolPullWaitingRequester();
+  TestPriorityOrder();
+  TestPriorityFile();
+  TestPoolPullPriority();
   if (failures != 0) {
     std::cerr << failures << " router job checks failed\n";
     return 1;
