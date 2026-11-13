@@ -159,7 +159,7 @@ struct InferenceBackend::Impl {
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
-      bool cache_persist = true) const {
+      bool cache_persist = true, bool chat_template = false) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -183,6 +183,7 @@ struct InferenceBackend::Impl {
             .cache_persist = cache_persist,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .chat_template = chat_template,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -201,7 +202,6 @@ InferenceBackend::~InferenceBackend() = default;
 #if defined(ENGINE_ENABLE_HIP)
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
                             std::string* error, std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             const TextDiskCacheConfig& disk_cache_config,
                             TextRunnerRamCacheOptions ram_cache_config) {
@@ -246,7 +246,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        std::move(runner_pool), scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -265,7 +265,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
 bool InferenceBackend::load(
     const std::string& model_path, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSchedulerPolicy scheduler_policy,
     const TextSpeculativeConfig& speculative_config,
     const TextDiskCacheConfig& disk_cache_config,
     const std::string& vision_model_path,
@@ -308,12 +308,12 @@ bool InferenceBackend::load(
   if (runner == nullptr) {
     return false;
   }
-  return load(std::move(runner), error, session_count, prefill_policy,
-              scheduler_policy, disk_cache_config, ram_cache_config);
+  return load(std::move(runner), error, session_count, scheduler_policy,
+              disk_cache_config, ram_cache_config);
 }
 #else
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
-                            std::string* error, std::size_t, TextPrefillPolicy,
+                            std::string* error, std::size_t,
                             TextSchedulerPolicy, const TextDiskCacheConfig&,
                             TextRunnerRamCacheOptions) {
   SetError(error, "HIP engine is disabled");
@@ -321,8 +321,8 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
 }
 
 bool InferenceBackend::load(const std::string&, std::string* error,
-                            std::uint32_t, std::size_t, TextPrefillPolicy,
-                            TextSchedulerPolicy, const TextSpeculativeConfig&,
+                            std::uint32_t, std::size_t, TextSchedulerPolicy,
+                            const TextSpeculativeConfig&,
                             const TextDiskCacheConfig&, const std::string&,
                             TextRunnerRamCacheOptions, bool,
                             const PrepareRunnerOptions&) {
@@ -397,6 +397,25 @@ std::vector<InferenceBackend::SessionState> InferenceBackend::session_states()
                           : std::vector<SessionState>{};
 #else
   return {};
+#endif
+}
+
+std::optional<InferenceBackend::PromptAdmissionBudget>
+InferenceBackend::prompt_admission_budget() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr)
+    return std::nullopt;
+  auto budget = state->scheduler->PromptAdmissionBudgetSnapshot();
+  if (!budget.has_value())
+    return std::nullopt;
+  return PromptAdmissionBudget{
+      .budget_bytes = budget->budget_bytes,
+      .used_bytes = budget->used_bytes,
+      .available_bytes = budget->available_bytes,
+  };
+#else
+  return std::nullopt;
 #endif
 }
 
@@ -584,7 +603,7 @@ InferenceBackend::Result InferenceBackend::chat(
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
-      request.cache_persist);
+      request.cache_persist, true);
 #else
   (void)request;
   (void)max_tokens;
@@ -685,6 +704,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
+          .chat_template = true,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format,

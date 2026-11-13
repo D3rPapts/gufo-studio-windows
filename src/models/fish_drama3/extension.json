@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "fish_drama3",
   "version": "0.1.0",
-  "api_version": ">= 0.2.0",
+  "api_version": ">= 0.3.0",
   "entry": "fish_drama3_register",
   "registration_target": "gufo_fish_drama3",
   "depends": [],

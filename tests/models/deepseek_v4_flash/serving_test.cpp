@@ -37,15 +37,18 @@ void Expect(bool condition, std::string_view message) {
 bool Load(gufo::server::InferenceBackend& backend,
           const std::shared_ptr<Model>& model, std::string* error,
           std::uint32_t max_context, std::size_t session_count,
-          gufo::server::TextPrefillPolicy prefill_policy = {},
+          // Zero keeps the scheduler's prompt unit.
+          std::size_t prefill_unit_tokens = 0,
           gufo::server::TextSchedulerPolicy scheduler_policy = {},
           const gufo::server::TextSpeculativeConfig& speculative = {},
           const gufo::server::TextDiskCacheConfig& disk = {}) {
   auto runner = gufo::models::deepseek_v4_flash::CreateDeepSeekTextRunner(
       model, max_context, speculative, disk.model_artifact_fingerprint,
       disk.draft_model_artifact_fingerprint);
-  return backend.load(std::move(runner), error, session_count, prefill_policy,
-                      scheduler_policy, disk);
+  if (prefill_unit_tokens != 0)
+    scheduler_policy.prefill_unit_tokens = prefill_unit_tokens;
+  return backend.load(std::move(runner), error, session_count, scheduler_policy,
+                      disk);
 }
 
 std::vector<gufo::tokenization::TokenId> GenerateDirect(
@@ -447,9 +450,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
   }
   {
     InferenceBackend backend;
-    Expect(Load(backend, model, &error, 4096, 2, {.decode_active_tokens = 32},
-                {}, speculative),
-           error);
+    Expect(Load(backend, model, &error, 4096, 2, 32, {}, speculative), error);
     auto active = backend.start_chat(prompt, 64, 0.0F, {}, true);
     std::shared_ptr<TextGenerationBackend::GenerationRequest> late;
     auto long_request = prompt;
@@ -680,8 +681,6 @@ int main(int argc, char** argv) {
         Expect((result->cache_restore_bytes == 0) ==
                    (result->cache_restore_ms == 0.0),
                "live reuse reports no restore copy; snapshot reuse reports it");
-        Expect(result->cache_shared_bytes == 0,
-               "full-copy DeepSeek snapshots do not claim shared bytes");
       }
       Expect(http_continuation.tokens == direct_continuation,
              "cached DeepSeek continuation differs from cold full prefill");

@@ -10,6 +10,7 @@
   libpng,
   libjpeg,
   libwebp,
+  libopus,
   libsndfile,
   soxr,
   openssl,
@@ -18,6 +19,13 @@
   rustToolchain,
   rustPlatform,
   rocmPackages,
+  libuuid,
+  # XRT with the amdxdna plugin (.devops/nix/xrt): the NPU runtime. Null
+  # only for revisions that predate it (the CI timing baseline).
+  xrt ? null,
+  # The IRON toolchain (.devops/nix/iron), passed through for development
+  # images that compile NPU designs; the package itself never uses it.
+  iron ? null,
   releaseVersion ? null,
   extensionsFromLock ? false,
   extensions ? [ ],
@@ -42,6 +50,25 @@ let
       else
         sourceRoot + "/src/core/png_decode/Cargo.lock";
   };
+  # The CI timing baseline builds an older revision with this definition;
+  # before the Rust audio decoder, EmbeddingGemma 2 linked libsndfile and soxr.
+  hasRustAudio = builtins.pathExists (sourceRoot + "/src/core/audio_decode/Cargo.toml");
+  # A store path has no Git metadata. A flake input or fetcher result still
+  # names its commit (`dirtyRev` ends in "-dirty") or at least the hash of its
+  # tree; a plain path names nothing.
+  extensionRevision =
+    ext:
+    let
+      revision =
+        if builtins.isAttrs ext then
+          ext.rev or ext.dirtyRev or ext.narHash or ext.outputHash or "unknown"
+        else
+          "unknown";
+    in
+    if builtins.isString revision && revision != "" && !(lib.hasInfix ";" revision) then
+      revision
+    else
+      "unknown";
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
     if releaseVersion == null then "0-unstable-${revision}" else releaseVersion;
@@ -119,8 +146,7 @@ stdenv.mkDerivation {
     libpng
     libjpeg
     libwebp
-    libsndfile
-    soxr
+    libopus
     openssl
     ffmpeg-headless
     rocmPackages.clr
@@ -130,6 +156,12 @@ stdenv.mkDerivation {
     rocmPackages.rocprim
     rocmPackages.rocwmma
     rocmPackages.rocblas
+  ] ++ lib.optionals (!hasRustAudio) [
+    libsndfile
+    soxr
+  ] ++ lib.optionals (xrt != null) [
+    xrt
+    libuuid
   ];
 
   cmakeFlags = [
@@ -141,8 +173,12 @@ stdenv.mkDerivation {
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
-  ] ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
-  ++ lib.optional (extensions != [ ]) "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}";
+  ] ++ lib.optional (xrt != null) "-DXRT_DIR=${xrt}/opt/xilinx/xrt/share/cmake/XRT"
+  ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
+  ++ lib.optionals (extensions != [ ]) [
+    "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}"
+    "-DGUFO_EXTENSION_DIR_REVISIONS=${lib.concatMapStringsSep ";" extensionRevision extensions}"
+  ];
 
   # CI exposes a persistent /tmp/gufo-ccache through extra-sandbox-paths for
   # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
@@ -172,6 +208,8 @@ stdenv.mkDerivation {
   postFixup = ''
     # HIP loads ROCr transitively. Select the patched ABI-compatible runtime
     # without rebuilding the unchanged HIP/BLAS compiler and kernel libraries.
+    # XRT locates its amdxdna plugin beside libxrt_coreutil, which the
+    # executable's RUNPATH finds in the merged XRT package.
     wrapProgram "$out/bin/gufo" \
       --prefix LD_LIBRARY_PATH : "${rocmRuntime}/lib"
   '';
@@ -200,7 +238,7 @@ stdenv.mkDerivation {
   '';
 
   passthru = {
-    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock;
+    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock xrt iron;
     extensionMetadata = import ./extension-metadata.nix {
       inherit lib sourceRoot extensions extensionsFromLock;
     };

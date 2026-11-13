@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "voxcpm2",
   "version": "0.2.0",
-  "api_version": ">= 0.2.0",
+  "api_version": ">= 0.3.0",
   "entry": "voxcpm2_register",
   "registration_target": "gufo_voxcpm2",
   "depends": [

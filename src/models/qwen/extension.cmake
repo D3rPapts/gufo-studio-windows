@@ -84,7 +84,6 @@ if(TARGET gufo_qwen_hip)
   gufo_extension_hip_sources(gufo_qwen_hip
     SOURCES
       hip/attention.hip
-      hip/batched_ssm.hip
       hip/dspine/kernels.hip
   )
   target_compile_definitions(gufo_qwen_hip PUBLIC ENGINE_ENABLE_HIP=1)

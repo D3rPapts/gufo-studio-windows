@@ -83,7 +83,7 @@ bool LaunchQ4K(const void* w, const float* x, float* y, std::size_t batch,
       case 2:  // +7%
         return Launch<T, 2, 8, 4, 1, 2, 4, 16>(w, x, y, m, k, stream);
       case 3:  // +21%
-        return Launch<T, 3, 4, 3, 1, 3, 8, 16>(w, x, y, m, k, stream);
+        return Launch<T, 3, 8, 4, 1, 3, 8, 16>(w, x, y, m, k, stream);
       case 4:  // +34%
         return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
       case 5:  // +44%
@@ -562,8 +562,6 @@ bool LaunchIQ4XS(const void* w, const float* x, float* y, std::size_t batch,
     switch (batch) {
       case 3:  // +7%
         return Launch<T, 3, 16, 4, 1, 3, 8, 16>(w, x, y, m, k, stream);
-      case 4:  // +5%
-        return Launch<T, 4, 4, 4, 1, 4, 8, 16>(w, x, y, m, k, stream);
       case 6:  // +40%
         return Launch<T, 6, 4, 4, 1, 6, 8, 16>(w, x, y, m, k, stream);
       case 7:  // +32%

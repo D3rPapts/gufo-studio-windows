@@ -61,12 +61,30 @@ the absolute file offset of the tensor and the GGUF type id (12 Q4_K, 13 Q5_K,
 Add the shape to the table of the platform you measured on in
 `verify_gemm_27b.hip` (the `_WIN32` block for Windows) under its format and
 projection, keyed by type, `m`, `k` and row count, only where it beats
-`generic` by the `--min-gain` margin. The target and the DFlash2 draft share some projection
-shapes (the Q4_K FFN and attention matrices), and one entry serves both, so
-sweep both GGUFs and judge a shared shape on both results. Then rebuild,
-rerun the sweep to confirm no listed shape loses to `generic`, confirm greedy
-output is unchanged end to end and measure a real workload: a per-launch gain
-only matters in proportion to the projection's share of the cycle.
+`generic` by the `--min-gain` margin. The target and the DFlash2 draft share
+some projection shapes (the Q4_K FFN and attention matrices), and one entry
+serves both, so sweep both GGUFs and judge a shared shape on both results.
+Then rebuild, rerun the sweep to confirm no listed shape loses to `generic`,
+confirm greedy output is unchanged end to end and measure a real workload: a
+per-launch gain only matters in proportion to the projection's share of the
+cycle.
+
+`gen_table.py` applies that rule to two independent sweeps of the target and
+the draft, the raw `--out` logs of `sweep.py`, and prints the four `Launch*`
+functions of a table:
+
+```sh
+python3 tools/qwen27b/verify_sweep/gen_table.py \
+  --target target.gguf --draft draft.gguf \
+  --first target1.log draft1.log --second target2.log draft2.log
+```
+
+A shape is listed where the first sweep's best candidate saves at least
+`--min-gain` percent over `generic`, summed over target and draft weighted by
+their layer counts, and saves that much in the second sweep too. `--skip`
+leaves out a candidate that spills with your compiler. The Windows table was
+generated this way, less IQ4_XS joined ffn_gate+ffn_up (34816x5120) at four
+rows, which saved under 1% in a later sweep.
 
 ## Limits
 

@@ -103,15 +103,16 @@ the same distribution.
   ([Qwen3.8 Flash-Next](models/qwen3.8-flash-next.md)), `dspark`
   ([DeepSeek V4 Flash](models/deepseek-v4-flash.md)).
 - `--dflash-model`, `--mtp-model`, `--dspark-model`: the draft file.
-- `--draft-tokens`: most tokens proposed per step.
+- `--draft-tokens`, `--min-draft-tokens`, `--draft-policy`: deprecated and
+  ignored; they will be removed. Each model sets how many tokens it proposes.
 
 **Server scheduling and limits**
 
 | Option | Default | Use |
 | --- | --- | --- |
 | `--prefill-chunk` | ignored | Deprecated and ignored; it will be removed. A prompt beside decoding requests is split by layers, so they keep decoding. |
-| `--max-pending` | 16 | Requests waiting for a session. |
-| `--max-pending-per-client` | `--max-pending` | Waiting requests per client IP. |
+| `--max-pending` | 16 | Requests waiting for a session. `0` turns the queue off: when every session is busy, a request gets `429` at once, so a router can fail over. |
+| `--max-pending-per-client` | `--max-pending` | Waiting requests per client IP. At most `--max-pending`; `0` lets a client run only on a free session. |
 | `--request-timeout-ms` | off | Cancel a request after this long, waiting included. |
 | `--stall-timeout-ms` | off | Exit as `device_lost` when generation stops progressing, so a supervisor restarts the server. At least 60000. |
 | `--max-output-bytes` | 1 MiB | Largest response. |
@@ -137,7 +138,9 @@ broken output, then delete the file: it holds whole conversations.
   the same models without a server. Models with an audio projector accept
   `--mmproj`.
 - **Images:** `gufo serve image --model DIR`; see
-  [Qwen-Image-2.1](models/qwen-image-2.1.md).
+  [Qwen-Image-2.1](models/qwen-image-2.1.md). Register LoRA adapters with
+  `--lora NAME=PATH`; requests select them by name
+  ([LoRA adapters](models/qwen-image-2.1.md#lora-adapters)).
 - **Video:** `gufo serve video` and `gufo video`; see
   [MiniMax H3](models/minimax-h3.md).
 - **Decisions:** `gufo serve decision --model PATH` answers at
