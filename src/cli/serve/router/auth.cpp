@@ -602,7 +602,6 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
   if (list == nullptr)
     list = doc.find("users");
   std::vector<User> users;
-  std::vector<std::size_t> reserved_names;
   if (list != nullptr && list->is_array()) {
     for (const json::Value& item : list->items()) {
       if (!item.is_object())
@@ -613,9 +612,6 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
         *error = "users file: bad user name '" + user.name + "'";
         return false;
       }
-      // A file from before the names were reserved: the router starts;
-      // decided below, once every user is read.
-      const bool reserved = IsReservedName(user.name);
       user.rolle = item.member_str("rolle", "nutzer");
       if (!IsRole(user.rolle))
         user.rolle = "nutzer";
@@ -659,27 +655,30 @@ bool UserStore::FromJson(const json::Value& doc, std::string* error) {
       if (const json::Value* g = item.find("gesperrt");
           g != nullptr && g->is_bool())
         user.gesperrt = g->as_bool();
-      if (reserved)
-        reserved_names.push_back(users.size());
       users.push_back(std::move(user));
     }
   }
-  // A reserved name (the router itself, the partner) is blocked, unless it
-  // is the only working admin: then it stays, so the file still opens the
+  // A reserved name (the router itself, the partner; a file from before
+  // the names were reserved) is blocked, unless no other admin would be
+  // left: then the first such admin stays, so the file still opens the
   // door (the name clashes only with the placeholders' owner rules).
-  for (const std::size_t index : reserved_names) {
-    bool other_admin = false;
-    for (std::size_t j = 0; j < users.size(); ++j)
-      if (j != index && users[j].admin() && !users[j].gesperrt &&
-          !users[j].hash_hex.empty() && !IsReservedName(users[j].name))
-        other_admin = true;
-    const bool block = other_admin || !users[index].admin() ||
-                       users[index].gesperrt || users[index].hash_hex.empty();
-    if (block)
-      users[index].gesperrt = true;
+  const auto working_admin = [](const User& u) {
+    return u.admin() && !u.gesperrt && !u.hash_hex.empty();
+  };
+  bool admin_left = std::any_of(users.begin(), users.end(), [&](const User& u) {
+    return !IsReservedName(u.name) && working_admin(u);
+  });
+  for (User& user : users) {
+    if (!IsReservedName(user.name))
+      continue;
+    const bool keep = !admin_left && working_admin(user);
+    if (keep)
+      admin_left = true;
+    else
+      user.gesperrt = true;
     Logger::Warn("router", "event=users_file_reserved_name name=" +
-                               users[index].name +
-                               (block ? " action=blocked" : " action=kept"));
+                               user.name +
+                               (keep ? " action=kept" : " action=blocked"));
   }
   const std::lock_guard<std::mutex> lock(mutex_);
   users_ = std::move(users);
@@ -1640,45 +1639,65 @@ bool Gate::CountDaily(const Identity& who, int weight, long long limit) {
 }
 
 namespace {
-/// Takes or confirms `key` for `name` (state mutex held).
+struct OwnerTable {
+  std::map<std::string, Gate::OwnerEntry>* owners;
+  std::size_t limit;
+  unsigned long long* generation;
+  long long* purged_at;
+};
+
+/// Over `limit` entries: the expired ones go, then confirmed owners older
+/// than an hour; tried at most once a minute. Reservations in flight and
+/// fresh owners always stay, so the table may exceed the limit (logged).
+void PurgeOwnersLocked(const OwnerTable& table, long long now) {
+  if (table.owners->size() < table.limit || now - *table.purged_at < 60)
+    return;
+  *table.purged_at = now;
+  for (auto it = table.owners->begin(); it != table.owners->end();) {
+    const Gate::OwnerEntry& entry = it->second;
+    const bool expired = entry.at < now - 86400;
+    const bool stale = !entry.reserved && entry.in_flight <= 0 &&
+                       entry.at < now - 3600;
+    it = expired || stale ? table.owners->erase(it) : std::next(it);
+  }
+  if (table.owners->size() >= table.limit)
+    Logger::Warn("router", "event=owner_table_full size=" +
+                               std::to_string(table.owners->size()) +
+                               " limit=" + std::to_string(table.limit));
+}
+
 /// Takes (`reserved`: for a request in flight) or confirms `key` for
-/// `name`, one lookup; false when another user holds it live. Over
-/// `limit` entries the expired ones go, then the oldest confirmed ones
-/// (half of all); reservations in flight always stay.
-bool TakeOwnerLocked(std::map<std::string, Gate::OwnerEntry>* owners,
-                     std::string_view key, std::string_view name,
-                     long long now, bool reserved, std::size_t limit) {
-  if (const auto it = owners->find(std::string(key)); it != owners->end()) {
+/// `name`, one lookup; 0 when another user holds it live, else the
+/// generation of the holding (a release names it).
+unsigned long long TakeOwnerLocked(const OwnerTable& table, std::string_view key,
+                                   std::string_view name, long long now,
+                                   bool reserved) {
+  if (const auto it = table.owners->find(std::string(key));
+      it != table.owners->end()) {
     Gate::OwnerEntry& entry = it->second;
     const bool live = entry.at >= now - 86400;
     if (live && entry.name != name)
-      return false;  // the first owner keeps it
+      return 0;  // the first owner keeps it
     if (!reserved) {
-      entry = {std::string(name), now, false, 0};  // confirmed
-    } else if (live && entry.reserved) {
-      ++entry.in_flight;  // one more request of the same user
+      // Confirmed: the holding ends, releases of it are no-ops.
+      entry = {std::string(name), now, false, 0, ++*table.generation};
+    } else if (entry.reserved && entry.name == name) {
+      // One more request of the same user (expired or not: its earlier
+      // requests may still release, so the count goes on).
+      ++entry.in_flight;
+      entry.at = now;
     } else if (!live) {
-      entry = {std::string(name), now, true, 1};
+      // Another user's expired entry: taken afresh, the old holding is
+      // stale (its releases name the old generation).
+      entry = {std::string(name), now, true, 1, ++*table.generation};
     }  // else: confirmed for this user already, nothing to reserve
-    return true;
+    return entry.generation;
   }
-  if (owners->size() >= limit) {
-    for (auto it = owners->begin(); it != owners->end();)
-      it = it->second.at < now - 86400 ? owners->erase(it) : std::next(it);
-    if (owners->size() >= limit) {
-      std::vector<std::pair<long long, std::string>> confirmed;
-      for (const auto& [k, entry] : *owners)
-        if (!entry.reserved && entry.in_flight <= 0)
-          confirmed.emplace_back(entry.at, k);
-      std::sort(confirmed.begin(), confirmed.end());
-      const std::size_t drop = std::min(confirmed.size(), owners->size() / 2);
-      for (std::size_t i = 0; i < drop; ++i)
-        owners->erase(confirmed[i].second);
-    }
-  }
-  (*owners)[std::string(key)] = {std::string(name), now, reserved,
-                                 reserved ? 1 : 0};
-  return true;
+  PurgeOwnersLocked(table, now);
+  const unsigned long long generation = ++*table.generation;
+  (*table.owners)[std::string(key)] = {std::string(name), now, reserved,
+                                       reserved ? 1 : 0, generation};
+  return generation;
 }
 }  // namespace
 
@@ -1687,32 +1706,38 @@ bool Gate::RememberOwner(std::string_view key, std::string_view name) {
     return true;
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
-  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/false,
-                         owner_limit_);
+  return TakeOwnerLocked({&owners_, owner_limit_, &owner_generation_,
+                          &owner_purged_at_},
+                         key, name, now, /*reserved=*/false) != 0;
 }
 
-bool Gate::ReserveOwner(std::string_view key, std::string_view name) {
+unsigned long long Gate::ReserveOwner(std::string_view key,
+                                      std::string_view name) {
   if (key.empty() || name.empty())
-    return true;
+    return 0;
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
-  return TakeOwnerLocked(&owners_, key, name, now, /*reserved=*/true,
-                         owner_limit_);
+  return TakeOwnerLocked({&owners_, owner_limit_, &owner_generation_,
+                          &owner_purged_at_},
+                         key, name, now, /*reserved=*/true);
 }
 
-void Gate::ReleaseOwner(std::string_view key, std::string_view name) {
+void Gate::ReleaseOwner(std::string_view key, std::string_view name,
+                        unsigned long long generation) {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = owners_.find(std::string(key));
-  if (it == owners_.end() || !it->second.reserved || it->second.name != name)
-    return;  // confirmed by an answer, or not this user's
+  if (it == owners_.end() || !it->second.reserved ||
+      it->second.name != name || it->second.generation != generation)
+    return;  // confirmed by an answer, not this user's, or taken afresh
   if (--it->second.in_flight <= 0)
     owners_.erase(it);
 }
 
-std::optional<HttpResponse> Gate::ReservePrompt(const Identity& who,
-                                                const json::Value& body,
-                                                std::string* key) {
+std::optional<HttpResponse> Gate::ReservePrompt(
+    const Identity& who, const json::Value& body, std::string* key,
+    unsigned long long* generation) {
   key->clear();
+  *generation = 0;
   const json::Value* id = body.find("prompt_id");
   if (id == nullptr || !id->is_string() || id->str().empty())
     return std::nullopt;
@@ -1725,7 +1750,8 @@ std::optional<HttpResponse> Gate::ReservePrompt(const Identity& who,
                        "prompt_id_taken");
     return std::nullopt;
   }
-  if (!ReserveOwner(wanted, who.name))
+  *generation = ReserveOwner(wanted, who.name);
+  if (*generation == 0)
     return AuthError(409, "Conflict", "prompt_id belongs to another user",
                      "prompt_id_taken");
   *key = wanted;
@@ -1782,16 +1808,26 @@ std::optional<HttpResponse> Gate::CsrfCheck(const HttpRequest& req) const {
   const std::string origin = NormalizeOrigin(raw);
   if (Contains(settings_.csrf_allow_origins, origin))
     return std::nullopt;
-  // Exactly this router (host and port): the pages on another port of
-  // this machine (8096, 8090) are other sites and need csrf-allow-origins.
+  // Exactly this router (scheme, host and port): the pages on another
+  // port of this machine (8096, 8090) are other sites and need
+  // csrf-allow-origins. The router speaks http; behind a TLS proxy the
+  // proxy says so (X-Forwarded-Proto) and sends Host: host:443.
   std::string scheme = "http";
   std::string origin_host = origin;
   if (const auto at = origin_host.find("://"); at != std::string::npos) {
     scheme = origin_host.substr(0, at);
     origin_host.erase(0, at + 3);
   }
-  // The Host header, normalised with the Origin's scheme (a TLS proxy
-  // sends Host: host:443 for https://host).
+  std::string own_scheme = Lower(Trim(req.header("X-Forwarded-Proto")));
+  if (const auto comma = own_scheme.find(','); comma != std::string::npos)
+    own_scheme.resize(comma);
+  if (own_scheme.empty())
+    own_scheme = "http";
+  if (scheme != own_scheme)
+    return AuthError(403, "Forbidden",
+                     "cross-site request refused (Origin " + origin +
+                         " uses another scheme than this router)",
+                     "csrf_rejected");
   std::string host = NormalizeOrigin(scheme + "://" + req.header("Host"));
   if (const auto at = host.find("://"); at != std::string::npos)
     host.erase(0, at + 3);
@@ -2647,14 +2683,16 @@ HttpResponse Gate::Serve(
     Gate* gate;
     std::string key;
     std::string name;
+    unsigned long long generation{0};
     ~Reservation() {
       if (!key.empty())
-        gate->ReleaseOwner(key, name);
+        gate->ReleaseOwner(key, name, generation);
     }
   } reservation{this, {}, who.name};
   std::optional<HttpResponse> refusal = Refuse(req, route, who, submit_body);
   if (!refusal.has_value() && submit_body != nullptr && req.path == "/prompt")
-    refusal = ReservePrompt(who, *submit_body, &reservation.key);
+    refusal = ReservePrompt(who, *submit_body, &reservation.key,
+                            &reservation.generation);
   if (refusal.has_value()) {
     std::string model;
     if (hooks_.model_of && route.kind == Route::Kind::kWork)

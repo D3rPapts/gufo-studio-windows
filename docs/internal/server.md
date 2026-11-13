@@ -1127,12 +1127,15 @@ pages are invisible from outside. Writes to the users API must come as
 something (not GET/HEAD) from a browser identity, a cookie session or
 loopback-as-admin, must come from this router's own pages:
 `Sec-Fetch-Site: cross-site`, or an `Origin` that is not exactly the
-`Host` header (host and port, the `Host` read with the `Origin`'s scheme
-so a TLS proxy's `Host: host:443` matches `https://host`; pages on
-another port of this machine need `csrf-allow-origins`, and the router
-logs `event=auth csrf_allow_origins=0` at start when the list is empty
-with `auth` on) and not in `csrf-allow-origins`, is `403 csrf_rejected`
-on any endpoint (users API, model control, generation, jobs), so a web page opened on the router machine cannot act through the
+`Host` header (scheme, host and port: the router's scheme is `http`
+unless a proxy says `X-Forwarded-Proto: https`, and the `Host` is read
+with that scheme so a TLS proxy's `Host: host:443` matches
+`https://host`; pages on another port of this machine need
+`csrf-allow-origins`, and the router logs `event=auth
+csrf_allow_origins=0` at start when the list is empty) and not in
+`csrf-allow-origins`, is `403 csrf_rejected` on any endpoint (users
+API, model control, generation, jobs), so a web page opened on the
+router machine cannot act through the
 loopback admin path or a signed-in session; tokens, the partner and the
 router's own calls are no browsers and pass. With `auth = off` the same
 rule guards loopback writes to the users API, `/router/zugriff`,
@@ -1140,8 +1143,9 @@ rule guards loopback writes to the users API, `/router/zugriff`,
 stage in which the first admin is created). The names `lokal` (the
 router itself, loopback) and `partner` (the partner router) are
 reserved: `400 name_reserved` on creation; a users file from before
-that still loads, such an account is blocked with a warning unless it is
-the only working admin (then it is kept, `action=kept`). The
+that still loads, such an account is blocked with a warning unless no
+other admin would be left (then the first such admin is kept,
+`action=kept`). The
 router itself, loopback-as-admin and the partner router name no user:
 a job they submit has no owner, their prompts and videos are not
 remembered (open to everyone).
@@ -1165,7 +1169,10 @@ a refusal, an exception). The first owner of an id keeps it. `/props`,
 (`?model=`) and count as work of that model's area (text, bild, text);
 without a model the router answers `400 missing_model` as before. Beyond the job store the
 gate remembers for a day who submitted each ComfyUI prompt and each
-direct video job (from the answers, in memory): `GET /history` shows a
+direct video job (from the answers, in memory, up to 20 000 entries:
+beyond that, confirmed owners older than an hour go first, reservations
+and fresh owners never, so the table may grow past the limit for a
+while): `GET /history` shows a
 user its own prompts, `POST /history` deletes only its own,
 `/v1/videos/<id>[/content]` and the job files a `POST /v1/videos/concat`
 names answer `404` for another user's; an id the gate never saw (before

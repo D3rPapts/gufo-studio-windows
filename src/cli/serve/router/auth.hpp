@@ -443,6 +443,10 @@ public:
     /// Requests of `name` sharing the reservation; it goes at 0 unless
     /// an answer confirmed it.
     int in_flight{0};
+    /// Changes whenever the entry is taken afresh (another user, or after
+    /// it expired): a release names the generation it took, so a request
+    /// of an earlier holding never frees a later one.
+    unsigned long long generation{0};
   };
   /// Owners of things the job store does not know: ComfyUI prompts
   /// ("prompt:<id>") and direct video jobs ("video:<id>"), remembered
@@ -454,14 +458,18 @@ public:
   /// hold it several times (in flight). RememberOwner confirms it,
   /// ReleaseOwner ends one holding: a reservation nobody holds and no
   /// answer confirmed goes.
-  bool ReserveOwner(std::string_view key, std::string_view name);
-  void ReleaseOwner(std::string_view key, std::string_view name);
+  /// Returns the generation taken (0 = another user holds it).
+  unsigned long long ReserveOwner(std::string_view key, std::string_view name);
+  void ReleaseOwner(std::string_view key, std::string_view name,
+                    unsigned long long generation);
   /// The client-chosen prompt id of a /prompt body, once every check
   /// passed: reserved for a real user, only checked for a placeholder;
-  /// 409 prompt_id_taken when another user holds it. `key` receives the
-  /// reserved key ("" when nothing was reserved) for ReleaseOwner.
+  /// 409 prompt_id_taken when another user holds it. `key` and
+  /// `generation` receive what ReleaseOwner needs ("" / 0 when nothing
+  /// was reserved).
   [[nodiscard]] std::optional<server::HttpResponse> ReservePrompt(
-      const Identity& who, const json::Value& body, std::string* key);
+      const Identity& who, const json::Value& body, std::string* key,
+      unsigned long long* generation);
   /// "HTTPS://Host:443/" -> "https://host": scheme and host lower case,
   /// the default port of the scheme dropped, no trailing slash.
   [[nodiscard]] static std::string NormalizeOrigin(std::string_view origin);
@@ -511,6 +519,8 @@ private:
   std::map<std::string, std::pair<std::string, long long>> daily_;
   std::map<std::string, OwnerEntry> owners_;
   std::size_t owner_limit_{20000};
+  unsigned long long owner_generation_{0};
+  long long owner_purged_at_{0};
   std::mutex log_mutex_;
   std::string log_day_;
 };

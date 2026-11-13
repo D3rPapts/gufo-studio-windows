@@ -397,6 +397,18 @@ void TestOldFileFormat() {
   CHECK(store.Find("lokal").has_value());
   CHECK(!store.Find("lokal")->gesperrt);
   CHECK(store.HasAdmin());
+  // Two reserved admins and no other: the first stays, the second is
+  // blocked.
+  {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << "{\"nutzer\": [{\"name\": \"lokal\", \"rolle\": \"admin\", "
+           "\"passwort\": {\"salz\": \"00\", \"hash\": \"ff\", \"runden\": 1}},"
+           " {\"name\": \"partner\", \"rolle\": \"admin\", "
+           "\"passwort\": {\"salz\": \"00\", \"hash\": \"ff\", \"runden\": 1}}]}";
+  }
+  CHECK(store.Load(&error));
+  CHECK(!store.Find("lokal")->gesperrt);
+  CHECK(store.Find("partner")->gesperrt);
   // Unknown document shape: an error, not a crash.
   {
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
@@ -1229,36 +1241,70 @@ void TestFilterAndLimit() {
       std::string key_a;
       std::string key_b;
       std::string key_anna;
-      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_a).has_value());
+      unsigned long long gen_a = 0;
+      unsigned long long gen_b = 0;
+      unsigned long long gen_anna = 0;
+      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_a, &gen_a).has_value());
       CHECK_EQ(key_a, std::string("prompt:p-neu"));
-      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_b).has_value());  // same user, twice
-      const auto taken = c.gate->ReservePrompt(anna_id, body, &key_anna);
+      CHECK(gen_a != 0);
+      CHECK(!c.gate->ReservePrompt(tim_id, body, &key_b, &gen_b).has_value());  // same user, twice
+      CHECK_EQ(gen_b, gen_a);  // one holding, shared
+      const auto taken = c.gate->ReservePrompt(anna_id, body, &key_anna, &gen_anna);
       CHECK(taken.has_value() && taken->status == 409);
       CHECK(key_anna.empty());
+      CHECK_EQ(gen_anna, 0ULL);
       // The second request fails at the adapter and goes: the id stays
       // tim's while the first is still in flight.
       HttpResponse failed{.status = 400, .reason = "Bad Request", .body = "{}"};
       c.gate->After(first_req, route, tim_id, &failed);
-      c.gate->ReleaseOwner(key_b, tim_id.name);
+      c.gate->ReleaseOwner(key_b, tim_id.name, gen_b);
       CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
-      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
+      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna, &gen_anna).has_value());
       // The first is confirmed by its answer: the id is tim's for good,
       // its release is a no-op.
       HttpResponse kept{.status = 200, .reason = "OK",
                         .body = "{\"prompt_id\":\"p-neu\"}"};
       c.gate->After(first_req, route, tim_id, &kept);
-      c.gate->ReleaseOwner(key_a, tim_id.name);
+      c.gate->ReleaseOwner(key_a, tim_id.name, gen_a);
       CHECK(c.gate->OwnerOf("prompt:p-neu") == std::optional<std::string>("tim"));
-      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna).has_value());
+      CHECK(c.gate->ReservePrompt(anna_id, body, &key_anna, &gen_anna).has_value());
       // Both in flight, both released without a confirming answer: free.
-      CHECK(!c.gate->ReservePrompt(tim_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_a).has_value());
-      CHECK(!c.gate->ReservePrompt(tim_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_b).has_value());
-      c.gate->ReleaseOwner(key_a, tim_id.name);
+      const json::Value frei = json::parse("{\"prompt_id\":\"p-frei\"}");
+      CHECK(!c.gate->ReservePrompt(tim_id, frei, &key_a, &gen_a).has_value());
+      CHECK(!c.gate->ReservePrompt(tim_id, frei, &key_b, &gen_b).has_value());
+      c.gate->ReleaseOwner(key_a, tim_id.name, gen_a);
       CHECK(c.gate->OwnerOf("prompt:p-frei") == std::optional<std::string>("tim"));
-      c.gate->ReleaseOwner(key_b, tim_id.name);
+      c.gate->ReleaseOwner(key_b, tim_id.name, gen_b);
       CHECK(!c.gate->OwnerOf("prompt:p-frei").has_value());
-      CHECK(!c.gate->ReservePrompt(anna_id, json::parse("{\"prompt_id\":\"p-frei\"}"), &key_anna).has_value());
-      c.gate->ReleaseOwner(key_anna, anna_id.name);
+      CHECK(!c.gate->ReservePrompt(anna_id, frei, &key_anna, &gen_anna).has_value());
+      c.gate->ReleaseOwner(key_anna, anna_id.name, gen_anna);
+      // An expired holding taken afresh by another user: the old
+      // request's release names the old generation and frees nothing.
+      {
+        Fixture e;
+        long long now = auth::NowUnix();
+        e.gate->SetClock([&now] { return now; });
+        std::string k_old;
+        unsigned long long g_old = 0;
+        CHECK(!e.gate->ReservePrompt(tim_id, frei, &k_old, &g_old).has_value());
+        now += 86400 + 10;  // the holding expired, the request still runs
+        std::string k_new;
+        unsigned long long g_new = 0;
+        CHECK(!e.gate->ReservePrompt(anna_id, frei, &k_new, &g_new).has_value());
+        CHECK(g_new != g_old);
+        e.gate->ReleaseOwner(k_old, tim_id.name, g_old);  // stale: no-op
+        CHECK(e.gate->OwnerOf("prompt:p-frei") == std::optional<std::string>("anna"));
+        // The same user after expiry: the count goes on, both releases needed.
+        now += 86400 + 10;
+        std::string k_again;
+        unsigned long long g_again = 0;
+        CHECK(!e.gate->ReservePrompt(anna_id, frei, &k_again, &g_again).has_value());
+        CHECK_EQ(g_again, g_new);
+        e.gate->ReleaseOwner(k_new, anna_id.name, g_new);
+        CHECK(e.gate->OwnerOf("prompt:p-frei") == std::optional<std::string>("anna"));
+        e.gate->ReleaseOwner(k_again, anna_id.name, g_again);
+        CHECK(!e.gate->OwnerOf("prompt:p-frei").has_value());
+      }
     }
     // Over the limit the oldest confirmed entries go, never a reservation
     // in flight.
@@ -1269,26 +1315,46 @@ void TestFilterAndLimit() {
       p.gate->SetClock([&now] { return now; });
       std::string k1;
       std::string k2;
+      unsigned long long g1 = 0;
+      unsigned long long g2 = 0;
       auth::Identity tim_like;
       tim_like.source = auth::Identity::Source::kCookie;
       tim_like.name = "tim";
       tim_like.rolle = "nutzer";
-      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r1\"}"), &k1).has_value());
+      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r1\"}"), &k1, &g1).has_value());
       now += 1;
       CHECK(p.gate->RememberOwner("prompt:c1", "anna"));
       now += 1;
-      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r2\"}"), &k2).has_value());
+      CHECK(!p.gate->ReservePrompt(tim_like, json::parse("{\"prompt_id\":\"r2\"}"), &k2, &g2).has_value());
       now += 1;
       CHECK(p.gate->RememberOwner("prompt:c2", "anna"));
       now += 1;
-      CHECK(p.gate->RememberOwner("prompt:c3", "anna"));  // the fifth: purge
+      // The fifth: over the limit, but nothing is an hour old yet, so the
+      // table grows past it (fresh owners never go).
+      CHECK(p.gate->RememberOwner("prompt:c3", "anna"));
+      CHECK(p.gate->OwnerOf("prompt:c1") == std::optional<std::string>("anna"));
+      CHECK(p.gate->OwnerOf("prompt:c2") == std::optional<std::string>("anna"));
+      // An hour later (and more than a minute after the last try): the
+      // confirmed owners older than an hour go, the reservations stay.
+      now += 3601;
+      CHECK(p.gate->RememberOwner("prompt:c4", "anna"));
       CHECK(p.gate->OwnerOf("prompt:r1") == std::optional<std::string>("tim"));
       CHECK(p.gate->OwnerOf("prompt:r2") == std::optional<std::string>("tim"));
-      CHECK(p.gate->OwnerOf("prompt:c3") == std::optional<std::string>("anna"));
-      CHECK(!p.gate->OwnerOf("prompt:c1").has_value());  // oldest confirmed
+      CHECK(p.gate->OwnerOf("prompt:c4") == std::optional<std::string>("anna"));
+      CHECK(!p.gate->OwnerOf("prompt:c1").has_value());
       CHECK(!p.gate->OwnerOf("prompt:c2").has_value());
-      p.gate->ReleaseOwner(k1, "tim");
-      p.gate->ReleaseOwner(k2, "tim");
+      CHECK(!p.gate->OwnerOf("prompt:c3").has_value());
+      // Within the next minute no further try, even when over the limit.
+      now += 30;
+      CHECK(p.gate->RememberOwner("prompt:c5", "anna"));
+      now += 3700;
+      CHECK(p.gate->RememberOwner("prompt:c6", "anna"));  // next try: c4, c5 go
+      CHECK(!p.gate->OwnerOf("prompt:c4").has_value());
+      CHECK(!p.gate->OwnerOf("prompt:c5").has_value());
+      CHECK(p.gate->OwnerOf("prompt:c6") == std::optional<std::string>("anna"));
+      CHECK(p.gate->OwnerOf("prompt:r1") == std::optional<std::string>("tim"));
+      p.gate->ReleaseOwner(k1, "tim", g1);
+      p.gate->ReleaseOwner(k2, "tim", g2);
     }
     // Placeholders (the router itself, loopback) own nothing, by source:
     // their answers are not remembered.
@@ -1611,14 +1677,24 @@ void TestUsersApi() {
   CHECK_EQ(auth::Gate::NormalizeOrigin(" 192.168.178.198:8081 "),
            std::string("http://192.168.178.198:8081"));
   CHECK_EQ(auth::Gate::NormalizeOrigin(""), std::string(""));
-  // A TLS proxy: Host carries the https default port.
+  // A TLS proxy says so (X-Forwarded-Proto) and sends Host with the
+  // https default port; an https Origin without the proxy, or an http
+  // page of the same name behind it, is another site.
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", admin}, {"Origin", "https://192.168.178.198"},
-                   {"Host", "192.168.178.198:443"}}));
+                   {"Host", "192.168.178.198:443"}, {"X-Forwarded-Proto", "https"}}));
   CHECK_EQ(r.status, 200);
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", admin}, {"Origin", "https://192.168.178.198"},
-                   {"Host", "192.168.178.198:80"}}));
+                   {"Host", "192.168.178.198:443"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "http://192.168.178.198"},
+                   {"Host", "192.168.178.198"}, {"X-Forwarded-Proto", "https"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "https://192.168.178.198"},
+                   {"Host", "192.168.178.198:80"}, {"X-Forwarded-Proto", "https"}}));
   CHECK_EQ(r.status, 403);
   // Pages on another port and a proxy named in csrf-allow-origins pass,
   // in any spelling; another proxy does not.
