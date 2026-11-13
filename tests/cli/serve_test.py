@@ -100,7 +100,7 @@ def main():
     assert "-1 = until EOS or context full" in help_text
     assert "Path to GGUF model file (required)" in help_text
     assert "8589934592" in help_text
-    assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
+    assert "Ignored, kept for compatibility" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
     assert "--cache-ram-bytes <N|off>" in help_text
