@@ -116,6 +116,11 @@ constexpr std::string_view kPresetGrammar =
     "    neither can), a free runner pulls the partner's older queued job\n"
     "    (POST /router/pool/pull) and runs it on its worker while the owner\n"
     "    keeps files and result; /router/status shows pool_queue.\n"
+    "    Priority (2.0.3): X-Gufo-Priority: 0..9 or \"priority\" in the\n"
+    "    body (0 = normal, higher first, then oldest first) orders the\n"
+    "    shared queue and the pull; a waiting pool request lets a higher\n"
+    "    one of its model go first (at most 2 s); invalid: 400\n"
+    "    invalid_priority.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
     "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
 
@@ -1087,6 +1092,28 @@ public:
     }
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
+    // Priority (2.0.3): X-Gufo-Priority (wins) or the JSON member
+    // "priority"; read before the lock (the body may be large) and checked
+    // on every request, used by the pool decision.
+    int priority = 0;
+    {
+      json::Value body;
+      const json::Value* member = nullptr;
+      if (IsJsonBody(req) &&
+          req.body.find("\"priority\"") != std::string::npos) {
+        try {
+          body = json::parse(req.body);
+          member = body.find("priority");
+        } catch (const std::exception&) {
+          // The worker answers a malformed body itself.
+        }
+      }
+      std::string why;
+      if (!router::ParsePriority(req.header(router::kPriorityHeader), member,
+                                 &priority, &why))
+        return Err(400, "Bad Request", why, "invalid_request_error",
+                   "invalid_priority");
+    }
     std::unique_lock<std::mutex> lock(mutex);
     if (req.method == "POST" &&
         (req.path == "/models/load" || req.path == "/models/unload")) {
@@ -1190,7 +1217,8 @@ public:
     }
     if (PooledLocked(*preset, req, music_job)) {
       // placement = pool: this machine or the remote, per request.
-      return DispatchPoolLocked(req, model_id, *preset, music_job, lock);
+      return DispatchPoolLocked(req, model_id, *preset, music_job, priority,
+                                lock);
     }
     if (RoutesRemoteLocked(*preset, req, music_job)) {
       // Another router owns the model: no admission, load or memory here.
@@ -1375,6 +1403,10 @@ public:
     int local_claims{0};
     /// Pool requests waiting for a free machine.
     int waiting{0};
+    /// Of those, by priority (X-Gufo-Priority, 2.0.3).
+    int waiting_by_priority[router::kPriorityMax + 1]{};
+    /// Requests that let a waiting one of a higher priority go first.
+    long long yields{0};
     /// Last time the model was seen loaded here / on the remote router.
     std::chrono::steady_clock::time_point local_warm_at{};
     std::chrono::steady_clock::time_point remote_warm_at{};
@@ -1579,16 +1611,31 @@ public:
                                std::to_string(waited.count()));
   }
 
+  /// The highest priority among the waiting pool requests of `model_id`
+  /// above `priority`, or -1 (state mutex held).
+  int HigherWaitingLocked(const std::string& model_id, int priority) const {
+    const auto it = pool_.find(model_id);
+    if (it == pool_.end())
+      return -1;
+    for (int level = router::kPriorityMax; level > priority; --level)
+      if (it->second.waiting_by_priority[level] > 0)
+        return level;
+    return -1;
+  }
+
   /// placement = pool (see pool.hpp): picks this machine or the remote
   /// router for one new request, waits (lock released) while neither fits,
   /// up to the remote section's queue-timeout-seconds. A local load that
   /// fails sends the request to the remote when it fits; a relay that got
   /// no answer at all (connect failure, closed before the head) is decided
   /// again without the remote, once, unless it created a job.
+  /// Priority (2.0.3, X-Gufo-Priority or "priority"): a request that sees
+  /// a free machine lets a waiting request of the same model with a
+  /// higher priority go first, at most kPoolYieldMax in a row.
   HttpResponse DispatchPoolLocked(const HttpRequest& req,
                                   const std::string& model_id,
                                   const router::PresetModel& preset,
-                                  const std::string& music_job,
+                                  const std::string& music_job, int priority,
                                   std::unique_lock<std::mutex>& lock) {
     constexpr std::chrono::milliseconds kPoolPoll{200};
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
@@ -1686,10 +1733,13 @@ public:
         began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
     bool remote_failed = false;
     bool waiting = false;
+    // Since when this request lets a higher priority go first (2.0.3).
+    std::chrono::steady_clock::time_point yield_began{};
     std::optional<HttpResponse> local_failure;
     const auto stop_waiting = [&] {
       if (waiting) {
         --pool_[model_id].waiting;
+        --pool_[model_id].waiting_by_priority[priority];
         waiting = false;
       }
     };
@@ -1738,7 +1788,38 @@ public:
         pool_input.local.available = false;
       else if (forced == "local")
         pool_input.remote.available = false;
-      const router::PoolDecision decision = router::ChoosePool(pool_input);
+      router::PoolDecision decision = router::ChoosePool(pool_input);
+      // Priority (2.0.3): a free machine goes to a waiting request of this
+      // model with a higher priority first; this one yields, at most
+      // kPoolYieldMax in a row (never stuck: the higher one may be pinned
+      // to the other side).
+      if (decision.choice != router::PoolChoice::kWait) {
+        const auto now = std::chrono::steady_clock::now();
+        router::PoolYieldInput yield_input;
+        yield_input.priority = priority;
+        yield_input.highest_waiting = HigherWaitingLocked(model_id, priority);
+        yield_input.yielded =
+            yield_began == std::chrono::steady_clock::time_point{}
+                ? std::chrono::milliseconds(0)
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - yield_began);
+        yield_input.forwarded = forwarded;
+        if (router::PoolShouldYield(yield_input)) {
+          if (yield_began == std::chrono::steady_clock::time_point{}) {
+            yield_began = now;
+            ++pool_[model_id].yields;
+            Logger::Info("router",
+                         "event=pool_yield model=" + model_id +
+                             " priority=" + std::to_string(priority) +
+                             " to_priority=" +
+                             std::to_string(yield_input.highest_waiting) +
+                             " waited_ms=" + std::to_string(waited.count()));
+          }
+          decision = {router::PoolChoice::kWait, "yields to a higher priority"};
+        } else {
+          yield_began = {};
+        }
+      }
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
@@ -1856,6 +1937,7 @@ public:
       if (!waiting) {
         waiting = true;
         ++pool_[model_id].waiting;
+        ++pool_[model_id].waiting_by_priority[priority];
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "wait");
       }
@@ -1903,6 +1985,9 @@ public:
     if (const auto it = pool_.find(model_id); it != pool_.end()) {
       const PoolEntry& pool = it->second;
       out["waiting"] = static_cast<long long>(pool.waiting);
+      out["waiting_priority"] =
+          static_cast<long long>(HigherWaitingLocked(model_id, -1));
+      out["yields"] = pool.yields;
       out["local_claims"] = static_cast<long long>(pool.local_claims);
       out["local_picks"] = pool.local_picks;
       out["remote_picks"] = pool.remote_picks;
