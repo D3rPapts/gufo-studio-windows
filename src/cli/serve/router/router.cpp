@@ -223,6 +223,7 @@ std::optional<HttpResponse> ServePage(const std::filesystem::path& dir,
                            : ext == ".css" ? "text/css; charset=utf-8"
                            : ext == ".png" ? "image/png"
                            : ext == ".svg" ? "image/svg+xml"
+                           : ext == ".ico" ? "image/x-icon"
                            : ext == ".jpg" ? "image/jpeg"
                            : ext == ".mp4" ? "video/mp4"
                            : ext == ".wav" ? "audio/wav"
