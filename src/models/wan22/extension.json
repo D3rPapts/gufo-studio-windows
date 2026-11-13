@@ -112,7 +112,7 @@
   "docs": {
     "title": "Wan 2.2 TI2V 5B and Wan 2.1 14B (Uni3C camera, VACE, InfiniteTalk)",
     "inputs": "Diffusers Wan 2.2 directory or gufo-camera/vace/talk.json bundles; text, image, audio and video conditioning",
-    "guide": "src/models/wan22/extension.json"
+    "guide": "../../src/models/wan22/extension.json"
   },
   "tests": [
     {

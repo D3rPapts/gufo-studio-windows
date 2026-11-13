@@ -29,6 +29,9 @@ GUIDE_LABELS = {
     "qwen3-tts": "Voice modes",
     "qwen3.8-27b": "Usage and modes",
     "qwen3.8-flash-next": "Usage and modes",
+    # A manifest without a user guide links its own extension.json (the
+    # guide path is relative to docs/models/, e.g. ../../src/models/x/).
+    "extension": "Extension manifest (no user guide yet)",
 }
 
 
