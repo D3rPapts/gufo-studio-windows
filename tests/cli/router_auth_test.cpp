@@ -2326,12 +2326,23 @@ void TestChatFilter() {
   CHECK_EQ(r.status, 400);
   CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
   CHECK(!r.streaming_body);
-  // An earlier user turn counts, text parts count, system/assistant not.
+  // Only the last user turn is read (a refused question the page keeps
+  // in the history must not block the conversation); text parts count,
+  // system/assistant not.
   r = chat("/v1/chat/completions", kind,
            "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
            "\"nackt\"},{\"role\":\"assistant\",\"content\":\"ok\"},"
            "{\"role\":\"user\",\"content\":\"weiter\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"Haus\"},{\"role\":\"assistant\",\"content\":\"ok\"},"
+           "{\"role\":\"user\",\"content\":\"nackt\"}]}");
   CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"input\":[{\"role\":\"user\",\"content\":"
+           "\"nackt\"},{\"role\":\"user\",\"content\":\"Haus\"}]}");
+  CHECK_EQ(r.status, 200);
   r = chat("/v1/chat/completions", kind,
            "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
            "[{\"type\":\"text\",\"text\":\"ein nsfw bild\"}]}]}");

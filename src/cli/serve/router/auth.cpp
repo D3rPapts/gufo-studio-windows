@@ -1381,8 +1381,9 @@ namespace {
 /// The texts a chat request carries from the user (2.0.5): `prompt` (a
 /// string or strings: completions), every user message of `messages`
 /// (chat completions, Anthropic messages) and every user item of `input`
-/// (responses), each a string or parts with a `text`. Every user turn is
-/// read, not only the last one: a client may send any history.
+/// (responses), each a string or parts with a `text`. Of `messages` and
+/// `input` only the last user turn is read: a refused question the page
+/// keeps in the history must not block the conversation for good.
 void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
   const auto content = [out](const json::Value& value) {
     if (value.is_string()) {
@@ -1413,16 +1414,18 @@ void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
     }
     if (!list->is_array())
       continue;
+    const json::Value* last = nullptr;
     for (const json::Value& item : list->items()) {
-      if (item.is_string()) {
-        out->push_back(item.str());
-        continue;
-      }
-      if (!item.is_object() || item.member_str("role", "user") != "user")
-        continue;
-      if (const json::Value* c = item.find("content"))
-        content(*c);
+      if (item.is_string() ||
+          (item.is_object() && item.member_str("role", "user") == "user"))
+        last = &item;
     }
+    if (last == nullptr)
+      continue;
+    if (last->is_string())
+      out->push_back(last->str());
+    else if (const json::Value* c = last->find("content"))
+      content(*c);
   }
 }
 
