@@ -61,6 +61,16 @@ void EnsureDetachInterruptHandler() {
 }
 #endif
 
+// Whether the comma-separated header value lists the lowercase token.
+bool HasToken(std::string_view value, std::string_view token) {
+  const int found = gufo_http_has_token(
+      reinterpret_cast<const std::uint8_t*>(value.data()), value.size(),
+      reinterpret_cast<const std::uint8_t*>(token.data()), token.size());
+  if (found < 0)
+    throw std::logic_error("Rust HTTP token check failed internally");
+  return found != 0;
+}
+
 }  // namespace
 
 bool IsWebSocketUpgrade(const HttpRequest& request) {
