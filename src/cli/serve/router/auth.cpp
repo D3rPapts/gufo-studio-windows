@@ -1087,8 +1087,7 @@ Route Classify(const HttpRequest& req) {
   if (p == "/router/status" || p == "/router/capabilities" ||
       p == "/router/placement" || p == "/v1/models" || p == "/models" ||
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||
-      p.starts_with("/v1/names/") || p == "/v1/slots" || p == "/props" ||
-      p == "/v1/systemone")
+      p.starts_with("/v1/names/") || p == "/v1/systemone")
     return set(Route::Kind::kAnyUser);
   // Generation endpoints by prefix.
   struct Prefix {
@@ -1111,6 +1110,12 @@ Route Classify(const HttpRequest& req) {
       {"/v1/reranking", "text", 0, false},
       {"/v1/realtime", "text", 0, false},
       {"/v1/figuren", "text", 0, false},
+      // GETs that load the model named by ?model= (router IsModelQueryGet
+      // and the introspection paths): the model's area and model list.
+      {"/props", "text", 0, false},
+      {"/v1/slots", "text", 0, false},
+      {"/slots", "text", 0, false},
+      {"/sdapi/v1/loras", "bild", 0, false},
       {"/v1/images/", "bild", 1, true},
       {"/v1/images", "bild", 1, true},
       {"/v1/previews/", "bild|video", 0, false},
@@ -1319,7 +1324,7 @@ Gate::Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks)
       store_(std::move(store)),
       hooks_(std::move(hooks)),
       filter_(store_->dir() / "filter-woerter.txt"),
-      internal_key_(RandomHex(24)) {
+      internal_key_(RandomHex(32)) {
   if (settings_.mode != Mode::kOff)
     filter_.EnsureDefaults();
   // The day of the last line decides when the log rotates next.
@@ -1471,8 +1476,10 @@ std::optional<Identity> Gate::SessionIdentity(std::string_view id) {
 Identity Gate::Identify(const HttpRequest& req) {
   const std::string address = RequestAddress(req);
   const bool loopback = IsLoopback(address);
-  // The router's own calls (jobs runner, figure check, ComfyUI adapter).
-  if (loopback) {
+  // The router's own calls (jobs runner, figure check, ComfyUI adapter):
+  // a 256-bit secret of this process, whatever address they arrive from
+  // (self_fetch connects to --host, which may be the LAN address).
+  {
     const std::string internal = req.header(kInternalHeader);
     if (!internal.empty() && !internal_key_.empty() &&
         ConstantTimeEquals(internal, internal_key_)) {
@@ -1496,8 +1503,18 @@ Identity Gate::Identify(const HttpRequest& req) {
       Identity who;
       who.source = Identity::Source::kPool;
       const std::string user = Lower(req.header(kUserHeader));
-      who.name = IsValidName(user) ? user : "partner";
-      who.rolle = "dienst";
+      if (!IsValidName(user)) {
+        // The partner router itself (probe, capabilities, pull, the
+        // queue it reads for the shared order): trusted like the
+        // router's own calls, nothing is filtered for it.
+        who.name = "partner";
+        who.rolle = "admin";
+        return who;
+      }
+      // A relayed request for one of the partner's users: its rights as
+      // the entry router checked them, the own-jobs rule applies here.
+      who.name = user;
+      who.rolle = "nutzer";
       const std::string rights = req.header(kRightsHeader);
       who.rechte = Rights::Decode(rights);
       for (const std::string& pair : Split(rights, ';'))
@@ -1557,6 +1574,28 @@ bool Gate::CountDaily(const Identity& who, int weight, long long limit) {
     return false;
   entry.second += weight;
   return true;
+}
+
+void Gate::RememberOwner(std::string_view key, std::string_view name) {
+  if (key.empty() || name.empty())
+    return;
+  const long long now = Now();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (owners_.size() >= 20000) {
+    for (auto it = owners_.begin(); it != owners_.end();)
+      it = it->second.second < now - 86400 ? owners_.erase(it) : std::next(it);
+    if (owners_.size() >= 20000)
+      owners_.clear();  // a day's worth of ids is gone: unknown = open
+  }
+  owners_[std::string(key)] = {std::string(name), now};
+}
+
+std::optional<std::string> Gate::OwnerOf(std::string_view key) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = owners_.find(std::string(key));
+  if (it == owners_.end() || it->second.second < Now() - 86400)
+    return std::nullopt;
+  return it->second.first;
 }
 
 long long Gate::DailyCount(std::string_view name) {
@@ -1735,8 +1774,93 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
       return std::nullopt;
     }
     case Route::Kind::kWork: {
+      int counts = route.counts;
+      std::optional<std::vector<WorkItem>> items;
+      if (req.method == "POST" && req.path == "/prompt" && hooks_.comfy_plan) {
+        // A ComfyUI graph: every task it resolves to is checked like a
+        // direct request (area, model, filter), the daily limit counts
+        // them all (videos twice). A graph that does not build gets the
+        // plain checks below (area bild, every string through the
+        // filter) and the adapter's error; nothing is counted for it.
+        items = hooks_.comfy_plan(req);
+        if (!items.has_value())
+          counts = 0;
+      }
+      if (items.has_value()) {
+        counts = 0;
+        for (const WorkItem& item : *items) {
+          if (!who.rechte.AllowsArea(item.area))
+            return Forbidden(AreaMessage(item.area), "forbidden");
+          if (!who.rechte.AllowsModel(item.model))
+            return Forbidden("Modell " + item.model +
+                                 " ist für diesen Nutzer nicht freigegeben "
+                                 "(model " +
+                                 item.model + " is not enabled for this user)",
+                             "model_forbidden");
+          if (who.rechte.FilterOn(who.rolle)) {
+            for (const std::string& text : item.texts) {
+              if (const std::string word = filter_.HitText(text);
+                  !word.empty()) {
+                Log(req, who, "abgelehnt:content_filtered", item.model);
+                return AuthError(400, "Bad Request",
+                                 "Der Prompt enthält ein gesperrtes Wort "
+                                 "(the prompt contains a blocked word)",
+                                 "content_filtered");
+              }
+            }
+          }
+          counts += item.counts;
+        }
+        if (counts > 0 && who.rechte.tageslimit > 0 &&
+            !CountDaily(who, counts, who.rechte.tageslimit))
+          return AuthError(429, "Too Many Requests",
+                           "Tageslimit von " +
+                               std::to_string(who.rechte.tageslimit) +
+                               " Aufträgen erreicht (daily limit reached)",
+                           "daily_limit");
+        return std::nullopt;
+      }
       if (!who.rechte.AllowsArea(route.area))
         return Forbidden(AreaMessage(route.area), "forbidden");
+      // Things of other users the job store does not know: a direct video
+      // job (/v1/videos/<id>[/content]), the job files a concat names, a
+      // ComfyUI prompt's history entry (POST /history deletes).
+      if (req.path.starts_with("/v1/videos/") && req.method != "POST") {
+        std::string id = req.path.substr(std::string("/v1/videos/").size());
+        if (const auto slash = id.find('/'); slash != std::string::npos)
+          id.resize(slash);
+        if (const auto owner = OwnerOf("video:" + id);
+            owner.has_value() && *owner != who.name)
+          return NotFound();
+      }
+      if (req.method == "POST" &&
+          (req.path == "/v1/videos/concat" || req.path == "/history")) {
+        try {
+          const json::Value body = json::parse(req.body);
+          const json::Value* list =
+              body.find(req.path == "/history" ? "delete" : "videos");
+          if (list != nullptr && list->is_array()) {
+            for (const json::Value& item : list->items()) {
+              if (!item.is_string())
+                continue;
+              std::optional<std::string> owner;
+              if (req.path == "/history") {
+                owner = OwnerOf("prompt:" + item.str());
+              } else if (const auto at = item.str().find("/v1/jobs/");
+                         at != std::string::npos && hooks_.job_owner) {
+                std::string id = item.str().substr(at + 9);
+                if (const auto slash = id.find('/'); slash != std::string::npos)
+                  id.resize(slash);
+                owner = hooks_.job_owner(id);
+              }
+              if (owner.has_value() && *owner != who.name)
+                return NotFound();
+            }
+          }
+        } catch (const std::exception&) {
+          // The adapter / concat answers the parse error.
+        }
+      }
       std::string model;
       if (hooks_.model_of)
         model = hooks_.model_of(req);
@@ -1756,8 +1880,8 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                            "content_filtered");
         }
       }
-      if (route.counts > 0 && who.rechte.tageslimit > 0 &&
-          !CountDaily(who, route.counts, who.rechte.tageslimit)) {
+      if (counts > 0 && who.rechte.tageslimit > 0 &&
+          !CountDaily(who, counts, who.rechte.tageslimit)) {
         return AuthError(429, "Too Many Requests",
                          "Tageslimit von " +
                              std::to_string(who.rechte.tageslimit) +
@@ -1796,8 +1920,64 @@ void Gate::After(const HttpRequest& req, const Route& route,
                  const Identity& who, HttpResponse* response) {
   const bool pool_user =
       who.source == Identity::Source::kPool && !who.admin();
-  if (route.kind != Route::Kind::kJobs || who.admin() ||
-      (who.trusted() && !pool_user) || req.method != "GET" ||
+  // Owners of ComfyUI prompts and direct video jobs come from the answer.
+  if (req.method == "POST" && response->status < 300 && !who.name.empty() &&
+      route.kind == Route::Kind::kWork) {
+    if (req.path == "/prompt" && !response->streaming_body) {
+      try {
+        const std::string id = json::parse(response->body).member_str("prompt_id");
+        RememberOwner("prompt:" + id, who.name);
+      } catch (const std::exception&) {
+      }
+    } else if (req.path == "/v1/videos") {
+      const std::string name = who.name;
+      const auto record = [this, name](const std::string& body) {
+        try {
+          const std::string id = json::parse(body).member_str("id");
+          RememberOwner("video:" + id, name);
+        } catch (const std::exception&) {
+        }
+      };
+      if (response->streaming_body) {
+        // The worker's answer streams through: read the id on the way.
+        auto inner = std::move(response->streaming_body);
+        response->streaming_body =
+            [inner, record](const HttpResponse::BodyWriter& write) {
+              std::string seen;
+              inner([&](std::string_view chunk) {
+                if (seen.size() < 65536)
+                  seen.append(chunk);
+                return write(chunk);
+              });
+              record(seen);
+            };
+      } else {
+        record(response->body);
+      }
+    }
+    return;
+  }
+  const bool restricted = !who.admin() && !(who.trusted() && !pool_user);
+  if (restricted && req.method == "GET" && route.kind == Route::Kind::kWork &&
+      (req.path == "/history" || req.path.starts_with("/history/")) &&
+      response->status == 200 && !response->streaming_body) {
+    // ComfyUI history: an object keyed by prompt id; a user sees its own.
+    try {
+      const json::Value history = json::parse(response->body);
+      if (history.is_object()) {
+        json::Value kept = json::Value::object();
+        for (const auto& [id, entry] : history.members()) {
+          const auto owner = OwnerOf("prompt:" + id);
+          if (owner.has_value() && *owner == who.name)
+            kept[id] = entry;
+        }
+        response->body = kept.dump();
+      }
+    } catch (const std::exception&) {
+    }
+    return;
+  }
+  if (route.kind != Route::Kind::kJobs || !restricted || req.method != "GET" ||
       response->status != 200 || response->streaming_body)
     return;
   if (req.path == "/v1/jobs") {
@@ -2158,6 +2338,34 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
         return NotFound();
       if (route.kind == Route::Kind::kAdminPage)
         return std::nullopt;
+      if (req.method != "GET" && req.method != "HEAD") {
+        // A page from elsewhere in a browser on this machine must not
+        // reach the API (no-cors POST): a cross-site fetch, or an Origin
+        // that is not this router, is refused; a body must be JSON (a
+        // preflight stops a cross-site one before it is sent).
+        if (Lower(req.header("Sec-Fetch-Site")) == "cross-site")
+          return AuthError(403, "Forbidden",
+                           "cross-site request refused (Sec-Fetch-Site)",
+                           "csrf_rejected");
+        const std::string origin = Lower(req.header("Origin"));
+        const std::string host = Lower(req.header("Host"));
+        if (!origin.empty() && origin != "null") {
+          std::string origin_host = origin;
+          if (const auto scheme = origin_host.find("://");
+              scheme != std::string::npos)
+            origin_host.erase(0, scheme + 3);
+          if (host.empty() || origin_host != host)
+            return AuthError(403, "Forbidden",
+                             "cross-site request refused (Origin " + origin +
+                                 " is not this router)",
+                             "csrf_rejected");
+        }
+        if (!req.body.empty() &&
+            !Lower(req.header("Content-Type")).starts_with("application/json"))
+          return AuthError(415, "Unsupported Media Type",
+                           "the users API takes application/json",
+                           "json_required");
+      }
       return UsersApi(req, who);
     }
     default:
@@ -2173,10 +2381,26 @@ HttpResponse Gate::Serve(
     return next(req);
   const Identity who = Identify(req);
   if (settings_.mode == Mode::kOff) {
-    // Stage 0: only the auth endpoints exist; nothing else is touched.
+    // Stage 0: only the auth endpoints exist. A client's identity headers
+    // still go (they would name a job's owner here and reach a partner
+    // with auth = lan beside the real pool key); nothing else is touched.
     if (auto answer = AuthEndpoint(req, route, who))
       return std::move(*answer);
-    return next(req);
+    const bool spoofed = std::any_of(
+        req.headers.begin(), req.headers.end(), [](const auto& header) {
+          const std::string name = Lower(header.first);
+          return name == Lower(kUserHeader) || name == Lower(kRightsHeader) ||
+                 name == Lower(kInternalHeader);
+        });
+    if (!spoofed)
+      return next(req);
+    HttpRequest copy = req;
+    std::erase_if(copy.headers, [](const auto& header) {
+      const std::string name = Lower(header.first);
+      return name == Lower(kUserHeader) || name == Lower(kRightsHeader) ||
+             name == Lower(kInternalHeader);
+    });
+    return next(copy);
   }
   if (auto answer = AuthEndpoint(req, route, who))
     return std::move(*answer);

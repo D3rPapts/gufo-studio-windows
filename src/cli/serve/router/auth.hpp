@@ -315,6 +315,16 @@ private:
 [[nodiscard]] std::vector<std::string> PromptTexts(
     const server::HttpRequest& req, bool all_strings);
 
+/// One unit of work a ComfyUI graph (POST /prompt) resolves to: the
+/// area and model it runs on, how it counts against the daily limit and
+/// the prompt texts the word filter sees.
+struct WorkItem {
+  std::string area;
+  std::string model;
+  int counts{1};
+  std::vector<std::string> texts;
+};
+
 /// The request gate. One per router; thread-safe.
 class Gate {
 public:
@@ -324,6 +334,11 @@ public:
     /// The owner (metadata.nutzer) of a local job, nullopt when unknown.
     std::function<std::optional<std::string>(const std::string& job_id)>
         job_owner;
+    /// The tasks a ComfyUI /prompt body resolves to (the adapter's plan);
+    /// nullopt when the graph does not build (the adapter answers that).
+    std::function<std::optional<std::vector<WorkItem>>(
+        const server::HttpRequest&)>
+        comfy_plan;
   };
 
   Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks);
@@ -391,6 +406,12 @@ public:
   /// Daily count of a user (tests).
   [[nodiscard]] long long DailyCount(std::string_view name);
 
+  /// Owners of things the job store does not know: ComfyUI prompts
+  /// ("prompt:<id>") and direct video jobs ("video:<id>"), remembered
+  /// from the answers for a day (in memory; unknown = not checked).
+  void RememberOwner(std::string_view key, std::string_view name);
+  [[nodiscard]] std::optional<std::string> OwnerOf(std::string_view key);
+
 private:
   struct SessionInfo {
     std::string name;
@@ -419,6 +440,7 @@ private:
   std::map<std::string, SessionInfo> sessions_;
   std::map<std::string, std::deque<long long>> failures_;
   std::map<std::string, std::pair<std::string, long long>> daily_;
+  std::map<std::string, std::pair<std::string, long long>> owners_;
   std::mutex log_mutex_;
   std::string log_day_;
 };

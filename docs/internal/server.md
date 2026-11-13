@@ -1051,9 +1051,11 @@ pool-secret-env = GUFO_POOL_SECRET
 
 Order per request: free paths (`/health`, `/ready`, `/login/` and its
 files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
-router's own calls (jobs runner, figure check, ComfyUI adapter: a
-per-process key on loopback), the partner (pool key), `Authorization:
-Bearer gufo_...` (API tokens), the `gufo_sitzung` cookie (HttpOnly,
+router's own calls (jobs runner, figure check, ComfyUI adapter: a 256-bit
+per-process key, whatever address `--host` makes them arrive from), the
+partner (pool key: without `X-Gufo-User` it is the partner router itself,
+trusted like the router's own calls; with it, the relayed user),
+`Authorization: Bearer gufo_...` (API tokens), the `gufo_sitzung` cookie (HttpOnly,
 SameSite=Lax, 12 h; "stay signed in" 30 days, stored hashed in the users
 file so it survives a restart), and finally loopback as admin. Anything
 else gets `401 not_authenticated` (JSON) or, for a page, `302` to
@@ -1115,7 +1117,28 @@ Endpoints (JSON):
 | `GET /router/zugriff?n=N` | loopback or admin | Last N lines of the access log. |
 
 Everyone else gets `404` on the users API and on `/verwaltung/`, so the
-pages are invisible from outside. The users file (`{"version": 1,
+pages are invisible from outside. Writes to the users API must come as
+`application/json` (`415 json_required`) and not cross-site: a request
+with `Sec-Fetch-Site: cross-site`, or an `Origin` that is not this
+router's `Host`, is `403 csrf_rejected`, so a web page opened on the
+router machine cannot create users through the loopback admin path.
+With `auth = off` the gate still drops a client's `X-Gufo-User`,
+`X-Gufo-Rights` and `X-Gufo-Internal` headers.
+
+ComfyUI graphs (`POST /prompt`) are resolved to the adapter's tasks
+before they run: each task is checked like a direct request (its area
+and model, the word filter on image, video and foley prompts) and all of
+them count against the daily limit (videos twice). `/props`,
+`/sdapi/v1/loras` and `/v1/slots` load the model they name and count as
+work of that model's area (text, bild, text). Beyond the job store the
+gate remembers for a day who submitted each ComfyUI prompt and each
+direct video job (from the answers, in memory): `GET /history` shows a
+user its own prompts, `POST /history` deletes only its own,
+`/v1/videos/<id>[/content]` and the job files a `POST /v1/videos/concat`
+names answer `404` for another user's; an id the gate never saw (before
+a restart, or created by the router itself) is open. `/view` is not
+checked (ComfyUI file names carry no owner). Idempotency keys are per
+owner. The users file (`{"version": 1,
 "nutzer": [...]}`) holds per user the name, role, PBKDF2-SHA256 hash
 (600 000 rounds, 16-byte salt), rights, token hashes with name and
 expiry, remembered session hashes, timestamps and `gesperrt`; it is

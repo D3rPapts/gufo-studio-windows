@@ -131,9 +131,36 @@ struct Fixture {
         return std::string();
       }
       try {
-        return json::parse(req.body).member_str("model");
+        const std::string model = json::parse(req.body).member_str("model");
+        if (!model.empty())
+          return model;
       } catch (const std::exception&) {
-        return std::string();
+      }
+      return req.query_param("model");
+    };
+    // A fake graph plan: the body's "tasks" [{area, model, counts, texts}].
+    hooks.comfy_plan = [](const HttpRequest& req)
+        -> std::optional<std::vector<auth::WorkItem>> {
+      try {
+        const json::Value body = json::parse(req.body);
+        const json::Value* tasks = body.find("tasks");
+        if (tasks == nullptr || !tasks->is_array())
+          return std::nullopt;
+        std::vector<auth::WorkItem> items;
+        for (const json::Value& task : tasks->items()) {
+          auth::WorkItem item;
+          item.area = task.member_str("area");
+          item.model = task.member_str("model");
+          item.counts = static_cast<int>(task.member_double("counts", 1));
+          if (const json::Value* texts = task.find("texts");
+              texts != nullptr && texts->is_array())
+            for (const json::Value& text : texts->items())
+              item.texts.push_back(text.str());
+          items.push_back(std::move(item));
+        }
+        return items;
+      } catch (const std::exception&) {
+        return std::nullopt;
       }
     };
     hooks.job_owner = [](const std::string& id) -> std::optional<std::string> {
@@ -604,6 +631,21 @@ void TestAreasAndJobs() {
   r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
                   "{\"model\":\"qwen3.5-4b\"}", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 200);
+  // GETs that load the model they name are work of that model's area.
+  r = f.Serve(Req("GET", "/sdapi/v1/loras?model=qwen-image-2.1", "192.168.178.50",
+                  "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("forbidden"));
+  r = f.Serve(Req("GET", "/props?model=qwen3.8-27b", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("model_forbidden"));
+  r = f.Serve(Req("GET", "/props?model=qwen3.5-4b", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/v1/slots?model=qwen3.8-27b", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
   // Admin control is admin only.
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", tim}}));
@@ -762,7 +804,8 @@ void TestPoolSecret() {
                                         {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK(who.source == auth::Identity::Source::kPool);
   CHECK_EQ(who.name, std::string("partner"));
-  CHECK_EQ(who.rolle, std::string("dienst"));
+  CHECK_EQ(who.rolle, std::string("admin"));  // the partner router itself
+  CHECK(who.trusted());
   // Job requests the partner relays for a user: that user's jobs only
   // (the entry router cannot know this router's jobs); an admin sees all.
   const std::vector<std::pair<std::string, std::string>> as_tim = {
@@ -805,6 +848,27 @@ void TestPoolSecret() {
   CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(1));
   r = f.Serve(Req("GET", "/v1/jobs", "192.168.100.56", "", as_admin));
   CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(2));
+  // The partner router's own calls (shared queue: the queued list it
+  // orders by, a pull, a pulled job's state) see everything.
+  r = f.Serve(Req("GET", "/v1/jobs?status=queued&limit=1000", "192.168.100.56",
+                  "", {{"X-Gufo-Pool-Key", "sehr-geheim"}, {"X-Gufo-Relay", "1"}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(2));
+  r = f.Serve(Req("GET", "/v1/jobs/j-anna", "192.168.100.56", "",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 200);
+  f.next = [&f](const HttpRequest& req) {
+    f.seen.push_back(req.path);
+    f.last = req;
+    return HttpResponse{.status = 200, .reason = "OK", .body = "{}"};
+  };
+  f.seen.clear();
+  r = f.Serve(Req("POST", "/router/pool/pull", "192.168.100.56",
+                  "{\"from\":\"http://192.168.100.56:8081\"}",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.seen.size(), std::size_t(1));
+  CHECK_EQ(f.last.header("X-Gufo-User"), std::string("partner"));
   // Generation requests of a relayed user are not checked again here.
   r = f.Serve(Req("POST", "/v1/images/generations", "192.168.100.56",
                   "{\"model\":\"m\",\"prompt\":\"nackt\"}", as_tim));
@@ -828,8 +892,15 @@ void TestPoolSecret() {
   CHECK(own.source == auth::Identity::Source::kInternal);
   CHECK_EQ(own.name, std::string("tim"));
   CHECK(own.admin());
-  CHECK(!g.gate->Identify(Req("POST", "/v1/images/generations", "192.168.178.50",
-                              "{}", {{"X-Gufo-Internal", key}}))
+  // self_fetch connects to --host, which may be the LAN address: the
+  // 256-bit process key counts wherever it arrives from.
+  CHECK_EQ(key.size(), std::size_t(64));
+  const auto lan = g.gate->Identify(Req("POST", "/v1/images/generations",
+                                        "192.168.178.198", "{}",
+                                        {{"X-Gufo-Internal", key}}));
+  CHECK(lan.source == auth::Identity::Source::kInternal);
+  CHECK(!g.gate->Identify(Req("POST", "/v1/images/generations", "192.168.178.198",
+                              "{}", {{"X-Gufo-Internal", std::string(64, 'f')}}))
              .authenticated());
 }
 
@@ -946,6 +1017,134 @@ void TestFilterAndLimit() {
   r = g.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
                   "{\"model\":\"m\",\"prompt\":\"Tölpel\"}", {{"Cookie", kind2}}));
   CHECK_EQ(r.status, 200);
+  // ComfyUI graphs: every task of the plan is checked (area, model,
+  // filter), the daily limit counts them all (videos twice).
+  const auto graph = [](const std::string& tasks) {
+    return "{\"prompt\":{},\"tasks\":[" + tasks + "]}";
+  };
+  r = g.Serve(Req("POST", "/prompt", "192.168.178.50",
+                  graph("{\"area\":\"bild\",\"model\":\"m\",\"texts\":[\"ein nacktes Bild\"]}"),
+                  {{"Cookie", kind2}}));
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  r = g.Serve(Req("POST", "/prompt", "192.168.178.50",
+                  graph("{\"area\":\"bild\",\"model\":\"m\",\"texts\":[\"Haus\"]},"
+                        "{\"area\":\"stimme\",\"model\":\"tts\"}"),
+                  {{"Cookie", kind2}}));
+  CHECK_EQ(r.status, 200);
+  {
+    Fixture c;
+    auth::Rights only_text;
+    only_text.bereiche = {"text", "bild"};
+    only_text.modelle = {"qwen-image-2.1"};
+    only_text.tageslimit = 3;
+    c.AddUser("tim", "nutzer", "tim-pw", only_text);
+    const std::string cookie = c.LoginCookie("tim", "tim-pw");
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    graph("{\"area\":\"video\",\"model\":\"minimax-h3\",\"counts\":2}"),
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 403);  // video is closed
+    CHECK(r.body.find("Bereich video") != std::string::npos);
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    graph("{\"area\":\"bild\",\"model\":\"moss-image\"}"),
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(ErrorCode(r), std::string("model_forbidden"));
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    graph("{\"area\":\"bild\",\"model\":\"qwen-image-2.1\"},"
+                          "{\"area\":\"bild\",\"model\":\"qwen-image-2.1\"}"),
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(c.gate->DailyCount("tim"), 2LL);
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    graph("{\"area\":\"bild\",\"model\":\"qwen-image-2.1\",\"counts\":2}"),
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 429);
+    // A graph that does not build: the adapter answers, nothing counted.
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50", "{\"prompt\":{}}",
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(c.gate->DailyCount("tim"), 2LL);
+    // Owners beyond the job store: a prompt's history entry and a direct
+    // video job are remembered from the answers.
+    c.AddUser("anna", "nutzer", "anna-pw");
+    const std::string anna = c.LoginCookie("anna", "anna-pw");
+    c.next = [](const HttpRequest& req) {
+      std::string body = "{}";
+      if (req.path == "/prompt")
+        body = "{\"prompt_id\":\"p-tim\"}";
+      else if (req.path == "/history")
+        body = "{\"p-tim\":{\"n\":1},\"p-anna\":{\"n\":2},\"p-alt\":{\"n\":3}}";
+      return HttpResponse{.status = 200, .reason = "OK", .body = body};
+    };
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    graph("{\"area\":\"bild\",\"model\":\"qwen-image-2.1\",\"counts\":0}"),
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    CHECK(c.gate->OwnerOf("prompt:p-tim") == std::optional<std::string>("tim"));
+    c.gate->RememberOwner("prompt:p-anna", "anna");
+    r = c.Serve(Req("GET", "/history", "192.168.178.50", "", {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    {
+      const json::Value history = json::parse(r.body);
+      CHECK_EQ(history.size(), std::size_t(1));
+      CHECK(history.contains("p-tim"));
+    }
+    r = c.Serve(Req("POST", "/history", "192.168.178.50",
+                    "{\"delete\":[\"p-anna\"]}", {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 404);
+    r = c.Serve(Req("POST", "/history", "192.168.178.50",
+                    "{\"delete\":[\"p-tim\",\"p-unbekannt\"]}", {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    // A direct video job: its id streams back from the worker.
+    c.next = [](const HttpRequest& req) {
+      HttpResponse out{.status = 200, .reason = "OK"};
+      if (req.method == "POST" && req.path == "/v1/videos")
+        out.streaming_body = [](const HttpResponse::BodyWriter& write) {
+          write("{\"id\":\"vi");
+          write("deo_7\"}");
+        };
+      else
+        out.body = "{}";
+      return out;
+    };
+    r = c.Serve(Req("POST", "/v1/videos", "192.168.178.50",
+                    "{\"model\":\"h3\",\"prompt\":\"See\"}", {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 200);
+    std::string streamed;
+    r.streaming_body([&streamed](std::string_view chunk) {
+      streamed.append(chunk);
+      return true;
+    });
+    CHECK_EQ(streamed, std::string("{\"id\":\"video_7\"}"));
+    CHECK(c.gate->OwnerOf("video:video_7") == std::optional<std::string>("anna"));
+    r = c.Serve(Req("GET", "/v1/videos/video_7", "192.168.178.50", "", {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 200);
+    r = c.Serve(Req("GET", "/v1/videos/video_7/content", "192.168.178.50", "",
+                    {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 200);
+    // tim has no video area at all; give anna's colleague one to see the
+    // owner check alone.
+    c.AddUser("ben", "nutzer", "ben-pw");
+    const std::string ben = c.LoginCookie("ben", "ben-pw");
+    r = c.Serve(Req("GET", "/v1/videos/video_7", "192.168.178.50", "", {{"Cookie", ben}}));
+    CHECK_EQ(r.status, 404);
+    r = c.Serve(Req("DELETE", "/v1/videos/video_7/content", "192.168.178.50", "",
+                    {{"Cookie", ben}}));
+    CHECK_EQ(r.status, 404);
+    r = c.Serve(Req("GET", "/v1/videos/video_unknown", "192.168.178.50", "",
+                    {{"Cookie", ben}}));
+    CHECK_EQ(r.status, 200);  // unknown to the gate: open
+    // Concat names job files: only own jobs (the job store's owner).
+    r = c.Serve(Req("POST", "/v1/videos/concat", "192.168.178.50",
+                    "{\"videos\":[\"/v1/jobs/j-anna/files/video.mp4\",\"/v1/jobs/j-tim/files/video.mp4\"]}",
+                    {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 404);
+    r = c.Serve(Req("POST", "/v1/videos/concat", "192.168.178.50",
+                    "{\"videos\":[\"http://x/v1/jobs/j-anna/files/video.mp4\",\"/v1/jobs/j-anna/files/b.mp4\",\"/v1/jobs/j-neu/files/c.mp4\"]}",
+                    {{"Cookie", anna}}));
+    CHECK_EQ(r.status, 200);  // own and unknown jobs pass
+  }
   // Multipart edits: the prompt field, not the image bytes.
   const std::string multipart =
       "--xyz\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n"
@@ -1066,6 +1265,37 @@ void TestUsersApi() {
   CHECK_EQ(r.status, 404);
   r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50", "", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 404);
+  // Writes: JSON only, never cross-site (a page open on the router machine
+  // could otherwise reach the loopback admin path with a no-cors POST).
+  r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
+                  "{\"name\":\"csrf\",\"passwort\":\"abcd\"}",
+                  {{"Content-Type", "text/plain"}}));
+  CHECK_EQ(r.status, 415);
+  CHECK_EQ(ErrorCode(r), std::string("json_required"));
+  r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
+                  "{\"name\":\"csrf\",\"passwort\":\"abcd\"}",
+                  {{"Content-Type", "application/json"},
+                   {"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  r = f.Serve(Req("POST", "/router/users", "127.0.0.1",
+                  "{\"name\":\"csrf\",\"passwort\":\"abcd\"}",
+                  {{"Content-Type", "application/json"},
+                   {"Sec-Fetch-Site", "cross-site"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("DELETE", "/router/users/tim", "127.0.0.1", "",
+                  {{"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
+  CHECK_EQ(r.status, 403);
+  CHECK(!f.store->Find("csrf").has_value());
+  // The router's own pages: same origin, JSON.
+  r = f.Serve(Req("POST", "/router/users", "192.168.178.50",
+                  "{\"name\":\"csrf\",\"passwort\":\"abcd\"}",
+                  {{"Cookie", admin}, {"Content-Type", "application/json"},
+                   {"Origin", "http://192.168.178.198:8081"},
+                   {"Host", "192.168.178.198:8081"}, {"Sec-Fetch-Site", "same-origin"}}));
+  CHECK_EQ(r.status, 201);
+  r = f.Serve(Req("DELETE", "/router/users/csrf?loeschen=1", "127.0.0.1"));
+  CHECK_EQ(r.status, 200);
   r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50", "", {{"Cookie", admin}}));
   CHECK_EQ(r.status, 200);
   r = f.Serve(Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", admin}}));
@@ -1124,6 +1354,18 @@ void TestModes() {
                                  "{\"model\":\"m\",\"prompt\":\"nackt\"}"));
     CHECK_EQ(r.status, 200);
     CHECK_EQ(f.last.header("X-Gufo-User"), std::string(""));  // untouched
+    // A client's identity headers go even so (they would name a job's
+    // owner, and reach a partner with auth = lan beside the pool key).
+    r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", "{}",
+                    {{"X-Gufo-User", "fabian"}, {"X-Gufo-Rights", "rolle=admin"},
+                     {"X-Gufo-Internal", "x"}, {"X-Gufo-Pool", "remote"},
+                     {"X-Other", "bleibt"}}));
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(f.last.header("X-Gufo-User"), std::string(""));
+    CHECK_EQ(f.last.header("X-Gufo-Rights"), std::string(""));
+    CHECK_EQ(f.last.header("X-Gufo-Internal"), std::string(""));
+    CHECK_EQ(f.last.header("X-Gufo-Pool"), std::string("remote"));  // a client's own pin stays
+    CHECK_EQ(f.last.header("X-Other"), std::string("bleibt"));
     r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50"));
     CHECK_EQ(r.status, 404);
     r = f.Serve(Req("GET", "/router/users", "192.168.178.50"));
