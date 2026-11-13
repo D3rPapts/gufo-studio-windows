@@ -1116,6 +1116,8 @@ Route Classify(const HttpRequest& req) {
     return set(Route::Kind::kLogout);
   if (get && p == "/router/me")
     return set(Route::Kind::kMe);
+  if (post && p == "/router/me/passwort")
+    return set(Route::Kind::kPasswort);
   if (p == "/router/users" || p.starts_with("/router/users/") ||
       p == "/router/zugriff")
     return set(Route::Kind::kUsers);
@@ -1125,12 +1127,14 @@ Route Classify(const HttpRequest& req) {
               p.starts_with("/gemeinsam/") || p == "/favicon.ico" ||
               p == "/favicon.svg"))
     return set(Route::Kind::kFree);
-  if (p == "/v1/jobs" || p.starts_with("/v1/jobs/"))
+  if (p == "/v1/jobs" || p.starts_with("/v1/jobs/") ||
+      p == "/router/partner/jobs")
     return set(Route::Kind::kJobs, "ablage");
   if (post && (p == "/models/load" || p == "/models/unload" ||
                p == "/router/placement" || p == "/router/pool/pull"))
     return set(Route::Kind::kAdminControl);
   if (p == "/router/status" || p == "/router/capabilities" ||
+      p == "/router/partner/status" || p == "/router/partner/capabilities" ||
       p == "/router/placement" || p == "/v1/models" || p == "/models" ||
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||
       p.starts_with("/v1/names/") || p == "/v1/systemone")
@@ -1143,10 +1147,11 @@ Route Classify(const HttpRequest& req) {
     bool filtered;
   };
   static constexpr Prefix kWork[] = {
-      {"/v1/chat/completions", "text", 1, false},
-      {"/v1/completions", "text", 1, false},
-      {"/v1/responses", "text", 1, false},
-      {"/v1/messages", "text", 1, false},
+      // Chats are filtered on their user texts since 2.0.5 (HitChat).
+      {"/v1/chat/completions", "text", 1, true},
+      {"/v1/completions", "text", 1, true},
+      {"/v1/responses", "text", 1, true},
+      {"/v1/messages", "text", 1, true},
       {"/v1/embeddings", "text", 0, false},
       {"/embeddings", "text", 0, false},
       {"/embedding", "text", 0, false},
@@ -1371,6 +1376,76 @@ std::string WordFilter::Hit(const HttpRequest& req, bool comfy) {
   return {};
 }
 
+namespace {
+
+/// The texts a chat request carries from the user (2.0.5): `prompt` (a
+/// string or strings: completions), every user message of `messages`
+/// (chat completions, Anthropic messages) and every user item of `input`
+/// (responses), each a string or parts with a `text`. Of `messages` and
+/// `input` only the last user turn is read: a refused question the page
+/// keeps in the history must not block the conversation for good.
+void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
+  const auto content = [out](const json::Value& value) {
+    if (value.is_string()) {
+      out->push_back(value.str());
+      return;
+    }
+    if (!value.is_array())
+      return;
+    for (const json::Value& part : value.items()) {
+      if (part.is_string()) {
+        out->push_back(part.str());
+      } else if (part.is_object()) {
+        if (const json::Value* text = part.find("text");
+            text != nullptr && text->is_string())
+          out->push_back(text->str());
+      }
+    }
+  };
+  if (const json::Value* prompt = body.find("prompt"))
+    content(*prompt);
+  for (const char* key : {"messages", "input"}) {
+    const json::Value* list = body.find(key);
+    if (list == nullptr)
+      continue;
+    if (list->is_string()) {
+      out->push_back(list->str());
+      continue;
+    }
+    if (!list->is_array())
+      continue;
+    const json::Value* last = nullptr;
+    for (const json::Value& item : list->items()) {
+      if (item.is_string() ||
+          (item.is_object() && item.member_str("role", "user") == "user"))
+        last = &item;
+    }
+    if (last == nullptr)
+      continue;
+    if (last->is_string())
+      out->push_back(last->str());
+    else if (const json::Value* c = last->find("content"))
+      content(*c);
+  }
+}
+
+}  // namespace
+
+std::string WordFilter::HitChat(const HttpRequest& req) {
+  if (req.body.empty() || !IsJsonBody(req))
+    return {};
+  std::vector<std::string> texts;
+  try {
+    CollectChatTexts(json::parse(req.body), &texts);
+  } catch (const std::exception&) {
+    return {};  // the worker refuses what is not JSON
+  }
+  for (const std::string& text : texts)
+    if (const std::string word = HitText(text); !word.empty())
+      return word;
+  return {};
+}
+
 // ---------------------------------------------------------------------------
 // Gate
 
@@ -1476,10 +1551,10 @@ void Gate::EndSession(std::string_view id) {
     store_->ForgetSession(id);
 }
 
-void Gate::EndSessionsOf(std::string_view name) {
+void Gate::EndSessionsOf(std::string_view name, std::string_view keep) {
   const std::lock_guard<std::mutex> lock(mutex_);
   for (auto it = sessions_.begin(); it != sessions_.end();) {
-    if (it->second.name == name)
+    if (it->second.name == name && it->first != keep)
       it = sessions_.erase(it);
     else
       ++it;
@@ -1585,8 +1660,13 @@ Identity Gate::Identify(const HttpRequest& req) {
     // A wrong key never falls back to loopback or a cookie.
     return Identity{};
   }
-  // Bearer token.
-  if (const std::string bearer = BearerOf(req); !bearer.empty()) {
+  // Bearer token. From loopback a value without the gufo_ prefix (an
+  // SDK's placeholder such as LLAMA_API_KEY) counts as no header at all:
+  // the machine's own programs stay admin, the log notes it.
+  const std::string bearer = BearerOf(req);
+  const bool bearer_ignored =
+      !bearer.empty() && loopback && !bearer.starts_with(kTokenPrefix);
+  if (!bearer.empty() && !bearer_ignored) {
     if (const auto user = store_->FindByToken(bearer); user.has_value()) {
       Identity who;
       who.source = Identity::Source::kBearer;
@@ -1611,6 +1691,7 @@ Identity Gate::Identify(const HttpRequest& req) {
     who.name = "lokal";
     who.rolle = "admin";
     who.placeholder = true;
+    who.bearer_ignored = bearer_ignored;
     return who;
   }
   if (settings_.mode == Mode::kOff) {
@@ -1619,6 +1700,7 @@ Identity Gate::Identify(const HttpRequest& req) {
     who.name = "lokal";
     who.rolle = "admin";
     who.placeholder = true;
+    who.bearer_ignored = bearer_ignored;
     return who;
   }
   return Identity{};
@@ -1929,10 +2011,12 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                      "pool_key_invalid");
   }
   if (route.kind == Route::Kind::kLogin || route.kind == Route::Kind::kLogout ||
-      route.kind == Route::Kind::kMe)
+      route.kind == Route::Kind::kMe || route.kind == Route::Kind::kPasswort)
     return std::nullopt;
   if (!who.authenticated()) {
-    if (!BearerOf(req).empty())
+    const std::string bearer = BearerOf(req);
+    if (!bearer.empty() &&
+        !(IsLoopback(RequestAddress(req)) && !bearer.starts_with(kTokenPrefix)))
       return AuthError(401, "Unauthorized", "unknown or expired API token",
                        "invalid_token");
     if (route.kind == Route::Kind::kPage || route.kind == Route::Kind::kAdminPage)
@@ -2006,6 +2090,13 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
           }
           body = &parsed;
         }
+        // A webhook (2.0.5) is for admin and service accounts: the router
+        // would call any address of --jobs-webhook-allow for a user.
+        if (const json::Value* webhook = body->find("webhook_url");
+            webhook != nullptr && !webhook->is_null() && who.rolle != "dienst")
+          return Forbidden("Webhook nur für admin und dienst (webhook_url "
+                           "is admin/dienst only)",
+                           "webhook_not_allowed");
         const json::Value* request = body->find("request");
         if (request != nullptr && request->is_object()) {
           inner.path = request->member_str("path");
@@ -2039,6 +2130,17 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
       return std::nullopt;
     }
     case Route::Kind::kWork: {
+      if (req.method == "GET" && req.path == "/view" && hooks_.comfy_file_prompt) {
+        // A ComfyUI result file (2.0.5): the prompt that made it names
+        // the owner, like /history; a file of nobody's prompt is open.
+        if (const auto prompt = hooks_.comfy_file_prompt(
+                req.query_param("filename"), req.query_param("subfolder"),
+                req.query_param("type"))) {
+          const auto owner = OwnerOf("prompt:" + *prompt);
+          if (!owner.has_value() || *owner != who.name)
+            return NotFound();
+        }
+      }
       int counts = route.counts;
       std::optional<std::vector<WorkItem>> items;
       if (req.method == "POST" && req.path == "/prompt" && hooks_.comfy_plan &&
@@ -2138,7 +2240,9 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                              model + " is not enabled for this user)",
                          "model_forbidden");
       if (route.filtered && who.rechte.FilterOn(who.rolle)) {
-        const std::string word = filter_.Hit(req, req.path == "/prompt");
+        const std::string word = route.area == "text"
+                                     ? filter_.HitChat(req)
+                                     : filter_.Hit(req, req.path == "/prompt");
         if (!word.empty()) {
           Log(req, who, "abgelehnt:content_filtered", model);
           return AuthError(400, "Bad Request",
@@ -2225,6 +2329,15 @@ void Gate::After(const HttpRequest& req, const Route& route,
     return;
   }
   const bool restricted = !who.admin() && !(who.trusted() && !pool_user);
+  if (restricted && req.method == "GET" &&
+      route.kind == Route::Kind::kAnyUser && response->status == 200 &&
+      !response->streaming_body) {
+    if (req.path == "/v1/models" || req.path == "/models")
+      HideModelArgs(response);
+    else if (req.path == "/router/status")
+      HideOthersJobs(who, response);
+    return;
+  }
   if (restricted && req.method == "GET" && route.kind == Route::Kind::kWork &&
       (req.path == "/history" || req.path.starts_with("/history/")) &&
       response->status == 200 && !response->streaming_body) {
@@ -2247,7 +2360,7 @@ void Gate::After(const HttpRequest& req, const Route& route,
   if (route.kind != Route::Kind::kJobs || !restricted || req.method != "GET" ||
       response->status != 200 || response->streaming_body)
     return;
-  if (req.path == "/v1/jobs") {
+  if (req.path == "/v1/jobs" || req.path == "/router/partner/jobs") {
     try {
       json::Value body = json::parse(response->body);
       const json::Value* data = body.find("data");
@@ -2278,6 +2391,96 @@ void Gate::After(const HttpRequest& req, const Route& route,
     const json::Value* metadata = job.find("metadata");
     if (metadata == nullptr || metadata->member_str("nutzer") != who.name)
       *response = NotFound();
+  } catch (const std::exception&) {
+  }
+}
+
+void Gate::HideModelArgs(HttpResponse* response) {
+  try {
+    const json::Value body = json::parse(response->body);
+    const json::Value* data = body.find("data");
+    if (data == nullptr || !data->is_array())
+      return;
+    json::Value out = json::Value::object();
+    for (const auto& [key, value] : body.members()) {
+      if (key != "data")
+        out.append_member(key, value);
+    }
+    json::Value kept = json::Value::array();
+    for (const json::Value& model : data->items()) {
+      if (!model.is_object()) {
+        kept.push_back(model);
+        continue;
+      }
+      json::Value copy = json::Value::object();
+      for (const auto& [key, value] : model.members()) {
+        if (key == "status" && value.is_object()) {
+          json::Value state = json::Value::object();
+          for (const auto& [k, v] : value.members())
+            if (k != "args" && k != "command")
+              state.append_member(k, v);
+          copy.append_member(key, std::move(state));
+        } else {
+          copy.append_member(key, value);
+        }
+      }
+      kept.push_back(std::move(copy));
+    }
+    out["data"] = std::move(kept);
+    response->body = out.dump();
+  } catch (const std::exception&) {
+  }
+}
+
+void Gate::HideOthersJobs(const Identity& who, HttpResponse* response) {
+  const auto mine = [this, &who](const std::string& id) {
+    if (hooks_.job_owner) {
+      if (const auto owner = hooks_.job_owner(id);
+          owner.has_value() && *owner == who.name)
+        return true;
+    }
+    const auto video = OwnerOf("video:" + id);
+    return video.has_value() && *video == who.name;
+  };
+  try {
+    const json::Value body = json::parse(response->body);
+    if (!body.is_object())
+      return;
+    json::Value out = json::Value::object();
+    for (const auto& [key, value] : body.members()) {
+      if (key == "pool_queue" && value.is_object()) {
+        json::Value queue = json::Value::object();
+        for (const auto& [k, v] : value.members()) {
+          if ((k == "pulling" || k == "pushed_active") && v.is_array()) {
+            json::Value ids = json::Value::array();
+            for (const json::Value& id : v.items())
+              if (id.is_string() && mine(id.str()))
+                ids.push_back(id);
+            queue.append_member(k, std::move(ids));
+          } else {
+            queue.append_member(k, v);
+          }
+        }
+        out.append_member(key, std::move(queue));
+      } else if (key == "remote" && value.is_object()) {
+        json::Value remote = json::Value::object();
+        for (const auto& [k, v] : value.members()) {
+          if (k == "jobs" && v.is_object()) {
+            json::Value jobs = json::Value::object();
+            for (const auto& [id, job] : v.members())
+              if (mine(id))
+                jobs.append_member(id, job);
+            remote.append_member(k, std::move(jobs));
+          } else {
+            remote.append_member(k, v);
+          }
+        }
+        out.append_member(key, std::move(remote));
+      } else {
+        out.append_member(key, value);
+      }
+    }
+    response->body = out.dump();
   } catch (const std::exception&) {
   }
 }
@@ -2376,6 +2579,79 @@ HttpResponse Gate::Login(const HttpRequest& req) {
               {{"Set-Cookie",
                 SessionCookie(id, remember ? kRememberTtl.count()
                                            : kSessionTtl.count())}});
+}
+
+HttpResponse Gate::ChangePassword(const HttpRequest& req,
+                                  const Identity& who) {
+  if (!who.authenticated())
+    return AuthError(401, "Unauthorized", "login required",
+                     "not_authenticated");
+  if (who.placeholder || who.source == Identity::Source::kPool ||
+      who.source == Identity::Source::kInternal)
+    return Forbidden("kein Nutzerkonto (lokal/Partner haben kein Passwort; "
+                     "no account to change)",
+                     "no_account");
+  if (who.rolle == "dienst")
+    return Forbidden("Dienstkonten haben kein Passwort, nur Token (service "
+                     "accounts use tokens)",
+                     "password_change_not_allowed");
+  const std::string address = RequestAddress(req);
+  long long retry_after = 0;
+  if (Blocked(address, &retry_after)) {
+    HttpResponse r = AuthError(429, "Too Many Requests",
+                               "zu viele Fehlversuche, bitte " +
+                                   std::to_string(retry_after) +
+                                   " s warten (too many failed attempts)",
+                               "too_many_attempts");
+    r.headers.emplace_back("Retry-After", std::to_string(retry_after));
+    return r;
+  }
+  std::string old_password;
+  std::string new_password;
+  try {
+    const json::Value body = json::parse(req.body.empty() ? "{}" : req.body);
+    old_password = body.member_str("alt", body.member_str("old"));
+    new_password = body.member_str("neu", body.member_str("new"));
+  } catch (const std::exception&) {
+    return AuthError(400, "Bad Request", "JSON {\"alt\", \"neu\"} expected",
+                     "invalid_request");
+  }
+  if (old_password.empty() || new_password.empty())
+    return AuthError(400, "Bad Request", "alt and neu are required",
+                     "invalid_request");
+  if (!store_->Verify(who.name, old_password).has_value()) {
+    NoteFailure(address);
+    Log(req, who, "passwort_alt_falsch");
+    return Forbidden("Altes Passwort falsch (wrong current password)",
+                     "wrong_password");
+  }
+  std::string error;
+  if (!store_->SetPassword(who.name, new_password, &error))
+    return AuthError(400, "Bad Request", error, "invalid_password");
+  ClearFailures(address);
+  // Every other session of the account ends; this one stays (a
+  // remembered one is written again, SetPassword cleared them).
+  const std::string current = CookieValue(req, kSessionCookie);
+  EndSessionsOf(who.name, current);
+  if (!current.empty()) {
+    bool remembered = false;
+    long long ablauf = 0;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (const auto it = sessions_.find(current); it != sessions_.end()) {
+        remembered = it->second.remembered;
+        ablauf = it->second.ablauf;
+      }
+    }
+    if (remembered &&
+        !store_->RememberSession(who.name, current, ablauf, &error))
+      Logger::Warn("router", "event=session_remember_failed reason=" + error);
+  }
+  Log(req, who, "passwort_geaendert");
+  json::Value body = json::Value::object();
+  body["ok"] = true;
+  body["name"] = who.name;
+  return JsonOk(body);
 }
 
 HttpResponse Gate::Logout(const HttpRequest& req, const Identity& who) {
@@ -2595,6 +2871,8 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
       return Login(req);
     case Route::Kind::kLogout:
       return Logout(req, who);
+    case Route::Kind::kPasswort:
+      return ChangePassword(req, who);
     case Route::Kind::kUsers:
     case Route::Kind::kAdminPage: {
       // Loopback while it counts as admin (auth = lan with auth-loopback
@@ -2636,9 +2914,11 @@ HttpResponse Gate::Serve(
     // Even at stage 0 a web page in a browser on this machine must not
     // reach the admin paths through loopback.
     if (req.method != "GET" && req.method != "HEAD" &&
-        (route.kind == Route::Kind::kUsers ||
-         route.kind == Route::Kind::kAdminControl) &&
-        IsLoopback(RequestAddress(req))) {
+        (((route.kind == Route::Kind::kUsers ||
+           route.kind == Route::Kind::kAdminControl) &&
+          IsLoopback(RequestAddress(req))) ||
+         (route.kind == Route::Kind::kPasswort &&
+          who.source == Identity::Source::kCookie))) {
       if (auto refusal = CsrfCheck(req)) {
         Log(req, who, "abgelehnt:csrf_rejected");
         return std::move(*refusal);
@@ -2772,7 +3052,8 @@ void Gate::Log(const HttpRequest& req, const Identity& who,
   out << IsoOf(Now()) << '\t' << clean(who.name.empty() ? "-" : who.name)
       << '\t' << clean(RequestAddress(req)) << '\t' << clean(req.method) << ' '
       << clean(req.path) << '\t' << clean(model.empty() ? "-" : model) << '\t'
-      << clean(result) << '\n';
+      << clean(result) << (who.bearer_ignored ? " bearer_ignored=1" : "")
+      << '\n';
 }
 
 std::vector<std::string> Gate::LogTail(std::size_t lines) {

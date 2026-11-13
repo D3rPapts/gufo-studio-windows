@@ -386,8 +386,29 @@ void TestLocalOmniRejected() {
 }
 #endif
 
+void TestReportedModality() {
+  // 2.0.5: an [external/<id>] section reports the modality its leading
+  // `args = serve <modality>` names; others keep their own.
+  PresetModel m;
+  m.modality = "external";
+  m.argv = {"serve", "llm", "--model", "x.gguf"};
+  assert(gufo::router::ReportedModality(m) == "llm");
+  m.argv = {"serve", "tts"};
+  assert(gufo::router::ReportedModality(m) == "tts");
+  m.argv = {"--model", "x.gguf"};
+  assert(gufo::router::ReportedModality(m) == "external");
+  m.argv = {"serve", "--help"};
+  assert(gufo::router::ReportedModality(m) == "external");
+  m.argv = {"serve"};
+  assert(gufo::router::ReportedModality(m) == "external");
+  m.modality = "image";
+  m.argv = {"serve", "llm"};
+  assert(gufo::router::ReportedModality(m) == "image");
+}
+
 int main() {
   gufo::cli::SetServeArgvValidator(&RejectBogus);
+  TestReportedModality();
   TestServedNameAliases();
 #if !GUFO_ROUTER_FORK_SERVE
   TestLocalOmniRejected();

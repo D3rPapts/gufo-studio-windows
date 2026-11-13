@@ -63,6 +63,19 @@ inline constexpr const char* kForwardedHeader = "X-Gufo-Forwarded";
 /// "host:port" of an endpoint, the key remote routers are known by.
 [[nodiscard]] std::string EndpointKey(const RemoteEndpoint& endpoint);
 
+/// GET /router/partner/<what> (2.0.4): the partner router's own answer,
+/// fetched over the pool link (its key, `X-Gufo-Relay`) and passed through
+/// as it came (status code, JSON body). `what` is `status`
+/// (/router/status), `jobs` (/v1/jobs with the query) or `capabilities`
+/// (/router/capabilities); anything else is 404. Without a partner, or
+/// when it does not answer within `timeout`, 503 remote_unavailable. The
+/// pages read the partner through this when a browser cannot reach it
+/// (https, a cookie of another site, a closed port).
+[[nodiscard]] server::HttpResponse PartnerRead(
+    const std::optional<RemoteSpec>& partner, const std::string& router_id,
+    const server::HttpRequest& req,
+    std::chrono::milliseconds timeout = std::chrono::seconds(3));
+
 /// What a router reports per locally served model in GET /v1/models
 /// (`"activity"`, placement = pool reads it from the partner).
 struct RemoteActivity {

@@ -231,6 +231,9 @@ struct Identity {
   /// The name is a placeholder, not a user: the router itself, loopback
   /// as admin, auth = off, the partner router. Owns nothing.
   bool placeholder{false};
+  /// A bearer value without the gufo_ prefix came from loopback and was
+  /// ignored (an SDK's placeholder key): noted in the log.
+  bool bearer_ignored{false};
 
   [[nodiscard]] bool authenticated() const { return source != Source::kNone; }
   [[nodiscard]] bool admin() const { return rolle == "admin"; }
@@ -281,6 +284,7 @@ struct Route {
     kLogin,        // POST /login
     kLogout,       // POST /logout
     kMe,           // GET /router/me
+    kPasswort,     // POST /router/me/passwort (own password)
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
     kAdminPage,    // /verwaltung/: loopback or admin, else 404
     kPage,         // GET /<page>/...: login (302), then the page's area
@@ -320,6 +324,10 @@ public:
   /// The first blocked word found in the request's prompt texts, "" when
   /// clean. `comfy` scans every string of the body (ComfyUI graphs).
   [[nodiscard]] std::string Hit(const server::HttpRequest& req, bool comfy);
+  /// The first blocked word in a chat request's user texts (2.0.5):
+  /// `prompt`, the last user message of `messages` and the last user item
+  /// of `input`, as a string or text parts; "" when clean.
+  [[nodiscard]] std::string HitChat(const server::HttpRequest& req);
   /// Every string of a parsed body (a ComfyUI graph).
   [[nodiscard]] std::string HitJson(const json::Value& body);
   [[nodiscard]] std::string HitText(std::string_view text);
@@ -364,6 +372,13 @@ public:
     std::function<std::optional<std::vector<WorkItem>>(
         const server::HttpRequest&, const json::Value& body)>
         comfy_plan;
+    /// The ComfyUI prompt whose finished outputs list a file (`/view`'s
+    /// filename, subfolder, type); nullopt for a file no history entry
+    /// names (an upload, a file of a deleted entry): those stay open.
+    std::function<std::optional<std::string>(const std::string& filename,
+                                             const std::string& subfolder,
+                                             const std::string& type)>
+        comfy_file_prompt;
   };
 
   Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks);
@@ -402,6 +417,12 @@ public:
   /// owner.
   void After(const server::HttpRequest& req, const Route& route,
              const Identity& who, server::HttpResponse* response);
+  /// `/v1/models` for a user (2.0.5): the worker command lines (paths on
+  /// this machine) are left out of every `status`.
+  static void HideModelArgs(server::HttpResponse* response);
+  /// `/router/status` for a user (2.0.5): the shared queue's id lists and
+  /// the remote jobs keep only the user's own jobs.
+  void HideOthersJobs(const Identity& who, server::HttpResponse* response);
 
   /// Login/logout/me/users endpoints; nullopt when `req` is none of them.
   [[nodiscard]] std::optional<server::HttpResponse> AuthEndpoint(
@@ -416,8 +437,9 @@ public:
   /// In-memory sessions (the remembered ones are also in the store).
   [[nodiscard]] std::string NewSession(const User& user, bool remember);
   void EndSession(std::string_view id);
-  /// Every session of `name` in memory (a password change or a block).
-  void EndSessionsOf(std::string_view name);
+  /// Every session of `name` in memory (a password change or a block),
+  /// except `keep` (the session that changed the password).
+  void EndSessionsOf(std::string_view name, std::string_view keep = {});
   [[nodiscard]] std::optional<Identity> SessionIdentity(std::string_view id);
 
   /// Append to zugriff.log (time, user, address, method path, model,
@@ -500,6 +522,11 @@ private:
   [[nodiscard]] server::HttpResponse Login(const server::HttpRequest& req);
   [[nodiscard]] server::HttpResponse Logout(const server::HttpRequest& req,
                                             const Identity& who);
+  /// POST /router/me/passwort {"alt", "neu"}: a signed-in user (admin or
+  /// nutzer, never a placeholder or a service account) sets its own
+  /// password; its other sessions end, this one stays.
+  [[nodiscard]] server::HttpResponse ChangePassword(
+      const server::HttpRequest& req, const Identity& who);
   [[nodiscard]] server::HttpResponse UsersApi(const server::HttpRequest& req,
                                               const Identity& who);
   [[nodiscard]] bool CountDaily(const Identity& who, int weight,

@@ -658,4 +658,14 @@ std::string CapabilityOf(const PresetModel& preset) {
   return "";
 }
 
+std::string ReportedModality(const PresetModel& preset) {
+  if (preset.modality != "external")
+    return preset.modality;
+  // The `args` key puts its words first: "serve llm" names the modality.
+  if (preset.argv.size() >= 2 && preset.argv[0] == "serve" &&
+      !preset.argv[1].empty() && preset.argv[1][0] != '-')
+    return preset.argv[1];
+  return "external";
+}
+
 }  // namespace gufo::router

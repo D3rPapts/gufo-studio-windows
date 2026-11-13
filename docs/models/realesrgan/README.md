@@ -178,13 +178,14 @@ body's `model` (the section id) and records the job id of a
 and cancel reads reach the same worker; async image jobs are tracked like
 music jobs (`/v1/images/upscale/{id}`). Every `model =` / `--model` file
 without `NAME=` takes the served name, so the three variants sit behind one
-id:
+id. The production section of 2.0.4 (`gufo-router-combo7.ini`) names the
+two extra files `wdn` and `anime` so a request can pick them with `model`:
 
 ```ini
 [external/gufo-upscale]
-command = D:\llm-modelle\gufo\app\gufo-1.4.9-2026-11-08\gufo.exe
-args = serve upscale --device gpu --model D:\llm-modelle\upscale\realesr-general-wdn-x4v3.safetensors --model D:\llm-modelle\upscale\realesr-animevideov3.safetensors
-model = D:\llm-modelle\upscale\realesr-general-x4v3.safetensors
+command = D:\llm-modelle\gufo\app\gufo-2.0.4-2026-11-13\gufo.exe
+args = serve upscale --device gpu --model wdn=D:\llm-modelle\gufo\modelle\upscale\realesr-general-wdn-x4v3.safetensors --model anime=D:\llm-modelle\gufo\modelle\upscale\realesr-animevideov3.safetensors
+model = D:\llm-modelle\gufo\modelle\upscale\realesr-general-x4v3.safetensors
 served-model-name = gufo-upscale
 max-request-bytes = 134217728
 router-gpu-gb = 1

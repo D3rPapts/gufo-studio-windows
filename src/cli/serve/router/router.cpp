@@ -321,7 +321,7 @@ std::optional<HttpResponse> RouteFront(
       model["id"] = preset->id;
       model["object"] = "model";
       model["owned_by"] = "gufo";
-      model["modality"] = preset->modality;
+      model["modality"] = router::ReportedModality(*preset);
       if (preset->switchable) {
         // Moved at runtime with POST /router/placement; the `remote` block
         // below appears only while requests go there, so another router's
@@ -1115,6 +1115,8 @@ public:
       return PlacementControl(req);
     if (req.method == "GET" && req.path == "/router/capabilities")
       return JsonOk(Capabilities());
+    if (req.method == "GET" && req.path.starts_with("/router/partner/"))
+      return router::PartnerRead(partner_spec, router_id, req);
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);
@@ -3043,7 +3045,7 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
       for (const auto& [preset, status] : registry.Statuses()) {
         json::Value model = json::Value::object();
-        model["modality"] = preset->modality;
+        model["modality"] = router::ReportedModality(*preset);
         model["placement"] =
             router::PlacementName(registry.PlacementOf(preset->id));
         model["switchable"] = preset->switchable;
@@ -4133,6 +4135,14 @@ int RunRouter(std::span<const char* const> args) {
     hooks.job_owner = [raw](const std::string& job_id) {
       return raw->JobOwner(job_id);
     };
+    hooks.comfy_file_prompt = [raw](const std::string& filename,
+                                    const std::string& subfolder,
+                                    const std::string& type)
+        -> std::optional<std::string> {
+      if (raw->comfy == nullptr)
+        return std::nullopt;
+      return raw->comfy->PromptOfFile(filename, subfolder, type);
+    };
     // A ComfyUI graph resolves to the adapter's tasks; the gate checks
     // each one (area, model, filter, daily count) before the adapter
     // runs it as the router itself.
@@ -4447,6 +4457,11 @@ int RunRouter(std::span<const char* const> args) {
                                     : jobs_webhook_allow) +
                                " expire_hours=" +
                                std::to_string(jobs_expire_hours));
+    if (!jobs_webhook_allow.empty() && jobs_webhook_secret.empty())
+      Logger::Warn("router",
+                   "event=jobs_webhook_unsigned --jobs-webhook-allow is set "
+                   "without --jobs-webhook-secret: receivers cannot verify "
+                   "that a call came from this router");
   }
   std::thread supervision([&state] {
     while (!state->stop_requested.load()) {

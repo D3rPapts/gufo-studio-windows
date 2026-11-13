@@ -162,6 +162,17 @@ struct Fixture {
         return std::nullopt;
       }
     };
+    hooks.comfy_file_prompt =
+        [](const std::string& filename, const std::string& subfolder,
+           const std::string& type) -> std::optional<std::string> {
+      if (!subfolder.empty() || (!type.empty() && type != "output"))
+        return std::nullopt;
+      if (filename == "tim_00001_.png")
+        return std::string("p-tim");
+      if (filename == "anna_00001_.png")
+        return std::string("p-anna");
+      return std::nullopt;
+    };
     hooks.job_owner = [](const std::string& id) -> std::optional<std::string> {
       if (id == "j-tim")
         return std::string("tim");
@@ -448,11 +459,18 @@ void TestClassify() {
         Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/v1/models", "x")).kind == Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/router/status", "x")).kind == Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/status", "x")).kind ==
+        Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/capabilities", "x")).kind ==
+        Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/jobs", "x")).kind == Kind::kJobs);
   const auto chat = auth::Classify(Req("POST", "/v1/chat/completions", "x"));
   CHECK(chat.kind == Kind::kWork);
   CHECK_EQ(chat.area, std::string("text"));
   CHECK_EQ(chat.counts, 1);
-  CHECK(!chat.filtered);
+  CHECK(chat.filtered);  // 2.0.5: chats are filtered on their user texts
+  CHECK(!auth::Classify(Req("GET", "/v1/chat/completions", "x")).filtered);
+  CHECK(!auth::Classify(Req("POST", "/v1/embeddings", "x")).filtered);
   const auto image = auth::Classify(Req("POST", "/v1/images/generations", "x"));
   CHECK_EQ(image.area, std::string("bild"));
   CHECK(image.filtered);
@@ -805,6 +823,48 @@ void TestAreasAndJobs() {
   }
   r = f.Serve(Req("GET", "/v1/jobs", "192.168.178.50", "", {{"Cookie", admin}}));
   CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(3));
+  // The partner's list read through the router (2.0.4): filtered the same
+  // way; the status read is open to every signed-in user.
+  f.next = [](const HttpRequest& req) {
+    json::Value body = json::Value::object();
+    if (req.path == "/router/partner/jobs") {
+      json::Value data = json::Value::array();
+      for (const char* owner : {"tim", "anna"}) {
+        json::Value job = json::Value::object();
+        job["id"] = std::string("p-") + owner;
+        json::Value metadata = json::Value::object();
+        metadata["nutzer"] = owner;
+        job["metadata"] = std::move(metadata);
+        data.push_back(std::move(job));
+      }
+      body["data"] = std::move(data);
+    }
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  r = f.Serve(Req("GET", "/router/partner/jobs?status=queued", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(1));
+  r = f.Serve(Req("GET", "/router/partner/jobs", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(2));
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50"));
+  CHECK_EQ(r.status, 401);
+  {
+    auth::Rights no_ablage;
+    no_ablage.bereiche = {"status"};
+    f.AddUser("gast", "nutzer", "gast-pw", no_ablage);
+    const std::string gast = f.LoginCookie("gast", "gast-pw");
+    r = f.Serve(Req("GET", "/router/partner/jobs", "192.168.178.50", "",
+                    {{"Cookie", gast}}));
+    CHECK_EQ(r.status, 403);
+    r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                    {{"Cookie", gast}}));
+    CHECK_EQ(r.status, 200);
+  }
   r = f.Serve(Req("GET", "/v1/jobs/j-fremd", "192.168.178.50", "", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 404);
   r = f.Serve(Req("GET", "/v1/jobs/j-fremd", "192.168.178.50", "", {{"Cookie", admin}}));
@@ -1079,7 +1139,7 @@ void TestFilterAndLimit() {
   CHECK_EQ(r.status, 200);
   r = image(admin, "{\"model\":\"m\",\"prompt\":\"nackt\"}");
   CHECK_EQ(r.status, 200);
-  // Videos and the ComfyUI graph are filtered too; chats are not.
+  // Videos, the ComfyUI graph and (2.0.5) chats are filtered too.
   r = f.Serve(Req("POST", "/v1/videos", "192.168.178.50",
                   "{\"model\":\"m\",\"prompt\":\"porno\"}", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 200);  // tim: filter off
@@ -1096,7 +1156,8 @@ void TestFilterAndLimit() {
   r = g.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
                   "{\"model\":\"m\",\"messages\":[{\"content\":\"nackt\"}]}",
                   {{"Cookie", kind2}}));
-  CHECK_EQ(r.status, 200);
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
   // Umlauts: "Töten" and "TÖTEN" meet "töt*" (UTF-8 aware lower case).
   CHECK_EQ(auth::LowerUtf8("TÖTEN Ärger ÜBER Straße ×"),
            std::string("töten ärger über straße ×"));
@@ -1781,6 +1842,130 @@ void TestUsersApi() {
   CHECK(json::parse(r.body).find("zeilen")->size() >= 1);
 }
 
+void TestPasswordChange() {
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  const std::string tim2 = f.LoginCookie("tim", "tim-pw", true, "192.168.178.51");
+  const auto change = [&f](const std::string& cookie, const std::string& alt,
+                           const std::string& neu,
+                           std::vector<std::pair<std::string, std::string>> more = {}) {
+    json::Value body = json::Value::object();
+    body["alt"] = alt;
+    body["neu"] = neu;
+    more.emplace_back("Cookie", cookie);
+    return f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                       body.dump(), std::move(more)));
+  };
+  HttpResponse r = change(tim, "falsch", "neu-pw-1");
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("wrong_password"));
+  r = change(tim, "tim-pw", "abc");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_password"));
+  CHECK(f.store->Verify("tim", "tim-pw").has_value());
+  // A browser write: the CSRF rule applies.
+  r = change(tim, "tim-pw", "neu-pw-1", {{"Sec-Fetch-Site", "cross-site"}});
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  r = change(tim, "tim-pw", "neu-pw-1");
+  CHECK_EQ(r.status, 200);
+  CHECK(json::parse(r.body).find("ok")->as_bool());
+  CHECK(f.store->Verify("tim", "neu-pw-1").has_value());
+  CHECK(!f.store->Verify("tim", "tim-pw").has_value());
+  // This session stays, the other one is over.
+  r = f.Serve(Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/router/me", "192.168.178.51", "", {{"Cookie", tim2}}));
+  CHECK_EQ(r.status, 401);
+  // A remembered session that changes the password survives a restart.
+  const std::string stay = f.LoginCookie("tim", "neu-pw-1", true);
+  r = change(stay, "neu-pw-1", "neu-pw-2");
+  CHECK_EQ(r.status, 200);
+  {
+    auth::Gate fresh(f.gate->settings(), f.store, {});
+    CHECK(fresh.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                             {{"Cookie", stay}}))
+              .authenticated());
+  }
+  // No account to change: loopback admin, the partner; service accounts
+  // have tokens only; nobody without a login.
+  r = f.Serve(Req("POST", "/router/me/passwort", "127.0.0.1",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}"));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("no_account"));
+  r = f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}",
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("password_change_not_allowed"));
+  r = f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}"));
+  CHECK_EQ(r.status, 401);
+  // Five wrong current passwords block the address like failed logins.
+  for (int i = 0; i < 5; ++i)
+    CHECK_EQ(change(stay, "falsch", "neu-pw-3").status, 403);
+  r = change(stay, "neu-pw-2", "neu-pw-3");
+  CHECK_EQ(r.status, 429);
+  // The log has the change, no passwords.
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(100)) {
+    CHECK(line.find("neu-pw") == std::string::npos);
+    logged = logged || line.find("passwort_geaendert") != std::string::npos;
+  }
+  CHECK(logged);
+  // An admin changes its own password the same way (the address's block
+  // from above is lifted first).
+  f.gate->ClearFailures("192.168.178.50");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = change(admin, "geheim123", "geheim456");
+  CHECK_EQ(r.status, 200);
+  CHECK(f.store->Verify("fabian", "geheim456").has_value());
+}
+
+void TestLoopbackBearer() {
+  // A bearer without the gufo_ prefix (an SDK's placeholder key) from
+  // loopback counts as no header: the machine's own programs stay admin;
+  // from the LAN it is still 401; a gufo_ token is always checked.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  const auto lokal = f.gate->Identify(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                                          "{\"model\":\"m\"}",
+                                          {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK(lokal.source == auth::Identity::Source::kLoopback);
+  CHECK(lokal.admin());
+  CHECK(lokal.bearer_ignored);
+  HttpResponse r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                               "{\"model\":\"m\"}",
+                               {{"Authorization", "Bearer LLAMA_API_KEY"}}));
+  CHECK_EQ(r.status, 200);
+  bool noted = false;
+  for (const std::string& line : f.gate->LogTail(20))
+    noted = noted || line.find("bearer_ignored=1") != std::string::npos;
+  CHECK(noted);
+  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
+                  "{\"model\":\"m\"}", {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_token"));
+  r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                  "{\"model\":\"m\"}",
+                  {{"Authorization", "Bearer gufo_" + std::string(64, 'a')}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_token"));
+  // With auth-loopback = login the placeholder key is ignored as well,
+  // and the caller is then simply not signed in.
+  Fixture g(auth::Mode::kLan, "", auth::LoopbackPolicy::kLogin);
+  g.AddUser("fabian", "admin", "geheim123");
+  r = g.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                  "{\"model\":\"m\"}", {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("not_authenticated"));
+}
+
 void TestModes() {
   // auth = off: everything passes untouched; only the auth endpoints
   // exist, the users API from loopback alone.
@@ -1952,6 +2137,281 @@ void TestPresetSection() {
   std::filesystem::remove_all(dir, ec);
 }
 
+void TestModelArgsHidden() {
+  // 2.0.5: the worker command lines (paths on this machine) are for the
+  // admin and the machine itself; a user or service account sees the
+  // state without them. Other fields stay as they came.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  f.next = [](const HttpRequest&) {
+    json::Value model = json::Value::object();
+    model["id"] = "qwen3.8-27b";
+    model["modality"] = "llm";
+    model["loaded"] = true;
+    json::Value args = json::Value::array();
+    args.push_back("--model");
+    args.push_back("D:\\modelle\\x.gguf");
+    json::Value status = json::Value::object();
+    status["value"] = "loaded";
+    status["args"] = std::move(args);
+    status["failed"] = false;
+    model["status"] = std::move(status);
+    json::Value data = json::Value::array();
+    data.push_back(std::move(model));
+    json::Value body = json::Value::object();
+    body["object"] = "list";
+    body["data"] = std::move(data);
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  const auto status_of = [](const HttpResponse& r) {
+    return *json::parse(r.body).find("data")->items().front().find("status");
+  };
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  CHECK(r.body.find("x.gguf") == std::string::npos);
+  CHECK(status_of(r).find("args") == nullptr);
+  CHECK_EQ(status_of(r).member_str("value"), std::string("loaded"));
+  CHECK(json::parse(r.body).find("data")->items().front().find("loaded")->as_bool());
+  CHECK_EQ(json::parse(r.body).member_str("object"), std::string("list"));
+  r = f.Serve(Req("GET", "/models", "192.168.178.50", "",
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 200);
+  CHECK(status_of(r).find("args") == nullptr);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  CHECK(status_of(r).find("args") != nullptr);
+  r = f.Serve(Req("GET", "/v1/models", "127.0.0.1"));
+  CHECK(status_of(r).find("args") != nullptr);
+}
+
+void TestStatusJobsHidden() {
+  // 2.0.5: /router/status names job ids of the shared queue and the
+  // remote jobs; a user sees its own, an admin all, the rest of the
+  // status stays.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.next = [](const HttpRequest&) {
+    json::Value ids = json::Value::array();
+    ids.push_back("j-tim");
+    ids.push_back("j-anna");
+    ids.push_back("j-unbekannt");
+    json::Value queue = json::Value::object();
+    queue["local"] = 3;
+    queue["pulling"] = ids;
+    queue["pushed_active"] = ids;
+    queue["enabled"] = true;
+    json::Value jobs = json::Value::object();
+    jobs["j-tim"] = json::Value::object();
+    jobs["j-anna"] = json::Value::object();
+    json::Value remote = json::Value::object();
+    remote["router_id"] = "r1";
+    remote["jobs"] = std::move(jobs);
+    json::Value body = json::Value::object();
+    body["models_max"] = 2;
+    body["pool_queue"] = std::move(queue);
+    body["remote"] = std::move(remote);
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/router/status", "192.168.178.50", "",
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  json::Value body = json::parse(r.body);
+  const json::Value* queue = body.find("pool_queue");
+  CHECK(queue != nullptr);
+  CHECK_EQ(queue->find("pulling")->items().size(), std::size_t(1));
+  CHECK_EQ(queue->find("pulling")->items().front().str(), std::string("j-tim"));
+  CHECK_EQ(queue->find("pushed_active")->items().size(), std::size_t(1));
+  CHECK_EQ(queue->member_size("local"), std::size_t(3));
+  CHECK(queue->find("enabled")->as_bool());
+  const json::Value* remote = body.find("remote");
+  CHECK(remote != nullptr);
+  CHECK_EQ(remote->find("jobs")->members().size(), std::size_t(1));
+  CHECK(remote->find("jobs")->find("j-tim") != nullptr);
+  CHECK_EQ(remote->member_str("router_id"), std::string("r1"));
+  CHECK_EQ(body.member_size("models_max"), std::size_t(2));
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/router/status", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  body = json::parse(r.body);
+  CHECK_EQ(body.find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(3));
+  CHECK_EQ(body.find("remote")->find("jobs")->members().size(),
+           std::size_t(2));
+  r = f.Serve(Req("GET", "/router/status", "127.0.0.1"));
+  CHECK_EQ(json::parse(r.body).find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(3));
+}
+
+void TestWebhookRoles() {
+  // 2.0.5: a webhook_url in a job is for admin and dienst; a nutzer gets
+  // 403 webhook_not_allowed, its job without a webhook goes through.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  const std::string with_hook =
+      "{\"request\":{\"path\":\"/v1/images/generations\",\"body\":"
+      "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}},"
+      "\"webhook_url\":\"http://192.168.178.56:8096/fertig\"}";
+  const std::string without =
+      "{\"request\":{\"path\":\"/v1/images/generations\",\"body\":"
+      "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}}}";
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                               {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("webhook_not_allowed"));
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50",
+                  "{\"request\":{\"path\":\"/v1/images/generations\"},"
+                  "\"webhook_url\":null}",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);  // null = none
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", without,
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 200);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("POST", "/v1/jobs", "192.168.178.50", with_hook,
+                  {{"Cookie", admin}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/v1/jobs", "127.0.0.1", with_hook));
+  CHECK_EQ(r.status, 200);
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(20))
+    logged = logged || line.find("abgelehnt:webhook_not_allowed") !=
+                           std::string::npos;
+  CHECK(logged);
+}
+
+void TestChatFilter() {
+  // 2.0.5: the word filter reads a chat's user texts (every user turn,
+  // text parts, `prompt`, `input`); the answer, code and log line are
+  // those of an image; admin and the machine itself are not filtered;
+  // a streaming request is refused before any stream; assistant and
+  // system texts are not read.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("kind", "nutzer", "kind-pw");
+  auth::Rights free_rights;
+  free_rights.filter = false;
+  f.AddUser("tim", "nutzer", "tim-pw", free_rights);
+  const std::string kind = f.LoginCookie("kind", "kind-pw");
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  const auto chat = [&f](const std::string& path, const std::string& cookie,
+                         const std::string& body) {
+    return f.Serve(Req("POST", path, "192.168.178.50", body,
+                       {{"Cookie", cookie}}));
+  };
+  HttpResponse r = chat("/v1/chat/completions", kind,
+                        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\","
+                        "\"content\":\"Ein Haus am See\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"stream\":true,\"messages\":[{\"role\":\"user\","
+           "\"content\":\"Eine NACKTE Frau\"}]}");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  CHECK(!r.streaming_body);
+  // Only the last user turn is read (a refused question the page keeps
+  // in the history must not block the conversation); text parts count,
+  // system/assistant not.
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"nackt\"},{\"role\":\"assistant\",\"content\":\"ok\"},"
+           "{\"role\":\"user\",\"content\":\"weiter\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"Haus\"},{\"role\":\"assistant\",\"content\":\"ok\"},"
+           "{\"role\":\"user\",\"content\":\"nackt\"}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"input\":[{\"role\":\"user\",\"content\":"
+           "\"nackt\"},{\"role\":\"user\",\"content\":\"Haus\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "[{\"type\":\"text\",\"text\":\"ein nsfw bild\"}]}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":"
+           "\"nackt\"},{\"role\":\"assistant\",\"content\":\"nackt\"},"
+           "{\"role\":\"user\",\"content\":\"Hallo\"}]}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/completions", kind, "{\"model\":\"m\",\"prompt\":\"porno\"}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/completions", kind,
+           "{\"model\":\"m\",\"prompt\":[\"Haus\",\"porno\"]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind, "{\"model\":\"m\",\"input\":\"porno\"}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"input\":[{\"role\":\"user\",\"content\":"
+           "[{\"type\":\"input_text\",\"text\":\"porno\"}]}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind, "{\"model\":\"m\",\"input\":\"Haus\"}");
+  CHECK_EQ(r.status, 200);
+  r = chat("/v1/messages", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"porno\"}]}");
+  CHECK_EQ(r.status, 400);
+  // Filter off for tim, for admins, for the machine itself.
+  const std::string bad =
+      "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"nackt\"}]}";
+  CHECK_EQ(chat("/v1/chat/completions", tim, bad).status, 200);
+  CHECK_EQ(chat("/v1/chat/completions", admin, bad).status, 200);
+  r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1", bad));
+  CHECK_EQ(r.status, 200);
+  // Not JSON: the worker answers; no crash here.
+  r = chat("/v1/chat/completions", kind, "nackt");
+  CHECK_EQ(r.status, 200);
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(40))
+    logged = logged ||
+             line.find("abgelehnt:content_filtered") != std::string::npos;
+  CHECK(logged);
+}
+
+void TestViewOwner() {
+  // 2.0.5: a ComfyUI result file answers 404 to another user; the owner
+  // and an admin read it; a file no prompt names stays open.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  CHECK(f.gate->RememberOwner("prompt:p-tim", "tim"));
+  CHECK(f.gate->RememberOwner("prompt:p-anna", "anna"));
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  HttpResponse r = f.Serve(Req("GET", "/view?filename=tim_00001_.png",
+                               "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png&type=output",
+                  "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("GET", "/view?filename=hochgeladen.png&type=input",
+                  "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png", "192.168.178.50",
+                  "", {{"Cookie", admin}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/view?filename=anna_00001_.png", "127.0.0.1"));
+  CHECK_EQ(r.status, 200);
+}
+
 }  // namespace
 
 int main() {
@@ -1966,8 +2426,15 @@ int main() {
   TestFailedLogins();
   TestFilterAndLimit();
   TestUsersApi();
+  TestPasswordChange();
+  TestLoopbackBearer();
   TestModes();
   TestPresetSection();
+  TestModelArgsHidden();
+  TestStatusJobsHidden();
+  TestWebhookRoles();
+  TestChatFilter();
+  TestViewOwner();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

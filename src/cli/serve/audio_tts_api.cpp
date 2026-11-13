@@ -305,13 +305,23 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     }
     speaker_embedding_only =
         clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only";
-    if (!speaker_embedding_only &&
-        (clone_text == nullptr || !clone_text->is_string() ||
-         clone_text->str().empty())) {
-      return Error(400, "Bad Request",
-                   "ICL voice cloning requires non-empty "
-                   "'reference_text'",
-                   "missing_reference_text");
+    const bool text_missing = clone_text == nullptr ||
+                              !clone_text->is_string() ||
+                              clone_text->str().empty();
+    if (!speaker_embedding_only && text_missing) {
+      if (clone_mode == nullptr &&
+          cond.reference_audio == ext::TtsConditioningMode::kOptional) {
+        // A provider that takes the clip alone (reference_audio optional:
+        // VoxCPM2's reference mode) clones from it without a transcript
+        // (2.0.5); a provider that needs the transcript (Qwen3-TTS Base)
+        // still refuses below.
+        speaker_embedding_only = true;
+      } else {
+        return Error(400, "Bad Request",
+                     "ICL voice cloning requires non-empty "
+                     "'reference_text'",
+                     "missing_reference_text");
+      }
     }
     if (clone_text != nullptr && !clone_text->is_string()) {
       return Error(400, "Bad Request", "'reference_text' must be a string",

@@ -20,6 +20,7 @@
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/preset.hpp"
 #include "src/cli/serve/router/proxy.hpp"
+#include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/remote.hpp"
 #include "src/core/platform/net.hpp"
 
@@ -183,6 +184,68 @@ void TestExtraHeadersReplaceClientAuthorization() {
   assert(seen.find("x-trace: router\r\n") != std::string::npos);
   // The body reaches the remote byte for byte.
   assert(seen.ends_with("\r\n\r\n" + body));
+}
+
+void TestPartnerRead() {
+  // GET /router/partner/<what>: the partner's answer passed through, the
+  // call carries the pool key and the relay header, the query stays.
+  FakeUpstream upstream([](net::Socket client, const std::string&) {
+    SendText(client,
+             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+             "Content-Length: 27\r\n\r\n{\"object\":\"list\",\"data\":[]}");
+  });
+  gufo::router::RemoteSpec spec;
+  spec.url.host = "127.0.0.1";
+  spec.url.port = upstream.port();
+  spec.connect_timeout_seconds = 2;
+  gufo::router::auth::SetPoolSecret("geheim-204");
+  HttpRequest request;
+  request.method = "GET";
+  request.path = "/router/partner/jobs";
+  request.query = "status=queued&limit=5";
+  request.headers = {{"Cookie", "gufo_sitzung=abc"}, {"X-Gufo-User", "tim"}};
+  HttpResponse response =
+      gufo::router::PartnerRead(spec, "r-204", request);
+  assert(response.status == 200);
+  assert(Drain(response) == "{\"object\":\"list\",\"data\":[]}");
+  std::string seen = upstream.Captured();
+  assert(seen.starts_with("GET /v1/jobs?status=queued&limit=5 HTTP/1.1\r\n"));
+  assert(seen.find("X-Gufo-Pool-Key: geheim-204\r\n") != std::string::npos);
+  assert(seen.find("X-Gufo-Relay: 1\r\n") != std::string::npos);
+  assert(seen.find("X-Gufo-Forwarded: r-204\r\n") != std::string::npos);
+  assert(seen.find("Cookie") == std::string::npos);
+  assert(seen.find("X-Gufo-User") == std::string::npos);
+  request.path = "/router/partner/status";
+  request.query.clear();
+  response = gufo::router::PartnerRead(spec, "r-204", request);
+  assert(response.status == 200);
+  Drain(response);
+  seen = upstream.Captured();
+  assert(seen.starts_with("GET /router/status HTTP/1.1\r\n"));
+  request.path = "/router/partner/capabilities";
+  response = gufo::router::PartnerRead(spec, "r-204", request);
+  assert(response.status == 200);
+  Drain(response);
+  assert(upstream.Captured().starts_with("GET /router/capabilities HTTP/1.1"));
+  // Anything else, and no partner, and a partner that does not answer.
+  request.path = "/router/partner/users";
+  response = gufo::router::PartnerRead(spec, "r-204", request);
+  assert(response.status == 404);
+  request.method = "POST";
+  request.path = "/router/partner/status";
+  response = gufo::router::PartnerRead(spec, "r-204", request);
+  assert(response.status == 404);
+  request.method = "GET";
+  response = gufo::router::PartnerRead(std::nullopt, "r-204", request);
+  assert(response.status == 503);
+  assert(Drain(response).find("remote_unavailable") != std::string::npos);
+  gufo::router::RemoteSpec gone = spec;
+  gone.url.port = 9;  // discard: nobody listens
+  response = gufo::router::PartnerRead(gone, "r-204", request,
+                                       std::chrono::milliseconds(500));
+  assert(response.status == 503);
+  assert(Drain(response).find("remote_unavailable") != std::string::npos);
+  gufo::router::auth::SetPoolSecret("");
 }
 
 void TestDefaultTargetSendsNoExtras() {
@@ -391,6 +454,7 @@ int main() {
   TestRemoteAllowList();
   TestGpuSlotsSerialAndTimeout();
   TestBusyCheckParse();
+  TestPartnerRead();
   std::cout << "All router remote proxy tests passed.\n";
   return 0;
 }

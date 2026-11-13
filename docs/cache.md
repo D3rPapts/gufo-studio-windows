@@ -66,6 +66,9 @@ turn still reuses everything up to it.
 
 The cache lives in host RAM. By default it takes half of the RAM available
 when the model loads, up to 32 GiB, and always leaves 4 GiB for the system.
+In gufo-studio-windows the environment variable `GUFO_HOST_RESERVE_MIB`
+(512 to 16384) sets that reserve in MiB instead, for machines whose Windows
+RAM is small next to the GPU memory; other values keep the 4 GiB.
 
 ```sh
 gufo serve llm --model "$MODEL" --cache-ram-bytes 17179869184   # 16 GiB

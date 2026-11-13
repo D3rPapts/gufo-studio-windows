@@ -752,12 +752,31 @@ void TestConditioningCapabilities() {
            R"({"model":"fish-drama-3","input":"x","reference_text":"orphan"})")
               .status == 400,
       "orphan reference_text without reference_audio fails closed");
+  // 2.0.5: a provider with optional reference audio takes the clip alone
+  // as speaker_embedding_only (no transcript needed); an explicit icl
+  // without the transcript, and Base (required), still fail closed.
+  const auto clip_only =
+      Send(hybrid, "POST", "/v1/audio/speech",
+           std::string(
+               R"({"model":"fish-drama-3","input":"x","reference_audio":")") +
+               std::string(kReferenceWav) + R"("})");
+  Check(clip_only.status == 200 && runner.latest.speaker_embedding_only &&
+            runner.latest.reference_text.empty() &&
+            runner.latest.reference_audio.samples.size() == 4,
+        "optional reference_audio alone clones as speaker_embedding_only");
   Check(Send(hybrid, "POST", "/v1/audio/speech",
              std::string(
                  R"({"model":"fish-drama-3","input":"x","reference_audio":")") +
-                 std::string(kReferenceWav) + R"("})")
+                 std::string(kReferenceWav) +
+                 R"(","voice_clone_mode":"icl"})")
                 .status == 400,
-        "ICL reference_audio without reference_text fails closed");
+        "explicit icl without reference_text fails closed");
+  Check(Send(hybrid, "POST", "/v1/audio/speech",
+             std::string(
+                 R"({"model":"fish-drama-3","input":"x","reference_audio":")") +
+                 std::string(kReferenceWav) + R"(","reference_text":""})")
+                .status == 200,
+        "optional reference_audio with an empty transcript clones too");
   Check(
       Send(
           hybrid, "POST", "/v1/audio/speech",
