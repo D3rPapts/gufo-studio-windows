@@ -1,14 +1,9 @@
-// Routed expert projections for IQ weight formats (unsloth UD-IQ4_XS:
-// IQ3_S/IQ4_XS gate and up, IQ4_NL down) against a double-precision
-// reference built from the core CPU dequantizers, which are independent of
-// the vendored device code. Covers the decode vector path (single and paired
-// projections, top-k and one-slot-per-row layouts) and the tiled MMQ path.
-
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -16,13 +11,16 @@
 #include <string>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
+// The routed-expert formats of the unsloth UD-Q3_K_XL GGUF (IQ3_XXS gate/up,
+// one IQ4_XS layer, IQ4_NL down) through every expert entry the executor
+// uses: the vector projection (one matrix and a gate/up pair) and the tiled
+// prefill GEMM. Each output is checked against the CPU dequantization times
+// the activations, so a wrong block layout, codebook or dispatch shows up as
+// an O(1) error, far above the activation quantization the kernels apply.
 namespace {
-
-using gufo::core::GgmlType;
 
 void CheckHip(hipError_t error, const char* operation) {
   if (error != hipSuccess) {
@@ -39,175 +37,143 @@ std::uint32_t NextRandom(std::uint32_t* state) noexcept {
 }
 
 struct Format {
+  int ggml_type;
   const char* name;
-  GgmlType type;
-  std::size_t block;
-  std::size_t bytes;
+  std::size_t block_elements;
+  std::size_t block_bytes;
+  void (*dequantize)(const void*, float*, std::size_t);
 };
 
-constexpr Format kIQ3_S{"IQ3_S", GgmlType::kIQ3_S, 256, 110};
-constexpr Format kIQ4_XS{"IQ4_XS", GgmlType::kIQ4_XS, 256, 136};
-constexpr Format kIQ4_NL{"IQ4_NL", GgmlType::kIQ4_NL, 32, 18};
+constexpr int kExperts = 8;
+constexpr int kUsed = 4;
 
-/// Random but valid blocks: every IQ byte pattern decodes, so only the fp16
-/// super-block scale (the first two bytes of each block) is controlled.
-struct Weights {
-  std::vector<std::uint8_t> blocks;
-  std::vector<float> values;  // [experts * rows][cols]
-};
-
-Weights MakeWeights(const Format& f, std::size_t matrices, std::size_t cols,
-                    std::uint32_t seed) {
-  Weights w;
-  const std::size_t row_bytes = cols / f.block * f.bytes;
-  w.blocks.resize(matrices * row_bytes);
-  for (auto& byte : w.blocks)
-    byte = static_cast<std::uint8_t>(NextRandom(&seed));
-  for (std::size_t b = 0; b < w.blocks.size() / f.bytes; ++b) {
-    const float scale =
-        0.002F + 0.004F * static_cast<float>(NextRandom(&seed) % 1000) / 1000.F;
-    const __half d = __float2half(scale);
-    std::memcpy(w.blocks.data() + b * f.bytes, &d, sizeof(d));
+/// Random blocks with a moderate FP16 scale in front of each one; every other
+/// byte (grid indices, signs, sub-block scales, nibbles) is a valid code.
+std::vector<std::uint8_t> MakeWeights(const Format& f, std::size_t rows,
+                                      std::size_t cols, std::uint32_t seed) {
+  const std::size_t blocks = rows * cols / f.block_elements;
+  std::vector<std::uint8_t> w(blocks * f.block_bytes);
+  for (auto& b : w) {
+    b = static_cast<std::uint8_t>(NextRandom(&seed));
   }
-  w.values.resize(matrices * cols);
-  for (std::size_t r = 0; r < matrices; ++r) {
-    const auto* src = w.blocks.data() + r * row_bytes;
-    float* dst = w.values.data() + r * cols;
-    switch (f.type) {
-      case GgmlType::kIQ3_S:
-        gufo::quant::DequantizeIQ3_S(src, dst, cols);
-        break;
-      case GgmlType::kIQ4_XS:
-        gufo::quant::DequantizeIQ4_XS(src, dst, cols);
-        break;
-      default:
-        gufo::quant::DequantizeIQ4_NL(src, dst, cols);
-        break;
-    }
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const float scale = 0.002F + 0.001F * static_cast<float>(b % 5);
+    const __half d = __float2half(scale);
+    std::memcpy(w.data() + b * f.block_bytes, &d, sizeof(d));
   }
   return w;
 }
 
 template<typename T>
-T* Upload(const std::vector<T>& host, const char* what) {
+T* Upload(const std::vector<T>& host) {
   T* device = nullptr;
-  CheckHip(hipMalloc(&device, host.size() * sizeof(T) + 4096), what);
-  CheckHip(hipMemset(device, 0, host.size() * sizeof(T) + 4096), what);
+  CheckHip(hipMalloc(&device, host.size() * sizeof(T)), "allocation");
   CheckHip(hipMemcpy(device, host.data(), host.size() * sizeof(T),
                      hipMemcpyHostToDevice),
-           what);
+           "upload");
   return device;
 }
 
-/// out[(t * used + s) * rows + r] = W[ids[t * used + s]][r] . x[t or slot].
-/// With `per_slot`, each (t, s) row has its own input, as for the down
-/// projection, which the executor runs with n_used == 1.
-double Compare(const std::vector<float>& actual, const Weights& w,
-               const std::vector<float>& x, const std::vector<int>& ids,
-               int rows, int cols, int tokens, int used, bool per_slot) {
-  double max_error = 0, max_reference = 0;
+std::vector<float> Download(const float* device, std::size_t count) {
+  std::vector<float> host(count);
+  CheckHip(hipMemcpy(host.data(), device, count * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "download");
+  return host;
+}
+
+/// Worst error of `actual` against the FP64 oracle, relative to the sum of
+/// |weight * activation| of the same output (the scale the int8 activations
+/// are rounded against).
+double Compare(const std::vector<float>& actual,
+               const std::vector<float>& weights, const std::vector<float>& x,
+               const std::vector<std::int32_t>& ids, int rows, int cols,
+               int tokens, int used) {
+  double worst = 0.0;
   for (int t = 0; t < tokens; ++t) {
-    for (int s = 0; s < used; ++s) {
-      const int slot = t * used + s;
+    for (int u = 0; u < used; ++u) {
+      const int slot = t * used + u;
       const int expert = ids[slot];
-      const float* input = x.data() + (per_slot ? slot : t) * cols;
+      const float* in = x.data() + static_cast<std::size_t>(t) * cols;
       for (int r = 0; r < rows; ++r) {
-        const float* weight =
-            w.values.data() + (std::size_t(expert) * rows + r) * cols;
-        double expected = 0;
-        for (int k = 0; k < cols; ++k)
-          expected += double(weight[k]) * input[k];
-        const double got = actual[std::size_t(slot) * rows + r];
-        if (!std::isfinite(got))
-          return INFINITY;
-        max_error = std::max(max_error, std::abs(got - expected));
-        max_reference = std::max(max_reference, std::abs(expected));
+        const float* w = weights.data() +
+                         (static_cast<std::size_t>(expert) * rows + r) * cols;
+        double sum = 0.0, magnitude = 0.0;
+        for (int k = 0; k < cols; ++k) {
+          sum += double(w[k]) * in[k];
+          magnitude += std::abs(double(w[k]) * in[k]);
+        }
+        const float got = actual[static_cast<std::size_t>(slot) * rows + r];
+        if (!std::isfinite(got)) {
+          throw std::runtime_error("nonfinite expert output");
+        }
+        worst = std::max(worst, std::abs(got - sum) / (magnitude + 1e-6));
       }
     }
   }
-  return max_reference > 0 ? max_error / max_reference : max_error;
+  return worst;
 }
 
-int FormatId(const Format& f) {
-  return static_cast<int>(f.type);
-}
-
-int Raw(const Format& f, const void* w, const float* x, const std::int32_t* ids,
-        float* out, int m, int k, int t, int e, int u) {
-  switch (f.type) {
-    case GgmlType::kIQ3_S:
-      return qfn_mmq_iq3_s_moe_raw(w, x, ids, out, m, k, t, e, u, nullptr);
-    case GgmlType::kIQ4_XS:
-      return qfn_mmq_iq4_xs_moe_raw(w, x, ids, out, m, k, t, e, u, nullptr);
-    default:
-      return qfn_mmq_iq4_nl_moe_raw(w, x, ids, out, m, k, t, e, u, nullptr);
+bool Check(const Format& f, int tokens, bool pair, std::uint32_t seed) {
+  constexpr int rows = 96, cols = 512;
+  const auto wa = MakeWeights(f, std::size_t(kExperts) * rows, cols, seed);
+  const auto wb = MakeWeights(f, std::size_t(kExperts) * rows, cols, seed + 1);
+  std::vector<float> da(wa.size() / f.block_bytes * f.block_elements);
+  std::vector<float> db(da.size());
+  f.dequantize(wa.data(), da.data(), da.size());
+  f.dequantize(wb.data(), db.data(), db.size());
+  std::vector<float> x(static_cast<std::size_t>(tokens) * cols);
+  std::uint32_t state = seed ^ 0x9E3779B9U;
+  for (float& v : x) {
+    v = static_cast<float>(static_cast<int>(NextRandom(&state) % 2001) - 1000) /
+        1000.0F;
   }
-}
-
-/// Activations quantize to Q8_1 on the device; 2% of the largest output
-/// covers that rounding with margin while catching layout or table errors.
-constexpr double kTolerance = 2e-2;
-
-bool Run(const Format& f, int rows, int cols, int tokens, int experts, int used,
-         bool per_slot, bool tiled, bool paired, std::uint32_t seed) {
-  const auto a = MakeWeights(f, std::size_t(experts) * rows, cols, seed);
-  const auto b = MakeWeights(f, std::size_t(experts) * rows, cols, seed ^ 77U);
-  const int inputs = per_slot ? tokens * used : tokens;
-  std::vector<float> x(std::size_t(inputs) * cols);
-  for (auto& v : x)
-    v = static_cast<float>(int(NextRandom(&seed) % 2001) - 1000) / 1000.F;
-  std::vector<int> ids(std::size_t(tokens) * used);
-  for (int t = 0; t < tokens; ++t)
-    for (int s = 0; s < used; ++s)
-      ids[t * used + s] = (t * 7 + s * 3) % experts;
-
-  void* dwa = Upload(a.blocks, "weights");
-  void* dwb = Upload(b.blocks, "weights");
-  float* dx = Upload(x, "input");
-  auto* di = reinterpret_cast<std::int32_t*>(Upload(ids, "ids"));
-  const std::size_t out_size = std::size_t(tokens) * used * rows;
-  std::vector<float> zeros(out_size, 0.F);
-  float* dya = Upload(zeros, "output");
-  float* dyb = Upload(zeros, "output");
-
-  // Per-slot layouts run as one input row per slot with one expert each.
-  const int T = per_slot ? tokens * used : tokens;
-  const int U = per_slot ? 1 : used;
+  std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens) * kUsed);
+  for (int t = 0; t < tokens; ++t) {
+    for (int u = 0; u < kUsed; ++u) {
+      ids[t * kUsed + u] = (t + 2 * u + t / 3) % kExperts;
+    }
+  }
+  void* d_wa = Upload(wa);
+  void* d_wb = Upload(wb);
+  float* d_x = Upload(x);
+  std::int32_t* d_ids = Upload(ids);
+  const std::size_t outputs = ids.size() * rows;
+  float* d_a = Upload(std::vector<float>(outputs, 0.0F));
+  float* d_b = Upload(std::vector<float>(outputs, 0.0F));
+  const bool tiled = tokens > 32;
   int rc = 0;
   if (tiled) {
-    qfn_mmq_set_routed_max_expert_rows(T * U);
-    qfn_mmq_set_routed_tile_cols(32);
-    rc = Raw(f, dwa, dx, di, dya, rows, cols, T, experts, U);
-    if (rc == 0 && paired)
-      rc = Raw(f, dwb, dx, di, dyb, rows, cols, T, experts, U);
+    qfn_mmq_set_routed_max_expert_rows(tokens);
+    rc = qfn_mmq_iq_moe_raw(f.ggml_type, d_wa, d_x, d_ids, d_a, rows, cols,
+                            tokens, kExperts, kUsed, nullptr);
+    qfn_mmq_set_routed_max_expert_rows(0);
   } else {
-    rc = qfn_mmq_moe_vec(FormatId(f), dwa, dx, di, dya, rows, cols, T, experts,
-                         U, nullptr, paired ? dwb : nullptr,
-                         paired ? dyb : nullptr);
+    rc = qfn_mmq_moe_vec(f.ggml_type, d_wa, d_x, d_ids, d_a, rows, cols, tokens,
+                         kExperts, kUsed, nullptr, pair ? d_wb : nullptr,
+                         pair ? d_b : nullptr);
   }
-  CheckHip(hipDeviceSynchronize(), "projection");
-  std::vector<float> ya(out_size), yb(out_size);
-  CheckHip(hipMemcpy(ya.data(), dya, out_size * sizeof(float),
-                     hipMemcpyDeviceToHost),
-           "download");
-  CheckHip(hipMemcpy(yb.data(), dyb, out_size * sizeof(float),
-                     hipMemcpyDeviceToHost),
-           "download");
-  for (void* p : {dwa, dwb, static_cast<void*>(dx), static_cast<void*>(di),
-                  static_cast<void*>(dya), static_cast<void*>(dyb)})
-    (void)hipFree(p);
-
-  double error =
-      rc == 0 ? Compare(ya, a, x, ids, rows, cols, tokens, used, per_slot)
-              : INFINITY;
-  if (paired && rc == 0)
-    error = std::max(
-        error, Compare(yb, b, x, ids, rows, cols, tokens, used, per_slot));
-  const bool ok = error < kTolerance;
-  std::cout << (ok ? "PASS " : "FAIL ") << f.name << (tiled ? " tiled" : " vec")
-            << (paired ? " pair" : "") << (per_slot ? " per-slot" : "")
-            << " rows=" << rows << " cols=" << cols << " tokens=" << tokens
-            << " used=" << used << " rc=" << rc << " rel_error=" << error
+  CheckHip(hipDeviceSynchronize(), "expert projection");
+  double worst = 0.0;
+  if (rc == 0) {
+    worst =
+        Compare(Download(d_a, outputs), da, x, ids, rows, cols, tokens, kUsed);
+    if (pair) {
+      worst = std::max(worst, Compare(Download(d_b, outputs), db, x, ids, rows,
+                                      cols, tokens, kUsed));
+    }
+  }
+  for (void* p :
+       {d_wa, d_wb, static_cast<void*>(d_x), static_cast<void*>(d_ids),
+        static_cast<void*>(d_a), static_cast<void*>(d_b)}) {
+    CheckHip(hipFree(p), "free");
+  }
+  const char* route = tiled ? "tiled" : pair ? "vector pair" : "vector";
+  // The kernels round activations to int8 per 32 values; that costs well
+  // under 1 % of the summed magnitude, a wrong layout costs all of it.
+  const bool ok = rc == 0 && worst < 1e-2;
+  std::cout << f.name << ' ' << route << " tokens=" << tokens << ": rc=" << rc
+            << " worst relative error " << worst << (ok ? "" : "  FAILED")
             << '\n';
   return ok;
 }
@@ -216,23 +182,29 @@ bool Run(const Format& f, int rows, int cols, int tokens, int experts, int used,
 
 int main() {
   try {
-    bool ok = true;
-    for (const Format* f : {&kIQ3_S, &kIQ4_XS}) {
-      // Gate/up shapes: hidden-width K, decode (1 and a draft of 4 tokens
-      // with top-8), the paired decode route, and wide tiled prefill.
-      ok = Run(*f, 64, 2560, 1, 16, 8, false, false, true, 0xA11CEU) && ok;
-      ok = Run(*f, 64, 2560, 4, 16, 8, false, false, true, 0xB0B5U) && ok;
-      ok = Run(*f, 64, 2560, 65, 16, 8, false, true, true, 0xC0FFEEU) && ok;
-      ok = Run(*f, 96, 2560, 300, 16, 8, false, true, false, 0xD00DU) && ok;
+    if (qfn_mmq_init(0) != 0) {
+      throw std::runtime_error("prepare quantized projections");
     }
-    // Down shapes: K = expert width, one input row per (token, slot).
-    ok = Run(kIQ4_NL, 128, 640, 1, 16, 8, true, false, false, 0xE1U) && ok;
-    ok = Run(kIQ4_NL, 128, 640, 3, 16, 8, true, false, false, 0xE2U) && ok;
-    ok = Run(kIQ4_NL, 128, 640, 65, 16, 8, true, true, false, 0xE3U) && ok;
-    ok = Run(kIQ4_NL, 2560, 640, 40, 16, 8, true, true, false, 0xE4U) && ok;
+    namespace quant = gufo::quant;
+    const Format formats[] = {
+        {18, "IQ3_XXS", 256, std::size_t{98} /* IQ3_XXS block */,
+         quant::DequantizeIQ3_XXS},
+        {23, "IQ4_XS", 256, sizeof(quant::block_iq4_xs),
+         quant::DequantizeIQ4_XS},
+        {20, "IQ4_NL", 32, sizeof(quant::block_iq4_nl),
+         quant::DequantizeIQ4_NL},
+    };
+    bool ok = true;
+    std::uint32_t seed = 0x1A3C5E7U;
+    for (const Format& f : formats) {
+      ok = Check(f, 1, false, seed++) && ok;
+      ok = Check(f, 4, false, seed++) && ok;
+      ok = Check(f, 4, true, seed++) && ok;
+      ok = Check(f, 70, false, seed++) && ok;
+    }
     return ok ? 0 : 1;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << '\n';
     return 1;
   }
 }

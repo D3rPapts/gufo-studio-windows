@@ -3,23 +3,23 @@
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <gufo/ext/experimental/hip_utils.hpp>
+#include <gufo/ext/experimental/snapshot_transfer.hpp>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 
-#include "src/core/hip/hip_utils.hpp"
-#include "src/core/hip/snapshot_transfer.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/copy_27b.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::hip {
 namespace {
 
-constexpr std::uint32_t kMaxPromptBatch = 4096;
 constexpr std::size_t kMaxTargetLayerTaps = 5;
 constexpr std::array<std::uint8_t, 8> kCompactSnapshotMagic = {
     'G', 'Q', 'K', 'V', 'S', 'N', 'P', '1'};
@@ -445,6 +445,12 @@ QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
   if (d_ssm_conv_buffers_[1] && d_ssm_deltanet_buffers_[1])
     CheckedAdd(RecurrentStateBytes(config_, policy_),
                &usage.request_state_bytes);
+  // Rollback scratch, not snapshot state: only the slots a wide verification
+  // added to the ring (the runner claims them).
+  if (d_ssm_replay_qkv_ != nullptr && replay_capacity_ > kSsmReplayCapacity)
+    CheckedAdd(SsmReplayLogBytes(config_, replay_capacity_) -
+                   SsmReplayLogBytes(config_, kSsmReplayCapacity),
+               &usage.temporary_scratch_bytes);
   return usage;
 }
 
@@ -959,6 +965,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
   d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
   d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
+  replay_capacity_ = other.replay_capacity_;
   saved_context_ = other.saved_context_;
   replay_last_position_ = other.replay_last_position_;
   replay_captured_positions_ = other.replay_captured_positions_;
@@ -1005,6 +1012,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_replay_alpha_ = nullptr;
   other.d_ssm_replay_beta_ = nullptr;
   other.d_ssm_replay_enabled_ = nullptr;
+  other.replay_capacity_ = kSsmReplayCapacity;
   other.saved_context_ = 0;
   other.replay_last_position_ = 0;
   other.replay_captured_positions_ = 0;
@@ -1061,6 +1069,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
     d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
     d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
+    replay_capacity_ = other.replay_capacity_;
     saved_context_ = other.saved_context_;
     replay_last_position_ = other.replay_last_position_;
     replay_captured_positions_ = other.replay_captured_positions_;
@@ -1107,6 +1116,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_replay_alpha_ = nullptr;
     other.d_ssm_replay_beta_ = nullptr;
     other.d_ssm_replay_enabled_ = nullptr;
+    other.replay_capacity_ = kSsmReplayCapacity;
     other.saved_context_ = 0;
     other.replay_last_position_ = 0;
     other.replay_captured_positions_ = 0;
@@ -1134,17 +1144,25 @@ void QwenGpuArena::Reset() {
   // Attention only reads positions through the current token. Prefill/decode
   // writes those rows before use; clearing reserved future KV adds O(capacity)
   // work to every short conversation and snapshot restore.
-  if (d_ssm_conv_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(d_ssm_conv_state, 0, total_conv * sizeof(float),
-                             stream));
-  }
-  if (d_ssm_deltanet_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(
-        d_ssm_deltanet_state, 0,
-        total_deltanet *
-            QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
-        stream));
-  }
+  // Windows: hipMemsetAsync of the ~160 MB recurrent state ran at ~0.5 GB/s
+  // in the DFlash2 server (330-400 ms per reset, twice per new prompt); a
+  // grid-stride kernel writes the same zeros in ~1-4 ms. GUFO_QWEN27_ZERO27=0
+  // restores the memset.
+  const auto zero = [&](void* buffer, std::size_t bytes) {
+#ifdef _WIN32
+    if (qwen27::Zero27On()) {
+      LaunchDeviceZero27(buffer, bytes, stream);
+      return;
+    }
+#endif
+    HIP_CHECK(hipMemsetAsync(buffer, 0, bytes, stream));
+  };
+  if (d_ssm_conv_state != nullptr)
+    zero(d_ssm_conv_state, total_conv * sizeof(float));
+  if (d_ssm_deltanet_state != nullptr)
+    zero(d_ssm_deltanet_state,
+         total_deltanet *
+             QwenRecurrentStateElementBytes(policy_.recurrent_state_storage));
   DisableSsmReplayCapture();
   saved_context_ = 0;
   replay_last_position_ = 0;

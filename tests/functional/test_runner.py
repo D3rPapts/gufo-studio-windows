@@ -30,8 +30,10 @@ from image_inputs import assert_color, image_cases, invalid_image_cases
 from cache_concurrency import check_cache_concurrency
 from cache_shared_prefix import check_cache_shared_prefix
 from cache_bridge import check_cache_bridge
+from cache_workloads import check_cache_pressure
 from cache_compaction import check_cache_compaction, ARCHIVE_LINE
 from cache_disk_spacing import check_disk_spacing
+import cache_persist
 from cache_growth import check_cache_growth
 from cache_depth import check_cache_depth
 from cache_rotation import check_cache_rotation, check_snapshot_budget, host_available_bytes
@@ -75,6 +77,23 @@ class FunctionalRunnerTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             summarize([(1, json.dumps(body).encode())], False, False,
                       ("/v1/messages/count_tokens", {}, 200))
+
+    def test_openai_count_tokens_contract(self):
+        for endpoint in ("/v1/chat/completions/input_tokens", "/v1/responses/input_tokens"):
+            body = {"object": "response.input_tokens", "input_tokens": 318}
+            measured, fingerprint = summarize([(1, json.dumps(body).encode())], False, True,
+                                              (endpoint, {"stream": True}, 200))
+            self.assertEqual(measured, {"prompt_tokens": 318})
+            self.assertIsNotNone(fingerprint)
+            recorder = Recorder(None)
+            measurement = recorder.begin(endpoint, {"stream": True})
+            self.assertFalse(measurement.row["stream"])
+            for invalid in ({"input_tokens": 318}, {**body, "object": "wrong"},
+                            {**body, "input_tokens": True}, {**body, "input_tokens": -1},
+                            {**body, "input_tokens": 3.5}, {**body, "output_tokens": 0}):
+                with self.subTest(endpoint=endpoint, invalid=invalid), self.assertRaises(AssertionError):
+                    summarize([(1, json.dumps(invalid).encode())], False, True,
+                              (endpoint, {}, 200))
 
     def test_messages_count_tokens_includes_cached_prompt(self):
         for usage in ({"input_tokens": 318},
@@ -265,7 +284,7 @@ class FunctionalRunnerTest(unittest.TestCase):
                         worker.join(timeout=5)
 
     def test_image_inputs_require_a_projector_before_starting_a_server(self):
-        for suite in ("image-inputs", "image-count", "tool-images"):
+        for suite in ("image-inputs", "image-count", "tool-images", "image-detail"):
             argv = ["run.py", "--output", "/unused", "--sampling-preset", "qwen38",
                     "--suite", suite, "--record-baseline", "--", "gufo", "serve", "llm"]
             with patch.object(sys, "argv", argv), patch.object(functional, "server") as start, \
@@ -391,7 +410,7 @@ class FunctionalRunnerTest(unittest.TestCase):
     def test_cache_rotation_checks_host_headroom_and_requested_limits(self):
         gib = 1024**3
         def log(capacity, sessions=1, entries=128):
-            return (f"event=snapshot_cache_configured sessions={sessions} "
+            return (f"schema=component-cache-v1 event=configured sessions={sessions} "
                     f"snapshot_entries={entries} capacity_bytes={capacity}\n")
         self.assertEqual(host_available_bytes("MemTotal: 9 kB\nMemAvailable: 4096 kB\n"),
                          4096 * 1024)
@@ -417,6 +436,59 @@ class FunctionalRunnerTest(unittest.TestCase):
         ):
             with self.subTest(output=output), self.assertRaises(ValueError):
                 check_snapshot_budget(output, available, requested, 1)
+
+    def test_cache_persist_flags_only_its_prompt(self):
+        def reply(text, total, cached, disk=False, persist=True):
+            return {"choices": [{"message": {"role": "assistant", "content": text}}],
+                    "cache_persist": persist,
+                    "usage": {"prompt_tokens": total, "cached_tokens": cached, "gufo": {
+                        "prefill_tokens": total - cached, "cache_disk_hit": disk}}}
+
+        sent = []
+
+        def script(*replies):
+            queue = list(replies)
+
+            def call(url, body):
+                sent.append(body)
+                return queue.pop(0)
+            return patch("continuation.call", side_effect=call)
+
+        with script(reply("BETA", 2500, 0, persist=False),
+                    reply("GAMMA", 2520, 2498, persist=False),
+                    reply("BETA", 2500, 3)):
+            previous = cache_persist.send("http://x", "m")
+        self.assertEqual([body.get("cache_persist") for body in sent], [False, False, None])
+        self.assertNotIn("cache_persist", sent[2])
+        previous = json.loads(json.dumps(previous))
+        cases = [
+            ((reply("BETA", 2500, 2496, True), reply("BETA", 2500, 3)), None),
+            ((reply("BETA", 2500, 2496, False), reply("BETA", 2500, 3)), "'disk': False"),
+            ((reply("BETA", 2500, 2496, True), reply("BETA", 2500, 2496, True)), "'cached': 2496"),
+            ((reply("BETA", 2500, 2496, True), reply("ALPHA", 2500, 3)), "ALPHA"),
+        ]
+        for replies, error in cases:
+            with self.subTest(error=error), script(*replies):
+                sent.clear()
+                if error is None:
+                    result = cache_persist.restore("http://x", "m", previous)
+                    self.assertTrue(result["control"]["disk"])
+                else:
+                    with self.assertRaisesRegex(AssertionError, error):
+                        cache_persist.restore("http://x", "m", previous)
+                self.assertNotIn("cache_persist", sent[0])
+        with script(reply("BETA", 2500, 0, persist=False),
+                    reply("GAMMA", 2520, 3, persist=False)), \
+                self.assertRaisesRegex(AssertionError, "'cached': 3"):
+            cache_persist.send("http://x", "m")
+        # A server that ignores the flag (no echo, or true) fails at once.
+        for echo in (None, True):
+            response = reply("BETA", 2500, 0, persist=echo)
+            if echo is None:
+                del response["cache_persist"]
+            with script(response), \
+                    self.assertRaisesRegex(AssertionError, "cache_persist"):
+                cache_persist.send("http://x", "m")
 
     def test_disk_spacing_checks_drained_logs(self):
         def event(tokens, reason="saved"):
@@ -462,6 +534,26 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 check_unchanged_retry("history", retry, 24, log, 0, log.stat().st_size,
                                       mutable_suffix_tokens=24)
+
+    def test_pressure_retry_allows_only_the_aligned_stable_boundary(self):
+        from cache_growth import check_unchanged_retry
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            # Flash-Next rounds the counted boundary 1305 down to 1304 (#1017).
+            log.write_text("schema=component-cache-v1 event=capture_refused "
+                           "reason=byte_capacity tokens=1329\n")
+            retry = {"usage": {"prompt_tokens": 1329}}
+            check_unchanged_retry("history", retry, 25, log, 0, log.stat().st_size,
+                                  mutable_suffix_tokens=24)
+            with self.assertRaises(AssertionError):
+                check_unchanged_retry("history", retry, 26, log, 0, log.stat().st_size,
+                                      mutable_suffix_tokens=24)
+            # An already aligned boundary 1304 leaves no extra token.
+            log.write_text("schema=component-cache-v1 event=capture_refused "
+                           "reason=byte_capacity tokens=1328\n")
+            with self.assertRaises(AssertionError):
+                check_unchanged_retry("history", {"usage": {"prompt_tokens": 1328}}, 25,
+                                      log, 0, log.stat().st_size, mutable_suffix_tokens=24)
 
     def test_disk_spacing_uses_capture_ids_for_delayed_publications(self):
         totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
@@ -1480,13 +1572,16 @@ class FunctionalRunnerTest(unittest.TestCase):
     def test_timing_evidence_does_not_hide_outliers_or_average_requests(self):
         def pair(old, new):
             result = {"status": "passed", "measurements": [],
-                      "quality_or_coverage_changes": [], "slowdown_tolerance": .05, "noise_ms": 3}
+                      "quality_or_coverage_changes": [], "slowdown_tolerance": .05, "noise_ms": 10}
             functional.compare_lifecycle(result, {"startup_ms": old}, {"startup_ms": new})
             return result
 
         self.assertEqual(qualify([pair(100, 105)])["status"], "passed")
         self.assertEqual(qualify([pair(1, 4)])["status"], "passed")
-        self.assertEqual(qualify([pair(100, 106)])["status"], "inconclusive")
+        self.assertEqual(qualify([pair(20, 29)])["status"], "passed")
+        self.assertEqual(qualify([pair(20, 30)])["status"], "passed")
+        self.assertEqual(qualify([pair(1000, 1049)])["status"], "passed")
+        self.assertEqual(qualify([pair(100, 111)])["status"], "inconclusive")
         self.assertEqual(qualify([pair(100, 120), pair(101, 119)])["status"], "failed")
         noisy = qualify([pair(100, 700), pair(700, 100)])
         self.assertEqual(noisy["status"], "inconclusive")
@@ -1721,6 +1816,100 @@ p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests":
             report = json.loads((root / "out" / "report.json").read_text())
             self.assertEqual(list(report["suites"]), ["tools", "tool-native-schemas"])
 
+    def test_runner_sizes_the_default_context_for_the_selected_suites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "openai_sdk.py").write_text('''import json,sys
+from pathlib import Path
+p = Path(sys.argv[sys.argv.index("--output") + 1])
+p.write_text(json.dumps({"status": "passed"}))
+p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests": [{
+    "index": 0, "case": "reply", "status": "complete", "endpoint": "/v1/chat/completions",
+    "wall_ms": 1, "request_sha256": "same", "output_sha256": "same"}]}))
+''')
+            for suites, server_options, context in (
+                    (["responses"], [], "8192"),
+                    (["responses", "cache-shared-prefix"], [], "16384"),
+                    (["cache-shared-prefix", "cache-depth"], [], "32768"),
+                    (["cache-depth"], ["--context", "65536"], "65536")):
+                args = ["run.py", "--output", str(root / context / str(len(server_options))),
+                        "--sampling-preset", "provider", "--record-baseline"]
+                for suite in suites:
+                    args += ["--suite", suite]
+                args += ["--", sys.executable, "serve", "llm", "--model", "fixture.gguf",
+                         *server_options]
+                with self.subTest(suites=suites, server_options=server_options), \
+                     patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
+                     patch.object(functional, "server",
+                                  return_value=contextlib.nullcontext()) as start, \
+                     patch.object(functional, "provenance", return_value={}), \
+                     patch.object(functional, "join_server_timings"), \
+                     patch.object(functional, "execution_coverage", return_value={}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(functional.main(), 0)
+                    command = start.call_args.args[0]
+                    self.assertEqual(command.count("--context"), 1)
+                    self.assertEqual(command[command.index("--context") + 1], context)
+
+    def test_runner_refuses_suite_settings_that_cannot_qualify_before_starting(self):
+        for suites, server_options, message in (
+                (["cache-depth"], ["--context", "8192"], "cache-depth needs --context 32768"),
+                (["responses", "cache-shared-prefix"], ["--context=8192"],
+                 "cache-shared-prefix needs --context 16384"),
+                (["cache-bridge"], [], "cache-bridge require --cache-ram-bytes"),
+                (["cache-bridge", "cache-pressure"], ["--context", "32768"],
+                 "cache-bridge and cache-pressure require --cache-ram-bytes")):
+            args = ["run.py", "--output", "/unused", "--sampling-preset", "provider",
+                    "--record-baseline"]
+            for suite in suites:
+                args += ["--suite", suite]
+            args += ["--", "gufo", "serve", "llm", "--model", "fixture.gguf", *server_options]
+            stderr = io.StringIO()
+            with self.subTest(suites=suites), patch.object(sys, "argv", args), \
+                 patch.object(functional, "server") as start, \
+                 contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                functional.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn(message, stderr.getvalue())
+            start.assert_not_called()
+
+    def test_cache_fill_failures_name_a_budget_the_requests_would_fill(self):
+        result = {"text": "OK", "reasoning": "", "tools": [], "finish": "stop",
+                  "usage": {"prompt_tokens": 10, "cached_tokens": 0,
+                            "gufo": {"prefill_tokens": 10, "cache_snapshot_bytes": 1000}}}
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(AssertionError, r"try --cache-ram-bytes 42666 or less"):
+            check_cache_bridge(None, "fixture", {}, lambda client, body: deepcopy(result),
+                               10**9)
+        result["text"] = "ALPHA"
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(AssertionError, r"try --cache-ram-bytes 24000 or less"):
+            check_cache_pressure(None, "fixture", {}, lambda client, body, *rest: deepcopy(result),
+                                 10**9)
+
+    def test_cancel_fixture_reports_a_model_that_finished_first(self):
+        import continuation
+
+        class Response:
+            status = 200
+
+            def getheader(self, name):
+                return "fixture"
+
+            def __iter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n'
+                yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'
+                yield b"data: [DONE]\n"
+
+        connection = unittest.mock.MagicMock()
+        connection.getresponse.return_value = Response()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(continuation, "TRACE", Recorder(Path(directory) / "r.json")), \
+             patch.object(continuation.http.client, "HTTPConnection", return_value=connection), \
+             self.assertRaisesRegex(RuntimeError, r"fixture never cancelled: the model "
+                                    r"finished after 1 of the eight content deltas"):
+            continuation.call("http://127.0.0.1:1", {"stream": True}, "content")
+
     def test_failed_or_incomplete_child_is_not_reported_as_a_pass(self):
         hung = 'import time; time.sleep(10)'
         for child, expected in (
@@ -1782,7 +1971,7 @@ import json, sys
 from pathlib import Path
 output = Path(sys.argv[sys.argv.index("--output") + 1])
 (output.parent / "disk").mkdir(exist_ok=True)
-(output.parent / "disk" / "entry.kvc").write_bytes(b"x")
+(output.parent / "disk" / "entry").write_bytes(b"x")
 payload = ({continuation_report!r} if Path(__file__).name == "continuation.py"
            else {{"exact": {spacing_exact!r}}})
 output.write_text(json.dumps([payload]))
@@ -1791,7 +1980,8 @@ output.with_suffix(".requests.json").write_text(json.dumps({{"version": 1, "requ
     "request_sha256": "fixture"}}]}}))
 sys.exit({exit_code})
 '''
-                for script in ("continuation.py", "cache_disk_spacing.py"):
+                for script in ("continuation.py", "cache_disk_spacing.py",
+                               "cache_persist.py"):
                     (root / script).write_text(child)
 
                 def server(command, log, timeout):
@@ -1816,6 +2006,8 @@ sys.exit({exit_code})
                 self.assertEqual(report["suites"]["text-cancel"]["status"],
                                  "passed" if continuation_passed else "failed")
                 self.assertEqual(report["suites"]["disk-spacing"]["status"],
+                                 "passed" if not exit_code and spacing_exact else "failed")
+                self.assertEqual(report["suites"]["cache-persist"]["status"],
                                  "passed" if not exit_code and spacing_exact else "failed")
                 self.assertIn("--cache-disk", report["command"])
                 self.assertFalse((root / "report/disk").exists())

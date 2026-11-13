@@ -40,6 +40,33 @@ int AudioVaeDecoder::samples() const noexcept {
   return 0;
 }
 
+struct AudioVaeEncoder::Impl {};
+
+AudioVaeEncoder::AudioVaeEncoder(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+AudioVaeEncoder::~AudioVaeEncoder() = default;
+AudioVaeEncoder::AudioVaeEncoder(AudioVaeEncoder&&) noexcept = default;
+AudioVaeEncoder& AudioVaeEncoder::operator=(AudioVaeEncoder&&) noexcept =
+    default;
+
+std::unique_ptr<AudioVaeEncoder> AudioVaeEncoder::Create(
+    const ModelInventory&, const CancellationToken*, AudioVaeEncoderTelemetry*,
+    std::string* error) {
+  if (error != nullptr) {
+    *error = "MiniMax H3 AudioVAE requires a HIP-enabled build";
+  }
+  return nullptr;
+}
+
+bool AudioVaeEncoder::Encode(const AudioWaveform&, const CancellationToken*,
+                             std::vector<float>*, int*,
+                             AudioVaeEncoderTelemetry*, std::string* error) {
+  if (error != nullptr) {
+    *error = "MiniMax H3 AudioVAE requires a HIP-enabled build";
+  }
+  return false;
+}
+
 #endif
 
 }  // namespace gufo::minimax_h3

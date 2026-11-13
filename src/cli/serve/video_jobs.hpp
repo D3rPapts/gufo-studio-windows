@@ -10,8 +10,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
-#include "src/models/minimax_h3/generation.hpp"
+#include "src/cli/serve/media/video_postprocess.hpp"
+#include "src/cli/serve/preview.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
 
@@ -41,8 +44,23 @@ struct VideoJobRequest {
   std::string size{"512x512"};
   std::string seconds{"1"};
   std::string output_format{"mp4"};
-  minimax_h3::GenerationParameters parameters;
+  ext::VideoParameters parameters;
   std::uint64_t seed{42};
+  /// Provider-owned options and inputs (`VideoProvider::prepare_request`).
+  std::string options_json;
+  std::vector<ext::VideoAttachment> attachments;
+  /// gufo-studio-windows post-steps after the runner (RIFE, Real-ESRGAN);
+  /// need VideoJobServiceOptions::postprocessors.
+  VideoPostProcess post;
+  /// Post-processing only (MP4 bytes, e.g. ComfyUI LoadVideo -> RIFE VFI):
+  /// nothing is generated, the upload is interpolated and/or upscaled. Needs
+  /// a post-step; prompt, size and parameters are not used.
+  std::vector<std::uint8_t> source_video;
+  /// Live preview (GET /v1/previews/{job id}): a loop of all latent frames,
+  /// every second step by default ("gufo": {"preview": {...}}), for providers
+  /// with `preview_latent` (gufo-studio-windows, as 1.4.9).
+  PreviewOptions preview{
+      .always = false, .every = 2, .dense_up_to = 16, .max_side = 320};
 };
 
 struct VideoJobSnapshot {
@@ -67,19 +85,31 @@ struct VideoJobContent {
 };
 
 struct VideoJobServiceOptions {
+  /// Video provider id; empty: the provider whose probe accepts
+  /// `model_root` (highest `probe_priority`), else `minimax-h3`.
+  std::string provider_id;
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
   std::filesystem::path storage_root;
   std::size_t queue_capacity{1};
   std::chrono::seconds artifact_ttl{std::chrono::hours(1)};
+  /// Additional IDs accepted from requests. They behave as the root
+  /// `minimax-h3` name; the preset-selecting variants stay fixed (#957).
+  std::vector<std::string> model_aliases;
   bool validate_model_inventory{true};
   std::function<std::string()> id_factory;
   std::function<std::int64_t()> now;
-  std::function<bool(const minimax_h3::GenerationRequest&,
-                     const minimax_h3::CancellationToken*,
-                     minimax_h3::GenerationProgress, void*,
-                     minimax_h3::GenerationTelemetry*, std::string*)>
+  std::function<bool(const ext::VideoRequest&, const ext::CancellationCheck&,
+                     ext::VideoProgress, void*, ext::VideoTelemetry*,
+                     std::string*)>
       runner;
+  /// gufo-studio-windows: RIFE / Real-ESRGAN post-steps; empty members
+  /// reject requests that ask for them.
+  VideoPostProcessors postprocessors;
+  /// gufo-studio-windows: the provider's own `serve video` options in
+  /// command-line order (`--lora`, `--vision-projector` for MiniMax H3),
+  /// passed to `VideoProvider::create_with_options`.
+  std::vector<std::pair<std::string, std::string>> provider_options;
 };
 
 struct VideoJobCreateResult {
@@ -112,6 +142,17 @@ public:
 
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] std::string initialization_error() const;
+  /// The provider this service runs (nullptr when initialization failed).
+  [[nodiscard]] const ext::VideoProvider* provider() const noexcept;
+  /// Canonical model name: the provider id of a provider with
+  /// `prepare_request`, else `minimax-h3`.
+  [[nodiscard]] std::string model_id() const;
+  /// True for a canonical `minimax-h3` name or a configured alias (#957).
+  [[nodiscard]] bool serves_model(std::string_view name) const;
+  /// The request name as a canonical model: aliases map to the root
+  /// `minimax-h3`, unknown names are returned unchanged for rejection.
+  [[nodiscard]] std::string normalize_model(std::string_view name) const;
+  [[nodiscard]] const std::vector<std::string>& model_aliases() const;
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);
   [[nodiscard]] VideoJobContentResult Content(std::string_view id);

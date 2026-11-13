@@ -1,0 +1,4179 @@
+{
+ "katalog_version": "1.0 (2026-11-13)",
+ "erzeugt": "2026-11-13T10:16:53",
+ "erzeugt_aus": {
+  "modellbaum": "D:\\llm-modelle\\gufo\\modelle",
+  "memory_json": "D:\\llm-modelle\\gufo\\gufo-router-combo7.memory.json",
+  "h3_manifest": "D:\\llm-modelle\\gufo\\app\\gufo-2.0.2-2026-11-13\\MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+ },
+ "hinweise": [
+  "Groessen (bytes) kommen aus dem echten Baum der .198; Hardlinks (hardlink_auf) zaehlen in den Summen nur einmal.",
+  "sha256_status: 'fehlt' = keine Pruefsumme bekannt; es gibt unter modelle\\ keine *.source-manifest.json. Vorhanden nur: H3-Manifest, Qwen-Image-2.1 .tree.json (LFS), IndexTTS german/SHA256SUMS.txt.",
+  "gpu_gb_notiz = gemessener Wert aus Preset-Kommentar/Release-Notes (Quelle dabei); gpu_gb_router/host_gb_router = vom Router gelernte Spitze (learned_* in gufo-router-combo7.memory.json, Datum dabei). Keine Schaetzwerte (estimate_* werden nicht uebernommen).",
+  "passt_64gb folgt der Tabelle in INSTALLER-PLAN-2026-11-13.md Schritt 2; wo unsere Messung auf der .198 (64 GB) abweicht, steht es im Hinweis.",
+  "Nicht im Katalog: [external/qwen3.5-4b] und [external/qwen3.5-9b] (llama-server fuer den Mailputzer, nicht gufo); alibaba-pai ControlNet, bosonai Higgs, wan21-vace, TRELLIS-image-large (im Baum, aber nicht im Produktions-Preset)."
+ ],
+ "worker": {
+  "gufo.exe": "bin\\gufo.exe der Version (Router + alle Standard-Worker)",
+  "router": "laeuft im Router-Prozess selbst (omni)",
+  "35b": "gufo-stockmind-35b (eigener Build, app\\gufo-stockmind-35b-2026-10-26b)",
+  "gufo-3d": "TripoSG-Worker (feat/triposg, app\\gufo-3d-2026-11-12)",
+  "trellis2": "TRELLIS.2-Worker (feat/trellis2, app\\gufo-trellis2-2026-11-12)",
+  "gufo-moss": "MOSS-Music-Worker (feat/moss-music, app\\gufo-moss-2026-11-12)",
+  "gufo-d": "D-Block-Worker mit Seed-VC (GPL, nicht veroeffentlicht, app\\gufo-d-2026-11-12)"
+ },
+ "bausteine": {
+  "chat": {
+   "titel": "Chat (Text)",
+   "beschreibung": "Qwen3.8-27B mit DFlash2; optional Flash-Next (Q3 fuer 64 GB, Q4 fuer 128 GB), Qwen3.6-35B-A3B, Hemmingway-1.5.",
+   "modelle": [
+    {
+     "id": "qwen3.8-27b",
+     "name": "Qwen3.8-27B UD-Q4_K_XL + mmproj + DFlash2",
+     "abschnitt": "external/qwen3.8-27b",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "unsloth\\Qwen3.8-27B-GGUF",
+      "z-lab\\Qwen3.8-27B-DFlash2-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "unsloth\\Qwen3.8-27B-GGUF",
+       "hf_repo": "unsloth/Qwen3.8-27B-GGUF",
+       "hf_revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+       "angabe_von": "docs/models/qwen3.8-27b.md",
+       "hinweis": ""
+      },
+      {
+       "ordner": "z-lab\\Qwen3.8-27B-DFlash2-GGUF",
+       "hf_repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+       "hf_revision": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+       "angabe_von": "docs/models/qwen3.8-27b.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft (Qwen3.8: Apache-2.0 laut THIRD_PARTY_NOTICES fuer die Chat-Vorlage; KB 1127: ungeprueft)",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 34.54,
+     "host_gb_router": 3.98,
+     "router_gemessen_am": "2026-11-09T13:05:03",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 19633331392,
+     "gb": 19.63,
+     "dateien": [
+      {
+       "pfad": "unsloth\\Qwen3.8-27B-GGUF\\Qwen3.8-27B-UD-Q4_K_XL.gguf",
+       "bytes": 17559178144,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-27B-GGUF\\mmproj-BF16.gguf",
+       "bytes": 931146432,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "z-lab\\Qwen3.8-27B-DFlash2-GGUF\\Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+       "bytes": 1143006816,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3.8-flash-next-q3",
+     "name": "Qwen3.8-Flash-Next UD-Q3_K_XL + MTP",
+     "abschnitt": "external/qwen3.8-flash-next-q3",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": 64,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "unsloth\\Qwen3.8-Flash-Next-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "unsloth\\Qwen3.8-Flash-Next-GGUF",
+       "hf_repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+       "hf_revision": "",
+       "angabe_von": "docs/models/qwen3.8-flash-next.md (Revision dort nur fuer UD-Q4_K_XL gepinnt)",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 37.86,
+     "host_gb_router": 2.01,
+     "router_gemessen_am": "2026-11-09T11:21:13",
+     "passt_64gb": "ja",
+     "hinweis": "Gemessen auf der .198 (64 GB): 24,3-28,7 tok/s (Release-Notes 2.0.1/2.0.2) mit expert-cache-bytes 24 GB, cache-ram-bytes off, GUFO_HOST_RESERVE_MIB=2048.",
+     "daten_dateien": [],
+     "bytes": 92772922080,
+     "gb": 92.77,
+     "dateien": [
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q3_K_XL\\Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf",
+       "bytes": 10946624,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q3_K_XL\\Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf",
+       "bytes": 49983253824,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q3_K_XL\\Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf",
+       "bytes": 39992153376,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+       "bytes": 2786568256,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3.8-flash-next",
+     "name": "Qwen3.8-Flash-Next UD-Q4_K_XL + MTP",
+     "abschnitt": "external/qwen3.8-flash-next",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": 128,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "unsloth\\Qwen3.8-Flash-Next-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "unsloth\\Qwen3.8-Flash-Next-GGUF",
+       "hf_repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+       "hf_revision": "d96201194f103c906994f283f504209dc8d2a10c",
+       "angabe_von": "docs/models/qwen3.8-flash-next.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 31.7,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 2026-10-26b (24 GB Cache, MTP): GPU 31.7 GB",
+     "gpu_gb_router": 37.81,
+     "host_gb_router": 2.04,
+     "router_gemessen_am": "2026-11-09T11:20:00",
+     "passt_64gb": "nur-128",
+     "hinweis": "Plan Schritt 2: Q4 fuer 128 GB. Laeuft auf der .198 (64 GB) mit expert-cache-bytes 24 GB, cache-ram-bytes off und GUFO_HOST_RESERVE_MIB=2048 (14,2-15,7 tok/s), braucht aber ~8,5 GB freien Host-RAM zum Laden (Release-Notes 2.0.2). Vorgabe fuer 64 GB ist Q3.",
+     "daten_dateien": [
+      "expert-profiles\\flash-next.prof"
+     ],
+     "bytes": 114121223040,
+     "gb": 114.12,
+     "dateien": [
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+       "bytes": 10946624,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+       "bytes": 49859583136,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+       "bytes": 49376141504,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+       "bytes": 12087983520,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "unsloth\\Qwen3.8-Flash-Next-GGUF\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+       "bytes": 2786568256,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3.6-35b-a3b",
+     "name": "Qwen3.6-35B-A3B Q4_K_M (eigener 35B-Worker)",
+     "abschnitt": "external/qwen3.6-35b-a3b",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "35b",
+     "oeffentlich": true,
+     "ordner": [
+      "lmstudio-community\\Qwen3.6-35B-A3B-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "lmstudio-community\\Qwen3.6-35B-A3B-GGUF",
+       "hf_repo": "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
+       "hf_revision": "",
+       "angabe_von": "Ordnername (nicht gepinnt)",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 24.5,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 31.10.2026: GPU peak 24.5 GiB (ohne DFlash2)",
+     "gpu_gb_router": 25.85,
+     "host_gb_router": 1.79,
+     "router_gemessen_am": "2026-11-09T11:22:01",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 21166757728,
+     "gb": 21.17,
+     "dateien": [
+      {
+       "pfad": "lmstudio-community\\Qwen3.6-35B-A3B-GGUF\\Qwen3.6-35B-A3B-Q4_K_M.gguf",
+       "bytes": 21166757728,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3.6-35b-a3b-json",
+     "name": "Qwen3.6-35B-A3B + DFlash2 (JSON/Film)",
+     "abschnitt": "external/qwen3.6-35b-a3b-json",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "35b",
+     "oeffentlich": true,
+     "ordner": [
+      "lmstudio-community\\Qwen3.6-35B-A3B-GGUF",
+      "aminya\\Qwen3.6-35B-A3B-DFlash2-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "lmstudio-community\\Qwen3.6-35B-A3B-GGUF",
+       "hf_repo": "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
+       "hf_revision": "",
+       "angabe_von": "Ordnername (nicht gepinnt)",
+       "hinweis": ""
+      },
+      {
+       "ordner": "aminya\\Qwen3.6-35B-A3B-DFlash2-GGUF",
+       "hf_repo": "aminya/Qwen3.6-35B-A3B-DFlash2-GGUF",
+       "hf_revision": "",
+       "angabe_von": "Ordnername; README: base_model incoai/Qwen3.6-35B-A3B-DFlash2",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft (DFlash2-Draft: Apache-2.0 laut README)",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 25.4,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 31.10.2026: GPU peak 25.4 GiB",
+     "gpu_gb_router": 26.93,
+     "host_gb_router": 2.56,
+     "router_gemessen_am": "2026-11-09T11:17:40",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 21737226272,
+     "gb": 21.74,
+     "dateien": [
+      {
+       "pfad": "lmstudio-community\\Qwen3.6-35B-A3B-GGUF\\Qwen3.6-35B-A3B-Q4_K_M.gguf",
+       "bytes": 21166757728,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "aminya\\Qwen3.6-35B-A3B-DFlash2-GGUF\\Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf",
+       "bytes": 570468544,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "hemmingway-1.5",
+     "name": "Hemmingway-1.5 i1-Q4_K_M (Erzaehler, 27B-Feintuning) + DFlash2",
+     "abschnitt": "external/hemmingway-1.5",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "mradermacher\\Hemmingway-1.5-i1-GGUF",
+      "z-lab\\Qwen3.8-27B-DFlash2-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "mradermacher\\Hemmingway-1.5-i1-GGUF",
+       "hf_repo": "mradermacher/Hemmingway-1.5-i1-GGUF",
+       "hf_revision": "",
+       "angabe_von": "Notiz gufo-modell-liste (nicht gepinnt)",
+       "hinweis": ""
+      },
+      {
+       "ordner": "z-lab\\Qwen3.8-27B-DFlash2-GGUF",
+       "hf_repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+       "hf_revision": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+       "angabe_von": "docs/models/qwen3.8-27b.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "CC BY-NC 4.0",
+      "satz": "Hemmingway-1.5: nur nicht-kommerziell; kommerziell nur mit Vertrag (KB 1127).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": null,
+     "host_gb_router": null,
+     "router_gemessen_am": "",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 17953722624,
+     "gb": 17.95,
+     "dateien": [
+      {
+       "pfad": "mradermacher\\Hemmingway-1.5-i1-GGUF\\Hemmingway-1.5.i1-Q4_K_M.gguf",
+       "bytes": 16810715808,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "z-lab\\Qwen3.8-27B-DFlash2-GGUF\\Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+       "bytes": 1143006816,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 262288850336,
+   "summe_gb": 262.29,
+   "summe_pflicht_bytes": 19633331392,
+   "summe_pflicht_gb": 19.63,
+   "anzahl_modelle": 6,
+   "anzahl_dateien": 17
+  },
+  "bilder": {
+   "titel": "Bilder",
+   "beschreibung": "Qwen-Image 2.1 + Turbo; optional MOSS-Image und LoRAs.",
+   "modelle": [
+    {
+     "id": "qwen-image-2.1",
+     "name": "Qwen-Image-2.1 (BF16, Hugging-Face-Ordner)",
+     "abschnitt": "external/qwen-image-2.1",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen-Image-2.1"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen-Image-2.1",
+       "hf_repo": "Qwen/Qwen-Image-2.1",
+       "hf_revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+       "angabe_von": "docs/models/qwen-image-2.1.md, THIRD_PARTY_NOTICES.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Qwen Research License (20.09.2026)",
+      "satz": "Qwen-Image 2.1: nur Forschung / nicht-kommerziell; kommerzielle Lizenz muss gesondert beantragt werden (Anfrage offen, KB 1127).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 30.2,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 31.10.2026: GPU peak 30.0-30.2 GiB; 2.0.2 nach dem Job 22.0 GB (Release-Notes)",
+     "gpu_gb_router": 42.82,
+     "host_gb_router": 0.85,
+     "router_gemessen_am": "2026-11-11T20:33:43",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 33131614660,
+     "gb": 33.13,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\LICENSE",
+       "bytes": 7831,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\model_index.json",
+       "bytes": 447,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\added_tokens.json",
+       "bytes": 707,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\chat_template.jinja",
+       "bytes": 5292,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\merges.txt",
+       "bytes": 1671853,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\preprocessor_config.json",
+       "bytes": 782,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\special_tokens_map.json",
+       "bytes": 613,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\tokenizer.json",
+       "bytes": 11422654,
+       "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\tokenizer_config.json",
+       "bytes": 5445,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\video_preprocessor_config.json",
+       "bytes": 817,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\processor\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\README.md",
+       "bytes": 5236,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\scheduler\\scheduler_config.json",
+       "bytes": 485,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\config.json",
+       "bytes": 1517,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\generation_config.json",
+       "bytes": 213,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00001-of-00004.safetensors",
+       "bytes": 4998056552,
+       "sha256": "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00002-of-00004.safetensors",
+       "bytes": 4915962464,
+       "sha256": "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00003-of-00004.safetensors",
+       "bytes": 4915962496,
+       "sha256": "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00004-of-00004.safetensors",
+       "bytes": 2704357976,
+       "sha256": "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\text_encoder\\model.safetensors.index.json",
+       "bytes": 67795,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\transformer\\config.json",
+       "bytes": 370,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\transformer\\diffusion_pytorch_model-00001-of-00002.safetensors",
+       "bytes": 9968332504,
+       "sha256": "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\transformer\\diffusion_pytorch_model-00002-of-00002.safetensors",
+       "bytes": 4261951904,
+       "sha256": "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\transformer\\diffusion_pytorch_model.safetensors.index.json",
+       "bytes": 30283,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\vae\\config.json",
+       "bytes": 2079,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1\\vae\\diffusion_pytorch_model.safetensors",
+       "bytes": 1350989512,
+       "sha256": "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417",
+       "sha256_status": "Hugging-Face .tree.json (LFS-oid)",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen-image-2.1-turbo",
+     "name": "Qwen-Image-2.1 Turbo (8 Schritte)",
+     "abschnitt": "external/qwen-image-2.1-turbo",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen-Image-2.1-Turbo"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen-Image-2.1-Turbo",
+       "hf_repo": "Qwen/Qwen-Image-2.1-Turbo",
+       "hf_revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+       "angabe_von": "docs/models/qwen-image-2.1.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Qwen Research License (20.09.2026)",
+      "satz": "Qwen-Image 2.1: nur Forschung / nicht-kommerziell; kommerzielle Lizenz muss gesondert beantragt werden (Anfrage offen, KB 1127).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 30.2,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 31.10.2026: same GPU peak as the base (30.0-30.2 GiB)",
+     "gpu_gb_router": 32.35,
+     "host_gb_router": 0.67,
+     "router_gemessen_am": "2026-11-10T00:32:07",
+     "passt_64gb": "ja",
+     "hinweis": "text_encoder\\ ist identisch mit Qwen-Image-2.1 (auf der .198 Hardlinks; zaehlt in der Summe nur einmal).",
+     "daten_dateien": [],
+     "bytes": 14917281630,
+     "gb": 14.92,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\LICENSE",
+       "bytes": 7831,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\model_index.json",
+       "bytes": 578,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\processor\\chat_template.jinja",
+       "bytes": 5292,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\processor\\processor_config.json",
+       "bytes": 1300,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\processor\\tokenizer.json",
+       "bytes": 11422650,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\processor\\tokenizer_config.json",
+       "bytes": 705,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\README.md",
+       "bytes": 15116,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\scheduler\\scheduler_config.json",
+       "bytes": 486,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\config.json",
+       "bytes": 1542,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\generation_config.json",
+       "bytes": 241,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\model-00001-of-00004.safetensors",
+       "bytes": 4998056552,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00001-of-00004.safetensors"
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\model-00002-of-00004.safetensors",
+       "bytes": 4915962464,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00002-of-00004.safetensors"
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\model-00003-of-00004.safetensors",
+       "bytes": 4915962496,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00003-of-00004.safetensors"
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\model-00004-of-00004.safetensors",
+       "bytes": 2704357976,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "Qwen\\Qwen-Image-2.1\\text_encoder\\model-00004-of-00004.safetensors"
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\text_encoder\\model.safetensors.index.json",
+       "bytes": 67795,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "Qwen\\Qwen-Image-2.1\\text_encoder\\model.safetensors.index.json"
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\transformer\\config.json",
+       "bytes": 370,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\transformer\\diffusion_pytorch_model-00001-of-00002.safetensors",
+       "bytes": 9968332504,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\transformer\\diffusion_pytorch_model-00002-of-00002.safetensors",
+       "bytes": 4261951904,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\transformer\\diffusion_pytorch_model.safetensors.index.json",
+       "bytes": 30283,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\vae\\config.json",
+       "bytes": 2172,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen-Image-2.1-Turbo\\vae\\diffusion_pytorch_model.safetensors",
+       "bytes": 675508656,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "lora-anime-consistency",
+     "name": "LoRA Qwen2.1 Anime consistency",
+     "abschnitt": "",
+     "art": "lora",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "loras\\qwen21-anime-consistency"
+     ],
+     "quellen": [
+      {
+       "ordner": "loras\\qwen21-anime-consistency",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "README: base_model Qwen/Qwen-Image-2.1, Repo nicht notiert"
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Apache-2.0 laut README der LoRA.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": null,
+     "host_gb_router": null,
+     "router_gemessen_am": "",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 167833681,
+     "gb": 0.17,
+     "dateien": [
+      {
+       "pfad": "loras\\qwen21-anime-consistency\\Qwen2.1_Anime_consistency.safetensors",
+       "bytes": 167830408,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "loras\\qwen21-anime-consistency\\README.md",
+       "bytes": 3273,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ],
+     "lora_name": "Qwen2.1_Anime_consistency",
+     "lora_fuer": "qwen-image-2.1"
+    },
+    {
+     "id": "lora-multiple-angles",
+     "name": "LoRA Qwen2.1 multiple angles (Name 'winkel' wie auf der .56, Regie #56-709)",
+     "abschnitt": "",
+     "art": "lora",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "loras\\qwen21-multiple-angles"
+     ],
+     "quellen": [
+      {
+       "ordner": "loras\\qwen21-multiple-angles",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "kein README im Ordner"
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": null,
+     "host_gb_router": null,
+     "router_gemessen_am": "",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 318819792,
+     "gb": 0.32,
+     "dateien": [
+      {
+       "pfad": "loras\\qwen21-multiple-angles\\qwen21_multiple_angles_v2_step1500.safetensors",
+       "bytes": 318819792,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ],
+     "lora_name": "winkel",
+     "lora_fuer": "qwen-image-2.1"
+    },
+    {
+     "id": "moss-image",
+     "name": "MOSS-Image SFT (ohne Inhaltsfilter)",
+     "abschnitt": "external/moss-image",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "OpenMOSS-Team\\MOSS-Image-SFT"
+     ],
+     "quellen": [
+      {
+       "ordner": "OpenMOSS-Team\\MOSS-Image-SFT",
+       "hf_repo": "OpenMOSS-Team/MOSS-Image-SFT",
+       "hf_revision": "",
+       "angabe_von": "Ordnername + README (nicht gepinnt); text_encoder.gguf lokal aus text_encoder-bf16.gguf (Hardlink)",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "MOSS-Image SFT: Apache-2.0 laut LICENSE und Modellkarte. Achtung: rendert ohne Inhaltsfilter.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 29.24,
+     "host_gb_router": 0.78,
+     "router_gemessen_am": "2026-11-10T00:28:33",
+     "passt_64gb": "ja",
+     "hinweis": "2.0 liest <model>\\text_encoder.gguf (Hardlink auf text_encoder-bf16.gguf, zaehlt einmal). Ob der Worker die HF-Originale unter text_encoder\\ (16,8 GB) noch braucht, ist nicht geprueft.",
+     "daten_dateien": [],
+     "bytes": 43106327763,
+     "gb": 43.11,
+     "dateien": [
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\LICENSE",
+       "bytes": 11358,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\model_index.json",
+       "bytes": 412,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\pipeline_moss_image.py",
+       "bytes": 25060,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\README.md",
+       "bytes": 9249,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\scheduler\\pipeline_moss_image.py",
+       "bytes": 25060,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\scheduler\\scheduler_config.json",
+       "bytes": 494,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\config.json",
+       "bytes": 2813,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\model-00001-of-00004.safetensors",
+       "bytes": 4973910744,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\model-00002-of-00004.safetensors",
+       "bytes": 4988364288,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\model-00003-of-00004.safetensors",
+       "bytes": 4954202112,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\model-00004-of-00004.safetensors",
+       "bytes": 1869001848,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder\\model.safetensors.index.json",
+       "bytes": 64641,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder-bf16.gguf",
+       "bytes": 15886459456,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder.gguf",
+       "bytes": 15886459456,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true,
+       "hardlink_auf": "OpenMOSS-Team\\MOSS-Image-SFT\\text_encoder-bf16.gguf"
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\tokenizer\\chat_template.jinja",
+       "bytes": 7756,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\tokenizer\\tokenizer.json",
+       "bytes": 19989325,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\tokenizer\\tokenizer_config.json",
+       "bytes": 1123,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\config.json",
+       "bytes": 240,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\diffusion_pytorch_model-00001-of-00003.safetensors",
+       "bytes": 4991978016,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\diffusion_pytorch_model-00002-of-00003.safetensors",
+       "bytes": 4983137016,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\diffusion_pytorch_model-00003-of-00003.safetensors",
+       "bytes": 189549184,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\diffusion_pytorch_model.safetensors.index.json",
+       "bytes": 40298,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\transformer\\pipeline_moss_image.py",
+       "bytes": 25060,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\vae\\config.json",
+       "bytes": 838,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\MOSS-Image-SFT\\vae\\diffusion_pytorch_model.safetensors",
+       "bytes": 249521372,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 91641877526,
+   "summe_gb": 91.64,
+   "summe_pflicht_bytes": 48048896290,
+   "summe_pflicht_gb": 48.05,
+   "anzahl_modelle": 5,
+   "anzahl_dateien": 75
+  },
+  "stimme": {
+   "titel": "Stimme",
+   "beschreibung": "Qwen3-TTS (3 Varianten) + Qwen3-ASR; optional Fish Drama-3, IndexTTS-2.5 German, VoxCPM2, Ming; Seed-VC nur intern (GPL).",
+   "modelle": [
+    {
+     "id": "qwen3-tts",
+     "name": "Qwen3-TTS 1.7B CustomVoice",
+     "abschnitt": "external/qwen3-tts",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice",
+       "hf_repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+       "hf_revision": "",
+       "angabe_von": "docs/models/qwen3-tts.md (Base) + Ordnername",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Frei, auch kommerziell; Lizenztext bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 7.35,
+     "host_gb_router": 0.41,
+     "router_gemessen_am": "2026-11-12T07:48:50",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 4520217432,
+     "gb": 4.52,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\config.json",
+       "bytes": 4908,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\generation_config.json",
+       "bytes": 245,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\model.safetensors",
+       "bytes": 3833402552,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\preprocessor_config.json",
+       "bytes": 127,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\README.md",
+       "bytes": 57846,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\speech_tokenizer\\config.json",
+       "bytes": 2336,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\speech_tokenizer\\configuration.json",
+       "bytes": 76,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\speech_tokenizer\\model.safetensors",
+       "bytes": 682293092,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\speech_tokenizer\\preprocessor_config.json",
+       "bytes": 234,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\tokenizer_config.json",
+       "bytes": 7344,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-CustomVoice\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3-tts-voicedesign",
+     "name": "Qwen3-TTS 1.7B VoiceDesign",
+     "abschnitt": "external/qwen3-tts-voicedesign",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+       "hf_repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+       "hf_revision": "",
+       "angabe_von": "Ordnername",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Frei, auch kommerziell; Lizenztext bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 6.68,
+     "host_gb_router": 0.39,
+     "router_gemessen_am": "2026-11-09T11:24:20",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 4520162313,
+     "gb": 4.52,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\config.json",
+       "bytes": 4421,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\generation_config.json",
+       "bytes": 245,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\model.safetensors",
+       "bytes": 3833402552,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\preprocessor_config.json",
+       "bytes": 127,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\README.md",
+       "bytes": 3214,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\speech_tokenizer\\config.json",
+       "bytes": 2336,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\speech_tokenizer\\configuration.json",
+       "bytes": 76,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\speech_tokenizer\\model.safetensors",
+       "bytes": 682293092,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\speech_tokenizer\\preprocessor_config.json",
+       "bytes": 234,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\tokenizer_config.json",
+       "bytes": 7344,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-VoiceDesign\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3-tts-clone",
+     "name": "Qwen3-TTS 1.7B Base (Stimmklon)",
+     "abschnitt": "external/qwen3-tts-clone",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen3-TTS-12Hz-1.7B-Base"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base",
+       "hf_repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+       "hf_revision": "",
+       "angabe_von": "docs/models/qwen3-tts.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Frei, auch kommerziell; Lizenztext bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 7.24,
+     "host_gb_router": 0.56,
+     "router_gemessen_am": "2026-11-09T11:24:14",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [
+      "voices\\erzaehler.wav",
+      "voices\\erzaehler.txt"
+     ],
+     "bytes": 4544228181,
+     "gb": 4.54,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\config.json",
+       "bytes": 4494,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\generation_config.json",
+       "bytes": 245,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\model.safetensors",
+       "bytes": 3857413744,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\preprocessor_config.json",
+       "bytes": 127,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\README.md",
+       "bytes": 57817,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\speech_tokenizer\\config.json",
+       "bytes": 2336,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\speech_tokenizer\\configuration.json",
+       "bytes": 76,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\speech_tokenizer\\model.safetensors",
+       "bytes": 682293092,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\speech_tokenizer\\preprocessor_config.json",
+       "bytes": 234,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\tokenizer_config.json",
+       "bytes": 7344,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-TTS-12Hz-1.7B-Base\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3-asr-1.7b",
+     "name": "Qwen3-ASR 1.7B (Spracherkennung)",
+     "abschnitt": "external/qwen3-asr-1.7b",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Qwen\\Qwen3-ASR-1.7B"
+     ],
+     "quellen": [
+      {
+       "ordner": "Qwen\\Qwen3-ASR-1.7B",
+       "hf_repo": "Qwen/Qwen3-ASR-1.7B",
+       "hf_revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+       "angabe_von": "docs/models/qwen3-asr.md",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Frei, auch kommerziell; Lizenztext bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 5.99,
+     "host_gb_router": 0.72,
+     "router_gemessen_am": "2026-11-02T13:26:50",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 4703112789,
+     "gb": 4.7,
+     "dateien": [
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\chat_template.json",
+       "bytes": 1161,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\config.json",
+       "bytes": 6194,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\generation_config.json",
+       "bytes": 142,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\merges.txt",
+       "bytes": 1671853,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\model-00001-of-00002.safetensors",
+       "bytes": 4220320824,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\model-00002-of-00002.safetensors",
+       "bytes": 478200688,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\model.safetensors.index.json",
+       "bytes": 64821,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\preprocessor_config.json",
+       "bytes": 330,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\README.md",
+       "bytes": 57456,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\tokenizer_config.json",
+       "bytes": 12487,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Qwen\\Qwen3-ASR-1.7B\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "fish-drama-3",
+     "name": "Fish Audio Drama-3 (35B-A3B)",
+     "abschnitt": "external/fish-drama-3",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "fishaudio\\drama-3"
+     ],
+     "quellen": [
+      {
+       "ordner": "fishaudio\\drama-3",
+       "hf_repo": "fishaudio/drama-3",
+       "hf_revision": "",
+       "angabe_von": "Notiz gufo-modell-liste + Ordnername (nicht gepinnt)",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Fish Audio Community License 1.0 (13.10.2026)",
+      "satz": "Fish Drama-3: kommerziell nur unter 500.000 US$ Jahresumsatz; kein gehosteter Dienst fuer Fremde, Wasserzeichen behalten, Ausgaben als KI kennzeichnen (KB 1126).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 38.56,
+     "host_gb_router": 2.93,
+     "router_gemessen_am": "2026-11-12T18:09:43",
+     "passt_64gb": "ja",
+     "hinweis": "Laeuft auf der .198 (64 GB) allein (Modell-Pruefung 2.0.0/2.0.2), aber nicht neben dem 27B (Preset-Kommentar).",
+     "daten_dateien": [],
+     "bytes": 41502592670,
+     "gb": 41.5,
+     "dateien": [
+      {
+       "pfad": "fishaudio\\drama-3\\chat_template.jinja",
+       "bytes": 7756,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\codec.pth",
+       "bytes": 1871099728,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\config.json",
+       "bytes": 5535,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\LICENSE",
+       "bytes": 19685,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00001-of-00008.safetensors",
+       "bytes": 5000202800,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00002-of-00008.safetensors",
+       "bytes": 5000496824,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00003-of-00008.safetensors",
+       "bytes": 5000988520,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00004-of-00008.safetensors",
+       "bytes": 5000496392,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00005-of-00008.safetensors",
+       "bytes": 5000227096,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00006-of-00008.safetensors",
+       "bytes": 4984792768,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00007-of-00008.safetensors",
+       "bytes": 4977946704,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model-00008-of-00008.safetensors",
+       "bytes": 4638423240,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\model.safetensors.index.json",
+       "bytes": 6880197,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\README.md",
+       "bytes": 7996,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\special_tokens_map.json",
+       "bytes": 102779,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\tokenizer.json",
+       "bytes": 20791070,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "fishaudio\\drama-3\\tokenizer_config.json",
+       "bytes": 103580,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "indextts-2.5-german",
+     "name": "IndexTTS-2.5 German (Buendel)",
+     "abschnitt": "external/indextts-2.5-german",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "IndexTeam\\IndexTTS-2.5-german-bundle"
+     ],
+     "quellen": [
+      {
+       "ordner": "IndexTeam\\IndexTTS-2.5-german-bundle",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "Buendel aus IndexTeam/IndexTTS-2.5 + deutschem GPT (sharrnah); Repos nicht gepinnt; german/SHA256SUMS.txt liegt bei"
+      }
+     ],
+     "lizenz": {
+      "name": "bilibili Model Use License",
+      "satz": "IndexTTS-2.5-German: kommerziell frei bis 100 Mio. monatliche Nutzer / 1 Mrd. RMB Umsatz; Restrisiko HUI-Audio-Korpus beim deutschen Feinschliff (KB 1128).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 2.45,
+     "host_gb_router": 1.2,
+     "router_gemessen_am": "2026-11-07T08:11:27",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [
+      "voices\\erzaehler-9s.wav"
+     ],
+     "bytes": 7082481554,
+     "gb": 7.08,
+     "dateien": [
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\bigvgan_v2_22khz_80band_256x\\bigvgan_generator.pt",
+       "bytes": 449228171,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\bigvgan_v2_22khz_80band_256x\\config.json",
+       "bytes": 1405,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\bigvgan_v2_22khz_80band_256x\\LICENSE",
+       "bytes": 1076,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\campplus\\campplus_cn_common.bin",
+       "bytes": 28036335,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\codec.pth",
+       "bytes": 607290935,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\config.yaml",
+       "bytes": 2860,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\feat1.pt",
+       "bytes": 57170,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\feat2.pt",
+       "bytes": 374866,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\evaluation_summary.json",
+       "bytes": 1402,
+       "sha256": "b55ab59ded367cf2c8feeed428d01a60566ddf4997a1afca93280e1bd8575520",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\german_text.py",
+       "bytes": 10471,
+       "sha256": "a8d12257cad20a3ca3024940e3f93297c9ba46b484cddf62a27e4b940f94ba94",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\gpt.pth",
+       "bytes": 3259542531,
+       "sha256": "e8298315db3829f0086aa99ffd933d06d1f9fa4031d3a8173d59fe1efd89e443",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\inference.py",
+       "bytes": 3728,
+       "sha256": "eb3b46b19d7b429017c0cfacf82e53f61653a72f7321897bcdb7cb4affad85e1",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\LICENSE",
+       "bytes": 10553,
+       "sha256": "cc7da9ea0f8a97ef15ab3bf0389e636ce79ffca1aef5489520796ac87d87a87b",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\NOTICE.md",
+       "bytes": 3182,
+       "sha256": "1793a31ae786aba28b5fcea3a0f7488fe1353bea82d6e5dafc96c2caf9e7243b",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\README.md",
+       "bytes": 8745,
+       "sha256": "151cf277ed6cbedaae7258b7587e46c594b1127da47e1ec53376adba8bffb430",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\SHA256SUMS.txt",
+       "bytes": 912,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\german\\training_config.yaml",
+       "bytes": 1163,
+       "sha256": "990d5dbda898014b610b08c3a6a91959b0dc3e7837ebd381fd2516eead5dae63",
+       "sha256_status": "german/SHA256SUMS.txt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\LICENSE",
+       "bytes": 10553,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\multilingual_zh_ja_yue_char_del.tiktoken",
+       "bytes": 907395,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\README.md",
+       "bytes": 4272,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\s2mel.pth",
+       "bytes": 414908601,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\w2v-bert-2.0\\config.json",
+       "bytes": 1874,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\w2v-bert-2.0\\model.safetensors",
+       "bytes": 2322063736,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\w2v-bert-2.0\\preprocessor_config.json",
+       "bytes": 275,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "IndexTeam\\IndexTTS-2.5-german-bundle\\wav2vec2bert_stats.pt",
+       "bytes": 9343,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "voxcpm2-tts",
+     "name": "VoxCPM2 (48 kHz, Klon)",
+     "abschnitt": "external/voxcpm2-tts",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "openbmb\\VoxCPM2"
+     ],
+     "quellen": [
+      {
+       "ordner": "openbmb\\VoxCPM2",
+       "hf_repo": "openbmb/VoxCPM2",
+       "hf_revision": "",
+       "angabe_von": "Ordnername + Download-Log",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Frei, auch kommerziell; Lizenztext bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 5.85,
+     "host_gb_router": 0.9,
+     "router_gemessen_am": "2026-11-07T09:22:10",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [
+      "voices\\erzaehler-9s.wav"
+     ],
+     "bytes": 4960730347,
+     "gb": 4.96,
+     "dateien": [
+      {
+       "pfad": "openbmb\\VoxCPM2\\audiovae.pth",
+       "bytes": 376951122,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\config.json",
+       "bytes": 4336,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\model.safetensors",
+       "bytes": 4580080592,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\README.md",
+       "bytes": 7939,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\special_tokens_map.json",
+       "bytes": 1632,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\tokenization_voxcpm2.py",
+       "bytes": 2895,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\tokenizer.json",
+       "bytes": 3676772,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "openbmb\\VoxCPM2\\tokenizer_config.json",
+       "bytes": 5059,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "ming-tts",
+     "name": "Ming-3.0-tts 0.5B",
+     "abschnitt": "external/ming-tts",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "inclusionAI\\Ming-3.0-tts-0.5B"
+     ],
+     "quellen": [
+      {
+       "ordner": "inclusionAI\\Ming-3.0-tts-0.5B",
+       "hf_repo": "inclusionAI/Ming-3.0-tts-0.5B",
+       "hf_revision": "",
+       "angabe_von": "Ordnername + Download-Log",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "MIT",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 1.9,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 02.11.2026: ~1.9 GB VRAM",
+     "gpu_gb_router": 2.04,
+     "host_gb_router": 0.16,
+     "router_gemessen_am": "2026-11-09T11:23:34",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [
+      "voices\\erzaehler-9s.wav"
+     ],
+     "bytes": 3003319337,
+     "gb": 3.0,
+     "dateien": [
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\added_tokens.json",
+       "bytes": 1785,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\campplus.onnx",
+       "bytes": 28303423,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\config.json",
+       "bytes": 4754,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\configuration.json",
+       "bytes": 51,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\merges.txt",
+       "bytes": 1671853,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\model.safetensors",
+       "bytes": 2959055504,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\README.md",
+       "bytes": 54759,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\special_tokens_map.json",
+       "bytes": 2726,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\tokenizer.json",
+       "bytes": 11431389,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\tokenizer_config.json",
+       "bytes": 16260,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "inclusionAI\\Ming-3.0-tts-0.5B\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "gufo-voice-convert",
+     "name": "Seed-VC Stimm-Umwandlung (nur intern, GPL)",
+     "abschnitt": "external/gufo-voice-convert",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo-d",
+     "oeffentlich": false,
+     "ordner": [
+      "voiceconv"
+     ],
+     "quellen": [
+      {
+       "ordner": "voiceconv",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "Seed-VC, HTDemucs, RMVPE, BigVGAN, Whisper, CAM++ aus verschiedenen Quellen; nicht gepinnt (RECHERCHE-SVC-2026-11-11.md)"
+      }
+     ],
+     "lizenz": {
+      "name": "GPL-3.0 (Seed-VC)",
+      "satz": "Nur intern; nie in oeffentliche gufo-Pakete (gufo ist MIT). Fabian 11.11.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 6.26,
+     "host_gb_router": 2,
+     "router_gemessen_am": "2026-11-12T12:48:27",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 2862131183,
+     "gb": 2.86,
+     "dateien": [
+      {
+       "pfad": "voiceconv\\bigvgan_v2_44khz_128band_512x.safetensors",
+       "bytes": 488692624,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\campplus\\campplus_cn_common.bin",
+       "bytes": 28036335,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\htdemucs\\955717e8-8726e21a.th",
+       "bytes": 84141911,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\rmvpe\\rmvpe.pt",
+       "bytes": 181184272,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\seedvc\\config_dit_mel_seed_uvit_whisper_base_f0_44k.yml",
+       "bytes": 2408,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\seedvc\\DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth",
+       "bytes": 820865494,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\seedvc\\README.md",
+       "bytes": 53,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\voices\\erzaehler\\reference.wav",
+       "bytes": 432044,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\voices\\mann-indextts\\reference.wav",
+       "bytes": 480812,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\voices\\mann-ryan\\reference.wav",
+       "bytes": 522284,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-base\\config.json",
+       "bytes": 1983,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-base\\model.safetensors",
+       "bytes": 290403936,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-base\\preprocessor_config.json",
+       "bytes": 184990,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-small\\config.json",
+       "bytes": 1967,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-small\\model.safetensors",
+       "bytes": 966995080,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "voiceconv\\whisper-small\\preprocessor_config.json",
+       "bytes": 184990,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 77698975806,
+   "summe_gb": 77.7,
+   "summe_pflicht_bytes": 18287720715,
+   "summe_pflicht_gb": 18.29,
+   "anzahl_modelle": 9,
+   "anzahl_dateien": 124
+  },
+  "video": {
+   "titel": "Video",
+   "beschreibung": "Wan 2.2 TI2V-5B; optional Wan 2.1 Kamera (Uni3C), InfiniteTalk, MiniMax H3 (nur 128 GB).",
+   "modelle": [
+    {
+     "id": "wan2.2-ti2v-5b",
+     "name": "Wan 2.2 TI2V-5B (Diffusers)",
+     "abschnitt": "external/wan2.2-ti2v-5b",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "Wan-AI\\Wan2.2-TI2V-5B-Diffusers",
+      "rife"
+     ],
+     "quellen": [
+      {
+       "ordner": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers",
+       "hf_repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+       "hf_revision": "",
+       "angabe_von": "Ordnername + Download-Log",
+       "hinweis": ""
+      },
+      {
+       "ordner": "rife",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "rife49.pth von https://huggingface.co/marduk191/rife (docs/models/rife), lokal nach safetensors umgewandelt"
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0",
+      "satz": "Wan-Gewichte Apache-2.0 (KB 1128); Kijai/WanVideo_comfy-Umwandlungen ohne eigene Lizenz, erben Apache-2.0.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 15.0,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar: GPU up to ~15 GiB",
+     "gpu_gb_router": 13.57,
+     "host_gb_router": 0.33,
+     "router_gemessen_am": "2026-11-07T00:48:39",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 34222748161,
+     "gb": 34.22,
+     "dateien": [
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\model_index.json",
+       "bytes": 499,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\README.md",
+       "bytes": 17633,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\scheduler\\scheduler_config.json",
+       "bytes": 820,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\text_encoder\\config.json",
+       "bytes": 855,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\text_encoder\\model-00001-of-00003.safetensors",
+       "bytes": 4935812536,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\text_encoder\\model-00002-of-00003.safetensors",
+       "bytes": 4983103192,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\text_encoder\\model-00003-of-00003.safetensors",
+       "bytes": 1442935480,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\text_encoder\\model.safetensors.index.json",
+       "bytes": 22476,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\tokenizer\\special_tokens_map.json",
+       "bytes": 7079,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\tokenizer\\spiece.model",
+       "bytes": 4548313,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\tokenizer\\tokenizer.json",
+       "bytes": 16837459,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\tokenizer\\tokenizer_config.json",
+       "bytes": 61758,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\config.json",
+       "bytes": 495,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model-00001-of-00005.safetensors",
+       "bytes": 4978254344,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model-00002-of-00005.safetensors",
+       "bytes": 4846784976,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model-00003-of-00005.safetensors",
+       "bytes": 4972658392,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model-00004-of-00005.safetensors",
+       "bytes": 4846785080,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model-00005-of-00005.safetensors",
+       "bytes": 354751840,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\transformer\\diffusion_pytorch_model.safetensors.index.json",
+       "bytes": 73297,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\vae\\config.json",
+       "bytes": 1701,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Wan-AI\\Wan2.2-TI2V-5B-Diffusers\\vae\\diffusion_pytorch_model.safetensors",
+       "bytes": 2818777808,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "rife\\weights\\rife49.safetensors",
+       "bytes": 21312128,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "wan2.1-uni3c",
+     "name": "Wan 2.1 I2V 14B + Uni3C Kamerafahrten + MoGe-2",
+     "abschnitt": "external/wan2.1-uni3c",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [
+      "wan2.2-ti2v-5b"
+     ],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "wan21-camera"
+     ],
+     "quellen": [
+      {
+       "ordner": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers",
+       "hf_repo": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+       "hf_revision": "",
+       "angabe_von": "Ordnername (nur Teilordner: image_encoder, vae, Konfiguration)",
+       "hinweis": ""
+      },
+      {
+       "ordner": "wan21-camera\\kijai",
+       "hf_repo": "Kijai/WanVideo_comfy",
+       "hf_revision": "",
+       "angabe_von": "KB 1128 (nicht gepinnt)",
+       "hinweis": ""
+      },
+      {
+       "ordner": "wan21-camera\\moge-2-vitl-normal",
+       "hf_repo": "microsoft/moge-2-vitl-normal",
+       "hf_revision": "",
+       "angabe_von": "Ordnername; moge2_vitl.safetensors lokal aus model.pt umgewandelt",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0 (Wan) + Uni3C nicht geprueft + MoGe-2 MIT",
+      "satz": "Wan 2.1 I2V und lightx2v Apache-2.0 (KB 1128), MoGe-2 MIT (Modellkarte); Uni3C-ControlNet: Lizenz nicht geprueft.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 27.0,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar: GPU ~27 GiB",
+     "gpu_gb_router": 27.98,
+     "host_gb_router": 1.14,
+     "router_gemessen_am": "2026-10-31T08:12:47 (learned_layouts[0])",
+     "passt_64gb": "ja",
+     "hinweis": "T5 kommt aus Wan2.2-TI2V-5B-Diffusers (gufo-camera.json), deshalb braucht dieses Modell wan2.2-ti2v-5b.",
+     "daten_dateien": [],
+     "bytes": 22476690886,
+     "gb": 22.48,
+     "dateien": [
+      {
+       "pfad": "wan21-camera\\gufo-camera.json",
+       "bytes": 517,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\image_encoder\\config.json",
+       "bytes": 582,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\image_encoder\\model.safetensors",
+       "bytes": 1264217760,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\image_processor\\preprocessor_config.json",
+       "bytes": 478,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\model_index.json",
+       "bytes": 567,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\scheduler\\scheduler_config.json",
+       "bytes": 751,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\transformer\\config.json",
+       "bytes": 466,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\vae\\config.json",
+       "bytes": 724,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\Wan2.1-I2V-14B-480P-Diffusers\\vae\\diffusion_pytorch_model.safetensors",
+       "bytes": 507591892,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\kijai\\I2V\\Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors",
+       "bytes": 16643349018,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\kijai\\Lightx2v\\lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+       "bytes": 738005744,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\kijai\\Wan21_Uni3C_controlnet_fp16.safetensors",
+       "bytes": 1997314376,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\moge-2-vitl-normal\\moge2_vitl.safetensors",
+       "bytes": 1304895796,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "wan21-camera\\moge-2-vitl-normal\\README.md",
+       "bytes": 87,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "rife\\weights\\rife49.safetensors",
+       "bytes": 21312128,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "wan2.1-infinitetalk-14b",
+     "name": "Wan 2.1 InfiniteTalk 14B (Lippensynchron)",
+     "abschnitt": "external/wan2.1-infinitetalk-14b",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [
+      "wan2.2-ti2v-5b",
+      "wan2.1-uni3c"
+     ],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "wan21-talk",
+      "Comfy-Org\\Wan-2.1",
+      "kijai\\wav2vec2_safetensors"
+     ],
+     "quellen": [
+      {
+       "ordner": "Comfy-Org\\Wan-2.1",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "Comfy-Org-Repackage (InfiniteTalk fp16), Repo nicht notiert"
+      },
+      {
+       "ordner": "kijai\\wav2vec2_safetensors",
+       "hf_repo": "Kijai/wav2vec2_safetensors",
+       "hf_revision": "",
+       "angabe_von": "Ordnername",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0 (Wan, InfiniteTalk, lightx2v) + MIT (wav2vec2)",
+      "satz": "Alles kommerziell frei (KB 1128); Lizenztexte bei Weitergabe beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 36.76,
+     "host_gb_router": 1.14,
+     "router_gemessen_am": "2026-11-12T02:31:40",
+     "passt_64gb": "ja",
+     "hinweis": "gufo-talk.json zeigt auf Wan2.1-I2V-14B-480P-Diffusers, den Kijai-DiT und die lightx2v-LoRA aus wan21-camera (deshalb braucht es wan2.1-uni3c) und auf T5 aus Wan 2.2.",
+     "daten_dateien": [],
+     "bytes": 10461125731,
+     "gb": 10.46,
+     "dateien": [
+      {
+       "pfad": "wan21-talk\\gufo-talk.json",
+       "bytes": 891,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Comfy-Org\\Wan-2.1\\model_patches\\wan2.1_infiniteTalk_single_fp16.safetensors",
+       "bytes": 5125258232,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "Comfy-Org\\Wan-2.1\\model_patches\\wan2.1_infiniteTalk_multi_fp16.safetensors",
+       "bytes": 5124439112,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "kijai\\wav2vec2_safetensors\\wav2vec2-chinese-base_fp16.safetensors",
+       "bytes": 190115368,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "rife\\weights\\rife49.safetensors",
+       "bytes": 21312128,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "minimax-h3",
+     "name": "MiniMax H3 FL2VA (Video mit Ton) + Turbo-LoRA + Vision-Projektor",
+     "abschnitt": "external/minimax-h3",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "MiniMaxAI\\MiniMax-H3",
+      "MiniMaxAI\\MiniMax-H3-vision",
+      "lightx2v\\Minimax-h3-Turbo"
+     ],
+     "quellen": [
+      {
+       "ordner": "MiniMaxAI\\MiniMax-H3",
+       "hf_repo": "MiniMaxAI/MiniMax-H3",
+       "hf_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+       "angabe_von": "MINIMAX_H3_FL2VA_BF16.source-manifest.json (84 Dateien mit SHA-256)",
+       "hinweis": "gated: Zugang bei MiniMax beantragen"
+      },
+      {
+       "ordner": "MiniMaxAI\\MiniMax-H3-vision",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "mmproj-BF16.gguf lokal umgewandelt (Qwen3-VL-32B-Encoder), Quelle nicht notiert"
+      },
+      {
+       "ordner": "lightx2v\\Minimax-h3-Turbo",
+       "hf_repo": "lightx2v/Minimax-h3-Turbo",
+       "hf_revision": "",
+       "angabe_von": "Ordnername + Download-Log",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "MiniMax H3 Community License Agreement (02.08.2026)",
+      "satz": "Zugang bei MiniMax beantragen (gated); KI-Kennzeichnung und \"MiniMax H3\" in der Beschreibung nennen (KB 1127). gufo verteilt keine Gewichte.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 47.0,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar: Peak GPU 31.5 GB dedicated + 15.5 GB shared; nothing else may run beside it",
+     "gpu_gb_router": 43.84,
+     "host_gb_router": 2.37,
+     "router_gemessen_am": "2026-11-10T08:51:53",
+     "passt_64gb": "nur-128",
+     "hinweis": "Plan Schritt 2: H3 nur 128 GB. Laeuft auf der .198 (64 GB) allein (Host-RAM bis ~3 GB); der Plan begrenzt die Kombination Flash-Next Q4 + H3.",
+     "daten_dateien": [],
+     "bytes": 147229082697,
+     "gb": 147.23,
+     "dateien": [
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\config.json",
+       "bytes": 1973,
+       "sha256": "d8f3bcc62e23c7e9806970fa63cca6139c06faa3797cf9c94034f60db8512771",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\config.yaml",
+       "bytes": 91,
+       "sha256": "259f675c9f71eedc24ca4f23965cd32a1b3878fc894f56664c40328d99831a5e",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_activations.py",
+       "bytes": 2189,
+       "sha256": "74ca8bb9e8039f1ff362ca4219eee5240a7df9502f3dbdc3161d4e86fbd6dc04",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_alias_free_act.py",
+       "bytes": 835,
+       "sha256": "db8761e66c0eaf9fce2dcccb59162d52b22ca0de9f699cf7d21ec7cd507e86fd",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_alias_free_filter.py",
+       "bytes": 3300,
+       "sha256": "a369523cd7f14f4f299d8e2e47f3c473da76ed1910e6e9134fd7a9fce02537e8",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_alias_free_resample.py",
+       "bytes": 1740,
+       "sha256": "fe35055893833c563e42adc5e5882cbe7628c82d48d33c300fcf0a9576997910",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_attn_proj.py",
+       "bytes": 3317,
+       "sha256": "0e04556fa5fd38d4a71e62fcf4d3242fd9a2464fd72ed62baef2ec0980d910c6",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_audio_vae.py",
+       "bytes": 7266,
+       "sha256": "ec04939602d4710d039e83f558a7572547669652f7fa967e3de0a3b6c48cfd48",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_bigvgan.py",
+       "bytes": 7102,
+       "sha256": "f5df4e6f633e74da479549ef7a6d2684964e4b65ac42c6765be42f9c7fcb7bd2",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\dac_utils.py",
+       "bytes": 362,
+       "sha256": "74ef0ba2c2a11ca35a7c0cc166fe88e564de01230000a0bcc8429103312ad9f0",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\metadata.json",
+       "bytes": 440,
+       "sha256": "755d0529d43b2b5c83590f6f44ca659bc68e6a21b01d5669c93e8b2965749bff",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\minimax_h3_audio_vae.py",
+       "bytes": 3532,
+       "sha256": "63bc0dab6def69480cfd77ea820f9a9a84fc4bd6e56868e4f45ec1e1e200578f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\audio_vae\\model.safetensors",
+       "bytes": 605429308,
+       "sha256": "37dddc2f3e6d5d5139d823d5ea283bbf304dadcb885b1ccda818aa13dade5ea2",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\model_index.json",
+       "bytes": 719,
+       "sha256": "d1113e0f123c69f79cd0de35ca1771606ebc3ec924270d257b771f96f584aa6b",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\chat_template.json",
+       "bytes": 5499,
+       "sha256": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\preprocessor_config.json",
+       "bytes": 390,
+       "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\tokenizer.json",
+       "bytes": 7032403,
+       "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\tokenizer_config.json",
+       "bytes": 11003,
+       "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\video_preprocessor_config.json",
+       "bytes": 385,
+       "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\processor\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\chat_template.json",
+       "bytes": 5499,
+       "sha256": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\config.json",
+       "bytes": 1474,
+       "sha256": "d2dd0c60d01b9e195d9447c52da61c7302d28828524914c044d9c6e1b81d0427",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00001-of-00014.safetensors",
+       "bytes": 4932328944,
+       "sha256": "6b9dfbc930e505402ae9d7e5091a9d7d656cda5f34614f01cfe70bfb0cca27cb",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00002-of-00014.safetensors",
+       "bytes": 4875990528,
+       "sha256": "d8bb44b4ff303fe76fe9e894022fb3dc71b15a2e716592790fe0e3c3e60478fa",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00003-of-00014.safetensors",
+       "bytes": 4875990552,
+       "sha256": "54f22e8b3168f8dc962fac0d313607ebf52a12b433d4cf3098a0d82d9f042940",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00004-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "ad09c74d3c13ee29b5d0d84548fd8a3424a651564eaccd519946c296e59c557f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00005-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "fc993c8a0e2a5b0570f383e1a95dc3a1281d1b224b6f3ee908f4827941e1dfc2",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00006-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "82f05620d1f718a90c362b221d6a184ff1a0f53301d706882d3df49695fa1974",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00007-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "fb91da8cb01ff4de3eef0eab1c3e769a734b3a1aafc61734068638a0d6c86934",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00008-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "431ca56535c8781944ce3801f5eb61c45531e853ecc5846d936ebaf4761b764f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00009-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "3825e3f4302f4d2f7d76aa7430d2ce0864fde6b9e540a5806bf0d8e38e4d9f47",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00010-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "aded5a4d1d5e22dbd8b6f79266b6eb88c840411b09527c53917a1419ace22e2f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00011-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "3820ffe8d8d6477f6fe8d614ef3c87abb264ee39accebf43a1507b970d80946f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00012-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "05ad2d08ce71963121c9b03f1d9ec5d7641052f4b23c6c12b80d71065eb8e98e",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00013-of-00014.safetensors",
+       "bytes": 4875990584,
+       "sha256": "b64f2289871261fdd1abbd3b78bcd66011b341de3dc8eeb2ed1a473ee7c8d95c",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model-00014-of-00014.safetensors",
+       "bytes": 3270697008,
+       "sha256": "e45b6c9998c77ee5a6577f9f47bc76416c1d4d387169e50c4c9d3134ea51b13b",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\model.safetensors.index.json",
+       "bytes": 97831,
+       "sha256": "06c952c569285870b811989b794b9766493e280fb77fbcb957fc4e5fcf25403a",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\preprocessor_config.json",
+       "bytes": 390,
+       "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\tokenizer.json",
+       "bytes": 7032403,
+       "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\tokenizer_config.json",
+       "bytes": 11003,
+       "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\video_preprocessor_config.json",
+       "bytes": 385,
+       "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\text_encoder\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\tokenizer\\merges.txt",
+       "bytes": 1671839,
+       "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\tokenizer\\tokenizer.json",
+       "bytes": 7032403,
+       "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\tokenizer\\tokenizer_config.json",
+       "bytes": 11003,
+       "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\tokenizer\\vocab.json",
+       "bytes": 2776833,
+       "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\config.json",
+       "bytes": 604,
+       "sha256": "f619093a231fcfbcc3d035bec26c50ad864e7331a500d5c519f5045dc1e50458",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00001-of-00013.safetensors",
+       "bytes": 5227812968,
+       "sha256": "0b3386565e476bfdea287e9ea9f269d036e5c649ed14bb9b4afac1dc4661bd2a",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00002-of-00013.safetensors",
+       "bytes": 5164578856,
+       "sha256": "9c98fd4579c9bc96d1b1bbf65c1243f9256df60bccd229570cecc61897773003",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00003-of-00013.safetensors",
+       "bytes": 5164578872,
+       "sha256": "fa484c940d4170199fb69f5016739df2daf6ecd1150631b12a297e06e3964730",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00004-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "4a851df37cce2d14b39cb58df41def7b591b1f11b8520a32b421a5fa3e997c9f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00005-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "3fe6ff94dc9d3107c6776a25277d2b72b5443f88cf0f4ed835fd5b65a94ea5d4",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00006-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "79b47e1b9ff03a2c6f06dd15a28972acf32c0867172ee34e5aa6e96b99494127",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00007-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "6ac4d6ce639786b722a8dd99843ed56dcab48a0d174a4b0f9b8cdcbe5160fb0f",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00008-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "03531812243fb0a333e01efa7e3d39750580bca8cbf2ba0529da419278eab736",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00009-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "7e82a80b0d0d267026eb841b81523069cc7b956c1ebd8a18c07e462ffb262487",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00010-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "ef0a1f6b65145232543dd2232d58d91a4d31f44b0da5084acf22cea123255481",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00011-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "bf885b8f2f078c5499b75fded21094a26bfe0e6e00bee276e499443ecd2f298d",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00012-of-00013.safetensors",
+       "bytes": 5164578896,
+       "sha256": "dc717572d014ebf8527e35af815d10eb2f5a6bc87253b8a7d2f456965192db69",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model-00013-of-00013.safetensors",
+       "bytes": 4242305176,
+       "sha256": "8bfd852d5817e9836de1d3ec8dbac1c5446b167568b717371f08282b22291aa2",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\transformer\\model.safetensors.index.json",
+       "bytes": 38323,
+       "sha256": "fb457a26ffa6294660e249b0ddd03a337f2e5393f770b5c34c8b8f90a29a7efb",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\attention.py",
+       "bytes": 5785,
+       "sha256": "c9db8465c57f0bfb40c0194227be6e34b2c1ff7c5b5d63abca9964eed6283767",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\base_module.py",
+       "bytes": 9520,
+       "sha256": "0e7ddf5086179a306298693ac461ffcbc27ccb28dbc786b1a05060de7a3357c0",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\config.json",
+       "bytes": 1807,
+       "sha256": "3edd2cdd1ebc823c868be55ef917e1b3b8a398fde4d3150dae44a3bf05d9f627",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\conv.py",
+       "bytes": 4487,
+       "sha256": "b3adee35f27e5d372543242aa86ce5e0138f13b794b6c81f919001e3e2346723",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\flash.py",
+       "bytes": 5763,
+       "sha256": "c1918463d303a16f278a670bb4f33d3f8d6f7653b0d473313ff5835699b86d04",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\func.py",
+       "bytes": 5840,
+       "sha256": "0612c26a65f095699cc7acd51937cd153584fa5a0476956e46a4679aa575c22d",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\klvae.py",
+       "bytes": 48594,
+       "sha256": "d05a22b4918ad303f147d6b0d0ae9038bd1af1f810a5553b04f3542ab9bcff96",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\minimax_h3_video_vae.py",
+       "bytes": 5123,
+       "sha256": "77fdea69a48485b5434f65d08096657b5d78b78b7cdf24e1241038f237720138",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\norm.py",
+       "bytes": 10686,
+       "sha256": "258b120ca8d9a16366d7b811fe93eebf98fe1564db0995e8b7747229c651919a",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\normalize.py",
+       "bytes": 1200,
+       "sha256": "8db651acb9eb551c906a2850bbca8e9d851f00d07b30ccf66ceb6057da687a13",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\parallel.py",
+       "bytes": 12997,
+       "sha256": "7193522beafd65bc3dbe40b9843e360ab8da3a0bb211e9bfb67bb0d5d0e66919",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\source\\config.json",
+       "bytes": 1164,
+       "sha256": "66c68f541e6578ce613ce7a0fc985eb59097038829e49f7535e6d08e6d95ab12",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\source\\model.safetensors",
+       "bytes": 10415548320,
+       "sha256": "5f0c2e161d895a9fee7645ca32d4a7e3a22b90cacfcbeba62ec999cdbbefe0d3",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\utils.py",
+       "bytes": 764,
+       "sha256": "309e45e9d9e33cd5516a10eac2d207eb9f940079a6d9bbe0ee80aaaf7eb42dcd",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\vae_cnn.py",
+       "bytes": 8836,
+       "sha256": "3949b701e6893bd2ea070cd5b18ed8135a7c21d884290df449b1997212d65b11",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\vae_module.py",
+       "bytes": 1884,
+       "sha256": "9558fb302e10a619f198e12e04701c68988e897d0b627f958f33d27fd2a30d94",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\vae_processor.py",
+       "bytes": 8369,
+       "sha256": "32870580a1802d9163104a4d68170e35a4772106867181e1bd343dff11f87d2e",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\FL2VA\\video_vae\\vae_vit.py",
+       "bytes": 13490,
+       "sha256": "a372c28441b56ec2dbc6041dbd6ce2766c64c0e61b2c69a16594a97a11da3f58",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\LICENSE",
+       "bytes": 17604,
+       "sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\model_index.json",
+       "bytes": 2936,
+       "sha256": "5a587fe13b2371427415ac892463142683aefcd8d322e274a3a095eac37ac7d2",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3\\README.md",
+       "bytes": 38406,
+       "sha256": "f0116a90332496bdfcc827320c603a26b849c73bf804f2674d03682fbbd2334a",
+       "sha256_status": "MINIMAX_H3_FL2VA_BF16.source-manifest.json",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "MiniMaxAI\\MiniMax-H3-vision\\mmproj-BF16.gguf",
+       "bytes": 1200333792,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "lightx2v\\Minimax-h3-Turbo\\minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+       "bytes": 1956193000,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "lightx2v\\Minimax-h3-Turbo\\README.md",
+       "bytes": 2206,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "rife\\weights\\rife49.safetensors",
+       "bytes": 21312128,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ],
+     "lizenz_zusatz": {
+      "name": "nicht geprueft (lightx2v-Repo)",
+      "satz": "Turbo-LoRA: \"Model assets are governed by the repository license\" (README); Lizenz nicht gelesen.",
+      "bestaetigen": true
+     }
+    }
+   ],
+   "summe_bytes": 214325711091,
+   "summe_gb": 214.33,
+   "summe_pflicht_bytes": 34222748161,
+   "summe_pflicht_gb": 34.22,
+   "anzahl_modelle": 4,
+   "anzahl_dateien": 130
+  },
+  "musik": {
+   "titel": "Musik",
+   "beschreibung": "ACE-Step 1.5 XL turbo; optional sft/base und MOSS-Music (Tonbewertung).",
+   "modelle": [
+    {
+     "id": "ace-step-1.5-xl-turbo",
+     "name": "ACE-Step 1.5 XL turbo",
+     "abschnitt": "external/ace-step-1.5-xl-turbo",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "ACE-Step\\gufo"
+     ],
+     "quellen": [
+      {
+       "ordner": "ACE-Step\\gufo",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-turbo, acestep-5Hz-lm-0.6B und Comfy-Org/ace_step_1.5_ComfyUI_files (Download-Logs); nicht gepinnt"
+      }
+     ],
+     "lizenz": {
+      "name": "MIT",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 15.0,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar: GPU 10.7 GB idle, ~15 GB peak",
+     "gpu_gb_router": 14.7,
+     "host_gb_router": 0.64,
+     "router_gemessen_am": "2026-11-09T23:54:03",
+     "passt_64gb": "ja",
+     "hinweis": "Welche LM-Datei turbo ohne --lm nimmt (lm.safetensors oder lm-0.6b.safetensors), ist nicht geprueft; beide sind aufgefuehrt.",
+     "daten_dateien": [],
+     "bytes": 21223961721,
+     "gb": 21.22,
+     "dateien": [
+      {
+       "pfad": "ACE-Step\\gufo\\dit.safetensors",
+       "bytes": 9974719892,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\lm.safetensors",
+       "bytes": 8379154232,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\lm-0.6b.safetensors",
+       "bytes": 1325804168,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\text_encoder.safetensors",
+       "bytes": 1191588248,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\vae.safetensors",
+       "bytes": 337431388,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\silence_latent.safetensors",
+       "bytes": 3840088,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\tokenizer.json",
+       "bytes": 11423705,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "ace-step-1.5-xl-sft",
+     "name": "ACE-Step 1.5 XL sft (50 Schritte, LM 1.7B)",
+     "abschnitt": "external/ace-step-1.5-xl-sft",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [
+      "ace-step-1.5-xl-turbo"
+     ],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "ACE-Step\\gufo"
+     ],
+     "quellen": [
+      {
+       "ordner": "ACE-Step\\gufo",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-sft; nicht gepinnt"
+      }
+     ],
+     "lizenz": {
+      "name": "MIT",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 14.16,
+     "host_gb_router": 0.63,
+     "router_gemessen_am": "2026-11-12T00:38:12",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 13683243556,
+     "gb": 13.68,
+     "dateien": [
+      {
+       "pfad": "ACE-Step\\gufo\\dit-sft.safetensors",
+       "bytes": 9974720044,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\lm-1.7b.safetensors",
+       "bytes": 3708523512,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "ace-step-1.5-xl-base",
+     "name": "ACE-Step 1.5 XL base (extract/lego/complete)",
+     "abschnitt": "external/ace-step-1.5-xl-base",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [
+      "ace-step-1.5-xl-turbo"
+     ],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "ACE-Step\\gufo"
+     ],
+     "quellen": [
+      {
+       "ordner": "ACE-Step\\gufo",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-base; nicht gepinnt"
+      }
+     ],
+     "lizenz": {
+      "name": "MIT",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 15.08,
+     "host_gb_router": 0.67,
+     "router_gemessen_am": "2026-11-12T07:01:47",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 13683243556,
+     "gb": 13.68,
+     "dateien": [
+      {
+       "pfad": "ACE-Step\\gufo\\dit-base.safetensors",
+       "bytes": 9974720044,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "ACE-Step\\gufo\\lm-1.7b.safetensors",
+       "bytes": 3708523512,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "moss-music-8b",
+     "name": "MOSS-Music-8B-Instruct (Tonbewertung, eigener Worker)",
+     "abschnitt": "external/moss-music",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo-moss",
+     "oeffentlich": true,
+     "ordner": [
+      "OpenMOSS-Team\\moss-music-gufo"
+     ],
+     "quellen": [
+      {
+       "ordner": "OpenMOSS-Team\\moss-music-gufo",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "lokal umgewandelt (Audio-Encoder BF16 + LLM Q8_0) aus OpenMOSS-Team MOSS-Music-8B-Instruct; Repo nicht gepinnt. Die BF16-Originale (32,8 GB) liegen daneben und sind nicht aufgefuehrt."
+      }
+     ],
+     "lizenz": {
+      "name": "Apache-2.0 (laut Modellkarte)",
+      "satz": "MOSS-Music-8B-Instruct: Apache-2.0 laut Modellkarte (Preset-Kommentar 12.11.); Lizenzdatei im gufo-Ordner nicht enthalten.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 10.6,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 12.11.2026: GPU ~10,6 GB bei Kontext 4096",
+     "gpu_gb_router": 12.27,
+     "host_gb_router": 2.11,
+     "router_gemessen_am": "2026-11-12T10:37:46",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 10434008192,
+     "gb": 10.43,
+     "dateien": [
+      {
+       "pfad": "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.llm-Q8_0.gguf",
+       "bytes": 8709518144,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.audio.gguf",
+       "bytes": 1724490048,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 55315933513,
+   "summe_gb": 55.32,
+   "summe_pflicht_bytes": 21223961721,
+   "summe_pflicht_gb": 21.22,
+   "anzahl_modelle": 4,
+   "anzahl_dateien": 13
+  },
+  "3d": {
+   "titel": "3D",
+   "beschreibung": "TripoSG (Bild -> GLB); optional TRELLIS.2 (mit Textur).",
+   "modelle": [
+    {
+     "id": "triposg",
+     "name": "TripoSG (eigener 3D-Worker)",
+     "abschnitt": "external/triposg",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo-3d",
+     "oeffentlich": true,
+     "ordner": [
+      "VAST-AI\\TripoSG"
+     ],
+     "quellen": [
+      {
+       "ordner": "VAST-AI\\TripoSG",
+       "hf_repo": "VAST-AI/TripoSG",
+       "hf_revision": "",
+       "angabe_von": "Ordnername; gufo/triposg.safetensors lokal aus dem HF-Ordner (11,9 GB, nicht aufgefuehrt) umgewandelt",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "MIT",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 6.7,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 12.11.2026: Spitze 6,7 GB + 0,55 GB geteilt",
+     "gpu_gb_router": 7.08,
+     "host_gb_router": 3.45,
+     "router_gemessen_am": "2026-11-12T13:22:09",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 3923957740,
+     "gb": 3.92,
+     "dateien": [
+      {
+       "pfad": "VAST-AI\\TripoSG\\gufo\\triposg.safetensors",
+       "bytes": 3923957740,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "trellis2",
+     "name": "TRELLIS.2-4B (eigener Worker, Built with DINOv3)",
+     "abschnitt": "external/trellis2",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "trellis2",
+     "oeffentlich": true,
+     "ordner": [
+      "microsoft\\gufo-trellis2"
+     ],
+     "quellen": [
+      {
+       "ordner": "microsoft\\gufo-trellis2",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "lokal umgewandelt aus microsoft/TRELLIS.2-4B (16,2 GB daneben, nicht aufgefuehrt) und facebook/dinov3-vitl16-pretrain-lvd1689m (THIRD_PARTY_NOTICES); nicht gepinnt"
+      }
+     ],
+     "lizenz": {
+      "name": "MIT + DINOv3 License (Meta, 19.08.2025)",
+      "satz": "TRELLIS.2 ist MIT; der Bildencoder DINOv3 hat die Meta-DINOv3-Lizenz: \"Built with DINOv3\" nennen und die Lizenzkopie beilegen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": 19.3,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar 12.11.2026: GPU-Spitze 19,3 GB mit Textur",
+     "gpu_gb_router": 18.79,
+     "host_gb_router": 1.51,
+     "router_gemessen_am": "2026-11-12T17:13:53",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 11019273535,
+     "gb": 11.02,
+     "dateien": [
+      {
+       "pfad": "microsoft\\gufo-trellis2\\LICENSE-DINOv3.md",
+       "bytes": 7503,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-dinov3.safetensors",
+       "bytes": 1212638136,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-shape_dec.safetensors",
+       "bytes": 948852556,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-shape_flow_512.safetensors",
+       "bytes": 2587225304,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-ss_dec.safetensors",
+       "bytes": 147604500,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-ss_flow.safetensors",
+       "bytes": 2586930280,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-tex_dec.safetensors",
+       "bytes": 948789952,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "microsoft\\gufo-trellis2\\trellis2-tex_flow_512.safetensors",
+       "bytes": 2587225304,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 14943231275,
+   "summe_gb": 14.94,
+   "summe_pflicht_bytes": 3923957740,
+   "summe_pflicht_gb": 3.92,
+   "anzahl_modelle": 2,
+   "anzahl_dateien": 9
+  },
+  "werkzeuge": {
+   "titel": "Werkzeuge",
+   "beschreibung": "Real-ESRGAN-Hochskalierung; optional RIFE-Zwischenbilder (braucht den H3-Ordner) und Qwen3-Omni-Captioner (Audio beschreiben).",
+   "modelle": [
+    {
+     "id": "gufo-upscale",
+     "name": "Real-ESRGAN (general, wdn, anime)",
+     "abschnitt": "external/gufo-upscale",
+     "art": "modell",
+     "pflicht": true,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "upscale"
+     ],
+     "quellen": [
+      {
+       "ordner": "upscale",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "Real-ESRGAN GitHub-Release v0.2.5.0 (.pth), lokal nach safetensors umgewandelt (docs/models/realesrgan)"
+      }
+     ],
+     "lizenz": {
+      "name": "BSD-3-Clause",
+      "satz": "Frei, auch kommerziell; Hinweis beilegen.",
+      "bestaetigen": false
+     },
+     "gpu_gb_notiz": 1.0,
+     "gpu_gb_notiz_quelle": "Preset-Kommentar: Small model (~1 GB GPU)",
+     "gpu_gb_router": 0.43,
+     "host_gb_router": 0.12,
+     "router_gemessen_am": "2026-11-11T16:09:55",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 12214359,
+     "gb": 0.01,
+     "dateien": [
+      {
+       "pfad": "upscale\\realesr-general-x4v3.safetensors",
+       "bytes": 4861400,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "upscale\\realesr-general-wdn-x4v3.safetensors",
+       "bytes": 4861400,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "upscale\\realesr-animevideov3.safetensors",
+       "bytes": 2490040,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "upscale\\weights\\Real-ESRGAN-LICENSE.txt",
+       "bytes": 1519,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "gufo-rife",
+     "name": "RIFE 4.9 Zwischenbilder (Video-Worker mit H3-Modellpfad)",
+     "abschnitt": "external/gufo-rife",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [
+      "minimax-h3"
+     ],
+     "worker": "gufo.exe",
+     "oeffentlich": true,
+     "ordner": [
+      "rife"
+     ],
+     "quellen": [
+      {
+       "ordner": "rife",
+       "hf_repo": "",
+       "hf_revision": "",
+       "angabe_von": "",
+       "hinweis": "rife49.pth von https://huggingface.co/marduk191/rife/resolve/main/rife49.pth (docs/models/rife), lokal umgewandelt"
+      }
+     ],
+     "lizenz": {
+      "name": "MIT (Code) / Gewichte nicht geprueft",
+      "satz": "Practical-RIFE-Code MIT; die Gewichte rife49.pth kommen vom Spiegel marduk191/rife (docs/models/rife), Lizenz der Gewichte nicht geprueft (KB 1127).",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 0.34,
+     "host_gb_router": 0.17,
+     "router_gemessen_am": "2026-11-11T16:40:29",
+     "passt_64gb": "ja",
+     "hinweis": "Der Produktions-Abschnitt zeigt mit model/manifest auf den MiniMax-H3-Ordner; ohne H3 ist dieser Abschnitt nicht startbar. RIFE selbst nutzen alle Video-Abschnitte ueber rife-model.",
+     "daten_dateien": [],
+     "bytes": 21312128,
+     "gb": 0.02,
+     "dateien": [
+      {
+       "pfad": "rife\\weights\\rife49.safetensors",
+       "bytes": 21312128,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    },
+    {
+     "id": "qwen3-omni-captioner",
+     "name": "Qwen3-Omni-30B-A3B-Captioner Q4_K_M (laeuft im Router)",
+     "abschnitt": "omni/qwen3-omni-captioner",
+     "art": "modell",
+     "pflicht": false,
+     "vorgabe_ram": null,
+     "benoetigt": [],
+     "worker": "router",
+     "oeffentlich": true,
+     "ordner": [
+      "mradermacher\\Qwen3-Omni-30B-A3B-Captioner-GGUF"
+     ],
+     "quellen": [
+      {
+       "ordner": "mradermacher\\Qwen3-Omni-30B-A3B-Captioner-GGUF",
+       "hf_repo": "mradermacher/Qwen3-Omni-30B-A3B-Captioner-GGUF",
+       "hf_revision": "",
+       "angabe_von": "Ordnername (nicht gepinnt)",
+       "hinweis": ""
+      }
+     ],
+     "lizenz": {
+      "name": "nicht geprueft",
+      "satz": "Keine Lizenzangabe im Ordner gelesen (KB 1127: ungeprueft); vor kommerzieller Nutzung pruefen.",
+      "bestaetigen": true
+     },
+     "gpu_gb_notiz": null,
+     "gpu_gb_notiz_quelle": "",
+     "gpu_gb_router": 20.08,
+     "host_gb_router": 0.5,
+     "router_gemessen_am": "2026-11-09T11:22:08",
+     "passt_64gb": "ja",
+     "hinweis": "",
+     "daten_dateien": [],
+     "bytes": 20760980768,
+     "gb": 20.76,
+     "dateien": [
+      {
+       "pfad": "mradermacher\\Qwen3-Omni-30B-A3B-Captioner-GGUF\\Qwen3-Omni-30B-A3B-Captioner.Q4_K_M.gguf",
+       "bytes": 18557053888,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      },
+      {
+       "pfad": "mradermacher\\Qwen3-Omni-30B-A3B-Captioner-GGUF\\Qwen3-Omni-30B-A3B-Captioner.mmproj-f16.gguf",
+       "bytes": 2203926880,
+       "sha256": "",
+       "sha256_status": "fehlt",
+       "im_baum_198": true
+      }
+     ]
+    }
+   ],
+   "summe_bytes": 20794507255,
+   "summe_gb": 20.79,
+   "summe_pflicht_bytes": 12214359,
+   "summe_pflicht_gb": 0.01,
+   "anzahl_modelle": 3,
+   "anzahl_dateien": 7
+  },
+  "zweiter-rechner": {
+   "titel": "Zweiter Rechner (Pool)",
+   "beschreibung": "Keine Modelle: [remote/<id>]-Zwillinge fuer die Modelle, die der Partner hat (placement = pool), plus --remote-allow.",
+   "modelle": [],
+   "summe_bytes": 0,
+   "summe_gb": 0.0,
+   "summe_pflicht_bytes": 0,
+   "summe_pflicht_gb": 0.0,
+   "anzahl_modelle": 0,
+   "anzahl_dateien": 0
+  }
+ },
+ "gesamt_bytes": 736987774674,
+ "gesamt_gb": 736.99,
+ "anzahl_dateien": 367,
+ "fehlend_im_baum_198": []
+}

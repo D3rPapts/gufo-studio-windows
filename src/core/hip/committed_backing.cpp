@@ -1,13 +1,10 @@
 #include "src/core/hip/committed_backing.hpp"
 
 #include <hip/hip_runtime.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -15,6 +12,8 @@
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/platform/page_pin.hpp"
+#include "src/core/platform/pages.hpp"
 
 namespace gufo::hip {
 namespace detail {
@@ -25,72 +24,28 @@ struct CommittedPages {
   explicit operator bool() const { return data != nullptr; }
 };
 
-// Ordinary anonymous pages, then registered with the GPU. Opt out of THP
-// before population: later huge-page promotion can invalidate GPU mappings.
+// Ordinary anonymous pages, then registered with the GPU. The platform leaf
+// commits, opts out of THP and populates; registration stays here.
 CommittedPages CommitPages(std::size_t bytes) {
-  constexpr std::size_t page = 4096;
-  const auto workers = std::min<std::size_t>(4, bytes / (128ULL << 20));
-  void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (data == MAP_FAILED)
+  void* data = platform::CommitZeroedPages(bytes);
+  if (data == nullptr)
     return {};
-  // Kernels built without THP reject this advice with EINVAL; their pages
-  // cannot be promoted. All other failures must release the mapping.
-  if (madvise(data, bytes, MADV_NOHUGEPAGE) != 0 && errno != EINVAL) {
-    munmap(data, bytes);
-    return {};
-  }
-  std::atomic<bool> populated{true};
-  const auto populate = [&](std::size_t begin, std::size_t end) {
-    // A long population call holds the process's mapping lock while faulting
-    // pages. Bound each call so request-side heap growth can make progress.
-    constexpr std::size_t piece = 64ULL << 10;
-    for (auto offset = begin; offset < end; offset += piece) {
-      if (!populated.load(std::memory_order_relaxed))
-        break;
-      if (madvise(static_cast<std::byte*>(data) + offset,
-                  std::min(piece, end - offset), MADV_POPULATE_WRITE) != 0) {
-        populated.store(false, std::memory_order_relaxed);
-        break;
-      }
-    }
-  };
-  if (workers >= 2) {
-    // Large serial page faults can hold up inference even when growth runs
-    // on a background thread. Populate disjoint ordinary-page ranges, then
-    // join before registering or exposing any of the backing.
-    std::array<std::jthread, 3> faults;
-    std::size_t next = 0;
-    for (std::size_t i = 0; i + 1 < workers; ++i) {
-      const auto end = (bytes / page) * (i + 1) / workers * page;
-      try {
-        faults[i] = std::jthread(populate, next, end);
-      } catch (...) {
-        // Thread exhaustion falls back to populating the remaining range
-        // here. Every started worker still joins before registration.
-        break;
-      }
-      next = end;
-    }
-    populate(next, bytes);
-  } else
-    populate(0, bytes);
-  if (!populated.load(std::memory_order_relaxed)) {
-    munmap(data, bytes);
-    return {};
-  }
-  const int pin = PinHostPages(data, bytes);
+  const int pin = platform::PinHostPages(data, bytes);
   if (hipHostRegister(data, bytes, hipHostRegisterDefault) != hipSuccess) {
-    UnpinHostPages(pin);
-    munmap(data, bytes);
+    platform::UnpinHostPages(pin);
+    platform::ReleaseCommittedPages(data, bytes);
     return {};
   }
   return {data, pin};
 }
+bool HeapFree(std::size_t& free_bytes) {
+  std::size_t total_bytes = 0;
+  return hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess;
+}
 void ReleasePages(CommittedPages pages, std::size_t bytes) {
   (void)hipHostUnregister(pages.data);
-  UnpinHostPages(pages.pin);
-  munmap(pages.data, bytes);
+  platform::UnpinHostPages(pages.pin);
+  platform::ReleaseCommittedPages(pages.data, bytes);
 }
 }  // namespace
 struct BackingState {
@@ -108,6 +63,7 @@ struct BackingState {
       std::numeric_limits<std::size_t>::max()};
   cache::ResourceLedger* ledger{};
   std::function<bool(std::size_t)> admit_segment;
+  std::function<bool(std::size_t, std::size_t, std::size_t)> keep_segment;
   std::mutex growth;
   std::atomic<bool> growing_ahead{};
   std::byte* Address(std::size_t index) const {
@@ -143,10 +99,20 @@ struct BackingState {
     } catch (const std::bad_alloc&) {
       return false;
     }
+    std::size_t heap_before = 0, heap_after = 0;
+    if (keep_segment && !HeapFree(heap_before))
+      return false;
     auto& data = segments[first / segment_blocks];
     data = CommitPages(count * block_bytes);
     if (!data)
       return false;
+    if (keep_segment &&
+        !(HeapFree(heap_after) &&
+          keep_segment(count * block_bytes, heap_before, heap_after))) {
+      ReleasePages(data, count * block_bytes);
+      data = {};
+      return false;
+    }
     try {
       for (std::size_t i = 0; i < count; ++i)
         blocks[first + i] = reservations[i].Convert();
@@ -276,6 +242,7 @@ CommittedBackingPool::CommittedBackingPool(cache::ResourceLedger& ledger,
       (count + state->segment_blocks - 1) / state->segment_blocks + 1);
   state->ledger = &ledger;
   state->admit_segment = std::move(config.admit_segment);
+  state->keep_segment = std::move(config.keep_segment);
   if (!config.segment_bytes && count) {
     std::vector<cache::ResourceReservation> reservations;
     reservations.reserve(count);

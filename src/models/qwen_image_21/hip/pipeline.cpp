@@ -1,14 +1,22 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
-#include "src/models/qwen/control_tokens.hpp"
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
+#include "src/models/qwen_image_21/control.hpp"
+#include "src/models/qwen_image_21/hip/memory.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 
@@ -35,6 +43,22 @@ double Milliseconds(Clock::time_point start) {
 void Cancel(const CancellationCheck& cancelled) {
   if (cancelled && cancelled())
     throw std::runtime_error("image request cancelled");
+}
+
+/// Observe a second pass (negative prompt, init image) under its own names.
+Observer Prefixed(const Observer& observer, std::string prefix) {
+  if (!observer.write)
+    return {};
+  Observer result;
+  result.write = [observer, prefix](std::string_view name,
+                                    std::span<const float> values, int rows,
+                                    int cols) {
+    observer.write(prefix + std::string(name), values, rows, cols);
+  };
+  result.include = [observer, prefix](std::string_view name) {
+    return observer.Wants(prefix + std::string(name));
+  };
+  return result;
 }
 
 Matrix Concat(Runtime& rt, std::initializer_list<Matrix> values) {
@@ -392,13 +416,47 @@ struct DiffusionContext {
   Matrix rope;
   std::vector<int> limits;
   std::array<Matrix, 32> keys, values;
+  // Leading condition rows taken from `base`'s caches instead of `prefix`.
+  // Block-causal rows never see later tokens, so a prefix that is identical
+  // in both prompts (the reference images before the prompt text) has
+  // identical K/V for the negative pass. `rope` and `limits` cover only the
+  // own rows; limits count keys in the full sequence.
+  const DiffusionContext* base{nullptr};
+  int shared_rows{0};
+  // Prefill already filled keys/values; every step then runs target rows.
+  bool prefilled{false};
+  // A Denoise call already ran the condition rows and filled the caches.
+  bool filled{false};
+  // Fun ControlNet: control-block K/V of the condition rows.
+  std::vector<Matrix> control_keys, control_values;
 };
+
+/// Leading encoder tokens shared by two prompts with the same references,
+/// ending after the last shared reference image; 0 without one. The
+/// remaining tail is never empty.
+int SharedConditionTokens(const EncodedPrompt& a, const EncodedPrompt& b) {
+  const std::size_t length =
+      std::min(a.ids.size() - a.drop, b.ids.size() - b.drop);
+  std::size_t common = 0;
+  while (common + 1 < length &&
+         a.ids[a.drop + common] == b.ids[b.drop + common])
+    ++common;
+  std::size_t shared = 0;
+  for (std::size_t i = 0; i < common; ++i)
+    if (a.ids[a.drop + i] == 151655 &&
+        (i + 1 == common || a.ids[a.drop + i + 1] != 151655))
+      shared = i + 1;
+  return static_cast<int>(shared);
+}
 
 DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
                                   const EncodedPrompt& prompt, int height,
                                   int width, const CancellationCheck& cancelled,
-                                  const Observer& observer) {
+                                  const Observer& observer,
+                                  const DiffusionContext* base = nullptr,
+                                  int shared_tokens = 0) {
   DiffusionContext context;
+  context.base = shared_tokens ? base : nullptr;
   auto text = rt.Linear(
       rt.Activate(rt.Linear(rt.Normalize(prompt.hidden, Norm::kZeroRms,
                                          "transformer.txt_in.text_norm"),
@@ -412,13 +470,19 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
   std::size_t image_index = 0;
   const int length = text.rows;
   while (cursor < length) {
+    if (cursor == shared_tokens)
+      context.shared_rows = static_cast<int>(positions.size());
+    const bool shared = cursor < shared_tokens;
     if (prompt.ids[prompt.drop + cursor] == 151655) {
       const auto& image = prompt.images.at(image_index++);
       const int slots = (image.height / 32) * (image.width / 32);
       const int h = image.height / 16, w = image.width / 16;
-      parts.push_back(
-          rt.Linear(EncodeVae(rt, weights, image, cancelled, observer),
-                    "transformer.img_in"));
+      if (shared && cursor + slots > shared_tokens)
+        throw std::logic_error("shared condition ends inside an image");
+      if (!shared)
+        parts.push_back(
+            rt.Linear(EncodeVae(rt, weights, image, cancelled, observer),
+                      "transformer.img_in"));
       const int end = static_cast<int>(positions.size()) + h * w;
       for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
@@ -429,15 +493,20 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
       cursor += slots;
     } else {
       const int start = cursor;
-      while (cursor < length && prompt.ids[prompt.drop + cursor] != 151655) {
+      const int stop = shared ? shared_tokens : length;
+      while (cursor < stop && prompt.ids[prompt.drop + cursor] != 151655) {
         positions.push_back({position, position, position});
         context.limits.push_back(static_cast<int>(positions.size()));
         ++position;
         ++cursor;
       }
-      parts.push_back(text.Slice(start, cursor - start));
+      if (!shared)
+        parts.push_back(text.Slice(start, cursor - start));
     }
   }
+  if (shared_tokens && (!context.base || shared_tokens >= length ||
+                        context.shared_rows > context.base->prefix.rows))
+    throw std::logic_error("invalid shared condition prefix");
   context.prefix = rt.Concat(parts);
   const int end = static_cast<int>(positions.size()) + height * width;
   for (int y = 0; y < height; ++y)
@@ -446,6 +515,11 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
           {position, y - (height - height / 2), x - (width - width / 2)});
       context.limits.push_back(end);
     }
+  if (context.shared_rows) {
+    positions.erase(positions.begin(), positions.begin() + context.shared_rows);
+    context.limits.erase(context.limits.begin(),
+                         context.limits.begin() + context.shared_rows);
+  }
   std::vector<float> rope(positions.size() * 128);
   for (std::size_t row = 0; row < positions.size(); ++row)
     for (int pair = 0; pair < 64; ++pair) {
@@ -462,10 +536,169 @@ DiffusionContext PrepareDiffusion(Runtime& rt, const Weights& weights,
   return context;
 }
 
+/// DiT condition rows of a prompt: text tokens plus 4 rows per image token.
+int ConditionRows(const EncodedPrompt& prompt) {
+  int rows = static_cast<int>(prompt.ids.size() - prompt.drop);
+  for (const auto& image : prompt.images)
+    rows += 3 * (image.height / 32) * (image.width / 32);
+  return rows;
+}
+
+// About one 1 MP reference: 0-1 references keep every weight resident.
+constexpr int kReleaseEncoderRows = 6144;
+// Host RAM left to Windows and other processes when shared GPU memory grows.
+constexpr std::uint64_t kHostReserveBytes = 3ULL << 30;
+constexpr std::uint64_t kMinimumFreeBytes = 512ULL << 20;
+
+/// DiT rows of encoder tokens [begin, end): 4 per image token, 1 otherwise.
+int RowsOf(const EncodedPrompt& prompt, std::size_t begin, std::size_t end) {
+  int rows = 0;
+  for (std::size_t i = prompt.drop + begin; i < prompt.drop + end; ++i)
+    rows += prompt.ids[i] == 151655 ? 4 : 1;
+  return rows;
+}
+
+/// GPU memory a large request still needs after the text encoder left:
+/// missing DiT/VAE weights, both condition caches, the larger of the prefill
+/// and per-step working sets, the bounded pool cache and a margin.
+std::uint64_t LargeRequestBytes(const Runtime& rt, const EncodedPrompt& prompt,
+                                const EncodedPrompt* negative,
+                                int target_rows, int region_rows = 0) {
+  constexpr std::uint64_t kCacheRow = 32ULL * 2 * 4096 * 2;
+  // Activations of one row through a DiT block (about 19 row-sized
+  // 4096-wide BF16 tensors including the 12288-wide MLP).
+  constexpr std::uint64_t kWorkRow = 19ULL * 4096 * 2;
+  const std::uint64_t rows = ConditionRows(prompt);
+  std::uint64_t cache = rows;
+  if (negative) {
+    const auto shared = SharedConditionTokens(prompt, *negative);
+    cache += RowsOf(*negative, shared, negative->ids.size() - negative->drop);
+  }
+  // Regional prompts keep their own caches beside the base prompt's.
+  cache += static_cast<std::uint64_t>(region_rows);
+  const std::uint64_t prefill = 3 * rows * 4096 * 2 + 4096 * kWorkRow;
+  const std::uint64_t step = static_cast<std::uint64_t>(target_rows) * kWorkRow;
+  return rt.MissingBytes("transformer.") + rt.MissingBytes("vae.") +
+         cache * kCacheRow + std::max(prefill, step) + (2ULL << 30) +
+         (1ULL << 30);
+}
+constexpr std::size_t kDefaultCacheBytes = 8ULL << 30;
+constexpr std::size_t kLargeRequestCacheBytes = 2ULL << 30;
+
+/// Fill the condition K/V caches before the first step, without the target
+/// rows. Block-causal condition rows never attend to the target and use the
+/// timestep-zero modulation, so this matches the joint first step; 4096-row
+/// chunks bound the temporaries of multi-reference prompts (a joint first
+/// step over 38k rows holds about 6 GB). Cached blocks of the growing key
+/// spans are returned after every layer.
+void Prefill(Runtime& rt, DiffusionContext& context, float sigma,
+             const CancellationCheck& cancelled) {
+  constexpr int kChunk = 4096;
+  const int rows = context.prefix.rows;
+  std::vector<std::pair<int, int>> chunks;
+  for (int start = 0; start < rows; start += kChunk)
+    chunks.emplace_back(start, std::min(kChunk, rows - start));
+  // The fused attention kernel needs at least 128 query rows.
+  if (chunks.size() > 1 && chunks.back().second < 128) {
+    chunks[chunks.size() - 2].second += chunks.back().second;
+    chunks.pop_back();
+  }
+  if (rows < 1 || (context.shared_rows && !context.base->prefilled))
+    throw std::logic_error("invalid condition prefill");
+  const float timestep = Bf16(Bf16(sigma * 1000.0F) / 1000.0F);
+  std::vector<float> time(512);
+  for (int row = 0; row < 2; ++row)
+    for (int i = 0; i < 128; ++i) {
+      const float angle = (row == 0 ? timestep * 1000 : 0) *
+                          std::exp(-std::log(10000.0F) * i / 128.0F);
+      time[row * 256 + i] = std::cos(angle);
+      time[row * 256 + 128 + i] = std::sin(angle);
+    }
+  const auto temb = rt.Linear(
+      rt.Activate(
+          rt.Linear(rt.Upload(time, 2, 256),
+                    "transformer.time_text_embed.timestep_embedder.linear_1"),
+          Activation::kSilu),
+      "transformer.time_text_embed.timestep_embedder.linear_2");
+  const auto factors =
+      rt.ModulationFactors(rt.Linear(rt.Activate(temb, Activation::kSilu),
+                                     "transformer.modulation.1"),
+                           true);
+  auto x = rt.Concat(std::array{context.prefix});
+  const int shared = context.shared_rows;
+  for (int layer = 0; layer < 32; ++layer) {
+    Cancel(cancelled);
+    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
+    // Image rows attend to their whole image block, which can extend past a
+    // chunk: first project every chunk, then attend.
+    auto queries = rt.New(rows, 4096), keys = rt.New(rows, 4096),
+         values = rt.New(rows, 4096);
+    for (const auto [start, count] : chunks) {
+      const auto rope = context.rope.Slice(start, count);
+      // Every row is a condition row: modulation part with timestep zero.
+      const auto norm =
+          rt.NormalizeModulate(x.Slice(start, count), factors, 0, count);
+      rt.CopyRows(queries, start,
+                  rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_q"),
+                                   p + ".attn.norm_q", 32, rope));
+      rt.CopyRows(keys, start,
+                  rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_k"),
+                                   p + ".attn.norm_k", 32, rope));
+      rt.CopyRows(values, start, rt.Linear(norm, p + ".attn.to_v"));
+    }
+    // The caches stay in the attention kernel's head-major layout, so later
+    // steps read them in place (no per-step concatenation or reordering).
+    auto head_keys = rt.HeadLayout(keys), head_values = rt.HeadLayout(values);
+    keys = {};
+    values = {};
+    // The last layer's condition outputs are never read.
+    for (const auto [start, count] :
+         layer == 31 ? decltype(chunks){} : chunks) {
+      const std::vector<int> limits(context.limits.begin() + start,
+                                    context.limits.begin() + start + count);
+      const int span = *std::max_element(limits.begin(), limits.end()) - shared;
+      std::vector<Runtime::HeadKeys> segments;
+      if (shared)
+        segments.push_back(
+            {context.base->keys[layer], context.base->values[layer], shared});
+      segments.push_back({head_keys, head_values, span});
+      const auto chunk = x.Slice(start, count);
+      const auto attention = rt.Linear(
+          rt.SegmentedAttention(queries.Slice(start, count), segments, limits),
+          p + ".attn.to_out.0");
+      auto out = rt.Modulate(attention, factors, 1, count, &chunk);
+      const auto norm2 = rt.NormalizeModulate(out, factors, 2, count);
+      const auto mlp = rt.Linear(
+          rt.GatedLinear(norm2, p + ".img_mlp.gate_layer", p + ".img_mlp.proj"),
+          p + ".img_mlp.out");
+      out = rt.Modulate(mlp, factors, 3, count, &out);
+      rt.CopyRows(x, start, out);
+    }
+    context.keys[layer] = std::move(head_keys);
+    context.values[layer] = std::move(head_values);
+    rt.Trim();
+  }
+  context.prefilled = true;
+}
+
+/// Fun ControlNet-Union state of one request (see control.hpp). The branch
+/// input before_proj(control_img_in(context)) is step-independent.
+struct ControlRun {
+  int blocks{0};
+  int stride{2};
+  float strength{1};
+  Matrix target_in;  // target rows x 4096, before_proj bias included
+};
+
 Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
                float sigma, int step, const CancellationCheck& cancelled,
-               const Observer& observer) {
-  const int prefix = step == 0 ? context.prefix.rows : 0;
+               const Observer& observer, const ControlRun* control = nullptr) {
+  // The first call of a context also runs its condition rows and fills the
+  // caches (a context first used after step 0 serves the steps outside a
+  // partial control range).
+  const int prefix =
+      !context.filled && !context.prefilled ? context.prefix.rows : 0;
+  context.filled = true;
   auto x = rt.Linear(latent, "transformer.img_in");
   if (prefix)
     x = Concat(rt, {context.prefix, x});
@@ -493,43 +726,159 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
   rt.Observe(observer, "dit." + std::to_string(step) + ".modulation",
              modulation);
   const auto factors = rt.ModulationFactors(modulation, true);
-  for (int layer = 0; layer < 32; ++layer) {
-    Cancel(cancelled);
-    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
-    const auto norm = rt.NormalizeModulate(x, factors, 0, prefix);
+  // One single-stream block over this step's rows. `keys`/`values` hold its
+  // condition rows (filled on the first call); `shared` reads the leading
+  // reference rows of `layer` from the positive pass.
+  const auto block = [&](Matrix h, const std::string& p, Matrix& keys,
+                         Matrix& values, bool shared, int layer) {
+    const auto norm = rt.NormalizeModulate(h, factors, 0, prefix);
     const auto q = rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_q"),
                                     p + ".attn.norm_q", 32, rope);
     auto k = rt.NormalizeRope(rt.Linear(norm, p + ".attn.to_k"),
                               p + ".attn.norm_k", 32, rope);
     auto v = rt.Linear(norm, p + ".attn.to_v");
-    if (prefix) {
+    Matrix attended;
+    if (context.prefilled) {
+      // Head-major caches read in place: shared reference rows, own
+      // condition rows, then this step's target rows.
+      std::vector<Runtime::HeadKeys> segments;
+      if (shared)
+        segments.push_back({context.base->keys[layer],
+                            context.base->values[layer], context.shared_rows});
+      segments.push_back({keys, values, context.prefix.rows});
+      segments.push_back({rt.HeadLayout(k), rt.HeadLayout(v), latent.rows});
+      attended = rt.SegmentedAttention(q, segments);
+    } else if (prefix) {
       // Copy only prefix rows: a view would pin full target K/V for all layers.
-      context.keys[layer] = rt.Concat(std::array{k.Slice(0, prefix)});
-      context.values[layer] = rt.Concat(std::array{v.Slice(0, prefix)});
+      keys = rt.Concat(std::array{k.Slice(0, prefix)});
+      values = rt.Concat(std::array{v.Slice(0, prefix)});
+      if (shared) {
+        k = Concat(
+            rt, {context.base->keys[layer].Slice(0, context.shared_rows), k});
+        v = Concat(
+            rt, {context.base->values[layer].Slice(0, context.shared_rows), v});
+      }
+    } else if (shared) {
+      k = Concat(rt, {context.base->keys[layer].Slice(0, context.shared_rows),
+                      keys, k});
+      v = Concat(rt, {context.base->values[layer].Slice(0, context.shared_rows),
+                      values, v});
     } else {
-      k = Concat(rt, {context.keys[layer], k});
-      v = Concat(rt, {context.values[layer], v});
+      k = Concat(rt, {keys, k});
+      v = Concat(rt, {values, v});
     }
-    const auto attention =
-        rt.Linear(rt.Attention(q, k, v, 32, 32, 128,
-                               prefix ? context.limits : std::vector<int>{}),
-                  p + ".attn.to_out.0");
-    x = rt.Modulate(attention, factors, 1, prefix, &x);
-    const auto norm2 = rt.NormalizeModulate(x, factors, 2, prefix);
+    if (!context.prefilled)
+      attended = rt.Attention(q, k, v, 32, 32, 128,
+                              prefix ? context.limits : std::vector<int>{});
+    const auto attention = rt.Linear(attended, p + ".attn.to_out.0");
+    h = rt.Modulate(attention, factors, 1, prefix, &h);
+    const auto norm2 = rt.NormalizeModulate(h, factors, 2, prefix);
     const auto mlp = rt.Linear(
         rt.GatedLinear(norm2, p + ".img_mlp.gate_layer", p + ".img_mlp.proj"),
         p + ".img_mlp.out");
-    x = rt.Modulate(mlp, factors, 3, prefix, &x);
+    return rt.Modulate(mlp, factors, 3, prefix, &h);
+  };
+  // Control stream: before_proj(control_joint) + x, where control_joint is
+  // zero on condition rows (they receive the bias alone).
+  Matrix c;
+  if (control) {
+    if (context.shared_rows || context.prefilled)
+      throw std::logic_error("ControlNet needs a text-only, unprefilled pass");
+    if (context.control_keys.size() !=
+        static_cast<std::size_t>(control->blocks)) {
+      context.control_keys.resize(control->blocks);
+      context.control_values.resize(control->blocks);
+    }
+    Matrix control_in = control->target_in;
+    if (prefix)
+      control_in = Concat(
+          rt, {rt.Linear(rt.Upload(std::vector<float>(
+                                       static_cast<std::size_t>(prefix) * 4096),
+                                   prefix, 4096),
+                         "controlnet.control_blocks.0.before_proj"),
+               control_in});
+    c = rt.Add(control_in, x);
+    rt.Observe(observer, "dit." + std::to_string(step) + ".control.input", c);
+  }
+  for (int layer = 0; layer < 32; ++layer) {
+    Cancel(cancelled);
+    const auto p = "transformer.transformer_blocks." + std::to_string(layer);
+    x = block(std::move(x), p, context.keys[layer], context.values[layer],
+              context.shared_rows > 0, layer);
+    if (control && layer % control->stride == 0 &&
+        layer / control->stride < control->blocks) {
+      // The control branch never reads the base stream after its start, so
+      // block i may run after base block stride * i (as ComfyUI does) and
+      // only one control stream stays alive.
+      const int index = layer / control->stride;
+      const auto cp = "controlnet.control_blocks." + std::to_string(index);
+      c = block(std::move(c), cp, context.control_keys[index],
+                context.control_values[index], false, layer);
+      // hidden + bf16(skip * scale), as the reference adds its hints.
+      x = rt.Euler(x, rt.Linear(c, cp + ".after_proj"), control->strength);
+      rt.Observe(observer,
+                 "dit." + std::to_string(step) + ".control." +
+                     std::to_string(index),
+                 c);
+    }
     rt.Observe(
         observer,
         "dit." + std::to_string(step) + ".block." + std::to_string(layer), x);
   }
   const auto scale = rt.Linear(activated, "transformer.norm_out.linear");
+  rt.Observe(observer, "dit." + std::to_string(step) + ".output_scale", scale);
   x = rt.NormalizeModulate(x.Slice(prefix, latent.rows),
                            rt.ModulationFactors(scale, false), 0, 0);
+  rt.Observe(observer, "dit." + std::to_string(step) + ".output_norm", x);
   x = rt.Linear(x, "transformer.proj_out");
   rt.Observe(observer, "dit." + std::to_string(step) + ".output", x);
   return x;
+}
+
+/// Encodes the control image (and, for the inpaint recipe, the masked start
+/// image), packs the 129-channel context and projects it once.
+ControlRun PrepareControl(Runtime& rt, const Weights& weights,
+                          const ControlnetInfo& info, const Request& request,
+                          const Image* init_image,
+                          const CancellationCheck& cancelled,
+                          const Observer& observer) {
+  const auto& input = *request.control;
+  const int rows = (request.height / 16) * (request.width / 16);
+  ControlRun run;
+  run.blocks = info.blocks;
+  run.stride = info.stride;
+  run.strength = input.strength;
+  // Without a control image the control channels stay zero (ComfyUI
+  // QwenImage21FunControlPatch: torch.zeros when image is None); only the
+  // inpaint channels steer.
+  std::vector<float> control;
+  if (ControlHasImage(input)) {
+    const auto canvas =
+        ControlCanvas(input.image, request.width, request.height);
+    control = rt.Download(EncodeVae(rt, weights, canvas, cancelled,
+                                    Prefixed(observer, "control.")));
+  } else {
+    control.assign(static_cast<std::size_t>(rows) * kControlLatentChannels,
+                   0.0F);
+  }
+  std::vector<float> keep, inpaint;
+  if (input.inpaint) {
+    if (!init_image || !request.mask)
+      throw std::invalid_argument("control inpaint needs init_image and mask");
+    keep = ControlKeepMask(*request.mask, request.mask_channel, request.width,
+                           request.height);
+    inpaint = rt.Download(EncodeVae(
+        rt, weights,
+        ControlInpaintSource(*init_image, *request.mask, request.mask_channel),
+        cancelled, Prefixed(observer, "control.inpaint.")));
+  }
+  const auto context = rt.Upload(
+      PackControlContext(control, keep, inpaint, rows), rows,
+      kControlInChannels);
+  rt.Observe(observer, "control.context", context);
+  run.target_in = rt.Linear(rt.Linear(context, "controlnet.control_img_in"),
+                            "controlnet.control_blocks.0.before_proj");
+  return run;
 }
 
 }  // namespace
@@ -537,76 +886,588 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
 struct Model::Impl {
   Weights weights;
   Tokenizer tokenizer;
+  // The runtime's adapter terms point into these patches.
+  std::map<std::string, LoraAdapter, std::less<>> loras;
   Runtime runtime;
   std::mutex mutex;
+  std::atomic<bool> lost{false};
+  std::function<void(const std::string&)> log;
+  // --keep-text-encoder (set before serving): see ReleasesTextEncoder.
+  bool keep_text_encoder{false};
+  // Under `mutex`: the set whose weights the runtime has built; reset while
+  // a switch is unfinished so the next request completes it.
+  std::optional<std::vector<Lora>> installed{std::in_place};
+  // Published by a completed switch.
+  std::vector<Lora> active;
+  mutable std::mutex active_mutex;
+  // Fun ControlNet-Union mapped under "controlnet." (Model::SetControlnet).
+  std::optional<ControlnetInfo> controlnet;
   explicit Impl(const std::filesystem::path& root)
       : weights(root), tokenizer(root), runtime(weights) {}
+  double SelectLoras(const std::vector<Lora>& requested,
+                     const CancellationCheck& cancelled);
 };
+
+// Called under `mutex`. Switched weights rebuild from the mapped originals,
+// so returning to an earlier set reproduces its weights exactly. Every
+// target whose terms change is built here, so the merge cost is in
+// `lora_ms` and not in denoising. Weights left unbuilt by a failed switch
+// rebuild with the current terms on next use.
+double Model::Impl::SelectLoras(const std::vector<Lora>& requested,
+                                const CancellationCheck& cancelled) {
+  std::vector<Lora> selected;
+  for (const auto& lora : requested)
+    if (lora.scale != 0)
+      selected.push_back(lora);
+  if (installed == selected)
+    return 0;
+  const auto start = Clock::now();
+  std::map<std::string, std::vector<LoraTerm>, std::less<>> terms;
+  for (const auto& lora : selected) {
+    const auto it = loras.find(lora.name);
+    if (it == loras.end())
+      throw std::invalid_argument("unknown LoRA adapter " + lora.name);
+    for (const auto& patch : it->second.patches())
+      terms[patch.target].push_back({&patch, lora.scale});
+  }
+  {
+    std::lock_guard active_lock(active_mutex);
+    active.clear();
+  }
+  installed.reset();
+  try {
+    const auto rebuild = runtime.SetLoras(std::move(terms));
+    // Stream the dropped transformer weights in bounded batches first; the
+    // loop then only finds them resident (or uploads any left over).
+    if (!rebuild.empty()) {
+      Cancel(cancelled);
+      runtime.UploadMissing("transformer.");
+    }
+    for (const auto& name : rebuild) {
+      Cancel(cancelled);
+      runtime.Weight(name);
+    }
+    runtime.Synchronize();
+  } catch (...) {
+    (void)hipStreamSynchronize(runtime.stream());
+    throw;
+  }
+  installed = selected;
+  std::lock_guard active_lock(active_mutex);
+  active = std::move(selected);
+  return Milliseconds(start);
+}
 
 Model::Model(const std::filesystem::path& root)
     : impl_(std::make_unique<Impl>(root)) {}
 Model::~Model() = default;
 
+const SamplingConfig& Model::sampling() const {
+  return impl_->weights.Sampling();
+}
+
 std::vector<std::uint32_t> Model::Tokenize(std::string_view text) const {
   return impl_->tokenizer.Encode(text);
+}
+
+LoraInfo Model::AddLora(const std::string& name,
+                        const std::filesystem::path& path) {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->loras.contains(name))
+    throw std::invalid_argument("duplicate LoRA adapter " + name);
+  const auto& weights = impl_->weights;
+  LoraAdapter adapter(path, [&](std::string_view tensor) {
+    return weights.Contains(tensor) ? weights.Get(tensor).shape
+                                    : std::vector<int>{};
+  });
+  LoraInfo info{adapter.format(), adapter.patches().size(), adapter.min_rank(),
+                adapter.max_rank()};
+  impl_->loras.emplace(name, std::move(adapter));
+  return info;
+}
+
+std::vector<Lora> Model::ActiveLoras() const {
+  std::lock_guard lock(impl_->active_mutex);
+  return impl_->active;
+}
+
+Model::ControlnetLayout Model::SetControlnet(
+    const std::filesystem::path& path) {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->controlnet)
+    throw std::invalid_argument("a ControlNet is already registered");
+  // Maps the file (header only); the runtime uploads "controlnet." as one
+  // group on the first control request.
+  impl_->weights.AddFile(path, std::string(kControlnetPrefix));
+  impl_->controlnet = InspectControlnet(impl_->weights);
+  return {impl_->controlnet->blocks, impl_->controlnet->bytes};
+}
+
+// Registered before serving, so no lock (a running request holds `mutex`).
+bool Model::HasControlnet() const {
+  return impl_->controlnet.has_value();
 }
 
 Result Model::Generate(const Request& request,
                        const CancellationCheck& cancelled,
                        const Observer& observer) {
   ValidateRequest(request);
+  const int steps = sampling().ResolveSteps(request.steps);
   std::unique_lock lock(impl_->mutex);
+  if (DeviceLost())
+    throw std::runtime_error("Qwen-Image GPU context lost; restart the server");
   Cancel(cancelled);
+  const auto total_start = Clock::now();
+  const double lora_ms = impl_->SelectLoras(request.loras, cancelled);
   const auto start = Clock::now();
   auto& rt = impl_->runtime;
   Result result;
+  struct CacheLimitReset {
+    Runtime& rt;
+    ~CacheLimitReset() { rt.SetCacheLimit(kDefaultCacheBytes); }
+  } cache_limit_reset{rt};
+  const auto Log = [this](const std::string& line) {
+    if (impl_->log)
+      impl_->log(line);
+  };
+  // Memory per phase: device budget, pool cache and resident weights.
+  const auto report = [&](std::string_view phase) {
+    if (!impl_->log)
+      return;
+    rt.Synchronize();
+    Log("event=memory phase=" + std::string(phase) + " " +
+        hip::QueryDeviceMemory().Describe() +
+        " pool_cached_mib=" + std::to_string(rt.CachedBytes() >> 20) +
+        " weights_mib=" + std::to_string(rt.WeightBytes() >> 20));
+  };
+  // Large requests stop cleanly when the shared segment runs out anyway.
+  const auto GuardMemory = [&](int step) {
+    const auto memory = hip::QueryDeviceMemory();
+    if (memory.Available(kHostReserveBytes) < kMinimumFreeBytes) {
+      Log("event=memory_exhausted step=" + std::to_string(step) + " " +
+          memory.Describe());
+      throw InsufficientMemory("Qwen-Image ran out of GPU memory at step " +
+                               std::to_string(step) +
+                               "; use fewer or smaller reference images");
+    }
+  };
+  result.metrics.lora_ms = lora_ms;
+  // GUFO_QWEN_IMAGE_FLASH_ATTENTION=1 selects the faster, not bit-identical
+  // attention kernel (BF16 probabilities).
+  Log(std::string("event=attention kernel=") +
+      (hip::FlashAttentionEnabled() ? "flash" : "exact"));
   try {
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
     const int height = request.height / 16, width = request.width / 16;
-    auto context = PrepareDiffusion(rt, impl_->weights, prompt, height, width,
-                                    cancelled, observer);
-    rt.Synchronize();
+    // True CFG: a second prompt; its boundaries are observed under
+    // "negative.".
+    const bool guided = request.guidance > 1;
+    const auto negative_observer = Prefixed(observer, "negative.");
+    if (request.control && !impl_->controlnet)
+      throw std::invalid_argument(
+          "this Qwen-Image server has no ControlNet (--controlnet)");
+    // Steps outside a partial control range run without the branch on their
+    // own condition caches (the controlled caches carry its skips).
+    bool control_partial = false, control_any = false;
+    for (int step = 0; request.control && step < steps; ++step) {
+      const bool active = ControlActiveAt(*request.control, step, steps);
+      control_partial |= !active;
+      control_any |= active;
+    }
+    // No active step (strength 0): the plain path, nothing uploaded.
+    control_partial &= control_any;
+    std::optional<EncodedPrompt> negative;
+    if (guided) {
+      Request text;
+      text.prompt = request.negative_prompt;
+      text.images = request.images;
+      negative = EncodePrompt(rt, impl_->tokenizer, text, cancelled,
+                              negative_observer);
+    }
+    // Regional prompts: each with its own references and cells; regions
+    // that cover no cell are dropped before encoding.
+    struct RegionPass {
+      std::size_t index{0};
+      RegionCells cells;
+      std::optional<EncodedPrompt> prompt;
+      std::optional<DiffusionContext> context;
+    };
+    std::vector<RegionPass> regions;
+    int region_rows = 0;
+    for (std::size_t i = 0; i < request.regions.size(); ++i) {
+      const auto& region = request.regions[i];
+      RegionPass pass{.index = i,
+                      .cells = PlanRegion(region, request.width,
+                                          request.height),
+                      .prompt = {},
+                      .context = {}};
+      if (pass.cells.Empty()) {
+        Log("event=region_skipped index=" + std::to_string(i) +
+            " reason=no_weight");
+        continue;
+      }
+      Request text;
+      text.prompt = region.prompt;
+      text.images = region.images;
+      pass.prompt = EncodePrompt(
+          rt, impl_->tokenizer, text, cancelled,
+          Prefixed(observer, "region." + std::to_string(i) + "."));
+      region_rows += ConditionRows(*pass.prompt);
+      Log("event=region index=" + std::to_string(i) +
+          " cells=" + std::to_string(pass.cells.top) + "," +
+          std::to_string(pass.cells.left) + "," +
+          std::to_string(pass.cells.rows) + "x" +
+          std::to_string(pass.cells.cols) +
+          " crop=" + (pass.cells.crop ? "1" : "0") +
+          " references=" + std::to_string(region.images.size()));
+      regions.push_back(std::move(pass));
+    }
+    const bool regional = !request.regions.empty();
+    result.metrics.region_condition_rows = region_rows;
+    // Every prompt is encoded; the text encoder (16 GB) has no further use
+    // in this request. By default it leaves now and the next request uploads
+    // it again (ReleasesTextEncoder; memory placement only, results are
+    // unchanged). With --keep-text-encoder it stays unless a large request's
+    // condition caches (32 layers of K and V, 512 KiB per row) do not fit
+    // beside all weights.
+    const int condition_rows = ConditionRows(prompt);
+    result.metrics.condition_rows = condition_rows;
+    report("encoded");
+    const bool large = condition_rows + region_rows > kReleaseEncoderRows;
+    bool large_fits = false;
+    if (large) {
+      // Freed temporaries stay cached up to this bound (8 GB otherwise).
+      rt.SetCacheLimit(kLargeRequestCacheBytes);
+      const auto need =
+          LargeRequestBytes(rt, prompt, negative ? &*negative : nullptr,
+                            height * width, region_rows);
+      const char* force = std::getenv("GUFO_QWEN_IMAGE_RELEASE_TEXT_ENCODER");
+      const bool force_release = force && *force && std::string(force) != "0";
+      bool keep = false;
+      if (!force_release && impl_->keep_text_encoder) {
+        // Return cached encoder temporaries before measuring.
+        rt.Trim();
+        const auto memory = hip::QueryDeviceMemory();
+        const auto available = memory.Available(kHostReserveBytes);
+        // Weights still to load count twice: on Windows a loader can hold
+        // their file mapping in host RAM while they upload (the first large
+        // job after a load usually releases; later ones keep the encoder).
+        const std::uint64_t loading =
+            rt.MissingBytes("transformer.") + rt.MissingBytes("vae.") +
+            (request.control ? rt.MissingBytes(kControlnetPrefix) : 0);
+        keep = hip::KeepsTextEncoder(need + loading, available, false);
+        Log("event=memory_check text_encoder=" +
+            std::string(keep ? "kept" : "release") +
+            " need_mib=" + std::to_string(need >> 20) +
+            " loading_mib=" + std::to_string(loading >> 20) +
+            " available_mib=" + std::to_string(available >> 20) + " " +
+            memory.Describe());
+      }
+      large_fits = keep;
+    }
+    if (ReleasesTextEncoder(impl_->keep_text_encoder, large, large_fits)) {
+      const auto before = rt.WeightBytes();
+      rt.Evict("text_encoder.model.language_model.");
+      rt.Evict("text_encoder.model.visual.");
+      result.metrics.released_text_encoder = true;
+      Log("event=text_encoder_released mib=" +
+          std::to_string((before - rt.WeightBytes()) >> 20) +
+          " large=" + (large ? "1" : "0"));
+      if (!large)
+        report("released");
+    }
+    if (large && result.metrics.released_text_encoder) {
+      // Refuse before the caches fill instead of failing inside a kernel:
+      // an exhausted shared segment ends in a launch failure or a driver
+      // reset, not in an allocation error.
+      const auto need =
+          LargeRequestBytes(rt, prompt, negative ? &*negative : nullptr,
+                            height * width, region_rows);
+      const auto memory = hip::QueryDeviceMemory();
+      const auto available = memory.Available(kHostReserveBytes);
+      Log("event=memory_check need_mib=" + std::to_string(need >> 20) +
+          " available_mib=" + std::to_string(available >> 20) + " " +
+          memory.Describe());
+      if (need > available)
+        throw InsufficientMemory(
+            "Qwen-Image needs about " + std::to_string(need >> 30) +
+            " GiB of GPU memory for " +
+            std::to_string(condition_rows + region_rows) +
+            " condition rows, but only " + std::to_string(available >> 30) +
+            " GiB are free; use fewer or smaller reference images");
+      report("released");
+    }
+    std::optional<DiffusionContext> context;
+    context.emplace(PrepareDiffusion(rt, impl_->weights, prompt, height, width,
+                                     cancelled, observer));
+    std::optional<DiffusionContext> negative_context;
+    if (guided) {
+      // The references before the prompt text share their K/V with the
+      // positive pass; only the negative text rows get their own cache.
+      // A controlled pass runs its condition rows jointly on the first
+      // step (no prefill), so it cannot borrow the positive caches.
+      negative_context.emplace(PrepareDiffusion(
+          rt, impl_->weights, *negative, height, width, cancelled,
+          negative_observer, &*context,
+          control_any ? 0 : SharedConditionTokens(prompt, *negative)));
+      result.metrics.negative_condition_rows = negative_context->prefix.rows;
+    }
+    for (auto& pass : regions) {
+      const bool crop = pass.cells.crop;
+      pass.context.emplace(PrepareDiffusion(
+          rt, impl_->weights, *pass.prompt, crop ? pass.cells.rows : height,
+          crop ? pass.cells.cols : width, cancelled,
+          Prefixed(observer, "region." + std::to_string(pass.index) + ".")));
+      pass.prompt.reset();
+    }
+    // The base prompt runs unless its weight is 0 and no negative pass
+    // reads its shared reference caches.
+    const bool run_base =
+        !regional || request.base_strength > 0 ||
+        (negative_context && negative_context->shared_rows > 0);
+    const RegionCells base_cells =
+        regional ? FullRegion(request.width, request.height,
+                              request.base_strength)
+                 : RegionCells{};
+    std::optional<DiffusionContext> plain_context, plain_negative_context;
+    if (control_partial) {
+      plain_context.emplace(PrepareDiffusion(rt, impl_->weights, prompt,
+                                             height, width, cancelled,
+                                             observer));
+      if (guided)
+        plain_negative_context.emplace(
+            PrepareDiffusion(rt, impl_->weights, *negative, height, width,
+                             cancelled, negative_observer));
+    }
+    negative.reset();
+    const bool img2img =
+        request.init_image && request.strength <= kFullStrength;
+    const bool masked = request.init_image && request.mask;
+    std::optional<Image> init_image;
+    Matrix init_latent;
+    if (img2img || masked) {
+      init_image =
+          ResizeImage(*request.init_image, request.width, request.height);
+      init_latent = EncodeVae(rt, impl_->weights, *init_image, cancelled,
+                              Prefixed(observer, "init."));
+    }
+    // Fun ControlNet: the branch input (step-independent).
+    std::optional<ControlRun> control;
+    if (control_any) {
+      control.emplace(PrepareControl(rt, impl_->weights, *impl_->controlnet,
+                                     request,
+                                     init_image ? &*init_image : nullptr,
+                                     cancelled, observer));
+      Log("event=control blocks=" + std::to_string(control->blocks) +
+          " strength=" + std::to_string(control->strength) +
+          " range=" + std::to_string(request.control->start) + "-" +
+          std::to_string(request.control->end) +
+          " inpaint=" + std::to_string(request.control->inpaint ? 1 : 0) +
+          " partial=" + std::to_string(control_partial ? 1 : 0));
+    }
+    // Drop cached encoder and VAE-encoder temporaries before the caches fill.
+    rt.Trim();
     result.metrics.prompt_ms = Milliseconds(start);
+    report("prepared");
     // Generate independent full-precision normal draws; seed replay never
     // depends on admission order, wall time, or another request's RNG.
     // A generated reference can otherwise reuse exactly the same noise when
     // edited at the same size and seed. Bind edit noise to its reference
     // pixels, including later edits of an edit, without changing generation or
     // replay.
-    std::mt19937_64 rng(InitialNoiseSeed(request.seed, prompt.images));
+    std::mt19937_64 rng(InitialNoiseSeed(request.seed, prompt.images,
+                                         init_image ? &*init_image : nullptr));
     std::normal_distribution<float> normal(0, 1);
     std::vector<float> noise(static_cast<std::size_t>(height) * width * 64);
     for (float& value : noise)
       value = normal(rng);
     auto latent = rt.Upload(noise, height * width, 64);
     rt.Observe(observer, "noise", latent);
+    // Masked editing re-noises the start image with the same draws.
+    Matrix start_noise, mask_weights;
+    if (masked) {
+      start_noise = latent;
+      mask_weights = rt.Upload(
+          SpreadMask(MaskWeights(*request.mask, request.mask_channel,
+                                 request.width, request.height),
+                     height, width, request.mask_blur),
+          height * width, 1);
+      rt.Observe(observer, "mask", mask_weights);
+    }
     const auto denoise_start = Clock::now();
-    const auto sigmas = FlowSigmas(request.steps, height * width);
+    // Turbo uses its checkpoint schedule; partial-strength img2img keeps
+    // the base model's KSampler-style truncated schedule.
+    if (sampling().IsTurbo() && img2img)
+      throw std::invalid_argument(
+          "Qwen-Image-2.1-Turbo does not support partial-strength img2img");
+    const auto sigmas =
+        sampling().IsTurbo()
+            ? sampling().Sigmas(steps, height * width)
+            : DenoiseSigmas(steps, request.strength, height * width);
     if (observer.Wants("sigmas"))
       observer.write("sigmas", sigmas, 1, static_cast<int>(sigmas.size()));
-    for (int step = 0; step < request.steps; ++step) {
-      const auto velocity =
-          Denoise(rt, context, latent, sigmas[step], step, cancelled, observer);
+    if (img2img) {
+      latent = rt.NoiseMix(latent, init_latent, sigmas[0]);
+      rt.Observe(observer, "init.latent", latent);
+    }
+    // Control requests fill their condition caches (text and reference
+    // rows) jointly on the first step, with the control stream beside them;
+    // that matches a prefill (block-causal, timestep-zero condition rows).
+    if (large && !control) {
+      // Condition caches in head-major layout, filled chunk by chunk.
+      Prefill(rt, *context, sigmas[0], cancelled);
+      if (negative_context)
+        Prefill(rt, *negative_context, sigmas[0], cancelled);
+      for (auto& pass : regions)
+        Prefill(rt, *pass.context, sigmas[0], cancelled);
+      report("prefilled");
+    }
+    for (int step = 0; step < steps; ++step) {
+      if (large)
+        GuardMemory(step);
+      // Regional requests carry no control (ValidateControl refuses them).
+      const bool controlled =
+          control && ControlActiveAt(*request.control, step, steps);
+      const ControlRun* branch = controlled ? &*control : nullptr;
+      Matrix velocity;
+      if (!regional) {
+        velocity =
+            Denoise(rt, control && !controlled ? *plain_context : *context,
+                    latent, sigmas[step], step, cancelled, observer, branch);
+      } else {
+        // ComfyUI calc_cond_batch: every conditioning predicts on its cells
+        // (the crop for areas), blended by weight in FP32 on the host.
+        const int cells = height * width;
+        std::vector<float> sum(static_cast<std::size_t>(cells) * 64);
+        std::vector<float> total(static_cast<std::size_t>(cells));
+        const auto host_latent = rt.Download(latent);
+        if (run_base) {
+          const auto base = Denoise(rt, *context, latent, sigmas[step], step,
+                                    cancelled, observer);
+          if (request.base_strength > 0) {
+            AccumulateRegion(sum, total, rt.Download(base), width, 64,
+                             base_cells);
+            ++result.metrics.region_passes;
+          }
+        }
+        for (auto& pass : regions) {
+          const auto& c = pass.cells;
+          const Matrix input =
+              c.crop ? rt.Upload(CropLatent(host_latent, width, 64, c),
+                                 c.rows * c.cols, 64)
+                     : latent;
+          const auto region = Denoise(
+              rt, *pass.context, input, sigmas[step], step, cancelled,
+              Prefixed(observer, "region." + std::to_string(pass.index) + "."));
+          AccumulateRegion(sum, total, rt.Download(region), width, 64, c);
+          ++result.metrics.region_passes;
+        }
+        velocity = rt.Upload(FinishRegions(sum, total, 64), cells, 64);
+        rt.Observe(observer, "dit." + std::to_string(step) + ".regional",
+                   velocity);
+      }
+      if (guided) {
+        const auto negative = Denoise(
+            rt,
+            control && !controlled ? *plain_negative_context
+                                   : *negative_context,
+            latent, sigmas[step], step, cancelled, negative_observer, branch);
+        velocity = rt.Guidance(velocity, negative, request.guidance);
+        rt.Observe(observer, "dit." + std::to_string(step) + ".guided",
+                   velocity);
+      }
       latent = rt.Euler(latent, velocity, sigmas[step + 1] - sigmas[step]);
+      if (masked)
+        // Kept cells follow the start image's trajectory and end on its
+        // latent at sigma 0; the edited cells see them as context.
+        latent = rt.MaskBlend(
+            latent, rt.NoiseMix(start_noise, init_latent, sigmas[step + 1]),
+            mask_weights);
       rt.Synchronize();
       rt.Observe(observer, "latent." + std::to_string(step), latent);
+      if (request.preview.Wants(step + 1, steps)) {
+        // Flow matching: x0 = x_t - sigma_t * v at the step just taken.
+        const auto x = rt.Download(latent), v = rt.Download(velocity);
+        const float sigma = sigmas[step + 1];
+        std::vector<float> x0(x.size());
+        for (std::size_t i = 0; i < x0.size(); ++i)
+          x0[i] = x[i] - sigma * v[i];
+        request.preview.publish({.step = step + 1,
+                                 .steps = steps,
+                                 .height = height,
+                                 .width = width,
+                                 .channels = 64,
+                                 .data = x0});
+      }
+      if (step == 0)
+        report("step0");
     }
     rt.Synchronize();
     result.metrics.denoise_ms = Milliseconds(denoise_start);
+    // The condition caches and DiT temporaries are done; give the VAE
+    // decoder their memory.
+    negative_context.reset();
+    regions.clear();
+    context.reset();
+    plain_negative_context.reset();
+    plain_context.reset();
+    control.reset();
+    rt.Trim();
+    report("denoised");
     const auto vae_start = Clock::now();
     result.image = DecodeVae(rt, impl_->weights, latent, height, width,
                              cancelled, observer);
+    if (masked && request.mask_composite)
+      CompositeMasked(result.image, *init_image,
+                      CompositeWeights(*request.mask, request.mask_channel,
+                                       request.width, request.height,
+                                       request.mask_feather));
     result.metrics.vae_ms = Milliseconds(vae_start);
-    result.metrics.total_ms = Milliseconds(start);
+    // The decoder's temporaries would stay cached (up to 8 GB) until the
+    // next request; between jobs only the resident weights remain.
+    rt.Trim();
+    report("finished");
+    result.metrics.total_ms = Milliseconds(total_start);
     result.metrics.resident_weight_bytes = rt.WeightBytes();
+    result.metrics.steps = steps;
     return result;
-  } catch (...) {
+  } catch (const std::exception& error) {
     // All launches on this request's stream must finish before temporary
     // buffers return to the pool and the next request starts.
+    const auto status = hipStreamSynchronize(rt.stream());
+    // A failed HIP or hipBLAS(Lt) call leaves this process unable to run
+    // later requests (they fail with "unspecified launch failure").
+    const std::string_view what = error.what();
+    if (status != hipSuccess || what.starts_with("Qwen-Image HIP") ||
+        what.starts_with("Qwen-Image hipBLAS")) {
+      impl_->lost.store(true, std::memory_order_release);
+    } else {
+      // The request's temporaries are back in the pool; a cancelled or
+      // refused job leaves only the resident weights, like a finished one.
+      try {
+        rt.Trim();
+      } catch (...) {
+      }
+    }
+    throw;
+  } catch (...) {
     (void)hipStreamSynchronize(rt.stream());
     throw;
   }
+}
+
+void Model::SetLog(std::function<void(const std::string&)> log) {
+  impl_->log = std::move(log);
+}
+
+void Model::SetKeepTextEncoder(bool keep) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->keep_text_encoder = keep;
+}
+
+bool Model::DeviceLost() const {
+  return impl_->lost.load(std::memory_order_acquire);
 }
 
 }  // namespace gufo::models::qwen_image_21

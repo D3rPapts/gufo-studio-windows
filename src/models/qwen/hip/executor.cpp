@@ -3,14 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <gufo/ext/experimental/dispatch_telemetry.hpp>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <utility>
 
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/core/hip/hip_utils.hpp"
+#include "src/families/qwen/kernels/copy_27b.hpp"
+#include "src/families/qwen/kernels/sample_27b.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
-#include "src/models/qwen/hip/kernels/copy_27b.hpp"
-#include "src/models/qwen/hip/kernels/sample_27b.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -270,7 +270,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
     for (std::uint32_t offset = 0; offset < count;) {
       const auto start = position + offset;
       const auto until_wrap = static_cast<std::uint32_t>(
-          kSsmReplayCapacity - (start % kSsmReplayCapacity));
+          arena_.replay_capacity_ - (start % arena_.replay_capacity_));
       const auto rows =
           std::min({count - offset, until_wrap, arena_.GetMaxBatch()});
       LaunchSSMConvRecurrenceRows(
@@ -314,10 +314,10 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSampling27(scratch.decode.logits.data(), d_out_token,
-                      weights_.config.vocab_size, parameters,
-                      sampler.penalties().data(), sampler.penalties().size(),
-                      &sampling_workspace_, arena_.stream);
+  (qwen27::Sample27On() ? LaunchGPUSampling27 : LaunchGPUSampling)(
+      scratch.decode.logits.data(), d_out_token, weights_.config.vocab_size,
+      parameters, sampler.penalties().data(), sampler.penalties().size(),
+      &sampling_workspace_, arena_.stream);
 
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
@@ -373,7 +373,7 @@ tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
   }
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSampling27(
+  (qwen27::Sample27On() ? LaunchGPUSampling27 : LaunchGPUSampling)(
       d_verification_logits_ + (row * weights_.config.vocab_size), d_out_token,
       weights_.config.vocab_size, parameters, sampler.penalties().data(),
       sampler.penalties().size(), &sampling_workspace_, arena_.stream);
@@ -423,7 +423,8 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSpeculativeSampling27(
+  (qwen27::Sample27On() ? LaunchGPUSpeculativeSampling27
+                         : LaunchGPUSpeculativeSampling)(
       d_verification_logits_ + (row * weights_.config.vocab_size), d_out_token,
       sampling_workspace_.speculative_accepted, weights_.config.vocab_size,
       parameters, draft_token, static_cast<float>(draft_token_probability),
@@ -436,6 +437,15 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
   std::uint32_t accepted = 0;
   profile.Enqueued();
 #ifdef _WIN32
+  if (!qwen27::Sample27On()) {
+    HIP_CHECK(hipMemcpyAsync(&result.token, d_out_token, sizeof(result.token),
+                             hipMemcpyDeviceToHost, arena_.stream));
+    HIP_CHECK(hipMemcpyAsync(&accepted,
+                             sampling_workspace_.speculative_accepted,
+                             sizeof(accepted), hipMemcpyDeviceToHost,
+                             arena_.stream));
+    HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  } else {
   if (h_row_result_ == nullptr) {
     std::uint32_t* pinned = nullptr;
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pinned),
@@ -454,6 +464,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
   WaitPublished27(published, 2, sequence, arena_.stream);
   result.token = published[0];
   accepted = published[1];
+  }
 #else
   HIP_CHECK(hipMemcpyAsync(&result.token, d_out_token, sizeof(result.token),
                            hipMemcpyDeviceToHost, arena_.stream));

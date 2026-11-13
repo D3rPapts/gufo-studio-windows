@@ -7,7 +7,7 @@ music and 3D run behind one OpenAI-compatible port; a second machine joins as a 
 (`/pool/`), and every job lands in one shared result store (`/ablage/`). Built on
 [gufo-org/gufo](https://github.com/gufo-org/gufo), measured on a 64 GB and a 128 GB GMKtec EVO-X2.
 
-> **[Download 2.0.3](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.3)** · unzip, edit `examples\router.ini`, run `start-router.cmd`.
+> **[Download 2.0.5](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.5)** · unzip, edit `examples\router.ini`, run `start-router.cmd`.
 > ROCm runtime included; FFmpeg via `winget install Gyan.FFmpeg`. Models load on the first request.
 
 | What | Models | 64 GB EVO-X2, Windows 11, ROCm 10.0 |
@@ -20,10 +20,10 @@ music and 3D run behind one OpenAI-compatible port; a second machine joins as a 
 | 3D | TripoSG, TRELLIS.2 (textured GLB) | 136 s / 121 s |
 | Tools | Real-ESRGAN upscale, RIFE, Omni captioner, memory, job store | |
 | Two machines | job pool with priorities, capabilities, never-stuck fallback, `/pool/` page | partner down → local in 3 s |
-| Users | optional login, roles, per-user areas and models, word filter, tokens (`/verwaltung/`, off by default) | |
+| Users | optional login, roles, per-user areas and models, word filter (images, video, chat), daily limits, tokens, own password change (`/verwaltung/`, off by default) | |
 
 All numbers are from the release notes; nothing here is estimated.
-Previous releases: 2.0.2, 2.0.1, 2.0.0, 1.4.21, 1.4.8 … 1.0.0 (see Releases). The repository was called `gufo_windows` until 31 October 2026.
+Previous releases: 2.0.3, 2.0.2, 2.0.1, 2.0.0, 1.4.21, 1.4.8 … 1.0.0 (see Releases). The repository was called `gufo_windows` until 31 October 2026.
 
 ### Focus
 

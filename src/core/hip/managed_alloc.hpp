@@ -8,7 +8,6 @@
 #include <cstdint>
 
 #include "src/core/hip/heap_placement.hpp"
-#include "src/core/platform/device_memory.hpp"
 
 namespace gufo::hip {
 
@@ -51,7 +50,7 @@ namespace gufo::hip {
                                                std::size_t bytes) {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
-  if (platform::DeviceMemoryInfo(&free_bytes, &total_bytes) != hipSuccess ||
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
       !HeapFitsAboveReserve(free_bytes, bytes)) {
     return AllocateManaged(pointer, bytes);
   }
@@ -88,7 +87,7 @@ private:
   static Placement Decide(std::uint64_t total_weight_bytes) {
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
-    if (platform::DeviceMemoryInfo(&free_bytes, &total_bytes) != hipSuccess)
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
       return Placement::kManaged;
     return ChooseWeightPlacement(free_bytes, total_weight_bytes);
   }

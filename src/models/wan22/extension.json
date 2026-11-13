@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "name": "wan22",
+  "version": "0.1.0",
+  "api_version": ">= 0.2.0",
+  "entry": "wan22_register",
+  "registration_target": "gufo_wan22",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "wan22-ti2v-5b",
+      "capability": "video_generation",
+      "keys": [
+        "diffusers:WanPipeline"
+      ],
+      "model_ids": [
+        "wan2.2-ti2v-5b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan22_ti2v_provider_register"
+    },
+    {
+      "id": "wan21-uni3c",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan21Uni3CCamera"
+      ],
+      "model_ids": [
+        "wan2.1-uni3c"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan21_uni3c_provider_register"
+    },
+    {
+      "id": "wan21-vace-14b",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan21Vace"
+      ],
+      "model_ids": [
+        "wan2.1-vace-14b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan21_vace_provider_register"
+    },
+    {
+      "id": "wan21-infinitetalk-14b",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan21InfiniteTalk"
+      ],
+      "model_ids": [
+        "wan2.1-infinitetalk-14b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan21_talk_provider_register"
+    }
+  ],
+  "targets": {
+    "gufo_wan22": {
+      "requires": []
+    },
+    "gufo_wan22_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "wan22_video_request_test": {
+      "requires": [],
+      "role": "test"
+    },
+    "wan22_tokenizer_test": {
+      "requires": [],
+      "role": "test"
+    },
+    "wan22_vace_context_test": {
+      "requires": [],
+      "role": "test"
+    }
+  },
+  "packages": [
+    {
+      "pkg_config": "sndfile",
+      "nix": "libsndfile",
+      "windows": "libsndfile"
+    },
+    {
+      "pkg_config": "soxr",
+      "nix": "soxr",
+      "windows": "soxr"
+    }
+  ],
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "docs": {
+    "title": "Wan 2.2 TI2V 5B and Wan 2.1 14B (Uni3C camera, VACE, InfiniteTalk)",
+    "inputs": "Diffusers Wan 2.2 directory or gufo-camera/vace/talk.json bundles; text, image, audio and video conditioning",
+    "guide": "../../src/models/wan22/extension.json"
+  },
+  "tests": [
+    {
+      "target": "wan22_video_request_test",
+      "ctest": "wan22_video_request_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "wan22_vace_context_test",
+      "ctest": "wan22_vace_context_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "wan22_tokenizer_test",
+      "ctest": "wan22_tokenizer_test",
+      "check_pr": false,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "wan22"
+  ]
+}

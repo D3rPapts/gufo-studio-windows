@@ -29,10 +29,10 @@ struct Format {
       return {32, 24};
     case GgmlType::kIQ4_NL:
       return {32, 18};
+    case GgmlType::kIQ3_XXS:
+      return {256, 98};
     case GgmlType::kIQ4_XS:
       return {256, 136};
-    case GgmlType::kIQ3_S:
-      return {256, 110};
     case GgmlType::kQ4_K:
       return {256, 144};
     case GgmlType::kQ5_K:
@@ -144,9 +144,11 @@ struct Binder {
     const std::uint64_t hc_dim = c.HcDim();
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
-    const auto experts = {GgmlType::kQ4_K,   GgmlType::kQ5_K,  GgmlType::kQ6_K,
-                          GgmlType::kQ5_1,   GgmlType::kQ8_0,  GgmlType::kIQ3_S,
-                          GgmlType::kIQ4_XS, GgmlType::kIQ4_NL};
+    // The IQ formats (unsloth UD-Q3_K_XL) take the generic vector and MMQ
+    // routes; the WMMA prefill route stays with the K-quants.
+    const auto experts = {GgmlType::kQ4_K,    GgmlType::kQ5_K,   GgmlType::kQ6_K,
+                          GgmlType::kQ5_1,    GgmlType::kQ8_0,   GgmlType::kIQ3_XXS,
+                          GgmlType::kIQ4_XS,  GgmlType::kIQ4_NL};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -283,8 +285,9 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
-      w.ple_table = b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows,
-                          1, {GgmlType::kIQ4_NL, GgmlType::kBF16});
+      w.ple_table =
+          b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
+                {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16});
     }
   }
   w.layers.reserve(c.num_layers);
@@ -321,6 +324,15 @@ std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
     return std::nullopt;
   }
   return m;
+}
+
+std::size_t ExpandedQ8_0Tensors(const LayerWeights& layer) noexcept {
+  std::size_t count = 0;
+  for (const TensorRef* t : {&layer.hc_attn.inject, &layer.hc_ffn.inject,
+                             &layer.ssm_alpha, &layer.ssm_beta}) {
+    count += !t->empty() && t->type == GgmlType::kQ8_0;
+  }
+  return count;
 }
 
 }  // namespace gufo::models::qwen38_flash_next

@@ -6,15 +6,18 @@
 #include <future>
 #include <iostream>
 #include <latch>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/cli/serve/text_model_runner.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
@@ -363,6 +366,77 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+// A continuation of a decoded frontier off the selection block, longer than
+// one prefill pass, ends its capacity-limited steps on the block (#1015).
+// Those steps then continue the prompt as one Sync from that frontier does.
+void CheckUnalignedContinuationPasses(
+    const std::shared_ptr<qfn::Model>& model) {
+  namespace server = gufo::server;
+  std::string error;
+  const std::size_t ratio = model->config().compress_ratio;
+  server::TextRunnerPool pool(qfn::CreateQwenFlashNextTextRunner(model, 6145),
+                              1);
+  const auto pattern = model->Tokenize(
+      "Virtual memory maps pages to physical storage. "
+      "A train travels sixty kilometers per hour. ");
+  Require(pattern.size() > 5, "short continuation fixture");
+  std::size_t unaligned = 0;
+  for (std::size_t generate = 1; generate <= 3; ++generate) {
+    std::vector<std::int32_t> prompt(pattern.begin(), pattern.begin() + 5);
+    prompt.front() += static_cast<std::int32_t>(generate);
+    const std::vector<std::int32_t> head = prompt;
+    auto first = pool.Acquire({prompt.begin(), prompt.end()},
+                              sampling::SamplingConfig{});
+    while (!first.prefill_complete())
+      (void)first.Prefill(prompt.size());
+    for (std::size_t i = 0; i < generate; ++i) {
+      prompt.push_back(static_cast<std::int32_t>(first.SelectNext().token));
+      first.Advance();
+    }
+    (void)first.Commit();
+    const auto decoded = prompt.size();
+    for (std::size_t i = 0; prompt.size() < 5000; ++i)
+      prompt.push_back(pattern[i % pattern.size()]);
+    auto second = pool.Acquire({prompt.begin(), prompt.end()},
+                               sampling::SamplingConfig{});
+    auto position = second.cached_prompt_tokens();
+    Require(position > head.size() && position <= decoded,
+            "continuation did not reuse the decoded frontier");
+    const auto frontier = position;
+    unaligned += position % ratio != 0;
+    std::vector<std::size_t> ends;
+    while (!second.prefill_complete()) {
+      position += second.Prefill(prompt.size()).consumed_tokens;
+      Require(position == prompt.size() || position % ratio == 0,
+              "capacity-limited prefill step ended off the selection block: " +
+                  std::to_string(position));
+      ends.push_back(position);
+    }
+    second.Invalidate();
+    Require(ends.size() > 1, "continuation fit one prefill pass");
+    auto bulk = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                     6145, &error);
+    auto split = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      6145, &error);
+    Require(bulk && split, error);
+    for (auto* session : {bulk.get(), split.get()}) {
+      Require(session->Sync(head, &error), error);
+      for (std::size_t i = head.size(); i < frontier; ++i)
+        Require(session->Evaluate(prompt[i], &error), error);
+    }
+    Require(bulk->Sync(prompt, &error), error);
+    for (const auto end : ends)
+      Require(split->Sync(std::span(prompt).first(end), &error), error);
+    RequireExact(bulk->Logits(), split->Logits(),
+                 "aligned continuation steps changed logits: frontier=" +
+                     std::to_string(frontier));
+  }
+  Require(unaligned > 0, "fixture never reused an unaligned frontier");
+  std::cout << "unaligned continuation: aligned steps exact, frontiers="
+            << unaligned << '\n'
+            << std::flush;
+}
+
 // A prefetched chunk serves the next chunk's leading tokens when a cache
 // frontier or step budget ends that chunk before or after the hint.
 void CheckPrefetchHints(const std::shared_ptr<qfn::Model>& model) {
@@ -692,11 +766,12 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
              : "Batch request " + std::to_string(i) +
                    ": Continue red, blue, blue, red,");
     if (thai) {
-      Require(std::ranges::any_of(prompt,
-                                  [](std::int32_t token) {
-                                    return token >= static_cast<std::int32_t>(
-                                                        qfn::kMtpDraftVocab);
-                                  }),
+      Require(std::ranges::any_of(
+                  prompt,
+                  [](std::int32_t token) {
+                    return token >= static_cast<std::int32_t>(
+                                        gufo::speculative::kDraftVocabPrefix);
+                  }),
               "Thai batch prompt stays inside the draft vocabulary");
     }
     // One member crosses the sparse-attention boundary while the others
@@ -1008,7 +1083,8 @@ std::vector<std::int32_t> RepeatTokens(std::vector<std::int32_t> pattern,
 std::size_t RareTokens(std::span<const std::int32_t> tokens) {
   return static_cast<std::size_t>(
       std::ranges::count_if(tokens, [](std::int32_t token) {
-        return token >= static_cast<std::int32_t>(qfn::kMtpDraftVocab);
+        return token >=
+               static_cast<std::int32_t>(gufo::speculative::kDraftVocabPrefix);
       }));
 }
 
@@ -1035,8 +1111,8 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     const auto pattern = model->Tokenize(text);
     Require(RareTokens(pattern) * 3 >= pattern.size(),
             "lifecycle pattern is not mostly rare tokens");
-    return RepeatTokens(pattern,
-                        pattern.size() * 2 + qfn::kMtpDraftVocabWindow + 64);
+    return RepeatTokens(pattern, pattern.size() * 2 +
+                                     gufo::speculative::kDraftVocabWindow + 64);
   };
   const auto thai = repeated(
       "แมวสีส้มนอน"
@@ -1149,8 +1225,8 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
   }
 
   // Switching to penalties preserves the target/predictor checkpoint.
-  // Greedy penalties use the full head; sampled proposals may use the table.
-  // Both must replay exactly in populated and fresh sessions.
+  // Greedy and sampled penalized proposals may both use the table. Both must
+  // replay exactly in populated and fresh sessions.
   for (const float temperature : {0.0F, 0.8F}) {
     auto fresh = create();
     Require(t->RestoreSnapshot(*thai_snapshot, &error) &&
@@ -1166,15 +1242,9 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     const auto actual = gufo::test::DecodeMtpReplay(*t, b, 32);
     Require(expected == actual && actual.drafted > 0,
             "penalized replay differs after a populated draft table");
-    if (temperature == 0.0F) {
-      Require(t->Statistics().small_head_cycles == 0 &&
-                  fresh->Statistics().small_head_cycles == 0,
-              "greedy penalties retained the reduced draft head");
-    } else {
-      Require(t->Statistics().small_head_cycles > 0 &&
-                  fresh->Statistics().small_head_cycles > 0,
-              "sampled penalty replay did not exercise the reduced head");
-    }
+    Require(t->Statistics().small_head_cycles > 0 &&
+                fresh->Statistics().small_head_cycles > 0,
+            "penalized replay did not exercise the reduced head");
     RequireExact(fresh->Logits(), t->Logits(),
                  "penalized replay changed target logits");
   }
@@ -1260,9 +1330,9 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
 // alone and in batches, and each request's head choice and table stay its
 // own: an isolated run, peers joining and leaving, and reordered pairs give
 // identical tokens (reasoning included), RNG, acceptance, head use and
-// logits. Restores into used sessions match fresh ones. Greedy eligibility
-// is unchanged: plain greedy keeps the full head alone, and uses the small
-// head in a jointly planned batch.
+// logits. Restores into used sessions match fresh ones. Plain greedy uses
+// the small head alone and in a jointly planned batch, keeps the full head
+// beside a sampled peer, and its text is the same either way.
 void CheckSampledDraftHead(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   if (!model->HasMtp())
@@ -1508,10 +1578,12 @@ void CheckSampledDraftHead(const std::shared_ptr<qfn::Model>& model) {
   Require(fresh[0]->Statistics().small_head_cycles > restored_small,
           "the restored English member left the small head");
 
-  // Greedy eligibility is unchanged. Alone, plain greedy keeps the full head
-  // on two sessions; a jointly planned greedy pair uses the small head.
+  // Alone, plain greedy drafts through the small head on two sessions as on
+  // one; beside a sampled peer it keeps the full head and makes the same
+  // text; a jointly planned greedy pair uses the small head.
   const auto english = chat("Count from one to thirty in words.", false);
-  std::array<std::unique_ptr<qfn::Session>, 2> greedy{create(), create()};
+  std::array<std::unique_ptr<qfn::Session>, 3> greedy{create(), create(),
+                                                      create()};
   std::vector<sampling::SamplerState> greedy_samplers;
   for (auto& session : greedy) {
     Require(session->Sync(english, &error), error);
@@ -1519,14 +1591,40 @@ void CheckSampledDraftHead(const std::shared_ptr<qfn::Model>& model) {
         sampling::SamplingConfig{},
         std::vector<sampling::TokenId>(english.begin(), english.end()));
   }
+  std::vector<std::int32_t> alone_tokens, mixed_tokens;
   for (std::size_t c = 0; c < 4; ++c) {
     qfn::Session::DecodeResult alone;
     Require(greedy[0]->DecodeStep(8, greedy_samplers[0], &alone, &error, false),
             error);
+    alone_tokens.insert(alone_tokens.end(), alone.tokens.begin(),
+                        alone.tokens.end());
   }
   const auto& alone = greedy[0]->Statistics();
-  Require(alone.drafted > alone.lookup && alone.small_head_cycles == 0,
-          "plain greedy reached the small head alone on two sessions");
+  Require(alone.drafted > alone.lookup && alone.small_head_cycles > 0,
+          "plain greedy kept the full head alone on two sessions");
+  auto sampled_peer = create();
+  Require(sampled_peer->Sync(members[0].prompt, &error), error);
+  sampling::SamplerState sampled_peer_sampler(
+      members[0].config,
+      std::vector<sampling::TokenId>(members[0].prompt.begin(),
+                                     members[0].prompt.end()));
+  while (mixed_tokens.size() < alone_tokens.size()) {
+    std::array<qfn::Session::DecodeResult, 2> results;
+    std::array<qfn::Session::DecodeRequest, 2> requests{{
+        {greedy[2].get(), 8, &greedy_samplers[2], &results[0], false},
+        {sampled_peer.get(), 8, &sampled_peer_sampler, &results[1], false},
+    }};
+    Require(qfn::Session::DecodeBatch(requests, &error), error);
+    Require(!results[0].tokens.empty(), "mixed greedy step made no progress");
+    mixed_tokens.insert(mixed_tokens.end(), results[0].tokens.begin(),
+                        results[0].tokens.end());
+  }
+  const auto& mixed = greedy[2]->Statistics();
+  Require(mixed.drafted > mixed.lookup && mixed.small_head_cycles == 0,
+          "plain greedy reached the small head beside a sampled peer");
+  Require(std::equal(alone_tokens.begin(), alone_tokens.end(),
+                     mixed_tokens.begin()),
+          "the small head changed greedy text");
   auto peer = create();
   Require(peer->Sync(english, &error), error);
   sampling::SamplerState peer_sampler(
@@ -1550,7 +1648,8 @@ void CheckSampledDraftHead(const std::shared_ptr<qfn::Model>& model) {
             << " mixed=" << overlap_use.mixed
             << " reordered all_small=" << reordered_use.all_small
             << " mixed=" << reordered_use.mixed
-            << " schedules_and_restores_exact=1 greedy_policy_unchanged=1\n"
+            << " schedules_and_restores_exact=1 greedy_alone_small_head="
+            << alone.small_head_cycles << " greedy_text_exact=1\n"
             << std::flush;
 }
 
@@ -1657,7 +1756,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(backend.load(model, &error, 128, 2, {}, {}, options), error);
+  Require(backend.load(qfn::CreateQwenFlashNextTextRunner(model, 128, options),
+                       &error, 2),
+          error);
   // Synthetic grammar pieces make the boundary deterministic: any ordinary
   // first token completes the empty JSON object; only stop tokens may follow.
   // Actual token IDs, EOS recognition, GPU execution and checkpoints stay real.
@@ -1675,12 +1776,17 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
       });
   sampling::SamplingConfig config;
   config.constraint = std::move(constraint);
+  config.logprobs = 2;
   const std::array<std::string, 2> prompts{
       "EOS fixture one: continue red, blue,",
       "EOS fixture two: continue green, yellow,"};
   std::array<Backend::Result, 2> references;
   for (std::size_t row = 0; row < prompts.size(); ++row) {
     references[row] = backend.complete(prompts[row], 8, config);
+    Require(references[row].logprobs.size() == 2 &&
+                model->IsStopToken(
+                    references[row].logprobs.back().entries.front().id),
+            "constrained EOS must retain its raw token probability");
     Require(
         references[row].tokens.size() == 1 &&
             !model->IsStopToken(references[row].tokens.front()),
@@ -1702,6 +1808,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::size_t batched = 0;
   for (std::size_t row = 0; row < pending.size(); ++row) {
     const auto result = pending[row].get();
+    Require(result.logprobs.size() == 2 &&
+                model->IsStopToken(result.logprobs.back().entries.front().id),
+            "batched cached EOS must retain token metadata");
     Require(result.tokens == references[row].tokens,
             "batched EOS accounting differs from the scalar checkpoint");
     batched += result.physical_execution_width > 1;
@@ -1746,10 +1855,13 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   using Backend = server::InferenceBackend;
   Backend ar, mtp;
   std::string error;
-  Require(ar.load(model, &error, 6145, 2), error);
+  Require(ar.load(qfn::CreateQwenFlashNextTextRunner(model, 6145), &error, 2),
+          error);
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(mtp.load(model, &error, 6145, 2, {}, {}, options), error);
+  Require(mtp.load(qfn::CreateQwenFlashNextTextRunner(model, 6145, options),
+                   &error, 2),
+          error);
   struct Reference {
     gufo::test::SamplingCase test;
     std::string prompt;
@@ -1882,7 +1994,80 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize(
+      "Continue this list: red blue green red blue green red blue green");
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  for (const bool mtp : {false, true}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                            : gufo::core::SessionMode::kAutoregressive;
+      auto observed = model->CreateSession(mode, 256, &error);
+      auto plain = model->CreateSession(mode, 256, &error);
+      auto reference = model->CreateSession(
+          gufo::core::SessionMode::kAutoregressive, 256, &error);
+      Require(observed && plain && reference, error);
+      Require(observed->Sync(prompt, &error) && plain->Sync(prompt, &error) &&
+                  reference->Sync(prompt, &error),
+              error);
+      sampling::SamplingConfig config;
+      config.temperature = temperature;
+      config.top_k = 20;
+      config.seed = 73;
+      sampling::SamplerState a(config, history);
+      config.logprobs = 5;
+      sampling::SamplerState b(config, history);
+      std::size_t generated = 0;
+      while (generated < 32) {
+        qfn::Session::DecodeResult expected, actual;
+        const auto budget = std::min<std::size_t>(mtp ? 8 : 1, 32 - generated);
+        Require(plain->DecodeStep(budget, a, &expected, &error, false) &&
+                    observed->DecodeStep(budget, b, &actual, &error, false),
+                error);
+        Require(
+            expected.tokens == actual.tokens && a.rng_state() == b.rng_state(),
+            "logprobs changed selected tokens or RNG");
+        Require(actual.logprobs.size() == actual.tokens.size(),
+                "missing accepted-token probabilities");
+        for (std::size_t i = 0; i < actual.tokens.size(); ++i) {
+          const auto logits = reference->Logits();
+          const double maximum =
+              *std::max_element(logits.begin(), logits.end());
+          double sum = 0;
+          for (const float value : logits)
+            sum += std::exp(double(value) - maximum);
+          const auto check = [&](const sampling::TokenLogprob& entry) {
+            const double expected_lp =
+                (double(logits[entry.token]) - maximum) - std::log(sum);
+            Require(std::abs(entry.logprob - expected_lp) < 1e-5,
+                    "reported probability disagrees with teacher-forced target "
+                    "logits");
+          };
+          Require(actual.logprobs[i].selected.token ==
+                      static_cast<sampling::TokenId>(actual.tokens[i]),
+                  "probability token order differs");
+          check(actual.logprobs[i].selected);
+          for (const auto& entry : actual.logprobs[i].top)
+            check(entry);
+          Require(reference->Evaluate(actual.tokens[i], &error), error);
+        }
+        generated += actual.tokens.size();
+      }
+      const auto x = observed->Statistics(), y = plain->Statistics();
+      Require(x.drafted == y.drafted && x.accepted == y.accepted,
+              "observation changed speculative acceptance");
+      if (mtp)
+        Require(x.drafted > 0, "logprob fixture must execute drafts");
+      std::cout << "logprobs mtp=" << mtp << " temperature=" << temperature
+                << " tokens=" << generated << " drafted=" << x.drafted << '\n';
+    }
+  }
+}
+
 int main(int argc, char** argv) {
+  const bool logprobs_only =
+      argc == 6 && std::string_view(argv[5]) == "--logprobs-only";
   const bool lookup_only =
       argc == 6 && std::string_view(argv[5]) == "--lookup-only";
   const bool execution_only =
@@ -1898,13 +2083,15 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only && !lookup_only) ||
+       !cache_only && !eos_only && !execution_only && !lookup_only &&
+       !logprobs_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --lookup-only | "
-                 "--execution-only TOKENS]\n";
+    std::cerr
+        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+           "[--batch-only | --prefill-only | --sampling-only | "
+           "--cache-only | --eos-only | --lookup-only | --logprobs-only | "
+           "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -1927,6 +2114,11 @@ int main(int argc, char** argv) {
          .decode_concurrency = 8},
         &error);
     Require(model != nullptr, error);
+    if (logprobs_only) {
+      CheckLogprobs(model);
+      CheckServingEos(model);
+      return 0;
+    }
     if (lookup_only) {
       CheckLookupBatch(model);
       return 0;
@@ -1956,6 +2148,7 @@ int main(int argc, char** argv) {
     if (!batch_only) {
       CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
+      CheckUnalignedContinuationPasses(model);
       CheckPrefetchHints(model);
     }
     if (prefill_only)

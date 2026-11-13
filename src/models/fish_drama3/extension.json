@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "name": "fish_drama3",
+  "version": "0.1.0",
+  "api_version": ">= 0.2.0",
+  "entry": "fish_drama3_register",
+  "registration_target": "gufo_fish_drama3",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "fish-drama-3",
+      "capability": "speech_synthesis",
+      "keys": [
+        "safetensors:fish_omni",
+        "safetensors:FishOmniModel"
+      ],
+      "model_ids": [
+        "fish-drama-3"
+      ],
+      "target": "gufo_fish_drama3_hip",
+      "entry": "fish_drama3_provider_register",
+      "serving": {
+        "voices": true
+      }
+    }
+  ],
+  "targets": {
+    "gufo_fish_drama3": {
+      "requires": []
+    },
+    "gufo_fish_drama3_hip": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "reference/"
+    ]
+  },
+  "docs": {
+    "title": "Fish Audio Drama-3",
+    "inputs": "FP8 (F8_E4M3 + 128x128 scale_inv) MoE safetensors + DAC codec; text, optional reference voice and transcript (gufo-studio-windows)",
+    "guide": "README.md"
+  },
+  "tests": [
+    {
+      "target": "fish_drama3_config_test",
+      "ctest": "fish_drama3_config_test",
+      "check_pr": true,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "fish-drama3"
+  ]
+}

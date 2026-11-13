@@ -1,16 +1,15 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <bit>
 #include <cerrno>
 #include <cstring>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
+#include <gufo/ext/platform/fs.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include <limits>
 #include <stdexcept>
-
-#include "src/core/quant/ggml_dequant.hpp"
+#include <system_error>
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -71,19 +70,23 @@ NgramTable::~NgramTable() {
   for (auto& w : workers_) {
     w.join();
   }
-  if (fd_ >= 0) {
-    ::close(fd_);
+  if (file_ != platform::kInvalidFile) {
+    platform::CloseFile(file_);
   }
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
+    platform::PlatformFile file, std::uint64_t file_offset, std::uint64_t rows,
     std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
-  const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
-  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18 : 2;
-  if ((type != core::GgmlType::kIQ4_NL && type != core::GgmlType::kBF16) ||
-      row_dim == 0 || row_dim % block != 0) {
+  const bool blocked =
+      type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kQ8_0;
+  const std::size_t block = blocked ? 32 : 1;
+  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18
+                                  : type == core::GgmlType::kQ8_0 ? 34
+                                                                  : 2;
+  if ((!blocked && type != core::GgmlType::kBF16) || row_dim == 0 ||
+      row_dim % block != 0) {
     if (error_msg != nullptr) {
       *error_msg = "unsupported n-gram table format";
     }
@@ -97,27 +100,17 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
-  // Direct I/O bypasses the page cache; the mapping used for the rest of the
-  // model must not be used here or every touched row would stay resident.
-  const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
-#ifdef _WIN32
-  // NTFS serializes direct reads of a file that is also mapped (the rest of
-  // the model is): 32 readers got ~5K rows/s. Cached overlapped reads keep
-  // ~70K/s at 32 readers and ~128K/s at 128; the pages go to the standby
-  // list, which Windows reclaims first, not to this process.
-  t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
-  t->direct_ = false;
-#else
-  t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-  t->direct_ = t->fd_ >= 0;
-#endif
-  if (t->fd_ < 0) {
-    t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  // Linux direct I/O avoids retaining every touched row in the page cache;
+  // Windows uses cached concurrent reads of the otherwise mapped model.
+  // When the platform cannot provide it, rows read buffered through a
+  // duplicate: the table always owns the handle it closes.
+  t->file_ = platform::ReopenRandomReadFile(file, t->direct_);
+  if (!platform::FileValid(t->file_)) {
+    t->file_ = platform::DuplicateFile(file);
   }
-  if (t->fd_ < 0) {
+  if (t->file_ == platform::kInvalidFile) {
     if (error_msg != nullptr) {
-      *error_msg = std::string("cannot open bound n-gram table: ") +
-                   std::strerror(errno);
+      *error_msg = "cannot open bound n-gram table";
     }
     return nullptr;
   }
@@ -130,6 +123,8 @@ std::unique_ptr<NgramTable> NgramTable::Open(
 void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
   if (type_ == core::GgmlType::kIQ4_NL) {
     gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
+  } else if (type_ == core::GgmlType::kQ8_0) {
+    gufo::quant::DequantizeQ8_0(src, dst, row_dim_);
   } else {
     for (std::uint32_t i = 0; i < row_dim_; ++i) {
       std::uint16_t bits = 0;
@@ -191,15 +186,17 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   std::uint8_t* cached =
       entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
   std::size_t got = 0;
+  std::error_code ec;
   while (got < needed) {
-    const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
+    const std::size_t n =
+        platform::ReadAt(file_, begin + got, base + got, length - got, ec);
+    if (n == 0 && ec == std::errc::interrupted) {
+      continue;
+    }
+    if (n == 0) {
       return false;
     }
-    got += static_cast<std::size_t>(n);
+    got += n;
   }
   if (owner != nullptr)
     owner->disk_reads_.fetch_add(1, std::memory_order_relaxed);

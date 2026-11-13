@@ -13,6 +13,15 @@
 namespace gufo::core {
 
 inline constexpr std::size_t kMaxEncodedImageBytes = 20 * 1024 * 1024;
+/// All images of one request together (gufo_win; upstream shares the 20 MiB
+/// single-image limit). Agents such as pi resend every earlier image of the
+/// conversation with each turn: about ten 2 MB screenshots failed with
+/// "request image byte budget exceeded" (2026-10-22), although pi already
+/// resizes each image to 2000x2000 and 4.5 MiB. Base64 data URLs count 4/3 of
+/// these bytes against --max-request-bytes, so that option is the practical
+/// bound (128 MiB in gufo_select: about 96 MB of images); this one only caps
+/// what a larger request body could hold. Single images keep the 20 MiB limit.
+inline constexpr std::size_t kMaxRequestImageBytes = 256 * 1024 * 1024;
 inline constexpr std::size_t kMaxImagePixels = 32 * 1024 * 1024;
 
 struct Image {
@@ -31,7 +40,7 @@ struct ImageReadBudget {
   /// False when the loaded model takes no image input; reading is refused
   /// before any data URL is decoded or any URL is fetched.
   bool accepts_images{true};
-  std::size_t remaining_bytes{kMaxEncodedImageBytes};
+  std::size_t remaining_bytes{kMaxRequestImageBytes};
   std::chrono::steady_clock::time_point deadline{
       std::chrono::steady_clock::now() + std::chrono::seconds(15)};
 };
@@ -44,6 +53,14 @@ struct ImageReadBudget {
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
                                                      ImageReadBudget& budget);
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url);
+/// Audio uses the same bounded reader and destination checks. Supports raw
+/// base64, audio data URLs and public HTTPS. The decoder checks the bytes.
+[[nodiscard]] std::vector<std::uint8_t> ReadAudioUrl(std::string_view url,
+                                                     ImageReadBudget& budget);
+
+/// Video uses the same shared byte/deadline and public HTTPS protections.
+[[nodiscard]] std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,
+                                                     ImageReadBudget& budget);
 
 }  // namespace gufo::core
 #endif

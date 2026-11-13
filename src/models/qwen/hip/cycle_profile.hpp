@@ -46,6 +46,29 @@ enum class Phase : std::uint8_t {
   return ProfileLevel() > 0;
 }
 
+// A/B switches for the Windows 27B decode kernels (default on; "0" falls back
+// to the shared upstream path). Diagnostics for cycle comparisons only.
+[[nodiscard]] inline bool SwitchOn(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr || value[0] != '0';
+}
+[[nodiscard]] inline bool Sample27On() {
+  static const bool on = SwitchOn("GUFO_QWEN27_SAMPLE27");
+  return on;
+}
+[[nodiscard]] inline bool Copy27On() {
+  static const bool on = SwitchOn("GUFO_QWEN27_COPY27");
+  return on;
+}
+[[nodiscard]] inline bool Zero27On() {
+  static const bool on = SwitchOn("GUFO_QWEN27_ZERO27");
+  return on;
+}
+[[nodiscard]] inline bool Attn27On() {
+  static const bool on = SwitchOn("GUFO_QWEN27_ATTN27");
+  return on;
+}
+
 enum class GpuPart : std::uint8_t {
   kAttnProj,
   kAttnCore,

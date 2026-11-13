@@ -1,0 +1,627 @@
+#include "src/cli/serve/router/remote.hpp"
+
+#include "src/cli/serve/router/auth.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <random>
+#include <exception>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "src/core/json.hpp"
+
+namespace gufo::router {
+
+bool RemoteEndpointAllowed(const RemoteEndpoint& endpoint,
+                           const std::vector<jobs::AllowEntry>& allow) {
+  for (const auto& entry : allow) {
+    if (entry.port != 0 && entry.port != endpoint.port) {
+      continue;
+    }
+    if (entry.kind == jobs::AllowEntry::Kind::kAny) {
+      return true;
+    }
+    if (entry.kind == jobs::AllowEntry::Kind::kNetwork &&
+        (endpoint.address & entry.mask) == entry.network) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CheckRemoteAllowed(const RemoteSpec& spec,
+                        const std::vector<jobs::AllowEntry>& allow,
+                        std::string* error) {
+  if (allow.empty()) {
+    *error = "remote sections need --remote-allow (e.g. --remote-allow " +
+             spec.url.host + ":" + std::to_string(spec.url.port) + ")";
+    return false;
+  }
+  if (!RemoteEndpointAllowed(spec.url, allow)) {
+    *error = "url http://" + spec.url.host + ":" +
+             std::to_string(spec.url.port) + " is not in --remote-allow";
+    return false;
+  }
+  if (spec.busy_check.has_value() &&
+      !RemoteEndpointAllowed(*spec.busy_check, allow)) {
+    *error = "busy-check-url http://" + spec.busy_check->host + ":" +
+             std::to_string(spec.busy_check->port) +
+             " is not in --remote-allow";
+    return false;
+  }
+  return true;
+}
+
+UpstreamTarget RemoteTarget(const RemoteSpec& spec,
+                            const std::string& router_id) {
+  UpstreamTarget target;
+  target.host = spec.url.host;
+  target.port = spec.url.port;
+  target.connect_timeout = std::chrono::seconds(spec.connect_timeout_seconds);
+  target.head_timeout = std::chrono::seconds(spec.head_timeout_seconds);
+  target.keepalive = true;
+  if (!spec.api_key.empty()) {
+    target.extra_headers.emplace_back("Authorization",
+                                      "Bearer " + spec.api_key);
+  }
+  if (!router_id.empty()) {
+    // Replaces a client's header of the same name: the next router sees
+    // who relayed it.
+    target.extra_headers.emplace_back(kForwardedHeader, router_id);
+  }
+  // The shared pool secret (preset `[router] pool-secret-env`, 2.0.3): a
+  // partner with `auth = lan` admits router-to-router calls only with it.
+  if (const std::string& secret = auth::PoolSecret(); !secret.empty()) {
+    target.extra_headers.emplace_back(auth::kPoolKeyHeader, secret);
+  }
+  return target;
+}
+
+server::HttpResponse PartnerRead(const std::optional<RemoteSpec>& partner,
+                                 const std::string& router_id,
+                                 const server::HttpRequest& req,
+                                 std::chrono::milliseconds timeout) {
+  constexpr std::string_view kPrefix = "/router/partner/";
+  const auto error = [](int status, const char* reason, const char* message,
+                        const char* code) {
+    json::Value detail = json::Value::object();
+    detail["message"] = message;
+    detail["type"] = status == 404 ? "invalid_request_error" : "server_error";
+    detail["code"] = code;
+    json::Value body = json::Value::object();
+    body["error"] = std::move(detail);
+    server::HttpResponse out;
+    out.status = status;
+    out.reason = reason;
+    out.body = body.dump();
+    out.headers = {{"Content-Type", "application/json"},
+                   {"Cache-Control", "no-store"}};
+    return out;
+  };
+  if (req.method != "GET" || !req.path.starts_with(kPrefix))
+    return error(404, "Not Found", "no route for this path", "not_found");
+  const std::string what = req.path.substr(kPrefix.size());
+  std::string path;
+  if (what == "status")
+    path = "/router/status";
+  else if (what == "jobs")
+    path = "/v1/jobs";
+  else if (what == "capabilities")
+    path = "/router/capabilities";
+  else
+    return error(404, "Not Found",
+                 "/router/partner/ takes status, jobs or capabilities",
+                 "not_found");
+  if (!partner.has_value())
+    return RemoteUnavailable("partner", "no partner router in the preset");
+  UpstreamTarget target = RemoteTarget(*partner, router_id);
+  target.connect_timeout = timeout;
+  target.head_timeout = timeout;
+  server::HttpRequest ask;
+  ask.method = "GET";
+  ask.path = path;
+  ask.query = req.query;
+  ask.client_id = req.client_id;
+  // Never relayed on by the partner (a loop guard for scope=pool).
+  ask.headers.emplace_back(jobs::kRelayHeader, "1");
+  const auto deadline = std::chrono::steady_clock::now() + 2 * timeout;
+  ask.is_cancelled = [deadline] {
+    return std::chrono::steady_clock::now() >= deadline;
+  };
+  server::HttpResponse answer = ProxyToWorker(target, ask);
+  if (answer.status == 502 && !answer.streaming_body) {
+    std::string detail = answer.log_details;
+    constexpr std::string_view kUnavailable = "upstream_unavailable detail=";
+    if (std::string_view(detail).starts_with(kUnavailable))
+      detail.erase(0, kUnavailable.size());
+    return RemoteUnavailable("partner", detail);
+  }
+  std::string body = std::move(answer.body);
+  if (answer.streaming_body) {
+    constexpr std::size_t kMaxBody = 8 * 1024 * 1024;
+    answer.streaming_body([&body](std::string_view chunk) {
+      if (body.size() + chunk.size() > kMaxBody)
+        return false;
+      body.append(chunk);
+      return true;
+    });
+  }
+  std::string type = "application/json";
+  for (const auto& [name, value] : answer.headers)
+    if (name == "Content-Type" || name == "content-type")
+      type = value;
+  server::HttpResponse out;
+  out.status = answer.status;
+  out.reason = answer.reason;
+  out.body = std::move(body);
+  out.headers = {{"Content-Type", type}, {"Cache-Control", "no-store"}};
+  return out;
+}
+
+std::string NewRouterId() {
+  std::random_device device;
+  std::mt19937_64 generator(
+      (static_cast<std::uint64_t>(device()) << 32) ^ device() ^
+      static_cast<std::uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  constexpr char kHex[] = "0123456789abcdef";
+  std::uint64_t value = generator();
+  std::string id = "gufo-";
+  for (int i = 0; i < 12; ++i, value >>= 4) {
+    id.push_back(kHex[value & 0xF]);
+  }
+  return id;
+}
+
+server::HttpResponse RemoteLoop(const std::string& model_id,
+                                const std::string& forwarded_by) {
+  json::Value error = json::Value::object();
+  error["message"] = "model '" + model_id +
+                     "' is remote on this router too; the request was "
+                     "already relayed by router '" +
+                     forwarded_by + "' and is not relayed again";
+  error["type"] = "server_error";
+  error["code"] = "remote_loop";
+  json::Value body = json::Value::object();
+  body["error"] = std::move(error);
+  server::HttpResponse response;
+  response.status = 508;
+  response.reason = "Loop Detected";
+  response.body = body.dump();
+  response.headers = {{"Content-Type", "application/json"}};
+  response.log_details = "remote_loop model=" + model_id +
+                         " forwarded_by=" + forwarded_by;
+  return response;
+}
+
+server::HttpResponse RemoteUnavailable(const std::string& model_id,
+                                       const std::string& detail) {
+  json::Value error = json::Value::object();
+  error["message"] = "remote model '" + model_id +
+                     "' is unreachable: " + detail;
+  error["type"] = "server_error";
+  error["code"] = "remote_unavailable";
+  json::Value body = json::Value::object();
+  body["error"] = std::move(error);
+  server::HttpResponse response;
+  response.status = 503;
+  response.reason = "Service Unavailable";
+  response.body = body.dump();
+  response.headers = {{"Content-Type", "application/json"},
+                      {"Retry-After", "30"}};
+  response.log_details = "remote_unavailable model=" + model_id;
+  return response;
+}
+
+std::string EndpointKey(const RemoteEndpoint& endpoint) {
+  return endpoint.host + ":" + std::to_string(endpoint.port);
+}
+
+void ParseRemoteModels(const std::string& body, RemoteProbe* probe) {
+  const json::Value listing = json::parse(body);
+  const json::Value* data = listing.find("data");
+  if (data == nullptr || !data->is_array()) {
+    throw std::runtime_error("no data array");
+  }
+  for (const json::Value& model : data->items()) {
+    const json::Value* id = model.find("id");
+    if (id == nullptr || !id->is_string()) {
+      continue;
+    }
+    std::string status;
+    if (const json::Value* remote = model.find("remote");
+        remote != nullptr && remote->is_object()) {
+      // The other router relays this id on as well: it is not served
+      // there, and relaying to it would only loop back.
+      probe->models[id->str()] = "remote";
+      continue;
+    }
+    if (const json::Value* state = model.find("status");
+        state != nullptr && state->is_object()) {
+      status = state->member_str("value");
+    }
+    if (status.empty()) {
+      const json::Value* loaded = model.find("loaded");
+      status = loaded != nullptr && loaded->as_bool() ? "loaded" : "unloaded";
+    }
+    probe->models[id->str()] = status;
+    if (const json::Value* activity = model.find("activity");
+        activity != nullptr && activity->is_object()) {
+      const auto flag = [activity](const char* key) {
+        const json::Value* value = activity->find(key);
+        return value != nullptr && value->as_bool();
+      };
+      const json::Value* waiting = activity->find("waiting");
+      probe->activity[id->str()] = RemoteActivity{
+          flag("busy"), flag("gpu_busy"), flag("others_busy"),
+          waiting != nullptr && waiting->is_number()
+              ? static_cast<long long>(waiting->as_double())
+              : 0LL};
+    }
+  }
+}
+
+RemoteProbe ProbeRemoteModels(const RemoteEndpoint& url,
+                              const std::string& key,
+                              std::chrono::milliseconds timeout,
+                              const std::string& router_id) {
+  RemoteSpec spec;
+  spec.url = url;
+  spec.api_key = key;
+  UpstreamTarget target = RemoteTarget(spec, router_id);
+  target.connect_timeout = timeout;
+  target.head_timeout = timeout;
+  server::HttpRequest request;
+  request.method = "GET";
+  request.path = "/v1/models";
+  // The proxy polls the cancel check while it waits: a remote that sends
+  // its head and then stalls ends here as well.
+  const auto deadline = std::chrono::steady_clock::now() + 2 * timeout;
+  request.is_cancelled = [deadline] {
+    return std::chrono::steady_clock::now() >= deadline;
+  };
+  RemoteProbe probe;
+  server::HttpResponse response = ProxyToWorker(target, request);
+  if (response.status == 502 && !response.streaming_body) {
+    probe.error = response.log_details;
+    constexpr std::string_view kPrefix = "upstream_unavailable detail=";
+    if (std::string_view(probe.error).starts_with(kPrefix)) {
+      probe.error.erase(0, kPrefix.size());
+    }
+    return probe;
+  }
+  probe.reachable = true;
+  std::string body = std::move(response.body);
+  bool complete = true;
+  if (response.streaming_body) {
+    constexpr std::size_t kMaxListing = 4 * 1024 * 1024;
+    response.streaming_body([&body, &complete](std::string_view chunk) {
+      if (body.size() + chunk.size() > kMaxListing) {
+        complete = false;
+        return false;
+      }
+      body.append(chunk);
+      return true;
+    });
+  }
+  if (response.status != 200) {
+    probe.error = "HTTP " + std::to_string(response.status) + " " +
+                  response.reason + " from GET /v1/models";
+    return probe;
+  }
+  try {
+    ParseRemoteModels(body, &probe);
+  } catch (const std::exception& error) {
+    probe.error = std::string(complete ? "" : "truncated ") +
+                  "model list did not parse: " + error.what();
+  }
+  return probe;
+}
+
+RemoteHub::RemoteHub(const std::vector<PresetModel>& presets) {
+  for (const auto& preset : presets) {
+    if (!preset.remote.has_value()) {
+      continue;
+    }
+    RouterInfo& info = routers_[EndpointKey(preset.remote->url)];
+    if (info.ids.empty()) {
+      info.url = preset.remote->url;
+      info.api_key = preset.remote->api_key;
+    }
+    info.ids.push_back(preset.id);
+  }
+}
+
+std::vector<RemoteHub::Target> RemoteHub::Targets() const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<Target> targets;
+  for (const auto& [key, info] : routers_) {
+    (void)key;
+    targets.push_back({info.url, info.api_key});
+  }
+  return targets;
+}
+
+std::vector<std::string> RemoteHub::Record(const RemoteEndpoint& url,
+                                           RemoteProbe probe) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end()) {
+    return {};
+  }
+  RouterInfo& info = it->second;
+  info.checked = true;
+  info.checked_at = Clock::now();
+  info.reachable = probe.reachable;
+  info.error = std::move(probe.error);
+  if (!probe.reachable || !info.error.empty()) {
+    // Keep the last known model states; they are only shown.
+    return {};
+  }
+  info.models = std::move(probe.models);
+  info.activity = std::move(probe.activity);
+  std::vector<std::string> missing;
+  for (const auto& id : info.ids) {
+    const auto model = info.models.find(id);
+    if (model == info.models.end() || model->second == "remote") {
+      missing.push_back(id);
+    }
+  }
+  if (missing == info.missing) {
+    return {};
+  }
+  info.missing = missing;
+  return missing;
+}
+
+void RemoteHub::MarkUnreachable(const RemoteEndpoint& url,
+                                const std::string& error) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end()) {
+    return;
+  }
+  it->second.checked = true;
+  it->second.checked_at = Clock::now();
+  it->second.reachable = false;
+  it->second.error = error;
+}
+
+bool RemoteHub::Reachable(const RemoteEndpoint& url,
+                          std::string* error) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end() || it->second.reachable) {
+    return true;
+  }
+  *error = it->second.error;
+  return false;
+}
+
+std::string RemoteHub::ModelStatus(const RemoteEndpoint& url,
+                                   const std::string& id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end() || !it->second.reachable) {
+    return "";
+  }
+  const auto model = it->second.models.find(id);
+  return model == it->second.models.end() ? std::string() : model->second;
+}
+
+json::Value RemoteHub::Status() const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto now = Clock::now();
+  json::Value out = json::Value::object();
+  for (const auto& [key, info] : routers_) {
+    json::Value entry = json::Value::object();
+    entry["url"] = "http://" + key;
+    entry["checked"] = info.checked;
+    entry["reachable"] = info.reachable;
+    entry["error"] = info.error;
+    if (info.checked) {
+      entry["checked_s_ago"] = static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                           info.checked_at)
+              .count());
+    }
+    json::Value models = json::Value::object();
+    for (const auto& id : info.ids) {
+      const auto model = info.models.find(id);
+      // "remote": the other router relays it too (both list it as remote).
+      models[id] = model == info.models.end() ? std::string("missing")
+                                              : model->second;
+    }
+    entry["models"] = std::move(models);
+    // What a gufo router (placement = pool aware) reports per model.
+    json::Value activity = json::Value::object();
+    for (const auto& id : info.ids) {
+      const auto found = info.activity.find(id);
+      if (found == info.activity.end()) {
+        continue;
+      }
+      json::Value flags = json::Value::object();
+      flags["busy"] = found->second.busy;
+      flags["gpu_busy"] = found->second.gpu_busy;
+      flags["others_busy"] = found->second.others_busy;
+      flags["waiting"] = found->second.waiting;
+      activity[id] = std::move(flags);
+    }
+    entry["activity"] = std::move(activity);
+    out[key] = std::move(entry);
+  }
+  return out;
+}
+
+RemoteHub::ModelView RemoteHub::View(const RemoteEndpoint& url,
+                                     const std::string& id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  ModelView view;
+  const auto it = routers_.find(EndpointKey(url));
+  if (it == routers_.end()) {
+    return view;
+  }
+  const RouterInfo& info = it->second;
+  view.checked_at = info.checked_at;
+  if (!info.reachable) {
+    return view;
+  }
+  const auto model = info.models.find(id);
+  if (model == info.models.end() || model->second == "remote") {
+    return view;
+  }
+  view.served = true;
+  view.status = model->second;
+  if (const auto activity = info.activity.find(id);
+      activity != info.activity.end()) {
+    view.has_activity = true;
+    view.activity = activity->second;
+  }
+  for (const auto& [other, status] : info.models) {
+    if (other != id && (status == "loaded" || status == "loading")) {
+      view.others_loaded = true;
+      break;
+    }
+  }
+  return view;
+}
+
+void RemoteHub::NoteBusyCheck(const RemoteEndpoint& url,
+                              const std::string& result) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  busy_checks_["http://" + EndpointKey(url) + url.path] = {result,
+                                                           Clock::now()};
+}
+
+json::Value RemoteHub::BusyCheckStatus() const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto now = Clock::now();
+  json::Value out = json::Value::object();
+  for (const auto& [url, entry] : busy_checks_) {
+    json::Value check = json::Value::object();
+    check["result"] = entry.first;
+    check["checked_s_ago"] = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - entry.second)
+            .count());
+    out[url] = std::move(check);
+  }
+  return out;
+}
+
+struct GpuSlots::Hold::Table {
+  struct Slot {
+    bool held{false};
+    std::string holder;
+    Clock::time_point since{};
+    std::deque<std::uint64_t> queue;  // waiting tickets, arrival order
+  };
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::map<std::string, Slot> slots;
+  std::uint64_t next_ticket{0};
+};
+
+GpuSlots::GpuSlots() : table_(std::make_shared<Hold::Table>()) {}
+
+void GpuSlots::Hold::Release() {
+  {
+    const std::lock_guard<std::mutex> lock(table_->mutex);
+    if (released_) {
+      return;
+    }
+    released_ = true;
+    auto& slot = table_->slots[slot_];
+    slot.held = false;
+    slot.holder.clear();
+  }
+  table_->changed.notify_all();
+}
+
+void GpuSlots::Hold::Describe(const std::string& holder) {
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  if (!released_) {
+    table_->slots[slot_].holder = holder;
+  }
+}
+
+std::shared_ptr<GpuSlots::Hold> GpuSlots::Acquire(
+    const std::string& slot, const std::string& holder,
+    std::chrono::milliseconds wait, const std::function<bool()>& cancelled) {
+  const auto deadline = Clock::now() + wait;
+  std::unique_lock<std::mutex> lock(table_->mutex);
+  auto& entry = table_->slots[slot];
+  const std::uint64_t ticket = table_->next_ticket++;
+  entry.queue.push_back(ticket);
+  for (;;) {
+    if (!entry.held && entry.queue.front() == ticket) {
+      entry.queue.pop_front();
+      entry.held = true;
+      entry.holder = holder;
+      entry.since = Clock::now();
+      return std::shared_ptr<Hold>(new Hold(table_, slot));
+    }
+    // Wake in slices so a client that went away stops waiting.
+    const bool gone = cancelled && cancelled();
+    if (gone || Clock::now() >= deadline) {
+      entry.queue.erase(
+          std::find(entry.queue.begin(), entry.queue.end(), ticket));
+      lock.unlock();
+      table_->changed.notify_all();
+      return nullptr;
+    }
+    table_->changed.wait_for(
+        lock, std::min<Clock::duration>(std::chrono::milliseconds(200),
+                                        deadline - Clock::now()));
+  }
+}
+
+bool GpuSlots::Idle(const std::string& slot) const {
+  if (slot.empty()) {
+    return true;
+  }
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  const auto it = table_->slots.find(slot);
+  return it == table_->slots.end() ||
+         (!it->second.held && it->second.queue.empty());
+}
+
+json::Value GpuSlots::Status() const {
+  const std::lock_guard<std::mutex> lock(table_->mutex);
+  const auto now = Clock::now();
+  json::Value out = json::Value::object();
+  for (const auto& [name, slot] : table_->slots) {
+    json::Value entry = json::Value::object();
+    entry["held"] = slot.held;
+    entry["waiting"] = static_cast<long long>(slot.queue.size());
+    if (slot.held) {
+      entry["holder"] = slot.holder;
+      entry["held_s"] = static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::seconds>(now - slot.since)
+              .count());
+    }
+    out[name] = std::move(entry);
+  }
+  return out;
+}
+
+bool BusyCheckSaysBusy(const std::string& body) {
+  try {
+    const json::Value queue = json::parse(body);
+    for (const char* key : {"queue_running", "queue_pending"}) {
+      const json::Value* items = queue.find(key);
+      if (items != nullptr && items->is_array() && items->size() > 0) {
+        return true;
+      }
+    }
+  } catch (const std::exception&) {
+    // Not a queue answer: nothing to wait for.
+  }
+  return false;
+}
+
+}  // namespace gufo::router

@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "name": "qwen_image_21",
+  "version": "0.1.0",
+  "api_version": ">= 0.2.0",
+  "entry": "qwen_image_21_register",
+  "registration_target": "gufo_qwen_image_21",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "qwen-image-21",
+      "capability": "image_generation",
+      "keys": [
+        "safetensors:qwen_image_21",
+        "safetensors:QwenImage21Model"
+      ],
+      "model_ids": [
+        "qwen-image-2.1"
+      ],
+      "target": "gufo_qwen_image_21_hip",
+      "entry": "qwen_image_21_provider_register"
+    }
+  ],
+  "options": [
+    {
+      "name": "--lora",
+      "type": "string",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "LoRA adapters NAME=PATH for the transformer, several separated by ';'; requests select them by name (loras)"
+    },
+    {
+      "name": "--lora-default",
+      "type": "string",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Registered LoRAs NAME:SCALE, several separated by ';', applied to requests that omit loras"
+    },
+    {
+      "name": "--controlnet",
+      "type": "path",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Qwen-Image-2.1 Fun ControlNet-Union safetensors file; enables gufo.control_image (pose, depth, canny, lineart, ...)"
+    },
+    {
+      "name": "--keep-text-encoder",
+      "type": "boolean",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "qwen-image-21"
+      ],
+      "help": "Keep the text encoder (about 16 GB) in GPU memory between requests; by default it leaves after encoding and reloads on the next request"
+    }
+  ],
+  "targets": {
+    "gufo_qwen_image_21": {
+      "requires": []
+    },
+    "gufo_qwen_image_21_hip": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "docs": {
+    "title": "Qwen-Image-2.1",
+    "inputs": "BF16 safetensors; generation and image editing",
+    "guide": "docs/models/qwen-image-2.1.md"
+  },
+  "tests": [
+    {
+      "target": "qwen_image_21_test",
+      "ctest": "qwen_image_21_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "qwen_image_21_weights_test",
+      "ctest": "qwen_image_21_weights_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "qwen_image_21_lora_test",
+      "ctest": "qwen_image_21_lora_test",
+      "check_pr": true,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "qwen-image-2.1"
+  ]
+}

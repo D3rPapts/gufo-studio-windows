@@ -1,10 +1,14 @@
 #include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
 
 #include "src/models/minimax_h3/runtime.hpp"
+#include "src/models/minimax_h3/stage_cache.hpp"
 
 namespace gufo::minimax_h3 {
 
@@ -130,6 +134,53 @@ public:
 };
 
 }  // namespace
+
+void TraceStage(const char* stage) {
+  static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
+  if (!enabled) {
+    return;
+  }
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    (void)hipGetLastError();
+  }
+  std::fprintf(stderr, "h3 trace: %s (device free %.2f of %.2f GiB)\n", stage,
+               static_cast<double>(free_bytes) / (1U << 30U),
+               static_cast<double>(total_bytes) / (1U << 30U));
+  std::fflush(stderr);
+}
+
+std::string ComputeBackendIdentity() {
+  std::string identity = "hip=";
+  int runtime = 0;
+  if (hipRuntimeGetVersion(&runtime) == hipSuccess) {
+    identity += std::to_string(runtime);
+  } else {
+    (void)hipGetLastError();
+  }
+  identity += ";arch=";
+  int device = 0;
+  hipDeviceProp_t properties{};
+  if (hipGetDevice(&device) == hipSuccess &&
+      hipGetDeviceProperties(&properties, device) == hipSuccess) {
+    identity += properties.gcnArchName;
+  } else {
+    (void)hipGetLastError();
+  }
+  identity += ";rocblas=";
+  std::size_t size = 0;
+  if (rocblas_get_version_string_size(&size) == rocblas_status_success &&
+      size > 0) {
+    std::string version(size, '\0');
+    if (rocblas_get_version_string(version.data(), size) ==
+        rocblas_status_success) {
+      version.resize(std::strlen(version.c_str()));
+      identity += version;
+    }
+  }
+  return identity;
+}
 
 std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
     std::string* error) {

@@ -525,6 +525,12 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
     sum += logits[order[i]];
   }
   sum = std::max(sum, 6.103515625e-5F);
+  const bool trunk =
+      &l >= w_.layers.data() && &l < w_.layers.data() + w_.layers.size();
+  if (expert_trace_ != nullptr && trunk) {
+    expert_trace_->insert(expert_trace_->end(), order.begin(),
+                          order.begin() + c_.num_experts_used);
+  }
 
   std::fill(out.begin(), out.end(), 0.0F);
   std::vector<float> gate(c_.expert_ff);

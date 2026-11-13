@@ -3,12 +3,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "src/core/quant/ggml_dequant.hpp"
+#include "src/families/qwen/config/qwen_config.hpp"
 #include "src/models/qwen/forward.hpp"
 
 namespace gufo::speculative {
@@ -30,10 +31,8 @@ bool IsNormType(core::GgmlType type) noexcept {
 }
 
 bool IsMatrixType(core::GgmlType type) noexcept {
-  // Unsloth's embedded MTP layers (blk.64.* in the 27B GGUFs) are Q8_0.
   return IsNormType(type) || type == core::GgmlType::kQ3_K ||
-         type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
-         type == core::GgmlType::kQ6_K || type == core::GgmlType::kQ8_0;
+         type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ6_K;
 }
 
 bool Validate(const models::QwenTensorRef& tensor, std::size_t elements,
@@ -79,7 +78,7 @@ const void* OutputRow(const models::QwenTensorRef& output, std::size_t token_id,
 
 std::optional<QwenMtpWeights> QwenMtpWeights::LoadFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
-  const auto config = reader.ExtractModelConfig(error_msg);
+  const auto config = models::qwen::ExtractQwenConfig(reader, error_msg);
   if (!config.has_value()) {
     return std::nullopt;
   }

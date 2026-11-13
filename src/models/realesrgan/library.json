@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "realesrgan",
+  "target": "gufo_realesrgan",
+  "kind": "static",
+  "purpose": "Real-ESRGAN SRVGGNetCompact video and image upscaling (gufo-studio-windows): HIP upscaler, NPU/CPU ONNX Runtime path and video post-processing.",
+  "consumers": [],
+  "checks": []
+}

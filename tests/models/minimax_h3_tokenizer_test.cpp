@@ -9,7 +9,7 @@
 
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
-#include "src/models/qwen/control_tokens.hpp"
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
 
 using gufo::tokenization::kImStart;
 

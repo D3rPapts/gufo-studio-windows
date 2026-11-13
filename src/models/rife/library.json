@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "rife",
+  "target": "gufo_rife",
+  "kind": "static",
+  "purpose": "RIFE 4.7 video frame interpolation (gufo-studio-windows) with the FFmpeg video I/O shared by the video models.",
+  "consumers": [
+    "gufo_mmaudio",
+    "gufo_realesrgan"
+  ],
+  "checks": [],
+  "tools": [
+    "gufo-upscale"
+  ]
+}

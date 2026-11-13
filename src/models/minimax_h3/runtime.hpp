@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <gufo/ext/platform/mapped_file.hpp>
+
 namespace gufo::minimax_h3 {
 
 enum class DType : std::uint8_t {
@@ -183,6 +185,9 @@ private:
 
 [[nodiscard]] std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
     std::string* error = nullptr);
+
+// GUFO_H3_TRACE=1: prints the stage and the device's free memory to stderr.
+void TraceStage(const char* stage);
 [[nodiscard]] constexpr ResidencyMode DefaultResidencyMode() noexcept {
   return ResidencyMode::kDeviceCopy;
 }
@@ -247,6 +252,7 @@ public:
 private:
   struct Mapping {
     std::filesystem::path shard;
+    platform::RawMappedFile mapping_file;
     void* host{nullptr};
     void* device_alias{nullptr};
     std::size_t bytes{0};

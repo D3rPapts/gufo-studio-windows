@@ -161,6 +161,8 @@ bool DenoiserSession::DenoiseWithProgress(std::span<float>, std::span<float>,
   return false;
 }
 
+void DenoiserSession::SetPreview(models::PreviewHook) {}
+
 const GenerationGeometry& DenoiserSession::geometry() const noexcept {
   static const GenerationGeometry empty;
   return empty;

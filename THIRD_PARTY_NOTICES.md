@@ -23,10 +23,16 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | ICU | Linked; Unicode normalization/tokenization | `Unicode-3.0` | 78.3; flake.lock | [unicode-org/icu](https://github.com/unicode-org/icu) |
 | curl / libcurl | Linked; image HTTPS and evaluation client | `curl` | 8.21.0; flake.lock | [curl/curl](https://github.com/curl/curl) |
 | OpenSSL | Linked; cryptographic hashes and HTTPS dependency | `Apache-2.0` | 3.6.3; flake.lock | [openssl/openssl](https://github.com/openssl/openssl) |
-| libpng | Linked; image decoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |
+| libpng | Linked; Qwen-Image PNG input decoding and output encoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |
 | libjpeg-turbo | Linked; JPEG decoding | `IJG AND BSD-3-Clause AND Zlib` | 3.1.4.1; flake.lock | [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) |
 | libwebp | Linked; WebP decoding | `BSD-3-Clause` | 1.6.0; flake.lock | [webmproject/libwebp](https://chromium.googlesource.com/webm/libwebp) |
-| FFmpeg | Separate ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 8.1.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| png (Rust crate) | Statically linked; PNG decoding | `MIT OR Apache-2.0` | 0.18.1; Cargo.lock | [image-rs/image-png](https://github.com/image-rs/image-png) |
+| Rust standard library and crates | Statically linked into the Rust library; [license texts](licenses/rust.txt) | `MIT OR Apache-2.0` and per-crate terms | rustc in rust-toolchain.toml, with the crates its standard library bundles; crates in Cargo.lock | [rust-lang/rust](https://github.com/rust-lang/rust) |
+| libsndfile | Linked; audio decoding | `LGPL-2.1-or-later` | 1.2.2; flake.lock | [libsndfile](https://github.com/libsndfile/libsndfile) |
+| libsoxr | Linked; audio resampling | `LGPL-2.1-or-later` | 0.1.3; flake.lock | [SoX Resampler](https://sourceforge.net/projects/soxr/) |
+| FFmpeg | Linked libavformat/libavcodec/libavutil/libswscale for video embeddings; ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 9.0.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| ONNX Runtime C API header | Vendored header (`third_party/onnxruntime`); the runtime DLL is loaded at run time from Windows ML, never linked or shipped; the AMD NPU execution provider comes from Windows ML and is not distributed | `MIT` | v1.23.2 (`onnxruntime_c_api.h`, `onnxruntime_ep_c_api.h`) | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+| LLVM OpenMP | Windows runtime built from upstream source; Microsoft-compatible DLL naming | `Apache-2.0 WITH LLVM-exception` | 18.1.8 (`3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff`) | [LLVM](https://github.com/llvm/llvm-project/tree/llvmorg-18.1.8/openmp); [license](licenses/llvm-openmp.txt) |
 | GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
 | llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | mikealanni/gufo | Adapted Flash-Next GDN row reuse and SSM stride optimization | `MIT` | `f450218743bcaf77e3e1f8fab78f4cd4e4aafae3` | [gufo fork](https://github.com/mikealanni/gufo/tree/f450218743bcaf77e3e1f8fab78f4cd4e4aafae3) |
@@ -35,6 +41,14 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | DS4 GB10/GX10 fork | Adapted paired MoE launch code, now HIP | `MIT` | `910501e` | [xangel82/DS4](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA) |
 | h3.c | Adapted H3 geometry, scheduling and sampler; implementation reference | `MIT` | `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [antirez/h3.c](https://github.com/antirez/h3.c) |
 | ccv TensorOps ancestry | Attribution retained through h3.c | `BSD-3-Clause` | h3.c pin above | [liuliu/ccv](https://github.com/liuliu/ccv) |
+| Real-ESRGAN | Ported `SRVGGNetCompact` network and tiling inference (`src/models/realesrgan`; `gufo serve upscale`, video upscale); checkpoints from release v0.2.5.0 are operator-supplied | `BSD-3-Clause` | License read at `a4abfb2979a7bbff3f69f58f58ae324608821e27` | [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN); [license](licenses/realesrgan.txt) |
+| ACE-Step 1.5 | Ported music pipeline (`src/models/ace_step`; `gufo serve music`) | `MIT` | License read at `ca1e85fe9430179831e6bc6be790c332190a3866` | [ace-step/ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5); [license](licenses/ace-step.txt) |
+| MMAudio | Ported video/text-to-audio network (`src/models/mmaudio`; `gufo serve foley`); the weights are CC BY-NC 4.0 and not shipped | `MIT` (code) | License read at `974010a026c731054592d8f777218bd9d85a6c24` | [hkchengrex/MMAudio](https://github.com/hkchengrex/MMAudio); [license](licenses/mmaudio.txt) |
+| RIFE (Practical-RIFE IFNet 4.7) | Ported frame interpolation network (`src/models/rife`; video interpolate) | `MIT` | License read at `bbfd2ea90910789a860ea3e2b32a240cd577b75e` | [hzwer/Practical-RIFE](https://github.com/hzwer/Practical-RIFE); [license](licenses/rife.txt) |
+| ComfyUI-Frame-Interpolation | Reference for the RIFE node defaults (padding, scale list, timesteps) | `MIT` | License read at `26545cc2dd95bc3d27f056016300673bdeee78f5` | [Fannovel16/ComfyUI-Frame-Interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation); [license](licenses/comfyui-frame-interpolation.txt) |
+| TripoSG | Ported image-to-3D pipeline of the separate `gufo serve objekt` worker build (branch feat/triposg); not part of this package's `gufo.exe` | `MIT` | License read at `fc5c40990181e2a756c4e0b1c2f4d6b5202faf8c` | [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG); [license](licenses/triposg.txt) |
+| TRELLIS.2 | Ported image-to-3D pipeline of the separate `gufo serve objekt` worker build (branch feat/trellis2); not part of this package's `gufo.exe` | `MIT` | License read at `75fbf0183001ed9876c8dbb35de6b68552ee08bd` | [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2); [license](licenses/trellis2.txt) |
+| DINOv3 | Image encoder used by TRELLIS.2 in that worker build (Built with DINOv3); the weights are operator-supplied | `LicenseRef-DINOv3-License` (last updated August 19, 2025) | License read at `6876159a11b4df116f30f667f8c9888617df0751`; identical to `LICENSE.md` of the Hugging Face snapshot facebook/dinov3-vitl16-pretrain-lvd1689m | [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3); [license](licenses/dinov3.txt) |
 
 Upstream license texts are retained in `licenses/` and
 [src/models/deepseek_v4_flash/LICENSE.ds4](src/models/deepseek_v4_flash/LICENSE.ds4).
@@ -44,15 +58,26 @@ adapted code. Model-private changes and import boundaries are recorded in the
 [DS4 provenance](src/models/deepseek_v4_flash/UPSTREAM.md),
 [DS4 HIP import](src/models/deepseek_v4_flash/kernels/rocm/mmq/VENDOR.md),
 [Flash-Next HIP import](src/models/qwen38_flash_next/kernels/rocm/mmq/VENDOR.md)
-and [H3 quality record](docs/models/minimax-h3/QUALITY.md).
+and [H3 quality record](docs/internal/models/minimax-h3/QUALITY.md).
 
 This software is based in part on the work of the Independent JPEG Group.
+
+The model ports above (Real-ESRGAN, ACE-Step 1.5, MMAudio, RIFE, TripoSG,
+TRELLIS.2) are reimplementations in C++/HIP that follow the upstream code;
+their license texts are kept verbatim in `licenses/`, copied from the
+upstream `LICENSE` file at the revision named in the table. "License read at"
+names the revision whose license file was copied, not necessarily the
+revision the port started from. TRELLIS.2 is built with DINOv3; the DINOv3
+License asks that a copy of it accompanies any redistribution of the DINO
+Materials (section 1.b.i). Gufo distributes neither DINOv3 nor any other
+model weights.
 
 The mikealanni/gufo fork retains the same Copyright (c) 2026 gufo contributors
 notice and MIT text as Gufo's root `LICENSE`.
 
-FFmpeg is invoked as a separate process, not linked into Gufo. The pinned Nix
-build enables GPL/version3 components; a system FFmpeg build can have different
+Gufo loads FFmpeg libraries on demand for video embeddings and invokes
+ffmpeg/ffprobe as separate processes for media tools. The pinned Nix build
+enables GPL/version3 components; a system FFmpeg build can have different
 terms. Redistributors bundling FFmpeg or other copyleft dependencies must also
 provide their applicable license texts and corresponding source/build materials,
 not just this MIT license. The pinned Nixpkgs expressions and `flake.lock`
@@ -71,9 +96,10 @@ The following projects informed Gufo's Strix Halo optimization work:
 - [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp) — [MIT license](https://github.com/LaurentZuijdwijk/llama.cpp/blob/11bfe8a633fa02bac251db6cf21bd5ddab282a64/LICENSE).
 - [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp) — [MIT license](https://github.com/Nathanw1014/strix-halo-llamacpp/blob/ce15ecca66e5e5a9aefa1ebc82357cb901330c86/LICENSE).
 - [gaetan-puleo/llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo) — [MIT license](https://github.com/gaetan-puleo/llama-cpp-strix-halo/blob/860c828363988d3e4b3d5c2b701dcba3d7b9f26c/LICENSE).
+- [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) — [MIT license](https://github.com/halo-box/strix-llama.cpp/blob/5081bc747b2d433964d66c37b80f350b248fb2fe/LICENSE).
 
 License links pin the notices reviewed for these inspiration credits.
-The two llama.cpp forks share the
+The three llama.cpp forks share the
 ggml authors' notice in [licenses/llama.cpp.txt](licenses/llama.cpp.txt);
 Nathan Wilson's notice is retained in
 [licenses/strix-halo-llamacpp.txt](licenses/strix-halo-llamacpp.txt).
@@ -111,6 +137,12 @@ loaded module hash and library versions, and requires locally available weights.
 Model checkpoints are not part of the gufo source or binary
 distribution. Operators obtain them directly from their publisher and remain
 responsible for the terms governing their location and use.
+
+### EmbeddingGemma 2
+
+- **Artifact**: [google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) at revision `914f7f89142e33e77833254d9c9b90c3cef7303b`, with BF16 safetensors, a tokenizer, and a model configuration.  Gufo reads the text backbone only.
+- **License**: Apache-2.0 as declared in the model card metadata.  Gufo neither ships nor automatically downloads these weights.
+- **Reference implementation**: Transformers and sentence-transformers, both Apache-2.0.  The Python reference dependencies are development-only.
 
 ### Qwen-Image-2.1
 
@@ -167,5 +199,5 @@ determination about a downstream operator.
 - **Relationship**: External model component within the operator-supplied H3
   checkpoint; not distributed by gufo
 
-See [the MiniMax H3 guide](docs/models/minimax-h3/README.md) for the acquisition, release, and
+See [the MiniMax H3 guide](docs/models/minimax-h3.md) for the acquisition, release, and
 runtime boundary.
