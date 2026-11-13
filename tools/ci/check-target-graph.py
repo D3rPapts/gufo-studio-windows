@@ -33,7 +33,9 @@ PROTECTED = (
 
 FORBIDDEN = {"gufo_serving", "gufo_http"}
 HIP_ONLY = {"gufo_hip_host", "gufo_cache_hip", "gufo_ext_hip",
-            "gufo_deepseek_v4_flash", "gufo_qwen_kernels"}
+            "gufo_deepseek_v4_flash", "gufo_qwen_kernels",
+            # gufo-studio-windows media libraries built with HIP only
+            "gufo_qwen3_omni", "gufo_realesrgan"}
 
 
 def manifest_targets(root):
