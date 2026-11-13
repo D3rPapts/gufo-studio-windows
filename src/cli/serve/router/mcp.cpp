@@ -76,12 +76,16 @@ json::Value Envelope(const json::Value& id) {
 }
 
 /// HTTP `status` with a JSON-RPC error object (the frame's own errors are
-/// 400, everything after the frame is 200).
+/// 400, an unknown method of a modern request 404, everything else 200).
 HttpResponse ErrorResponse(int status, const json::Value& id,
                            json::Value error) {
   json::Value body = Envelope(id);
   body["error"] = std::move(error);
-  return JsonResponse(status, status == 400 ? "Bad Request" : "OK", body);
+  return JsonResponse(status,
+                      status == 400   ? "Bad Request"
+                      : status == 404 ? "Not Found"
+                                      : "OK",
+                      body);
 }
 
 HttpResponse ResultResponse(const json::Value& id, json::Value result) {
@@ -105,6 +109,54 @@ std::string VersionList() {
     out += version;
   }
   return out;
+}
+
+/// 2026-07-28, Versioning -> Protocol Version Negotiation: "If the server
+/// does not implement the requested version ... it MUST respond with an
+/// UnsupportedProtocolVersionError listing the versions it does support"
+/// (`{"code": -32022, "message": "Unsupported protocol version", "data":
+/// {"supported": [...], "requested": "..."}}`); on Streamable HTTP with
+/// `400 Bad Request`. A dual-era client reads this body before falling
+/// back to `initialize` (Streamable HTTP -> Backward Compatibility).
+HttpResponse UnsupportedVersion(const json::Value& id,
+                                std::string_view requested) {
+  json::Value data = json::Value::object();
+  data["supported"] = SupportedVersions();
+  data["requested"] = std::string(requested);
+  return ErrorResponse(
+      400, id,
+      RpcError(kUnsupportedProtocolVersion,
+               "Unsupported protocol version '" + std::string(requested) +
+                   "' (supported: " + VersionList() + ")",
+               std::move(data)));
+}
+
+/// 2026-07-28, Streamable HTTP -> Server Validation: a mirrored header
+/// (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) that does not match
+/// the body is `400 Bad Request` with `-32020 HeaderMismatch`.
+HttpResponse HeaderMismatch(const json::Value& id, std::string_view header,
+                            std::string_view value, std::string_view body) {
+  return ErrorResponse(
+      400, id,
+      RpcError(kHeaderMismatch, "Header mismatch: " + std::string(header) +
+                                    " header value '" + std::string(value) +
+                                    "' does not match body value '" +
+                                    std::string(body) + "'"));
+}
+
+/// The value of a mirrored header, decoded when it carries the Base64
+/// sentinel `=?base64?...?=` (Streamable HTTP -> Value Encoding).
+std::string HeaderValue(std::string_view raw) {
+  const std::string value(Trim(raw));
+  constexpr std::string_view kPrefix = "=?base64?";
+  constexpr std::string_view kSuffix = "?=";
+  if (value.size() > kPrefix.size() + kSuffix.size() &&
+      value.starts_with(kPrefix) && value.ends_with(kSuffix)) {
+    if (auto decoded = comfy::Base64Decode(std::string_view(value).substr(
+            kPrefix.size(), value.size() - kPrefix.size() - kSuffix.size())))
+      return *decoded;
+  }
+  return value;
 }
 
 /// A tool result that is an error the model can read (spec: execution
@@ -1142,6 +1194,16 @@ bool IsProtocolVersion(std::string_view version) {
                    version) != std::end(kProtocolVersions);
 }
 
+bool IsLegacyProtocolVersion(std::string_view version) {
+  return std::find(std::begin(kLegacyProtocolVersions),
+                   std::end(kLegacyProtocolVersions),
+                   version) != std::end(kLegacyProtocolVersions);
+}
+
+bool IsModernProtocolVersion(std::string_view version) {
+  return version == kModernProtocolVersion;
+}
+
 McpService::McpService(Options options) : options_(std::move(options)) {
   if (options_.version.empty())
     options_.version = GUFO_RELEASE_VERSION " (" GUFO_REVISION ")";
@@ -1172,12 +1234,35 @@ json::Value McpService::ToolsFor(const auth::Identity& who) const {
   return list;
 }
 
+json::Value McpService::ServerInfo() const {
+  json::Value info = json::Value::object();
+  info["name"] = kServerName;
+  info["title"] = "gufo Router";
+  info["version"] = options_.version;
+  return info;
+}
+
+namespace {
+
+constexpr const char* kInstructions =
+    "Werkzeuge des gufo-Routers: Chat, Bild, Video, Stimme, Musik, 3D, "
+    "Hochskalieren und die Ablage. Lange Arbeiten laufen als Auftrag: das "
+    "Werkzeug gibt eine auftrag_id zurück, auftrag_status zeigt den "
+    "Fortschritt, ablage_lesen holt das Ergebnis. (gufo router tools: "
+    "chat, image, video, speech, music, 3D, upscaling and the job store. "
+    "Long work runs as a job: the tool returns an auftrag_id, "
+    "auftrag_status reports progress, ablage_lesen fetches the result.)";
+
+}  // namespace
+
 json::Value McpService::Initialize(const json::Value& params) const {
-  // Version rule of the spec: the client's version when supported, else
-  // the server's own (the client then decides whether to go on).
+  // Version rule of the legacy spec (Lifecycle -> Version Negotiation):
+  // the client's version when supported, else the server's own (the client
+  // then decides whether to go on). Only a legacy version: the modern one
+  // has no handshake (2026-07-28 Changelog, Major changes 2).
   const std::string requested = params.member_str("protocolVersion");
   json::Value result = json::Value::object();
-  result["protocolVersion"] = IsProtocolVersion(requested)
+  result["protocolVersion"] = IsLegacyProtocolVersion(requested)
                                   ? requested
                                   : std::string(kDefaultProtocolVersion);
   json::Value tools = json::Value::object();
@@ -1185,19 +1270,41 @@ json::Value McpService::Initialize(const json::Value& params) const {
   json::Value capabilities = json::Value::object();
   capabilities["tools"] = std::move(tools);
   result["capabilities"] = std::move(capabilities);
-  json::Value info = json::Value::object();
-  info["name"] = kServerName;
-  info["title"] = "gufo Router";
-  info["version"] = options_.version;
-  result["serverInfo"] = std::move(info);
+  result["serverInfo"] = ServerInfo();
+  result["instructions"] = kInstructions;
+  return result;
+}
+
+json::Value McpService::Discover(const auth::Identity& who) const {
+  // 2026-07-28, Server -> Discovery: "server/discover lets a client query
+  // a server's supported protocol versions, capabilities, and identity
+  // before sending any other requests. Servers MUST implement it."
+  // DiscoverResult: supportedVersions, capabilities,
+  // _meta["io.modelcontextprotocol/serverInfo"] (SHOULD), instructions;
+  // with the CacheableResult fields ttlMs and cacheScope (Changelog, Minor
+  // changes 5). The instructions name the tools `who` may see, so the
+  // result is private to the caller.
+  json::Value result = json::Value::object();
+  result["resultType"] = "complete";
+  result["supportedVersions"] = SupportedVersions();
+  json::Value capabilities = json::Value::object();
+  capabilities["tools"] = json::Value::object();
+  result["capabilities"] = std::move(capabilities);
+  json::Value meta = json::Value::object();
+  meta[kMetaServerInfo] = ServerInfo();
+  result["_meta"] = std::move(meta);
+  std::string names;
+  for (const Tool& tool : tools_) {
+    if (!Visible(tool, who))
+      continue;
+    if (!names.empty())
+      names += ", ";
+    names += tool.name;
+  }
   result["instructions"] =
-      "Werkzeuge des gufo-Routers: Chat, Bild, Video, Stimme, Musik, 3D, "
-      "Hochskalieren und die Ablage. Lange Arbeiten laufen als Auftrag: das "
-      "Werkzeug gibt eine auftrag_id zurück, auftrag_status zeigt den "
-      "Fortschritt, ablage_lesen holt das Ergebnis. (gufo router tools: "
-      "chat, image, video, speech, music, 3D, upscaling and the job store. "
-      "Long work runs as a job: the tool returns an auftrag_id, "
-      "auftrag_status reports progress, ablage_lesen fetches the result.)";
+      std::string(kInstructions) + " Werkzeuge (tools): " + names + ".";
+  result["ttlMs"] = 300000;
+  result["cacheScope"] = "private";
   return result;
 }
 
@@ -2376,15 +2483,102 @@ HttpResponse McpService::Rpc(const HttpRequest& req,
     return ErrorResponse(200, id,
                          RpcError(kInvalidParams, "params must be an object"));
   const std::string& name = method->str();
+
+  // Modern era (2026-07-28). Versioning -> Protocol Version Negotiation:
+  // "There is no negotiation handshake. Every request declares the
+  // protocol version it is using in its _meta field. On HTTP, this is
+  // also carried in the MCP-Protocol-Version header." Streamable HTTP ->
+  // Protocol Version Header: "The header value MUST match the
+  // io.modelcontextprotocol/protocolVersion field carried in the request
+  // body's _meta. If the values do not match, the server MUST reject the
+  // request with 400 Bad Request and a HeaderMismatch JSON-RPC error."
+  // Versioning -> Backward Compatibility: "A dual-era server selects its
+  // behavior from how the client opens: A request carrying modern
+  // per-request _meta is served statelessly according to this revision.
+  // An initialize request selects legacy semantics." A request without
+  // `_meta` is legacy (the header alone was checked by Handle).
+  // Deviation: `io.modelcontextprotocol/clientCapabilities` (required by
+  // Base Protocol -> _meta) is not demanded, the endpoint never needs a
+  // client capability; a modern request without it is served, not -32602.
+  bool modern = false;
+  std::string client;
+  if (const json::Value* meta = params->find("_meta");
+      meta != nullptr && meta->is_object()) {
+    if (const json::Value* given = meta->find(kMetaProtocolVersion);
+        given != nullptr && !given->is_null()) {
+      if (!given->is_string())
+        return ErrorResponse(
+            400, id,
+            RpcError(kInvalidParams, std::string("params._meta[\"") +
+                                         kMetaProtocolVersion +
+                                         "\"] must be a string"));
+      const std::string& requested = given->str();
+      if (!IsProtocolVersion(requested))
+        return UnsupportedVersion(id, requested);
+      const std::string header =
+          std::string(Trim(req.header("MCP-Protocol-Version")));
+      if (!header.empty() && header != requested)
+        return HeaderMismatch(id, "MCP-Protocol-Version", header, requested);
+      modern = IsModernProtocolVersion(requested);
+    }
+    if (const json::Value* info = meta->find(kMetaClientInfo);
+        info != nullptr && info->is_object()) {
+      client = info->member_str("name");
+      if (!info->member_str("version").empty())
+        client += "/" + info->member_str("version");
+    }
+  }
+  // Streamable HTTP -> Server Validation: the mirrored headers Mcp-Method
+  // and Mcp-Name must match the body when sent (-32020). Deviation: a
+  // request without them is served (legacy clients and the dual-era
+  // probe send none).
+  if (const std::string mirrored = HeaderValue(req.header("Mcp-Method"));
+      !mirrored.empty() && mirrored != name)
+    return HeaderMismatch(id, "Mcp-Method", mirrored, name);
+  if (name == "tools/call") {
+    if (const std::string mirrored = HeaderValue(req.header("Mcp-Name"));
+        !mirrored.empty() && mirrored != params->member_str("name"))
+      return HeaderMismatch(id, "Mcp-Name", mirrored,
+                            params->member_str("name"));
+  }
+  // The era-selecting calls, once per client start.
+  if (name == "server/discover" || name == "initialize")
+    Logger::Info("router",
+                 "event=mcp_client method=" + name +
+                     " era=" + (modern ? "modern" : "legacy") +
+                     " client=\"" + client + "\" user=" + who.name);
+
+  // Base Protocol -> Result Responses (2026-07-28): "The result MUST
+  // include a resultType field"; _meta -> Per-response protocol fields:
+  // "Servers SHOULD include io.modelcontextprotocol/serverInfo in every
+  // result's _meta". Legacy results stay as they were.
+  const auto finish = [&](json::Value result) {
+    if (modern) {
+      if (!result.contains("resultType"))
+        result["resultType"] = "complete";
+      if (!result.contains("_meta"))
+        result["_meta"] = json::Value::object();
+      result["_meta"][kMetaServerInfo] = ServerInfo();
+    }
+    return ResultResponse(id, std::move(result));
+  };
   try {
+    if (name == "server/discover")
+      return finish(Discover(who));
     if (name == "initialize")
-      return ResultResponse(id, Initialize(*params));
+      return finish(Initialize(*params));
     if (name == "ping")
-      return ResultResponse(id, json::Value::object());
+      return finish(json::Value::object());
     if (name == "tools/list") {
       json::Value result = json::Value::object();
       result["tools"] = ToolsFor(who);
-      return ResultResponse(id, std::move(result));
+      if (modern) {
+        // CacheableResult (Changelog, Minor changes 5): the list is per
+        // user (areas), so private; 5 minutes.
+        result["ttlMs"] = 300000;
+        result["cacheScope"] = "private";
+      }
+      return finish(std::move(result));
     }
     if (name == "tools/call") {
       const std::string tool = params->member_str("name");
@@ -2402,9 +2596,13 @@ HttpResponse McpService::Rpc(const HttpRequest& req,
       if (const json::Value* error = out.find("error");
           error != nullptr && error->is_object())
         return ErrorResponse(200, id, *error);
-      return ResultResponse(id, std::move(out));
+      return finish(std::move(out));
     }
-    return ErrorResponse(200, id,
+    // Streamable HTTP -> Protocol Version Header (2026-07-28): "If the
+    // server does not implement the requested RPC method, it MUST respond
+    // with 404 Not Found and a JSON-RPC error with code -32601"; legacy
+    // requests get the 200 of the older transports.
+    return ErrorResponse(modern ? 404 : 200, id,
                          RpcError(kMethodNotFound, "Method not found: " + name));
   } catch (const std::exception& error) {
     Logger::Warn("router", "event=mcp_error method=" + name +
@@ -2434,18 +2632,15 @@ std::optional<HttpResponse> McpService::Handle(const HttpRequest& req) {
     return HttpError(406, "Not Acceptable",
                      "the MCP endpoint answers application/json",
                      "not_acceptable");
+  // A missing header counts as 2025-03-26 (allowed by 2025-06-18 and by
+  // 2026-07-28 Streamable HTTP -> Protocol Version Header for servers that
+  // support clients before 2025-06-18); an unknown one is 400 with the
+  // modern -32022 and the supported list, so a dual-era client retries
+  // with one of them instead of falling back blindly.
   const std::string version =
       std::string(Trim(req.header("MCP-Protocol-Version")));
-  if (!version.empty() && !IsProtocolVersion(version)) {
-    json::Value data = json::Value::object();
-    data["supported"] = SupportedVersions();
-    return ErrorResponse(
-        400, json::Value(),
-        RpcError(kInvalidRequest,
-                 "unsupported MCP-Protocol-Version '" + version +
-                     "' (supported: " + VersionList() + ")",
-                 std::move(data)));
-  }
+  if (!version.empty() && !IsProtocolVersion(version))
+    return UnsupportedVersion(json::Value(), version);
   const auth::Identity who =
       options_.gate != nullptr ? options_.gate->Identify(req) : AdminIdentity();
   // DNS-rebinding guard of the spec: an Origin must be this router's own

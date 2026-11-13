@@ -6,7 +6,10 @@
 // job tools (bild_erzeugen, bild_bearbeiten, video_erzeugen, stimme,
 // musik, objekt_3d, hochskalieren: the submit body, the priority header,
 // argument errors, inner refusals) as inner requests through the real
-// gate to a fake router. Pure state, no sockets, no models.
+// gate to a fake router, and the Commit 4 modern era (2026-07-28:
+// server/discover, the per-request _meta version, -32022 / -32020,
+// resultType and serverInfo in modern results). Pure state, no sockets,
+// no models.
 
 #include <algorithm>
 #include <cmath>
@@ -487,8 +490,9 @@ void TestClassifyAndPreset() {
   CHECK(mcp::IsProtocolVersion("2025-03-26"));
   CHECK(mcp::IsProtocolVersion("2025-06-18"));
   CHECK(mcp::IsProtocolVersion("2025-11-25"));
-  CHECK(!mcp::IsProtocolVersion("2026-07-28"));  // modern era: Commit 4
+  CHECK(mcp::IsProtocolVersion("2026-07-28"));  // modern era: Commit 4
   CHECK(!mcp::IsProtocolVersion(""));
+  CHECK(!mcp::IsProtocolVersion("2026-07-28 "));
 
   // [router] mcp = on|off, default on; a typo stops the router.
   const auto dir = TempDir();
@@ -562,7 +566,8 @@ void TestFrame() {
   r = f.Post(Msg("resources/list"));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(RpcCode(r), mcp::kMethodNotFound);
-  r = f.Post(Msg("server/discover"));  // modern era: Commit 4
+  r = f.Post(Msg("resources/read", "1", "{\"uri\":\"x\"}"));
+  CHECK_EQ(r.status, 200);
   CHECK_EQ(RpcCode(r), mcp::kMethodNotFound);
   // Notifications and client responses: 202 without a body.
   r = f.Post("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
@@ -615,15 +620,21 @@ void TestFrame() {
   CHECK_EQ(r.status, 200);
   r = f.Post(Msg("ping"), kLoopback, {{"MCP-Protocol-Version", "2025-11-25"}});
   CHECK_EQ(r.status, 200);
+  r = f.Post(Msg("ping"), kLoopback, {{"MCP-Protocol-Version", "2026-07-28"}});
+  CHECK_EQ(r.status, 200);
+  // An unknown header version is the modern -32022 with the supported
+  // list (a dual-era client retries with one of them).
   r = f.Post(Msg("ping"), kLoopback, {{"MCP-Protocol-Version", "1999-01-01"}});
   CHECK_EQ(r.status, 400);
-  CHECK_EQ(RpcCode(r), mcp::kInvalidRequest);
+  CHECK_EQ(RpcCode(r), mcp::kUnsupportedProtocolVersion);
   CHECK(Body(r).find("id") != nullptr && Body(r).find("id")->is_null());
   {
     const json::Value body = Body(r);
     const json::Value* data = body.find("error")->find("data");
     CHECK(data != nullptr && data->find("supported") != nullptr &&
-          data->find("supported")->size() == 3);
+          data->find("supported")->size() == 4);
+    CHECK(data != nullptr &&
+          data->member_str("requested") == std::string("1999-01-01"));
   }
   // A session id sent anyway is ignored (stateless).
   r = f.Post(Msg("ping"), kLoopback, {{"Mcp-Session-Id", "abc"}});
@@ -668,6 +679,12 @@ void TestInitialize() {
   r = f.Post(Msg("initialize", "1", "{}"));
   CHECK_EQ(Result(Body(r))->member_str("protocolVersion"),
            std::string("2025-06-18"));
+  // The modern version has no handshake: initialize never echoes it.
+  r = f.Post(Msg("initialize", "1", "{\"protocolVersion\":\"2026-07-28\"}"));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(Result(Body(r))->member_str("protocolVersion"),
+           std::string(mcp::kDefaultProtocolVersion));
+  CHECK(Result(Body(r))->find("resultType") == nullptr);  // legacy result
   // The version comes from the options when set.
   Fixture::Config config;
   config.version = "2.1.0 (test)";
@@ -2128,6 +2145,184 @@ void TestMediaJobs() {
   CHECK_EQ(f.service->tools().size(), kAllTools.size());
 }
 
+// --- Commit 4: the modern era (2026-07-28) ---------------------------------
+
+/// `params` with the modern `_meta` of `version` (plus `extra` members).
+std::string Modern(const std::string& version, const std::string& extra = {}) {
+  return "{" + (extra.empty() ? std::string() : extra + ",") +
+         "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"" + version +
+         "\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"claude-code\","
+         "\"version\":\"2.1.325\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}";
+}
+
+void TestModernEra() {
+  Fixture f;
+  const char* kVersion = "2026-07-28";
+  const std::vector<std::pair<std::string, std::string>> header = {
+      {"MCP-Protocol-Version", kVersion}, {"Mcp-Method", "server/discover"}};
+  // server/discover: supportedVersions (modern first, the legacy three),
+  // capabilities.tools, serverInfo in _meta, resultType, cache fields.
+  HttpResponse r = f.Post(Msg("server/discover", "\"d-1\"", Modern(kVersion)),
+                          kLoopback, header);
+  CHECK_EQ(r.status, 200);
+  {
+    const json::Value body = Body(r);
+    CHECK_EQ(body.member_str("id"), std::string("d-1"));
+    const json::Value* result = Result(body);
+    CHECK(result != nullptr);
+    if (result != nullptr) {
+      CHECK_EQ(result->member_str("resultType"), std::string("complete"));
+      const json::Value* versions = result->find("supportedVersions");
+      CHECK(versions != nullptr && versions->size() == 4);
+      if (versions != nullptr && versions->size() == 4) {
+        CHECK_EQ(versions->items()[0].str(), std::string(kVersion));
+        CHECK_EQ(versions->items()[3].str(), std::string("2025-03-26"));
+      }
+      const json::Value* caps = result->find("capabilities");
+      CHECK(caps != nullptr && caps->find("tools") != nullptr);
+      const json::Value* meta = result->find("_meta");
+      CHECK(meta != nullptr && meta->find(mcp::kMetaServerInfo) != nullptr);
+      if (meta != nullptr && meta->find(mcp::kMetaServerInfo) != nullptr) {
+        CHECK_EQ(meta->find(mcp::kMetaServerInfo)->member_str("name"),
+                 std::string("gufo-router"));
+        CHECK(!meta->find(mcp::kMetaServerInfo)->member_str("version").empty());
+      }
+      CHECK(result->find("serverInfo") == nullptr);  // only in _meta
+      CHECK(result->member_str("instructions").find("bild_erzeugen") !=
+            std::string::npos);
+      CHECK(result->find("ttlMs") != nullptr);
+      CHECK_EQ(result->member_str("cacheScope"), std::string("private"));
+    }
+  }
+  // Without _meta (a probe) it is answered too, as a legacy-shaped result.
+  r = f.Post(Msg("server/discover"));
+  CHECK_EQ(r.status, 200);
+  CHECK(Result(Body(r)) != nullptr &&
+        Result(Body(r))->find("supportedVersions") != nullptr);
+  // A user sees only its tools in the instructions.
+  auth::Rights text_only;
+  text_only.bereiche = {"text"};
+  f.AddUser("tex", "nutzer", text_only);
+  r = f.Post(Msg("server/discover", "1", Modern(kVersion)), kLan,
+             Fixture::Bearer(f.Token("tex")));
+  CHECK_EQ(r.status, 200);
+  {
+    const std::string text = Result(Body(r))->member_str("instructions");
+    CHECK(text.find("chat") != std::string::npos);
+    CHECK(text.find("bild_erzeugen") == std::string::npos);
+  }
+
+  // tools/list with modern _meta: resultType, serverInfo, cache fields.
+  r = f.Post(Msg("tools/list", "2", Modern(kVersion)), kLoopback,
+             {{"MCP-Protocol-Version", kVersion}, {"Mcp-Method", "tools/list"}});
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(ToolNames(r).size(), kAllTools.size());
+  {
+    const json::Value body = Body(r);  // kept alive for the pointer
+    const json::Value* result = Result(body);
+    CHECK(result != nullptr && result->member_str("resultType") == "complete");
+    CHECK(result != nullptr && result->find("ttlMs") != nullptr);
+    CHECK(result != nullptr && result->find("_meta") != nullptr);
+  }
+  // The same without _meta stays a legacy result.
+  r = f.Post(Msg("tools/list"));
+  CHECK(Result(Body(r))->find("resultType") == nullptr);
+  CHECK(Result(Body(r))->find("ttlMs") == nullptr);
+
+  // tools/call with modern _meta goes through: the tool result carries
+  // resultType and serverInfo beside content/structuredContent.
+  f.fake = [](const HttpRequest& req) -> std::optional<HttpResponse> {
+    if (req.path == "/v1/models") {
+      json::Value body = json::Value::object();
+      body["data"] = json::Value::array();
+      return JsonAnswer(200, body);
+    }
+    return std::nullopt;
+  };
+  r = f.Post(Msg("tools/call", "3",
+                 Modern(kVersion, "\"name\":\"modelle\",\"arguments\":{}")),
+             kLoopback,
+             {{"MCP-Protocol-Version", kVersion},
+              {"Mcp-Method", "tools/call"},
+              {"Mcp-Name", "modelle"}});
+  CHECK_EQ(r.status, 200);
+  {
+    const json::Value body = Body(r);
+    const json::Value* result = Result(body);
+    CHECK(result != nullptr);
+    if (result != nullptr) {
+      CHECK_EQ(result->member_str("resultType"), std::string("complete"));
+      CHECK(result->find("content") != nullptr);
+      CHECK(result->find("structuredContent") != nullptr);
+      CHECK(result->find("_meta") != nullptr);
+    }
+  }
+  CHECK(Has(f.seen, "/v1/models"));
+  // Mcp-Name with the Base64 sentinel decodes to the tool name.
+  r = f.Post(Msg("tools/call", "3",
+                 Modern(kVersion, "\"name\":\"modelle\",\"arguments\":{}")),
+             kLoopback, {{"Mcp-Name", "=?base64?bW9kZWxsZQ==?="}});
+  CHECK_EQ(r.status, 200);
+  CHECK(Result(Body(r)) != nullptr);
+  // A legacy _meta version (2025-11-25) is accepted, served legacy-shaped.
+  r = f.Post(Msg("tools/list", "4", Modern("2025-11-25")));
+  CHECK_EQ(r.status, 200);
+  CHECK(Result(Body(r))->find("resultType") == nullptr);
+
+  // An unknown _meta version: 400 with -32022, data.supported + requested.
+  r = f.Post(Msg("tools/list", "5", Modern("2024-01-01")));
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(RpcCode(r), mcp::kUnsupportedProtocolVersion);
+  {
+    const json::Value body = Body(r);
+    CHECK_EQ(body.member_double("id"), 5.0);
+    const json::Value* data = body.find("error")->find("data");
+    CHECK(data != nullptr && data->find("supported") != nullptr &&
+          data->find("supported")->size() == 4);
+    CHECK(data != nullptr &&
+          data->member_str("requested") == std::string("2024-01-01"));
+  }
+  r = f.Post(Msg("tools/list", "5", "{\"_meta\":{\"io.modelcontextprotocol/"
+                                     "protocolVersion\":7}}"));
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+
+  // Header and _meta must agree (-32020), as must Mcp-Method / Mcp-Name.
+  r = f.Post(Msg("tools/list", "6", Modern(kVersion)), kLoopback,
+             {{"MCP-Protocol-Version", "2025-11-25"}});
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(RpcCode(r), mcp::kHeaderMismatch);
+  CHECK(RpcMessage(r).find("MCP-Protocol-Version") != std::string::npos);
+  r = f.Post(Msg("tools/list", "6", Modern(kVersion)), kLoopback,
+             {{"Mcp-Method", "tools/call"}});
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(RpcCode(r), mcp::kHeaderMismatch);
+  r = f.Post(Msg("tools/call", "6",
+                 Modern(kVersion, "\"name\":\"modelle\",\"arguments\":{}")),
+             kLoopback, {{"Mcp-Name", "chat"}});
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(RpcCode(r), mcp::kHeaderMismatch);
+
+  // An unknown method of a modern request is 404 -32601 (legacy: 200).
+  r = f.Post(Msg("resources/list", "7", Modern(kVersion)));
+  CHECK_EQ(r.status, 404);
+  CHECK_EQ(RpcCode(r), mcp::kMethodNotFound);
+  r = f.Post(Msg("resources/list", "7"));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(RpcCode(r), mcp::kMethodNotFound);
+
+  // The gate stays in front: a modern request without a token is 401.
+  r = f.Post(Msg("server/discover", "8", Modern(kVersion)), kLan);
+  CHECK_EQ(r.status, 401);
+  // Version helpers.
+  CHECK(mcp::IsProtocolVersion("2026-07-28"));
+  CHECK(mcp::IsModernProtocolVersion("2026-07-28"));
+  CHECK(!mcp::IsLegacyProtocolVersion("2026-07-28"));
+  CHECK(mcp::IsLegacyProtocolVersion("2025-03-26"));
+  CHECK(!mcp::IsModernProtocolVersion("2025-11-25"));
+  CHECK(!mcp::IsProtocolVersion("2026-07-29"));
+}
+
 }  // namespace
 
 int main() {
@@ -2140,6 +2335,7 @@ int main() {
   TestChat();
   TestJobs();
   TestMediaJobs();
+  TestModernEra();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

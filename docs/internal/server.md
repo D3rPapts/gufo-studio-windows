@@ -1391,22 +1391,52 @@ hides tiles and menu entries of closed areas and goes to `/login/` on
 
 From 2.1 the router is an MCP server (Model Context Protocol, Streamable
 HTTP transport) so Claude Code, the Regie and other agents use its
-abilities as tools under their own token. Protocol versions 2025-03-26,
-2025-06-18 and 2025-11-25 with the `initialize` handshake: `initialize`
-answers the client's version when it is one of these, else 2025-06-18,
-with `capabilities.tools` and `serverInfo.name = "gufo-router"` (the
-build's version); `notifications/initialized` and every other
-notification are `202`; `ping` answers `{}`. One JSON-RPC 2.0 message per
-`POST /mcp` (a batch is `400 -32600`), answered as `application/json`;
-`GET` and `DELETE` are `405` (no server-initiated stream, no sessions:
-`Mcp-Session-Id` is never issued and ignored when sent); a body that is
-no `application/json` is `415`, an `Accept` without JSON `406`. A missing
-`MCP-Protocol-Version` header counts as 2025-03-26, an unknown one is
-`400` with a JSON-RPC error that lists the supported versions. Malformed
-JSON is `400 -32700`, a frame without `jsonrpc: "2.0"` or `method` `400
--32600`, an unknown method `200 -32601`, an unknown or invisible tool and
-bad arguments `200 -32602`, an exception `200 -32603`. The 2026-07-28 era
-(`server/discover`, per-request `_meta` version) is not spoken yet.
+abilities as tools under their own token. It is a dual-era server in the
+words of the 2026-07-28 specification (Versioning, "Backward Compatibility
+with Initialization-Based Versions"): it speaks the legacy protocol
+versions 2025-03-26, 2025-06-18 and 2025-11-25 with the `initialize`
+handshake and the modern version 2026-07-28 without one. One JSON-RPC 2.0
+message per `POST /mcp` (a batch is `400 -32600`), answered as
+`application/json`; `GET` and `DELETE` are `405` (no server-initiated
+stream, no sessions: `Mcp-Session-Id` is never issued and ignored when
+sent); a body that is no `application/json` is `415`, an `Accept` without
+JSON `406`. Malformed JSON is `400 -32700`, a frame without `jsonrpc:
+"2.0"` or `method` `400 -32600`, an unknown or invisible tool and bad
+arguments `200 -32602`, an exception `200 -32603`.
+
+- Legacy (a request without `_meta` version): `initialize` answers the
+  client's version when it is one of the three, else 2025-06-18 (the
+  modern version is never echoed: it has no handshake), with
+  `capabilities.tools` and `serverInfo.name = "gufo-router"` (the build's
+  version); `notifications/initialized` and every other notification are
+  `202`; `ping` answers `{}`; an unknown method is `200 -32601`. A
+  missing `MCP-Protocol-Version` header counts as 2025-03-26.
+- Modern (2026-07-28; the request carries
+  `params._meta["io.modelcontextprotocol/protocolVersion"]`): served
+  statelessly, every result gets `resultType: "complete"` and
+  `_meta["io.modelcontextprotocol/serverInfo"]`, `tools/list` the cache
+  fields `ttlMs` (5 min) and `cacheScope: "private"` (the list depends on
+  the user's areas). `server/discover` (which the specification makes
+  mandatory) answers `supportedVersions` (`2026-07-28, 2025-11-25,
+  2025-06-18, 2025-03-26`), `capabilities.tools`, the server info in
+  `_meta` and `instructions` that name the caller's tools; it is answered
+  without `_meta` too (a probe). An unknown method of a modern request is
+  `404 -32601` as that transport demands. The mirrored headers are
+  checked when sent: an `MCP-Protocol-Version` that differs from the
+  `_meta` version, or an `Mcp-Method`/`Mcp-Name` (Base64 sentinel
+  `=?base64?...?=` decoded) that differs from the body, is `400 -32020
+  HeaderMismatch`. Deviations from the letter of 2026-07-28: a request
+  without `Mcp-Method`/`Mcp-Name` or without
+  `io.modelcontextprotocol/clientCapabilities` is served, not refused
+  (the endpoint needs no client capability, and dual-era probes send
+  none); `ping` and `initialize` stay answered.
+- Both: an unknown protocol version, in the header or in `_meta`, is
+  `400` with `-32022 UnsupportedProtocolVersion` and `data {supported:
+  [...], requested}`, so a dual-era client retries with a listed version
+  instead of falling back blindly (Claude Code 2.1.325 opens with
+  `server/discover` and the 2026-07-28 `_meta`). The router log notes
+  each `server/discover` or `initialize` as `event=mcp_client era=modern|
+  legacy client="<name/version>" user=<name>`.
 
 Who: `Authorization: Bearer gufo_...` of any role (admin, nutzer,
 dienst), loopback as admin and `auth = off`; a cookie session is `403
@@ -1419,15 +1449,28 @@ do), at `auth = off` as well. `[router] mcp = off` turns the endpoint off
 (`404`).
 
 Tools (`tools/list`, German names with an English sentence in each
-description, JSON schemas for input and output): `modelle` (every
-signed-in user), `chat` (area text, synchronous `/v1/chat/completions`
-without a stream), `bild_erzeugen`, `bild_bearbeiten` (bild),
-`video_erzeugen` (video), `stimme` (stimme), `musik` (musik), `objekt_3d`
-(3d), `hochskalieren` (bild or video; each a `POST /v1/jobs` around the
-matching endpoint, answering `{auftrag_id, status, position?, url}`),
-`auftrag_status`, `auftrag_liste`, `auftrag_abbrechen` and `ablage_lesen`
-(ablage; `/v1/jobs/{id}[/files/{name}]`). A user sees only the tools of
-its areas; the job tools exist only with `--jobs-dir`. The `model`
+description, JSON schemas for input and output), in the order of the
+list:
+
+| Tool | Area | Inner request | Answer |
+| --- | --- | --- | --- |
+| `modelle` | every signed-in user | `GET /v1/models` | `{modelle: [{id, modalitaet, geladen, ort}]}` |
+| `chat` | text | `POST /v1/chat/completions` (synchronous, no stream) | `{text, gedanken?, model, usage, finish_reason}` |
+| `bild_erzeugen` | bild | job around `/v1/images/generations` | job (`{auftrag_id, status, url, modell, position?, geschaetzt?}`) |
+| `bild_bearbeiten` | bild | job around `/v1/images/edits` (multipart) | job |
+| `video_erzeugen` | video (counts twice) | job around `/v1/videos` | job |
+| `stimme` | stimme | job around `/v1/audio/speech` | job |
+| `musik` | musik | job around `/v1/audio/music` | job |
+| `objekt_3d` | 3d | job around `/v1/3d/generations` | job |
+| `hochskalieren` | bild or video (by file type) | job around `/v1/images/upscale` or `/v1/videos/upscale` | job |
+| `auftrag_status` | ablage | `GET /v1/jobs/{id}` | the job view (`status`, `fortschritt`, `dateien`, ...) |
+| `auftrag_liste` | ablage | `GET /v1/jobs?limit=&status=&kind=&q=` | `{auftraege: [...]}` |
+| `auftrag_abbrechen` | ablage | `GET` then `DELETE /v1/jobs/{id}` | `{auftrag_id, status, geloescht}` |
+| `ablage_lesen` | ablage | `GET /v1/jobs/{id}` (+ `/files/{name}` when embedding) | `{auftrag_id, name, url, content_type, bytes, eingebettet}` + link or image/audio block |
+
+A job tool submits `POST /v1/jobs` (which itself needs the ablage area)
+and answers the job id. A user sees only the tools of its areas; the job
+tools exist only with `--jobs-dir`. The `model`
 field of a tool carries the preset's default and names the preset's
 models of that modality in its description (no `enum`: a model the user
 may not use is the gate's `403 model_forbidden` at call time). Files

@@ -7,9 +7,14 @@
 // use the router's abilities as tools. Stateless: one JSON-RPC 2.0 message
 // per POST, answered as application/json; no sessions (Mcp-Session-Id is
 // never issued and ignored), no server-initiated stream (GET and DELETE
-// are 405). Legacy handshake (protocol versions 2025-03-26, 2025-06-18 and
-// 2025-11-25): `initialize`, `notifications/initialized` (202), `ping`,
-// `tools/list`, `tools/call`.
+// are 405). Dual-era (spec 2026-07-28, Versioning -> "Backward
+// Compatibility with Initialization-Based Versions"): the legacy handshake
+// (protocol versions 2025-03-26, 2025-06-18 and 2025-11-25: `initialize`,
+// `notifications/initialized` (202), `ping`, `tools/list`, `tools/call`)
+// and the modern era 2026-07-28 (no handshake, no sessions: every request
+// carries its version in `params._meta["io.modelcontextprotocol/
+// protocolVersion"]` and the `MCP-Protocol-Version` header, the server
+// answers `server/discover`; Commit 4, see Rpc in mcp.cpp).
 //
 // The gate runs first (Route::Kind::kMcp): any bearer token (admin, nutzer,
 // dienst), loopback as admin and auth = off may call it; a cookie session
@@ -59,22 +64,50 @@
 
 namespace gufo::router::mcp {
 
-/// Protocol versions answered by `initialize` (the client's when it is one
-/// of these, else kDefaultProtocolVersion) and accepted in the
-/// MCP-Protocol-Version header (a missing header counts as the oldest).
-inline constexpr std::string_view kProtocolVersions[] = {
+/// The legacy protocol versions (`initialize` handshake; spec 2025-03-26
+/// .. 2025-11-25): `initialize` answers the client's when it is one of
+/// these, else kDefaultProtocolVersion (Lifecycle -> Version Negotiation).
+inline constexpr std::string_view kLegacyProtocolVersions[] = {
     "2025-03-26", "2025-06-18", "2025-11-25"};
 inline constexpr std::string_view kDefaultProtocolVersion = "2025-06-18";
+/// The modern era (spec 2026-07-28, Versioning -> Terminology: "protocol
+/// versions that convey version, identity, and capabilities as per-request
+/// metadata"): no handshake, the version in every request's `_meta`.
+inline constexpr std::string_view kModernProtocolVersion = "2026-07-28";
+/// Every version the endpoint speaks, modern first: what the
+/// MCP-Protocol-Version header and `_meta` may carry and the `supported`
+/// list of the -32022 error (a missing header counts as the oldest legacy
+/// version, as 2026-07-28 Streamable HTTP -> Protocol Version Header
+/// allows for servers that support clients before 2025-06-18).
+inline constexpr std::string_view kProtocolVersions[] = {
+    "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"};
 inline constexpr const char* kServerName = "gufo-router";
 
-/// JSON-RPC 2.0 error codes the endpoint uses.
+/// The reserved `_meta` keys of 2026-07-28 (Base Protocol -> `_meta` ->
+/// "Per-request protocol fields" and "Per-response protocol fields").
+inline constexpr const char* kMetaProtocolVersion =
+    "io.modelcontextprotocol/protocolVersion";
+inline constexpr const char* kMetaClientInfo =
+    "io.modelcontextprotocol/clientInfo";
+inline constexpr const char* kMetaServerInfo =
+    "io.modelcontextprotocol/serverInfo";
+
+/// JSON-RPC 2.0 error codes the endpoint uses; -32020 and -32022 are the
+/// MCP-defined ones of 2026-07-28 (Base Protocol -> Error Codes:
+/// `HeaderMismatch`, `UnsupportedProtocolVersion`).
 inline constexpr int kParseError = -32700;
 inline constexpr int kInvalidRequest = -32600;
 inline constexpr int kMethodNotFound = -32601;
 inline constexpr int kInvalidParams = -32602;
 inline constexpr int kInternalError = -32603;
+inline constexpr int kHeaderMismatch = -32020;
+inline constexpr int kUnsupportedProtocolVersion = -32022;
 
+/// `version` is one of kProtocolVersions / kLegacyProtocolVersions /
+/// kModernProtocolVersion.
 [[nodiscard]] bool IsProtocolVersion(std::string_view version);
+[[nodiscard]] bool IsLegacyProtocolVersion(std::string_view version);
+[[nodiscard]] bool IsModernProtocolVersion(std::string_view version);
 
 /// One entry of the tool table.
 struct Tool {
@@ -159,6 +192,12 @@ private:
   [[nodiscard]] server::HttpResponse Rpc(const server::HttpRequest& req,
                                          const auth::Identity& who);
   [[nodiscard]] json::Value Initialize(const json::Value& params) const;
+  /// The modern era's `server/discover` result (2026-07-28, Server ->
+  /// Discovery: DiscoverResult) for `who`.
+  [[nodiscard]] json::Value Discover(const auth::Identity& who) const;
+  /// `{name, title, version}` of this server (serverInfo of `initialize`
+  /// and `_meta[kMetaServerInfo]` of every modern result).
+  [[nodiscard]] json::Value ServerInfo() const;
   [[nodiscard]] const Tool* FindTool(std::string_view name,
                                      const auth::Identity& who) const;
   [[nodiscard]] bool Visible(const Tool& tool,
