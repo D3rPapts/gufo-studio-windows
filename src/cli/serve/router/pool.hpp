@@ -337,6 +337,91 @@ struct PoolFallbackInput {
 inline constexpr const char* kPriorityHeader = "X-Gufo-Priority";
 inline constexpr int kPriorityMax = 9;
 
+/// The raw JSON text of the top-level member `key` of an object body
+/// ("7", "\"7\"", "null", "{...}"), or nullopt when the body is not an
+/// object or has no such member at depth 0. One pass over the text, no
+/// allocation: the front reads a request's "priority" without parsing
+/// a large body, and a key inside a string or a nested object (a chat
+/// text mentioning "priority") never counts.
+[[nodiscard]] inline std::optional<std::string_view> TopLevelMemberText(
+    std::string_view body, std::string_view key) {
+  std::size_t i = 0;
+  const auto skip_ws = [&] {
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i])))
+      ++i;
+  };
+  // A JSON string from body[i] == '"': the index past its closing quote.
+  const auto skip_string = [&]() -> bool {
+    if (i >= body.size() || body[i] != '"')
+      return false;
+    for (++i; i < body.size(); ++i) {
+      if (body[i] == '\\') {
+        ++i;
+      } else if (body[i] == '"') {
+        ++i;
+        return true;
+      }
+    }
+    return false;
+  };
+  // Any value from body[i]: the index past it.
+  const auto skip_value = [&]() -> bool {
+    skip_ws();
+    if (i >= body.size())
+      return false;
+    if (body[i] == '"')
+      return skip_string();
+    if (body[i] == '{' || body[i] == '[') {
+      int depth = 0;
+      for (; i < body.size(); ++i) {
+        if (body[i] == '"') {
+          if (!skip_string())
+            return false;
+          --i;
+        } else if (body[i] == '{' || body[i] == '[') {
+          ++depth;
+        } else if (body[i] == '}' || body[i] == ']') {
+          if (--depth == 0) {
+            ++i;
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    while (i < body.size() && body[i] != ',' && body[i] != '}' &&
+           !std::isspace(static_cast<unsigned char>(body[i])))
+      ++i;
+    return true;
+  };
+  skip_ws();
+  if (i >= body.size() || body[i] != '{')
+    return std::nullopt;
+  ++i;
+  while (true) {
+    skip_ws();
+    if (i >= body.size() || body[i] == '}')
+      return std::nullopt;
+    const std::size_t key_begin = i;
+    if (!skip_string())
+      return std::nullopt;
+    const std::string_view found = body.substr(key_begin + 1, i - key_begin - 2);
+    skip_ws();
+    if (i >= body.size() || body[i] != ':')
+      return std::nullopt;
+    ++i;
+    skip_ws();
+    const std::size_t value_begin = i;
+    if (!skip_value())
+      return std::nullopt;
+    if (found == key)
+      return body.substr(value_begin, i - value_begin);
+    skip_ws();
+    if (i < body.size() && body[i] == ',')
+      ++i;
+  }
+}
+
 /// " 7 " -> 7; nullopt for anything but an integer 0..kPriorityMax.
 [[nodiscard]] inline std::optional<int> PriorityOfText(std::string_view text) {
   while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
