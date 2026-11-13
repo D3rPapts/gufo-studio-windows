@@ -2176,6 +2176,95 @@ void TestPoolPullOldPartner() {
   CHECK(h.queue->PoolQueueStatus().find("partner")->is_null());
 }
 
+void TestPoolPinLocal() {
+  // A job submitted with X-Gufo-Pool: local (the access gate sets it for
+  // a user without the pool right) stays on this router: never handed
+  // out on /router/pool/pull, runs with side local, keeps the pin over a
+  // requeue and a restart; the owner comes from X-Gufo-User.
+  Harness h("pin-local", false);
+  h.capabilities = CapsB;
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const auto submit = [&h](const std::string& body, bool pin,
+                           const std::string& user) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/v1/jobs";
+    request.body = body;
+    request.headers.emplace_back("Content-Type", "application/json");
+    if (pin)
+      request.headers.emplace_back(jobs::kPoolSideHeader, "local");
+    if (!user.empty())
+      request.headers.emplace_back("X-Gufo-User", user);
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer.has_value());
+    if (answer && answer->status != 202)
+      std::cerr << "submit: HTTP " << answer->status << " " << answer->body
+                << "\n";
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  const std::string first =
+      submit(ImageJob("SLOW first"), false, "").member_str("id");
+  h.WaitFor(first, "in_progress");
+  json::Value pinned = submit(
+      ImageJob("pinned second", R"(,"metadata":{"nutzer":"fremd","titel":"t"})"),
+      true, "tim");
+  const std::string second = pinned.member_str("id");
+  CHECK(pinned.member_str("pinned") == "local");
+  CHECK(pinned.find("metadata")->member_str("nutzer") == "tim");  // header wins
+  CHECK(pinned.find("metadata")->member_str("titel") == "t");
+  const std::string third = submit(ImageJob("free third"), false, "").member_str("id");
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + third).body).find("pinned") == nullptr);
+  const auto pull = [&h] {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body = R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":)"
+                   R"({"models":{"qwen-image":{"placement":"pool","loras":[]}}}})";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  // The partner gets the free job, never the pinned one.
+  CHECK(pull().member_str("job") == third);
+  CHECK(pull().find("job")->is_null());
+  h.api->release = true;  // the SLOW first job ends, the runner takes second
+  h.WaitFor(second, "completed");
+  CHECK(h.api->SideOf("pinned second") == "local");
+  // The pin survives a restart of the queue (jobs.json).
+  h.queue->Stop();
+  h.Open(false);
+  json::Value view = json::parse(h.Call("GET", "/v1/jobs/" + second).body);
+  CHECK(view.member_str("pinned") == "local");
+  CHECK(view.find("metadata")->member_str("nutzer") == "tim");
+  // Only the partner could run it (a LoRA this router lacks): refused.
+  Harness g("pin-local-refused", false);
+  g.capabilities = CapsA;
+  g.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  g.partner_name = "http://10.0.0.2:8081";
+  g.relay = [](const HttpRequest&, std::chrono::milliseconds,
+               std::chrono::milliseconds,
+               std::string*) -> std::optional<HttpResponse> {
+    return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
+  };
+  g.Open(true);
+  HttpRequest request;
+  request.method = "POST";
+  request.path = "/v1/jobs";
+  request.body = LoraImageJob("needs winkel", "winkel");
+  request.headers.emplace_back("Content-Type", "application/json");
+  request.headers.emplace_back(jobs::kPoolSideHeader, "local");
+  const auto refused = g.queue->Handle(request);
+  CHECK(refused && refused->status == 400);
+  CHECK(refused && json::parse(refused->body).find("error")->member_str("code") ==
+                       "pool_not_allowed");
+  request.headers.pop_back();
+  const auto allowed = g.queue->Handle(request);
+  CHECK(allowed && allowed->status == 202);
+}
+
 void TestPoolPullOwner() {
   // Router B: POST /router/pool/pull hands out the oldest queued job the
   // requester can run, never one a runner took, never twice, not one
@@ -2757,6 +2846,7 @@ int main() {
   TestPoolPullBindAddress();
   TestPoolWaitTakeover();
   TestPoolPullWaitingRequester();
+  TestPoolPinLocal();
   TestPriorityOrder();
   TestPriorityFile();
   TestPoolPullPriority();

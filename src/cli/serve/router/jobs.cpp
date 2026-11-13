@@ -30,6 +30,7 @@
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/proxy.hpp"
+#include "src/cli/serve/router/strings.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::router::jobs {
@@ -81,6 +82,10 @@ struct JobQueue::Job {
   std::string pulled_by;
   /// X-Gufo-Pool for the job's requests ("local", "remote", "" = any).
   std::string side;
+  /// Submitted with X-Gufo-Pool: local (a user without the pool right,
+  /// 2.0.3): runs here only, never handed to the partner; survives a
+  /// requeue and a restart.
+  bool pin_local{false};
   /// 0..kPriorityMax, higher runs first (with created_at the run order).
   int priority{0};
   std::atomic<bool> cancel{false};
@@ -175,13 +180,6 @@ bool ValidJobId(std::string_view id) {
     if (!std::isxdigit(static_cast<unsigned char>(c)))
       return false;
   return true;
-}
-
-std::string Lower(std::string_view text) {
-  std::string out(text);
-  for (char& c : out)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return out;
 }
 
 bool ValidHostName(std::string_view host) {
@@ -1779,14 +1777,24 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
           options_.models.end())
     return Err(404, "Not Found", "unknown model '" + job->model + "'",
                "model_not_found");
+  // X-Gufo-Pool: local on the submit (the access gate sets it for a user
+  // without the pool right): the job stays on this machine for good.
+  job->pin_local = PoolSideOf(request.header(kPoolSideHeader)) == "local";
+  if (job->pin_local)
+    job->side = "local";
   if (needs_model) {
     // Neither router can run it (model placed remote on both, a LoRA no
     // machine has): say so now instead of failing the job later.
     json::Value refusal;
-    SideFor(*job, &refusal);
+    const std::string side = SideFor(*job, &refusal);
     if (!refusal.is_null())
       return Err(400, "Bad Request", refusal.member_str("message"),
                  refusal.member_str("code"));
+    if (job->pin_local && side == "remote")
+      return Err(400, "Bad Request",
+                 "only the partner router can run this job, but this user "
+                 "may not use the partner (pool = aus)",
+                 "pool_not_allowed");
   }
   if (const json::Value* metadata = body.find("metadata");
       metadata != nullptr && !metadata->is_null()) {
@@ -1795,6 +1803,15 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
                  "metadata must be a JSON object of at most 16 KiB",
                  "invalid_metadata");
     job->metadata = *metadata;
+  }
+  // The owner (2.0.3): the access gate names the user on every request
+  // it lets through (X-Gufo-User, a client's own copy is dropped there);
+  // the partner's relays carry the entry router's user the same way.
+  if (const std::string owner = request.header("X-Gufo-User");
+      !owner.empty()) {
+    if (!job->metadata.is_object())
+      job->metadata = json::Value::object();
+    job->metadata["nutzer"] = owner;
   }
   if (const json::Value* webhook = body.find("webhook_url");
       webhook != nullptr && !webhook->is_null()) {
@@ -2528,6 +2545,8 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   else
     view["running_on"] = "local";
   view["pool_wait"] = pool_state == "wait";
+  if (job.pin_local)
+    view["pinned"] = "local";
   view["priority"] = static_cast<long long>(job.priority);
   view["created_at"] = job.created_at;
   view["started_at"] =
@@ -2612,6 +2631,7 @@ json::Value JobQueue::RecordLocked(const Job& job) const {
   record["idempotency_key"] = job.idempotency_key;
   record["request_hash"] = job.request_hash;
   record["priority"] = static_cast<long long>(job.priority);
+  record["pin_local"] = job.pin_local;
   record["created_at"] = job.created_at;
   record["started_at"] = job.started_at;
   record["completed_at"] = job.completed_at;
@@ -2700,6 +2720,11 @@ void JobQueue::Load() {
         static_cast<long long>(record.member_double("created_at", 0));
     // A file written before 2.0.3 has no priority: normal.
     job->priority = PriorityOfView(record);
+    if (const json::Value* pin = record.find("pin_local");
+        pin != nullptr && pin->is_bool())
+      job->pin_local = pin->as_bool();
+    if (job->pin_local)
+      job->side = "local";
     job->started_at =
         static_cast<long long>(record.member_double("started_at", 0));
     job->completed_at =
@@ -3096,6 +3121,8 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
     for (const auto& [job, waiting] : candidates) {
       if (job->path == kConcatPath || job->cancel.load())
         continue;  // runs on this router's ffmpeg
+      if (job->pin_local)
+        continue;  // its user may not use the partner
       // Only a model this router has in the pool can be moved: the
       // request runs through the pool decision with X-Gufo-Pool: remote.
       const json::Value* entry = models->find(job->model);
@@ -3485,7 +3512,7 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->progress = -1;
           job->preview_id.clear();
           job->pulled_by.clear();
-          job->side.clear();
+          job->side = job->pin_local ? "local" : "";
           InsertPendingLocked(job, /*front=*/true);
           PersistLocked();
           requeued = true;
