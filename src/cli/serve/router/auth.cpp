@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/strings.hpp"
 #include "src/core/crypto/sha256.hpp"
 
@@ -218,6 +219,28 @@ std::string SessionCookie(std::string_view id, long long max_age) {
 
 std::string RequestAddress(const HttpRequest& req) {
   return req.client_id.empty() ? std::string("?") : req.client_id;
+}
+
+/// The headers that carry an identity the gate (or the partner) sets:
+/// never from a client.
+bool IsIdentityHeader(std::string_view name) {
+  const auto equals = [name](std::string_view known) {
+    if (name.size() != known.size())
+      return false;
+    for (std::size_t i = 0; i < name.size(); ++i)
+      if (std::tolower(static_cast<unsigned char>(name[i])) !=
+          std::tolower(static_cast<unsigned char>(known[i])))
+        return false;
+    return true;
+  };
+  return equals(kUserHeader) || equals(kRightsHeader) ||
+         equals(kInternalHeader) || equals(kPoolKeyHeader);
+}
+
+void DropIdentityHeaders(HttpRequest* req) {
+  std::erase_if(req->headers, [](const auto& header) {
+    return IsIdentityHeader(header.first);
+  });
 }
 
 const char* kDefaultFilterWords =
@@ -1089,6 +1112,10 @@ Route Classify(const HttpRequest& req) {
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||
       p.starts_with("/v1/names/") || p == "/v1/systemone")
     return set(Route::Kind::kAnyUser);
+  // Introspection without a model names nothing to load: any user.
+  if ((p == "/props" || p == "/v1/slots" || p == "/slots") &&
+      req.query_param("model").empty())
+    return set(Route::Kind::kAnyUser);
   // Generation endpoints by prefix.
   struct Prefix {
     const char* prefix;
@@ -1505,10 +1532,11 @@ Identity Gate::Identify(const HttpRequest& req) {
       const std::string user = Lower(req.header(kUserHeader));
       if (!IsValidName(user)) {
         // The partner router itself (probe, capabilities, pull, the
-        // queue it reads for the shared order): trusted like the
-        // router's own calls, nothing is filtered for it.
+        // queue it reads for the shared order): trusted for work and
+        // jobs, nothing is filtered for it, but no admin (the pool
+        // secret opens no users API and no model control).
         who.name = "partner";
-        who.rolle = "admin";
+        who.rolle = "partner";
         return who;
       }
       // A relayed request for one of the partner's users: its rights as
@@ -1576,11 +1604,16 @@ bool Gate::CountDaily(const Identity& who, int weight, long long limit) {
   return true;
 }
 
-void Gate::RememberOwner(std::string_view key, std::string_view name) {
-  if (key.empty() || name.empty())
-    return;
+bool Gate::RememberOwner(std::string_view key, std::string_view name) {
+  if (key.empty() || name.empty() || name == "lokal")
+    return true;  // the router itself owns nothing
   const long long now = Now();
   const std::lock_guard<std::mutex> lock(mutex_);
+  if (const auto it = owners_.find(std::string(key));
+      it != owners_.end() && it->second.second >= now - 86400) {
+    // The first owner keeps it (a client may choose its prompt id).
+    return it->second.first == name;
+  }
   if (owners_.size() >= 20000) {
     for (auto it = owners_.begin(); it != owners_.end();)
       it = it->second.second < now - 86400 ? owners_.erase(it) : std::next(it);
@@ -1588,14 +1621,41 @@ void Gate::RememberOwner(std::string_view key, std::string_view name) {
       owners_.clear();  // a day's worth of ids is gone: unknown = open
   }
   owners_[std::string(key)] = {std::string(name), now};
+  return true;
 }
 
 std::optional<std::string> Gate::OwnerOf(std::string_view key) {
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto it = owners_.find(std::string(key));
-  if (it == owners_.end() || it->second.second < Now() - 86400)
+  if (it == owners_.end() || it->second.second < Now() - 86400 ||
+      it->second.first == "lokal")
     return std::nullopt;
   return it->second.first;
+}
+
+std::optional<HttpResponse> Gate::CsrfRefusal(const HttpRequest& req,
+                                              const Identity& who) {
+  if (req.method == "GET" || req.method == "HEAD" ||
+      (who.source != Identity::Source::kCookie &&
+       who.source != Identity::Source::kLoopback))
+    return std::nullopt;
+  if (Lower(req.header("Sec-Fetch-Site")) == "cross-site")
+    return AuthError(403, "Forbidden",
+                     "cross-site request refused (Sec-Fetch-Site)",
+                     "csrf_rejected");
+  const std::string origin = Lower(req.header("Origin"));
+  if (origin.empty() || origin == "null")
+    return std::nullopt;
+  std::string origin_host = origin;
+  if (const auto scheme = origin_host.find("://"); scheme != std::string::npos)
+    origin_host.erase(0, scheme + 3);
+  const std::string host = Lower(req.header("Host"));
+  if (host.empty() || origin_host != host)
+    return AuthError(403, "Forbidden",
+                     "cross-site request refused (Origin " + origin +
+                         " is not this router)",
+                     "csrf_rejected");
+  return std::nullopt;
 }
 
 long long Gate::DailyCount(std::string_view name) {
@@ -1697,8 +1757,22 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
   // The partner's relayed job requests run for the user the entry router
   // named: its rights were checked there, but which jobs are its own only
   // this router knows (the owner check below applies).
-  const bool pool_user =
-      who.source == Identity::Source::kPool && !who.admin();
+  const bool pool_user = who.relayed_user();
+  if (who.partner_router()) {
+    // The partner router: work, jobs, pull, status, never model control
+    // or bulk delete (it is no admin here).
+    if (route.kind == Route::Kind::kAdminControl &&
+        req.path != "/router/pool/pull")
+      return Forbidden("nur admin: Modelle laden/entladen, Platzierung "
+                       "(admin only; the partner router may only pull)",
+                       "forbidden");
+    if (route.kind == Route::Kind::kJobs && req.method == "DELETE" &&
+        req.path == "/v1/jobs")
+      return Forbidden("Sammel-Löschen nur admin (bulk delete is admin "
+                       "only)",
+                       "forbidden");
+    return std::nullopt;
+  }
   if (who.admin() ||
       (who.trusted() && !(pool_user && route.kind == Route::Kind::kJobs)))
     return std::nullopt;
@@ -1786,8 +1860,37 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
         if (!items.has_value())
           counts = 0;
       }
+      if (req.method == "POST" && req.path == "/prompt") {
+        // A client may choose its prompt id: never one that belongs to
+        // another user's history entry.
+        if (const auto id = TopLevelMemberText(req.body, "prompt_id");
+            id.has_value()) {
+          try {
+            const json::Value value = json::parse(*id);
+            if (value.is_string()) {
+              if (const auto owner = OwnerOf("prompt:" + value.str());
+                  owner.has_value() && *owner != who.name)
+                return AuthError(409, "Conflict",
+                                 "prompt_id belongs to another user",
+                                 "prompt_id_taken");
+            }
+          } catch (const std::exception&) {
+          }
+        }
+      }
       if (items.has_value()) {
         counts = 0;
+        // Every string of the graph as the floor, then the texts the plan
+        // names (prompts, speech, lyrics ...) task by task.
+        if (who.rechte.FilterOn(who.rolle)) {
+          if (const std::string word = filter_.Hit(req, true); !word.empty()) {
+            Log(req, who, "abgelehnt:content_filtered");
+            return AuthError(400, "Bad Request",
+                             "Der Prompt enthält ein gesperrtes Wort (the "
+                             "prompt contains a blocked word)",
+                             "content_filtered");
+          }
+        }
         for (const WorkItem& item : *items) {
           if (!who.rechte.AllowsArea(item.area))
             return Forbidden(AreaMessage(item.area), "forbidden");
@@ -1896,11 +1999,9 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
 }
 
 void Gate::Rewrite(HttpRequest* req, const Identity& who) {
-  std::erase_if(req->headers, [](const auto& header) {
-    const std::string name = Lower(header.first);
-    return name == Lower(kUserHeader) || name == Lower(kRightsHeader) ||
-           name == Lower(kInternalHeader) || name == Lower(kPoolKeyHeader);
-  });
+  DropIdentityHeaders(req);
+  if (who.partner_router())
+    return;  // its calls are answered here; it names no user
   req->headers.emplace_back(kUserHeader, who.name);
   req->headers.emplace_back(kRightsHeader,
                             "rolle=" + who.rolle + ";" + who.rechte.Encode());
@@ -1918,11 +2019,10 @@ void Gate::Rewrite(HttpRequest* req, const Identity& who) {
 
 void Gate::After(const HttpRequest& req, const Route& route,
                  const Identity& who, HttpResponse* response) {
-  const bool pool_user =
-      who.source == Identity::Source::kPool && !who.admin();
+  const bool pool_user = who.relayed_user();
   // Owners of ComfyUI prompts and direct video jobs come from the answer.
   if (req.method == "POST" && response->status < 300 && !who.name.empty() &&
-      route.kind == Route::Kind::kWork) {
+      who.name != "lokal" && route.kind == Route::Kind::kWork) {
     if (req.path == "/prompt" && !response->streaming_body) {
       try {
         const std::string id = json::parse(response->body).member_str("prompt_id");
@@ -2338,34 +2438,11 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
         return NotFound();
       if (route.kind == Route::Kind::kAdminPage)
         return std::nullopt;
-      if (req.method != "GET" && req.method != "HEAD") {
-        // A page from elsewhere in a browser on this machine must not
-        // reach the API (no-cors POST): a cross-site fetch, or an Origin
-        // that is not this router, is refused; a body must be JSON (a
-        // preflight stops a cross-site one before it is sent).
-        if (Lower(req.header("Sec-Fetch-Site")) == "cross-site")
-          return AuthError(403, "Forbidden",
-                           "cross-site request refused (Sec-Fetch-Site)",
-                           "csrf_rejected");
-        const std::string origin = Lower(req.header("Origin"));
-        const std::string host = Lower(req.header("Host"));
-        if (!origin.empty() && origin != "null") {
-          std::string origin_host = origin;
-          if (const auto scheme = origin_host.find("://");
-              scheme != std::string::npos)
-            origin_host.erase(0, scheme + 3);
-          if (host.empty() || origin_host != host)
-            return AuthError(403, "Forbidden",
-                             "cross-site request refused (Origin " + origin +
-                                 " is not this router)",
-                             "csrf_rejected");
-        }
-        if (!req.body.empty() &&
-            !Lower(req.header("Content-Type")).starts_with("application/json"))
-          return AuthError(415, "Unsupported Media Type",
-                           "the users API takes application/json",
-                           "json_required");
-      }
+      if (req.method != "GET" && req.method != "HEAD" && !req.body.empty() &&
+          !Lower(req.header("Content-Type")).starts_with("application/json"))
+        return AuthError(415, "Unsupported Media Type",
+                         "the users API takes application/json",
+                         "json_required");
       return UsersApi(req, who);
     }
     default:
@@ -2386,21 +2463,16 @@ HttpResponse Gate::Serve(
     // with auth = lan beside the real pool key); nothing else is touched.
     if (auto answer = AuthEndpoint(req, route, who))
       return std::move(*answer);
-    const bool spoofed = std::any_of(
-        req.headers.begin(), req.headers.end(), [](const auto& header) {
-          const std::string name = Lower(header.first);
-          return name == Lower(kUserHeader) || name == Lower(kRightsHeader) ||
-                 name == Lower(kInternalHeader);
-        });
-    if (!spoofed)
-      return next(req);
+    if (who.source == Identity::Source::kPool ||
+        who.source == Identity::Source::kInternal)
+      return next(req);  // the partner's relayed user, the router's own call
     HttpRequest copy = req;
-    std::erase_if(copy.headers, [](const auto& header) {
-      const std::string name = Lower(header.first);
-      return name == Lower(kUserHeader) || name == Lower(kRightsHeader) ||
-             name == Lower(kInternalHeader);
-    });
+    DropIdentityHeaders(&copy);
     return next(copy);
+  }
+  if (auto refusal = CsrfRefusal(req, who)) {
+    Log(req, who, "abgelehnt:csrf_rejected");
+    return std::move(*refusal);
   }
   if (auto answer = AuthEndpoint(req, route, who))
     return std::move(*answer);

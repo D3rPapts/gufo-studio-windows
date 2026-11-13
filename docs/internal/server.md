@@ -1053,8 +1053,10 @@ Order per request: free paths (`/health`, `/ready`, `/login/` and its
 files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
 router's own calls (jobs runner, figure check, ComfyUI adapter: a 256-bit
 per-process key, whatever address `--host` makes them arrive from), the
-partner (pool key: without `X-Gufo-User` it is the partner router itself,
-trusted like the router's own calls; with it, the relayed user),
+partner (pool key: without `X-Gufo-User` it is the partner router
+itself, trusted for work, jobs, `/router/pool/pull` and status but no
+admin: the users API answers it `404`, model control and bulk delete
+`403`; with `X-Gufo-User`, the relayed user),
 `Authorization: Bearer gufo_...` (API tokens), the `gufo_sitzung` cookie (HttpOnly,
 SameSite=Lax, 12 h; "stay signed in" 30 days, stored hashed in the users
 file so it survives a restart), and finally loopback as admin. Anything
@@ -1118,17 +1120,26 @@ Endpoints (JSON):
 
 Everyone else gets `404` on the users API and on `/verwaltung/`, so the
 pages are invisible from outside. Writes to the users API must come as
-`application/json` (`415 json_required`) and not cross-site: a request
-with `Sec-Fetch-Site: cross-site`, or an `Origin` that is not this
-router's `Host`, is `403 csrf_rejected`, so a web page opened on the
-router machine cannot create users through the loopback admin path.
+`application/json` (`415 json_required`). Every request that changes
+something (not GET/HEAD) from a browser identity, a cookie session or
+loopback-as-admin, must come from this router's own pages:
+`Sec-Fetch-Site: cross-site`, or an `Origin` that is not this router's
+`Host`, is `403 csrf_rejected` on any endpoint (users API, model
+control, generation, jobs), so a web page opened on the router machine
+cannot act through the loopback admin path or a signed-in session;
+tokens, the partner and the router's own calls are no browsers and pass.
 With `auth = off` the gate still drops a client's `X-Gufo-User`,
-`X-Gufo-Rights` and `X-Gufo-Internal` headers.
+`X-Gufo-Rights`, `X-Gufo-Internal` and `X-Gufo-Pool-Key` headers (not
+the partner's, which carry a checked pool key).
 
 ComfyUI graphs (`POST /prompt`) are resolved to the adapter's tasks
 before they run: each task is checked like a direct request (its area
-and model, the word filter on image, video and foley prompts) and all of
-them count against the daily limit (videos twice). `/props`,
+and model, the word filter on every text the plan carries: image, video
+and foley prompts, speech texts and instructions, dialogue lines, music
+tags and lyrics, and as the floor every string of the graph) and all of
+them count against the daily limit (videos twice). A client-chosen
+`prompt_id` that belongs to another user's history entry is `409
+prompt_id_taken`; the first owner of an id keeps it. `/props`,
 `/sdapi/v1/loras` and `/v1/slots` load the model they name and count as
 work of that model's area (text, bild, text). Beyond the job store the
 gate remembers for a day who submitted each ComfyUI prompt and each

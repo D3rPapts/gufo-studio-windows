@@ -234,6 +234,17 @@ struct Identity {
     return source == Source::kOff || source == Source::kLoopback ||
            source == Source::kInternal || source == Source::kPool;
   }
+  /// The partner router itself (pool key, no relayed user): trusted for
+  /// work, jobs, pull and status, but no admin (users API, model control
+  /// and bulk delete stay closed to it).
+  [[nodiscard]] bool partner_router() const {
+    return source == Source::kPool && rolle == "partner";
+  }
+  /// A user the partner relays (pool key + X-Gufo-User) who is no admin:
+  /// the own-jobs rule applies here as well.
+  [[nodiscard]] bool relayed_user() const {
+    return source == Source::kPool && rolle != "partner" && !admin();
+  }
   [[nodiscard]] const char* SourceName() const;
 };
 
@@ -408,9 +419,17 @@ public:
 
   /// Owners of things the job store does not know: ComfyUI prompts
   /// ("prompt:<id>") and direct video jobs ("video:<id>"), remembered
-  /// from the answers for a day (in memory; unknown = not checked).
-  void RememberOwner(std::string_view key, std::string_view name);
+  /// from the answers for a day (in memory; unknown = not checked). The
+  /// first owner wins: false when a live entry names someone else. The
+  /// placeholder "lokal" (the router itself) is never an owner.
+  bool RememberOwner(std::string_view key, std::string_view name);
   [[nodiscard]] std::optional<std::string> OwnerOf(std::string_view key);
+  /// Browser requests (a cookie session, loopback as admin) that change
+  /// something must come from this router's own pages: a cross-site
+  /// fetch or a foreign Origin is 403 csrf_rejected. Tokens, the partner
+  /// and the router's own calls are no browsers and pass. Nullopt = fine.
+  [[nodiscard]] static std::optional<server::HttpResponse> CsrfRefusal(
+      const server::HttpRequest& req, const Identity& who);
 
 private:
   struct SessionInfo {

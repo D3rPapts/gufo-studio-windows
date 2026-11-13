@@ -646,6 +646,20 @@ void TestAreasAndJobs() {
   r = f.Serve(Req("GET", "/v1/slots?model=qwen3.8-27b", "192.168.178.50", "",
                   {{"Cookie", tim}}));
   CHECK_EQ(r.status, 403);
+  // Without a model they load nothing: status reads for any user.
+  {
+    auth::Rights bild_only;
+    bild_only.bereiche = {"bild"};
+    f.AddUser("maler", "nutzer", "maler-pw", bild_only);
+    const std::string maler = f.LoginCookie("maler", "maler-pw");
+    for (const char* path : {"/props", "/v1/slots", "/slots"}) {
+      r = f.Serve(Req("GET", path, "192.168.178.50", "", {{"Cookie", maler}}));
+      CHECK_EQ(r.status, 200);
+    }
+    r = f.Serve(Req("GET", "/props?model=qwen3.5-4b", "192.168.178.50", "",
+                    {{"Cookie", maler}}));
+    CHECK_EQ(r.status, 403);
+  }
   // Admin control is admin only.
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", tim}}));
@@ -804,8 +818,33 @@ void TestPoolSecret() {
                                         {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK(who.source == auth::Identity::Source::kPool);
   CHECK_EQ(who.name, std::string("partner"));
-  CHECK_EQ(who.rolle, std::string("admin"));  // the partner router itself
+  CHECK_EQ(who.rolle, std::string("partner"));  // the partner router itself
   CHECK(who.trusted());
+  CHECK(who.partner_router());
+  CHECK(!who.admin());
+  // The pool secret opens no admin door: users API 404, model control
+  // and bulk delete 403; work and job reads pass.
+  r = f.Serve(Req("POST", "/router/users", "192.168.100.56",
+                  "{\"name\":\"x\",\"passwort\":\"abcd\"}",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("GET", "/router/zugriff", "192.168.100.56", "",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 404);
+  r = f.Serve(Req("POST", "/models/unload", "192.168.100.56", "{}",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/router/placement", "192.168.100.56", "{}",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("DELETE", "/v1/jobs?older_than=1", "192.168.100.56", "",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.100.56",
+                  "{\"model\":\"m\",\"prompt\":\"nackt\"}",
+                  {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.last.header("X-Gufo-User"), std::string(""));  // it names no user
   // Job requests the partner relays for a user: that user's jobs only
   // (the entry router cannot know this router's jobs); an admin sees all.
   const std::vector<std::pair<std::string, std::string>> as_tim = {
@@ -868,7 +907,22 @@ void TestPoolSecret() {
                   {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.seen.size(), std::size_t(1));
-  CHECK_EQ(f.last.header("X-Gufo-User"), std::string("partner"));
+  CHECK_EQ(f.last.header("X-Gufo-User"), std::string(""));
+  // With auth = off a partner relay keeps its user (the job's owner).
+  {
+    Fixture off(auth::Mode::kOff, "sehr-geheim");
+    HttpResponse o = off.Serve(Req("POST", "/v1/jobs", "192.168.100.56",
+                                   "{\"request\":{}}",
+                                   {{"X-Gufo-Pool-Key", "sehr-geheim"},
+                                    {"X-Gufo-User", "tim"},
+                                    {"X-Gufo-Rights", "rolle=nutzer"}}));
+    CHECK_EQ(o.status, 200);
+    CHECK_EQ(off.last.header("X-Gufo-User"), std::string("tim"));
+    CHECK_EQ(off.last.header("X-Gufo-Pool-Key"), std::string("sehr-geheim"));
+    o = off.Serve(Req("POST", "/v1/jobs", "192.168.178.50", "{\"request\":{}}",
+                      {{"X-Gufo-User", "tim"}}));
+    CHECK_EQ(off.last.header("X-Gufo-User"), std::string(""));
+  }
   // Generation requests of a relayed user are not checked again here.
   r = f.Serve(Req("POST", "/v1/images/generations", "192.168.100.56",
                   "{\"model\":\"m\",\"prompt\":\"nackt\"}", as_tim));
@@ -1032,6 +1086,18 @@ void TestFilterAndLimit() {
                         "{\"area\":\"stimme\",\"model\":\"tts\"}"),
                   {{"Cookie", kind2}}));
   CHECK_EQ(r.status, 200);
+  // Speech, dialogue and music texts of the plan are filtered too, and
+  // every string of the graph as the floor.
+  r = g.Serve(Req("POST", "/prompt", "192.168.178.50",
+                  graph("{\"area\":\"stimme\",\"model\":\"tts\",\"texts\":[\"sag nackt\"]}"),
+                  {{"Cookie", kind2}}));
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  r = g.Serve(Req("POST", "/prompt", "192.168.178.50",
+                  "{\"prompt\":{\"7\":{\"inputs\":{\"lyrics\":\"blood\"}}},"
+                  "\"tasks\":[{\"area\":\"musik\",\"model\":\"ace\",\"texts\":[\"pop\"]}]}",
+                  {{"Cookie", kind2}}));
+  CHECK_EQ(r.status, 400);
   {
     Fixture c;
     auth::Rights only_text;
@@ -1082,7 +1148,24 @@ void TestFilterAndLimit() {
                     {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 200);
     CHECK(c.gate->OwnerOf("prompt:p-tim") == std::optional<std::string>("tim"));
-    c.gate->RememberOwner("prompt:p-anna", "anna");
+    CHECK(c.gate->RememberOwner("prompt:p-anna", "anna"));
+    // The first owner keeps an id: neither a later answer nor a client's
+    // chosen prompt_id takes it over.
+    CHECK(!c.gate->RememberOwner("prompt:p-anna", "tim"));
+    CHECK(c.gate->OwnerOf("prompt:p-anna") == std::optional<std::string>("anna"));
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    "{\"prompt_id\":\"p-anna\",\"prompt\":{},\"tasks\":[]}",
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 409);
+    CHECK_EQ(ErrorCode(r), std::string("prompt_id_taken"));
+    r = c.Serve(Req("POST", "/prompt", "192.168.178.50",
+                    "{\"prompt_id\":\"p-tim\",\"prompt\":{},\"tasks\":[]}",
+                    {{"Cookie", cookie}}));
+    CHECK_EQ(r.status, 200);
+    CHECK(c.gate->OwnerOf("prompt:p-anna") == std::optional<std::string>("anna"));
+    // The router's own placeholder owns nothing: such a video stays open.
+    CHECK(c.gate->RememberOwner("video:video_lokal", "lokal"));
+    CHECK(!c.gate->OwnerOf("video:video_lokal").has_value());
     r = c.Serve(Req("GET", "/history", "192.168.178.50", "", {{"Cookie", cookie}}));
     CHECK_EQ(r.status, 200);
     {
@@ -1135,6 +1218,24 @@ void TestFilterAndLimit() {
     r = c.Serve(Req("GET", "/v1/videos/video_unknown", "192.168.178.50", "",
                     {{"Cookie", ben}}));
     CHECK_EQ(r.status, 200);  // unknown to the gate: open
+    r = c.Serve(Req("GET", "/v1/videos/video_lokal/content", "192.168.178.50", "",
+                    {{"Cookie", ben}}));
+    CHECK_EQ(r.status, 200);  // the router's own: open
+    // A video the router's own call makes (a job without an owner) is
+    // not remembered either.
+    c.next = [](const HttpRequest& req) {
+      HttpResponse out{.status = 200, .reason = "OK"};
+      out.body = req.path == "/v1/videos" ? "{\"id\":\"video_int\"}" : "{}";
+      return out;
+    };
+    r = c.Serve(Req("POST", "/v1/videos", "127.0.0.1",
+                    "{\"model\":\"h3\",\"prompt\":\"See\"}",
+                    {{"X-Gufo-Internal", c.gate->internal_key()}}));
+    CHECK_EQ(r.status, 200);
+    CHECK(!c.gate->OwnerOf("video:video_int").has_value());
+    r = c.Serve(Req("GET", "/v1/videos/video_int/content", "192.168.178.50", "",
+                    {{"Cookie", ben}}));
+    CHECK_EQ(r.status, 200);
     // Concat names job files: only own jobs (the job store's owner).
     r = c.Serve(Req("POST", "/v1/videos/concat", "192.168.178.50",
                     "{\"videos\":[\"/v1/jobs/j-anna/files/video.mp4\",\"/v1/jobs/j-tim/files/video.mp4\"]}",
@@ -1295,6 +1396,40 @@ void TestUsersApi() {
                    {"Host", "192.168.178.198:8081"}, {"Sec-Fetch-Site", "same-origin"}}));
   CHECK_EQ(r.status, 201);
   r = f.Serve(Req("DELETE", "/router/users/csrf?loeschen=1", "127.0.0.1"));
+  CHECK_EQ(r.status, 200);
+  // The guard covers every change a browser identity makes, not only the
+  // users API: model control and generation from a foreign page are
+  // refused for a session and for loopback-as-admin; a token is no
+  // browser and passes.
+  r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
+                  {{"Cookie", admin}, {"Origin", "http://boese.example"},
+                   {"Host", "192.168.178.198:8081"}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"Haus\"}",
+                  {{"Cookie", admin}, {"Sec-Fetch-Site", "cross-site"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
+                  {{"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/v1/jobs", "127.0.0.1", "{}",
+                  {{"Sec-Fetch-Site", "cross-site"}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("POST", "/router/users/film-56/tokens", "127.0.0.1",
+                  "{\"name\":\"csrf\"}"));
+  CHECK_EQ(r.status, 201);
+  const std::string csrf_token = json::parse(r.body).member_str("token");
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"Haus\"}",
+                  {{"Authorization", "Bearer " + csrf_token},
+                   {"Origin", "http://boese.example"}, {"Host", "192.168.178.198:8081"},
+                   {"Sec-Fetch-Site", "cross-site"}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/v1/models", "192.168.178.50", "",
+                  {{"Cookie", admin}, {"Sec-Fetch-Site", "cross-site"}}));
+  CHECK_EQ(r.status, 200);  // reads are never refused
+  r = f.Serve(Req("DELETE", "/router/users/film-56/tokens/csrf", "127.0.0.1"));
   CHECK_EQ(r.status, 200);
   r = f.Serve(Req("GET", "/verwaltung/", "192.168.178.50", "", {{"Cookie", admin}}));
   CHECK_EQ(r.status, 200);
