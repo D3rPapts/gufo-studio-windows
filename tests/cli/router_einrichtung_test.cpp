@@ -1,6 +1,9 @@
 // The setup assistant's router side (src/cli/serve/router/einrichtung.*):
 // the gate rules for /router/setup/* and /einrichtung/, the machine check,
-// the catalogue and the service's endpoints with a temp folder.
+// the catalogue, the preset built from the building blocks (against the
+// real einrichtung/ folder and, when python3 is known, against
+// einrichten.py --plan section by section like vergleich_preset.py), the
+// foreign-block keeper and the service's endpoints with a temp folder.
 
 #include <cstdlib>
 #include <filesystem>
@@ -69,6 +72,12 @@ std::string ReadFile(const std::filesystem::path& file) {
   if (text.starts_with("\xEF\xBB\xBF"))
     text.erase(0, 3);
   return text;
+}
+
+void WriteFile(const std::filesystem::path& file, const std::string& text) {
+  std::filesystem::create_directories(file.parent_path());
+  std::ofstream out(file, std::ios::binary | std::ios::trunc);
+  out << text;
 }
 
 json::Value LoadJson(const std::filesystem::path& file) {
@@ -165,6 +174,27 @@ struct Fixture {
     return set.substr(0, set.find(';'));
   }
 };
+
+/// LoadPreset checks that every `command` exists: the test's answers point
+/// the app and worker folders at `tmp` with an empty gufo.exe each.
+void PointWorkersAt(json::Value* antworten, const std::filesystem::path& tmp) {
+  json::Value& pfade = (*antworten)["pfade"];
+  for (const char* key : {"app", "app_35b", "app_3d", "app_moss", "app_d",
+                          "app_trellis2"}) {
+    const std::filesystem::path dir = tmp / key;
+    WriteFile(dir / "gufo.exe", "");
+    pfade[key] = dir.string();
+  }
+#if !GUFO_ROUTER_FORK_SERVE
+  // A build without `gufo serve omni` refuses a local [omni/...] section.
+  json::Value weg = json::Value::array();
+  if (const json::Value* old = antworten->find("modelle_weglassen"))
+    for (const json::Value& id : old->items())
+      weg.push_back(id);
+  weg.push_back("qwen3-omni-captioner");
+  (*antworten)["modelle_weglassen"] = std::move(weg);
+#endif
+}
 
 std::string CheckStatus(const json::Value& check_list, std::string_view id) {
   for (const json::Value& c : check_list.items())
@@ -272,6 +302,35 @@ void TestHelpers() {
   CHECK(!einrichtung::IsSafePath("srv/gufo"));
   CHECK(!einrichtung::IsSafePath("/srv/../etc"));
 #endif
+  CHECK_EQ(einrichtung::ParentOf("C:\\gufo\\2.0.3\\router"), "C:\\gufo\\2.0.3");
+  CHECK_EQ(einrichtung::ParentOf("C:\\gufo\\"), "C:\\");
+  CHECK_EQ(einrichtung::ParentOf("C:\\gufo"), "C:\\");
+  CHECK_EQ(einrichtung::ParentOf("/srv/gufo/x"), "/srv/gufo");
+
+  const auto sections = einrichtung::PresetSections(
+      "# c\n[a/b]\nkey = v1\n\n[router]\nauth = lan\n# x = y\n");
+  CHECK_EQ(sections.size(), std::size_t{2});
+  CHECK_EQ(sections.at("a/b").at("key"), "v1");
+  CHECK_EQ(sections.at("router").at("auth"), "lan");
+
+  const std::vector<std::string> fremd = einrichtung::ForeignBlocks(
+      "# head\n"
+      "# baustein: router\n# start: x\n\n"
+      "# baustein: chat\n# modell: a\n[external/a]\nmodel = x\n\n"
+      "[external/mine]\ncommand = y\n\n"
+      "# --- kept from the previous preset (not managed by einrichten.py) ---\n"
+      "[external/old]\nmodel = z\n");
+  const std::string joined = [&] {
+    std::string out;
+    for (const std::string& line : fremd)
+      out += line + "\n";
+    return out;
+  }();
+  CHECK(joined.find("[external/mine]") != std::string::npos);
+  CHECK(joined.find("[external/old]") != std::string::npos);
+  CHECK(joined.find("[external/a]") == std::string::npos);
+  CHECK(joined.find("kept from") == std::string::npos);
+  CHECK(joined.starts_with("# head\n"));
 }
 
 void TestMachineCheck() {
@@ -318,6 +377,171 @@ void TestMachineCheck() {
   CHECK_EQ(CheckStatus(*out.find("pruefungen"), "zuteilung"), "warn");
 }
 
+void TestPlan() {
+  const json::Value katalog = LoadJson(kDir / "katalog.json");
+  json::Value beispiel = LoadJson(kDir / "antworten-beispiel.json");
+  CHECK(katalog.find("bausteine") != nullptr);
+  const std::filesystem::path tmp = TempDir();
+  PointWorkersAt(&beispiel, tmp);
+  // The same answers for einrichten.py below.
+  WriteFile(tmp / "antworten.json", beispiel.tojson());
+  einrichtung::Plan plan;
+  std::string error;
+  CHECK(einrichtung::BuildPlan(beispiel, katalog, kDir / "bausteine", &plan,
+                               &error));
+  if (!error.empty())
+    std::cerr << "  BuildPlan: " << error << "\n";
+  CHECK(!plan.modelle.empty());
+  CHECK(plan.preset_text.find("[external/qwen3.8-27b]") != std::string::npos);
+  CHECK(plan.preset_text.find("[external/qwen3.8-flash-next]") !=
+        std::string::npos);  // vorgabe_ram 128
+  CHECK(plan.preset_text.find("[external/qwen3.8-flash-next-q3]") ==
+        std::string::npos);
+  CHECK(plan.preset_text.find("[remote/qwen3.8-27b]") != std::string::npos);
+  CHECK(plan.preset_text.find("url = http://192.168.100.198:8081") !=
+        std::string::npos);
+  CHECK(plan.preset_text.find("--remote-allow 192.168.100.198") !=
+        std::string::npos);
+  CHECK(plan.preset_text.find("pool-wait-seconds =") == std::string::npos);
+  CHECK(plan.preset_text.find("--host 0.0.0.0") != std::string::npos);
+  const auto sections = einrichtung::PresetSections(plan.preset_text);
+  CHECK(sections.contains("router"));
+  if (sections.contains("router")) {
+    CHECK_EQ(sections.at("router").at("auth"), "lan");
+    CHECK_EQ(sections.at("router").at("auth-loopback"), "admin");
+  }
+  CHECK(sections.contains("external/qwen-image-2.1"));
+  if (sections.contains("external/qwen-image-2.1"))
+    CHECK(sections.at("external/qwen-image-2.1").at("lora").find(';') !=
+          std::string::npos);  // two LoRAs on one line
+  CHECK(!plan.lizenzen_offen.empty());  // nothing confirmed in the example
+  CHECK(!plan.partner_modelle.empty());
+  CHECK_EQ(plan.werte.at("preset"), "C:\\gufo\\2.0.3\\gufo-router.ini");
+  CHECK_EQ(plan.werte.at("pages"), "C:\\gufo\\2.0.3\\pages");
+  CHECK(plan.start_cmd.find("\"" + (tmp / "app").string() +
+                            "\\gufo.exe\" router --models-preset") !=
+        std::string::npos);
+  CHECK(plan.start_cmd.find("cd /d \"" + (tmp / "app").string() + "\"") !=
+        std::string::npos);
+  CHECK(plan.start_cmd.find("set GUFO_HOST_RESERVE_MIB=2048") !=
+        std::string::npos);
+  CHECK(plan.bericht.find("## Bausteine und Modelle") != std::string::npos);
+  CHECK(plan.bericht.find("[OFFEN]") != std::string::npos);
+
+  // The router itself accepts the text (the point of the parse probe).
+  WriteFile(tmp / "plan.ini", plan.preset_text);
+  std::vector<gufo::router::PresetModel> models;
+  gufo::router::RouterSection section;
+  CHECK(gufo::router::LoadPreset(tmp / "plan.ini", {}, &models, &error,
+                                 &section));
+  if (!error.empty())
+    std::cerr << "  LoadPreset: " << error << "\n";
+  CHECK_EQ(section.auth, "lan");
+  CHECK(models.size() >= plan.modelle.size() - 2);  // LoRAs have no section
+
+  // The same answers as einrichten.py sees them: section by section equal
+  // (keys and values; comments and the time stamp do not count).
+#ifdef GUFO_PYTHON3
+  {
+    const std::filesystem::path py_out = tmp / "py-plan.ini";
+    const std::filesystem::path py_log = tmp / "py-plan.log";
+    std::string cmd = "\"" GUFO_PYTHON3 "\" -X utf8 \"" +
+                      (kDir / "einrichten.py").string() + "\" --antworten \"" +
+                      (tmp / "antworten.json").string() +
+                      "\" --katalog \"" + (kDir / "katalog.json").string() +
+                      "\" --plan --preset-ausgabe \"" + py_out.string() +
+                      "\" > \"" + py_log.string() + "\" 2>&1";
+#ifdef _WIN32
+    cmd = "\"" + cmd + "\"";
+#endif
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0 || !std::filesystem::is_regular_file(py_out)) {
+      std::cerr << "  einrichten.py --plan did not run (rc " << rc
+                << "); python comparison skipped\n";
+    } else {
+      const auto py = einrichtung::PresetSections(ReadFile(py_out));
+      CHECK_EQ(py.size(), sections.size());
+      std::size_t same = 0;
+      for (const auto& [name, keys] : py) {
+        const auto it = sections.find(name);
+        if (it == sections.end()) {
+          std::cerr << "  only in python: [" << name << "]\n";
+          ++failures;
+          continue;
+        }
+        if (it->second == keys) {
+          ++same;
+          continue;
+        }
+        ++failures;
+        std::cerr << "  [" << name << "] differs\n";
+        for (const auto& [k, v] : keys)
+          if (!it->second.contains(k) || it->second.at(k) != v)
+            std::cerr << "    py  " << k << " = " << v << "\n    c++ "
+                      << (it->second.contains(k) ? it->second.at(k)
+                                                 : "(missing)")
+                      << "\n";
+        for (const auto& [k, v] : it->second)
+          if (!keys.contains(k))
+            std::cerr << "    c++ only " << k << " = " << v << "\n";
+      }
+      for (const auto& [name, keys] : sections)
+        if (!py.contains(name)) {
+          std::cerr << "  only in c++: [" << name << "]\n";
+          ++failures;
+        }
+      std::cerr << "  python comparison: " << same << " of " << py.size()
+                << " sections identical\n";
+      CHECK_EQ(same, py.size());
+    }
+  }
+#else
+  std::cerr << "  (no python3 known to the build: einrichten.py comparison "
+               "skipped)\n";
+#endif
+
+  // Switches: nur-dieser-rechner -> auth = off; 64 GB -> Flash-Next Q3;
+  // LoRAs left out -> no lora line; the optional line disappears.
+  json::Value a = beispiel;
+  a["ram_gb"] = 64;
+  a["router"]["erreichbarkeit"] = "nur-dieser-rechner";
+  a["modelle_weglassen"] = json::parse(
+      "[\"lora-anime-consistency\",\"lora-multiple-angles\",\"minimax-h3\"]");
+  CHECK(einrichtung::BuildPlan(a, katalog, kDir / "bausteine", &plan, &error));
+  const auto s2 = einrichtung::PresetSections(plan.preset_text);
+  CHECK_EQ(s2.at("router").at("auth"), "off");
+  CHECK(!s2.at("router").contains("auth-loopback"));
+  CHECK(s2.contains("external/qwen3.8-flash-next-q3"));
+  CHECK(!s2.contains("external/qwen3.8-flash-next"));
+  CHECK(!s2.at("external/qwen-image-2.1").contains("lora"));
+  CHECK(plan.preset_text.find("--host 127.0.0.1") != std::string::npos);
+
+  // Errors with einrichten.py's words.
+  json::Value bad = beispiel;
+  bad["ram_gb"] = 96;
+  CHECK(!einrichtung::BuildPlan(bad, katalog, kDir / "bausteine", &plan, &error));
+  CHECK_EQ(error, "ram_gb muss 64 oder 128 sein");
+  bad = beispiel;
+  bad["bausteine"] = json::parse("[\"chat\",\"kaffee\"]");
+  CHECK(!einrichtung::BuildPlan(bad, katalog, kDir / "bausteine", &plan, &error));
+  CHECK(error.starts_with("unbekannter Baustein 'kaffee'"));
+  bad = beispiel;
+  bad["modelle_optional"] = json::parse("[\"gibt-es-nicht\"]");
+  CHECK(!einrichtung::BuildPlan(bad, katalog, kDir / "bausteine", &plan, &error));
+  CHECK(error.starts_with("unbekanntes Modell 'gibt-es-nicht'"));
+  bad = beispiel;
+  bad["bausteine"] = json::parse("[\"chat\"]");
+  bad["modelle_optional"] = json::parse("[\"moss-image\"]");
+  CHECK(!einrichtung::BuildPlan(bad, katalog, kDir / "bausteine", &plan, &error));
+  CHECK(error.find("gehoert zum Baustein 'bilder'") != std::string::npos);
+  bad = json::parse("{\"rechner\":\"x\",\"ram_gb\":64,\"bausteine\":[\"chat\"],"
+                    "\"pfade\":{\"modelle\":\"C:\\\\m\",\"daten\":\"C:\\\\d\"}}");
+  CHECK(!einrichtung::BuildPlan(bad, katalog, kDir / "bausteine", &plan, &error));
+  CHECK_EQ(error, "pfade.app fehlt");
+  std::error_code ec;
+  std::filesystem::remove_all(tmp, ec);
+}
+
 void TestService() {
   const std::filesystem::path tmp = TempDir();
   Fixture f(auth::Mode::kOff);
@@ -327,6 +551,12 @@ void TestService() {
   options.port = 8098;
   options.users_unbound = true;
   options.gate = f.gate.get();
+  options.check_preset = [](const std::filesystem::path& file) {
+    std::vector<gufo::router::PresetModel> models;
+    std::string error;
+    return gufo::router::LoadPreset(file, {}, &models, &error) ? std::string()
+                                                                : error;
+  };
   einrichtung::SetupService service(options);
 
   // Catalogue and machine check.
@@ -346,7 +576,13 @@ void TestService() {
   r = service.Handle(Req("GET", "/router/setup/downloads", "127.0.0.1"));
   CHECK(r.has_value() && r->status == 501);
 
-  // Step 3: folders checked and created.
+  // The admin needs the data folder first (users file unknown).
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"chef\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "no_data_dir");
+
+  // Step 3: folders checked and created, the users file bound.
   const std::string modelle = (tmp / "modelle").string();
   const std::string daten = (tmp / "daten").string();
   const auto esc = [](std::string text) {
@@ -370,12 +606,173 @@ void TestService() {
     }
   }
   CHECK(std::filesystem::is_directory(tmp / "daten"));
+  CHECK_EQ(f.store->path().string(),
+           (tmp / "daten" / "nutzer" / "nutzer.json").string());
   r = service.Handle(Req("POST", "/router/setup/pruefen", "127.0.0.1",
                          "{\"pfade\":{\"modelle\":\"modelle\",\"daten\":\"" +
                              esc(daten) + "\"}}"));
   CHECK(r.has_value() && r->status == 400);
   CHECK_EQ(ErrorCode(*r), "invalid_path");
 
+  // The first admin: loopback only, once.
+  r = service.Handle(Req("POST", "/router/setup/admin", "192.168.1.5",
+                         "{\"name\":\"chef\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 404);
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"Chef!\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "invalid_name");
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"chef\",\"passwort\":\"abc\"}"));
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "invalid_password");
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"lokal\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "name_reserved");
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"Chef\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 201);
+  CHECK_EQ(Body(*r).member_str("name"), "chef");
+  CHECK_EQ(Body(*r).member_str("rolle"), "admin");
+  CHECK(std::filesystem::is_regular_file(tmp / "daten" / "nutzer" /
+                                         "nutzer.json"));
+  CHECK(f.store->HasAdmin());
+  CHECK(f.store->Verify("chef", "geheim").has_value());
+  r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                         "{\"name\":\"zwei\",\"passwort\":\"geheim\"}"));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "admin_exists");
+
+  // Preset: preview, licences, write, backup and kept sections.
+  json::Value antworten = LoadJson(kDir / "antworten-beispiel.json");
+  PointWorkersAt(&antworten, tmp);
+  json::Value& pfade = antworten["pfade"];
+  pfade["modelle"] = modelle;
+  pfade["daten"] = daten;
+  pfade["preset"] = (tmp / "daten" / "gufo-router.ini").string();
+  pfade["pages"] = (tmp / "pages").string();
+  const auto request = [&](bool schreiben) {
+    json::Value body = json::Value::object();
+    body["antworten"] = antworten;
+    body["schreiben"] = schreiben;
+    return Req("POST", "/router/setup/preset", "127.0.0.1", body.dump());
+  };
+  r = service.Handle(request(false));
+  CHECK(r.has_value() && r->status == 200);
+  if (r.has_value() && r->status != 200)
+    std::cerr << "  " << r->body << "\n";
+  {
+    const json::Value body = Body(*r);
+    CHECK(body.member_str("preset_text").find("[external/qwen3.8-27b]") !=
+          std::string::npos);
+    CHECK(!body.member_str("start_cmd").empty());
+    CHECK(!body.member_str("bericht").empty());
+    CHECK(body.find("lizenzen_offen") != nullptr &&
+          !body.find("lizenzen_offen")->empty());
+    CHECK(body.find("dateien_fehlend") != nullptr &&
+          !body.find("dateien_fehlend")->empty());  // nothing under tmp
+    CHECK(body.find("geschrieben") != nullptr &&
+          body.find("geschrieben")->empty());
+  }
+  CHECK(!std::filesystem::exists(tmp / "daten" / "gufo-router.ini"));
+  r = service.Handle(request(true));
+  CHECK(r.has_value() && r->status == 409);
+  CHECK_EQ(ErrorCode(*r), "licenses_open");
+  CHECK(Body(*r).find("lizenzen_offen") != nullptr);
+  antworten["lizenzen_bestaetigt"] = json::parse("[\"alle\"]");
+  r = service.Handle(request(true));
+  CHECK(r.has_value() && r->status == 200);
+  if (r.has_value() && r->status != 200) {
+    std::cerr << "  " << r->body << "\n";
+    return;
+  }
+  const std::filesystem::path preset = tmp / "daten" / "gufo-router.ini";
+  CHECK(std::filesystem::is_regular_file(preset));
+  CHECK(std::filesystem::is_regular_file(tmp / "daten" / "start-router.cmd"));
+  CHECK(std::filesystem::is_regular_file(tmp / "daten" / "einrichtung.json"));
+  CHECK(std::filesystem::is_regular_file(tmp / "daten" /
+                                         "einrichtung-bericht.md"));
+  CHECK(std::filesystem::is_directory(tmp / "daten" / "jobs" / "objekt"));
+  CHECK(std::filesystem::is_directory(tmp / "daten" / "voices"));
+  {
+    const json::Value body = Body(*r);
+    CHECK(body.find("geschrieben") != nullptr &&
+          body.find("geschrieben")->size() >= 4);
+    CHECK(body.member_str("bericht").find("- Preset: ") != std::string::npos);
+    const json::Value stand = LoadJson(tmp / "daten" / "einrichtung.json");
+    CHECK(stand.find("antworten") != nullptr);
+    CHECK_EQ(stand.find("antworten")->member_str("rechner"), "evo-56");
+    CHECK(!stand.find("modelle")->empty());
+  }
+  {
+    std::vector<gufo::router::PresetModel> models;
+    std::string error;
+    gufo::router::RouterSection section;
+    CHECK(gufo::router::LoadPreset(preset, {}, &models, &error, &section));
+    CHECK_EQ(section.auth, "lan");
+  }
+  // A section of the user's own survives the next write, after the blocks.
+  {
+    std::string text = ReadFile(preset);
+    // LoadPreset wants the command to exist: the dummy gufo.exe of `app`.
+    text += "\n[external/meins]\ncommand = " +
+            (tmp / "app" / "gufo.exe").string() + "\nmodel = C:\\x\\m.gguf\n";
+    WriteFile(preset, text);
+  }
+  r = service.Handle(request(true));
+  CHECK(r.has_value() && r->status == 200);
+  if (r.has_value() && r->status != 200)
+    std::cerr << "  " << r->body << "\n";
+  {
+    const std::string text = ReadFile(preset);
+    CHECK(text.find("[external/meins]") != std::string::npos);
+    CHECK(text.find("kept from the previous preset") != std::string::npos);
+    CHECK(text.find("[external/meins]") > text.find("[remote/"));
+    int backups = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp / "daten"))
+      if (entry.path().filename().string().find(".bak-") != std::string::npos)
+        ++backups;
+    CHECK_EQ(backups, 1);
+    std::vector<gufo::router::PresetModel> models;
+    std::string error;
+    CHECK(gufo::router::LoadPreset(preset, {}, &models, &error));
+    bool meins = false;
+    for (const auto& m : models)
+      meins = meins || m.id == "meins";
+    CHECK(meins);
+  }
+  // Paths outside the rules are refused before anything is written.
+  {
+    json::Value relative = antworten;
+    relative["pfade"]["daten"] = "daten";
+    relative["pfade"]["preset"] = "daten\\gufo-router.ini";
+    json::Value body = json::Value::object();
+    body["antworten"] = relative;
+    body["schreiben"] = true;
+    r = service.Handle(Req("POST", "/router/setup/preset", "127.0.0.1",
+                           body.dump()));
+    CHECK(r.has_value() && r->status == 400);
+    CHECK_EQ(ErrorCode(*r), "invalid_path");
+  }
+  // The parse probe stops a preset the router would refuse.
+  {
+    einrichtung::ServiceOptions strict = options;
+    strict.check_preset = [](const std::filesystem::path&) {
+      return std::string("[external/x] Unknown option: --bogus");
+    };
+    einrichtung::SetupService refusing(strict);
+    r = refusing.Handle(request(true));
+    CHECK(r.has_value() && r->status == 422);
+    CHECK_EQ(ErrorCode(*r), "preset_invalid");
+  }
+  // Bad input.
+  r = service.Handle(Req("POST", "/router/setup/preset", "127.0.0.1", "{"));
+  CHECK(r.has_value() && r->status == 400);
+  r = service.Handle(Req("POST", "/router/setup/preset", "127.0.0.1",
+                         "{\"antworten\":{\"rechner\":\"x\"}}"));
+  CHECK(r.has_value() && r->status == 400);
+  CHECK_EQ(ErrorCode(*r), "invalid_request");
   std::error_code ec;
   std::filesystem::remove_all(tmp, ec);
 }
@@ -384,6 +781,7 @@ int main() {
   TestClassifyAndGate();
   TestHelpers();
   TestMachineCheck();
+  TestPlan();
   TestService();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";

@@ -4271,6 +4271,15 @@ int RunRouter(std::span<const char* const> args) {
     setup_options.port = port;
     setup_options.users_unbound = einrichtung && preset_path.empty();
     setup_options.gate = state->gate.get();
+    setup_options.check_preset =
+        [models_dir](const std::filesystem::path& file) -> std::string {
+      std::vector<router::PresetModel> probe;
+      std::string error;
+      router::RouterSection section;
+      if (!router::LoadPreset(file, models_dir, &probe, &error, &section))
+        return error.empty() ? "preset does not parse" : error;
+      return "";
+    };
     state->setup = std::make_unique<router::einrichtung::SetupService>(
         std::move(setup_options));
     Logger::Info("router",

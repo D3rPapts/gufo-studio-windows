@@ -766,6 +766,15 @@ bool UserStore::Save(std::string* error) const {
   return SaveLocked(error);
 }
 
+bool UserStore::Relocate(std::filesystem::path file, std::string* error) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    file_ = std::move(file);
+    users_.clear();
+  }
+  return Load(error);
+}
+
 bool UserStore::empty() const {
   const std::lock_guard<std::mutex> lock(mutex_);
   return users_.empty();

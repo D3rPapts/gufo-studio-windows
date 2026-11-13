@@ -4,8 +4,9 @@
 // The setup assistant's router side (gufo-studio-windows 2.1, plan
 // EINRICHTUNG-ROUTER-PLAN-2026-11-13): the endpoints under /router/setup/
 // behind the gate (loopback or an admin session, else 404), the machine
-// check and the building-block catalogue. The preset written from the
-// blocks and the first admin account (C2), the downloads (C3) and the
+// check, the building-block catalogue, the preset written from the blocks
+// (a port of einrichtung/einrichten.py, which stays the reference and the
+// unattended tool) and the first admin account. The downloads (C3) and the
 // self-test (C5) come later. `gufo router --einrichtung` runs without a
 // preset: pages and this API only, nothing loads.
 
@@ -48,6 +49,54 @@ inline constexpr const char* kMinDriver = "32.0.32015.7029";
 /// (no UNC, no forward-slash root), `/...` elsewhere, no `..` segment.
 [[nodiscard]] bool IsSafePath(std::string_view path);
 
+/// Parent folder of a Windows or POSIX path by text (no filesystem call,
+/// so a test on Linux sees `C:\a\b` -> `C:\a` like einrichten.py).
+[[nodiscard]] std::string ParentOf(std::string_view path);
+
+/// Section -> key -> value of a preset text, comments and blanks skipped
+/// (vergleich_preset.py's `lies`).
+[[nodiscard]] std::map<std::string, std::map<std::string, std::string>>
+PresetSections(std::string_view text);
+
+/// What BuildPlan makes of the answers.
+struct Plan {
+  /// The answers with defaults applied (router.port, idle_seconds, ...).
+  json::Value antworten;
+  std::string preset_text;
+  std::string start_cmd;
+  std::string bericht;
+  /// Chosen model ids in catalogue order, the partner twins, the notes
+  /// ("x braucht y: mit aufgenommen").
+  std::vector<std::string> modelle;
+  std::vector<std::string> partner_modelle;
+  std::vector<std::string> hinweise;
+  /// Licences the answers have not confirmed (model ids).
+  std::vector<std::string> lizenzen_offen;
+  /// Files missing or of another size under pfade.modelle (catalogue
+  /// paths) and their bytes; data files missing under pfade.daten.
+  std::vector<std::string> dateien_fehlend;
+  long long bytes_fehlend{0};
+  long long bytes_da{0};
+  std::vector<std::string> daten_fehlend;
+  /// pfade.* keys whose gufo.exe is missing -> the models needing it.
+  std::map<std::string, std::vector<std::string>> worker_fehlend;
+  /// The filled placeholders (preset, pages, app, daten, zeit, ...).
+  std::map<std::string, std::string> werte;
+};
+
+/// Checks the answers (the messages of einrichten.py's fehler()), picks
+/// the models (required + RAM default + optional + dependencies), checks
+/// the files, fills the templates of `bausteine_dir` and builds the
+/// preset text, start-router.cmd and the report. Nothing is written.
+[[nodiscard]] bool BuildPlan(const json::Value& antworten,
+                             const json::Value& katalog,
+                             const std::filesystem::path& bausteine_dir,
+                             Plan* out, std::string* error);
+
+/// Lines of an existing preset that belong to no "# baustein:" block
+/// (einrichten.py's fremde_bloecke): kept at the end of a rewritten one.
+[[nodiscard]] std::vector<std::string> ForeignBlocks(std::string_view old);
+
 /// One result line of the machine check.
 struct CheckOptions {
   std::filesystem::path exe;  // gufo.exe of this router
@@ -71,9 +120,12 @@ struct ServiceOptions {
   auth::Gate* gate{nullptr};
   /// Live memory; MakeSystemMemoryProbe() when empty.
   std::function<SystemMemory()> memory;
+  /// Parses a preset file like the router at start (router::LoadPreset);
+  /// "" = valid, else the message. Set by the router.
+  std::function<std::string(const std::filesystem::path&)> check_preset;
 };
 
-/// /router/setup/{katalog,pruefen}; the gate has already
+/// /router/setup/{katalog,pruefen,preset,admin}; the gate has already
 /// refused everyone who is neither loopback nor admin.
 class SetupService {
 public:
@@ -93,10 +145,17 @@ private:
   [[nodiscard]] server::HttpResponse Pruefen(const server::HttpRequest& req);
   [[nodiscard]] server::HttpResponse PruefenPfade(
       const server::HttpRequest& req);
+  [[nodiscard]] server::HttpResponse Preset(const server::HttpRequest& req);
+  [[nodiscard]] server::HttpResponse Admin(const server::HttpRequest& req);
+  /// Binds the gate's users file to <preset dir>\nutzer\nutzer.json once
+  /// the paths are known (users_unbound only).
+  void BindUsers(const std::filesystem::path& preset);
 
   ServiceOptions options_;
   std::mutex mutex_;
   std::unique_ptr<MemoryProbe> probe_;
+  /// The preset path step 3 implied (pfade.preset or <daten>\gufo-router.ini).
+  std::filesystem::path preset_path_;
 };
 
 }  // namespace gufo::router::einrichtung

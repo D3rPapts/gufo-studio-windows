@@ -28,14 +28,14 @@ Alles Python 3.11, nur Standardbibliothek.
 | `{port}` `{host}` | Port; `0.0.0.0` bei `erreichbarkeit = heimnetz`, sonst `127.0.0.1` | | |
 | `{reserve}` `{idle_seconds}` `{webhook_allow}` | `GUFO_HOST_RESERVE_MIB`, `--sleep-idle-seconds`, `--jobs-webhook-allow` | 2048, 1800, 192.168.0.0/16 | |
 | `{comfy_dir?}` `{comfy_ffmpeg?}` `{names_file?}` `{pool_wait?}` `{lora_qwen_image?}` | optional: ist der Wert leer, fällt die ganze Zeile weg | | |
-| `{id}` | nur in `zweiter-rechner.ini`: Modell-ID je `[remote/…]`-Block | | |
+| `{id}` | nur in `zweiter-rechner.ini`: Abschnitts-ID je `[remote/…]`-Block (der lokale Abschnitt, z. B. `moss-music` für `moss-music-8b`) | | |
 
 Weitere Regeln der Vorlagen:
 
 - **Marker:** jeder Abschnitt beginnt mit `# baustein: <name>` und `# modell: <id>`. Daran erkennt `einrichten.py` seine Abschnitte beim Nachrüsten (eigene Abschnitte eines Nutzers bleiben erhalten und wandern ans Ende unter „kept from the previous preset“). **Achtung:** der Marker ist `#`, nicht `;` – `preset.cpp` kennt nur `#` als Kommentar; ein `;`-Marker wäre „expected key = value“ und der Router startet nicht.
 - **Schalter-Zeilen:** `#@<flag> key = value` wird nur übernommen, wenn das Flag aktiv ist. Aktiv sind `64`/`128` (RAM-Größe) und alle `schalter` aus den Antworten, die `true` sind. Heute genutzt: `#@stimmen_vorlage` für die `voice =`-Zeilen (Stimmen-Dateien unter `{daten}\voices\`).
 - **64/128 GB:** Die einzige gemessene Variante ist die Modellwahl Flash-Next **Q3 (Vorgabe 64 GB)** gegen **Q4 (Vorgabe 128 GB)** (`vorgabe_ram` im Katalog). Die Speicherwerte `expert-cache-bytes = 24 GB` und `cache-ram-bytes = off` sind für beide Größen gleich: so läuft es auf der .198 (64 GB) und auf der .56 (128 GB, gleiches Preset über `preset_fuer_56.py`). Für 128 GB gibt es keine eigene Messung mit größeren Caches; das Paketbeispiel (`examples\router.ini`, upstream) sagt „leave out expert-cache-bytes on a 128 GB machine“, das ist nicht von uns gemessen und deshalb nicht in der Vorlage. Gleiches gilt für `cache-ram-bytes` des 27B (1 GiB wegen RAM auf der .198; 4 GiB ließen 64 GB ~0,1 GB Luft).
-- **Router-Kopf:** Der Parser hat keinen `[router]`-Abschnitt (nur `[modalität/id]`), deshalb stehen Startzeile und Umgebung als `# start:` / `# start-opt:` / `# env:`-Kommentare in `router.ini`; `einrichten.py` baut daraus `start-router.cmd` (wie `start-router.ps1` der .198 bzw. `start-router-56.bat` aus `buendel_56.py`).
+- **Router-Kopf:** Der Parser kennt neben `[modalität/id]` nur den `[router]`-Abschnitt für Nutzer und Zugriff (2.0.3+; `router.ini` schreibt ihn aus `router.erreichbarkeit`: `heimnetz` = `auth = lan` + `auth-loopback = admin`, `nur-dieser-rechner` = `auth = off`), deshalb stehen Startzeile und Umgebung als `# start:` / `# start-opt:` / `# env:`-Kommentare in `router.ini`; `einrichten.py` baut daraus `start-router.cmd` (wie `start-router.ps1` der .198 bzw. `start-router-56.bat` aus `buendel_56.py`).
 
 ## antworten.json
 
@@ -86,4 +86,4 @@ python vergleich_preset.py --erzeugt plan.ini --ignorieren external/qwen3.5-4b,e
 - **„passt in 64 GB“** folgt der Plan-Tabelle (Flash-Next Q4 und H3 „nur-128“). Beide laufen auf der .198 (64 GB) – Q4 mit 24-GB-Cache und ~8,5 GB freiem Host-RAM beim Laden, H3 nur allein; die Begrenzung der Kombination Flash-Next Q4 + H3 (Plan 7) ist noch nicht im Skript.
 - **Nicht geprüft:** welche LM-Datei ACE-Step turbo ohne `--lm` lädt (beide aufgeführt); ob MOSS-Image die HF-Originale unter `text_encoder\` (16,8 GB) noch braucht; ob TTS-Worker ohne vorhandene `voice`-Datei starten (deshalb Schalter `stimmen_vorlage`).
 - **Im Baum, aber nicht im Katalog** (nicht im Produktions-Preset): alibaba-pai ControlNet, bosonai Higgs, wan21-vace, TRELLIS-image-large, ACE-Step/MOSS/TripoSG/TRELLIS-Originalordner, Mailputzer-GGUFs (llama-server).
-- **Noch nicht gebaut:** Router-Endpunkte `/router/setup/*`, Download mit Wiederaufnahme/SHA, Seite `/einrichtung/`, Nutzerverwaltung, Firewall-Regel/Autostart (Admin), Selbsttest (Plan Teile 2, 3, 4, 6). `start-router.cmd` wird geschrieben, aber nicht gestartet.
+- **Im Router (2.1, `src/cli/serve/router/einrichtung.cpp`):** `/router/setup/katalog`, `pruefen`, `preset` (Port dieser Logik nach C++, Gleichheitstest `tests/cli/router_einrichtung_test.cpp` gegen `einrichten.py --plan`), `admin`; `gufo router --einrichtung`. **Noch nicht gebaut:** Download mit Wiederaufnahme/SHA, Seite `/einrichtung/` im Paket, Firewall-Regel/Autostart (Admin), Selbsttest (Plan Teile 3, 4, 6). `start-router.cmd` wird geschrieben, aber nicht gestartet.
