@@ -174,16 +174,24 @@ void SetModelHint(json::Value* schema, const std::vector<std::string>& ids,
 json::Value JobOutputSchema() {
   return json::parse(R"json({
     "type": "object",
-    "required": ["auftrag_id", "status", "url"],
+    "required": ["auftrag_id", "status", "url", "modell"],
     "properties": {
       "auftrag_id": {"type": "string", "description": "Auftrags-ID (job id)"},
       "status": {"type": "string",
                  "enum": ["queued", "in_progress", "completed", "failed", "cancelled"]},
       "position": {"type": "integer", "description": "Platz in der Warteschlange (queue position)"},
-      "url": {"type": "string", "description": "/v1/jobs/<id>"}
+      "url": {"type": "string", "description": "/v1/jobs/<id>"},
+      "modell": {"type": "string", "description": "Das verwendete Modell (model id)"},
+      "geschaetzt": {"type": "boolean", "description": "Fortschritt wird nur geschätzt (progress is an estimate)"}
     }
   })json");
 }
+
+const char* kTitelSchema =
+    R"json({"type": "string", "maxLength": 200,
+            "description": "Titel in der Ablage (job title)"})json";
+
+json::Value Titel() { return json::parse(kTitelSchema); }
 
 const char* kVorrangSchema =
     R"json({"type": "integer", "minimum": 0, "maximum": 9, "default": 0,
@@ -201,6 +209,7 @@ std::vector<Tool> BuildTools(const Options& options) {
   const std::vector<std::string> music =
       ModelIds(options.models, {"music", "moss-music"});
   const std::vector<std::string> objekt = ModelIds(options.models, {"objekt"});
+  const std::vector<std::string> upscale = ModelIds(options.models, {"upscale"});
 
   // modelle ----------------------------------------------------------------
   {
@@ -305,10 +314,10 @@ std::vector<Tool> BuildTools(const Options& options) {
         "anzahl": {"type": "integer", "minimum": 1, "maximum": 4, "default": 1, "description": "Bilder je Auftrag (images per job)"},
         "lora": {"type": "array", "items": {"type": "object", "required": ["name"],
                  "properties": {"name": {"type": "string"}, "staerke": {"type": "number", "default": 1.0}}},
-                 "description": "LoRA-Zusätze (LoRA adapters)"},
-        "titel": {"type": "string", "description": "Titel in der Ablage (job title)"}
+                 "description": "LoRA-Zusätze, nur für qwen-image-2.1 (LoRA adapters, qwen-image-2.1 only)"}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, image, "qwen-image-2.1-turbo");
     t.output_schema = JobOutputSchema();
@@ -332,13 +341,17 @@ std::vector<Tool> BuildTools(const Options& options) {
         "prompt": {"type": "string", "description": "Was geändert werden soll (edit instruction)"},
         "bilder": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"},
                    "description": "Ablage-Pfade /v1/jobs/<id>/files/<name> oder data:-URLs, zusammen höchstens 20 MB (file paths or data URLs, 20 MB in total)"},
-        "maske": {"type": "string", "description": "Maske als Ablage-Pfad oder data:-URL (mask image)"},
-        "staerke": {"type": "number", "minimum": 0, "maximum": 1, "description": "Wie stark das Bild verändert wird (edit strength)"},
-        "model": {"type": "string", "description": "Bildmodell (image model id)"},
+        "maske": {"type": "string", "description": "Maske (PNG) als Ablage-Pfad oder data:-URL; gilt für das erste Bild (mask image for the first image)"},
+        "staerke": {"type": "number", "minimum": 0, "maximum": 1, "description": "Wie stark das erste Bild verändert wird, unter 1 = Teilstärke (edit strength of the first image)"},
+        "negativ": {"type": "string", "description": "Was nicht im Bild sein soll (negative prompt)"},
+        "model": {"type": "string", "description": "Bildmodell; nur Qwen-Image kann bearbeiten (image model id; Qwen-Image only)"},
+        "breite": {"type": "integer", "minimum": 64, "maximum": 4096, "description": "Zielgröße, Vielfaches von 32; ohne Angabe die Größe des Bildes (target size)"},
+        "hoehe": {"type": "integer", "minimum": 64, "maximum": 4096},
         "schritte": {"type": "integer", "minimum": 1, "maximum": 100},
         "seed": {"type": "integer", "minimum": 0}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, image, "qwen-image-2.1");
     t.output_schema = JobOutputSchema();
@@ -360,20 +373,22 @@ std::vector<Tool> BuildTools(const Options& options) {
       "required": ["prompt"],
       "properties": {
         "prompt": {"type": "string"},
-        "model": {"type": "string", "description": "Videomodell (video model id)"},
-        "startbild": {"type": "string", "description": "Erstes Bild als Ablage-Pfad oder data:-URL (start frame)"},
-        "endbild": {"type": "string", "description": "Letztes Bild (end frame)"},
-        "ton": {"type": "string", "description": "Tonspur als Ablage-Pfad oder data:-URL, für Sprechvideos (audio track for talking videos)"},
-        "sekunden": {"type": "number", "minimum": 1, "description": "Länge (duration in seconds)"},
-        "breite": {"type": "integer", "minimum": 64},
+        "model": {"type": "string", "description": "Videomodell: minimax-h3 (Text, Start-/Endbild, Ton-Anker, 512x512 oder 1344x768, bis 14 s), wan2.2-ti2v-5b (Text oder Startbild, bis 5 s, Schritte, Guidance, Negativ), wan2.1-uni3c (Kamerafahrt vom Startbild, 832x480, bis 5 s), wan2.1-infinitetalk-14b (Sprechen: Startbild + Ton, Länge vom Ton) (video model id)"},
+        "startbild": {"type": "string", "description": "Erstes Bild als Ablage-Pfad oder data:-URL (start frame); Pflicht bei wan2.1-uni3c und wan2.1-infinitetalk-14b"},
+        "endbild": {"type": "string", "description": "Letztes Bild, nur minimax-h3 (end frame, H3 only)"},
+        "ton": {"type": "string", "description": "Tonspur als Ablage-Pfad oder data:-URL: Pflicht bei wan2.1-infinitetalk-14b (Sprechen), bei minimax-h3 ein Ton-Anker; WAN 2.2 und Uni3C nehmen keinen Ton (audio track)"},
+        "sekunden": {"type": "number", "minimum": 1, "maximum": 14, "description": "Länge; WAN höchstens 5, H3 höchstens 14; beim Sprechen kommt sie vom Ton (duration in seconds)"},
+        "breite": {"type": "integer", "minimum": 64, "description": "Nur WAN 2.2 (480x480, 832x480, 1280x704) und H3 (512x512, 1344x768); Uni3C und Sprechen rechnen fest 832x480 (width)"},
         "hoehe": {"type": "integer", "minimum": 64},
-        "schritte": {"type": "integer", "minimum": 1},
+        "schritte": {"type": "integer", "minimum": 1, "description": "Nur WAN 2.2 (Vorgabe 20); H3 nimmt sie aus qualitaet, Uni3C und Sprechen rechnen fest 4 (steps)"},
         "qualitaet": {"type": "string", "enum": ["genau", "schnell", "schnellste"], "default": "genau",
-                      "description": "genau = beste Qualität; schnell/schnellste schwächen Ton und Gesichter (exact is the default; fast modes degrade audio and faces)"},
-        "negativ": {"type": "string"},
+                      "description": "Nur minimax-h3: genau = beste Qualität (512 px); schnell/schnellste schwächen Ton und Gesichter (H3 only; exact is the default, fast modes degrade audio and faces)"},
+        "guidance": {"type": "number", "minimum": 0, "description": "Nur WAN 2.2 (guidance, WAN 2.2 only)"},
+        "negativ": {"type": "string", "description": "Nur WAN 2.2 (negative prompt, WAN 2.2 only)"},
         "seed": {"type": "integer", "minimum": 0}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, video, "minimax-h3");
     t.output_schema = JobOutputSchema();
@@ -397,15 +412,17 @@ std::vector<Tool> BuildTools(const Options& options) {
       "properties": {
         "text": {"type": "string", "description": "Der zu sprechende Text (text to speak)"},
         "model": {"type": "string", "description": "Stimmmodell (speech model id)"},
-        "stimme": {"type": "string", "description": "Name der Stimme (voice name)"},
+        "stimme": {"type": "string", "description": "Name der Stimme aus /v1/audio/voices; Vorgabe die Standardstimme des Modells, mit probe voice-clone (voice name)"},
         "sprache": {"type": "string", "description": "Sprachkürzel, z. B. de, en (language code)"},
-        "tempo": {"type": "number", "minimum": 0.5, "maximum": 2.0, "description": "Sprechtempo (speed)"},
-        "beschreibung": {"type": "string", "description": "Anweisung zur Sprechweise (style instructions)"},
-        "probe": {"type": "string", "description": "Stimmprobe als Ablage-Pfad oder data:-URL (reference audio for cloning)"},
-        "wortlaut": {"type": "string", "description": "Was die Probe sagt (transcript of the reference)"},
-        "format": {"type": "string", "enum": ["wav", "mp3"], "default": "wav"}
+        "tempo": {"type": "number", "minimum": 0.25, "maximum": 4.0, "description": "Sprechtempo, 1 = normal (speed)"},
+        "beschreibung": {"type": "string", "description": "Anweisung zur Sprechweise; bei qwen3-tts-voicedesign die Stimmbeschreibung (style instructions)"},
+        "probe": {"type": "string", "description": "Stimmprobe (WAV) als Ablage-Pfad oder data:-URL zum Klonen (reference audio for cloning)"},
+        "wortlaut": {"type": "string", "description": "Was die Probe sagt; Pflicht bei fish-drama-3 (transcript of the reference)"},
+        "format": {"type": "string", "enum": ["wav", "mp3"], "default": "wav"},
+        "seed": {"type": "integer", "minimum": 0}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, tts, "fish-drama-3");
     t.output_schema = JobOutputSchema();
@@ -427,12 +444,13 @@ std::vector<Tool> BuildTools(const Options& options) {
       "properties": {
         "stil": {"type": "string", "description": "Stil, Instrumente, Stimmung, auf Englisch (style tags, English)"},
         "liedtext": {"type": "string", "description": "Liedtext; [Instrumental] für ohne Gesang (lyrics; [Instrumental] for none)"},
-        "sekunden": {"type": "number", "minimum": 5, "maximum": 600, "description": "Länge (duration in seconds)"},
+        "sekunden": {"type": "number", "minimum": 1, "maximum": 600, "default": 30, "description": "Länge (duration in seconds)"},
         "model": {"type": "string", "description": "Musikmodell (music model id)"},
         "format": {"type": "string", "enum": ["wav", "mp3"], "default": "wav"},
         "seed": {"type": "integer", "minimum": 0}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, music, "ace-step-1.5-xl-turbo");
     t.output_schema = JobOutputSchema();
@@ -454,13 +472,15 @@ std::vector<Tool> BuildTools(const Options& options) {
       "properties": {
         "bild": {"type": "string", "description": "PNG mit Alpha als Ablage-Pfad oder data:-URL (PNG with alpha)"},
         "model": {"type": "string", "description": "3D-Modell (3D model id)"},
-        "schritte": {"type": "integer", "minimum": 1},
-        "guidance": {"type": "number", "minimum": 0},
+        "schritte": {"type": "integer", "minimum": 1, "maximum": 200},
+        "guidance": {"type": "number", "minimum": 1, "maximum": 15, "description": "Nur triposg (guidance, triposg only)"},
         "seed": {"type": "integer", "minimum": 0},
-        "aufloesung": {"type": "integer", "enum": [256, 512], "description": "Gitterauflösung (grid resolution)"},
-        "max_dreiecke": {"type": "integer", "minimum": 1000, "description": "Höchstzahl Dreiecke (max faces)"}
+        "aufloesung": {"type": "integer", "enum": [256, 512], "description": "Gitterauflösung, nur triposg (grid resolution)"},
+        "max_dreiecke": {"type": "integer", "minimum": 0, "description": "Höchstzahl Dreiecke, 0 = unbegrenzt (max faces)"},
+        "textur": {"type": "boolean", "description": "Nur trellis2: Farben als Textur (texture, trellis2 only)"}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
     SetModelHint(&t.input_schema, objekt, "trellis2");
     t.output_schema = JobOutputSchema();
@@ -484,10 +504,13 @@ std::vector<Tool> BuildTools(const Options& options) {
         "faktor": {"type": "integer", "enum": [2, 4], "default": 2},
         "variante": {"type": "string", "enum": ["allgemein", "entrauscht", "anime"], "default": "allgemein",
                      "description": "Modellvariante (general, denoised, anime)"},
-        "ausgabe": {"type": "string", "enum": ["png", "jpg"], "default": "png", "description": "Bildformat der Ausgabe (output format for images)"}
+        "ausgabe": {"type": "string", "enum": ["png", "jpg"], "default": "png", "description": "Bildformat der Ausgabe (output format for images)"},
+        "model": {"type": "string", "description": "Hochskalierer (upscale model id)"}
       }
     })json");
+    t.input_schema["properties"]["titel"] = Titel();
     t.input_schema["properties"]["vorrang"] = Vorrang();
+    SetModelHint(&t.input_schema, upscale, "gufo-upscale");
     t.output_schema = JobOutputSchema();
     add(std::move(t));
   }
@@ -975,6 +998,143 @@ bool InnerPathAllowed(std::string_view path) {
          path == "/v1/jobs" || path.starts_with("/v1/jobs/");
 }
 
+// --- media job tools (Commit 3) -------------------------------------------
+
+/// Reference images of an edit, together (the Bild page's limit).
+constexpr std::size_t kEditBytesLimit = static_cast<std::size_t>(20) << 20;
+/// A single input file of any media tool (the video anchors' limit).
+constexpr std::size_t kMediaBytesLimit = static_cast<std::size_t>(20) << 20;
+
+bool IsAblagePath(std::string_view value) {
+  return value.starts_with("/v1/jobs/") &&
+         value.find("/files/") != std::string_view::npos;
+}
+
+/// "data:<type>;base64,<data>" -> bytes and type; nullopt when it is no
+/// base64 data URL.
+std::optional<std::pair<std::string, std::string>> ParseDataUrl(
+    std::string_view value) {
+  if (!value.starts_with("data:"))
+    return std::nullopt;
+  const auto comma = value.find(',');
+  if (comma == std::string_view::npos)
+    return std::nullopt;
+  const std::string_view head = value.substr(5, comma - 5);
+  if (!head.ends_with(";base64"))
+    return std::nullopt;
+  std::string type(head.substr(0, head.size() - 7));
+  if (type.empty())
+    type = "application/octet-stream";
+  const auto bytes = comfy::Base64Decode(value.substr(comma + 1));
+  if (!bytes.has_value())
+    return std::nullopt;
+  return std::make_pair(std::move(*bytes), std::move(type));
+}
+
+std::string DataUrlOf(const McpService::Media& media) {
+  return "data:" + media.content_type + ";base64," +
+         comfy::Base64Encode(media.bytes);
+}
+
+/// The file's extension for a multipart part name ("bild.png").
+std::string FileNameOf(const McpService::Media& media,
+                       std::string_view fallback) {
+  if (!media.name.empty())
+    return media.name;
+  const std::string type = Lower(media.content_type);
+  std::string ext = "bin";
+  if (type.starts_with("image/png"))
+    ext = "png";
+  else if (type.starts_with("image/jpeg") || type.starts_with("image/jpg"))
+    ext = "jpg";
+  else if (type.starts_with("image/webp"))
+    ext = "webp";
+  else if (type.starts_with("audio/wav") || type.starts_with("audio/x-wav"))
+    ext = "wav";
+  else if (type.starts_with("audio/mpeg"))
+    ext = "mp3";
+  else if (type.starts_with("video/mp4"))
+    ext = "mp4";
+  return std::string(fallback) + "." + ext;
+}
+
+bool IsVideoMedia(const McpService::Media& media) {
+  const std::string type = Lower(media.content_type);
+  if (type.starts_with("video/"))
+    return true;
+  if (type.starts_with("image/"))
+    return false;
+  const std::string name = Lower(media.name);
+  return name.ends_with(".mp4") || name.ends_with(".webm") ||
+         name.ends_with(".mov") || name.ends_with(".mkv");
+}
+
+/// `breite` x `hoehe` as "WxH"; both or neither, multiples of `step`, at
+/// most `max_pixels` together; "" without them.
+std::string SizeArg(const json::Value& args, int step, long long max_pixels) {
+  const auto breite = ArgInt(args, "breite", 16, 8192);
+  const auto hoehe = ArgInt(args, "hoehe", 16, 8192);
+  if (breite.has_value() != hoehe.has_value())
+    throw InvalidParams("arguments.breite and arguments.hoehe go together");
+  if (!breite.has_value())
+    return {};
+  if (step > 1 && (*breite % step != 0 || *hoehe % step != 0))
+    throw InvalidParams("arguments.breite and arguments.hoehe must be multiples of " +
+                        std::to_string(step));
+  if (max_pixels > 0 && *breite * *hoehe > max_pixels)
+    throw InvalidParams("arguments.breite x arguments.hoehe must be at most " +
+                        std::to_string(max_pixels) + " pixels");
+  return std::to_string(*breite) + "x" + std::to_string(*hoehe);
+}
+
+std::string ArgEnum(const json::Value& args, const std::string& key,
+                    std::initializer_list<std::string_view> allowed,
+                    std::string_view fallback) {
+  const std::string value = ArgString(args, key, false);
+  if (value.empty())
+    return std::string(fallback);
+  if (std::find(allowed.begin(), allowed.end(), value) == allowed.end()) {
+    std::string list;
+    for (const std::string_view item : allowed)
+      list += (list.empty() ? "" : ", ") + std::string(item);
+    throw InvalidParams("arguments." + key + " must be one of " + list);
+  }
+  return value;
+}
+
+/// The first `n` characters of a prompt for the job title.
+std::string Short(std::string_view text, std::size_t n) {
+  std::string out(Trim(text));
+  if (out.size() > n) {
+    out.resize(n);
+    // Do not cut a UTF-8 sequence.
+    while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80)
+      out.pop_back();
+    out += "…";
+  }
+  return out;
+}
+
+json::Value MetadataFor(const std::string& seite, const json::Value& args,
+                        const std::string& titel, const std::string& model) {
+  json::Value metadata = json::Value::object();
+  metadata["quelle"] = "mcp";
+  metadata["seite"] = seite;
+  metadata["titel"] = titel;
+  metadata["modell"] = model;
+  if (const json::Value* seed = Arg(args, "seed"); seed != nullptr && seed->is_number())
+    metadata["seed"] = *seed;
+  return metadata;
+}
+
+/// The ISO-like title: the caller's `titel` or `fallback`.
+std::string TitelArg(const json::Value& args, const std::string& fallback) {
+  const std::string titel = ArgString(args, "titel", false);
+  if (titel.size() > 200)
+    throw InvalidParams("arguments.titel must be at most 200 characters");
+  return Trim(titel).empty() ? fallback : std::string(Trim(titel));
+}
+
 }  // namespace
 
 bool IsProtocolVersion(std::string_view version) {
@@ -1041,10 +1201,10 @@ json::Value McpService::Initialize(const json::Value& params) const {
   return result;
 }
 
-McpService::InnerAnswer McpService::Inner(const HttpRequest& outer,
-                                          std::string method, std::string path,
-                                          std::string query,
-                                          std::string body) const {
+McpService::InnerAnswer McpService::Inner(
+    const HttpRequest& outer, std::string method, std::string path,
+    std::string query, std::string body,
+    std::vector<std::pair<std::string, std::string>> extra) const {
   if (!InnerPathAllowed(path))
     throw std::logic_error("mcp: inner path not allowed: " + path);
   if (!options_.serve)
@@ -1057,11 +1217,18 @@ McpService::InnerAnswer McpService::Inner(const HttpRequest& outer,
   inner.client_id = outer.client_id;
   inner.is_cancelled = outer.is_cancelled;
   inner.request_id = outer.request_id;
+  bool own_priority = false;
+  for (const auto& [name, value] : extra) {
+    if (EqualsIgnoreCase(name, "X-Gufo-Priority"))
+      own_priority = true;
+    inner.headers.emplace_back(name, value);
+  }
   // The caller's token (never a cookie: the gate refused it before) and
-  // its job priority; nothing else of the outer headers.
+  // its job priority (unless the tool set one); nothing else of the outer
+  // headers.
   for (const auto& [name, value] : outer.headers) {
     if (EqualsIgnoreCase(name, "Authorization") ||
-        EqualsIgnoreCase(name, "X-Gufo-Priority"))
+        (EqualsIgnoreCase(name, "X-Gufo-Priority") && !own_priority))
       inner.headers.emplace_back(name, value);
   }
   if (!inner.body.empty())
@@ -1490,6 +1657,591 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
   return ToolResult(std::move(structured), std::move(extra));
 }
 
+// --- media job tools (Commit 3) -------------------------------------------
+
+McpService::Media McpService::ReadMedia(const HttpRequest& outer,
+                                        const std::string& value,
+                                        const std::string& field) const {
+  Media media;
+  if (IsAblagePath(value)) {
+    // Through the gate: another user's job is 404, a missing file too.
+    const InnerAnswer file = Inner(outer, "GET", value);
+    if (file.status >= 400) {
+      media.failure = HttpFailure(file);
+      return media;
+    }
+    media.bytes = file.body;
+    media.content_type = file.content_type.empty()
+                             ? std::string("application/octet-stream")
+                             : file.content_type.substr(0, file.content_type.find(';'));
+    media.name = value.substr(value.rfind('/') + 1);
+  } else if (auto data = ParseDataUrl(value)) {
+    media.bytes = std::move(data->first);
+    media.content_type = std::move(data->second);
+  } else {
+    throw InvalidParams(field +
+                        " must be /v1/jobs/<id>/files/<name> or a base64 data: URL");
+  }
+  if (media.bytes.empty())
+    throw InvalidParams(field + " is an empty file");
+  if (media.bytes.size() > kMediaBytesLimit)
+    throw InvalidParams(field + " is larger than 20 MB");
+  return media;
+}
+
+json::Value McpService::SubmitJob(const HttpRequest& outer,
+                                  const std::string& path,
+                                  const json::Value& body,
+                                  const std::string& raw_body,
+                                  const std::string& content_type,
+                                  const std::string& model,
+                                  std::optional<long long> vorrang,
+                                  json::Value metadata) const {
+  json::Value request = json::Value::object();
+  request["method"] = "POST";
+  request["path"] = path;
+  if (!raw_body.empty()) {
+    request["body_base64"] = comfy::Base64Encode(raw_body);
+    request["content_type"] = content_type;
+  } else {
+    request["body"] = body;
+  }
+  json::Value submit = json::Value::object();
+  submit["request"] = std::move(request);
+  if (vorrang.has_value() && *vorrang > 0)
+    submit["priority"] = *vorrang;
+  submit["metadata"] = std::move(metadata);
+  std::vector<std::pair<std::string, std::string>> extra;
+  if (vorrang.has_value())
+    extra.emplace_back("X-Gufo-Priority", std::to_string(*vorrang));
+  const InnerAnswer answer =
+      Inner(outer, "POST", "/v1/jobs", {}, submit.dump(), std::move(extra));
+  if (answer.status >= 400)
+    return HttpFailure(answer);
+  const std::optional<json::Value> view = JsonOf(answer);
+  if (!view.has_value() || view->member_str("id").empty())
+    return UnexpectedAnswer(answer);
+  const std::string id = view->member_str("id");
+  json::Value structured = json::Value::object();
+  structured["auftrag_id"] = id;
+  structured["status"] = view->member_str("status").empty()
+                             ? std::string("queued")
+                             : view->member_str("status");
+  structured["url"] = "/v1/jobs/" + id;
+  std::string modell;
+  if (const json::Value* request_view = view->find("request"))
+    modell = request_view->member_str("model");
+  structured["modell"] = modell.empty() ? model : modell;
+  if (const json::Value* position = view->find("position");
+      position != nullptr && position->is_number())
+    structured["position"] = static_cast<long long>(position->as_double());
+  if (const json::Value* flag = view->find("progress_estimated");
+      flag != nullptr && flag->is_bool())
+    structured["geschaetzt"] = flag->as_bool();
+  // The text mirror names the next steps for a client without
+  // structured content.
+  json::Value content = json::Value::array();
+  content.push_back(TextBlock("Auftrag " + id + " angenommen (Status " +
+                              structured.member_str("status") +
+                              "), Stand mit auftrag_status, Ergebnis mit "
+                              "ablage_lesen. Job accepted.\n" +
+                              structured.dump()));
+  json::Value result = json::Value::object();
+  result["content"] = std::move(content);
+  result["structuredContent"] = std::move(structured);
+  return result;
+}
+
+json::Value McpService::RunBildErzeugen(const json::Value& args,
+                                        const HttpRequest& outer) const {
+  // pages/bild/index.html: POST /v1/jobs around /v1/images/generations
+  // {model, prompt, size, steps?, seed, response_format b64_json, loras?,
+  // gufo {negative_prompt?}} (negative_prompt is the Qwen-Image "gufo"
+  // extension, src/models/qwen_image_21/request.cpp).
+  const std::string prompt = ArgString(args, "prompt", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("bild_erzeugen");
+  const std::string negativ = ArgString(args, "negativ", false);
+  const std::string size = SizeArg(args, 32, 4LL << 20);
+  const auto schritte = ArgInt(args, "schritte", 1, 100);
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto anzahl = ArgInt(args, "anzahl", 1, 4);
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["prompt"] = prompt;
+  if (!size.empty())
+    body["size"] = size;
+  if (schritte.has_value())
+    body["steps"] = *schritte;
+  if (seed.has_value())
+    body["seed"] = *seed;
+  if (anzahl.has_value() && *anzahl > 1)
+    body["n"] = *anzahl;
+  body["response_format"] = "b64_json";
+  if (const json::Value* lora = Arg(args, "lora")) {
+    if (!lora->is_array())
+      throw InvalidParams("arguments.lora must be an array of {name, staerke}");
+    json::Value loras = json::Value::array();
+    for (const json::Value& item : lora->items()) {
+      if (!item.is_object() || item.member_str("name").empty())
+        throw InvalidParams("arguments.lora[] needs a name");
+      json::Value entry = json::Value::object();
+      entry["name"] = item.member_str("name");
+      const json::Value* staerke = item.find("staerke");
+      if (staerke != nullptr && !staerke->is_null() && !staerke->is_number())
+        throw InvalidParams("arguments.lora[].staerke must be a number");
+      entry["scale"] = staerke != nullptr && staerke->is_number()
+                           ? staerke->as_double()
+                           : 1.0;
+      loras.push_back(std::move(entry));
+    }
+    if (loras.size() > 0)
+      body["loras"] = std::move(loras);
+  }
+  if (!Trim(negativ).empty()) {
+    json::Value gufo = json::Value::object();
+    gufo["negative_prompt"] = negativ;
+    body["gufo"] = std::move(gufo);
+  }
+  json::Value metadata =
+      MetadataFor("bild", args, TitelArg(args, model + " · " + Short(prompt, 60)), model);
+  metadata["prompt"] = Short(prompt, 4000);
+  if (!size.empty())
+    metadata["groesse"] = size;
+  if (schritte.has_value())
+    metadata["schritte"] = *schritte;
+  return SubmitJob(outer, "/v1/images/generations", body, {}, {}, model,
+                   vorrang, std::move(metadata));
+}
+
+json::Value McpService::RunBildBearbeiten(const json::Value& args,
+                                          const HttpRequest& outer) const {
+  // pages/bild/index.html (editing): multipart /v1/images/edits with the
+  // parts model, prompt, size, steps?, seed, response_format, image[]
+  // (references), init_image + mask (+ gufo.strength) for a start image
+  // with a mask or a partial strength, loras (JSON), gufo.negative_prompt.
+  const std::string prompt = ArgString(args, "prompt", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("bild_bearbeiten");
+  const json::Value* bilder = Arg(args, "bilder");
+  if (bilder == nullptr || !bilder->is_array() || bilder->size() == 0)
+    throw InvalidParams("arguments.bilder must be a non-empty array of strings");
+  if (bilder->size() > 10)
+    throw InvalidParams("arguments.bilder takes at most 10 images");
+  const std::string maske = ArgString(args, "maske", false);
+  const auto staerke = ArgNumber(args, "staerke", 0.0);
+  if (staerke.has_value() && *staerke > 1.0)
+    throw InvalidParams("arguments.staerke must be between 0 and 1");
+  const std::string negativ = ArgString(args, "negativ", false);
+  const std::string size = SizeArg(args, 32, 4LL << 20);
+  const auto schritte = ArgInt(args, "schritte", 1, 100);
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+
+  std::vector<Media> images;
+  std::size_t total = 0;
+  std::size_t index = 0;
+  for (const json::Value& bild : bilder->items()) {
+    const std::string where = "arguments.bilder[" + std::to_string(index++) + "]";
+    if (!bild.is_string())
+      throw InvalidParams(where + " must be a string");
+    Media media = ReadMedia(outer, bild.str(), where);
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    total += media.bytes.size();
+    images.push_back(std::move(media));
+  }
+  std::optional<Media> mask;
+  if (!maske.empty()) {
+    Media media = ReadMedia(outer, maske, "arguments.maske");
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    total += media.bytes.size();
+    mask = std::move(media);
+  }
+  if (total > kEditBytesLimit)
+    throw InvalidParams("arguments.bilder (with maske) exceed 20 MB together");
+
+  // The first image is the start image when a mask or a partial strength
+  // applies to it (the page sends init_image then), else a reference.
+  const bool init = mask.has_value() || (staerke.has_value() && *staerke < 1.0);
+  std::vector<comfy::MultipartPart> parts;
+  const auto field = [&parts](std::string name, std::string value) {
+    comfy::MultipartPart part;
+    part.name = std::move(name);
+    part.data = std::move(value);
+    parts.push_back(std::move(part));
+  };
+  const auto file = [&parts](std::string name, const Media& media,
+                             std::string_view fallback) {
+    comfy::MultipartPart part;
+    part.name = std::move(name);
+    part.filename = FileNameOf(media, fallback);
+    part.content_type = media.content_type;
+    part.data = media.bytes;
+    parts.push_back(std::move(part));
+  };
+  field("model", model);
+  field("prompt", prompt);
+  if (!size.empty())
+    field("size", size);
+  else if (init)
+    field("size", "auto");  // the start image's size (as the page sends it)
+  if (schritte.has_value())
+    field("steps", std::to_string(*schritte));
+  if (seed.has_value())
+    field("seed", std::to_string(*seed));
+  field("response_format", "b64_json");
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    if (i == 0 && init)
+      file("init_image", images[i], "start");
+    else
+      file("image[]", images[i], "bild-" + std::to_string(i + 1));
+  }
+  if (mask.has_value())
+    file("mask", *mask, "maske");
+  if (staerke.has_value() && *staerke < 1.0)
+    field("gufo.strength", std::to_string(*staerke));
+  if (!Trim(negativ).empty())
+    field("gufo.negative_prompt", negativ);
+  const std::string boundary = "gufo-mcp-" + auth::RandomHex(12);
+  const std::string raw = comfy::BuildMultipart(parts, boundary);
+  json::Value metadata = MetadataFor(
+      "bild", args, TitelArg(args, model + " · " + Short(prompt, 60)), model);
+  metadata["prompt"] = Short(prompt, 4000);
+  metadata["bilder"] = static_cast<long long>(images.size());
+  if (mask.has_value())
+    metadata["maske"] = true;
+  return SubmitJob(outer, "/v1/images/edits", json::Value(), raw,
+                   "multipart/form-data; boundary=" + boundary, model,
+                   vorrang, std::move(metadata));
+}
+
+json::Value McpService::RunVideoErzeugen(const json::Value& args,
+                                         const HttpRequest& outer) const {
+  // pages/video/index.html anfrageBauen(): one JSON body per model family
+  // around POST /v1/videos: H3 {model, prompt, seconds, size 512x512,
+  // gufo {preset, seed}, first_frame?, last_frame?, audio_reference?};
+  // WAN 2.2 {model, prompt, seconds, size, gufo {steps, seed, guidance?,
+  // negative_prompt?}, first_frame?}; Uni3C {model, prompt, seconds, size
+  // 832x480, gufo {steps 4, seed}, first_frame}; InfiniteTalk {model,
+  // prompt, size 832x480, gufo {steps 4, seed, talk {audio [data url]}},
+  // first_frame} (the length comes from the audio).
+  const std::string prompt = ArgString(args, "prompt", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("video_erzeugen");
+  const bool wan = model.starts_with("wan2.2");
+  const bool cam = model == "wan2.1-uni3c";
+  const bool talk = model == "wan2.1-infinitetalk-14b";
+  const bool h3 = !wan && !cam && !talk;
+  const std::string startbild = ArgString(args, "startbild", false);
+  const std::string endbild = ArgString(args, "endbild", false);
+  const std::string ton = ArgString(args, "ton", false);
+  const auto sekunden = ArgNumber(args, "sekunden", 1.0);
+  const std::string size = SizeArg(args, 16, 0);
+  const auto schritte = ArgInt(args, "schritte", 1, 200);
+  const std::string qualitaet =
+      ArgEnum(args, "qualitaet", {"genau", "schnell", "schnellste"}, "genau");
+  const auto guidance = ArgNumber(args, "guidance", 0.0);
+  const std::string negativ = ArgString(args, "negativ", false);
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  // The limits the pages state (de.ini [faehigkeiten]).
+  if (!endbild.empty() && !h3)
+    throw InvalidParams("arguments.endbild: only minimax-h3 takes an end frame");
+  if (!ton.empty() && (wan || cam))
+    throw InvalidParams("arguments.ton: " + model + " takes no audio");
+  if ((cam || talk) && startbild.empty())
+    throw InvalidParams("arguments.startbild is required for " + model);
+  if (talk && ton.empty())
+    throw InvalidParams("arguments.ton is required for " + model);
+  if (sekunden.has_value()) {
+    if ((wan || cam) && *sekunden > 5.0)
+      throw InvalidParams("arguments.sekunden: " + model + " takes at most 5");
+    if (h3 && *sekunden > 14.375)
+      throw InvalidParams("arguments.sekunden: minimax-h3 takes at most 14");
+  }
+
+  json::Value gufo = json::Value::object();
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["prompt"] = prompt;
+  if (h3) {
+    body["seconds"] = sekunden.value_or(5.0);
+    body["size"] = size.empty() ? std::string("512x512") : size;
+    gufo["preset"] = qualitaet == "schnell"      ? "fast"
+                     : qualitaet == "schnellste" ? "aggressive"
+                                                 : "exact";
+  } else if (wan) {
+    body["seconds"] = sekunden.value_or(5.0);
+    body["size"] = size.empty() ? std::string("480x480") : size;
+    gufo["steps"] = schritte.value_or(20);
+    if (guidance.has_value())
+      gufo["guidance"] = *guidance;
+    if (!Trim(negativ).empty())
+      gufo["negative_prompt"] = negativ;
+  } else if (cam) {
+    body["seconds"] = sekunden.value_or(5.0);
+    body["size"] = "832x480";
+    gufo["steps"] = 4;
+  } else {
+    body["size"] = "832x480";
+    gufo["steps"] = 4;
+  }
+  if (seed.has_value())
+    gufo["seed"] = *seed;
+  if (!startbild.empty()) {
+    Media media = ReadMedia(outer, startbild, "arguments.startbild");
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    body["first_frame"] = DataUrlOf(media);
+  }
+  if (!endbild.empty()) {
+    Media media = ReadMedia(outer, endbild, "arguments.endbild");
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    body["last_frame"] = DataUrlOf(media);
+  }
+  if (!ton.empty()) {
+    Media media = ReadMedia(outer, ton, "arguments.ton");
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    if (talk) {
+      json::Value audio = json::Value::array();
+      audio.push_back(DataUrlOf(media));
+      json::Value talk_ext = json::Value::object();
+      talk_ext["audio"] = std::move(audio);
+      gufo["talk"] = std::move(talk_ext);
+    } else {
+      body["audio_reference"] = DataUrlOf(media);
+    }
+  }
+  body["gufo"] = std::move(gufo);
+  json::Value metadata = MetadataFor(
+      "video", args, TitelArg(args, model + " · " + Short(prompt, 60)), model);
+  metadata["prompt"] = Short(prompt, 4000);
+  if (body.find("seconds") != nullptr)
+    metadata["dauer"] = *body.find("seconds");
+  metadata["groesse"] = body.member_str("size");
+  metadata["startbild"] = !startbild.empty();
+  metadata["endbild"] = !endbild.empty();
+  metadata["ton"] = !ton.empty();
+  if (h3)
+    metadata["qualitaet"] = (*body.find("gufo")).member_str("preset");
+  return SubmitJob(outer, "/v1/videos", body, {}, {}, model, vorrang,
+                   std::move(metadata));
+}
+
+json::Value McpService::RunStimme(const json::Value& args,
+                                  const HttpRequest& outer) const {
+  // pages/stimme/index.html: POST /v1/audio/speech {model, input, seed,
+  // voice, language?, instructions?, speed?, reference_audio (raw base64),
+  // reference_text?, response_format} (server.md "POST /v1/audio/speech").
+  const std::string text = ArgString(args, "text", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("stimme");
+  std::string stimme = ArgString(args, "stimme", false);
+  const std::string sprache = ArgString(args, "sprache", false);
+  const auto tempo = ArgNumber(args, "tempo", 0.25);
+  if (tempo.has_value() && *tempo > 4.0)
+    throw InvalidParams("arguments.tempo must be between 0.25 and 4");
+  const std::string beschreibung = ArgString(args, "beschreibung", false);
+  const std::string probe = ArgString(args, "probe", false);
+  const std::string wortlaut = ArgString(args, "wortlaut", false);
+  const std::string format = ArgEnum(args, "format", {"wav", "mp3"}, "wav");
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  if (model == "fish-drama-3" && !probe.empty() && Trim(wortlaut).empty())
+    throw InvalidParams("arguments.wortlaut is required with a probe for fish-drama-3");
+  if (model == "qwen3-tts-voicedesign" && Trim(beschreibung).empty())
+    throw InvalidParams("arguments.beschreibung is required for qwen3-tts-voicedesign");
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["input"] = text;
+  if (model == "qwen3-tts-voicedesign")
+    stimme = "voice-design";
+  else if (stimme.empty() && !probe.empty())
+    stimme = "voice-clone";
+  if (!stimme.empty())
+    body["voice"] = stimme;
+  if (!sprache.empty())
+    body["language"] = sprache;
+  if (tempo.has_value() && *tempo != 1.0)
+    body["speed"] = *tempo;
+  if (!Trim(beschreibung).empty())
+    body["instructions"] = beschreibung;
+  if (seed.has_value())
+    body["seed"] = *seed;
+  if (!probe.empty()) {
+    Media media = ReadMedia(outer, probe, "arguments.probe");
+    if (media.failure.has_value())
+      return std::move(*media.failure);
+    body["reference_audio"] = comfy::Base64Encode(media.bytes);
+    if (!Trim(wortlaut).empty())
+      body["reference_text"] = wortlaut;
+  }
+  body["response_format"] = format;
+  json::Value metadata = MetadataFor(
+      "stimme", args,
+      TitelArg(args, model + " · " + (stimme.empty() ? "default" : stimme) +
+                         " · " + Short(text, 40)),
+      model);
+  metadata["prompt"] = Short(text, 4000);
+  metadata["stimme"] = stimme.empty() ? std::string("default") : stimme;
+  metadata["sprache"] = sprache.empty() ? std::string("auto") : sprache;
+  return SubmitJob(outer, "/v1/audio/speech", body, {}, {}, model, vorrang,
+                   std::move(metadata));
+}
+
+json::Value McpService::RunMusik(const json::Value& args,
+                                 const HttpRequest& outer) const {
+  // pages/musik/index.html: POST /v1/audio/music {model, prompt, lyrics,
+  // seed, task text2music, duration, response_format, bitrate_kbps?}
+  // (server.md "POST /v1/audio/music").
+  const std::string stil = ArgString(args, "stil", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("musik");
+  std::string liedtext = ArgString(args, "liedtext", false);
+  if (Trim(liedtext).empty())
+    liedtext = "[Instrumental]";
+  const auto sekunden = ArgNumber(args, "sekunden", 1.0);
+  if (sekunden.has_value() && *sekunden > 600.0)
+    throw InvalidParams("arguments.sekunden must be between 1 and 600");
+  const std::string format = ArgEnum(args, "format", {"wav", "mp3"}, "wav");
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["prompt"] = stil;
+  body["lyrics"] = liedtext;
+  body["task"] = "text2music";
+  body["duration"] = sekunden.value_or(30.0);
+  if (seed.has_value())
+    body["seed"] = *seed;
+  body["response_format"] = format;
+  if (format != "wav")
+    body["bitrate_kbps"] = 192;
+  json::Value metadata = MetadataFor(
+      "musik", args,
+      TitelArg(args, std::to_string(static_cast<long long>(sekunden.value_or(30.0))) +
+                         " s · " + Short(stil, 60)),
+      model);
+  metadata["prompt"] = Short(stil, 4000);
+  metadata["liedtext"] = Short(liedtext, 4000);
+  metadata["dauer"] = *body.find("duration");
+  metadata["format"] = format;
+  return SubmitJob(outer, "/v1/audio/music", body, {}, {}, model, vorrang,
+                   std::move(metadata));
+}
+
+json::Value McpService::RunObjekt3d(const json::Value& args,
+                                    const HttpRequest& outer) const {
+  // pages/objekt/index.html: POST /v1/3d/generations {model, image (data
+  // URL), steps, seed, resolution, max_faces, preview, texture?/guidance?}
+  // (server.md "POST /v1/3d/generations").
+  const std::string bild = ArgString(args, "bild", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("objekt_3d");
+  const auto schritte = ArgInt(args, "schritte", 1, 200);
+  const auto guidance = ArgNumber(args, "guidance", 1.0);
+  if (guidance.has_value() && *guidance > 15.0)
+    throw InvalidParams("arguments.guidance must be between 1 and 15");
+  const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
+  const auto aufloesung = ArgInt(args, "aufloesung", 256, 512);
+  if (aufloesung.has_value() && *aufloesung != 256 && *aufloesung != 512)
+    throw InvalidParams("arguments.aufloesung must be 256 or 512");
+  const auto max_dreiecke = ArgInt(args, "max_dreiecke", 0, 100000000LL);
+  const auto textur = ArgBool(args, "textur");
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  Media media = ReadMedia(outer, bild, "arguments.bild");
+  if (media.failure.has_value())
+    return std::move(*media.failure);
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["image"] = DataUrlOf(media);
+  if (schritte.has_value())
+    body["steps"] = *schritte;
+  if (seed.has_value())
+    body["seed"] = *seed;
+  if (aufloesung.has_value())
+    body["resolution"] = *aufloesung;
+  if (max_dreiecke.has_value())
+    body["max_faces"] = *max_dreiecke;
+  if (guidance.has_value())
+    body["guidance"] = *guidance;
+  if (textur.has_value())
+    body["texture"] = *textur;
+  body["preview"] = true;
+  json::Value metadata = MetadataFor(
+      "objekt", args,
+      TitelArg(args, "Objekt · " + (media.name.empty() ? model : media.name)),
+      model);
+  if (!media.name.empty())
+    metadata["quelle_datei"] = media.name;
+  if (schritte.has_value())
+    metadata["schritte"] = *schritte;
+  return SubmitJob(outer, "/v1/3d/generations", body, {}, {}, model, vorrang,
+                   std::move(metadata));
+}
+
+json::Value McpService::RunHochskalieren(const json::Value& args,
+                                        const HttpRequest& outer) const {
+  // pages/hochskalieren/index.html: image -> POST /v1/images/upscale
+  // {model, variant general|wdn|anime, image (data URL), scale, output,
+  // response_format b64_json, quality 92 for jpg}; video -> POST
+  // /v1/videos/upscale {model, variant, video (data URL), scale, keep_audio,
+  // async true} (docs/models/realesrgan/README.md).
+  const std::string datei = ArgString(args, "datei", true);
+  std::string model = ArgString(args, "model", false);
+  if (model.empty())
+    model = DefaultModel("hochskalieren");
+  const long long faktor = ArgInt(args, "faktor", 2, 4).value_or(2);
+  if (faktor != 2 && faktor != 4)
+    throw InvalidParams("arguments.faktor must be 2 or 4");
+  const std::string variante =
+      ArgEnum(args, "variante", {"allgemein", "entrauscht", "anime"}, "allgemein");
+  const std::string ausgabe = ArgEnum(args, "ausgabe", {"png", "jpg"}, "png");
+  const auto vorrang = ArgInt(args, "vorrang", 0, 9);
+  Media media = ReadMedia(outer, datei, "arguments.datei");
+  if (media.failure.has_value())
+    return std::move(*media.failure);
+  const bool video = IsVideoMedia(media);
+  json::Value body = json::Value::object();
+  body["model"] = model;
+  body["variant"] = variante == "entrauscht" ? "wdn"
+                    : variante == "anime"    ? "anime"
+                                             : "general";
+  body["scale"] = faktor;
+  if (video) {
+    body["video"] = DataUrlOf(media);
+    body["keep_audio"] = true;
+    body["async"] = true;
+  } else {
+    body["image"] = DataUrlOf(media);
+    body["output"] = ausgabe;
+    body["response_format"] = "b64_json";
+    if (ausgabe == "jpg")
+      body["quality"] = 92;
+  }
+  const std::string name = media.name.empty() ? (video ? "video" : "bild") : media.name;
+  json::Value metadata = MetadataFor(
+      "hochskalieren", args,
+      TitelArg(args, name + " · " + std::to_string(faktor) + "× · " + variante),
+      model);
+  metadata["variante"] = body.member_str("variant");
+  metadata["faktor"] = faktor;
+  metadata["quelle_datei"] = name;
+  return SubmitJob(outer, video ? "/v1/videos/upscale" : "/v1/images/upscale",
+                   body, {}, {}, model, vorrang, std::move(metadata));
+}
+
 json::Value McpService::Call(std::string_view name, const json::Value& args,
                              const auth::Identity& who,
                              const HttpRequest& outer) {
@@ -1528,12 +2280,24 @@ json::Value McpService::Call(std::string_view name, const json::Value& args,
       result = RunAuftragAbbrechen(args, outer);
     else if (tool->name == "ablage_lesen")
       result = RunAblageLesen(args, outer);
+    else if (tool->name == "bild_erzeugen")
+      result = RunBildErzeugen(args, outer);
+    else if (tool->name == "bild_bearbeiten")
+      result = RunBildBearbeiten(args, outer);
+    else if (tool->name == "video_erzeugen")
+      result = RunVideoErzeugen(args, outer);
+    else if (tool->name == "stimme")
+      result = RunStimme(args, outer);
+    else if (tool->name == "musik")
+      result = RunMusik(args, outer);
+    else if (tool->name == "objekt_3d")
+      result = RunObjekt3d(args, outer);
+    else if (tool->name == "hochskalieren")
+      result = RunHochskalieren(args, outer);
     else {
-      // The media job tools follow in Commit 3.
       log("nicht_umgesetzt");
       return ToolError("Werkzeug '" + tool->name +
-                       "' ist noch nicht umgesetzt (Commit 3). Tool not "
-                       "implemented yet.");
+                       "' ist nicht umgesetzt. Tool not implemented.");
     }
   } catch (const InvalidParams& error) {
     log("abgelehnt:invalid_params");

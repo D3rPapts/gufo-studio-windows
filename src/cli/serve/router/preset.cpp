@@ -677,6 +677,14 @@ std::string ReportedModality(const PresetModel& preset) {
   if (preset.argv.size() >= 2 && preset.argv[0] == "serve" &&
       !preset.argv[1].empty() && preset.argv[1][0] != '-')
     return preset.argv[1];
+  // A llama.cpp server (2.1: `command = ...\llama-server.exe` without
+  // `args`, as the production preset runs its GGUF chat models) is a
+  // chat model.
+  std::string command = preset.command;
+  std::transform(command.begin(), command.end(), command.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (command.find("llama-server") != std::string::npos)
+    return "llm";
   return "external";
 }
 

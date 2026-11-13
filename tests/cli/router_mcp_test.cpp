@@ -2,8 +2,11 @@
 // initialize handshake, tools/list per role, the gate's rules for /mcp
 // (token of any role, loopback, never a cookie, the partner 404, Origin
 // check, [router] mcp = off) and the Commit 2 tools (modelle, chat,
-// auftrag_status/liste/abbrechen, ablage_lesen) as inner requests through
-// the real gate to a fake router. Pure state, no sockets, no models.
+// auftrag_status/liste/abbrechen, ablage_lesen) and the Commit 3 media
+// job tools (bild_erzeugen, bild_bearbeiten, video_erzeugen, stimme,
+// musik, objekt_3d, hochskalieren: the submit body, the priority header,
+// argument errors, inner refusals) as inner requests through the real
+// gate to a fake router. Pure state, no sockets, no models.
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +16,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -209,6 +213,9 @@ struct Fixture {
   /// The fake router's answers (nullopt: a plain {"ok": true}).
   std::function<std::optional<HttpResponse>(const HttpRequest&)> fake;
   std::function<HttpResponse(const HttpRequest&)> dispatch;
+  /// Job owners the gate's job_owner hook knows (the real router's job
+  /// store); empty = the hook answers nullopt.
+  std::map<std::string, std::string> owners;
 
   explicit Fixture(Config config = {}) {
     auth::Settings settings;
@@ -222,6 +229,12 @@ struct Fixture {
       } catch (const std::exception&) {
         return std::string();
       }
+    };
+    hooks.job_owner = [this](const std::string& id) -> std::optional<std::string> {
+      const auto it = owners.find(id);
+      if (it == owners.end())
+        return std::nullopt;
+      return it->second;
     };
     gate = std::make_unique<auth::Gate>(settings, store, std::move(hooks));
     dispatch = [this](const HttpRequest& req) {
@@ -835,8 +848,10 @@ void TestVisibility() {
   r = f.Post(Msg("tools/call", "1", "{\"name\":\"foo\"}"), kLan,
              Fixture::Bearer(leser));
   CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
-  // A visible media job tool (Commit 3) answers isError (not a protocol
-  // error), and the access log carries the mcp line.
+  // A visible media job tool sends its inner POST /v1/jobs, which the
+  // gate refuses for a user without the ablage area (as it does for the
+  // Bild page): isError 403 forbidden, not a protocol error, with the mcp
+  // log line; the fake router saw nothing.
   r = f.Post(Msg("tools/call", "7",
                  "{\"name\":\"bild_erzeugen\",\"arguments\":{\"prompt\":\"x\"}}"),
              kLan, Fixture::Bearer(maler));
@@ -853,13 +868,13 @@ void TestVisibility() {
       CHECK(content != nullptr && content->size() == 1);
       if (content != nullptr && content->size() == 1) {
         CHECK_EQ(content->items()[0].member_str("type"), std::string("text"));
-        CHECK(content->items()[0].member_str("text").find("noch nicht") !=
-              std::string::npos);
+        CHECK(content->items()[0].member_str("text").starts_with("403 forbidden"));
       }
+      const json::Value* structured = result->find("structuredContent");
+      CHECK(structured != nullptr && structured->member_str("code") == "forbidden");
     }
-    CHECK(f.Logged({"\tmaler\t", "mcp:bild_erzeugen:nicht_umgesetzt"}, 3));
+    CHECK(f.Logged({"\tmaler\t", "mcp:bild_erzeugen:abgelehnt:forbidden"}, 3));
   }
-  // The fake router saw no inner request for it (Commit 3 sends them).
   CHECK(f.seen.empty());
   // Schemas: objects with the plan's defaults; model lists from the preset.
   r = f.Post(Msg("tools/list"), kLan, Fixture::Bearer(bot));
@@ -1551,6 +1566,568 @@ void TestJobs() {
   }
 }
 
+// --- Commit 3: the media job tools -----------------------------------------
+
+/// The submit body of the last POST /v1/jobs (null without one).
+json::Value LastSubmit(const Fixture& f) {
+  const std::vector<HttpRequest> posts = f.Requests("/v1/jobs");
+  for (auto it = posts.rbegin(); it != posts.rend(); ++it)
+    if (it->method == "POST")
+      return BodyOf(*it);
+  return json::Value();
+}
+
+const HttpRequest* LastSubmitRequest(const Fixture& f) {
+  for (auto it = f.requests.rbegin(); it != f.requests.rend(); ++it)
+    if (it->method == "POST" && it->path == "/v1/jobs")
+      return &*it;
+  return nullptr;
+}
+
+/// `request.body` of a submit (the wrapped JSON request).
+json::Value WrappedBody(const json::Value& submit) {
+  const json::Value* request = submit.find("request");
+  const json::Value* body = request != nullptr ? request->find("body") : nullptr;
+  return body != nullptr ? *body : json::Value();
+}
+
+std::string WrappedPath(const json::Value& submit) {
+  const json::Value* request = submit.find("request");
+  return request != nullptr ? request->member_str("path") : std::string();
+}
+
+/// A job tool result: the uniform answer plus the text that names the
+/// next steps.
+void CheckAccepted(const HttpResponse& r, const std::string& model) {
+  CHECK_EQ(RpcCode(r), 0);
+  CHECK(!IsToolError(r));
+  const json::Value s = Structured(r);
+  CHECK_EQ(s.member_str("auftrag_id"), std::string("n1"));
+  CHECK_EQ(s.member_str("status"), std::string("queued"));
+  CHECK_EQ(s.member_str("url"), std::string("/v1/jobs/n1"));
+  CHECK_EQ(s.member_str("modell"), model);
+  CHECK_EQ(s.member_double("position"), 2.0);
+  CHECK(s.find("geschaetzt") != nullptr && !s.find("geschaetzt")->as_bool());
+  const std::vector<json::Value> blocks = Blocks(r);
+  CHECK_EQ(blocks.size(), std::size_t(1));
+  if (!blocks.empty()) {
+    const std::string text = blocks[0].member_str("text");
+    CHECK(text.starts_with("Auftrag n1 angenommen"));
+    CHECK(text.find("auftrag_status") != std::string::npos);
+    CHECK(text.find(s.dump()) != std::string::npos);
+  }
+}
+
+void TestMediaJobs() {
+  Fixture f;
+  auth::Rights media;
+  media.bereiche = {"bild", "video", "stimme", "musik", "3d", "ablage"};
+  f.AddUser("mia", "nutzer", media);
+  auth::Rights one_model = media;
+  one_model.modelle = {"qwen-image-2.1"};
+  f.AddUser("ben", "nutzer", one_model);
+  auth::Rights two_a_day = media;
+  two_a_day.tageslimit = 2;
+  f.AddUser("vid", "nutzer", two_a_day);
+  f.AddUser("bob", "nutzer", media);
+  const std::string mia = f.Token("mia");
+  const std::string ben = f.Token("ben");
+  const std::string vid = f.Token("vid");
+  const std::string bob = f.Token("bob");
+  f.owners["j1"] = "mia";  // the real store's owner: bob's reads are 404
+  const std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + std::string(92, 'x');
+  const std::string wav = "RIFF" + std::string(56, 'w');
+  const std::string mp4 = std::string(30, 'v');
+  const std::string png_url = "data:image/png;base64," + gufo::router::comfy::Base64Encode(png);
+  const std::string wav_url = "data:audio/wav;base64," + gufo::router::comfy::Base64Encode(wav);
+  f.fake = [&](const HttpRequest& req) -> std::optional<HttpResponse> {
+    const std::string& p = req.path;
+    if (req.method == "POST" && p == "/v1/jobs") {
+      const json::Value submit = BodyOf(req);
+      const json::Value body = WrappedBody(submit);
+      if (body.member_str("prompt").find("voll") != std::string::npos)
+        return ErrorAnswer(507, "insufficient_memory", "not enough memory");
+      json::Value view = JobView("n1", "queued", "mia", WrappedPath(submit));
+      json::Value request = *view.find("request");
+      request["model"] = body.member_str("model");
+      view["request"] = std::move(request);
+      view["position"] = 2;
+      return JsonAnswer(202, view);
+    }
+    if (req.method == "GET") {
+      if (p == "/v1/jobs/j1/files/image-1.png") return FileAnswer(png, "image/png");
+      if (p == "/v1/jobs/j1/files/ton.wav") return FileAnswer(wav, "audio/wav");
+      if (p == "/v1/jobs/j1/files/video.mp4") return FileAnswer(mp4, "video/mp4");
+      if (p.starts_with("/v1/jobs/"))
+        return ErrorAnswer(404, "job_not_found", "job not found");
+    }
+    return std::nullopt;
+  };
+
+  // bild_erzeugen: the page's body, the priority header, the metadata.
+  HttpResponse r = f.Call(
+      "bild_erzeugen",
+      "{\"prompt\":\"Haus am See\",\"vorrang\":5,\"breite\":1024,\"hoehe\":768,"
+      "\"schritte\":8,\"seed\":7,\"negativ\":\"unscharf\","
+      "\"lora\":[{\"name\":\"stil\",\"staerke\":0.8}],\"titel\":\"Mein Haus\"}",
+      kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "qwen-image-2.1-turbo");
+  {
+    const HttpRequest* submit = LastSubmitRequest(f);
+    CHECK(submit != nullptr);
+    if (submit != nullptr) {
+      CHECK_EQ(submit->header("X-Gufo-Priority"), std::string("5"));
+      CHECK_EQ(submit->header("Authorization"), "Bearer " + mia);
+      const json::Value s = BodyOf(*submit);
+      CHECK_EQ(WrappedPath(s), std::string("/v1/images/generations"));
+      CHECK_EQ(s.member_double("priority"), 5.0);
+      const json::Value b = WrappedBody(s);
+      CHECK_EQ(b.member_str("model"), std::string("qwen-image-2.1-turbo"));
+      CHECK_EQ(b.member_str("prompt"), std::string("Haus am See"));
+      CHECK_EQ(b.member_str("size"), std::string("1024x768"));
+      CHECK_EQ(b.member_double("steps"), 8.0);
+      CHECK_EQ(b.member_double("seed"), 7.0);
+      CHECK(b.find("n") == nullptr);
+      CHECK_EQ(b.member_str("response_format"), std::string("b64_json"));
+      const json::Value* loras = b.find("loras");
+      CHECK(loras != nullptr && loras->size() == 1);
+      if (loras != nullptr && loras->size() == 1) {
+        CHECK_EQ(loras->items()[0].member_str("name"), std::string("stil"));
+        CHECK_EQ(loras->items()[0].member_double("scale"), 0.8);
+      }
+      CHECK(b.find("gufo") != nullptr);
+      if (b.find("gufo") != nullptr)
+        CHECK_EQ(b.find("gufo")->member_str("negative_prompt"), std::string("unscharf"));
+      const json::Value* metadata = s.find("metadata");
+      CHECK(metadata != nullptr);
+      if (metadata != nullptr) {
+        CHECK_EQ(metadata->member_str("quelle"), std::string("mcp"));
+        CHECK_EQ(metadata->member_str("seite"), std::string("bild"));
+        CHECK_EQ(metadata->member_str("titel"), std::string("Mein Haus"));
+        CHECK_EQ(metadata->member_str("prompt"), std::string("Haus am See"));
+        CHECK_EQ(metadata->member_str("modell"), std::string("qwen-image-2.1-turbo"));
+      }
+    }
+    CHECK(f.Logged({"\tmia\t", "mcp:bild_erzeugen:ok", "qwen-image-2.1-turbo"}, 3));
+    CHECK(f.Logged({"\tmia\t", "POST /v1/jobs"}, 3));
+  }
+  // Without vorrang: no priority header, no priority member; anzahl -> n;
+  // the title from the prompt.
+  r = f.Call("bild_erzeugen", "{\"prompt\":\"Haus am See\",\"anzahl\":3,\"model\":\"qwen-image-2.1\"}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "qwen-image-2.1");
+  {
+    const HttpRequest* submit = LastSubmitRequest(f);
+    CHECK(submit != nullptr && submit->header("X-Gufo-Priority").empty());
+    const json::Value s = LastSubmit(f);
+    CHECK(s.find("priority") == nullptr);
+    CHECK_EQ(WrappedBody(s).member_double("n"), 3.0);
+    CHECK(WrappedBody(s).find("size") == nullptr);
+    CHECK_EQ(s.find("metadata")->member_str("titel"), std::string("qwen-image-2.1 · Haus am See"));
+  }
+  // Argument errors name the field.
+  for (const auto& [bad, field] : std::vector<std::pair<const char*, const char*>>{
+           {"{}", "arguments.prompt"},
+           {"{\"prompt\":\"x\",\"vorrang\":12}", "arguments.vorrang"},
+           {"{\"prompt\":\"x\",\"vorrang\":\"hoch\"}", "arguments.vorrang"},
+           {"{\"prompt\":\"x\",\"breite\":1024}", "arguments.breite"},
+           {"{\"prompt\":\"x\",\"breite\":1000,\"hoehe\":512}", "arguments.breite"},
+           {"{\"prompt\":\"x\",\"breite\":4096,\"hoehe\":4096}", "arguments.breite"},
+           {"{\"prompt\":\"x\",\"anzahl\":5}", "arguments.anzahl"},
+           {"{\"prompt\":\"x\",\"lora\":[{\"staerke\":1}]}", "arguments.lora"},
+           {"{\"prompt\":\"x\",\"schritte\":0}", "arguments.schritte"}}) {
+    r = f.Call("bild_erzeugen", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find(field) != std::string::npos);
+  }
+  CHECK(f.Logged({"\tmia\t", "mcp:bild_erzeugen:abgelehnt:invalid_params"}, 2));
+  // Inner refusals: 507 from the router, 403 model_forbidden from the gate.
+  r = f.Call("bild_erzeugen", "{\"prompt\":\"Speicher voll\"}", kLan, Fixture::Bearer(mia));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 507);
+  CHECK_EQ(FailureCode(r), std::string("insufficient_memory"));
+  CHECK(f.Logged({"\tmia\t", "mcp:bild_erzeugen:abgelehnt:insufficient_memory"}, 2));
+  r = f.Call("bild_erzeugen", "{\"prompt\":\"Haus am See\"}", kLan, Fixture::Bearer(ben));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 403);
+  CHECK_EQ(FailureCode(r), std::string("model_forbidden"));
+  CHECK(f.Logged({"\tben\t", "mcp:bild_erzeugen:abgelehnt:model_forbidden"}, 2));
+  r = f.Call("bild_erzeugen", "{\"prompt\":\"Haus am See\",\"model\":\"qwen-image-2.1\"}",
+             kLan, Fixture::Bearer(ben));
+  CheckAccepted(r, "qwen-image-2.1");
+
+  // bild_bearbeiten: the Ablage file is read first, the multipart body
+  // travels as body_base64; a mask makes the first image the init_image.
+  const std::size_t fetched = f.Requests("/v1/jobs/j1/files/image-1.png").size();
+  r = f.Call("bild_bearbeiten",
+             "{\"prompt\":\"Himmel blau\",\"bilder\":[\"/v1/jobs/j1/files/image-1.png\",\"" +
+                 png_url + "\"],\"maske\":\"" + png_url +
+                 "\",\"staerke\":0.6,\"schritte\":20,\"seed\":3,\"negativ\":\"grau\",\"vorrang\":9}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "qwen-image-2.1");
+  CHECK_EQ(f.Requests("/v1/jobs/j1/files/image-1.png").size(), fetched + 1);
+  {
+    const HttpRequest* submit = LastSubmitRequest(f);
+    CHECK(submit != nullptr && submit->header("X-Gufo-Priority") == "9");
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/images/edits"));
+    const json::Value* request = s.find("request");
+    CHECK(request != nullptr && request->find("body") == nullptr);
+    const std::string type = request != nullptr ? request->member_str("content_type") : "";
+    CHECK(type.starts_with("multipart/form-data; boundary="));
+    const auto raw = gufo::router::comfy::Base64Decode(
+        request != nullptr ? request->member_str("body_base64") : "");
+    CHECK(raw.has_value());
+    std::vector<gufo::router::comfy::MultipartPart> parts;
+    std::string error;
+    CHECK(raw.has_value() &&
+          gufo::router::comfy::ParseMultipart(type, *raw, &parts, &error));
+    const auto part = [&parts](std::string_view name) -> const gufo::router::comfy::MultipartPart* {
+      for (const auto& p : parts)
+        if (p.name == name)
+          return &p;
+      return nullptr;
+    };
+    CHECK(part("model") != nullptr && part("model")->data == "qwen-image-2.1");
+    CHECK(part("prompt") != nullptr && part("prompt")->data == "Himmel blau");
+    CHECK(part("size") != nullptr && part("size")->data == "auto");
+    CHECK(part("steps") != nullptr && part("steps")->data == "20");
+    CHECK(part("seed") != nullptr && part("seed")->data == "3");
+    CHECK(part("response_format") != nullptr && part("response_format")->data == "b64_json");
+    CHECK(part("init_image") != nullptr && part("init_image")->data == png &&
+          part("init_image")->filename == "image-1.png" &&
+          part("init_image")->content_type == "image/png");
+    CHECK(part("image[]") != nullptr && part("image[]")->data == png &&
+          part("image[]")->filename == "bild-2.png");
+    CHECK(part("mask") != nullptr && part("mask")->data == png);
+    CHECK(part("gufo.strength") != nullptr &&
+          part("gufo.strength")->data.starts_with("0.6"));
+    CHECK(part("gufo.negative_prompt") != nullptr && part("gufo.negative_prompt")->data == "grau");
+    CHECK_EQ(parts.size(), std::size_t(11));
+    CHECK_EQ(s.find("metadata")->member_str("seite"), std::string("bild"));
+    CHECK_EQ(s.find("metadata")->member_double("bilder"), 2.0);
+  }
+  // Without mask and strength: references only, no size part.
+  r = f.Call("bild_bearbeiten",
+             "{\"prompt\":\"Himmel blau\",\"bilder\":[\"" + png_url + "\"]}", kLan,
+             Fixture::Bearer(mia));
+  CheckAccepted(r, "qwen-image-2.1");
+  {
+    const json::Value s = LastSubmit(f);
+    const json::Value* request = s.find("request");
+    const auto raw = gufo::router::comfy::Base64Decode(request->member_str("body_base64"));
+    std::vector<gufo::router::comfy::MultipartPart> parts;
+    std::string error;
+    CHECK(raw.has_value() && gufo::router::comfy::ParseMultipart(
+                                 request->member_str("content_type"), *raw, &parts, &error));
+    bool init = false, size = false, reference = false;
+    for (const auto& p : parts) {
+      init = init || p.name == "init_image";
+      size = size || p.name == "size";
+      reference = reference || (p.name == "image[]" && p.filename == "bild-1.png");
+    }
+    CHECK(!init && !size && reference);
+  }
+  // Another user's Ablage file (the gate: 404), an unknown job, bad refs.
+  r = f.Call("bild_bearbeiten",
+             "{\"prompt\":\"x\",\"bilder\":[\"/v1/jobs/j1/files/image-1.png\"]}", kLan,
+             Fixture::Bearer(bob));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 404);
+  CHECK_EQ(FailureCode(r), std::string("not_found"));
+  CHECK(f.Logged({"\tbob\t", "mcp:bild_bearbeiten:abgelehnt:not_found"}, 2));
+  r = f.Call("bild_bearbeiten",
+             "{\"prompt\":\"x\",\"bilder\":[\"/v1/jobs/j9/files/image-1.png\"]}", kLan,
+             Fixture::Bearer(mia));
+  CheckShape(r, true);
+  CHECK_EQ(FailureCode(r), std::string("job_not_found"));
+  for (const auto& [bad, field] : std::vector<std::pair<std::string, const char*>>{
+           {"{\"prompt\":\"x\"}", "arguments.bilder"},
+           {"{\"prompt\":\"x\",\"bilder\":[]}", "arguments.bilder"},
+           {"{\"prompt\":\"x\",\"bilder\":\"" + png_url + "\"}", "arguments.bilder"},
+           {"{\"prompt\":\"x\",\"bilder\":[\"http://x/y.png\"]}", "arguments.bilder[0]"},
+           {"{\"prompt\":\"x\",\"bilder\":[\"data:image/png,abc\"]}", "arguments.bilder[0]"},
+           {"{\"prompt\":\"x\",\"bilder\":[\"data:image/png;base64,\"]}", "arguments.bilder[0]"},
+           {"{\"prompt\":\"x\",\"bilder\":[\"" + png_url + "\"],\"maske\":\"nein\"}", "arguments.maske"},
+           {"{\"prompt\":\"x\",\"bilder\":[\"" + png_url + "\"],\"staerke\":1.5}", "arguments.staerke"}}) {
+    r = f.Call("bild_bearbeiten", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find(field) != std::string::npos);
+  }
+
+  // video_erzeugen: H3 with both anchors and an audio reference.
+  r = f.Call("video_erzeugen",
+             "{\"prompt\":\"Boot auf dem See\",\"sekunden\":5,\"startbild\":\"/v1/jobs/j1/files/image-1.png\","
+             "\"endbild\":\"" + png_url + "\",\"ton\":\"/v1/jobs/j1/files/ton.wav\",\"qualitaet\":\"schnell\",\"seed\":11}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "minimax-h3");
+  {
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/videos"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("model"), std::string("minimax-h3"));
+    CHECK_EQ(b.member_double("seconds"), 5.0);
+    CHECK_EQ(b.member_str("size"), std::string("512x512"));
+    CHECK_EQ(b.member_str("first_frame"), png_url);
+    CHECK_EQ(b.member_str("last_frame"), png_url);
+    CHECK_EQ(b.member_str("audio_reference"), wav_url);
+    const json::Value* gufo = b.find("gufo");
+    CHECK(gufo != nullptr);
+    if (gufo != nullptr) {
+      CHECK_EQ(gufo->member_str("preset"), std::string("fast"));
+      CHECK_EQ(gufo->member_double("seed"), 11.0);
+      CHECK(gufo->find("steps") == nullptr);
+    }
+    const json::Value* metadata = s.find("metadata");
+    CHECK_EQ(metadata->member_str("seite"), std::string("video"));
+    CHECK_EQ(metadata->member_str("qualitaet"), std::string("fast"));
+    CHECK(metadata->find("startbild")->as_bool() && metadata->find("ton")->as_bool());
+  }
+  // The default quality is exact.
+  r = f.Call("video_erzeugen", "{\"prompt\":\"Boot\"}", kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "minimax-h3");
+  CHECK_EQ(WrappedBody(LastSubmit(f)).find("gufo")->member_str("preset"), std::string("exact"));
+  // WAN 2.2: steps, guidance and negative prompt in gufo; no end frame.
+  r = f.Call("video_erzeugen",
+             "{\"prompt\":\"Boot\",\"model\":\"wan2.2-ti2v-5b\",\"schritte\":30,\"guidance\":4,"
+             "\"negativ\":\"Text\",\"breite\":832,\"hoehe\":480,\"sekunden\":3}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "wan2.2-ti2v-5b");
+  {
+    const json::Value b = WrappedBody(LastSubmit(f));
+    CHECK_EQ(b.member_str("size"), std::string("832x480"));
+    CHECK_EQ(b.member_double("seconds"), 3.0);
+    const json::Value* gufo = b.find("gufo");
+    CHECK_EQ(gufo->member_double("steps"), 30.0);
+    CHECK_EQ(gufo->member_double("guidance"), 4.0);
+    CHECK_EQ(gufo->member_str("negative_prompt"), std::string("Text"));
+    CHECK(gufo->find("preset") == nullptr);
+  }
+  // InfiniteTalk: start image and audio required, the audio in gufo.talk.
+  r = f.Call("video_erzeugen",
+             "{\"prompt\":\"spricht\",\"model\":\"wan2.1-infinitetalk-14b\",\"startbild\":\"" + png_url +
+                 "\",\"ton\":\"" + wav_url + "\"}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "wan2.1-infinitetalk-14b");
+  {
+    const json::Value b = WrappedBody(LastSubmit(f));
+    CHECK(b.find("seconds") == nullptr);
+    CHECK_EQ(b.member_str("size"), std::string("832x480"));
+    CHECK_EQ(b.member_str("first_frame"), png_url);
+    const json::Value* gufo = b.find("gufo");
+    CHECK_EQ(gufo->member_double("steps"), 4.0);
+    const json::Value* talk = gufo->find("talk");
+    CHECK(talk != nullptr && talk->find("audio") != nullptr &&
+          talk->find("audio")->size() == 1 &&
+          talk->find("audio")->items()[0].str() == wav_url);
+  }
+  for (const auto& [bad, field] : std::vector<std::pair<std::string, const char*>>{
+           {"{\"prompt\":\"x\",\"model\":\"wan2.2-ti2v-5b\",\"endbild\":\"" + png_url + "\"}", "arguments.endbild"},
+           {"{\"prompt\":\"x\",\"model\":\"wan2.2-ti2v-5b\",\"ton\":\"" + wav_url + "\"}", "arguments.ton"},
+           {"{\"prompt\":\"x\",\"model\":\"wan2.2-ti2v-5b\",\"sekunden\":10}", "arguments.sekunden"},
+           {"{\"prompt\":\"x\",\"sekunden\":15}", "arguments.sekunden"},
+           {"{\"prompt\":\"x\",\"model\":\"wan2.1-uni3c\"}", "arguments.startbild"},
+           {"{\"prompt\":\"x\",\"model\":\"wan2.1-infinitetalk-14b\",\"startbild\":\"" + png_url + "\"}", "arguments.ton"},
+           {"{\"prompt\":\"x\",\"qualitaet\":\"turbo\"}", "arguments.qualitaet"},
+           {"{\"prompt\":\"x\",\"startbild\":\"foto.png\"}", "arguments.startbild"}}) {
+    r = f.Call("video_erzeugen", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find(field) != std::string::npos);
+  }
+  // A video counts twice: limit 2 is used up by one.
+  r = f.Call("video_erzeugen", "{\"prompt\":\"Boot\"}", kLan, Fixture::Bearer(vid));
+  CheckAccepted(r, "minimax-h3");
+  r = f.Call("video_erzeugen", "{\"prompt\":\"Boot\"}", kLan, Fixture::Bearer(vid));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 429);
+  CHECK_EQ(FailureCode(r), std::string("daily_limit"));
+
+  // stimme: the speech body with a cloned voice (raw base64 sample).
+  r = f.Call("stimme",
+             "{\"text\":\"Guten Morgen\",\"probe\":\"/v1/jobs/j1/files/ton.wav\",\"wortlaut\":\"Hallo\","
+             "\"sprache\":\"de\",\"tempo\":1.2,\"format\":\"mp3\",\"seed\":5,\"vorrang\":1}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "fish-drama-3");
+  {
+    const HttpRequest* submit = LastSubmitRequest(f);
+    CHECK(submit != nullptr && submit->header("X-Gufo-Priority") == "1");
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/audio/speech"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("model"), std::string("fish-drama-3"));
+    CHECK_EQ(b.member_str("input"), std::string("Guten Morgen"));
+    CHECK_EQ(b.member_str("voice"), std::string("voice-clone"));
+    CHECK_EQ(b.member_str("reference_audio"), gufo::router::comfy::Base64Encode(wav));
+    CHECK_EQ(b.member_str("reference_text"), std::string("Hallo"));
+    CHECK_EQ(b.member_str("language"), std::string("de"));
+    CHECK_EQ(b.member_double("speed"), 1.2);
+    CHECK_EQ(b.member_double("seed"), 5.0);
+    CHECK_EQ(b.member_str("response_format"), std::string("mp3"));
+    CHECK(b.find("voice_clone_mode") == nullptr);
+    CHECK_EQ(s.find("metadata")->member_str("seite"), std::string("stimme"));
+  }
+  r = f.Call("stimme", "{\"text\":\"Guten Morgen\",\"model\":\"qwen3-tts-voicedesign\",\"beschreibung\":\"tief\"}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "qwen3-tts-voicedesign");
+  {
+    const json::Value b = WrappedBody(LastSubmit(f));
+    CHECK_EQ(b.member_str("voice"), std::string("voice-design"));
+    CHECK_EQ(b.member_str("instructions"), std::string("tief"));
+    CHECK(b.find("speed") == nullptr && b.find("reference_audio") == nullptr);
+    CHECK_EQ(b.member_str("response_format"), std::string("wav"));
+  }
+  r = f.Call("stimme", "{\"text\":\"Hallo\",\"stimme\":\"erzaehler\"}", kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "fish-drama-3");
+  CHECK_EQ(WrappedBody(LastSubmit(f)).member_str("voice"), std::string("erzaehler"));
+  for (const auto& [bad, field] : std::vector<std::pair<std::string, const char*>>{
+           {"{}", "arguments.text"},
+           {"{\"text\":\"x\",\"probe\":\"" + wav_url + "\"}", "arguments.wortlaut"},
+           {"{\"text\":\"x\",\"model\":\"qwen3-tts-voicedesign\"}", "arguments.beschreibung"},
+           {"{\"text\":\"x\",\"tempo\":5}", "arguments.tempo"},
+           {"{\"text\":\"x\",\"format\":\"ogg\"}", "arguments.format"}}) {
+    r = f.Call("stimme", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find(field) != std::string::npos);
+  }
+
+  // musik: the music body.
+  r = f.Call("musik", "{\"stil\":\"calm piano\",\"sekunden\":20,\"format\":\"mp3\",\"seed\":3}", kLan,
+             Fixture::Bearer(mia));
+  CheckAccepted(r, "ace-step-1.5-xl-turbo");
+  {
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/audio/music"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("prompt"), std::string("calm piano"));
+    CHECK_EQ(b.member_str("lyrics"), std::string("[Instrumental]"));
+    CHECK_EQ(b.member_str("task"), std::string("text2music"));
+    CHECK_EQ(b.member_double("duration"), 20.0);
+    CHECK_EQ(b.member_str("response_format"), std::string("mp3"));
+    CHECK_EQ(b.member_double("bitrate_kbps"), 192.0);
+    CHECK_EQ(b.member_double("seed"), 3.0);
+    CHECK_EQ(s.find("metadata")->member_str("seite"), std::string("musik"));
+  }
+  r = f.Call("musik", "{\"stil\":\"rock\",\"liedtext\":\"la la\",\"model\":\"moss-music\"}", kLan,
+             Fixture::Bearer(mia));
+  CheckAccepted(r, "moss-music");
+  {
+    const json::Value b = WrappedBody(LastSubmit(f));
+    CHECK_EQ(b.member_str("lyrics"), std::string("la la"));
+    CHECK_EQ(b.member_double("duration"), 30.0);
+    CHECK(b.find("bitrate_kbps") == nullptr);
+  }
+  for (const char* bad : {"{}", "{\"stil\":\"x\",\"sekunden\":700}", "{\"stil\":\"x\",\"format\":\"flac\"}"}) {
+    r = f.Call("musik", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  }
+
+  // objekt_3d: the 3D body with the image as a data URL.
+  r = f.Call("objekt_3d",
+             "{\"bild\":\"/v1/jobs/j1/files/image-1.png\",\"model\":\"triposg\",\"schritte\":12,"
+             "\"aufloesung\":256,\"max_dreiecke\":5000,\"guidance\":7,\"seed\":2}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "triposg");
+  {
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/3d/generations"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("image"), png_url);
+    CHECK_EQ(b.member_double("steps"), 12.0);
+    CHECK_EQ(b.member_double("resolution"), 256.0);
+    CHECK_EQ(b.member_double("max_faces"), 5000.0);
+    CHECK_EQ(b.member_double("guidance"), 7.0);
+    CHECK_EQ(b.member_double("seed"), 2.0);
+    CHECK(b.find("preview")->as_bool());
+    CHECK_EQ(s.find("metadata")->member_str("seite"), std::string("objekt"));
+    CHECK_EQ(s.find("metadata")->member_str("quelle_datei"), std::string("image-1.png"));
+  }
+  // No model: the preset's first 3D model (the fixture has only triposg).
+  r = f.Call("objekt_3d", "{\"bild\":\"" + png_url + "\",\"textur\":true}", kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "triposg");
+  CHECK(WrappedBody(LastSubmit(f)).find("texture")->as_bool());
+  for (const char* bad : {"{}", "{\"bild\":\"x.png\"}", "{\"bild\":\"data:image/png;base64,QUJD\",\"aufloesung\":300}",
+                          "{\"bild\":\"data:image/png;base64,QUJD\",\"guidance\":20}"}) {
+    r = f.Call("objekt_3d", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  }
+
+  // hochskalieren: an image goes to /v1/images/upscale, a video to
+  // /v1/videos/upscale (area video, counts twice).
+  r = f.Call("hochskalieren", "{\"datei\":\"/v1/jobs/j1/files/image-1.png\"}", kLan,
+             Fixture::Bearer(mia));
+  CheckAccepted(r, "gufo-upscale");
+  {
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/images/upscale"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("model"), std::string("gufo-upscale"));
+    CHECK_EQ(b.member_str("variant"), std::string("general"));
+    CHECK_EQ(b.member_double("scale"), 2.0);
+    CHECK_EQ(b.member_str("image"), png_url);
+    CHECK_EQ(b.member_str("output"), std::string("png"));
+    CHECK_EQ(b.member_str("response_format"), std::string("b64_json"));
+    CHECK(b.find("quality") == nullptr && b.find("video") == nullptr);
+    CHECK_EQ(s.find("metadata")->member_str("seite"), std::string("hochskalieren"));
+    CHECK_EQ(s.find("metadata")->member_str("titel"), std::string("image-1.png · 2× · allgemein"));
+  }
+  r = f.Call("hochskalieren",
+             "{\"datei\":\"/v1/jobs/j1/files/video.mp4\",\"faktor\":4,\"variante\":\"entrauscht\",\"ausgabe\":\"jpg\"}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "gufo-upscale");
+  {
+    const json::Value s = LastSubmit(f);
+    CHECK_EQ(WrappedPath(s), std::string("/v1/videos/upscale"));
+    const json::Value b = WrappedBody(s);
+    CHECK_EQ(b.member_str("variant"), std::string("wdn"));
+    CHECK_EQ(b.member_double("scale"), 4.0);
+    CHECK_EQ(b.member_str("video"), "data:video/mp4;base64," + gufo::router::comfy::Base64Encode(mp4));
+    CHECK(b.find("keep_audio")->as_bool());
+    CHECK(b.find("async")->as_bool());
+    CHECK(b.find("image") == nullptr && b.find("output") == nullptr);
+  }
+  r = f.Call("hochskalieren", "{\"datei\":\"" + png_url + "\",\"ausgabe\":\"jpg\",\"variante\":\"anime\"}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "gufo-upscale");
+  CHECK_EQ(WrappedBody(LastSubmit(f)).member_double("quality"), 92.0);
+  CHECK_EQ(WrappedBody(LastSubmit(f)).member_str("variant"), std::string("anime"));
+  for (const char* bad : {"{}", "{\"datei\":\"x\"}", "{\"datei\":\"data:image/png;base64,QUJD\",\"faktor\":3}",
+                          "{\"datei\":\"data:image/png;base64,QUJD\",\"variante\":\"scharf\"}"}) {
+    r = f.Call("hochskalieren", bad, kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  }
+  // The video upscale of a user without the video area is the gate's 403.
+  {
+    auth::Rights bild_only;
+    bild_only.bereiche = {"bild", "ablage"};
+    f.AddUser("pix", "nutzer", bild_only);
+    const std::string pix = f.Token("pix");
+    r = f.Call("hochskalieren", "{\"datei\":\"data:video/mp4;base64,QUJD\"}", kLan,
+               Fixture::Bearer(pix));
+    CheckShape(r, true);
+    CHECK_EQ(FailureStatus(r), 403);
+    CHECK_EQ(FailureCode(r), std::string("forbidden"));
+    r = f.Call("hochskalieren", "{\"datei\":\"data:image/png;base64,QUJD\"}", kLan,
+               Fixture::Bearer(pix));
+    CheckAccepted(r, "gufo-upscale");
+  }
+
+  // Schemas: every job tool has a model default, titel and vorrang.
+  for (const mcp::Tool& tool : f.service->tools()) {
+    if (!tool.needs_jobs || tool.name.starts_with("auftrag") || tool.name == "ablage_lesen")
+      continue;
+    const json::Value* properties = tool.input_schema.find("properties");
+    CHECK(properties != nullptr);
+    if (properties == nullptr)
+      continue;
+    CHECK(properties->find("vorrang") != nullptr);
+    CHECK(properties->find("titel") != nullptr);
+    const json::Value* model = properties->find("model");
+    CHECK(model != nullptr && !model->member_str("default").empty());
+    CHECK(tool.output_schema.find("properties")->find("modell") != nullptr);
+  }
+  CHECK_EQ(f.service->tools().size(), kAllTools.size());
+}
+
 }  // namespace
 
 int main() {
@@ -1562,6 +2139,7 @@ int main() {
   TestModelle();
   TestChat();
   TestJobs();
+  TestMediaJobs();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

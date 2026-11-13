@@ -693,8 +693,10 @@ independent of workers. `GET /v1/models` lists every preset model in
 OpenAI list shape with the extension field `"loaded": true|false`. Its
 `"modality"` (also in `/router/capabilities`) is the section's; an
 `[external/<id>]` section reports the modality its leading `args = serve
-<modality>` names (`llm`, `image`, `tts`, ...) and `external` only when
-the command line does not say (2.0.5).
+<modality>` names (`llm`, `image`, `tts`, ...), `llm` for a section
+whose `command` is a llama.cpp `llama-server` without such `args` (2.1:
+the production preset's GGUF chat models), and `external` only when the
+command line does not say (2.0.5).
 `GET /v1/slots` and `GET /v1/metrics` require `?model=<id>`: they proxy to
 that worker when loaded and return 409 `model_not_loaded` otherwise.
 Unknown paths return 404 `not_found`, and video routes keep `serve`'s verb
@@ -1457,7 +1459,7 @@ when the refusal carries a `Retry-After` header (the daily limit sends
 none).
 
 The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
-`auftrag_abbrechen`, `ablage_lesen`; the media job tools follow):
+`auftrag_abbrechen`, `ablage_lesen` and the media job tools below):
 
 - `modelle` `{modalitaet?}`: `GET /v1/models` reduced to
   `{modelle: [{id, modalitaet, geladen, ort}]}` with the German
@@ -1504,6 +1506,86 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   link; a video or any other type is always the link. Only an embedded
   file (or one the job's list does not name) is read through
   `GET /v1/jobs/{id}/files/{name}`.
+
+Media job tools: each one `POST /v1/jobs` around the endpoint the
+matching page uses, with the body that page sends (pages/bild, video,
+stimme, musik, objekt, hochskalieren), so a job made through MCP is a
+job of that page in the Ablage: `metadata {quelle: "mcp", seite, titel,
+modell, prompt?, seed?, ...}`; `titel` is the caller's or built from the
+model and the prompt. `vorrang` (0-9) goes as `X-Gufo-Priority` on the
+submit (and as its `priority` member), replacing a priority header of the
+`/mcp` request. `model` defaults to the preset's first model of the
+modality (the schema's `default`; the preset's models are named in the
+field's description). Input files (`startbild`, `probe`, `bild`, `datei`,
+`bilder[]`, `maske`, `ton`, `endbild`) are an Ablage path
+`/v1/jobs/{id}/files/{name}` (read through the gate: another user's job
+is the gate's 404, so an agent can only use its own results) or a base64
+`data:` URL (`-32602` for anything else, an empty file or one over 20 MB);
+the router sends them on as data URLs (the workers do not fetch router
+paths). The answer is `{auftrag_id, status, url, modell, position?,
+geschaetzt?}` from the job store's 202 and the text "Auftrag <id>
+angenommen (Status queued), Stand mit auftrag_status, Ergebnis mit
+ablage_lesen. Job accepted." followed by that JSON. The gate counts
+every submit as the wrapped request (a video twice), checks area, model
+and word filter on it, and its refusal (`403 forbidden`, `403
+model_forbidden`, `400 content_filtered`, `429 daily_limit`) or the
+router's (`507 insufficient_memory`, `503 ...`) is the tool's `isError`.
+As for the pages, the submit itself needs the `ablage` area (`/v1/jobs`):
+a user with `bild` alone sees `bild_erzeugen` but gets `403 forbidden`.
+
+- `bild_erzeugen` `{prompt, negativ?, model?, breite?+hoehe? (multiples
+  of 32, at most 4 MP), schritte?, seed?, anzahl? (1-4), lora? [{name,
+  staerke}], titel?, vorrang?}`: `/v1/images/generations` `{model, prompt,
+  size?, steps?, seed?, n?, loras? [{name, scale}], response_format
+  b64_json, gufo {negative_prompt}?}`.
+- `bild_bearbeiten` `{prompt, bilder [1-10], maske?, staerke? (0-1),
+  negativ?, model?, breite?+hoehe?, schritte?, seed?, titel?, vorrang?}`:
+  the multipart body of `/v1/images/edits` (`comfy::BuildMultipart`,
+  submitted as `request.body_base64` + `content_type multipart/form-data;
+  boundary=...`): parts `model`, `prompt`, `size` (the given one, or
+  `auto` with a start image), `steps`, `seed`, `response_format
+  b64_json`, the images as `image[]` references, or, with `maske` or a
+  `staerke` below 1, the first image as `init_image` plus `mask` and
+  `gufo.strength`; `gufo.negative_prompt`. All files together at most
+  20 MB.
+- `video_erzeugen` `{prompt, model?, startbild?, endbild?, ton?,
+  sekunden?, breite?+hoehe?, schritte?, qualitaet? (genau|schnell|
+  schnellste), guidance?, negativ?, seed?, titel?, vorrang?}`:
+  `/v1/videos` with the body of the video page per model family:
+  `minimax-h3` `{model, prompt, seconds (default 5, at most 14), size
+  (default 512x512), first_frame?, last_frame?, audio_reference?, gufo
+  {preset exact|fast|aggressive, seed?}}`; `wan2.2-*` `{model, prompt,
+  seconds (at most 5), size (default 480x480), first_frame?, gufo {steps
+  (default 20), guidance?, negative_prompt?, seed?}}`; `wan2.1-uni3c`
+  (`startbild` required, size 832x480, 4 steps); `wan2.1-infinitetalk-14b`
+  (`startbild` and `ton` required, no `seconds`: the length comes from
+  the audio, size 832x480, 4 steps, `gufo.talk.audio [data url]`). An end
+  frame for a WAN model, audio for WAN 2.2 or Uni3C and a missing start
+  image or audio where required are `-32602`.
+- `stimme` `{text, model?, stimme?, sprache?, tempo? (0.25-4),
+  beschreibung?, probe?, wortlaut?, format? (wav|mp3), seed?, titel?,
+  vorrang?}`: `/v1/audio/speech` `{model, input, voice?, language?,
+  speed? (unless 1), instructions?, seed?, reference_audio? (raw base64,
+  as the page sends it), reference_text?, response_format}`; `voice` is
+  `stimme`, `voice-clone` when only a `probe` is given, `voice-design`
+  for `qwen3-tts-voicedesign` (which needs `beschreibung`); `fish-drama-3`
+  needs `wortlaut` with a probe; `voice_clone_mode` is left to the
+  router.
+- `musik` `{stil, liedtext? (default [Instrumental]), sekunden? (default
+  30, at most 600), model?, format?, seed?, titel?, vorrang?}`:
+  `/v1/audio/music` `{model, prompt, lyrics, task text2music, duration,
+  seed?, response_format, bitrate_kbps 192 for mp3}`.
+- `objekt_3d` `{bild, model?, schritte?, guidance? (1-15), seed?,
+  aufloesung? (256|512), max_dreiecke?, textur?, titel?, vorrang?}`:
+  `/v1/3d/generations` `{model, image (data url), steps?, seed?,
+  resolution?, max_faces?, guidance?, texture?, preview true}`.
+- `hochskalieren` `{datei, faktor? (2|4), variante? (allgemein|
+  entrauscht|anime), ausgabe? (png|jpg), model?, titel?, vorrang?}`: an
+  image (by content type) goes to `/v1/images/upscale` `{model, variant
+  general|wdn|anime, image (data url), scale, output, response_format
+  b64_json, quality 92 for jpg}`, a video to `/v1/videos/upscale`
+  `{model, variant, video (data url), scale, keep_audio true, async
+  true}` (area video, counts twice).
 
 
 ## Endpoint Set

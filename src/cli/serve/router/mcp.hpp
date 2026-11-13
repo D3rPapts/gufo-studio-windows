@@ -30,7 +30,20 @@
 // `isError: true` and `structuredContent {http_status, code, message,
 // retry_after?}`; every result carries `structuredContent` and its JSON as
 // `content[0]` text. The access log gets `mcp:<tool>:ok|abgelehnt:<code>`
-// beside the inner request's own line. Commit 3 adds the media job tools.
+// beside the inner request's own line.
+//
+// Commit 3: the media job tools `bild_erzeugen`, `bild_bearbeiten`,
+// `video_erzeugen`, `stimme`, `musik`, `objekt_3d` and `hochskalieren`.
+// Each is one `POST /v1/jobs` around the endpoint the matching page uses
+// (pages/bild|video|stimme|musik|objekt|hochskalieren, with the field
+// names those pages send), `vorrang` as X-Gufo-Priority, `metadata
+// {quelle: "mcp", seite, titel, ...}` for the Ablage, answering
+// `{auftrag_id, status, url, modell, position?, geschaetzt?}` plus the text
+// "Auftrag <id> angenommen ...". Input files are Ablage paths
+// (`/v1/jobs/<id>/files/<name>`, read through the gate: own jobs only) or
+// `data:` URLs; `bild_bearbeiten` builds the multipart body of
+// `/v1/images/edits` (comfy::BuildMultipart) and submits it as
+// `request.body_base64` + `content_type`.
 
 #include <cstddef>
 #include <functional>
@@ -132,6 +145,16 @@ public:
     long long retry_after{0};
   };
 
+  /// An input file of a media tool: the bytes of an Ablage path (read
+  /// through the gate) or a data: URL. `failure` is set when the gate or
+  /// the job store refused the path (the tool answers that failure).
+  struct Media {
+    std::string bytes;
+    std::string content_type;
+    std::string name;
+    std::optional<json::Value> failure;
+  };
+
 private:
   [[nodiscard]] server::HttpResponse Rpc(const server::HttpRequest& req,
                                          const auth::Identity& who);
@@ -141,14 +164,31 @@ private:
   [[nodiscard]] bool Visible(const Tool& tool,
                              const auth::Identity& who) const;
   /// One inner request through Options::serve: `outer`'s token, address
-  /// and cancellation, a JSON body when `body` is set. `path` must be one
-  /// of the tool paths (never /mcp itself).
-  [[nodiscard]] InnerAnswer Inner(const server::HttpRequest& outer,
-                                  std::string method, std::string path,
-                                  std::string query = {},
-                                  std::string body = {}) const;
+  /// and cancellation, a JSON body when `body` is set, `extra` headers
+  /// (an X-Gufo-Priority there replaces the outer one). `path` must be
+  /// one of the tool paths (never /mcp itself).
+  [[nodiscard]] InnerAnswer Inner(
+      const server::HttpRequest& outer, std::string method, std::string path,
+      std::string query = {}, std::string body = {},
+      std::vector<std::pair<std::string, std::string>> extra = {}) const;
   /// The documented default of a tool's `model` field.
   [[nodiscard]] std::string DefaultModel(std::string_view tool) const;
+
+  [[nodiscard]] Media ReadMedia(const server::HttpRequest& outer,
+                                const std::string& value,
+                                const std::string& field) const;
+  /// `POST /v1/jobs` around `path` with a JSON `body` or a raw body of
+  /// `content_type` (base64 in the submit), `vorrang` as X-Gufo-Priority,
+  /// `metadata` (quelle mcp is added): the uniform job tool result, whose
+  /// `modell` is the store's `request.model` or `model`.
+  [[nodiscard]] json::Value SubmitJob(const server::HttpRequest& outer,
+                                      const std::string& path,
+                                      const json::Value& body,
+                                      const std::string& raw_body,
+                                      const std::string& content_type,
+                                      const std::string& model,
+                                      std::optional<long long> vorrang,
+                                      json::Value metadata) const;
 
   // The builders (Commit 2). Each returns a tool result (`content`,
   // `structuredContent`, maybe `isError`); bad arguments throw
@@ -165,6 +205,22 @@ private:
   [[nodiscard]] json::Value RunAuftragAbbrechen(
       const json::Value& args, const server::HttpRequest& outer) const;
   [[nodiscard]] json::Value RunAblageLesen(
+      const json::Value& args, const server::HttpRequest& outer) const;
+
+  // The media job builders (Commit 3).
+  [[nodiscard]] json::Value RunBildErzeugen(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunBildBearbeiten(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunVideoErzeugen(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunStimme(const json::Value& args,
+                                      const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunMusik(const json::Value& args,
+                                     const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunObjekt3d(const json::Value& args,
+                                        const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunHochskalieren(
       const json::Value& args, const server::HttpRequest& outer) const;
 
   Options options_;
