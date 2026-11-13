@@ -4,13 +4,13 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-> **Download [1.4.8](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.8)**
-> (`gufo-studio-windows-1.4.8-windows-x64-gfx1151.zip`, branch `release/1.4`): text,
-> images, speech, music and video from one OpenAI-compatible port on Windows 11, plus a
-> ComfyUI-compatible API. Unpack it, edit `examples\router.ini`, run `start-router.cmd`;
+> **Download [2.0.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.2)**
+> (`gufo-studio-windows-2.0.2-windows-x64-gfx1151.zip`, branch `v2/v034-prep`): text,
+> images, speech, music, video and 3D from one OpenAI-compatible port on Windows 11, plus a
+> ComfyUI-compatible API and a two-machine pool (`/pool/`). Unpack it, edit `examples\router.ini`, run `start-router.cmd`;
 > models load on the first request. The ROCm runtime is included; FFmpeg is not
 > (`winget install Gyan.FFmpeg`). The release notes list what was tested.
-> Previous: [1.4.7](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.7), [1.4.5](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.5), [1.4.4](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.4), [1.4.3](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.3), [1.4.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.2), [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1), [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
+> Previous: [2.0.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.1), [2.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.0), [1.4.21](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.21), [1.4.8](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.8), [1.4.7](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.7), [1.4.5](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.5), [1.4.4](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.4), [1.4.3](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.3), [1.4.2](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.2), [1.4.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.1), [1.4.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.4.0), [1.3.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.3.0), [1.2.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.2.0), [1.1.1](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.1), [1.1.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.1.0), [1.0.0](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v1.0.0).
 > This repository was called `gufo_windows` until 31 October 2026; old links still work.
 
 ### Focus
