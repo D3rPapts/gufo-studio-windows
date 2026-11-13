@@ -560,8 +560,43 @@ void TestTopLevelMember() {
   CHECK(text("", "priority") == "<none>");
 }
 
+void TestYieldClock() {
+  using gufo::router::PoolYieldClock;
+  using gufo::router::PoolShouldYield;
+  using gufo::router::PoolYieldInput;
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point t0 = Clock::now();
+  const auto at = [t0](int ms) { return t0 + std::chrono::milliseconds(ms); };
+  PoolYieldClock clock;
+  CHECK(!clock.yielding());
+  CHECK(clock.Yielded(at(0)) == std::chrono::milliseconds(0));
+  CHECK(clock.Begin(at(0)));
+  CHECK(!clock.Begin(at(100)));  // goes on, not a new yield
+  CHECK(clock.Yielded(at(1500)) == std::chrono::milliseconds(1500));
+  // A busy wait in between (kWait for a machine) pauses the clock: the
+  // time waited for a machine never counts as yielding.
+  clock.Pause(at(1500));
+  CHECK(!clock.yielding());
+  CHECK(clock.Yielded(at(60000)) == std::chrono::milliseconds(0));
+  CHECK(clock.total == std::chrono::milliseconds(1500));
+  // A later higher priority gets a fresh stretch of kPoolYieldMax.
+  CHECK(clock.Begin(at(60000)));
+  PoolYieldInput in;
+  in.priority = 0;
+  in.highest_waiting = 5;
+  in.yielded = clock.Yielded(at(61000));
+  CHECK(PoolShouldYield(in));
+  in.yielded = clock.Yielded(at(62100));
+  CHECK(!PoolShouldYield(in));
+  clock.Pause(at(62100));
+  CHECK(clock.total == std::chrono::milliseconds(3600));
+  clock.Pause(at(70000));  // idempotent
+  CHECK(clock.total == std::chrono::milliseconds(3600));
+}
+
 int main() {
   TestTopLevelMember();
+  TestYieldClock();
   TestWarmAndFree();
   TestColdLoads();
   TestHysteresis();

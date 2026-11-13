@@ -1775,8 +1775,9 @@ public:
         began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
     bool remote_failed = false;
     bool waiting = false;
-    // Since when this request lets a higher priority go first (2.0.3).
-    std::chrono::steady_clock::time_point yield_began{};
+    // How long this request has let a higher priority go first (2.0.3):
+    // only real yield stretches count, not busy waits in between.
+    router::PoolYieldClock yield_clock;
     std::optional<HttpResponse> local_failure;
     const auto stop_waiting = [&] {
       if (waiting) {
@@ -1835,20 +1836,19 @@ public:
       // model with a higher priority first; this one yields, at most
       // kPoolYieldMax in a row (never stuck: the higher one may be pinned
       // to the other side).
-      if (decision.choice != router::PoolChoice::kWait) {
+      if (decision.choice == router::PoolChoice::kWait) {
+        // Waiting for a machine, not for a higher priority: the yield
+        // stretch (if any) ends here and is booked.
+        yield_clock.Pause(std::chrono::steady_clock::now());
+      } else {
         const auto now = std::chrono::steady_clock::now();
         router::PoolYieldInput yield_input;
         yield_input.priority = priority;
         yield_input.highest_waiting = HigherWaitingLocked(model_id, priority);
-        yield_input.yielded =
-            yield_began == std::chrono::steady_clock::time_point{}
-                ? std::chrono::milliseconds(0)
-                : std::chrono::duration_cast<std::chrono::milliseconds>(
-                      now - yield_began);
+        yield_input.yielded = yield_clock.Yielded(now);
         yield_input.forwarded = forwarded;
         if (router::PoolShouldYield(yield_input)) {
-          if (yield_began == std::chrono::steady_clock::time_point{}) {
-            yield_began = now;
+          if (yield_clock.Begin(now)) {
             ++pool_[model_id].yields;
             Logger::Info("router",
                          "event=pool_yield model=" + model_id +
@@ -1859,7 +1859,7 @@ public:
           }
           decision = {router::PoolChoice::kWait, "yields to a higher priority"};
         } else {
-          yield_began = {};
+          yield_clock.Pause(now);
         }
       }
       if (decision.choice == router::PoolChoice::kLocal) {
@@ -4125,6 +4125,67 @@ int RunRouter(std::span<const char* const> args) {
     };
     hooks.job_owner = [raw](const std::string& job_id) {
       return raw->JobOwner(job_id);
+    };
+    // A ComfyUI graph resolves to the adapter's tasks; the gate checks
+    // each one (area, model, filter, daily count) before the adapter
+    // runs it as the router itself.
+    router::comfy::ModelIds comfy_ids;
+    for (const auto& model : models)
+      comfy_ids.available.push_back(model.id);
+    hooks.comfy_plan = [comfy_ids](const HttpRequest& req)
+        -> std::optional<std::vector<router::auth::WorkItem>> {
+      json::Value body;
+      try {
+        body = json::parse(req.body);
+      } catch (const std::exception&) {
+        return std::nullopt;
+      }
+      const json::Value* prompt = body.find("prompt");
+      if (prompt == nullptr || !prompt->is_object())
+        return std::nullopt;
+      router::comfy::Plan plan;
+      router::comfy::PlanError plan_error;
+      if (!router::comfy::BuildPlan(*prompt, comfy_ids, &plan, &plan_error))
+        return std::nullopt;
+      std::vector<router::auth::WorkItem> items;
+      for (const router::comfy::Task& task : plan.tasks) {
+        router::auth::WorkItem item;
+        std::visit(
+            [&item](const auto& spec) {
+              using Spec = std::decay_t<decltype(spec)>;
+              if constexpr (std::is_same_v<Spec, router::comfy::ImageTask>) {
+                item.area = "bild";
+                item.model = spec.model;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::VideoTask>) {
+                item.area = "video";
+                item.model = spec.model;
+                item.counts = 2;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::SpeechTask>) {
+                item.area = "stimme";
+                item.model = spec.model;
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::DialogueTask>) {
+                item.area = "stimme";
+                if (!spec.lines.empty())
+                  item.model = spec.lines.front().model;
+              } else if constexpr (std::is_same_v<Spec,
+                                                  router::comfy::MusicTask>) {
+                item.area = "musik";
+                item.model = spec.model;
+              } else {
+                item.area = "musik";  // foley
+                item.model = spec.model;
+                item.texts = {spec.prompt, spec.negative_prompt};
+              }
+            },
+            task.spec);
+        items.push_back(std::move(item));
+      }
+      return items;
     };
     state->gate = std::make_unique<router::auth::Gate>(
         auth_settings, users, std::move(hooks));

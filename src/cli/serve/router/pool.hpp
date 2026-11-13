@@ -513,6 +513,41 @@ struct PoolYieldInput {
          in.yielded < kPoolYieldMax;
 }
 
+/// How long a request has actually yielded: only the stretches in which
+/// it stood back for a higher priority count, never the time it waited
+/// because both machines were busy, so "at most kPoolYieldMax in a row"
+/// holds for every later higher-priority arrival too.
+struct PoolYieldClock {
+  using Clock = std::chrono::steady_clock;
+  std::chrono::milliseconds total{0};
+  Clock::time_point began{};
+
+  [[nodiscard]] bool yielding() const { return began != Clock::time_point{}; }
+  /// The open stretch so far (0 when not yielding): the budget is per
+  /// stretch, a later higher-priority arrival gets a fresh one. `total`
+  /// keeps the sum for the log.
+  [[nodiscard]] std::chrono::milliseconds Yielded(Clock::time_point now) const {
+    return yielding() ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - began)
+                      : std::chrono::milliseconds(0);
+  }
+  /// A yield starts (or goes on). True when it just started.
+  bool Begin(Clock::time_point now) {
+    if (yielding())
+      return false;
+    began = now;
+    return true;
+  }
+  /// The request no longer yields (it waits for a machine, or runs): the
+  /// open stretch is booked and the clock stops.
+  void Pause(Clock::time_point now) {
+    if (!yielding())
+      return;
+    total += std::chrono::duration_cast<std::chrono::milliseconds>(now - began);
+    began = {};
+  }
+};
+
 }  // namespace gufo::router
 
 #endif  // GUFO_CLI_SERVE_ROUTER_POOL_HPP_
