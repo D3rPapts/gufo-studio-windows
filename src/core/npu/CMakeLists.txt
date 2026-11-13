@@ -1,6 +1,16 @@
 # The NPU runtime on XRT (found at the top level). Only the backend sources
 # include XRT; npu.hpp names no XRT type.
 # Which NPUs are present: sysfs on Linux, XRT's enumeration on Windows.
+if(NOT GUFO_NPU)
+  # gufo-studio-windows: no XRT SDK on the build host. The stub probes no
+  # device and refuses to open one; the sysfs probe, instruction patching and
+  # dispatch libraries (common.cpp) and the Q8 GEMM front end stay testable.
+  add_library(gufo_npu STATIC common.cpp stub.cpp q8_gemm.cpp)
+  target_include_directories(gufo_npu PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(gufo_npu PUBLIC cxx_std_20)
+  target_link_libraries(gufo_npu PUBLIC gufo_platform)
+  return()
+endif()
 add_library(gufo_npu STATIC common.cpp xrt.cpp q8_gemm.cpp
   "$<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/probe.cpp>"
   "$<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/probe_windows.cpp>")

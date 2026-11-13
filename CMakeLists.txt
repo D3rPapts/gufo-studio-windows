@@ -100,9 +100,14 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 # The NPU runtime (src/core/npu): XRT_DIR, XILINX_XRT or /opt/xilinx/xrt; on
 # Windows, Xilinx's XRT SDK unpacked to C:\xrt (BUILD-WINDOWS.md). Do not set
 # XILINX_XRT there: the NPU driver's XRT then looks for its device shim in it.
-find_package(XRT REQUIRED CONFIG
-  HINTS "$ENV{XILINX_XRT}/share/cmake/XRT"
-  PATHS /opt/xilinx/xrt/share/cmake/XRT C:/xrt/xrt_sdk/xrt/share/cmake/XRT)
+# GUFO_NPU=OFF (gufo-studio-windows) builds the runtime from src/core/npu/stub.cpp
+# without the XRT SDK: no NPU is found and opening one reports an error.
+option(GUFO_NPU "Build the XDNA NPU runtime against the XRT SDK" ON)
+if(GUFO_NPU)
+  find_package(XRT REQUIRED CONFIG
+    HINTS "$ENV{XILINX_XRT}/share/cmake/XRT"
+    PATHS /opt/xilinx/xrt/share/cmake/XRT C:/xrt/xrt_sdk/xrt/share/cmake/XRT)
+endif()
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING

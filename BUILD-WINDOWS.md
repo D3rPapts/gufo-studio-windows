@@ -84,6 +84,10 @@ release packaging builds the upstream runtime instead.
   not set `XILINX_XRT`: the driver's XRT then looks for its device plugin
   there and finds no NPU.
 
+  gufo-studio-windows: without the SDK, configure with `-DGUFO_NPU=OFF`.
+  The NPU runtime is then a stub (`src/core/npu/stub.cpp`): `gufo diagnose`
+  warns `No XDNA NPU found` and NPU runners report an error.
+
 ## 2. Patch the SDK's HIP headers (once, and after every SDK reinstall)
 
 MSVC 14.40+ conflicts with Clang's HIP math headers. The repository ships an
