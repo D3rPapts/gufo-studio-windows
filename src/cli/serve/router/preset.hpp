@@ -99,14 +99,28 @@ struct PresetModel {
 /// ("serve objekt" -> "image_to_3d"); "" when none is known.
 std::string CapabilityOf(const PresetModel& preset);
 
+/// The optional `[router]` section (2.0.3): users and access control,
+/// see docs/internal/server.md "Users and access". Values are kept as
+/// text; the router resolves them (users-file against the preset's
+/// directory, pool-secret-env against the environment).
+struct RouterSection {
+  bool present{false};
+  std::string auth{"off"};             // off|lan|all
+  std::string auth_loopback{"admin"};  // admin|login
+  std::string users_file;              // "" = <preset dir>/nutzer/nutzer.json
+  std::string pool_secret_env;         // "" = no pool secret
+};
+
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves
 /// relative path values; when empty, values are passed through unchanged.
 /// Returns false and sets `error` (section-prefixed, e.g.
-/// "[llm/a] Unknown option: --bogus") on any problem.
+/// "[llm/a] Unknown option: --bogus") on any problem. `router` (may be
+/// null) receives the `[router]` section.
 [[nodiscard]] bool LoadPreset(const std::filesystem::path& file,
                               const std::filesystem::path& models_dir,
                               std::vector<PresetModel>* models,
-                              std::string* error);
+                              std::string* error,
+                              RouterSection* router = nullptr);
 
 /// Parses `http://<IPv4>:<port>` (with `allow_path`, an optional path
 /// after it). Returns false and sets `error` otherwise.

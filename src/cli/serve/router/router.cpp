@@ -27,6 +27,7 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
@@ -122,7 +123,24 @@ constexpr std::string_view kPresetGrammar =
     "    one of its model go first (at most 2 s); invalid: 400\n"
     "    invalid_priority.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
-    "    others_busy} (read by the partner's probe) and \"inflight\".\n\n";
+    "    others_busy} (read by the partner's probe) and \"inflight\".\n"
+    "\n"
+    "    [router]              users and access control (2.0.3), optional:\n"
+    "      auth = off                   off (default): everyone may use\n"
+    "                                   everything; lan: 127.0.0.1 is admin,\n"
+    "                                   everyone else logs in (cookie) or\n"
+    "                                   sends Authorization: Bearer gufo_...;\n"
+    "                                   all: the machine itself logs in too\n"
+    "      auth-loopback = admin        admin|login: whether 127.0.0.1 counts\n"
+    "                                   as admin without a login (auth = lan)\n"
+    "      users-file = PATH            users file (default: nutzer/\n"
+    "                                   nutzer.json next to the preset)\n"
+    "      pool-secret-env = NAME       environment variable with the secret\n"
+    "                                   both routers share; router-to-router\n"
+    "                                   calls carry it as X-Gufo-Pool-Key\n"
+    "    Users, roles (admin|nutzer|dienst), rights, tokens and the log:\n"
+    "    /router/users, /verwaltung/ (loopback or admin only), docs/internal/\n"
+    "    server.md \"Users and access\".\n\n";
 
 constexpr std::chrono::milliseconds kAdmissionPoll{50};
 constexpr std::chrono::milliseconds kSupervisionTick{250};
@@ -951,6 +969,35 @@ public:
   std::unique_ptr<router::names::NameService> names;
   /// POST /v1/figuren (figure check over the router's own vision chats).
   std::unique_ptr<router::figuren::FigurenService> figuren;
+  /// Users and access control (preset `[router]`, 2.0.3): the front hook
+  /// in front of Dispatch. Always set; with auth = off it only answers the
+  /// auth endpoints.
+  std::unique_ptr<router::auth::Gate> gate;
+  /// metadata.nutzer of a local job (the gate's owner check); nullopt when
+  /// the job API is off or the job is unknown here.
+  std::optional<std::string> JobOwner(const std::string& job_id) {
+    if (jobs == nullptr || job_id.empty())
+      return std::nullopt;
+    // Through the public handler; X-Gufo-Relay keeps an unknown id from
+    // being asked of the partner (then the owner is simply unknown).
+    HttpRequest ask;
+    ask.method = "GET";
+    ask.path = "/v1/jobs/" + job_id;
+    ask.client_id = "127.0.0.1";
+    ask.headers.emplace_back(router::jobs::kRelayHeader, "1");
+    const std::optional<HttpResponse> answer = jobs->Handle(ask);
+    if (!answer.has_value() || answer->status != 200 ||
+        answer->streaming_body)
+      return std::nullopt;
+    try {
+      const json::Value job = json::parse(answer->body);
+      if (const json::Value* metadata = job.find("metadata");
+          metadata != nullptr && metadata->is_object())
+        return metadata->member_str("nutzer");
+    } catch (const std::exception&) {
+    }
+    return std::string();
+  }
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
   /// Reachability and model states of the remote routers; null without
@@ -3943,10 +3990,42 @@ int RunRouter(std::span<const char* const> args) {
   }
   std::vector<router::PresetModel> models;
   std::string preset_error;
-  if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error)) {
+  router::RouterSection router_section;
+  if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error,
+                          &router_section)) {
     std::cerr << "Error: " << preset_error << "\n";
     return 2;
   }
+  // Users and access control (2.0.3). The users file defaults to
+  // nutzer/nutzer.json next to the preset: the preset is the one file
+  // both machines always have (--jobs-dir is optional), and in production
+  // (D:\llm-modelle\gufo\gufo-router-combo7.ini, C:\gufo\...) that is
+  // exactly the nutzer\ folder the concept names.
+  router::auth::Settings auth_settings;
+  (void)router::auth::ParseMode(router_section.auth, &auth_settings.mode);
+  (void)router::auth::ParseLoopbackPolicy(router_section.auth_loopback,
+                                          &auth_settings.loopback);
+  auth_settings.users_file =
+      router_section.users_file.empty()
+          ? std::filesystem::absolute(preset_path).parent_path() / "nutzer" /
+                "nutzer.json"
+          : std::filesystem::absolute(
+                std::filesystem::path(router_section.users_file).is_relative()
+                    ? std::filesystem::absolute(preset_path).parent_path() /
+                          router_section.users_file
+                    : std::filesystem::path(router_section.users_file));
+  auth_settings.pool_secret_env = router_section.pool_secret_env;
+  if (!auth_settings.pool_secret_env.empty()) {
+    if (const char* secret = std::getenv(auth_settings.pool_secret_env.c_str());
+        secret != nullptr && *secret != '\0') {
+      auth_settings.pool_secret = secret;
+    } else {
+      std::cerr << "Warning: [router] pool-secret-env: "
+                << auth_settings.pool_secret_env
+                << " is not set; partner calls carry no pool key\n";
+    }
+  }
+  router::auth::SetPoolSecret(auth_settings.pool_secret);
 
   // Remote models reach only the routers --remote-allow names.
   std::vector<router::jobs::AllowEntry> remote_allow_list;
@@ -4038,6 +4117,41 @@ int RunRouter(std::span<const char* const> args) {
   }
   // The ComfyUI adapter and the job API call the router's own API.
   RouterState* const raw = state.get();
+  {
+    auto users = std::make_shared<router::auth::UserStore>(
+        auth_settings.users_file);
+    std::string users_error;
+    if (!users->Load(&users_error)) {
+      std::cerr << "Error: [router] users-file: " << users_error << "\n";
+      return 2;
+    }
+    router::auth::Gate::Hooks hooks;
+    hooks.model_of = [](const HttpRequest& req) {
+      return ResolveModel(req).model_id;
+    };
+    hooks.job_owner = [raw](const std::string& job_id) {
+      return raw->JobOwner(job_id);
+    };
+    state->gate = std::make_unique<router::auth::Gate>(
+        auth_settings, users, std::move(hooks));
+    Logger::Info("router",
+                 "event=auth mode=" + std::string(router::auth::ModeName(
+                                          auth_settings.mode)) +
+                     " loopback=" +
+                     (auth_settings.loopback ==
+                              router::auth::LoopbackPolicy::kAdmin
+                          ? "admin"
+                          : "login") +
+                     " users_file=" + auth_settings.users_file.string() +
+                     " users=" + std::to_string(users->List().size()) +
+                     " admin=" + (users->HasAdmin() ? "yes" : "no") +
+                     " pool_secret=" +
+                     (auth_settings.pool_secret.empty() ? "none" : "set"));
+    if (auth_settings.mode != router::auth::Mode::kOff && !users->HasAdmin())
+      Logger::Warn("router",
+                   "event=auth_no_admin hint=\"create the first admin from "
+                   "127.0.0.1: POST /router/users\"");
+  }
   router::comfy::Fetch self_fetch;
   {
     // Jobs go through the front like any client, so they show up in the
@@ -4048,10 +4162,15 @@ int RunRouter(std::span<const char* const> args) {
         host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
             ? "127.0.0.1"
             : host;
-    self_fetch = [self_host, port](const HttpRequest& request) {
+    const std::string internal_key = state->gate->internal_key();
+    self_fetch = [self_host, port, internal_key](const HttpRequest& request) {
       router::UpstreamTarget target;
       target.host = self_host;
       target.port = port;
+      // The gate admits the router's own calls by this key (loopback
+      // only), whatever `auth` says; a job runs for its owner.
+      target.extra_headers.emplace_back(router::auth::kInternalHeader,
+                                        internal_key);
       return CollectResponse(router::ProxyToWorker(target, request));
     };
   }
@@ -4226,7 +4345,11 @@ int RunRouter(std::span<const char* const> args) {
   // window ends, instead of the front severing them on the signal.
   options.graceful_shutdown = true;
   options.dispatcher = [state](const HttpRequest& request) {
-    return state->Dispatch(request);
+    // Users and access control first (auth = off: only /router/me, /login,
+    // /logout and the users API from loopback), then the routing.
+    return state->gate->Serve(request, [&state](const HttpRequest& checked) {
+      return state->Dispatch(checked);
+    });
   };
   HttpServer server(host, port, nullptr, nullptr, nullptr, nullptr,
                     std::move(options));
