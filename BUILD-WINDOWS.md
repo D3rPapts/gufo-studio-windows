@@ -84,7 +84,10 @@ release packaging builds the upstream runtime instead.
   not set `XILINX_XRT`: the driver's XRT then looks for its device plugin
   there and finds no NPU.
 
-  gufo-studio-windows: without the SDK, configure with `-DGUFO_NPU=OFF`.
+  gufo-studio-windows: the build hosts keep the SDK at `C:\xrt\xrt_sdk`
+  (XRT 2.21.0), where `cmake --preset windows-cpu-test` finds it without
+  `-DXRT_DIR`; `GUFO_NPU=ON` is the default. Without the SDK, configure
+  with `-DGUFO_NPU=OFF`.
   The NPU runtime is then a stub (`src/core/npu/stub.cpp`): `gufo diagnose`
   warns `No XDNA NPU found` and NPU runners report an error.
 
