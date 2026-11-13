@@ -2243,6 +2243,35 @@ Use appropriate HTTP status codes:
 - `500` internal failure
 - `503` model or backend unavailable, or GPU context lost (`device_lost`)
 
+The router front (gufo-studio-windows) adds these; the `code` strings
+are from `src/cli/serve/router/{auth,router,jobs,remote}.cpp`:
+
+- `401` not signed in (`[router] auth = lan|all`): `not_authenticated`
+  (login required), `no_admin` (no admin user exists yet; create one
+  from the machine itself), `invalid_token` (unknown or expired bearer
+  token), `pool_key_invalid` (partner call with a missing or wrong
+  `X-Gufo-Pool-Key`), `login_failed` (wrong name or password on
+  `POST /router/login`). Type `authentication_error`.
+- `403` signed in but not allowed: `forbidden` (area not enabled for
+  the user), `model_forbidden` (model not in the user's list),
+  `csrf_rejected` (browser write from another origin or scheme);
+  the password-change codes are listed under
+  [Users and access](#users-and-access). Type `permission_error`.
+- `415` `json_required`: a write to the users API without
+  `Content-Type: application/json`.
+- `502` `upstream_unavailable`: the worker failed to spawn or start, or
+  the router is shutting down; `partner_unreachable`: a job relay to the
+  partner router failed.
+- `504` `load_timeout`: the worker did not load within
+  `--load-timeout-seconds`; `objekt_timeout`: a 3D job exceeded its
+  deadline.
+- `507` `insufficient_memory`: `--memory-guard` stopped or gave up the
+  load because free GPU, host or commit memory ran low (the message
+  names what is needed and what is free).
+- `508` `remote_loop`: a request relayed by the partner (`X-Gufo-Forwarded`)
+  arrived at a router where the model is remote as well; it is not
+  relayed again.
+
 Generation stops at the request budget or context capacity and reports a
 length finish reason when either limit is reached.
 

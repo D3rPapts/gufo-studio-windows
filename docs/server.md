@@ -172,6 +172,20 @@ Errors use the OpenAI error object:
 | 429 | Queue full; retry later |
 | 503 | Model loading, or the GPU was lost (`device_lost`) |
 
+The router of gufo-studio-windows (`gufo router`) adds:
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Not signed in: `not_authenticated`, `no_admin`, `invalid_token`, `login_failed` |
+| 403 | Signed in but not allowed: `forbidden` (area), `model_forbidden`, `csrf_rejected` |
+| 415 | `json_required`: users API called without `Content-Type: application/json` |
+| 502 | `upstream_unavailable`: the worker did not start; `partner_unreachable`: job relay to the partner failed |
+| 504 | `load_timeout`: the model did not load within `--load-timeout-seconds` |
+| 507 | `insufficient_memory`: not enough free memory to load the model |
+| 508 | `remote_loop`: the request was already relayed by the partner router |
+
+The [server reference](internal/server.md#errors) explains each code.
+
 A stream that fails after it started ends with an error event instead.
 
 ## Health and restarts
