@@ -15,6 +15,13 @@ Download the variant you need; Gufo detects which one it is.
 
 The 0.6B, 25Hz and GGUF checkpoints aren't supported.
 
+The IDs above are the defaults of a single `gufo serve tts`. Behind the
+router each preset section sets its own `served-model-name`; the production
+preset of gufo-studio-windows (`gufo-router-combo7.ini`) calls them
+`qwen3-tts` (CustomVoice), `qwen3-tts-voicedesign` (VoiceDesign) and
+`qwen3-tts-clone` (Base with registered voices). `GET /v1/models` on the
+router lists the names in use.
+
 ```sh
 hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --local-dir models/Qwen3-TTS-12Hz-1.7B-Base
