@@ -231,6 +231,9 @@ struct Identity {
   /// The name is a placeholder, not a user: the router itself, loopback
   /// as admin, auth = off, the partner router. Owns nothing.
   bool placeholder{false};
+  /// A bearer value without the gufo_ prefix came from loopback and was
+  /// ignored (an SDK's placeholder key): noted in the log.
+  bool bearer_ignored{false};
 
   [[nodiscard]] bool authenticated() const { return source != Source::kNone; }
   [[nodiscard]] bool admin() const { return rolle == "admin"; }
@@ -281,6 +284,7 @@ struct Route {
     kLogin,        // POST /login
     kLogout,       // POST /logout
     kMe,           // GET /router/me
+    kPasswort,     // POST /router/me/passwort (own password)
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
     kAdminPage,    // /verwaltung/: loopback or admin, else 404
     kPage,         // GET /<page>/...: login (302), then the page's area
@@ -416,8 +420,9 @@ public:
   /// In-memory sessions (the remembered ones are also in the store).
   [[nodiscard]] std::string NewSession(const User& user, bool remember);
   void EndSession(std::string_view id);
-  /// Every session of `name` in memory (a password change or a block).
-  void EndSessionsOf(std::string_view name);
+  /// Every session of `name` in memory (a password change or a block),
+  /// except `keep` (the session that changed the password).
+  void EndSessionsOf(std::string_view name, std::string_view keep = {});
   [[nodiscard]] std::optional<Identity> SessionIdentity(std::string_view id);
 
   /// Append to zugriff.log (time, user, address, method path, model,
@@ -500,6 +505,11 @@ private:
   [[nodiscard]] server::HttpResponse Login(const server::HttpRequest& req);
   [[nodiscard]] server::HttpResponse Logout(const server::HttpRequest& req,
                                             const Identity& who);
+  /// POST /router/me/passwort {"alt", "neu"}: a signed-in user (admin or
+  /// nutzer, never a placeholder or a service account) sets its own
+  /// password; its other sessions end, this one stays.
+  [[nodiscard]] server::HttpResponse ChangePassword(
+      const server::HttpRequest& req, const Identity& who);
   [[nodiscard]] server::HttpResponse UsersApi(const server::HttpRequest& req,
                                               const Identity& who);
   [[nodiscard]] bool CountDaily(const Identity& who, int weight,

@@ -1115,6 +1115,8 @@ public:
       return PlacementControl(req);
     if (req.method == "GET" && req.path == "/router/capabilities")
       return JsonOk(Capabilities());
+    if (req.method == "GET" && req.path.starts_with("/router/partner/"))
+      return router::PartnerRead(partner_spec, router_id, req);
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);

@@ -1065,8 +1065,13 @@ SameSite=Lax, 12 h; "stay signed in" 30 days, stored hashed in the users
 file so it survives a restart), and finally loopback as admin. Anything
 else gets `401 not_authenticated` (JSON) or, for a page, `302` to
 `/login/?zurueck=<page>`. A bearer that does not match any token is `401
-invalid_token`; after 5 failed logins from one address within a minute
-that address waits 60 s (`429 too_many_attempts`, `Retry-After`).
+invalid_token`; a bearer value without the `gufo_` prefix (an SDK's
+placeholder key such as `LLAMA_API_KEY`) sent from `127.0.0.1`/`::1`
+counts as no header at all (2.0.4: the machine's own programs stay
+loopback admin, the log line carries `bearer_ignored=1`), from any other
+address it is `401 invalid_token` as well. After 5 failed logins from one
+address within a minute that address waits 60 s (`429
+too_many_attempts`, `Retry-After`).
 
 Roles: `admin` (everything, including the users API, model load/unload,
 `POST /router/placement`, `/router/pool/pull` and every job), `nutzer`
@@ -1115,6 +1120,9 @@ Endpoints (JSON):
 | `GET /router/me` | anyone | `{auth, name, rolle, quelle, bereiche, modelle, filter, tageslimit, pool, verwaltung, setup}`; `401` with `setup: true` while no admin exists. |
 | `POST /login` | anyone | `{"name", "passwort", "bleiben"}` -> `200` + `Set-Cookie`, `401 login_failed`, `403 login_not_allowed` (dienst), `429 too_many_attempts`. |
 | `POST /logout` | anyone | Ends the session, clears the cookie. |
+| `GET /router/partner/status`, `GET /router/partner/capabilities` | any signed-in user | The partner router's own `/router/status` / `/router/capabilities`, fetched over the pool link with the pool key (3 s) and passed through as it came (status code, JSON); `503 remote_unavailable` without a partner or when it does not answer (2.0.4: the pages read the partner this way when a browser cannot reach it directly: https, a cookie of another site, a closed port). |
+| `GET /router/partner/jobs?status=…` | area `ablage` | The partner's `/v1/jobs` list with the same query, passed through; a `nutzer` sees its own jobs in it, an admin all. |
+| `POST /router/me/passwort` | signed-in admin or nutzer | `{"alt", "neu"}` (2.0.4): checks the current password, sets the new one (same rules as the users API, at least 4 characters), ends the account's other sessions (this one stays, a remembered one is written again), logs `passwort_geaendert`. `403 wrong_password` (counts as a failed login), `400 invalid_password`, `403 no_account` for loopback/partner, `403 password_change_not_allowed` for `dienst`; the CSRF rule applies like to every browser write. The pages offer it as "Passwort ändern" beside "Abmelden". |
 | `GET/POST /router/users` | loopback or admin | List (no hashes) / create `{"name", "rolle", "passwort", "rechte"}`. |
 | `GET/PUT/DELETE /router/users/<name>` | loopback or admin | Read / change `{rolle, rechte, passwort, gesperrt}` / block; `?loeschen=1` removes the user. |
 | `POST /router/users/<name>/tokens` | loopback or admin | `{"name", "tage"}` -> the token `gufo_<64 hex>` once; only its SHA-256 is stored. |

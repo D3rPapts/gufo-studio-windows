@@ -448,6 +448,11 @@ void TestClassify() {
         Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/v1/models", "x")).kind == Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/router/status", "x")).kind == Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/status", "x")).kind ==
+        Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/capabilities", "x")).kind ==
+        Kind::kAnyUser);
+  CHECK(auth::Classify(Req("GET", "/router/partner/jobs", "x")).kind == Kind::kJobs);
   const auto chat = auth::Classify(Req("POST", "/v1/chat/completions", "x"));
   CHECK(chat.kind == Kind::kWork);
   CHECK_EQ(chat.area, std::string("text"));
@@ -805,6 +810,48 @@ void TestAreasAndJobs() {
   }
   r = f.Serve(Req("GET", "/v1/jobs", "192.168.178.50", "", {{"Cookie", admin}}));
   CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(3));
+  // The partner's list read through the router (2.0.4): filtered the same
+  // way; the status read is open to every signed-in user.
+  f.next = [](const HttpRequest& req) {
+    json::Value body = json::Value::object();
+    if (req.path == "/router/partner/jobs") {
+      json::Value data = json::Value::array();
+      for (const char* owner : {"tim", "anna"}) {
+        json::Value job = json::Value::object();
+        job["id"] = std::string("p-") + owner;
+        json::Value metadata = json::Value::object();
+        metadata["nutzer"] = owner;
+        job["metadata"] = std::move(metadata);
+        data.push_back(std::move(job));
+      }
+      body["data"] = std::move(data);
+    }
+    return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
+  };
+  r = f.Serve(Req("GET", "/router/partner/jobs?status=queued", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(1));
+  r = f.Serve(Req("GET", "/router/partner/jobs", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  CHECK_EQ(json::parse(r.body).find("data")->size(), std::size_t(2));
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50"));
+  CHECK_EQ(r.status, 401);
+  {
+    auth::Rights no_ablage;
+    no_ablage.bereiche = {"status"};
+    f.AddUser("gast", "nutzer", "gast-pw", no_ablage);
+    const std::string gast = f.LoginCookie("gast", "gast-pw");
+    r = f.Serve(Req("GET", "/router/partner/jobs", "192.168.178.50", "",
+                    {{"Cookie", gast}}));
+    CHECK_EQ(r.status, 403);
+    r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                    {{"Cookie", gast}}));
+    CHECK_EQ(r.status, 200);
+  }
   r = f.Serve(Req("GET", "/v1/jobs/j-fremd", "192.168.178.50", "", {{"Cookie", tim}}));
   CHECK_EQ(r.status, 404);
   r = f.Serve(Req("GET", "/v1/jobs/j-fremd", "192.168.178.50", "", {{"Cookie", admin}}));
@@ -1781,6 +1828,130 @@ void TestUsersApi() {
   CHECK(json::parse(r.body).find("zeilen")->size() >= 1);
 }
 
+void TestPasswordChange() {
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("film-56", "dienst", "");
+  std::string error;
+  const std::string token = f.store->CreateToken("film-56", "p", 0, &error);
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  const std::string tim2 = f.LoginCookie("tim", "tim-pw", true, "192.168.178.51");
+  const auto change = [&f](const std::string& cookie, const std::string& alt,
+                           const std::string& neu,
+                           std::vector<std::pair<std::string, std::string>> more = {}) {
+    json::Value body = json::Value::object();
+    body["alt"] = alt;
+    body["neu"] = neu;
+    more.emplace_back("Cookie", cookie);
+    return f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                       body.dump(), std::move(more)));
+  };
+  HttpResponse r = change(tim, "falsch", "neu-pw-1");
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("wrong_password"));
+  r = change(tim, "tim-pw", "abc");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_password"));
+  CHECK(f.store->Verify("tim", "tim-pw").has_value());
+  // A browser write: the CSRF rule applies.
+  r = change(tim, "tim-pw", "neu-pw-1", {{"Sec-Fetch-Site", "cross-site"}});
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  r = change(tim, "tim-pw", "neu-pw-1");
+  CHECK_EQ(r.status, 200);
+  CHECK(json::parse(r.body).find("ok")->as_bool());
+  CHECK(f.store->Verify("tim", "neu-pw-1").has_value());
+  CHECK(!f.store->Verify("tim", "tim-pw").has_value());
+  // This session stays, the other one is over.
+  r = f.Serve(Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("GET", "/router/me", "192.168.178.51", "", {{"Cookie", tim2}}));
+  CHECK_EQ(r.status, 401);
+  // A remembered session that changes the password survives a restart.
+  const std::string stay = f.LoginCookie("tim", "neu-pw-1", true);
+  r = change(stay, "neu-pw-1", "neu-pw-2");
+  CHECK_EQ(r.status, 200);
+  {
+    auth::Gate fresh(f.gate->settings(), f.store, {});
+    CHECK(fresh.Identify(Req("GET", "/router/me", "192.168.178.50", "",
+                             {{"Cookie", stay}}))
+              .authenticated());
+  }
+  // No account to change: loopback admin, the partner; service accounts
+  // have tokens only; nobody without a login.
+  r = f.Serve(Req("POST", "/router/me/passwort", "127.0.0.1",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}"));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("no_account"));
+  r = f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}",
+                  {{"Authorization", "Bearer " + token}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("password_change_not_allowed"));
+  r = f.Serve(Req("POST", "/router/me/passwort", "192.168.178.50",
+                  "{\"alt\":\"x\",\"neu\":\"yyyy\"}"));
+  CHECK_EQ(r.status, 401);
+  // Five wrong current passwords block the address like failed logins.
+  for (int i = 0; i < 5; ++i)
+    CHECK_EQ(change(stay, "falsch", "neu-pw-3").status, 403);
+  r = change(stay, "neu-pw-2", "neu-pw-3");
+  CHECK_EQ(r.status, 429);
+  // The log has the change, no passwords.
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(100)) {
+    CHECK(line.find("neu-pw") == std::string::npos);
+    logged = logged || line.find("passwort_geaendert") != std::string::npos;
+  }
+  CHECK(logged);
+  // An admin changes its own password the same way (the address's block
+  // from above is lifted first).
+  f.gate->ClearFailures("192.168.178.50");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  r = change(admin, "geheim123", "geheim456");
+  CHECK_EQ(r.status, 200);
+  CHECK(f.store->Verify("fabian", "geheim456").has_value());
+}
+
+void TestLoopbackBearer() {
+  // A bearer without the gufo_ prefix (an SDK's placeholder key) from
+  // loopback counts as no header: the machine's own programs stay admin;
+  // from the LAN it is still 401; a gufo_ token is always checked.
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  const auto lokal = f.gate->Identify(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                                          "{\"model\":\"m\"}",
+                                          {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK(lokal.source == auth::Identity::Source::kLoopback);
+  CHECK(lokal.admin());
+  CHECK(lokal.bearer_ignored);
+  HttpResponse r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                               "{\"model\":\"m\"}",
+                               {{"Authorization", "Bearer LLAMA_API_KEY"}}));
+  CHECK_EQ(r.status, 200);
+  bool noted = false;
+  for (const std::string& line : f.gate->LogTail(20))
+    noted = noted || line.find("bearer_ignored=1") != std::string::npos;
+  CHECK(noted);
+  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
+                  "{\"model\":\"m\"}", {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_token"));
+  r = f.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                  "{\"model\":\"m\"}",
+                  {{"Authorization", "Bearer gufo_" + std::string(64, 'a')}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_token"));
+  // With auth-loopback = login the placeholder key is ignored as well,
+  // and the caller is then simply not signed in.
+  Fixture g(auth::Mode::kLan, "", auth::LoopbackPolicy::kLogin);
+  g.AddUser("fabian", "admin", "geheim123");
+  r = g.Serve(Req("POST", "/v1/chat/completions", "127.0.0.1",
+                  "{\"model\":\"m\"}", {{"Authorization", "Bearer sk-no-key"}}));
+  CHECK_EQ(r.status, 401);
+  CHECK_EQ(ErrorCode(r), std::string("not_authenticated"));
+}
+
 void TestModes() {
   // auth = off: everything passes untouched; only the auth endpoints
   // exist, the users API from loopback alone.
@@ -1966,6 +2137,8 @@ int main() {
   TestFailedLogins();
   TestFilterAndLimit();
   TestUsersApi();
+  TestPasswordChange();
+  TestLoopbackBearer();
   TestModes();
   TestPresetSection();
   if (failures != 0) {

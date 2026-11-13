@@ -82,6 +82,87 @@ UpstreamTarget RemoteTarget(const RemoteSpec& spec,
   return target;
 }
 
+server::HttpResponse PartnerRead(const std::optional<RemoteSpec>& partner,
+                                 const std::string& router_id,
+                                 const server::HttpRequest& req,
+                                 std::chrono::milliseconds timeout) {
+  constexpr std::string_view kPrefix = "/router/partner/";
+  const auto error = [](int status, const char* reason, const char* message,
+                        const char* code) {
+    json::Value detail = json::Value::object();
+    detail["message"] = message;
+    detail["type"] = status == 404 ? "invalid_request_error" : "server_error";
+    detail["code"] = code;
+    json::Value body = json::Value::object();
+    body["error"] = std::move(detail);
+    server::HttpResponse out;
+    out.status = status;
+    out.reason = reason;
+    out.body = body.dump();
+    out.headers = {{"Content-Type", "application/json"},
+                   {"Cache-Control", "no-store"}};
+    return out;
+  };
+  if (req.method != "GET" || !req.path.starts_with(kPrefix))
+    return error(404, "Not Found", "no route for this path", "not_found");
+  const std::string what = req.path.substr(kPrefix.size());
+  std::string path;
+  if (what == "status")
+    path = "/router/status";
+  else if (what == "jobs")
+    path = "/v1/jobs";
+  else if (what == "capabilities")
+    path = "/router/capabilities";
+  else
+    return error(404, "Not Found",
+                 "/router/partner/ takes status, jobs or capabilities",
+                 "not_found");
+  if (!partner.has_value())
+    return RemoteUnavailable("partner", "no partner router in the preset");
+  UpstreamTarget target = RemoteTarget(*partner, router_id);
+  target.connect_timeout = timeout;
+  target.head_timeout = timeout;
+  server::HttpRequest ask;
+  ask.method = "GET";
+  ask.path = path;
+  ask.query = req.query;
+  ask.client_id = req.client_id;
+  // Never relayed on by the partner (a loop guard for scope=pool).
+  ask.headers.emplace_back(jobs::kRelayHeader, "1");
+  const auto deadline = std::chrono::steady_clock::now() + 2 * timeout;
+  ask.is_cancelled = [deadline] {
+    return std::chrono::steady_clock::now() >= deadline;
+  };
+  server::HttpResponse answer = ProxyToWorker(target, ask);
+  if (answer.status == 502 && !answer.streaming_body) {
+    std::string detail = answer.log_details;
+    constexpr std::string_view kUnavailable = "upstream_unavailable detail=";
+    if (std::string_view(detail).starts_with(kUnavailable))
+      detail.erase(0, kUnavailable.size());
+    return RemoteUnavailable("partner", detail);
+  }
+  std::string body = std::move(answer.body);
+  if (answer.streaming_body) {
+    constexpr std::size_t kMaxBody = 8 * 1024 * 1024;
+    answer.streaming_body([&body](std::string_view chunk) {
+      if (body.size() + chunk.size() > kMaxBody)
+        return false;
+      body.append(chunk);
+      return true;
+    });
+  }
+  std::string type = "application/json";
+  for (const auto& [name, value] : answer.headers)
+    if (name == "Content-Type" || name == "content-type")
+      type = value;
+  server::HttpResponse out;
+  out.status = answer.status;
+  out.reason = answer.reason;
+  out.body = std::move(body);
+  out.headers = {{"Content-Type", type}, {"Cache-Control", "no-store"}};
+  return out;
+}
+
 std::string NewRouterId() {
   std::random_device device;
   std::mt19937_64 generator(
