@@ -50,6 +50,9 @@ struct RemoteSpec {
   std::optional<RemoteEndpoint> busy_check;
   /// Longest wait for the gpu slot (and the busy check) before 503.
   int queue_timeout_seconds{900};
+  /// placement = pool: longest wait on the partner before a request this
+  /// router can run falls back here (B5 "never stuck").
+  int pool_wait_seconds{60};
   /// Request body limit for this model (0 = only --max-request-bytes).
   std::size_t max_request_bytes{0};
 };

@@ -776,12 +776,27 @@ body states its LoRAs only through a `loras` JSON part.
 `pool_busy`, ...) or `504` (its load timed out), nothing has reached the
 client yet, so the pool decides once more without the partner (this
 machine, or wait for it), like it already did for `507` and for `503
-remote_unavailable`. Video, music and 3D creates and requests pinned
-with `X-Gufo-Pool: remote` are not retried. The partner then gets no
-pool request of that model for 60 s (`event=pool_remote_failed`;
+remote_unavailable`. Video, music and 3D creates are not retried;
+requests pinned with `X-Gufo-Pool: remote` only when this router has
+the model and every LoRA they name (2.0.2). The partner then gets no
+pool request of that model for 60 s, also when it could not be reached
+at all (connect refused, timeout; 2.0.2) (`event=pool_remote_failed`;
 pinned requests ignore the hold); `/router/status` and
 `/router/placement` show `"remote_failed_s_ago"` and `"remote_failed"`
 (status and detail) in the model's `pool` block.
+
+**Never stuck (2.0.2).** A pool request that this router can run (it
+serves the model with every LoRA the request names) waits on the partner
+at most `pool-wait-seconds` (remote section, default 60): after that the
+partner drops out of its decision and a pin to it (`X-Gufo-Pool:
+remote` after a pull or redirect) no longer holds. The request then runs
+here as soon as this machine can load or run the model (evicting idle
+models; a busy local worker is still waited for, oldest first), and
+`queue-timeout-seconds` (900) is only the last resort. Relayed requests
+(`X-Gufo-Forwarded`) are left to the partner. Every switch to this
+machine because of the partner (waited too long, unreachable, failed,
+out of memory) logs `event=pool_fallback reason="..."` and counts in the
+`pool` block's `"fallbacks"`.
 
 **Waiting is not busy.** The `"activity"` object of a pool model in `GET
 /v1/models` (what the partner's probe reads) reports `"busy"` only for
@@ -871,6 +886,7 @@ max-request-bytes = 67108864
 | `head-timeout-seconds` | Response-head deadline after the request is sent (default 0 = none) |
 | `gpu-slot` | Remote models sharing the name run one GPU-starting request at a time |
 | `queue-timeout-seconds` | Longest wait for the slot and the busy check (default 900) |
+| `pool-wait-seconds` | placement = pool: longest wait on the partner before a request this router can run falls back here (default 60) |
 | `busy-check-url` | Optional `http://<IPv4>:<port>/path` (a ComfyUI `/queue`); wait while it reports running or pending work |
 | `max-request-bytes` | 413 `request_too_large` above this body size |
 

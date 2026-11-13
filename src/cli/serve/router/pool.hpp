@@ -255,6 +255,54 @@ enum class PoolRemoteAnswer {
   return PoolRemoteAnswer::kPass;
 }
 
+/// Whether the partner should be held off after this answer: it failed the
+/// model (502/503/504) or could not be reached at all (connect refused,
+/// timeout, name lookup). Both keep pool requests of the model off it for
+/// kPoolRemoteFailHold (B5: an unreachable partner is not retried on every
+/// request until the next probe notices).
+[[nodiscard]] inline bool PoolRemoteHold(PoolRemoteAnswer answer) {
+  return answer == PoolRemoteAnswer::kRetryFailed ||
+         answer == PoolRemoteAnswer::kRetryUnreachable;
+}
+
+/// pool-wait-seconds default: how long a pool request waits on the partner
+/// before it falls back to this machine.
+inline constexpr int kPoolWaitSecondsDefault = 60;
+
+/// B5 "never stuck" (Fabian 13.11.): a pool request that could run here
+/// never waits on the partner longer than pool-wait-seconds.
+struct PoolFallbackInput {
+  /// How long the request has waited for a decision.
+  std::chrono::milliseconds waited{0};
+  /// pool-wait-seconds of the model's remote section.
+  std::chrono::seconds limit{kPoolWaitSecondsDefault};
+  /// Relayed here by the partner (X-Gufo-Forwarded): the partner decides.
+  bool forwarded{false};
+  /// X-Gufo-Pool: remote (pulled by the partner, redirected, or a client).
+  bool pinned_remote{false};
+  /// This router serves the model with every LoRA the request names.
+  bool local_capable{true};
+};
+
+/// Why the request stops counting on the partner now; nullptr while it
+/// still may wait for it. With a reason, the router drops the partner from
+/// the decision (WithoutPartner) and a remote pin no longer holds: the
+/// request runs here as soon as this machine can load or run the model
+/// (evicting idle models), and queue-timeout-seconds stays the last resort.
+[[nodiscard]] inline const char* PoolFallbackReason(
+    const PoolFallbackInput& in) {
+  if (in.forwarded || !in.local_capable || in.waited < in.limit)
+    return nullptr;
+  return in.pinned_remote ? "pinned to the partner too long"
+                          : "waited too long for the partner";
+}
+
+/// The decision input with the partner out of the picture.
+[[nodiscard]] inline PoolInput WithoutPartner(PoolInput in) {
+  in.remote = PoolSide{};
+  return in;
+}
+
 /// "local" | "remote" from an X-Gufo-Pool header value; "" for anything
 /// else (any side).
 [[nodiscard]] inline std::string PoolSideOf(std::string_view header) {

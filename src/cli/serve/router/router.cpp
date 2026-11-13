@@ -86,6 +86,9 @@ constexpr std::string_view kPresetGrammar =
     "                                   GPU request (or video/music job) at\n"
     "                                   a time; others wait\n"
     "      queue-timeout-seconds = 900  longest wait, then 503 remote_busy\n"
+    "      pool-wait-seconds = 60       placement = pool: longest wait on the\n"
+    "                                   partner, then this machine (if it\n"
+    "                                   has the model and LoRAs)\n"
     "      busy-check-url = http://<IPv4>:<port>/queue  optional ComfyUI\n"
     "                                   queue; wait while it runs anything\n"
     "      max-request-bytes = N        413 above N bytes\n"
@@ -1386,6 +1389,9 @@ public:
     long long local_picks{0};
     long long remote_picks{0};
     long long retried_local{0};
+    /// Requests that fell back to this machine (B5: partner gone, failed,
+    /// or waited on longer than pool-wait-seconds).
+    long long fallbacks{0};
     /// Last decision ("remote: warm").
     std::string last;
   };
@@ -1596,6 +1602,9 @@ public:
     // lacks a LoRA.
     std::string forced =
         router::PoolSideOf(req.header(router::jobs::kPoolSideHeader));
+    // This router has every LoRA the request names (B5: only then may a
+    // request pinned to the partner fall back to this machine).
+    bool local_capable = true;
     if (!forwarded && IsJsonBody(req)) {
       std::vector<std::string> needs;
       try {
@@ -1612,6 +1621,7 @@ public:
             break;
           }
         const bool local_ok = missing.empty();
+        local_capable = local_ok;
         bool partner_ok = true;
         std::string why_partner;
         lock.unlock();
@@ -1659,8 +1669,14 @@ public:
           forced = "local";
       }
     }
+    // B5: a request pinned to the partner may still run here when this
+    // router can (it has the LoRAs) and the partner failed or is gone.
     const bool may_retry = !IsVideoCreate(req) && !IsMusicCreate(req) &&
-                           !IsObjektCreate(req) && forced != "remote";
+                           !IsObjektCreate(req) &&
+                           (forced != "remote" || local_capable);
+    const std::chrono::seconds pool_wait(preset.remote->pool_wait_seconds);
+    // Set once the request stopped counting on the partner (B5).
+    const char* fallback = nullptr;
     // The job this request belongs to (job store): its pool state is
     // reported and, while it waits, may be redirected to the partner.
     const std::string job_id =
@@ -1699,8 +1715,26 @@ public:
       router::PoolInput pool_input =
           PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited,
                           /*ignore_remote_hold=*/forced == "remote");
+      // B5 "never stuck" (Fabian 13.11.): after pool-wait-seconds on the
+      // partner a request this router can run stops waiting for it.
+      if (fallback == nullptr) {
+        fallback = router::PoolFallbackReason(
+            {waited, pool_wait, forwarded, forced == "remote", local_capable});
+        if (fallback != nullptr) {
+          ++pool_[model_id].fallbacks;
+          Logger::Warn("router", "event=pool_fallback model=" + model_id +
+                                     " reason=\"" + fallback +
+                                     "\" waited_ms=" +
+                                     std::to_string(waited.count()));
+        }
+      }
+      if (fallback != nullptr)
+        pool_input = router::WithoutPartner(pool_input);
       // One side only (capabilities): the other is out, even when free.
-      if (forced == "remote")
+      // A remote pin ends once the partner failed this request or the
+      // fallback dropped it (local_capable: this side has the LoRAs).
+      if (forced == "remote" &&
+          !(local_capable && (remote_failed || fallback != nullptr)))
         pool_input.local.available = false;
       else if (forced == "local")
         pool_input.remote.available = false;
@@ -1769,8 +1803,9 @@ public:
             router::ClassifyPoolRemoteAnswer(
                 response.status, static_cast<bool>(response.streaming_body),
                 response.log_details);
-        if (answer == router::PoolRemoteAnswer::kRetryFailed && !forwarded) {
-          // Keep the next pool requests of this model off the partner too.
+        if (router::PoolRemoteHold(answer) && !forwarded) {
+          // Keep the next pool requests of this model off the partner too
+          // (B5: also when it could not be reached at all).
           PoolEntry& pool = pool_[model_id];
           pool.remote_failed = true;
           pool.remote_failed_at = std::chrono::steady_clock::now();
@@ -1789,9 +1824,20 @@ public:
           // remote (this machine, or wait for it).
           remote_failed = true;
           ++pool_[model_id].retried_local;
+          ++pool_[model_id].fallbacks;
           Logger::Warn("router", "event=pool_retry_local model=" + model_id +
                                      " detail=\"" + response.log_details +
                                      "\"");
+          Logger::Warn(
+              "router",
+              "event=pool_fallback model=" + model_id + " reason=\"" +
+                  (answer == router::PoolRemoteAnswer::kRetryUnreachable
+                       ? "partner unreachable"
+                   : answer == router::PoolRemoteAnswer::kRetryMemory
+                       ? "partner out of memory"
+                       : "partner failed") +
+                  "\" status=" + std::to_string(response.status) +
+                  " waited_ms=" + std::to_string(waited.count()));
           continue;
         }
         return response;
@@ -1861,6 +1907,7 @@ public:
       out["local_picks"] = pool.local_picks;
       out["remote_picks"] = pool.remote_picks;
       out["retried_local"] = pool.retried_local;
+      out["fallbacks"] = pool.fallbacks;
       out["last"] = pool.last;
       if (pool.local_failed) {
         out["local_failed_s_ago"] = static_cast<long long>(
@@ -1879,6 +1926,7 @@ public:
       out["waiting"] = 0LL;
       out["local_picks"] = 0LL;
       out["remote_picks"] = 0LL;
+      out["fallbacks"] = 0LL;
     }
     return out;
   }

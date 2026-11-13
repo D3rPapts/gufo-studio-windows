@@ -206,6 +206,12 @@ bool ParseRemoteSection(const Section& section, PresetModel* model,
                             "'queue-timeout-seconds' takes 0..86400", error);
       }
       spec.queue_timeout_seconds = static_cast<int>(number);
+    } else if (key == "pool-wait-seconds") {
+      if (!ParseWhole(value, 0, 86400, &number)) {
+        return SectionError(section, "'pool-wait-seconds' takes 0..86400",
+                            error);
+      }
+      spec.pool_wait_seconds = static_cast<int>(number);
     } else if (key == "max-request-bytes") {
       if (!ParseWhole(value, 1, 1LL << 40, &number)) {
         return SectionError(section,

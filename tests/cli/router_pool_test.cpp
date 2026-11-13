@@ -391,6 +391,69 @@ void TestRegistryCounts() {
   CHECK(std::string(gufo::router::PlacementName(Placement::kPool)) == "pool");
 }
 
+// B5 "never stuck" (Fabian 13.11.): a request this router can run waits on
+// the partner at most pool-wait-seconds, then the partner drops out.
+void TestFallback() {
+  using gufo::router::PoolFallbackInput;
+  using gufo::router::PoolFallbackReason;
+  using gufo::router::PoolRemoteAnswer;
+  using gufo::router::PoolRemoteHold;
+  using gufo::router::WithoutPartner;
+  using std::chrono::seconds;
+  PoolFallbackInput in;
+  in.limit = seconds(60);
+  in.waited = seconds(59);
+  CHECK(PoolFallbackReason(in) == nullptr);
+  in.waited = seconds(60);
+  CHECK(PoolFallbackReason(in) != nullptr);
+  in.pinned_remote = true;
+  CHECK(PoolFallbackReason(in) != nullptr);
+  // Without the LoRAs here the pin holds; a relayed request is the
+  // partner's to decide.
+  in.local_capable = false;
+  CHECK(PoolFallbackReason(in) == nullptr);
+  in.local_capable = true;
+  in.forwarded = true;
+  CHECK(PoolFallbackReason(in) == nullptr);
+  in.forwarded = false;
+  in.limit = seconds(0);
+  in.waited = std::chrono::milliseconds(0);
+  CHECK(PoolFallbackReason(in) != nullptr);
+
+  // GPU work here and the partner busy: "both busy" until the fallback,
+  // then this machine despite its GPU work.
+  PoolInput both;
+  both.local = Warm(true);
+  both.local.gpu_busy = true;
+  both.remote = Warm(false);
+  both.waited = seconds(61);
+  CHECK(ChoosePool(both).choice == PoolChoice::kWait);
+  CHECK(ChoosePool(WithoutPartner(both)).choice == PoolChoice::kLocal);
+  // Pinned to a busy partner (local.available = false by the pin): after the
+  // fallback the pin is lifted and a cold load here evicts idle models.
+  PoolInput pinned;
+  pinned.local = Cold();
+  pinned.local.empty = false;
+  pinned.remote = Warm(false);
+  pinned.waited = seconds(61);
+  PoolInput pinned_now = pinned;
+  pinned_now.local.available = false;
+  CHECK(ChoosePool(pinned_now).choice == PoolChoice::kWait);
+  const auto fell = ChoosePool(WithoutPartner(pinned));
+  CHECK(fell.choice == PoolChoice::kLocal);
+  CHECK(std::string(fell.reason) == "load after evicting idle models");
+  // Busy here too: it still waits for this machine (FIFO), never fails.
+  PoolInput busy = WithoutPartner(pinned);
+  busy.local = Warm(false);
+  CHECK(ChoosePool(busy).choice == PoolChoice::kWait);
+
+  // An unreachable partner is held off like a failed one.
+  CHECK(PoolRemoteHold(PoolRemoteAnswer::kRetryUnreachable));
+  CHECK(PoolRemoteHold(PoolRemoteAnswer::kRetryFailed));
+  CHECK(!PoolRemoteHold(PoolRemoteAnswer::kRetryMemory));
+  CHECK(!PoolRemoteHold(PoolRemoteAnswer::kPass));
+}
+
 }  // namespace
 
 int main() {
@@ -407,6 +470,7 @@ int main() {
   TestProbeActivity();
   TestGpuSlotIdle();
   TestRegistryCounts();
+  TestFallback();
   if (failures != 0) {
     std::cerr << failures << " router pool checks failed\n";
     return 1;

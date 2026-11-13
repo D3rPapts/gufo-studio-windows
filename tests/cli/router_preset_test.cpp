@@ -172,6 +172,7 @@ void TestRemoteSection() {
       "gpu-slot = studio56\n"
       "busy-check-url = http://192.168.100.56:8085/queue\n"
       "queue-timeout-seconds = 60\n"
+      "pool-wait-seconds = 20\n"
       "max-request-bytes = 67108864\n"
       "\n"
       "[remote/tts]\n"
@@ -197,6 +198,7 @@ void TestRemoteSection() {
   assert(spec.busy_check.has_value() && spec.busy_check->port == 8085 &&
          spec.busy_check->path == "/queue");
   assert(spec.queue_timeout_seconds == 60);
+  assert(spec.pool_wait_seconds == 20);
   assert(spec.max_request_bytes == 67108864u);
   const auto& tts = *models[2].remote;
   // Defaults; a bare trailing slash is no path.
@@ -204,6 +206,7 @@ void TestRemoteSection() {
   assert(tts.connect_timeout_seconds == 3 && tts.head_timeout_seconds == 0);
   assert(tts.gpu_slot.empty() && !tts.busy_check.has_value());
   assert(tts.queue_timeout_seconds == 900 && tts.max_request_bytes == 0);
+  assert(tts.pool_wait_seconds == 60);
 }
 
 void TestRemoteErrors() {
