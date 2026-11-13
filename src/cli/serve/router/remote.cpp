@@ -1,5 +1,7 @@
 #include "src/cli/serve/router/remote.hpp"
 
+#include "src/cli/serve/router/auth.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -71,6 +73,11 @@ UpstreamTarget RemoteTarget(const RemoteSpec& spec,
     // Replaces a client's header of the same name: the next router sees
     // who relayed it.
     target.extra_headers.emplace_back(kForwardedHeader, router_id);
+  }
+  // The shared pool secret (preset `[router] pool-secret-env`, 2.0.3): a
+  // partner with `auth = lan` admits router-to-router calls only with it.
+  if (const std::string& secret = auth::PoolSecret(); !secret.empty()) {
+    target.extra_headers.emplace_back(auth::kPoolKeyHeader, secret);
   }
   return target;
 }
