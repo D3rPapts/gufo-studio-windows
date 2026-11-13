@@ -554,6 +554,12 @@ bool LoadPreset(const std::filesystem::path& file,
       section.modality = std::string(TrimSpaces(header.substr(0, slash)));
       section.id = std::string(TrimSpaces(header.substr(slash + 1)));
       in_section = true;
+      if (section.modality == "router") {
+        // Only the plain `[router]` carries the access keys.
+        *error = "invalid section header '" + std::string(line) +
+                 "': the router section is [router] without an id";
+        return false;
+      }
       if (!IsKnownModality(section.modality)) {
         return SectionError(
             section, "unknown modality '" + section.modality + "'", error);

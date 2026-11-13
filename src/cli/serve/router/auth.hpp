@@ -187,8 +187,9 @@ public:
   [[nodiscard]] bool RememberSession(std::string_view name,
                                      std::string_view session_id,
                                      long long ablauf, std::string* error);
+  /// `ablauf` (may be null) receives the stored expiry (unix seconds).
   [[nodiscard]] std::optional<User> FindBySession(
-      std::string_view session_id) const;
+      std::string_view session_id, long long* ablauf = nullptr) const;
   void ForgetSession(std::string_view session_id);
   void NoteLogin(std::string_view name);
 
@@ -281,6 +282,10 @@ struct Route {
 [[nodiscard]] std::string PageArea(std::string_view path);
 [[nodiscard]] bool IsLoopback(std::string_view address);
 
+/// Lower case for the filter: ASCII and the Latin-1 letters of UTF-8
+/// (Ä Ö Ü É ... -> ä ö ü é; ß stays), so "TÖTEN" meets "töt*".
+[[nodiscard]] std::string LowerUtf8(std::string_view text);
+
 /// Word filter for image/video prompts: one word per line in
 /// `filter-woerter.txt` next to the users file (created with a default
 /// list when missing). Case-insensitive whole-word match on the prompt
@@ -342,12 +347,15 @@ public:
   /// Who the request is (loopback -> internal -> pool -> bearer -> cookie).
   [[nodiscard]] Identity Identify(const server::HttpRequest& req);
   /// The refusal for `req` under `who` (401/302/403/400/404/429) or
-  /// nullopt when it may proceed. `route` is Classify(req).
+  /// nullopt when it may proceed. `route` is Classify(req). `body` (may be
+  /// null) is the request's parsed JSON body when the caller has it (a job
+  /// submit is parsed once in Serve).
   [[nodiscard]] std::optional<server::HttpResponse> Refuse(
-      const server::HttpRequest& req, const Route& route, const Identity& who);
+      const server::HttpRequest& req, const Route& route, const Identity& who,
+      const json::Value* body = nullptr);
   /// Rewrites a request that proceeds: drops client-supplied gufo
-  /// headers, sets kUserHeader/kRightsHeader, pins the pool side, stamps
-  /// the job owner.
+  /// headers, sets kUserHeader/kRightsHeader (the job API stamps the
+  /// owner from it), pins the pool side. Never touches the body.
   void Rewrite(server::HttpRequest* req, const Identity& who);
   /// A user's job list shows only its own jobs; its job reads 404 for
   /// others' jobs.
@@ -367,6 +375,8 @@ public:
   /// In-memory sessions (the remembered ones are also in the store).
   [[nodiscard]] std::string NewSession(const User& user, bool remember);
   void EndSession(std::string_view id);
+  /// Every session of `name` in memory (a password change or a block).
+  void EndSessionsOf(std::string_view name);
   [[nodiscard]] std::optional<Identity> SessionIdentity(std::string_view id);
 
   /// Append to zugriff.log (time, user, address, method path, model,
