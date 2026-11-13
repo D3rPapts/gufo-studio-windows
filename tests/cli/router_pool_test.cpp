@@ -536,7 +536,32 @@ void TestPriority() {
 
 }  // namespace
 
+void TestTopLevelMember() {
+  using gufo::router::TopLevelMemberText;
+  const auto text = [](std::string_view body, std::string_view key) {
+    const auto found = TopLevelMemberText(body, key);
+    return found ? std::string(*found) : std::string("<none>");
+  };
+  CHECK(text(R"({"model":"m","priority":7})", "priority") == "7");
+  CHECK(text(R"({ "priority" : "3" , "x": 1})", "priority") == R"("3")");
+  CHECK(text(R"({"priority":null})", "priority") == "null");
+  CHECK(text(R"({"a":{"priority":9},"b":[{"priority":8}],"priority":2})",
+             "priority") == "2");
+  // Inside a string or nested: not a member of the body.
+  CHECK(text(R"({"messages":[{"content":"the \"priority\" is high"}]})",
+             "priority") == "<none>");
+  CHECK(text(R"({"a":{"priority":9}})", "priority") == "<none>");
+  CHECK(text(R"({"model":"a \"priority\" b"})", "priority") == "<none>");
+  CHECK(text(R"({"priority":{"n":1},"z":0})", "priority") == R"({"n":1})");
+  CHECK(text(R"({"priority":[1,2]})", "priority") == "[1,2]");
+  CHECK(text(R"([{"priority":1}])", "priority") == "<none>");
+  CHECK(text("not json", "priority") == "<none>");
+  CHECK(text(R"({"priority":)", "priority") == "<none>");
+  CHECK(text("", "priority") == "<none>");
+}
+
 int main() {
+  TestTopLevelMember();
   TestWarmAndFree();
   TestColdLoads();
   TestHysteresis();

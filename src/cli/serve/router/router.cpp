@@ -38,6 +38,7 @@
 #include "src/cli/serve/router/registry.hpp"
 #include "src/cli/serve/router/remote.hpp"
 #include "src/cli/serve/router/residency.hpp"
+#include "src/cli/serve/router/strings.hpp"
 #include "src/cli/serve/router/workers.hpp"
 #include "src/cli/serve/router/ws_relay.hpp"
 #include "src/cli/serve/serve.hpp"
@@ -811,19 +812,8 @@ bool IsObjektCreate(const HttpRequest& req) {
   return req.method == "POST" && req.path == "/v1/3d/generations";
 }
 
-/// A POST with a JSON object body (Content-Type application/json, or no
-/// type and a body that starts with '{'): the pool reads its LoRA names.
-bool IsJsonBody(const HttpRequest& req) {
-  if (req.method != "POST" || req.body.empty())
-    return false;
-  std::string type = req.header("Content-Type");
-  std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  if (type.starts_with("application/json"))
-    return true;
-  return type.empty() && req.body.front() == '{';
-}
+/// A POST with a JSON object body: the pool reads its LoRA names.
+using router::IsJsonBody;
 
 /// Job id of the status resource `/v1/videos/<id>`; empty for `/content` or
 /// any deeper path.
@@ -1140,20 +1130,24 @@ public:
     }
     if (auto page = ServePage(pages_dir, req))
       return std::move(*page);
-    // Priority (2.0.3): X-Gufo-Priority (wins) or the JSON member
-    // "priority"; read before the lock (the body may be large) and checked
-    // on every request, used by the pool decision.
+    // Priority (2.0.3): X-Gufo-Priority (wins) or the top-level JSON
+    // member "priority"; read before the lock and checked on every
+    // request, used by the pool decision. Only that member is parsed (a
+    // large body is scanned once, never parsed whole; "priority" inside a
+    // chat text does not count).
     int priority = 0;
     {
-      json::Value body;
+      json::Value member_value;
       const json::Value* member = nullptr;
-      if (IsJsonBody(req) &&
-          req.body.find("\"priority\"") != std::string::npos) {
-        try {
-          body = json::parse(req.body);
-          member = body.find("priority");
-        } catch (const std::exception&) {
-          // The worker answers a malformed body itself.
+      if (IsJsonBody(req)) {
+        if (const auto text = router::TopLevelMemberText(req.body, "priority");
+            text.has_value()) {
+          try {
+            member_value = json::parse(*text);
+            member = &member_value;
+          } catch (const std::exception&) {
+            // The worker answers a malformed body itself.
+          }
         }
       }
       std::string why;
