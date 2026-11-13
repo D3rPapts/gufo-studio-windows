@@ -742,14 +742,54 @@ again with `X-Gufo-Pool: remote` (`event=job_redirected`). A request
 that already reached a worker is never redirected, so nothing runs
 twice. The pull answer says `"was_waiting": true|false`.
 
-**View.** Every job carries `"request": {"loras": [...]}`,
+**Priority (2.0.3).** Every job has `"priority"`: an integer 0..9, 0
+(normal) by default, a higher value runs first. Given on `POST
+/v1/jobs` as the header `X-Gufo-Priority` (wins when both are there),
+the member `"priority"` of the submit body, the member `"priority"` of
+the wrapped request body or a multipart form field `priority`; any
+other value (not an integer 0..9, as a number or a digit string) is
+`400 invalid_priority`, nothing is queued. Order: the queue of each
+router runs the highest priority first and, among equal priorities,
+the oldest job (first in, first out, as before); a job put back after
+`remote_unavailable`/`pool_busy` returns to the front of its priority.
+Pull: a free runner takes the partner's first job (priority, then age)
+only when it runs before its own next job, i.e. `(priority desc,
+created_at asc)` replaces the plain `created_at` comparison; the owner
+hands out its best candidate in the same order and names `"priority"`
+in the pull answer. `"position"` follows the same order. Every request
+of a job carries `X-Gufo-Priority` (only when > 0), so the pool
+decision on both routers knows it. `jobs.json` keeps `"priority"`; a
+file from before 2.0.3 reads as 0; a partner older than 2.0.3 lists no
+priority and its jobs count as normal, and its own queue stays by age.
+
+Direct (synchronous) requests to a pool model take the priority from
+the header or the body member too (`400 invalid_priority` as above;
+the body is passed on unchanged, workers ignore the member). The pool
+loop forms no order among several waiting requests: each polls every
+200 ms and takes the first free machine it sees. The precedence rule
+is therefore small: a request that sees a free machine (local or
+remote) and finds a waiting request of the same model with a higher
+priority lets it go first (`event=pool_yield`, `choice=wait
+reason="yields to a higher priority"`), for at most 2 s in a row
+(`kPoolYieldMax`): the higher one polls within 200 ms and takes the
+machine; if it does not (pinned to the other side, gone), the lower one
+takes it, so nothing waits longer than before (B5 holds; the yield
+counts against the request's `queue-timeout-seconds`). A relayed
+request (`X-Gufo-Forwarded`) never yields; the partner decided already.
+Not covered: priorities across different models (a free GPU still goes
+to whichever model's request sees it first), the worker's own queue
+once a request reached it, and ComfyUI graphs. `/router/status` shows
+per pool model `"waiting_priority"` (the highest waiting priority, -1
+when none) and `"yields"`.
+
+**View.** Every job carries `"request": {"loras": [...]}`, `"priority"`,
 `"pool_wait"` and `"running_on"`: `"local"` while it runs on the owner's
 worker, the partner's `http://host:port` while the partner's worker runs
 it (pulled, or the pool sent the request there), `null` while it waits
 in the pool or is not running. `GET /v1/jobs?scope=pool` adds
 `"position"`: the rank among the queued and waiting jobs of both routers
-by `created_at` (1 = next to run), `null` for the others; the partner's
-`running_on` is translated to this router's point of view. `GET
+by priority, then `created_at` (1 = next to run), `null` for the others;
+the partner's `running_on` is translated to this router's point of view. `GET
 /router/status` gets `"pool_queue": {"local": queued or waiting here,
 "local_waiting": of those waiting in the pool, "partner": queued or
 waiting there (null while unknown), "pulled": jobs this router fetched
