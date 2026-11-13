@@ -120,6 +120,9 @@ struct RouterSection {
   std::string csrf_allow_origins;
   /// The MCP endpoint `POST /mcp` (2.1): on|off.
   std::string mcp{"on"};
+  /// `ablage_lesen` embeds an image or audio file inline up to this many
+  /// MiB (whole number, 0 = links only).
+  std::string mcp_inline_mb{"4"};
 };
 
 /// Parse + validate a preset file. `models_dir` (may be empty) resolves

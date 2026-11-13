@@ -1210,6 +1210,7 @@ pool-secret-env = GUFO_POOL_SECRET
 | `csrf-allow-origins` | none | Comma list of origins (`http://host:port`) whose pages may make browser writes besides this router's own address: pages served from another port of this machine (8096, 8090) and reverse proxies that rewrite `Host`. Spelling is normalised (case, default port, trailing slash). |
 | `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
 | `mcp` | `on` | The MCP endpoint `POST /mcp` (2.1, see [MCP endpoint](#mcp-endpoint-post-mcp)); `off` answers it `404`. |
+| `mcp-inline-mb` | `4` | Whole MiB up to which the MCP tool `ablage_lesen` embeds an image or audio file as base64 on request (`0` = links only); a call's `max_bytes` can lower it, never raise it. |
 
 Order per request: free paths (`/health`, `/ready`, `/login/` and its
 files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
@@ -1431,14 +1432,78 @@ may not use is the gate's `403 model_forbidden` at call time). Files
 travel as `/v1/jobs/{id}/files/{name}` links; `ablage_lesen` embeds an
 image or audio file as base64 only on request and up to 4 MiB.
 
-From 2.1 (Commit 2/3): every `tools/call` is one inner request through
-the same gate and dispatch as an HTTP client's, under the caller's
-token (area, model list, word filter, daily limit, own jobs,
-`X-Gufo-User`, access log); a refusal or a router error comes back as a
-tool result with `isError: true` and `structuredContent {http_status,
-code, message}`. Until the builders land, every known tool answers
-`isError: true` with "noch nicht umgesetzt". The access log carries
-`mcp:<tool>:<result>` beside the inner request's line.
+Every `tools/call` is one inner request through the same gate and
+dispatch as an HTTP client's, under the caller's token (never the
+router's internal key): area, model list, word filter, daily limit
+(counted once, by the inner request; `/mcp` itself counts nothing), own
+jobs, `X-Gufo-User` and the access log hold unchanged, and the inner
+paths are a fixed list (`/v1/models`, `/v1/chat/completions`,
+`/v1/jobs...`; never `/mcp`). Every result carries `structuredContent`
+(the tool's `outputSchema`) and its JSON as `content[0]` text for clients
+without structured content. A refusal or a router error of the inner
+request (status >= 400) is a tool result with `isError: true`, the text
+`<status> <code>: <message>` and `structuredContent {http_status, code,
+message, retry_after?}` with the router's error code (`403 forbidden`,
+`403 model_forbidden`, `400 content_filtered`, `429 daily_limit` with
+`retry_after`, `404 job_not_found`/`not_found` for another user's job,
+`503 pool_busy`, ...); a 2xx that is not the expected JSON is
+`unexpected_answer`. Missing or wrong arguments are JSON-RPC `-32602`
+naming the field (`arguments.<name> ...`). The access log carries
+`mcp:<tool>:ok` or `mcp:<tool>:abgelehnt:<code>` (`invalid_params` for
+-32602) with the call's model beside the inner request's own line (a
+`POST`, such as the chat; the gate logs no `GET`, so a model list, a job
+read or a file read has only the mcp line). `retry_after` appears only
+when the refusal carries a `Retry-After` header (the daily limit sends
+none).
+
+The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
+`auftrag_abbrechen`, `ablage_lesen`; the media job tools follow):
+
+- `modelle` `{modalitaet?}`: `GET /v1/models` reduced to
+  `{modelle: [{id, modalitaet, geladen, ort}]}` with the German
+  modality (`text` for llm/omni, `bild`, `video`, `stimme`, `musik`,
+  `3d`, `hochskalieren`), `geladen` from `loaded` and `ort` `partner`
+  for a relayed or remote-placed model, else `lokal`; a user sees only
+  the models of its `modelle` right.
+- `chat` `{nachricht, system?, verlauf?, bilder?, model?, denken?,
+  max_tokens?, temperature?, json?}`: one synchronous `POST
+  /v1/chat/completions` with `stream: false`, `chat_template_kwargs
+  {enable_thinking: denken}` (as the chat page sends it), `response_format
+  json_object` for `json`, the messages system -> verlauf -> user. An
+  entry of `bilder` is a `data:` URL (sent as an `image_url` part) or an
+  Ablage path `/v1/jobs/{id}/files/{name}`, which the router reads
+  through the gate first (area ablage, own jobs) and sends as a data URL.
+  A streamed worker answer is collected. The answer is
+  `{text, gedanken?, model, usage {prompt_tokens, completion_tokens},
+  finish_reason}`; `gedanken` is the message's `reasoning_content` or a
+  leading `<think>...</think>` block split off the text.
+- `auftrag_status` `{auftrag_id}`: `GET /v1/jobs/{id}` as `{auftrag_id,
+  status, art (image|music|speech|video|other from the wrapped path),
+  model?, titel?, fortschritt (0-100 or null), geschaetzt?, laeuft_auf?
+  (`lokal` or the partner's url), position?, dateien [{name, url,
+  content_type, bytes}], fehler?, vorschau_url?, erstellt, fertig?, url}`
+  with ISO 8601 UTC times.
+- `auftrag_liste` `{status?, art?, limit? (1-50, default 20), suche?}`:
+  `GET /v1/jobs?limit=&status=&kind=&q=` (the gate keeps the caller's
+  own jobs) as `{auftraege: [{auftrag_id, status, art, model?, titel?,
+  fortschritt, erstellt, url}]}`.
+- `auftrag_abbrechen` `{auftrag_id, loeschen? = false}`: reads the job
+  first; a finished one (completed, failed, cancelled) is `isError 409
+  job_finished` unless `loeschen` is true, then (or for a queued or
+  running job) `DELETE /v1/jobs/{id}` cancels or removes it:
+  `{auftrag_id, status, geloescht}`.
+- `ablage_lesen` `{auftrag_id, datei?, inhalt? = false, max_bytes?}`:
+  reads the job (own jobs only) and takes `datei` or its first image,
+  audio or video file (`isError 404 file_not_found` without one, with
+  the job's `status`), answering `{auftrag_id, name, url, content_type,
+  bytes, eingebettet}` with `url = <self name>/v1/jobs/{id}/files/{name}`
+  (the router's reachable address, never 127.0.0.1) and a second content
+  block: by default a `resource_link {uri, name, mimeType, size}`; with
+  `inhalt` an `image` or `audio` block (base64 `data`, `mimeType`) when
+  the file is at most `min(max_bytes, [router] mcp-inline-mb)`, else the
+  link; a video or any other type is always the link. Only an embedded
+  file (or one the job's list does not name) is read through
+  `GET /v1/jobs/{id}/files/{name}`.
 
 
 ## Endpoint Set

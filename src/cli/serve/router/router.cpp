@@ -4443,6 +4443,9 @@ int RunRouter(std::span<const char* const> args) {
     mcp_options.models = models;
     mcp_options.self_name = state->self_name;
     mcp_options.enabled = router_section.mcp != "off";
+    mcp_options.inline_limit =
+        static_cast<std::size_t>(std::stoull(router_section.mcp_inline_mb))
+        << 20;
     mcp_options.jobs_api = state->jobs != nullptr;
     state->mcp =
         std::make_unique<router::mcp::McpService>(std::move(mcp_options));

@@ -1,6 +1,7 @@
 #include "src/cli/serve/router/preset.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdlib>
@@ -361,10 +362,17 @@ bool ParseRouterSection(const Section& section, RouterSection* out,
       if (value != "on" && value != "off")
         return fail("mcp takes on|off, got '" + value + "'");
       out->mcp = value;
+    } else if (key == "mcp-inline-mb") {
+      if (value.empty() || value.size() > 4 ||
+          !std::all_of(value.begin(), value.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return fail("mcp-inline-mb takes whole megabytes (0-9999), got '" +
+                    value + "'");
+      out->mcp_inline_mb = value;
     } else {
       return fail("unknown key '" + key +
                   "' (auth, auth-loopback, users-file, pool-secret-env, "
-                  "csrf-allow-origins, mcp)");
+                  "csrf-allow-origins, mcp, mcp-inline-mb)");
     }
   }
   out->present = true;

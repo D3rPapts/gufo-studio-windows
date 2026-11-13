@@ -18,10 +18,19 @@
 // `tools/list` shows a user only the tools of its areas; `tools/call` of a
 // tool it may not see is -32602 like an unknown name.
 //
-// Commit 1 (this file): the frame, the handshake, the tool table with its
-// schemas and a `tools/call` skeleton that answers every known tool with
-// isError (not implemented yet). Commit 2/3 add the builders that run each
-// tool as one inner request through gate and dispatch (Options::serve).
+// Commit 1: the frame, the handshake, the tool table with its schemas and
+// the `tools/call` skeleton. Commit 2: the builders of `modelle`, `chat`,
+// `auftrag_status`, `auftrag_liste`, `auftrag_abbrechen` and
+// `ablage_lesen`. Every tool call is one inner request (a fixed path list:
+// /v1/models, /v1/chat/completions, /v1/jobs...) through the same gate and
+// dispatch as an HTTP client's (Options::serve), under the caller's own
+// token: area, model list, word filter, daily limit (counted once, by the
+// inner request), own jobs, X-Gufo-User and the access log hold unchanged.
+// A refusal or router error (status >= 400) is a tool result with
+// `isError: true` and `structuredContent {http_status, code, message,
+// retry_after?}`; every result carries `structuredContent` and its JSON as
+// `content[0]` text. The access log gets `mcp:<tool>:ok|abgelehnt:<code>`
+// beside the inner request's own line. Commit 3 adds the media job tools.
 
 #include <cstddef>
 #include <functional>
@@ -82,7 +91,9 @@ struct Options {
   std::string self_name;
   /// serverInfo.version; "" = this build's release version.
   std::string version;
-  /// ablage_lesen: a file is embedded inline up to this size.
+  /// ablage_lesen: an image or audio file is embedded inline up to this
+  /// size (`[router] mcp-inline-mb`, default 4); a call's max_bytes may
+  /// lower it, never raise it.
   std::size_t inline_limit{static_cast<std::size_t>(4) << 20};
   /// `[router] mcp = on|off`: off answers 404.
   bool enabled{true};
@@ -111,6 +122,16 @@ public:
                                  const auth::Identity& who,
                                  const server::HttpRequest& outer);
 
+  /// The collected answer of an inner request (a streamed body is read to
+  /// the end, as the job runner does).
+  struct InnerAnswer {
+    int status{0};
+    std::string content_type;
+    std::string body;
+    /// Retry-After header in seconds, 0 without one.
+    long long retry_after{0};
+  };
+
 private:
   [[nodiscard]] server::HttpResponse Rpc(const server::HttpRequest& req,
                                          const auth::Identity& who);
@@ -119,6 +140,32 @@ private:
                                      const auth::Identity& who) const;
   [[nodiscard]] bool Visible(const Tool& tool,
                              const auth::Identity& who) const;
+  /// One inner request through Options::serve: `outer`'s token, address
+  /// and cancellation, a JSON body when `body` is set. `path` must be one
+  /// of the tool paths (never /mcp itself).
+  [[nodiscard]] InnerAnswer Inner(const server::HttpRequest& outer,
+                                  std::string method, std::string path,
+                                  std::string query = {},
+                                  std::string body = {}) const;
+  /// The documented default of a tool's `model` field.
+  [[nodiscard]] std::string DefaultModel(std::string_view tool) const;
+
+  // The builders (Commit 2). Each returns a tool result (`content`,
+  // `structuredContent`, maybe `isError`); bad arguments throw
+  // InvalidParams (mcp.cpp) and become -32602.
+  [[nodiscard]] json::Value RunModelle(const json::Value& args,
+                                       const auth::Identity& who,
+                                       const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunChat(const json::Value& args,
+                                    const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunAuftragStatus(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunAuftragListe(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunAuftragAbbrechen(
+      const json::Value& args, const server::HttpRequest& outer) const;
+  [[nodiscard]] json::Value RunAblageLesen(
+      const json::Value& args, const server::HttpRequest& outer) const;
 
   Options options_;
   std::vector<Tool> tools_;
