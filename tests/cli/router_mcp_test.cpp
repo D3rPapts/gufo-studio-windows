@@ -2325,6 +2325,110 @@ void TestModernEra() {
 
 }  // namespace
 
+void TestByteCaps() {
+  // 2.1 (review finding 5): files are read with a hard cap in the body
+  // callback: a media input over 20 MB and chat images over 20 MB together
+  // are -32602 with a hint, ablage_lesen stops at mcp-inline-mb and answers
+  // a link. Finding 11: a huge or fractional integer argument is -32602.
+  Fixture f;
+  auth::Rights rights;
+  rights.bereiche = {"text", "bild", "video", "ablage"};
+  f.AddUser("mia", "nutzer", rights);
+  const std::string mia = f.Token("mia");
+  f.owners["j1"] = "mia";
+  constexpr std::size_t kMb = static_cast<std::size_t>(1) << 20;
+  int chunks = 0;  // chunks the streamed file offered
+  json::Value files = json::Value::array();
+  json::Value entry = json::Value::object();  // no size known
+  entry["name"] = "gross.png";
+  entry["url"] = "/v1/jobs/j1/files/gross.png";
+  entry["content_type"] = "image/png";
+  files.push_back(std::move(entry));
+  const json::Value j1 =
+      JobView("j1", "completed", "mia", "/v1/images/generations", files);
+  f.fake = [&](const HttpRequest& req) -> std::optional<HttpResponse> {
+    const std::string& p = req.path;
+    if (req.method == "GET" && p == "/v1/jobs/j1")
+      return JsonAnswer(200, j1);
+    if (req.method == "GET" && p == "/v1/jobs/j1/files/gross.png") {
+      HttpResponse out{.status = 200, .reason = "OK", .body = {},
+                       .headers = {{"Content-Type", "image/png"}}};
+      out.streaming_body = [&chunks](const HttpResponse::BodyWriter& write) {
+        const std::string chunk(kMb, 'g');
+        for (int i = 0; i < 64; ++i) {
+          ++chunks;
+          if (!write(chunk))
+            return;
+        }
+      };
+      return out;
+    }
+    if (req.method == "GET" && p == "/v1/jobs/j1/files/mittel.png")
+      return FileAnswer(std::string(11 * kMb, 'm'), "image/png");
+    if (req.method == "POST" && p == "/v1/chat/completions") {
+      json::Value message = json::Value::object();
+      message["role"] = "assistant";
+      message["content"] = "ok";
+      json::Value choice = json::Value::object();
+      choice["message"] = std::move(message);
+      choice["finish_reason"] = "stop";
+      json::Value choices = json::Value::array();
+      choices.push_back(std::move(choice));
+      json::Value body = json::Value::object();
+      body["choices"] = std::move(choices);
+      return JsonAnswer(200, body);
+    }
+    return std::nullopt;
+  };
+
+  HttpResponse r = f.Call("hochskalieren",
+                          "{\"datei\":\"/v1/jobs/j1/files/gross.png\"}", kLan,
+                          Fixture::Bearer(mia));
+  CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  CHECK(RpcMessage(r).find("arguments.datei is larger than 20 MB") !=
+        std::string::npos);
+  CHECK(chunks <= 21);  // stopped after 20 MB, not read to the end
+  CHECK(f.Requests("/v1/jobs").empty());
+
+  r = f.Call("chat",
+             "{\"nachricht\":\"x\",\"bilder\":[\"/v1/jobs/j1/files/mittel.png\","
+             "\"/v1/jobs/j1/files/mittel.png\"]}",
+             kLan, Fixture::Bearer(mia));
+  CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  CHECK(RpcMessage(r).find("arguments.bilder[1]") != std::string::npos);
+  CHECK(RpcMessage(r).find("20 MB together") != std::string::npos);
+  CHECK(f.Requests("/v1/chat/completions").empty());
+  r = f.Call("chat",
+             "{\"nachricht\":\"x\",\"bilder\":[\"/v1/jobs/j1/files/mittel.png\"]}",
+             kLan, Fixture::Bearer(mia));
+  CheckShape(r, false);
+  CHECK_EQ(f.Requests("/v1/chat/completions").size(), std::size_t(1));
+
+  chunks = 0;
+  r = f.Call("ablage_lesen",
+             "{\"auftrag_id\":\"j1\",\"datei\":\"gross.png\",\"inhalt\":true}",
+             kLan, Fixture::Bearer(mia));
+  CheckShape(r, false);
+  CHECK(chunks <= 5);  // the fixture's inline cap is 4 MB
+  {
+    const json::Value s = Structured(r);
+    CHECK(!s.find("eingebettet")->as_bool());
+    CHECK(s.find("bytes") == nullptr);
+    const std::vector<json::Value> blocks = Blocks(r);
+    CHECK_EQ(blocks.size(), std::size_t(2));
+    if (blocks.size() == 2)
+      CHECK_EQ(blocks[1].member_str("type"), std::string("resource_link"));
+  }
+
+  for (const char* bad : {"1e300", "-1e300", "1.5", "9.3e18"}) {
+    r = f.Call("ablage_lesen",
+               std::string("{\"auftrag_id\":\"j1\",\"max_bytes\":") + bad + "}",
+               kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find("arguments.max_bytes") != std::string::npos);
+  }
+}
+
 int main() {
   TestClassifyAndPreset();
   TestFrame();
@@ -2336,6 +2440,7 @@ int main() {
   TestJobs();
   TestMediaJobs();
   TestModernEra();
+  TestByteCaps();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;
