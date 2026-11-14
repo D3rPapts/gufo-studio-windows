@@ -245,6 +245,36 @@ void TestPartnerRead() {
                                        std::chrono::milliseconds(500));
   assert(response.status == 503);
   assert(Drain(response).find("remote_unavailable") != std::string::npos);
+  // 2.1 (review finding 8): an answer over 8 MB is not relayed cut as a
+  // 200 but refused as 502 upstream_too_large.
+  {
+    const std::string big = "[\"" + std::string(9 * 1024 * 1024, 'x') + "\"]";
+    // The relay may hang up after 8 MB: a refused send is no failure here.
+    const auto send_all = [](net::Socket socket, std::string_view text) {
+      while (!text.empty()) {
+        const auto count =
+            net::SendNoSignal(socket, text.data(), text.size());
+        if (count <= 0)
+          return;
+        text.remove_prefix(static_cast<std::size_t>(count));
+      }
+    };
+    FakeUpstream large([big, send_all](net::Socket client, const std::string&) {
+      send_all(client,
+               "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+               "Content-Length: " + std::to_string(big.size()) + "\r\n\r\n");
+      send_all(client, big);
+    });
+    gufo::router::RemoteSpec huge = spec;
+    huge.url.port = large.port();
+    request.path = "/router/partner/jobs";
+    response = gufo::router::PartnerRead(huge, "r-204", request,
+                                         std::chrono::milliseconds(5000));
+    assert(response.status == 502);
+    const std::string text = Drain(response);
+    assert(text.find("upstream_too_large") != std::string::npos);
+    assert(text.size() < 1024);
+  }
   gufo::router::auth::SetPoolSecret("");
 }
 

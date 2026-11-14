@@ -767,12 +767,56 @@ bool UserStore::Save(std::string* error) const {
 }
 
 bool UserStore::Relocate(std::filesystem::path file, std::string* error) {
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    file_ = std::move(file);
-    users_.clear();
+  // Loaded into a store of its own first: a file that does not parse
+  // leaves this store (its users and its file) as it was, so a later
+  // admin creation cannot overwrite a users file that failed to load.
+  UserStore fresh(file, rounds_);
+  if (!fresh.Load(error))
+    return false;
+  std::vector<User> users = fresh.List();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  file_ = std::move(file);
+  users_ = std::move(users);
+  return true;
+}
+
+bool UserStore::Create(User user, std::string_view password,
+                       std::string* error) {
+  user.name = Lower(user.name);
+  if (!IsValidName(user.name)) {
+    *error = "bad user name (1-32 of a-z 0-9 . _ -)";
+    return false;
   }
-  return Load(error);
+  if (IsReservedName(user.name)) {
+    *error = "the name is reserved (lokal, partner)";
+    return false;
+  }
+  if (!IsRole(user.rolle)) {
+    *error = "bad role (admin|nutzer|dienst)";
+    return false;
+  }
+  if (password.size() < 4) {
+    *error = "password too short (at least 4 characters)";
+    return false;
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (FindLocked(user.name) != nullptr) {
+    *error = "user exists";
+    return false;
+  }
+  SetPasswordLocked(&user, password);
+  if (user.hash_hex.empty()) {
+    *error = "password hashing failed";
+    return false;
+  }
+  if (user.erstellt == 0)
+    user.erstellt = NowUnix();
+  users_.push_back(std::move(user));
+  if (!SaveLocked(error)) {
+    users_.pop_back();
+    return false;
+  }
+  return true;
 }
 
 bool UserStore::empty() const {
@@ -1395,11 +1439,15 @@ std::string WordFilter::Hit(const HttpRequest& req, bool comfy) {
 namespace {
 
 /// The texts a chat request carries from the user (2.0.5): `prompt` (a
-/// string or strings: completions), every user message of `messages`
-/// (chat completions, Anthropic messages) and every user item of `input`
-/// (responses), each a string or parts with a `text`. Of `messages` and
-/// `input` only the last user turn is read: a refused question the page
-/// keeps in the history must not block the conversation for good.
+/// string or strings: completions), the `messages` (chat completions,
+/// Anthropic messages) and `input` items (responses), each a string or
+/// parts with a `text`, plus `system` and `instructions` (Anthropic and
+/// responses system prompts). Of `messages` and `input` the last user
+/// turn is read, and every system and developer item (2.1: a system
+/// prompt is the caller's text too, else the filter were a role away);
+/// earlier user turns are not: a refused question the page keeps in the
+/// history must not block the conversation for good. Assistant turns are
+/// the model's own words.
 void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
   const auto content = [out](const json::Value& value) {
     if (value.is_string()) {
@@ -1420,6 +1468,10 @@ void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
   };
   if (const json::Value* prompt = body.find("prompt"))
     content(*prompt);
+  // Anthropic `system` (string or blocks) and responses `instructions`.
+  for (const char* key : {"system", "instructions"})
+    if (const json::Value* text = body.find(key))
+      content(*text);
   for (const char* key : {"messages", "input"}) {
     const json::Value* list = body.find(key);
     if (list == nullptr)
@@ -1432,9 +1484,19 @@ void CollectChatTexts(const json::Value& body, std::vector<std::string>* out) {
       continue;
     const json::Value* last = nullptr;
     for (const json::Value& item : list->items()) {
-      if (item.is_string() ||
-          (item.is_object() && item.member_str("role", "user") == "user"))
+      if (item.is_string()) {
         last = &item;
+        continue;
+      }
+      if (!item.is_object())
+        continue;
+      const std::string role = item.member_str("role", "user");
+      if (role == "user") {
+        last = &item;
+      } else if (role == "system" || role == "developer") {
+        if (const json::Value* c = item.find("content"))
+          content(*c);
+      }
     }
     if (last == nullptr)
       continue;
@@ -2367,7 +2429,8 @@ void Gate::After(const HttpRequest& req, const Route& route,
       !response->streaming_body) {
     if (req.path == "/v1/models" || req.path == "/models")
       HideModelArgs(response);
-    else if (req.path == "/router/status")
+    else if (req.path == "/router/status" ||
+             req.path == "/router/partner/status")
       HideOthersJobs(who, response);
     return;
   }

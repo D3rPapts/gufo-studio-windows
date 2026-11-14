@@ -170,6 +170,11 @@ public:
 
   /// Adds or replaces (by name) and saves.
   [[nodiscard]] bool Put(User user, std::string* error);
+  /// Adds a new user with its password in one save: nothing is stored
+  /// when the name is taken or the password is refused (the setup
+  /// assistant's first admin never exists without a password).
+  [[nodiscard]] bool Create(User user, std::string_view password,
+                            std::string* error);
   [[nodiscard]] bool Remove(std::string_view name, std::string* error);
   [[nodiscard]] bool SetPassword(std::string_view name,
                                  std::string_view password,
