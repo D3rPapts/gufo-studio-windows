@@ -64,8 +64,15 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
     for (const auto& [id, bytes] : backing->component_classes)
       largest = std::max(largest, bytes);
     const auto block = allocation.block_bytes;
-    const auto target =
-        std::max<std::size_t>(std::size_t{128} << 20, 2 * largest) / block;
+#if defined(_WIN32)
+    // Windows: with 128 MiB segments Gemma 4 captures past ~24K tokens fail
+    // their device-to-host copies (hipErrorInvalidValue, left unchecked until
+    // a later launch reports it); 1 GiB segments do not (gufo_win fb06faec).
+    constexpr std::size_t kSegmentTarget = std::size_t{1} << 30;
+#else
+    constexpr std::size_t kSegmentTarget = std::size_t{128} << 20;
+#endif
+    const auto target = std::max<std::size_t>(kSegmentTarget, 2 * largest) / block;
     const auto parts =
         std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
     const auto segment = (allocation.blocks + parts - 1) / parts * block;
