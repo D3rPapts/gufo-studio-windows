@@ -76,6 +76,18 @@ if (BUILD_TESTING)
       TIMEOUT 60)
   endforeach()
 
+  # A pool request against a fake partner, with `gufo router` as a child
+  # process (14.11.: a dropped 503 with a body ended the router).
+  add_executable(router_pool_relay_test tests/cli/router_pool_relay_test.cpp)
+  target_link_libraries(router_pool_relay_test PRIVATE gufo_router)
+  target_compile_options(router_pool_relay_test PRIVATE
+    ${gufo_router_test_undebug})
+  add_dependencies(router_pool_relay_test gufo)
+  add_test(NAME router_pool_relay_test
+    COMMAND router_pool_relay_test $<TARGET_FILE:gufo>)
+  set_tests_properties(router_pool_relay_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 90)
+
   # The ComfyUI graph translator alone: no server library needed.
   foreach (router_test IN ITEMS router_comfy_graph_test
       router_comfy_control_test)
