@@ -693,8 +693,10 @@ independent of workers. `GET /v1/models` lists every preset model in
 OpenAI list shape with the extension field `"loaded": true|false`. Its
 `"modality"` (also in `/router/capabilities`) is the section's; an
 `[external/<id>]` section reports the modality its leading `args = serve
-<modality>` names (`llm`, `image`, `tts`, ...) and `external` only when
-the command line does not say (2.0.5).
+<modality>` names (`llm`, `image`, `tts`, ...), `llm` for a section
+whose `command` is a llama.cpp `llama-server` without such `args` (2.1:
+the production preset's GGUF chat models), and `external` only when the
+command line does not say (2.0.5).
 `GET /v1/slots` and `GET /v1/metrics` require `?model=<id>`: they proxy to
 that worker when loaded and return 409 `model_not_loaded` otherwise.
 Unknown paths return 404 `not_found`, and video routes keep `serve`'s verb
@@ -1209,6 +1211,8 @@ pool-secret-env = GUFO_POOL_SECRET
 | `users-file` | `nutzer\nutzer.json` next to the preset | The users file; a relative path resolves against the preset's directory. `nutzer\filter-woerter.txt` and `nutzer\zugriff.log` live beside it. |
 | `csrf-allow-origins` | none | Comma list of origins (`http://host:port`) whose pages may make browser writes besides this router's own address: pages served from another port of this machine (8096, 8090) and reverse proxies that rewrite `Host`. Spelling is normalised (case, default port, trailing slash). |
 | `pool-secret-env` | none | Environment variable holding the secret both routers share. Every router-to-router call (model probe, relay, capabilities, job relay, `/router/pool/pull`) carries it as `X-Gufo-Pool-Key`; a request with a wrong or missing key is answered `401 pool_key_invalid`, which the partner's probe reports as unreachable (the B5 fallback then runs the work locally). Set the same value in both presets and both environments. |
+| `mcp` | `on` | The MCP endpoint `POST /mcp` (2.1, see [MCP endpoint](#mcp-endpoint-post-mcp)); `off` answers it `404`. |
+| `mcp-inline-mb` | `4` | Whole MiB up to which the MCP tool `ablage_lesen` embeds an image or audio file as base64 on request (`0` = links only); a call's `max_bytes` can lower it, never raise it. |
 
 Order per request: free paths (`/health`, `/ready`, `/login/` and its
 files, `/gemeinsam/` files, the favicons) are served to anyone. Then the
@@ -1382,6 +1386,249 @@ de/en, dark mode) and `gemeinsam/anmeldung.js`, which every page loads
 after `sprache.js`: it reads `/router/me`, shows the name and "Abmelden",
 hides tiles and menu entries of closed areas and goes to `/login/` on
 `401`.
+
+### MCP endpoint (`POST /mcp`)
+
+From 2.1 the router is an MCP server (Model Context Protocol, Streamable
+HTTP transport) so Claude Code, the Regie and other agents use its
+abilities as tools under their own token. It is a dual-era server in the
+words of the 2026-07-28 specification (Versioning, "Backward Compatibility
+with Initialization-Based Versions"): it speaks the legacy protocol
+versions 2025-03-26, 2025-06-18 and 2025-11-25 with the `initialize`
+handshake and the modern version 2026-07-28 without one. One JSON-RPC 2.0
+message per `POST /mcp` (a batch is `400 -32600`), answered as
+`application/json`; `GET` and `DELETE` are `405` (no server-initiated
+stream, no sessions: `Mcp-Session-Id` is never issued and ignored when
+sent); a body that is no `application/json` is `415`, an `Accept` without
+JSON `406`. Malformed JSON is `400 -32700`, a frame without `jsonrpc:
+"2.0"` or `method` `400 -32600`, an unknown or invisible tool and bad
+arguments `200 -32602`, an exception `200 -32603`.
+
+- Legacy (a request without `_meta` version): `initialize` answers the
+  client's version when it is one of the three, else 2025-06-18 (the
+  modern version is never echoed: it has no handshake), with
+  `capabilities.tools` and `serverInfo.name = "gufo-router"` (the build's
+  version); `notifications/initialized` and every other notification are
+  `202`; `ping` answers `{}`; an unknown method is `200 -32601`. A
+  missing `MCP-Protocol-Version` header counts as 2025-03-26.
+- Modern (2026-07-28; the request carries
+  `params._meta["io.modelcontextprotocol/protocolVersion"]`): served
+  statelessly, every result gets `resultType: "complete"` and
+  `_meta["io.modelcontextprotocol/serverInfo"]`, `tools/list` the cache
+  fields `ttlMs` (5 min) and `cacheScope: "private"` (the list depends on
+  the user's areas). `server/discover` (which the specification makes
+  mandatory) answers `supportedVersions` (`2026-07-28, 2025-11-25,
+  2025-06-18, 2025-03-26`), `capabilities.tools`, the server info in
+  `_meta` and `instructions` that name the caller's tools; it is answered
+  without `_meta` too (a probe). An unknown method of a modern request is
+  `404 -32601` as that transport demands. The mirrored headers are
+  checked when sent: an `MCP-Protocol-Version` that differs from the
+  `_meta` version, or an `Mcp-Method`/`Mcp-Name` (Base64 sentinel
+  `=?base64?...?=` decoded) that differs from the body, is `400 -32020
+  HeaderMismatch`. Deviations from the letter of 2026-07-28: a request
+  without `Mcp-Method`/`Mcp-Name` or without
+  `io.modelcontextprotocol/clientCapabilities` is served, not refused
+  (the endpoint needs no client capability, and dual-era probes send
+  none); `ping` and `initialize` stay answered.
+- Both: an unknown protocol version, in the header or in `_meta`, is
+  `400` with `-32022 UnsupportedProtocolVersion` and `data {supported:
+  [...], requested}`, so a dual-era client retries with a listed version
+  instead of falling back blindly (Claude Code 2.1.325 opens with
+  `server/discover` and the 2026-07-28 `_meta`). The router log notes
+  each `server/discover` or `initialize` as `event=mcp_client era=modern|
+  legacy client="<name/version>" user=<name>`.
+
+Who: `Authorization: Bearer gufo_...` of any role (admin, nutzer,
+dienst), loopback as admin and `auth = off`; a cookie session is `403
+mcp_token_required` (a page must not drive the tools through a browser
+session), the partner router `404`. The gate runs first, so an unsigned
+call is `401` without a tool list, and `GET /mcp` is no page (no `302`).
+An `Origin` header must pass the CSRF rule for every identity, tokens
+included (`403 csrf_rejected`; MCP clients send none, browsers always
+do), at `auth = off` as well. `[router] mcp = off` turns the endpoint off
+(`404`).
+
+Tools (`tools/list`, German names with an English sentence in each
+description, JSON schemas for input and output), in the order of the
+list:
+
+| Tool | Area | Inner request | Answer |
+| --- | --- | --- | --- |
+| `modelle` | every signed-in user | `GET /v1/models` | `{modelle: [{id, modalitaet, geladen, ort}]}` |
+| `chat` | text | `POST /v1/chat/completions` (synchronous, no stream) | `{text, gedanken?, model, usage, finish_reason}` |
+| `bild_erzeugen` | bild | job around `/v1/images/generations` | job (`{auftrag_id, status, url, modell, position?, geschaetzt?}`) |
+| `bild_bearbeiten` | bild | job around `/v1/images/edits` (multipart) | job |
+| `video_erzeugen` | video (counts twice) | job around `/v1/videos` | job |
+| `stimme` | stimme | job around `/v1/audio/speech` | job |
+| `musik` | musik | job around `/v1/audio/music` | job |
+| `objekt_3d` | 3d | job around `/v1/3d/generations` | job |
+| `hochskalieren` | bild or video (by file type) | job around `/v1/images/upscale` or `/v1/videos/upscale` | job |
+| `auftrag_status` | ablage | `GET /v1/jobs/{id}` | the job view (`status`, `fortschritt`, `dateien`, ...) |
+| `auftrag_liste` | ablage | `GET /v1/jobs?limit=&status=&kind=&q=` | `{auftraege: [...]}` |
+| `auftrag_abbrechen` | ablage | `GET` then `DELETE /v1/jobs/{id}` | `{auftrag_id, status, geloescht}` |
+| `ablage_lesen` | ablage | `GET /v1/jobs/{id}` (+ `/files/{name}` when embedding) | `{auftrag_id, name, url, content_type, bytes, eingebettet}` + link or image/audio block |
+
+A job tool submits `POST /v1/jobs` (which itself needs the ablage area)
+and answers the job id. A user sees only the tools of its areas; the job
+tools exist only with `--jobs-dir`. The `model`
+field of a tool carries the preset's default and names the preset's
+models of that modality in its description (no `enum`: a model the user
+may not use is the gate's `403 model_forbidden` at call time). Files
+travel as `/v1/jobs/{id}/files/{name}` links; `ablage_lesen` embeds an
+image or audio file as base64 only on request and up to 4 MiB.
+
+Every `tools/call` is one inner request through the same gate and
+dispatch as an HTTP client's, under the caller's token (never the
+router's internal key): area, model list, word filter, daily limit
+(counted once, by the inner request; `/mcp` itself counts nothing), own
+jobs, `X-Gufo-User` and the access log hold unchanged, and the inner
+paths are a fixed list (`/v1/models`, `/v1/chat/completions`,
+`/v1/jobs...`; never `/mcp`). Every result carries `structuredContent`
+(the tool's `outputSchema`) and its JSON as `content[0]` text for clients
+without structured content. A refusal or a router error of the inner
+request (status >= 400) is a tool result with `isError: true`, the text
+`<status> <code>: <message>` and `structuredContent {http_status, code,
+message, retry_after?}` with the router's error code (`403 forbidden`,
+`403 model_forbidden`, `400 content_filtered`, `429 daily_limit` with
+`retry_after`, `404 job_not_found`/`not_found` for another user's job,
+`503 pool_busy`, ...); a 2xx that is not the expected JSON is
+`unexpected_answer`. Missing or wrong arguments are JSON-RPC `-32602`
+naming the field (`arguments.<name> ...`). The access log carries
+`mcp:<tool>:ok` or `mcp:<tool>:abgelehnt:<code>` (`invalid_params` for
+-32602) with the call's model beside the inner request's own line (a
+`POST`, such as the chat; the gate logs no `GET`, so a model list, a job
+read or a file read has only the mcp line). `retry_after` appears only
+when the refusal carries a `Retry-After` header (the daily limit sends
+none).
+
+The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
+`auftrag_abbrechen`, `ablage_lesen` and the media job tools below):
+
+- `modelle` `{modalitaet?}`: `GET /v1/models` reduced to
+  `{modelle: [{id, modalitaet, geladen, ort}]}` with the German
+  modality (`text` for llm/omni, `bild`, `video`, `stimme`, `musik`,
+  `3d`, `hochskalieren`), `geladen` from `loaded` and `ort` `partner`
+  for a relayed or remote-placed model, else `lokal`; a user sees only
+  the models of its `modelle` right.
+- `chat` `{nachricht, system?, verlauf?, bilder?, model?, denken?,
+  max_tokens?, temperature?, json?}`: one synchronous `POST
+  /v1/chat/completions` with `stream: false`, `chat_template_kwargs
+  {enable_thinking: denken}` (as the chat page sends it), `response_format
+  json_object` for `json`, the messages system -> verlauf -> user. An
+  entry of `bilder` is a `data:` URL (sent as an `image_url` part) or an
+  Ablage path `/v1/jobs/{id}/files/{name}`, which the router reads
+  through the gate first (area ablage, own jobs) and sends as a data URL.
+  A streamed worker answer is collected. The answer is
+  `{text, gedanken?, model, usage {prompt_tokens, completion_tokens},
+  finish_reason}`; `gedanken` is the message's `reasoning_content` or a
+  leading `<think>...</think>` block split off the text.
+- `auftrag_status` `{auftrag_id}`: `GET /v1/jobs/{id}` as `{auftrag_id,
+  status, art (image|music|speech|video|other from the wrapped path),
+  model?, titel?, fortschritt (0-100 or null), geschaetzt?, laeuft_auf?
+  (`lokal` or the partner's url), position?, dateien [{name, url,
+  content_type, bytes}], fehler?, vorschau_url?, erstellt, fertig?, url}`
+  with ISO 8601 UTC times.
+- `auftrag_liste` `{status?, art?, limit? (1-50, default 20), suche?}`:
+  `GET /v1/jobs?limit=&status=&kind=&q=` (the gate keeps the caller's
+  own jobs) as `{auftraege: [{auftrag_id, status, art, model?, titel?,
+  fortschritt, erstellt, url}]}`.
+- `auftrag_abbrechen` `{auftrag_id, loeschen? = false}`: reads the job
+  first; a finished one (completed, failed, cancelled) is `isError 409
+  job_finished` unless `loeschen` is true, then (or for a queued or
+  running job) `DELETE /v1/jobs/{id}` cancels or removes it:
+  `{auftrag_id, status, geloescht}`.
+- `ablage_lesen` `{auftrag_id, datei?, inhalt? = false, max_bytes?}`:
+  reads the job (own jobs only) and takes `datei` or its first image,
+  audio or video file (`isError 404 file_not_found` without one, with
+  the job's `status`), answering `{auftrag_id, name, url, content_type,
+  bytes, eingebettet}` with `url = <self name>/v1/jobs/{id}/files/{name}`
+  (the router's reachable address, never 127.0.0.1) and a second content
+  block: by default a `resource_link {uri, name, mimeType, size}`; with
+  `inhalt` an `image` or `audio` block (base64 `data`, `mimeType`) when
+  the file is at most `min(max_bytes, [router] mcp-inline-mb)`, else the
+  link; a video or any other type is always the link. Only an embedded
+  file (or one the job's list does not name) is read through
+  `GET /v1/jobs/{id}/files/{name}`.
+
+Media job tools: each one `POST /v1/jobs` around the endpoint the
+matching page uses, with the body that page sends (pages/bild, video,
+stimme, musik, objekt, hochskalieren), so a job made through MCP is a
+job of that page in the Ablage: `metadata {quelle: "mcp", seite, titel,
+modell, prompt?, seed?, ...}`; `titel` is the caller's or built from the
+model and the prompt. `vorrang` (0-9) goes as `X-Gufo-Priority` on the
+submit (and as its `priority` member), replacing a priority header of the
+`/mcp` request. `model` defaults to the preset's first model of the
+modality (the schema's `default`; the preset's models are named in the
+field's description). Input files (`startbild`, `probe`, `bild`, `datei`,
+`bilder[]`, `maske`, `ton`, `endbild`) are an Ablage path
+`/v1/jobs/{id}/files/{name}` (read through the gate: another user's job
+is the gate's 404, so an agent can only use its own results) or a base64
+`data:` URL (`-32602` for anything else, an empty file or one over 20 MB);
+the router sends them on as data URLs (the workers do not fetch router
+paths). The answer is `{auftrag_id, status, url, modell, position?,
+geschaetzt?}` from the job store's 202 and the text "Auftrag <id>
+angenommen (Status queued), Stand mit auftrag_status, Ergebnis mit
+ablage_lesen. Job accepted." followed by that JSON. The gate counts
+every submit as the wrapped request (a video twice), checks area, model
+and word filter on it, and its refusal (`403 forbidden`, `403
+model_forbidden`, `400 content_filtered`, `429 daily_limit`) or the
+router's (`507 insufficient_memory`, `503 ...`) is the tool's `isError`.
+As for the pages, the submit itself needs the `ablage` area (`/v1/jobs`):
+a user with `bild` alone sees `bild_erzeugen` but gets `403 forbidden`.
+
+- `bild_erzeugen` `{prompt, negativ?, model?, breite?+hoehe? (multiples
+  of 32, at most 4 MP), schritte?, seed?, anzahl? (1-4), lora? [{name,
+  staerke}], titel?, vorrang?}`: `/v1/images/generations` `{model, prompt,
+  size?, steps?, seed?, n?, loras? [{name, scale}], response_format
+  b64_json, gufo {negative_prompt}?}`.
+- `bild_bearbeiten` `{prompt, bilder [1-10], maske?, staerke? (0-1),
+  negativ?, model?, breite?+hoehe?, schritte?, seed?, titel?, vorrang?}`:
+  the multipart body of `/v1/images/edits` (`comfy::BuildMultipart`,
+  submitted as `request.body_base64` + `content_type multipart/form-data;
+  boundary=...`): parts `model`, `prompt`, `size` (the given one, or
+  `auto` with a start image), `steps`, `seed`, `response_format
+  b64_json`, the images as `image[]` references, or, with `maske` or a
+  `staerke` below 1, the first image as `init_image` plus `mask` and
+  `gufo.strength`; `gufo.negative_prompt`. All files together at most
+  20 MB.
+- `video_erzeugen` `{prompt, model?, startbild?, endbild?, ton?,
+  sekunden?, breite?+hoehe?, schritte?, qualitaet? (genau|schnell|
+  schnellste), guidance?, negativ?, seed?, titel?, vorrang?}`:
+  `/v1/videos` with the body of the video page per model family:
+  `minimax-h3` `{model, prompt, seconds (default 5, at most 14), size
+  (default 512x512), first_frame?, last_frame?, audio_reference?, gufo
+  {preset exact|fast|aggressive, seed?}}`; `wan2.2-*` `{model, prompt,
+  seconds (at most 5), size (default 480x480), first_frame?, gufo {steps
+  (default 20), guidance?, negative_prompt?, seed?}}`; `wan2.1-uni3c`
+  (`startbild` required, size 832x480, 4 steps); `wan2.1-infinitetalk-14b`
+  (`startbild` and `ton` required, no `seconds`: the length comes from
+  the audio, size 832x480, 4 steps, `gufo.talk.audio [data url]`). An end
+  frame for a WAN model, audio for WAN 2.2 or Uni3C and a missing start
+  image or audio where required are `-32602`.
+- `stimme` `{text, model?, stimme?, sprache?, tempo? (0.25-4),
+  beschreibung?, probe?, wortlaut?, format? (wav|mp3), seed?, titel?,
+  vorrang?}`: `/v1/audio/speech` `{model, input, voice?, language?,
+  speed? (unless 1), instructions?, seed?, reference_audio? (raw base64,
+  as the page sends it), reference_text?, response_format}`; `voice` is
+  `stimme`, `voice-clone` when only a `probe` is given, `voice-design`
+  for `qwen3-tts-voicedesign` (which needs `beschreibung`); `fish-drama-3`
+  needs `wortlaut` with a probe; `voice_clone_mode` is left to the
+  router.
+- `musik` `{stil, liedtext? (default [Instrumental]), sekunden? (default
+  30, at most 600), model?, format?, seed?, titel?, vorrang?}`:
+  `/v1/audio/music` `{model, prompt, lyrics, task text2music, duration,
+  seed?, response_format, bitrate_kbps 192 for mp3}`.
+- `objekt_3d` `{bild, model?, schritte?, guidance? (1-15), seed?,
+  aufloesung? (256|512), max_dreiecke?, textur?, titel?, vorrang?}`:
+  `/v1/3d/generations` `{model, image (data url), steps?, seed?,
+  resolution?, max_faces?, guidance?, texture?, preview true}`.
+- `hochskalieren` `{datei, faktor? (2|4), variante? (allgemein|
+  entrauscht|anime), ausgabe? (png|jpg), model?, titel?, vorrang?}`: an
+  image (by content type) goes to `/v1/images/upscale` `{model, variant
+  general|wdn|anime, image (data url), scale, output, response_format
+  b64_json, quality 92 for jpg}`, a video to `/v1/videos/upscale`
+  `{model, variant, video (data url), scale, keep_audio true, async
+  true}` (area video, counts twice).
 
 
 ## Endpoint Set
@@ -2313,7 +2560,9 @@ are from `src/cli/serve/router/{auth,router,jobs,remote}.cpp`:
   `POST /router/login`). Type `authentication_error`.
 - `403` signed in but not allowed: `forbidden` (area not enabled for
   the user), `model_forbidden` (model not in the user's list),
-  `csrf_rejected` (browser write from another origin or scheme);
+  `csrf_rejected` (browser write from another origin or scheme),
+  `mcp_token_required` (`POST /mcp` with a cookie session instead of a
+  bearer token);
   the password-change codes are listed under
   [Users and access](#users-and-access). Type `permission_error`.
 - `415` `json_required`: a write to the users API without

@@ -1,6 +1,7 @@
 #include "src/cli/serve/router/preset.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdlib>
@@ -357,10 +358,21 @@ bool ParseRouterSection(const Section& section, RouterSection* out,
         return fail("csrf-allow-origins needs a comma list of origins "
                     "(http://host:port)");
       out->csrf_allow_origins = value;
+    } else if (key == "mcp") {
+      if (value != "on" && value != "off")
+        return fail("mcp takes on|off, got '" + value + "'");
+      out->mcp = value;
+    } else if (key == "mcp-inline-mb") {
+      if (value.empty() || value.size() > 4 ||
+          !std::all_of(value.begin(), value.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return fail("mcp-inline-mb takes whole megabytes (0-9999), got '" +
+                    value + "'");
+      out->mcp_inline_mb = value;
     } else {
       return fail("unknown key '" + key +
                   "' (auth, auth-loopback, users-file, pool-secret-env, "
-                  "csrf-allow-origins)");
+                  "csrf-allow-origins, mcp, mcp-inline-mb)");
     }
   }
   out->present = true;
@@ -665,6 +677,14 @@ std::string ReportedModality(const PresetModel& preset) {
   if (preset.argv.size() >= 2 && preset.argv[0] == "serve" &&
       !preset.argv[1].empty() && preset.argv[1][0] != '-')
     return preset.argv[1];
+  // A llama.cpp server (2.1: `command = ...\llama-server.exe` without
+  // `args`, as the production preset runs its GGUF chat models) is a
+  // chat model.
+  std::string command = preset.command;
+  std::transform(command.begin(), command.end(), command.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (command.find("llama-server") != std::string::npos)
+    return "llm";
   return "external";
 }
 

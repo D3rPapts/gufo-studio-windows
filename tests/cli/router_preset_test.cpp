@@ -404,6 +404,23 @@ void TestReportedModality() {
   m.modality = "image";
   m.argv = {"serve", "llm"};
   assert(gufo::router::ReportedModality(m) == "image");
+  // 2.1: a llama.cpp server section (command llama-server, no `args`) is
+  // a chat model, as the production preset's qwen3.5-4b/9b sections.
+  m.modality = "external";
+  m.argv = {"--model", "D:\\x\\Qwen3.5-4B-Q8_0.gguf", "--alias", "qwen3.5-4b"};
+  m.command = "C:\\Users\\x\\WinGet\\Packages\\ggml.llamacpp\\llama-server.exe";
+  assert(gufo::router::ReportedModality(m) == "llm");
+  m.command = "/usr/local/bin/Llama-Server";
+  assert(gufo::router::ReportedModality(m) == "llm");
+  m.command = "D:\\gufo\\app\\gufo.exe";
+  assert(gufo::router::ReportedModality(m) == "external");
+  m.argv = {"serve", "tts"};
+  m.command = "D:\\llama-server.exe";
+  assert(gufo::router::ReportedModality(m) == "tts");  // args win
+  m.modality = "llm";
+  m.argv = {};
+  m.command = "";
+  assert(gufo::router::ReportedModality(m) == "llm");
 }
 
 int main() {
