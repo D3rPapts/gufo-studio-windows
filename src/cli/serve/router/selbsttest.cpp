@@ -471,7 +471,8 @@ void SelfTest::Set(std::size_t index, const std::string& status,
 
 SelfTest::Reply SelfTest::Request(const std::string& method,
                                   const std::string& url,
-                                  const std::string& body, long timeout_s) {
+                                  const std::string& body, long timeout_s,
+                                  bool own) {
   Reply r;
   std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
                                                            curl_easy_cleanup);
@@ -498,15 +499,20 @@ SelfTest::Reply SelfTest::Request(const std::string& method,
   curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel_);
   std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(
       nullptr, curl_slist_free_all);
+  if (own)
+    for (const std::string& header : options_.headers)
+      headers.reset(curl_slist_append(headers.release(), header.c_str()));
   if (method == "POST") {
-    headers.reset(curl_slist_append(nullptr, "Content-Type: application/json"));
+    headers.reset(
+        curl_slist_append(headers.release(), "Content-Type: application/json"));
     headers.reset(curl_slist_append(headers.release(), "Expect:"));
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(c, CURLOPT_POST, 1L);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE,
                      static_cast<curl_off_t>(body.size()));
   }
+  if (headers != nullptr)
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
   const CURLcode rc = curl_easy_perform(c);
   if (rc != CURLE_OK) {
     r.error = error_buffer[0] != '\0' ? std::string(error_buffer.data())
@@ -521,12 +527,12 @@ SelfTest::Reply SelfTest::Request(const std::string& method,
 }
 
 SelfTest::Reply SelfTest::Get(const std::string& path, long timeout_s) {
-  return Request("GET", base_url_ + path, "", timeout_s);
+  return Request("GET", base_url_ + path, "", timeout_s, true);
 }
 
 SelfTest::Reply SelfTest::Post(const std::string& path, const json::Value& body,
                                long timeout_s) {
-  return Request("POST", base_url_ + path, body.dump(), timeout_s);
+  return Request("POST", base_url_ + path, body.dump(), timeout_s, true);
 }
 
 void SelfTest::Explain(const Reply& r, std::string* hint, std::string* log) {
@@ -592,13 +598,6 @@ bool SelfTest::StartChild(std::string* error) {
              " (\"# start:\" line of the preset)";
     return false;
   }
-  for (const auto& [name, value] : start.env) {
-#ifdef _WIN32
-    SetEnvironmentVariableA(name.c_str(), value.c_str());
-#else
-    setenv(name.c_str(), value.c_str(), 1);
-#endif
-  }
   const int port = ReserveLoopbackPort(error);
   if (port < 0)
     return false;
@@ -607,6 +606,9 @@ bool SelfTest::StartChild(std::string* error) {
   spec.command = start.program;
   spec.args = start.args;
   spec.port = port;
+  // The `# env:` lines go to the child only, never into this router's
+  // own environment (review finding 2).
+  spec.env = start.env;
   std::unique_ptr<Worker> child = Worker::Spawn(spec, options_.exe, error);
   if (child == nullptr)
     return false;
@@ -667,9 +669,83 @@ bool SelfTest::WaitReady(std::string* error) {
   return false;
 }
 
-void SelfTest::Unload(const std::string& model) {
+std::optional<TargetModelState> TargetModelStateOf(std::string_view models_body,
+                                                   std::string_view id) {
+  json::Value v;
+  try {
+    v = json::parse(std::string(models_body));
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+  const json::Value* data = v.is_object() ? v.find("data") : nullptr;
+  if (data == nullptr || !data->is_array())
+    return std::nullopt;
+  TargetModelState state;
+  for (const json::Value& m : data->items()) {
+    if (!m.is_object() || m.member_str("id") != id)
+      continue;
+    state.listed = true;
+    std::string status;
+    if (const json::Value* s = m.find("status"); s != nullptr && s->is_object())
+      status = s->member_str("value");
+    if (status.empty()) {
+      const json::Value* loaded = m.find("loaded");
+      status = loaded != nullptr && loaded->as_bool() ? "loaded" : "unloaded";
+    }
+    state.loaded = status == "loaded" || status == "loading";
+    if (const json::Value* a = m.find("activity"); a != nullptr && a->is_object())
+      if (const json::Value* busy = a->find("busy"); busy != nullptr)
+        state.busy = busy->as_bool();
+    if (const json::Value* in = m.find("inflight"); in != nullptr && in->is_object())
+      state.busy = state.busy || in->member_double("local") > 0 ||
+                   in->member_double("remote") > 0;
+    if (const json::Value* r = m.find("remote"); r != nullptr && r->is_object())
+      state.remote = true;
+    break;
+  }
+  return state;
+}
+
+bool UnloadAfterCase(bool own_child,
+                     const std::optional<TargetModelState>& before,
+                     const std::optional<TargetModelState>& now) {
+  if (own_child)
+    return true;
+  if (!before.has_value() || !now.has_value())
+    return false;
+  if (!before->listed || before->loaded || before->remote)
+    return false;
+  return now->listed && now->loaded && !now->busy && !now->remote;
+}
+
+std::optional<TargetModelState> SelfTest::ModelState(const std::string& model) {
+  const Reply r = Get("/v1/models", 30);
+  if (!r.ok || r.status != 200)
+    return std::nullopt;
+  return TargetModelStateOf(r.body, model);
+}
+
+void SelfTest::Unload(const std::string& model,
+                      const std::optional<TargetModelState>& before) {
   if (!options_.unload_after)
     return;
+  // Against a running router (production) the case must not take away a
+  // model someone else loaded or uses right now.
+  const bool own_child = options_.base_url.empty();
+  if (!own_child) {
+    const std::optional<TargetModelState> now = ModelState(model);
+    if (!UnloadAfterCase(false, before, now)) {
+      Logger::Info(
+          "router",
+          "event=selbsttest_unload_skipped model=" + model + " reason=" +
+              (!before.has_value() || !now.has_value() ? "state_unknown"
+               : before->loaded                        ? "loaded_before"
+               : now->busy                             ? "busy"
+               : before->remote || now->remote         ? "remote"
+                                                       : "not_loaded"));
+      return;
+    }
+  }
   json::Value body = json::Value::object();
   body["model"] = model;
   const Reply r = Post("/models/unload", body, 120);
@@ -982,6 +1058,11 @@ void SelfTest::RunCase(std::size_t index) {
   std::string out;
   std::string ext;
   bool ok = false;
+  // A running router: remember whether the model was loaded before, so the
+  // unload afterwards leaves models of other users alone.
+  std::optional<TargetModelState> before;
+  if (c.art != "partner" && options_.unload_after && !options_.base_url.empty())
+    before = ModelState(c.modell);
   if (c.art == "chat") {
     ok = Chat(c, &hint, &log, &out, &ext);
   } else if (c.art == "bild") {
@@ -1037,7 +1118,7 @@ void SelfTest::RunCase(std::size_t index) {
                              " seconds=" + std::to_string(seconds()) +
                              " hint=\"" + OneLine(hint) + "\"");
   if (c.art != "partner")
-    Unload(c.modell);
+    Unload(c.modell, before);
 }
 
 void SelfTest::WriteReport() {

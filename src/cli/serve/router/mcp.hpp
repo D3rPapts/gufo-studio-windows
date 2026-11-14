@@ -176,6 +176,9 @@ public:
     std::string body;
     /// Retry-After header in seconds, 0 without one.
     long long retry_after{0};
+    /// The body exceeded the caller's byte cap: reading stopped, `body`
+    /// is empty (a GB video must not land in RAM; review finding 5).
+    bool truncated{false};
   };
 
   /// An input file of a media tool: the bytes of an Ablage path (read
@@ -205,11 +208,17 @@ private:
   /// One inner request through Options::serve: `outer`'s token, address
   /// and cancellation, a JSON body when `body` is set, `extra` headers
   /// (an X-Gufo-Priority there replaces the outer one). `path` must be
-  /// one of the tool paths (never /mcp itself).
+  /// one of the tool paths (never /mcp itself). A body over `max_body`
+  /// bytes is not kept: reading stops, InnerAnswer::truncated is set.
   [[nodiscard]] InnerAnswer Inner(
       const server::HttpRequest& outer, std::string method, std::string path,
       std::string query = {}, std::string body = {},
-      std::vector<std::pair<std::string, std::string>> extra = {}) const;
+      std::vector<std::pair<std::string, std::string>> extra = {},
+      std::size_t max_body = kInnerBodyLimit) const;
+  /// The cap of an inner answer without a tighter one of its own (job
+  /// views, lists, chat replies).
+  static constexpr std::size_t kInnerBodyLimit =
+      static_cast<std::size_t>(64) << 20;
   /// The documented default of a tool's `model` field.
   [[nodiscard]] std::string DefaultModel(std::string_view tool) const;
 

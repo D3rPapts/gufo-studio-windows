@@ -99,29 +99,41 @@ void AppendArgument(std::wstring& command, const std::wstring& argument) {
 
 /// The router's environment without HOST/PORT/GUFO_HOST/GUFO_PORT (serve
 /// prefers HOST/PORT, so an inherited one would override the assignment),
-/// plus the worker's loopback address. Sorted by name as CreateProcessW
-/// expects.
-std::wstring WorkerEnvironment(int port) {
+/// plus the worker's loopback address and the spec's own `env` (which
+/// replaces an inherited variable of that name). Sorted by name as
+/// CreateProcessW expects.
+std::wstring WorkerEnvironment(const WorkerSpec& spec) {
+  const auto upper = [](std::wstring name) {
+    for (wchar_t& c : name) {
+      c = static_cast<wchar_t>(std::towupper(c));
+    }
+    return name;
+  };
+  std::vector<std::wstring> own;
+  for (const auto& [name, value] : spec.env) {
+    own.push_back(upper(Widen(name)));
+  }
   std::vector<std::wstring> entries;
   if (wchar_t* block = GetEnvironmentStringsW(); block != nullptr) {
     for (const wchar_t* entry = block; *entry != L'\0';
          entry += std::wcslen(entry) + 1) {
       const std::wstring_view text(entry);
       const auto equals = text.find(L'=', 1);
-      std::wstring name(text.substr(0, equals));
-      for (wchar_t& c : name) {
-        c = static_cast<wchar_t>(std::towupper(c));
-      }
+      const std::wstring name = upper(std::wstring(text.substr(0, equals)));
       if (name == L"HOST" || name == L"PORT" || name == L"GUFO_HOST" ||
-          name == L"GUFO_PORT") {
+          name == L"GUFO_PORT" ||
+          std::ranges::find(own, name) != own.end()) {
         continue;
       }
       entries.emplace_back(text);
     }
     FreeEnvironmentStringsW(block);
   }
+  for (const auto& [name, value] : spec.env) {
+    entries.push_back(Widen(name) + L"=" + Widen(value));
+  }
   entries.push_back(L"GUFO_HOST=127.0.0.1");
-  entries.push_back(L"GUFO_PORT=" + std::to_wstring(port));
+  entries.push_back(L"GUFO_PORT=" + std::to_wstring(spec.port));
   std::ranges::sort(entries, [](const std::wstring& a, const std::wstring& b) {
     return _wcsicmp(a.c_str(), b.c_str()) < 0;
   });
@@ -324,7 +336,7 @@ std::unique_ptr<Worker> Worker::Spawn(const WorkerSpec& spec,
       AppendArgument(command, arg);
     }
   }
-  std::wstring environment = WorkerEnvironment(spec.port);
+  std::wstring environment = WorkerEnvironment(spec);
 
   SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
   HANDLE out_read = nullptr;

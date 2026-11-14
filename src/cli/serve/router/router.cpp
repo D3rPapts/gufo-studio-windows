@@ -667,6 +667,12 @@ Resolution ResolveModel(const HttpRequest& req) {
 /// `Arm` runs with the router mutex already held; `Release` takes it itself
 /// because the stream completion (or response destruction) happens on a
 /// request thread with the lock free.
+/// Rule: an armed HeldBusy (or a RemoteHold, or an HttpResponse whose
+/// streaming_body captured one) must never be released or destroyed while
+/// this thread holds the router mutex. std::mutex is not recursive and has
+/// no owner query, so Release cannot detect that case; on MSVC the re-lock
+/// throws inside a noexcept destructor and the process ends with
+/// 0xc0000409 (14.11.). Drop such a response only after `lock.unlock()`.
 class HeldBusy : public std::enable_shared_from_this<HeldBusy> {
 public:
   /// `remote`: a relay to the remote router, counted apart from local work
@@ -1987,6 +1993,15 @@ public:
                        : "partner failed") +
                   "\" status=" + std::to_string(response.status) +
                   " waited_ms=" + std::to_string(waited.count()));
+          // The dropped answer may carry a lazy streamed body whose
+          // closure owns a RemoteHold; its release takes `mutex`. Destroy
+          // it with the lock released: destroyed at `continue` under the
+          // lock it re-locked the std::mutex on the same thread inside a
+          // destructor and ended the router with 0xc0000409 (14.11. 10:33,
+          // a 503 with a body from the partner after 15 min).
+          lock.unlock();
+          { const HttpResponse dropped = std::move(response); }
+          lock.lock();
           continue;
         }
         return response;
@@ -2254,10 +2269,16 @@ public:
       }
     }
     HttpResponse response = RelayRemote(model_id, spec, req);
-    if ((response.status == 503 && !response.streaming_body) ||
-        response.status == 507) {
-      // 507: the pool may drop this answer and try locally, so the remote
-      // slot must not stay held by an unread streamed body.
+    if (response.status == 502 || response.status == 503 ||
+        response.status == 504 || response.status == 507) {
+      // The pool may drop these answers and decide again
+      // (ClassifyPoolRemoteAnswer: 507 kRetryMemory, 502/503/504 with or
+      // without a body kRetryFailed), so the remote slot must not stay held
+      // by an unread streamed body, and the dropped body must not own a
+      // hold whose release takes `mutex` (14.11. 10:33: a 503 with a body
+      // destroyed under the lock ended the router with 0xc0000409). An
+      // error answer starts no remote work, so nothing needs the hold
+      // while its body is relayed.
       hold->Release();
       return response;
     }
@@ -4282,6 +4303,24 @@ int RunRouter(std::span<const char* const> args) {
     setup_options.port = port;
     setup_options.users_unbound = einrichtung && preset_path.empty();
     setup_options.gate = state->gate.get();
+    if (!einrichtung && !preset_path.empty()) {
+      // A router running a preset tests itself through its own loopback
+      // (with its internal key, as self_fetch below); a child router from
+      // the same preset would collide on worker ports and memory (review
+      // finding 1). Only --einrichtung starts the preset as a child.
+      std::string self_host =
+          host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+              ? std::string("127.0.0.1")
+              : host;
+      if (self_host.find(':') != std::string::npos &&
+          !self_host.starts_with('['))
+        self_host = "[" + self_host + "]";
+      setup_options.selbsttest_base_url =
+          "http://" + self_host + ":" + std::to_string(port);
+      setup_options.selbsttest_headers.push_back(
+          std::string(router::auth::kInternalHeader) + ": " +
+          state->gate->internal_key());
+    }
     setup_options.check_preset =
         [models_dir](const std::filesystem::path& file) -> std::string {
       std::vector<router::PresetModel> probe;

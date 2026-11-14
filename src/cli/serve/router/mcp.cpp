@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -758,14 +759,15 @@ std::optional<long long> ArgInt(const json::Value& args, const std::string& key,
   const json::Value* v = Arg(args, key);
   if (v == nullptr)
     return std::nullopt;
+  // The range is checked on the double before any cast: a 1e300 or an
+  // infinity cast to long long is undefined behaviour (review finding 11).
   const double d = v->as_double(-1e300);
-  if (!v->is_number() || d != static_cast<double>(static_cast<long long>(d)))
+  if (!v->is_number() || !std::isfinite(d) || std::floor(d) != d)
     throw InvalidParams("arguments." + key + " must be an integer");
-  const auto n = static_cast<long long>(d);
-  if (n < min || n > max)
+  if (d < static_cast<double>(min) || d > static_cast<double>(max))
     throw InvalidParams("arguments." + key + " must be between " +
                         std::to_string(min) + " and " + std::to_string(max));
-  return n;
+  return static_cast<long long>(d);
 }
 
 std::optional<double> ArgNumber(const json::Value& args, const std::string& key,
@@ -1056,6 +1058,8 @@ bool InnerPathAllowed(std::string_view path) {
 constexpr std::size_t kEditBytesLimit = static_cast<std::size_t>(20) << 20;
 /// A single input file of any media tool (the video anchors' limit).
 constexpr std::size_t kMediaBytesLimit = static_cast<std::size_t>(20) << 20;
+/// The images of one chat call, together (review finding 5).
+constexpr std::size_t kChatImagesLimit = static_cast<std::size_t>(20) << 20;
 
 bool IsAblagePath(std::string_view value) {
   return value.starts_with("/v1/jobs/") &&
@@ -1311,7 +1315,8 @@ json::Value McpService::Discover(const auth::Identity& who) const {
 McpService::InnerAnswer McpService::Inner(
     const HttpRequest& outer, std::string method, std::string path,
     std::string query, std::string body,
-    std::vector<std::pair<std::string, std::string>> extra) const {
+    std::vector<std::pair<std::string, std::string>> extra,
+    std::size_t max_body) const {
   if (!InnerPathAllowed(path))
     throw std::logic_error("mcp: inner path not allowed: " + path);
   if (!options_.serve)
@@ -1352,14 +1357,23 @@ McpService::InnerAnswer McpService::Inner(
   }
   if (response.streaming_body) {
     // The worker's answer streams through the relay even without
-    // `stream`: read it to the end, as the job runner does.
-    response.streaming_body([&out](std::string_view chunk) {
+    // `stream`: read it to the end, as the job runner does, but never
+    // past `max_body` (a GB video must not land in RAM; review finding 5).
+    response.streaming_body([&out, max_body](std::string_view chunk) {
+      if (out.body.size() + chunk.size() > max_body) {
+        out.truncated = true;
+        return false;
+      }
       out.body.append(chunk);
       return true;
     });
+  } else if (response.body.size() > max_body) {
+    out.truncated = true;
   } else {
     out.body = std::move(response.body);
   }
+  if (out.truncated)
+    std::string().swap(out.body);
   return out;
 }
 
@@ -1468,20 +1482,35 @@ json::Value McpService::RunChat(const json::Value& args,
     text_part["text"] = nachricht;
     parts.push_back(std::move(text_part));
     std::size_t index = 0;
+    std::size_t total = 0;  // the images' bytes so far (kChatImagesLimit)
+    const auto too_large = [](const std::string& where) {
+      return InvalidParams(where +
+                           ": the images are larger than 20 MB together "
+                           "(send smaller or fewer images)");
+    };
     for (const json::Value& bild : bilder->items()) {
       const std::string where = "arguments.bilder[" + std::to_string(index++) + "]";
       if (!bild.is_string())
         throw InvalidParams(where + " must be a string");
       std::string url = bild.str();
       if (url.starts_with("/v1/jobs/") && url.find("/files/") != std::string::npos) {
-        const InnerAnswer file = Inner(outer, "GET", url);
+        const InnerAnswer file =
+            Inner(outer, "GET", url, {}, {}, {}, kChatImagesLimit - total);
         if (file.status >= 400)
           return HttpFailure(file);
+        if (file.truncated)
+          throw too_large(where);
+        total += file.body.size();
         const std::string type = file.content_type.empty()
                                      ? std::string("application/octet-stream")
                                      : file.content_type;
         url = "data:" + type + ";base64," + comfy::Base64Encode(file.body);
-      } else if (!url.starts_with("data:")) {
+      } else if (url.starts_with("data:")) {
+        // The decoded size, about 3/4 of the base64 text.
+        total += (url.size() - std::min(url.size(), url.find(',') + 1)) / 4 * 3;
+        if (total > kChatImagesLimit)
+          throw too_large(where);
+      } else {
         throw InvalidParams(where +
                             " must be /v1/jobs/<id>/files/<name> or a data: URL");
       }
@@ -1724,13 +1753,15 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
   std::string data;
   bool embedded = false;
   if (fetch) {
-    const InnerAnswer file = Inner(outer, "GET", path);
+    // Never more than the inline cap ([router] mcp-inline-mb): a larger
+    // file stops in the body callback and is answered as a link.
+    const InnerAnswer file = Inner(outer, "GET", path, {}, {}, {}, limit);
     if (file.status >= 400)
       return HttpFailure(file);
     if (content_type.empty())
       content_type = file.content_type;
-    bytes = static_cast<long long>(file.body.size());
-    if (inhalt && !media_kind(content_type).empty() &&
+    bytes = file.truncated ? -1 : static_cast<long long>(file.body.size());
+    if (inhalt && !file.truncated && !media_kind(content_type).empty() &&
         media_kind(content_type) != "video" &&
         file.body.size() <= limit) {
       data = comfy::Base64Encode(file.body);
@@ -1772,12 +1803,18 @@ McpService::Media McpService::ReadMedia(const HttpRequest& outer,
   Media media;
   if (IsAblagePath(value)) {
     // Through the gate: another user's job is 404, a missing file too.
-    const InnerAnswer file = Inner(outer, "GET", value);
+    // Read at most 20 MB: a longer answer stops in the body callback.
+    InnerAnswer file =
+        Inner(outer, "GET", value, {}, {}, {}, kMediaBytesLimit);
     if (file.status >= 400) {
       media.failure = HttpFailure(file);
       return media;
     }
-    media.bytes = file.body;
+    if (file.truncated)
+      throw InvalidParams(field +
+                          " is larger than 20 MB (use a smaller or shorter "
+                          "file)");
+    media.bytes = std::move(file.body);
     media.content_type = file.content_type.empty()
                              ? std::string("application/octet-stream")
                              : file.content_type.substr(0, file.content_type.find(';'));
@@ -1792,7 +1829,9 @@ McpService::Media McpService::ReadMedia(const HttpRequest& outer,
   if (media.bytes.empty())
     throw InvalidParams(field + " is an empty file");
   if (media.bytes.size() > kMediaBytesLimit)
-    throw InvalidParams(field + " is larger than 20 MB");
+    throw InvalidParams(field +
+                        " is larger than 20 MB (use a smaller or shorter "
+                        "file)");
   return media;
 }
 

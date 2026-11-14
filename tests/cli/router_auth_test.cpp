@@ -435,6 +435,56 @@ void TestOldFileFormat() {
   std::filesystem::remove_all(dir, ec);
 }
 
+void TestRelocateAndCreate() {
+  // 2.1 (review finding 4): Relocate to a file that does not parse leaves
+  // the store as it was (users and path), so nothing overwrites the
+  // broken file later; a missing file is an empty store at the new path.
+  // Finding 7: Create stores name and password in one save, or nothing.
+  const auto dir = TempDir();
+  auth::UserStore store(dir / "a" / "nutzer.json", kTestRounds);
+  std::string error;
+  CHECK(store.Load(&error));
+  CHECK(store.Create(auth::User{.name = "fabian", .rolle = "admin"},
+                     "geheim123", &error));
+  CHECK(store.HasAdmin());
+  CHECK(store.Verify("fabian", "geheim123").has_value());
+  CHECK(!store.Create(auth::User{.name = "fabian", .rolle = "admin"},
+                      "anders", &error));
+  CHECK(!store.Create(auth::User{.name = "kurz", .rolle = "nutzer"}, "abc",
+                      &error));
+  CHECK(!store.Find("kurz").has_value());
+  CHECK(!store.Create(auth::User{.name = "lokal", .rolle = "nutzer"},
+                      "geheim123", &error));
+  CHECK_EQ(store.List().size(), std::size_t(1));
+  {
+    std::filesystem::create_directories(dir / "b");
+    std::ofstream out(dir / "b" / "nutzer.json", std::ios::binary);
+    out << "{ kaputt";
+  }
+  CHECK(!store.Relocate(dir / "b" / "nutzer.json", &error));
+  CHECK(error.find("does not parse") != std::string::npos);
+  CHECK_EQ(store.path().string(), (dir / "a" / "nutzer.json").string());
+  CHECK_EQ(store.List().size(), std::size_t(1));
+  CHECK(store.HasAdmin());
+  // An admin created now goes to the old file, the broken one is intact.
+  CHECK(store.Create(auth::User{.name = "zwei", .rolle = "admin"},
+                     "geheim123", &error));
+  {
+    std::ifstream in(dir / "b" / "nutzer.json", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    CHECK_EQ(text, std::string("{ kaputt"));
+  }
+  CHECK(store.Relocate(dir / "c" / "nutzer.json", &error));
+  CHECK_EQ(store.path().string(), (dir / "c" / "nutzer.json").string());
+  CHECK(store.empty());
+  CHECK(!store.HasAdmin());
+  CHECK(store.Relocate(dir / "a" / "nutzer.json", &error));
+  CHECK_EQ(store.List().size(), std::size_t(2));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
 void TestClassify() {
   using Kind = auth::Route::Kind;
   CHECK(auth::Classify(Req("GET", "/health", "x")).kind == Kind::kFree);
@@ -2249,6 +2299,25 @@ void TestStatusJobsHidden() {
   r = f.Serve(Req("GET", "/router/status", "127.0.0.1"));
   CHECK_EQ(json::parse(r.body).find("pool_queue")->find("pulling")->items().size(),
            std::size_t(3));
+  // 2.1 (review finding 3): the partner's status, relayed through
+  // /router/partner/status, is filtered the same way.
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  body = json::parse(r.body);
+  CHECK_EQ(body.find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(1));
+  CHECK_EQ(body.find("pool_queue")->find("pushed_active")->items().size(),
+           std::size_t(1));
+  CHECK_EQ(body.find("remote")->find("jobs")->members().size(),
+           std::size_t(1));
+  CHECK(body.find("remote")->find("jobs")->find("j-tim") != nullptr);
+  CHECK_EQ(body.member_size("models_max"), std::size_t(2));
+  r = f.Serve(Req("GET", "/router/partner/status", "192.168.178.50", "",
+                  {{"Cookie", admin}}));
+  body = json::parse(r.body);
+  CHECK_EQ(body.find("pool_queue")->find("pulling")->items().size(),
+           std::size_t(3));
 }
 
 void TestWebhookRoles() {
@@ -2300,8 +2369,8 @@ void TestChatFilter() {
   // 2.0.5: the word filter reads a chat's user texts (every user turn,
   // text parts, `prompt`, `input`); the answer, code and log line are
   // those of an image; admin and the machine itself are not filtered;
-  // a streaming request is refused before any stream; assistant and
-  // system texts are not read.
+  // a streaming request is refused before any stream; assistant texts
+  // are not read, system/developer texts are (2.1).
   Fixture f;
   f.AddUser("fabian", "admin", "geheim123");
   f.AddUser("kind", "nutzer", "kind-pw");
@@ -2347,10 +2416,37 @@ void TestChatFilter() {
            "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
            "[{\"type\":\"text\",\"text\":\"ein nsfw bild\"}]}]}");
   CHECK_EQ(r.status, 400);
+  // 2.1 (review finding 6): system and developer messages, Anthropic
+  // `system` and responses `instructions` are read too; assistant turns
+  // are not.
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"assistant\",\"content\":"
+           "\"nackt\"},{\"role\":\"user\",\"content\":\"Hallo\"}]}");
+  CHECK_EQ(r.status, 200);
   r = chat("/v1/chat/completions", kind,
            "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":"
-           "\"nackt\"},{\"role\":\"assistant\",\"content\":\"nackt\"},"
+           "\"nackt\"},{\"role\":\"user\",\"content\":\"Hallo\"}]}");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  r = chat("/v1/chat/completions", kind,
+           "{\"model\":\"m\",\"messages\":[{\"role\":\"developer\",\"content\":"
+           "[{\"type\":\"text\",\"text\":\"porno\"}]},"
            "{\"role\":\"user\",\"content\":\"Hallo\"}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"instructions\":\"nackt\",\"input\":\"Haus\"}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/responses", kind,
+           "{\"model\":\"m\",\"input\":[{\"role\":\"system\",\"content\":"
+           "\"nackt\"},{\"role\":\"user\",\"content\":\"Haus\"}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/messages", kind,
+           "{\"model\":\"m\",\"system\":[{\"type\":\"text\",\"text\":\"nackt\"}],"
+           "\"messages\":[{\"role\":\"user\",\"content\":\"Haus\"}]}");
+  CHECK_EQ(r.status, 400);
+  r = chat("/v1/messages", kind,
+           "{\"model\":\"m\",\"system\":\"Sei knapp\","
+           "\"messages\":[{\"role\":\"user\",\"content\":\"Haus\"}]}");
   CHECK_EQ(r.status, 200);
   r = chat("/v1/completions", kind, "{\"model\":\"m\",\"prompt\":\"porno\"}");
   CHECK_EQ(r.status, 400);
@@ -2419,6 +2515,7 @@ int main() {
   TestRights();
   TestStoreRoundTrip();
   TestOldFileFormat();
+  TestRelocateAndCreate();
   TestClassify();
   TestGateOrder();
   TestAreasAndJobs();

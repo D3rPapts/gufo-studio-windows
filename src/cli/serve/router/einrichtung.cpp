@@ -1168,7 +1168,8 @@ std::vector<DownloadFile> PlanDownloads(const json::Value& katalog,
       f.modell = mid;
       f.bytes = static_cast<long long>(d.member_double("bytes", 0.0));
       const std::string sha = Lower(d.member_str("sha256"));
-      if (sha.size() == 64)
+      // Not 64 hex digits: unknown, as without one (review finding 13).
+      if (IsHex64(sha))
         f.sha256 = sha;
       f.ziel = NativePath(JoinPath(std::string(ziel), pfad));
 
@@ -1946,11 +1947,24 @@ HttpResponse SetupService::Preset(const HttpRequest& req) {
   }
   // Parse probe: the router must accept the file before it is written.
   if (options_.check_preset) {
-    const std::filesystem::path probe =
-        std::filesystem::temp_directory_path() /
-        ("gufo-einrichtung-" + auth::RandomHex(4) + ".ini");
-    if (!WriteText(probe, text, &error))
-      return Error(500, "Internal Server Error", "write_failed", error);
+    // A broken TEMP must not throw (review finding 10): when it gives no
+    // folder or the probe cannot be written there, it goes next to the
+    // preset.
+    const std::string name =
+        "gufo-einrichtung-" + auth::RandomHex(4) + ".ini";
+    const std::filesystem::path temp = std::filesystem::temp_directory_path(ec);
+    std::filesystem::path probe;
+    bool written = false;
+    if (!ec && !temp.empty()) {
+      probe = temp / name;
+      written = WriteText(probe, text, &error);
+    }
+    ec.clear();
+    if (!written) {
+      probe = preset_path.parent_path() / name;
+      if (!WriteText(probe, text, &error))
+        return Error(500, "Internal Server Error", "write_failed", error);
+    }
     const std::string message = options_.check_preset(probe);
     std::filesystem::remove(probe, ec);
     if (!message.empty())
@@ -2104,10 +2118,13 @@ HttpResponse SetupService::Admin(const HttpRequest& req) {
     return auth::AuthError(409, "Conflict", "user exists", "user_exists");
   user.erstellt = auth::NowUnix();
   std::string error;
-  if (!store.Put(user, &error))
+  // Name and password in one save: a failure stores nothing, so a retry
+  // is not refused as "user exists" by a passwordless admin (finding 7).
+  if (!store.Create(user, password, &error)) {
+    if (error == "user exists")
+      return auth::AuthError(409, "Conflict", error, "user_exists");
     return auth::AuthError(500, "Internal Server Error", error, "users_file");
-  if (!store.SetPassword(user.name, password, &error))
-    return auth::AuthError(500, "Internal Server Error", error, "users_file");
+  }
   Logger::Info("router", "event=setup_admin name=" + user.name +
                              " file=" + store.path().string());
   json::Value out = json::Value::object();
@@ -2459,6 +2476,7 @@ HttpResponse SetupService::SelbsttestPost(const HttpRequest& req) {
   o.daten = daten.empty() ? preset.parent_path() : NativePath(daten);
   o.exe = options_.exe;
   o.base_url = options_.selbsttest_base_url;
+  o.headers = options_.selbsttest_headers;
   o.partner_url = partner_url;
   o.tests = std::move(tests);
   o.start_timeout_s = options_.selbsttest_start_timeout_s;

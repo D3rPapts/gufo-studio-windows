@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -87,6 +88,33 @@ struct StartLine {
 /// bytes: the input of the 3D and upscale checks.
 [[nodiscard]] std::string TestImagePng();
 
+/// One model of the target's GET /v1/models, as far as the unload after a
+/// case needs it.
+struct TargetModelState {
+  /// The listing names the model.
+  bool listed{false};
+  /// status.value "loaded" or "loading" (or `"loaded": true`).
+  bool loaded{false};
+  /// Work of the model runs there: activity.busy, or inflight local/remote.
+  bool busy{false};
+  /// The target relays it to another router (`"remote"` block).
+  bool remote{false};
+};
+
+/// The state of `id` in a /v1/models body; nullopt when the body does not
+/// parse as a model list.
+[[nodiscard]] std::optional<TargetModelState> TargetModelStateOf(
+    std::string_view models_body, std::string_view id);
+
+/// Whether the self-test unloads a case's model afterwards. Its own child
+/// router (`own_child`): always, as before. A running router serves others:
+/// only a model the case loaded itself (listed and not loaded before, loaded
+/// now) that no one uses now (not busy) and that is not relayed elsewhere.
+/// An unknown state (listing failed) never unloads there.
+[[nodiscard]] bool UnloadAfterCase(
+    bool own_child, const std::optional<TargetModelState>& before,
+    const std::optional<TargetModelState>& now);
+
 struct SelfTestOptions {
   std::filesystem::path preset;
   /// Results go to <daten>\jobs\selbsttest.
@@ -95,13 +123,17 @@ struct SelfTestOptions {
   std::filesystem::path exe;
   /// The target; "" = start the preset's router as a child.
   std::string base_url;
+  /// Extra "Name: value" headers of every call to the target (the
+  /// router's own loopback: its internal key, so auth admits the test).
+  std::vector<std::string> headers;
   std::string partner_url;
   std::vector<SelfTestCase> tests;
   int start_timeout_s{180};
   /// Per case, loading included (plan: 15 min).
   int test_timeout_s{900};
   int poll_ms{2000};
-  /// POST /models/unload after every case, so the next one has room.
+  /// POST /models/unload after every case, so the next one has room; on a
+  /// running router (base_url) only what the case loaded (UnloadAfterCase).
   bool unload_after{true};
 };
 
@@ -151,9 +183,16 @@ private:
   bool Upscale(const SelfTestCase& c, std::string* hint, std::string* log,
                std::string* out, std::string* ext);
   bool Partner(std::string* hint, std::string* log);
-  void Unload(const std::string& model);
+  /// The model's state on the target now (nullopt: listing failed).
+  std::optional<TargetModelState> ModelState(const std::string& model);
+  /// Unloads after a case when UnloadAfterCase allows it; `before` is the
+  /// state read before the case.
+  void Unload(const std::string& model,
+              const std::optional<TargetModelState>& before);
+  /// `own`: a call to the target, which carries SelfTestOptions::headers
+  /// (never sent to the partner).
   Reply Request(const std::string& method, const std::string& url,
-                const std::string& body, long timeout_s);
+                const std::string& body, long timeout_s, bool own = false);
   Reply Get(const std::string& path, long timeout_s);
   Reply Post(const std::string& path, const json::Value& body,
              long timeout_s);

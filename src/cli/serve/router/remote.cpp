@@ -142,14 +142,26 @@ server::HttpResponse PartnerRead(const std::optional<RemoteSpec>& partner,
     return RemoteUnavailable("partner", detail);
   }
   std::string body = std::move(answer.body);
+  constexpr std::size_t kMaxBody = 8 * 1024 * 1024;
+  bool too_large = body.size() > kMaxBody;
   if (answer.streaming_body) {
-    constexpr std::size_t kMaxBody = 8 * 1024 * 1024;
-    answer.streaming_body([&body](std::string_view chunk) {
-      if (body.size() + chunk.size() > kMaxBody)
+    answer.streaming_body([&body, &too_large](std::string_view chunk) {
+      if (body.size() + chunk.size() > kMaxBody) {
+        too_large = true;
         return false;
+      }
       body.append(chunk);
       return true;
     });
+  }
+  if (too_large) {
+    // A cut JSON must not travel on as a 200 (review finding 8).
+    server::HttpResponse out = error(502, "Bad Gateway",
+                             "the partner's answer exceeds 8 MB and was not "
+                             "relayed",
+                             "upstream_too_large");
+    out.log_details = "partner_read_too_large path=" + path;
+    return out;
   }
   std::string type = "application/json";
   for (const auto& [name, value] : answer.headers)

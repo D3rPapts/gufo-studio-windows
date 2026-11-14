@@ -50,7 +50,7 @@ if defined EINR echo Katalog: %EINR%
 echo Adresse: http://127.0.0.1:%PORT%/einrichtung/   ^(nur dieser Rechner^)
 echo Dieses Fenster offen lassen, bis die Einrichtung fertig ist. Beenden mit Strg+C.
 echo.
-start "" "http://127.0.0.1:%PORT%/einrichtung/"
+start "" /b powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "$u='http://127.0.0.1:%PORT%'; for ($i = 0; $i -lt 120; $i++) { try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri ($u + '/health') | Out-Null; break } catch { Start-Sleep -Milliseconds 500 } }; Start-Process ($u + '/einrichtung/')"
 if defined EINR (
   "%EXE%" router --einrichtung --host 127.0.0.1 --port %PORT% --pages-dir "%PAGES%" --einrichtung-dir "%EINR%"
 ) else (

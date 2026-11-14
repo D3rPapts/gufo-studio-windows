@@ -17,6 +17,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -65,6 +66,8 @@ struct DownloadFile {
 };
 
 [[nodiscard]] const char* ToString(DownloadFile::Status status);
+/// 64 hex digits (a SHA-256 as the catalogue and X-Linked-ETag give it).
+[[nodiscard]] bool IsHex64(std::string_view text);
 
 struct DownloaderOptions {
   int parallel{2};

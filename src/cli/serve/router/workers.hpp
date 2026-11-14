@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gufo::router {
@@ -18,6 +19,10 @@ struct WorkerSpec {
   /// Non-empty: start this program with args plus `--host 127.0.0.1 --port
   /// <port>` instead of `<exe> serve <modality>` (PresetModel::command).
   std::string command{};
+  /// Extra environment of this child only (name, value): replaces an
+  /// inherited variable of the same name; the router's own environment
+  /// stays untouched (the self-test's `# env:` lines).
+  std::vector<std::pair<std::string, std::string>> env{};
 };
 
 /// This process's executable, which workers run as `serve <modality>`.

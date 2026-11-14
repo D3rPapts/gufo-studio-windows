@@ -1517,8 +1517,8 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   json_object` for `json`, the messages system -> verlauf -> user. An
   entry of `bilder` is a `data:` URL (sent as an `image_url` part) or an
   Ablage path `/v1/jobs/{id}/files/{name}`, which the router reads
-  through the gate first (area ablage, own jobs) and sends as a data URL.
-  A streamed worker answer is collected. The answer is
+  through the gate first (area ablage, own jobs) and sends as a data URL;
+  all images together at most 20 MB (`-32602` naming the entry). A streamed worker answer is collected. The answer is
   `{text, gedanken?, model, usage {prompt_tokens, completion_tokens},
   finish_reason}`; `gedanken` is the message's `reasoning_content` or a
   leading `<think>...</think>` block split off the text.
@@ -1548,7 +1548,9 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   the file is at most `min(max_bytes, [router] mcp-inline-mb)`, else the
   link; a video or any other type is always the link. Only an embedded
   file (or one the job's list does not name) is read through
-  `GET /v1/jobs/{id}/files/{name}`.
+  `GET /v1/jobs/{id}/files/{name}`, capped at that size: a streamed
+  answer stops there, a larger file is not kept (the link without
+  `bytes`).
 
 Media job tools: each one `POST /v1/jobs` around the endpoint the
 matching page uses, with the body that page sends (pages/bild, video,
@@ -1563,7 +1565,9 @@ field's description). Input files (`startbild`, `probe`, `bild`, `datei`,
 `bilder[]`, `maske`, `ton`, `endbild`) are an Ablage path
 `/v1/jobs/{id}/files/{name}` (read through the gate: another user's job
 is the gate's 404, so an agent can only use its own results) or a base64
-`data:` URL (`-32602` for anything else, an empty file or one over 20 MB);
+`data:` URL (`-32602` for anything else, an empty file or one over 20 MB;
+a streamed Ablage answer, e.g. the partner's, is read only up to that
+cap, a larger file's bytes are not kept);
 the router sends them on as data URLs (the workers do not fetch router
 paths). The answer is `{auftrag_id, status, url, modell, position?,
 geschaetzt?}` from the job store's 202 and the text "Auftrag <id>
@@ -1700,11 +1704,13 @@ in `/v1/models`. After every case `POST /models/unload`. The cases come
 from `einrichtung.json` next to the preset (`modelle`, `antworten`), or
 the request names them in `tests`. A router in `--einrichtung` mode starts
 the production router from the preset's `# start:` line (`# start-opt:`
-and `# env:` applied, `--host`/`--port` replaced by `127.0.0.1` and a
-free port) as a child process (`Worker::Spawn`, its output in the log as
-`model=selbsttest-router`), waits for `/ready` (180 s), runs the cases
-over HTTP and stops the child at the end; a router that already runs a
-preset is asked directly. Each case has 15 minutes; red cases carry the
+and `# env:` applied to the child's environment only, `--host`/`--port`
+replaced by `127.0.0.1` and a free port) as a child process
+(`Worker::Spawn`, its output in the log as `model=selbsttest-router`),
+waits for `/ready` (180 s), runs the cases over HTTP and stops the child
+at the end; a router that already runs a preset is asked directly,
+through its own loopback with its internal key (never a second router
+from the same preset: worker ports and memory would collide). Each case has 15 minutes; red cases carry the
 filtered cause in `hinweis` ("zu wenig Speicher" for `507` /
 ResourceExhausted, the missing file, the worker error) and the target's
 message in `log`. Results (txt, png, wav, mp4, glb) land in
