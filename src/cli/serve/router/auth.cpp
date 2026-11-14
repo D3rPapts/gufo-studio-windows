@@ -766,6 +766,15 @@ bool UserStore::Save(std::string* error) const {
   return SaveLocked(error);
 }
 
+bool UserStore::Relocate(std::filesystem::path file, std::string* error) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    file_ = std::move(file);
+    users_.clear();
+  }
+  return Load(error);
+}
+
 bool UserStore::empty() const {
   const std::lock_guard<std::mutex> lock(mutex_);
   return users_.empty();
@@ -1121,8 +1130,11 @@ Route Classify(const HttpRequest& req) {
   if (p == "/router/users" || p.starts_with("/router/users/") ||
       p == "/router/zugriff")
     return set(Route::Kind::kUsers);
-  if (p == "/verwaltung" || p.starts_with("/verwaltung/"))
+  if (p == "/verwaltung" || p.starts_with("/verwaltung/") ||
+      p == "/einrichtung" || p.starts_with("/einrichtung/"))
     return set(Route::Kind::kAdminPage);
+  if (p.starts_with("/router/setup/"))
+    return set(Route::Kind::kSetup);
   if (get && (p == "/login" || p.starts_with("/login/") ||
               p.starts_with("/gemeinsam/") || p == "/favicon.ico" ||
               p == "/favicon.svg"))
@@ -2058,6 +2070,7 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                        "forbidden");
     case Route::Kind::kUsers:
     case Route::Kind::kAdminPage:
+    case Route::Kind::kSetup:
       return NotFound();
     case Route::Kind::kPage:
       if (!who.rechte.AllowsArea(route.area))
@@ -2505,6 +2518,9 @@ json::Value Gate::MeJson(const Identity& who) const {
   out["pool"] = who.rechte.pool;
   out["verwaltung"] = who.admin() && who.source != Identity::Source::kOff;
   out["setup"] = SetupPending();
+  // The router knows /router/setup/* (2.1): a 404 there means "hidden
+  // from this caller", not "router too old".
+  out["setup_api"] = true;
   return out;
 }
 
@@ -2865,6 +2881,7 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
       body["error"] = std::move(detail);
       body["auth"] = ModeName(settings_.mode);
       body["setup"] = SetupPending();
+      body["setup_api"] = true;
       return Json(401, "Unauthorized", body);
     }
     case Route::Kind::kLogin:
@@ -2874,7 +2891,8 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
     case Route::Kind::kPasswort:
       return ChangePassword(req, who);
     case Route::Kind::kUsers:
-    case Route::Kind::kAdminPage: {
+    case Route::Kind::kAdminPage:
+    case Route::Kind::kSetup: {
       // Loopback while it counts as admin (auth = lan with auth-loopback
       // = admin, or auth = off) or an admin session; everyone else sees
       // 404 so the pages stay invisible from outside. With auth-loopback
@@ -2893,6 +2911,8 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
         return AuthError(415, "Unsupported Media Type",
                          "the users API takes application/json",
                          "json_required");
+      if (route.kind == Route::Kind::kSetup)
+        return std::nullopt;  // the setup service answers (einrichtung.cpp)
       return UsersApi(req, who);
     }
     default:
@@ -2915,7 +2935,8 @@ HttpResponse Gate::Serve(
     // reach the admin paths through loopback.
     if (req.method != "GET" && req.method != "HEAD" &&
         (((route.kind == Route::Kind::kUsers ||
-           route.kind == Route::Kind::kAdminControl) &&
+           route.kind == Route::Kind::kAdminControl ||
+           route.kind == Route::Kind::kSetup) &&
           IsLoopback(RequestAddress(req))) ||
          (route.kind == Route::Kind::kPasswort &&
           who.source == Identity::Source::kCookie))) {

@@ -1,6 +1,6 @@
 {
- "katalog_version": "1.0 (2026-11-13)",
- "erzeugt": "2026-11-13T10:16:53",
+ "katalog_version": "1.1 (2026-11-14)",
+ "erzeugt": "2026-11-14T00:23:29",
  "erzeugt_aus": {
   "modellbaum": "D:\\llm-modelle\\gufo\\modelle",
   "memory_json": "D:\\llm-modelle\\gufo\\gufo-router-combo7.memory.json",
@@ -8,7 +8,8 @@
  },
  "hinweise": [
   "Groessen (bytes) kommen aus dem echten Baum der .198; Hardlinks (hardlink_auf) zaehlen in den Summen nur einmal.",
-  "sha256_status: 'fehlt' = keine Pruefsumme bekannt; es gibt unter modelle\\ keine *.source-manifest.json. Vorhanden nur: H3-Manifest, Qwen-Image-2.1 .tree.json (LFS), IndexTTS german/SHA256SUMS.txt.",
+  "sha256_status: 'fehlt' = keine Pruefsumme bekannt; es gibt unter modelle\\ keine *.source-manifest.json. Vorhanden nur: H3-Manifest, Qwen-Image-2.1 .tree.json (LFS), IndexTTS german/SHA256SUMS.txt, dazu unsere eigenen Repos (sha256-eigene-repos.json).",
+  "sha256_status 'hf-upload' = aus dem Upload-Cache von hf upload-large-folder (= LFS-oid auf Hugging Face), 'lokal' = sha256sum auf der .198 ueber die hochgeladene Datei (13.11.2026). hf_repo/hf_pfad/hf_revision je Datei = unsere umgewandelten Gewichte unter huggingface.co/D3rPapst (der Router laedt <hf_repo>/resolve/<hf_revision oder main>/<hf_pfad>); null = nicht auf HF (DINOv3 selbst wandeln). Dateien ohne diese Felder laedt der Router ueber die Quelle (quellen[]), deren Ordner der Pfad-Praefix ist.",
   "gpu_gb_notiz = gemessener Wert aus Preset-Kommentar/Release-Notes (Quelle dabei); gpu_gb_router/host_gb_router = vom Router gelernte Spitze (learned_* in gufo-router-combo7.memory.json, Datum dabei). Keine Schaetzwerte (estimate_* werden nicht uebernommen).",
   "passt_64gb folgt der Tabelle in INSTALLER-PLAN-2026-11-13.md Schritt 2; wo unsere Messung auf der .198 (64 GB) abweicht, steht es im Hinweis.",
   "Nicht im Katalog: [external/qwen3.5-4b] und [external/qwen3.5-9b] (llama-server fuer den Mailputzer, nicht gufo); alibaba-pai ControlNet, bosonai Higgs, wan21-vace, TRELLIS-image-large (im Baum, aber nicht im Produktions-Preset)."
@@ -64,9 +65,9 @@
      },
      "gpu_gb_notiz": null,
      "gpu_gb_notiz_quelle": "",
-     "gpu_gb_router": 34.54,
-     "host_gb_router": 3.98,
-     "router_gemessen_am": "2026-11-09T13:05:03",
+     "gpu_gb_router": 46.82,
+     "host_gb_router": 4.32,
+     "router_gemessen_am": "2026-11-14T00:21:56",
      "passt_64gb": "ja",
      "hinweis": "",
      "daten_dateien": [],
@@ -454,7 +455,7 @@
      "gpu_gb_notiz": 30.2,
      "gpu_gb_notiz_quelle": "Preset-Kommentar 31.10.2026: GPU peak 30.0-30.2 GiB; 2.0.2 nach dem Job 22.0 GB (Release-Notes)",
      "gpu_gb_router": 42.82,
-     "host_gb_router": 0.85,
+     "host_gb_router": 1.12,
      "router_gemessen_am": "2026-11-11T20:33:43",
      "passt_64gb": "ja",
      "hinweis": "",
@@ -1324,9 +1325,9 @@
      },
      "gpu_gb_notiz": null,
      "gpu_gb_notiz_quelle": "",
-     "gpu_gb_router": 6.68,
-     "host_gb_router": 0.39,
-     "router_gemessen_am": "2026-11-09T11:24:20",
+     "gpu_gb_router": 12.96,
+     "host_gb_router": 0.4,
+     "router_gemessen_am": "2026-11-13T19:59:27",
      "passt_64gb": "ja",
      "hinweis": "",
      "daten_dateien": [],
@@ -2444,10 +2445,10 @@
       },
       {
        "ordner": "rife",
-       "hf_repo": "",
-       "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "rife49.pth von https://huggingface.co/marduk191/rife (docs/models/rife), lokal nach safetensors umgewandelt"
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 287), Karte",
+       "hinweis": "rife49.safetensors aus unserem Repo (MIT); lokal unter rife\\weights\\"
       }
      ],
      "lizenz": {
@@ -2616,9 +2617,12 @@
       {
        "pfad": "rife\\weights\\rife49.safetensors",
        "bytes": 21312128,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_pfad": "rife49.safetensors",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482"
       }
      ]
     },
@@ -2658,6 +2662,13 @@
        "hf_revision": "",
        "angabe_von": "Ordnername; moge2_vitl.safetensors lokal aus model.pt umgewandelt",
        "hinweis": ""
+      },
+      {
+       "ordner": "rife",
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 287), Karte",
+       "hinweis": "rife49.safetensors aus unserem Repo (MIT); lokal unter rife\\weights\\"
       }
      ],
      "lizenz": {
@@ -2777,9 +2788,12 @@
       {
        "pfad": "rife\\weights\\rife49.safetensors",
        "bytes": 21312128,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_pfad": "rife49.safetensors",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482"
       }
      ]
     },
@@ -2815,6 +2829,13 @@
        "hf_revision": "",
        "angabe_von": "Ordnername",
        "hinweis": ""
+      },
+      {
+       "ordner": "rife",
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 287), Karte",
+       "hinweis": "rife49.safetensors aus unserem Repo (MIT); lokal unter rife\\weights\\"
       }
      ],
      "lizenz": {
@@ -2864,9 +2885,12 @@
       {
        "pfad": "rife\\weights\\rife49.safetensors",
        "bytes": 21312128,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_pfad": "rife49.safetensors",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482"
       }
      ]
     },
@@ -2906,6 +2930,13 @@
        "hf_revision": "",
        "angabe_von": "Ordnername + Download-Log",
        "hinweis": ""
+      },
+      {
+       "ordner": "rife",
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 287), Karte",
+       "hinweis": "rife49.safetensors aus unserem Repo (MIT); lokal unter rife\\weights\\"
       }
      ],
      "lizenz": {
@@ -2915,9 +2946,9 @@
      },
      "gpu_gb_notiz": 47.0,
      "gpu_gb_notiz_quelle": "Preset-Kommentar: Peak GPU 31.5 GB dedicated + 15.5 GB shared; nothing else may run beside it",
-     "gpu_gb_router": 43.84,
+     "gpu_gb_router": 45.88,
      "host_gb_router": 2.37,
-     "router_gemessen_am": "2026-11-10T08:51:53",
+     "router_gemessen_am": "2026-11-13T18:53:29",
      "passt_64gb": "nur-128",
      "hinweis": "Plan Schritt 2: H3 nur 128 GB. Laeuft auf der .198 (64 GB) allein (Host-RAM bis ~3 GB); der Plan begrenzt die Kombination Flash-Next Q4 + H3.",
      "daten_dateien": [],
@@ -3536,9 +3567,12 @@
       {
        "pfad": "rife\\weights\\rife49.safetensors",
        "bytes": 21312128,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_pfad": "rife49.safetensors",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482"
       }
      ],
      "lizenz_zusatz": {
@@ -3575,10 +3609,10 @@
      "quellen": [
       {
        "ordner": "ACE-Step\\gufo",
-       "hf_repo": "",
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
        "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-turbo, acestep-5Hz-lm-0.6B und Comfy-Org/ace_step_1.5_ComfyUI_files (Download-Logs); nicht gepinnt"
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Karten-Commit 32069b4a; Gewichte-Commit von upload-large-folder nicht gedruckt, darum Revision leer = main), Karte",
+       "hinweis": "unsere Umwandlung; Quellen ACE-Step/acestep-v15-xl-turbo, acestep-5Hz-lm-0.6B, Comfy-Org/ACE-Step-1.5 (drei Dateien unveraendert), Qwen/Qwen3-Embedding-0.6B (tokenizer.json); Details auf der Karte"
       }
      ],
      "lizenz": {
@@ -3600,51 +3634,72 @@
       {
        "pfad": "ACE-Step\\gufo\\dit.safetensors",
        "bytes": 9974719892,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "86a1afb0a1f711f0e3304ff65d874df3ae6783db683dcf982513fb9b6d14ae71",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "dit.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\lm.safetensors",
        "bytes": 8379154232,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "ffe5ffb855086c2ab55e467e9859fb01894781020a0376484dd19de166b79873",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "lm.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\lm-0.6b.safetensors",
        "bytes": 1325804168,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "cb08bbd967437524438129650673b09293117702eb926ef5c1ede50b441728d5",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "lm-0.6b.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\text_encoder.safetensors",
        "bytes": 1191588248,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fd4590c82153b8ddb67e15a2e7aaa8afa8b83a858c8a9b82a4831063156aa7a7",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "text_encoder.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\vae.safetensors",
        "bytes": 337431388,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "da17edb604c40deaf09e9b24974e590d1ca83a374070e5d0884cfa4bed9a99b0",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "vae.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\silence_latent.safetensors",
        "bytes": 3840088,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "1e3f263c000e7b29439cebb9b611b58500ed382a0e49ef5821ac6b10758672c2",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "silence_latent.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\tokenizer.json",
        "bytes": 11423705,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "tokenizer.json",
+       "hf_revision": ""
       }
      ]
     },
@@ -3666,10 +3721,10 @@
      "quellen": [
       {
        "ordner": "ACE-Step\\gufo",
-       "hf_repo": "",
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
        "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-sft; nicht gepinnt"
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Karten-Commit 32069b4a; Gewichte-Commit von upload-large-folder nicht gedruckt, darum Revision leer = main), Karte",
+       "hinweis": "unsere Umwandlung aus ACE-Step/acestep-v15-xl-sft (Konverter c641db8d/5d50ac23, 11.11.2026); Metadatum gufo.variant=base siehe Lizenzpruefung Zweifelsfall 3"
       }
      ],
      "lizenz": {
@@ -3691,16 +3746,22 @@
       {
        "pfad": "ACE-Step\\gufo\\dit-sft.safetensors",
        "bytes": 9974720044,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fbe389cbe9f05181a30c8fbf3f2600a6b9606ac2c6b332f161c09bbb8f948ab7",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "dit-sft.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\lm-1.7b.safetensors",
        "bytes": 3708523512,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "b4778c453dfa5118182d65490df88d94f575e03de85e3b3da3332af357783b86",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "lm-1.7b.safetensors",
+       "hf_revision": ""
       }
      ]
     },
@@ -3722,10 +3783,10 @@
      "quellen": [
       {
        "ordner": "ACE-Step\\gufo",
-       "hf_repo": "",
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
        "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "lokal umgewandelt aus ACE-Step/acestep-v15-xl-base; nicht gepinnt"
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Karten-Commit 32069b4a; Gewichte-Commit von upload-large-folder nicht gedruckt, darum Revision leer = main), Karte",
+       "hinweis": "unsere Umwandlung aus ACE-Step/acestep-v15-xl-base (Konverter c641db8d/5d50ac23, 11.11.2026)"
       }
      ],
      "lizenz": {
@@ -3747,16 +3808,22 @@
       {
        "pfad": "ACE-Step\\gufo\\dit-base.safetensors",
        "bytes": 9974720044,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "3f465fdaf91cc9ed8218c90bdc0819273d4d565e96753490348e8ade9ca7d227",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "dit-base.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "ACE-Step\\gufo\\lm-1.7b.safetensors",
        "bytes": 3708523512,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "b4778c453dfa5118182d65490df88d94f575e03de85e3b3da3332af357783b86",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/ace-step-1.5-gufo",
+       "hf_pfad": "lm-1.7b.safetensors",
+       "hf_revision": ""
       }
      ]
     },
@@ -3776,15 +3843,15 @@
      "quellen": [
       {
        "ordner": "OpenMOSS-Team\\moss-music-gufo",
-       "hf_repo": "",
+       "hf_repo": "D3rPapst/moss-music-8b-gufo",
        "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "lokal umgewandelt (Audio-Encoder BF16 + LLM Q8_0) aus OpenMOSS-Team MOSS-Music-8B-Instruct; Repo nicht gepinnt. Die BF16-Originale (32,8 GB) liegen daneben und sind nicht aufgefuehrt."
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Karten-Commit cec7cc64; Gewichte-Commit nicht gedruckt, Revision leer = main), Karte",
+       "hinweis": "unsere Umwandlung (Audio-GGUF BF16 + LLM Q8_0, 12.11.2026) aus OpenMOSS-Team/MOSS-Music-8B-Instruct Revision fce7f830; Apache-2.0, Lizenztext im Repo. Die BF16-Originale (32,8 GB) liegen auf der .198 daneben und sind nicht aufgefuehrt."
       }
      ],
      "lizenz": {
       "name": "Apache-2.0 (laut Modellkarte)",
-      "satz": "MOSS-Music-8B-Instruct: Apache-2.0 laut Modellkarte (Preset-Kommentar 12.11.); Lizenzdatei im gufo-Ordner nicht enthalten.",
+      "satz": "MOSS-Music-8B-Instruct: Apache-2.0 laut Modellkarte (Preset-Kommentar 12.11.); Lizenztext liegt im HF-Repo D3rPapst/moss-music-8b-gufo bei (LICENSE).",
       "bestaetigen": false
      },
      "gpu_gb_notiz": 10.6,
@@ -3801,16 +3868,22 @@
       {
        "pfad": "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.llm-Q8_0.gguf",
        "bytes": 8709518144,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "eeeb19b6f78342cc93708564f1fba18be49d5e7ca060c83f8db44782e6a49807",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/moss-music-8b-gufo",
+       "hf_pfad": "moss-music-8b.llm-Q8_0.gguf",
+       "hf_revision": ""
       },
       {
        "pfad": "OpenMOSS-Team\\moss-music-gufo\\moss-music-8b.audio.gguf",
        "bytes": 1724490048,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "653e9ae67f35ba5ed3d4df8b34381ca03aea92c16d92449a131d4f1a8a65763e",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/moss-music-8b-gufo",
+       "hf_pfad": "moss-music-8b.audio.gguf",
+       "hf_revision": ""
       }
      ]
     }
@@ -3842,10 +3915,10 @@
      "quellen": [
       {
        "ordner": "VAST-AI\\TripoSG",
-       "hf_repo": "VAST-AI/TripoSG",
-       "hf_revision": "",
-       "angabe_von": "Ordnername; gufo/triposg.safetensors lokal aus dem HF-Ordner (11,9 GB, nicht aufgefuehrt) umgewandelt",
-       "hinweis": ""
+       "hf_repo": "D3rPapst/triposg-gufo",
+       "hf_revision": "3477fc000d52fc42a6126e67bf64593984389c97",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 9063), Karte",
+       "hinweis": "unsere Umwandlung (12.11.2026) aus VAST-AI/TripoSG Revision 2c1c516d (Original 7,9 GB, nicht aufgefuehrt); auf HF liegt triposg.safetensors im Wurzelverzeichnis, lokal unter VAST-AI\\TripoSG\\gufo\\"
       }
      ],
      "lizenz": {
@@ -3867,9 +3940,12 @@
       {
        "pfad": "VAST-AI\\TripoSG\\gufo\\triposg.safetensors",
        "bytes": 3923957740,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "570159920a91fdf9cc68d489521a3d890a12050f1d8626815e83fe25cd7caad9",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/triposg-gufo",
+       "hf_pfad": "triposg.safetensors",
+       "hf_revision": "3477fc000d52fc42a6126e67bf64593984389c97"
       }
      ]
     },
@@ -3889,10 +3965,10 @@
      "quellen": [
       {
        "ordner": "microsoft\\gufo-trellis2",
-       "hf_repo": "",
+       "hf_repo": "D3rPapst/trellis2-gufo",
        "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "lokal umgewandelt aus microsoft/TRELLIS.2-4B (16,2 GB daneben, nicht aufgefuehrt) und facebook/dinov3-vitl16-pretrain-lvd1689m (THIRD_PARTY_NOTICES); nicht gepinnt"
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Karten-Commit e1d90499; Gewichte-Commit nicht gedruckt, Revision leer = main), Karte",
+       "hinweis": "unsere Umwandlung (12.11.2026) aus microsoft/TRELLIS.2-4B Revision af44b45f (5 Teile) und microsoft/TRELLIS-image-large (ss_dec); trellis2-dinov3.safetensors NICHT im Repo: facebook/dinov3-vitl16-pretrain-lvd1689m (gated, DINOv3-Lizenz) selbst laden und mit tools/trellis2/convert_hf_to_gufo.py --parts dinov3 wandeln"
       }
      ],
      "lizenz": {
@@ -3916,56 +3992,80 @@
        "bytes": 7503,
        "sha256": "",
        "sha256_status": "fehlt",
-       "im_baum_198": true
+       "im_baum_198": true,
+       "hf_repo": null,
+       "hf_pfad": null,
+       "hf_revision": null
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-dinov3.safetensors",
        "bytes": 1212638136,
        "sha256": "",
        "sha256_status": "fehlt",
-       "im_baum_198": true
+       "im_baum_198": true,
+       "hf_repo": null,
+       "hf_pfad": null,
+       "hf_revision": null
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-shape_dec.safetensors",
        "bytes": 948852556,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "feee6a80f41e230cd9c67ceada3ec72abccc113b51b8c489c3ad81136f03534f",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-shape_dec.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-shape_flow_512.safetensors",
        "bytes": 2587225304,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "739e4a5bbf66862e1c6a194c6934cf6ba4aee3f2594fb9f9c4100122b102e485",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-shape_flow_512.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-ss_dec.safetensors",
        "bytes": 147604500,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "22031a15458152b13479be13784df2aacee35e89b27c58ad88abfe665f37ba31",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-ss_dec.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-ss_flow.safetensors",
        "bytes": 2586930280,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "d1a7adb3761a5a7222bd0a3b9e401d5b64b311cb6018cf356b72cfa8562c9d41",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-ss_flow.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-tex_dec.safetensors",
        "bytes": 948789952,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "82140d40e10dca03124f95e2f43e89ef46d069833e6f0000d8b4fbea92f6928e",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-tex_dec.safetensors",
+       "hf_revision": ""
       },
       {
        "pfad": "microsoft\\gufo-trellis2\\trellis2-tex_flow_512.safetensors",
        "bytes": 2587225304,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "b7800ed58a69c82caab6688d2f31e40291b98f2571393c9308783773973f31f4",
+       "sha256_status": "hf-upload",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/trellis2-gufo",
+       "hf_pfad": "trellis2-tex_flow_512.safetensors",
+       "hf_revision": ""
       }
      ]
     }
@@ -3997,10 +4097,10 @@
      "quellen": [
       {
        "ordner": "upscale",
-       "hf_repo": "",
-       "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "Real-ESRGAN GitHub-Release v0.2.5.0 (.pth), lokal nach safetensors umgewandelt (docs/models/realesrgan)"
+       "hf_repo": "D3rPapst/realesrgan-srvgg-gufo",
+       "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 915), Karte",
+       "hinweis": "unsere Umwandlung der Real-ESRGAN-Release-v0.2.5.0-.pth (SHA-256 der Quellen auf der Karte, docs/models/realesrgan); BSD-3-Clause, Lizenztext im Repo als LICENSE"
       }
      ],
      "lizenz": {
@@ -4022,30 +4122,42 @@
       {
        "pfad": "upscale\\realesr-general-x4v3.safetensors",
        "bytes": 4861400,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "6b217ff50258cc7823169f074d2af7fa52d03bb8c9da615cb16b439576bde838",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/realesrgan-srvgg-gufo",
+       "hf_pfad": "realesr-general-x4v3.safetensors",
+       "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5"
       },
       {
        "pfad": "upscale\\realesr-general-wdn-x4v3.safetensors",
        "bytes": 4861400,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "29edd79d26ee6f7290736c8c76be7c6a163709e1f96520ee4457abdd122d8328",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/realesrgan-srvgg-gufo",
+       "hf_pfad": "realesr-general-wdn-x4v3.safetensors",
+       "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5"
       },
       {
        "pfad": "upscale\\realesr-animevideov3.safetensors",
        "bytes": 2490040,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "c5a3177446372b9181f99a4015fffcecfbbb67b3e8507aca716391d8c66a7c9e",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/realesrgan-srvgg-gufo",
+       "hf_pfad": "realesr-animevideov3.safetensors",
+       "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5"
       },
       {
        "pfad": "upscale\\weights\\Real-ESRGAN-LICENSE.txt",
        "bytes": 1519,
        "sha256": "",
        "sha256_status": "fehlt",
-       "im_baum_198": true
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/realesrgan-srvgg-gufo",
+       "hf_pfad": "LICENSE",
+       "hf_revision": "a3d8e7bf8e7963c328fec3ea3a99f4626e6810c5"
       }
      ]
     },
@@ -4067,16 +4179,16 @@
      "quellen": [
       {
        "ordner": "rife",
-       "hf_repo": "",
-       "hf_revision": "",
-       "angabe_von": "",
-       "hinweis": "rife49.pth von https://huggingface.co/marduk191/rife/resolve/main/rife49.pth (docs/models/rife), lokal umgewandelt"
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482",
+       "angabe_von": "hf-upload\\upload-2026-11-13.log (Gewichte-Commit, Log Zeile 287), Karte",
+       "hinweis": "unsere Umwandlung von rife47.pth/rife49.pth (Spiegel marduk191/rife, SHA-256 der Quellen auf der Karte); Repo enthaelt rife49 + rife47 + *.convert.txt; lokal unter rife\\weights\\"
       }
      ],
      "lizenz": {
-      "name": "MIT (Code) / Gewichte nicht geprueft",
-      "satz": "Practical-RIFE-Code MIT; die Gewichte rife49.pth kommen vom Spiegel marduk191/rife (docs/models/rife), Lizenz der Gewichte nicht geprueft (KB 1127).",
-      "bestaetigen": true
+      "name": "MIT",
+      "satz": "Practical-RIFE IFNet 4.7/4.9, MIT (hzwer); Quelle der .pth: Spiegel marduk191/rife ohne eigene Lizenzangabe (Lizenzpruefung 13.11.2026, hf-upload\\LIZENZPRUEFUNG-2026-11-13.md); Lizenztext im Repo D3rPapst/rife-ifnet-gufo.",
+      "bestaetigen": false
      },
      "gpu_gb_notiz": null,
      "gpu_gb_notiz_quelle": "",
@@ -4092,9 +4204,12 @@
       {
        "pfad": "rife\\weights\\rife49.safetensors",
        "bytes": 21312128,
-       "sha256": "",
-       "sha256_status": "fehlt",
-       "im_baum_198": true
+       "sha256": "fb19941f0e4ec0a42bdfd933cf1c0bc1c3b3b5033ee31226b4a0e4c3a7c0711f",
+       "sha256_status": "lokal",
+       "im_baum_198": true,
+       "hf_repo": "D3rPapst/rife-ifnet-gufo",
+       "hf_pfad": "rife49.safetensors",
+       "hf_revision": "f22306090db92290648c4fc87e2be18424591482"
       }
      ]
     },

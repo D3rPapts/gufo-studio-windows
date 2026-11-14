@@ -29,6 +29,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/names.hpp"
@@ -966,6 +967,9 @@ public:
   /// in front of Dispatch. Always set; with auth = off it only answers the
   /// auth endpoints.
   std::unique_ptr<router::auth::Gate> gate;
+  /// The setup assistant's API (/router/setup/*, 2.1); the gate lets only
+  /// loopback and admins through to it.
+  std::unique_ptr<router::einrichtung::SetupService> setup;
   /// metadata.nutzer of a local job (the gate's owner check); nullopt when
   /// the job API is off or the job is unknown here.
   std::optional<std::string> JobOwner(const std::string& job_id) {
@@ -1117,6 +1121,10 @@ public:
       return JsonOk(Capabilities());
     if (req.method == "GET" && req.path.starts_with("/router/partner/"))
       return router::PartnerRead(partner_spec, router_id, req);
+    if (setup != nullptr) {
+      if (auto answer = setup->Handle(req))
+        return std::move(*answer);
+    }
     if (jobs != nullptr) {
       if (auto answer = jobs->Handle(req))
         return std::move(*answer);
@@ -3748,6 +3756,8 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path preset_path;
   std::filesystem::path models_dir;
   std::filesystem::path pages_dir;
+  bool einrichtung = false;
+  std::filesystem::path einrichtung_dir;
   std::filesystem::path comfy_dir;
   std::filesystem::path comfy_ffmpeg;
   std::filesystem::path jobs_dir;
@@ -3800,6 +3810,16 @@ int RunRouter(std::span<const char* const> args) {
   parser.AddOption("", "--models-dir", "DIR",
                    "Base directory that resolves relative model paths",
                    "Router", &models_dir);
+  parser.AddFlag("", "--einrichtung",
+                 "Setup assistant (2.1): run without --models-preset, no "
+                 "models, only the pages and /router/setup/* (loopback or "
+                 "admin); the assistant writes the preset and the first "
+                 "admin, then the router is started normally",
+                 "Router", &einrichtung);
+  parser.AddOption("", "--einrichtung-dir", "DIR",
+                   "Folder with katalog.json and bausteine/ for the setup "
+                   "assistant (default: examples/einrichtung next to bin/)",
+                   "Router", &einrichtung_dir);
   parser.AddOption("", "--pages-dir", "DIR",
                    "Serve static pages: GET /<name>/ returns "
                    "DIR/<name>/index.html; GET / redirects to /start/ "
@@ -3985,18 +4005,28 @@ int RunRouter(std::span<const char* const> args) {
     std::cout << report.dump() << "\n";
     return 0;
   }
-  if (preset_path.empty()) {
-    std::cerr << "Error: --models-preset <FILE> is required\n";
+  if (preset_path.empty() && !einrichtung) {
+    std::cerr << "Error: --models-preset <FILE> is required (or "
+                 "--einrichtung for the setup assistant)\n";
     return 2;
   }
   std::vector<router::PresetModel> models;
   std::string preset_error;
   router::RouterSection router_section;
-  if (!router::LoadPreset(preset_path, models_dir, &models, &preset_error,
+  if (!preset_path.empty() &&
+      !router::LoadPreset(preset_path, models_dir, &models, &preset_error,
                           &router_section)) {
     std::cerr << "Error: " << preset_error << "\n";
     return 2;
   }
+  // --einrichtung without a preset: the users file is bound to the data
+  // folder once the assistant's step 3 names it (UserStore::Relocate);
+  // until then it is nutzer/nutzer.json next to gufo.exe (nothing writes
+  // there unless someone creates a user from loopback before step 3).
+  const std::filesystem::path preset_dir =
+      preset_path.empty()
+          ? router::ExecutablePath().parent_path()
+          : std::filesystem::absolute(preset_path).parent_path();
   // Users and access control (2.0.3). The users file defaults to
   // nutzer/nutzer.json next to the preset: the preset is the one file
   // both machines always have (--jobs-dir is optional), and in production
@@ -4008,12 +4038,10 @@ int RunRouter(std::span<const char* const> args) {
                                           &auth_settings.loopback);
   auth_settings.users_file =
       router_section.users_file.empty()
-          ? std::filesystem::absolute(preset_path).parent_path() / "nutzer" /
-                "nutzer.json"
+          ? preset_dir / "nutzer" / "nutzer.json"
           : std::filesystem::absolute(
                 std::filesystem::path(router_section.users_file).is_relative()
-                    ? std::filesystem::absolute(preset_path).parent_path() /
-                          router_section.users_file
+                    ? preset_dir / router_section.users_file
                     : std::filesystem::path(router_section.users_file));
   auth_settings.AllowOrigins(
       router::Split(router_section.csrf_allow_origins, ','));
@@ -4089,7 +4117,7 @@ int RunRouter(std::span<const char* const> args) {
     residency_options.policy.reserve_commit = router::FromGb(reserve_commit_gb);
     residency_options.policy.abort_commit = router::FromGb(abort_commit_gb);
     residency_options.idle_default = registry_options.idle_timeout;
-    if (memory_file.empty()) {
+    if (memory_file.empty() && !preset_path.empty()) {
       memory_file = preset_path;
       memory_file.replace_extension(".memory.json");
     }
@@ -4232,6 +4260,40 @@ int RunRouter(std::span<const char* const> args) {
       Logger::Warn("router",
                    "event=auth_no_admin hint=\"create the first admin from "
                    "127.0.0.1: POST /router/users\"");
+  }
+  {
+    // The setup assistant's API: always there (a running router can add
+    // blocks later); with --einrichtung it is the point of the process.
+    router::einrichtung::ServiceOptions setup_options;
+    setup_options.exe = state->exe_path;
+    setup_options.dir =
+        router::einrichtung::FindDir(state->exe_path, einrichtung_dir);
+    setup_options.port = port;
+    setup_options.users_unbound = einrichtung && preset_path.empty();
+    setup_options.gate = state->gate.get();
+    setup_options.check_preset =
+        [models_dir](const std::filesystem::path& file) -> std::string {
+      std::vector<router::PresetModel> probe;
+      std::string error;
+      router::RouterSection section;
+      if (!router::LoadPreset(file, models_dir, &probe, &error, &section))
+        return error.empty() ? "preset does not parse" : error;
+      return "";
+    };
+    state->setup = std::make_unique<router::einrichtung::SetupService>(
+        std::move(setup_options));
+    Logger::Info("router",
+                 std::string("event=setup_api mode=") +
+                     (einrichtung ? "einrichtung" : "normal") + " dir=" +
+                     (state->setup->dir().empty()
+                          ? std::string("none")
+                          : state->setup->dir().string()) +
+                     " models=" + std::to_string(models.size()));
+    if (einrichtung && state->setup->dir().empty())
+      Logger::Warn("router",
+                   "event=setup_no_catalogue hint=\"examples/einrichtung/"
+                   "katalog.json not found; --einrichtung-dir names the "
+                   "folder\"");
   }
   router::comfy::Fetch self_fetch;
   {
