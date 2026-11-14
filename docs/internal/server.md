@@ -1285,7 +1285,7 @@ Endpoints (JSON):
 
 | Endpoint | Who | What |
 | --- | --- | --- |
-| `GET /router/me` | anyone | `{auth, name, rolle, quelle, bereiche, modelle, filter, tageslimit, pool, verwaltung, setup}`; `401` with `setup: true` while no admin exists. |
+| `GET /router/me` | anyone | `{auth, name, rolle, quelle, bereiche, modelle, filter, tageslimit, pool, verwaltung, setup, setup_api}`; `401` with `setup: true` while no admin exists. `setup_api: true` says the router knows `/router/setup/*` (2.1), so a `404` there means "hidden", not "too old". |
 | `POST /login` | anyone | `{"name", "passwort", "bleiben"}` -> `200` + `Set-Cookie`, `401 login_failed`, `403 login_not_allowed` (dienst), `429 too_many_attempts`. |
 | `POST /logout` | anyone | Ends the session, clears the cookie. |
 | `GET /router/partner/status`, `GET /router/partner/capabilities` | any signed-in user | The partner router's own `/router/status` / `/router/capabilities`, fetched over the pool link with the pool key (3 s) and passed through as it came (status code, JSON); `503 remote_unavailable` without a partner or when it does not answer (2.0.4: the pages read the partner this way when a browser cannot reach it directly: https, a cookie of another site, a closed port). |
@@ -1382,6 +1382,93 @@ de/en, dark mode) and `gemeinsam/anmeldung.js`, which every page loads
 after `sprache.js`: it reads `/router/me`, shows the name and "Abmelden",
 hides tiles and menu entries of closed areas and goes to `/login/` on
 `401`.
+
+### Setup assistant (`/einrichtung/`, `/router/setup/*`)
+
+From 2.1 the router sets itself up (gufo-studio-windows only; plan
+`EINRICHTUNG-ROUTER-PLAN-2026-11-13`): the page `/einrichtung/` walks six
+steps (machine check, building blocks, folders, downloads, settings and
+preset, self-test) and talks to the endpoints below. The code is
+`src/cli/serve/router/einrichtung.*` (service, catalogue, machine check,
+preset from the blocks: a port of `einrichtung/einrichten.py`, which stays
+the reference and the unattended tool for a second machine),
+`download.*` (Hugging Face downloads) and `selbsttest.*` (the self-test).
+
+**Starting without a preset.** `gufo router --einrichtung --host
+127.0.0.1 --port 8081 --pages-dir pages` runs the router with no models:
+only the pages and `/router/setup/*` are served, nothing loads, the users
+file is unknown until step 3 names the data folder (then
+`<daten>\nutzer\nutzer.json`, `UserStore::Relocate`). `--einrichtung-dir`
+names the folder with `katalog.json` and `bausteine\`; the default is
+`examples\einrichtung` next to `bin\` (a build tree finds
+`<repo>\einrichtung`). The package ships `gufo-einrichten.cmd`, which
+starts this and opens the page in the browser. A router that runs a
+preset serves the API too (blocks can be added later).
+
+**Rights.** `Classify()` puts `/router/setup/*` into `kSetup` and
+`/einrichtung/*` into `kAdminPage`: both answer only from loopback (with
+`auth-loopback = admin`, not `auth = all`) or an admin session, everyone
+else gets `404` like `/verwaltung/`. `POST` needs the CSRF check (same
+origin), also with `auth = off`. `POST /router/setup/admin` is loopback
+only and works only while `SetupPending()` (no admin yet).
+
+| Endpoint | What |
+| --- | --- |
+| `GET /router/setup/katalog` | `einrichtung/katalog.json` as is, plus `katalog_datei` and `einrichtung_version`; read on every call. `404 katalog_missing`. |
+| `GET /router/setup/pruefen` | Machine check: `ram_gb`, `app`, `rechner`, `adresse`, `worker` (folders of the worker builds), `gpu`, `laufwerke`, `pruefungen[]` (`gpu`, `treiber`, `ram`, `zuteilung`, `platte`, `windows`, `ffmpeg`, `tdr`, `port`, `auslagerung`; each `ok`/`warn`/`err` with a German text and what to do). `?port=` names the wanted port. |
+| `POST /router/setup/pruefen` | `{"pfade": {"modelle", "daten"}}`: creates the folders, writes and removes a probe file, answers `ordner[]` with `schreibbar`, `frei_bytes`, `angelegt`; binds the users file. `400 invalid_path` for anything but an absolute local path without `..` or UNC. |
+| `POST /router/setup/preset` | `{"antworten": {...}, "schreiben": bool}`: the preset text, `start_cmd`, `bericht`, `lizenzen_offen`, `dateien_fehlend`, `worker_fehlend`, `preset_datei`. With `schreiben` it writes `gufo-router.ini` (backup `.bak-<time>`, foreign sections kept), `start-router.cmd`, `einrichtung.json`, `einrichtung-bericht.md` and the data folders; before writing the text is parsed with `router::LoadPreset` (`422 preset_invalid`). `409 licenses_open`, `400 invalid_request`. Autostart and the firewall rule are not done yet (`autostart: "uebersprungen"`). |
+| `POST /router/setup/admin` | `{"name", "passwort"}` -> `201 {name, rolle: "admin"}`; loopback only, `409 admin_exists`, `409 no_data_dir` before step 3; codes as `POST /router/users`. |
+| `GET` / `POST /router/setup/downloads` | `POST {"aktion": "planen" \| "start" \| "pause" \| "weiter" \| "abbrechen", "modelle": [...], "ziel": "D:\\...", "hf_token"?}`. `planen` lists the files of the models (dependencies included) with their state on disk (`vorhanden` by size, `wartet`, `fehler` without a source); `start` fills the queue for two worker threads (`202`; `507 disk_full` with `fehlt_bytes`; `409 download_running`). `GET` is the live state (`laeuft`, `pause`, `rate_bytes_s`, `gesamt_bytes`, `geladen_bytes`, `dateien[]` with `status`, `geladen`, `sha256_status`, `fehler`). |
+| `GET` / `POST /router/setup/selbsttest` | `POST {"aktion": "start" \| "abbrechen", "bausteine"?, "alle_modelle"?, "preset"?, "tests"?: [{"baustein", "modell"}]}`; `GET` the state (`laeuft`, `fertig`, `abgebrochen`, `ziel`, `ordner`, `kind {port, pid}`, `ok`, `fehler`, `tests[]` with `baustein`, `modell`, `art`, `status` `wartet\|laeuft\|ok\|fehler\|uebersprungen\|abgebrochen`, `dauer_s`, `hinweis`, `log`, `datei`). `409 no_preset` before step 5, `409 selbsttest_running`, `409 download_running`. |
+
+**Downloads** (`router::Downloader`): libcurl, which `gufo.exe` already
+links; `https://huggingface.co/<hf_repo>/resolve/<revision or
+main>/<path>` from the catalogue entry (`hf_repo`/`hf_pfad`/`hf_revision`
+per file when given, else the `quellen[]` folder); a `HEAD` compares the
+size with the catalogue (`size_mismatch`), `401`/`403` is `gated` until a
+token comes; the body streams into `<ziel>\<pfad>.part` and resumes with
+a `Range` request; SHA-256 is computed while writing and compared with
+the catalogue or, without one, the `X-Linked-ETag` (`sha256_status` `ok`,
+`falsch`: the file stays as `.falsch`, `unbekannt`); five retries with
+growing pauses; below 1 GB free the job pauses itself. The state is
+written to `<ziel>\.einrichtung-downloads.json` after every change, so a
+restarted router and the next `planen` find the digests of files loaded
+earlier; files already present by size are not re-hashed. The Hugging
+Face token lives only in the downloader's memory for the job and never
+reaches the state file, the report or the log.
+
+**Self-test** (`einrichtung::SelfTest`): one small request per chosen
+block, one after the other (one model in memory), the requests of
+`modell_pruefung.py`: chat `POST /v1/chat/completions` (one sentence,
+160 tokens, thinking off), bilder `POST /v1/images/generations`
+512x512 (the turbo model), stimme `POST /v1/audio/speech` (one sentence,
+the first voice of `GET /v1/audio/voices?model=`), video `POST
+/v1/videos` 640x352 1 s 20 steps, musik `POST /v1/audio/music` 5 s,
+3d `POST /v1/3d/generations` and werkzeuge `POST /v1/images/upscale`
+with a built-in 64x64 PNG, zweiter-rechner `GET <partner>/health`.
+Models without a request (ASR, clone, voice design, Uni3C, InfiniteTalk,
+RIFE, LoRAs) are `uebersprungen`, as is a model the target does not list
+in `/v1/models`. After every case `POST /models/unload`. The cases come
+from `einrichtung.json` next to the preset (`modelle`, `antworten`), or
+the request names them in `tests`. A router in `--einrichtung` mode starts
+the production router from the preset's `# start:` line (`# start-opt:`
+and `# env:` applied, `--host`/`--port` replaced by `127.0.0.1` and a
+free port) as a child process (`Worker::Spawn`, its output in the log as
+`model=selbsttest-router`), waits for `/ready` (180 s), runs the cases
+over HTTP and stops the child at the end; a router that already runs a
+preset is asked directly. Each case has 15 minutes; red cases carry the
+filtered cause in `hinweis` ("zu wenig Speicher" for `507` /
+ResourceExhausted, the missing file, the worker error) and the target's
+message in `log`. Results (txt, png, wav, mp4, glb) land in
+`<daten>\jobs\selbsttest\`, with `selbsttest.json`; the report is also
+written as `selbsttest` into `einrichtung.json`. A download that still
+runs blocks the start (`409 download_running`); `abbrechen` stops the
+running request (libcurl progress callback) and the child.
+
+Live check 14.11.2026 (CPU build, `--einrichtung` on 8077, a preset with
+only `[external/qwen3.5-4b]` on llama-server): the child router came up,
+the chat case answered, the child was stopped; see the C5 commit.
 
 
 ## Endpoint Set

@@ -1,6 +1,17 @@
-# Einrichtung: Bausteine-Katalog und unbeaufsichtigtes Einrichtungs-Skript
+# Einrichtung: Katalog, Vorlagen, Assistent im Router und Skript für den Zweitrechner
 
-Teile 1 und 5 aus `D:\claude\gufo-arbeit\INSTALLER-PLAN-2026-11-13.md` (Stand 13.11.2026, KI-unterstützt mit Claude Code, Baumeister .198). Noch ohne Router-Endpunkte, ohne Seite `/einrichtung/`, ohne Download – das Skript **prüft nur**, welche Dateien fehlen, und **lädt nichts**.
+Teile 1 bis 6 aus `D:\claude\gufo-arbeit\INSTALLER-PLAN-2026-11-13.md` (Stand 14.11.2026, KI-unterstützt mit Claude Code, Baumeister .198).
+
+## Der normale Weg (2.1): der Router richtet sich selbst ein
+
+1. Paket entpacken, `gufo-einrichten.cmd` doppelklicken. Es startet `bin\gufo.exe router --einrichtung --host 127.0.0.1 --port 8081 --pages-dir pages` (ohne Preset, keine Modelle; ist 8081 belegt, nimmt es 8089) und öffnet `http://127.0.0.1:8081/einrichtung/` im Browser. Nur vom Rechner selbst erreichbar.
+2. Die Seite führt durch sechs Schritte: Rechner prüfen (GPU, Treiber, RAM, Platte, Windows, FFmpeg, TDR, Port, Auslagerung), Bausteine wählen, Speicherort (Modelle und Daten), Herunterladen (von Hugging Face durch den Router, mit Fortsetzen und Prüfsumme), Einstellungen und Preset (Admin-Konto, Port, Heimnetz; das Preset wird vor dem Schreiben vom Router geprüft), Selbsttest.
+3. Der Selbsttest startet den fertigen Router mit dem neuen Preset als Kindprozess auf einem freien Port, schickt je Baustein eine kleine Anfrage (ein Satz Text, ein 512er-Bild, ein Satz Stimme, eine Sekunde Video, fünf Sekunden Musik, ein 3D-Objekt, ein Hochskalieren, Partner-Health) und beendet ihn wieder. Ergebnisse unter `{daten}\jobs\selbsttest\`, Bericht in `einrichtung.json`.
+4. Danach `start-router.cmd` im Datenordner starten (oder die geplante Aufgabe anlegen; Autostart/Firewall macht der Router noch nicht selbst). Für das Heimnetz bindet der Router an `0.0.0.0` und braucht die Firewall-Regel für den Port.
+
+Endpunkte, Rechte und Ablauf im Code: `docs/internal/server.md` „Setup assistant“; Code `src/cli/serve/router/einrichtung.*`, `download.*`, `selbsttest.*`; Seite `pages/einrichtung/`.
+
+Das Skript `einrichten.py` unten bleibt für die **Regie auf dem Zweitrechner** (Export/Import der Antworten, unbeaufsichtigt) und als Referenz für den C++-Port; es **prüft nur**, welche Dateien fehlen, und **lädt nichts**.
 
 ## Was liegt hier
 
