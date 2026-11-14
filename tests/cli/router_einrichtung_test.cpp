@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1478,6 +1479,10 @@ void TestRealDownload() {
 struct FakeRouter {
   std::mutex mutex;
   std::vector<std::string> unloaded;
+  /// Models a worker holds (a case's request loads its model, an unload
+  /// frees it) and models someone else uses right now.
+  std::set<std::string> loaded;
+  std::set<std::string> busy;
   std::vector<std::string> paths;
   /// "<path> <X-Gufo-Internal>" of every request.
   std::vector<std::string> keys;
@@ -1561,6 +1566,13 @@ struct FakeRouter {
             "gufo-upscale", "m-fail"}) {
         json::Value m = json::Value::object();
         m["id"] = id;
+        const std::lock_guard<std::mutex> lock(mutex);
+        json::Value status = json::Value::object();
+        status["value"] = loaded.contains(id) ? "loaded" : "unloaded";
+        m["status"] = std::move(status);
+        json::Value activity = json::Value::object();
+        activity["busy"] = busy.contains(id);
+        m["activity"] = std::move(activity);
         data.push_back(std::move(m));
       }
       json::Value v = json::Value::object();
@@ -1570,7 +1582,12 @@ struct FakeRouter {
     if (req.path == "/models/unload") {
       const std::lock_guard<std::mutex> lock(mutex);
       unloaded.push_back(model);
+      loaded.erase(model);
       return JsonOk(json::Value::object());
+    }
+    if (!model.empty() && model != "m-fail" && req.method == "POST") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      loaded.insert(model);
     }
     if (req.path == "/v1/chat/completions") {
       if (model == "m-fail")
@@ -1792,6 +1809,53 @@ void TestSelfTestPlanning() {
   const std::string png = einrichtung::TestImagePng();
   CHECK(png.starts_with("\x89PNG"));
   CHECK(png.size() > 100);
+
+  // Unload after a case: the state from /v1/models and the rule.
+  const std::string listing =
+      "{\"data\":["
+      "{\"id\":\"a\",\"status\":{\"value\":\"unloaded\"},"
+      "\"activity\":{\"busy\":false}},"
+      "{\"id\":\"b\",\"status\":{\"value\":\"loaded\"},"
+      "\"activity\":{\"busy\":true}},"
+      "{\"id\":\"c\",\"loaded\":true},"
+      "{\"id\":\"d\",\"status\":{\"value\":\"loading\"},"
+      "\"inflight\":{\"local\":0,\"remote\":1}},"
+      "{\"id\":\"e\",\"status\":{\"value\":\"loaded\"},"
+      "\"remote\":{\"url\":\"http://x\"}}]}";
+  using State = einrichtung::TargetModelState;
+  std::optional<State> s = einrichtung::TargetModelStateOf(listing, "a");
+  CHECK(s.has_value() && s->listed && !s->loaded && !s->busy && !s->remote);
+  s = einrichtung::TargetModelStateOf(listing, "b");
+  CHECK(s.has_value() && s->loaded && s->busy);
+  s = einrichtung::TargetModelStateOf(listing, "c");
+  CHECK(s.has_value() && s->loaded && !s->busy);
+  s = einrichtung::TargetModelStateOf(listing, "d");
+  CHECK(s.has_value() && s->loaded && s->busy);
+  s = einrichtung::TargetModelStateOf(listing, "e");
+  CHECK(s.has_value() && s->remote);
+  s = einrichtung::TargetModelStateOf(listing, "fehlt");
+  CHECK(s.has_value() && !s->listed);
+  CHECK(!einrichtung::TargetModelStateOf("kaputt", "a").has_value());
+  CHECK(!einrichtung::TargetModelStateOf("{\"x\":1}", "a").has_value());
+  State unloaded_state;
+  unloaded_state.listed = true;
+  State loaded_state = unloaded_state;
+  loaded_state.loaded = true;
+  State busy_state = loaded_state;
+  busy_state.busy = true;
+  // The own child router: always, whatever the state.
+  CHECK(einrichtung::UnloadAfterCase(true, std::nullopt, std::nullopt));
+  CHECK(einrichtung::UnloadAfterCase(true, loaded_state, busy_state));
+  // A running router: only what the case loaded and no one uses.
+  CHECK(einrichtung::UnloadAfterCase(false, unloaded_state, loaded_state));
+  CHECK(!einrichtung::UnloadAfterCase(false, loaded_state, loaded_state));
+  CHECK(!einrichtung::UnloadAfterCase(false, unloaded_state, busy_state));
+  CHECK(!einrichtung::UnloadAfterCase(false, unloaded_state, unloaded_state));
+  CHECK(!einrichtung::UnloadAfterCase(false, std::nullopt, loaded_state));
+  CHECK(!einrichtung::UnloadAfterCase(false, unloaded_state, std::nullopt));
+  State remote_state = loaded_state;
+  remote_state.remote = true;
+  CHECK(!einrichtung::UnloadAfterCase(false, unloaded_state, remote_state));
 }
 
 void TestSelfTestService() {
@@ -1975,6 +2039,35 @@ void TestSelfTestService() {
   }
   CHECK_EQ(done.member_double("ok"), 1.0);
   CHECK_EQ(done.member_double("fehler"), 1.0);
+
+  // A running router serves others (14.11.): a model that was loaded before
+  // the case and a model someone uses right now both stay; only the model
+  // the case loaded itself is unloaded.
+  {
+    const std::lock_guard<std::mutex> lock(router.mutex);
+    router.unloaded.clear();
+    router.loaded = {"qwen3.8-27b"};
+    router.busy = {"qwen3-tts"};
+  }
+  r = service.Handle(Req(
+      "POST", "/router/setup/selbsttest", "127.0.0.1",
+      "{\"aktion\":\"start\",\"tests\":[{\"baustein\":\"chat\",\"modell\":"
+      "\"qwen3.8-27b\"},{\"baustein\":\"stimme\",\"modell\":\"qwen3-tts\"},"
+      "{\"baustein\":\"bilder\",\"modell\":\"qwen-image-2.1-turbo\"}]}"));
+  CHECK(r.has_value() && r->status == 202);
+  done = WaitSelfTest(service);
+  CHECK_EQ(done.member_double("ok"), 3.0);
+  {
+    const std::lock_guard<std::mutex> lock(router.mutex);
+    CHECK_EQ(router.unloaded.size(), std::size_t(1));
+    if (router.unloaded.size() == 1)
+      CHECK_EQ(router.unloaded[0], std::string("qwen-image-2.1-turbo"));
+    CHECK(router.loaded.contains("qwen3.8-27b"));
+    CHECK(router.loaded.contains("qwen3-tts"));
+    CHECK(!router.loaded.contains("qwen-image-2.1-turbo"));
+    router.busy.clear();
+    router.loaded.clear();
+  }
 
   // Cancel: the running case ends, the waiting ones are abgebrochen.
   router.chat_delay_ms = 2000;

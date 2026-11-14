@@ -669,9 +669,83 @@ bool SelfTest::WaitReady(std::string* error) {
   return false;
 }
 
-void SelfTest::Unload(const std::string& model) {
+std::optional<TargetModelState> TargetModelStateOf(std::string_view models_body,
+                                                   std::string_view id) {
+  json::Value v;
+  try {
+    v = json::parse(std::string(models_body));
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+  const json::Value* data = v.is_object() ? v.find("data") : nullptr;
+  if (data == nullptr || !data->is_array())
+    return std::nullopt;
+  TargetModelState state;
+  for (const json::Value& m : data->items()) {
+    if (!m.is_object() || m.member_str("id") != id)
+      continue;
+    state.listed = true;
+    std::string status;
+    if (const json::Value* s = m.find("status"); s != nullptr && s->is_object())
+      status = s->member_str("value");
+    if (status.empty()) {
+      const json::Value* loaded = m.find("loaded");
+      status = loaded != nullptr && loaded->as_bool() ? "loaded" : "unloaded";
+    }
+    state.loaded = status == "loaded" || status == "loading";
+    if (const json::Value* a = m.find("activity"); a != nullptr && a->is_object())
+      if (const json::Value* busy = a->find("busy"); busy != nullptr)
+        state.busy = busy->as_bool();
+    if (const json::Value* in = m.find("inflight"); in != nullptr && in->is_object())
+      state.busy = state.busy || in->member_double("local") > 0 ||
+                   in->member_double("remote") > 0;
+    if (const json::Value* r = m.find("remote"); r != nullptr && r->is_object())
+      state.remote = true;
+    break;
+  }
+  return state;
+}
+
+bool UnloadAfterCase(bool own_child,
+                     const std::optional<TargetModelState>& before,
+                     const std::optional<TargetModelState>& now) {
+  if (own_child)
+    return true;
+  if (!before.has_value() || !now.has_value())
+    return false;
+  if (!before->listed || before->loaded || before->remote)
+    return false;
+  return now->listed && now->loaded && !now->busy && !now->remote;
+}
+
+std::optional<TargetModelState> SelfTest::ModelState(const std::string& model) {
+  const Reply r = Get("/v1/models", 30);
+  if (!r.ok || r.status != 200)
+    return std::nullopt;
+  return TargetModelStateOf(r.body, model);
+}
+
+void SelfTest::Unload(const std::string& model,
+                      const std::optional<TargetModelState>& before) {
   if (!options_.unload_after)
     return;
+  // Against a running router (production) the case must not take away a
+  // model someone else loaded or uses right now.
+  const bool own_child = options_.base_url.empty();
+  if (!own_child) {
+    const std::optional<TargetModelState> now = ModelState(model);
+    if (!UnloadAfterCase(false, before, now)) {
+      Logger::Info(
+          "router",
+          "event=selbsttest_unload_skipped model=" + model + " reason=" +
+              (!before.has_value() || !now.has_value() ? "state_unknown"
+               : before->loaded                        ? "loaded_before"
+               : now->busy                             ? "busy"
+               : before->remote || now->remote         ? "remote"
+                                                       : "not_loaded"));
+      return;
+    }
+  }
   json::Value body = json::Value::object();
   body["model"] = model;
   const Reply r = Post("/models/unload", body, 120);
@@ -984,6 +1058,11 @@ void SelfTest::RunCase(std::size_t index) {
   std::string out;
   std::string ext;
   bool ok = false;
+  // A running router: remember whether the model was loaded before, so the
+  // unload afterwards leaves models of other users alone.
+  std::optional<TargetModelState> before;
+  if (c.art != "partner" && options_.unload_after && !options_.base_url.empty())
+    before = ModelState(c.modell);
   if (c.art == "chat") {
     ok = Chat(c, &hint, &log, &out, &ext);
   } else if (c.art == "bild") {
@@ -1039,7 +1118,7 @@ void SelfTest::RunCase(std::size_t index) {
                              " seconds=" + std::to_string(seconds()) +
                              " hint=\"" + OneLine(hint) + "\"");
   if (c.art != "partner")
-    Unload(c.modell);
+    Unload(c.modell, before);
 }
 
 void SelfTest::WriteReport() {
