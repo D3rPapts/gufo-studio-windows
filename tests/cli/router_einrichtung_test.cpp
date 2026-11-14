@@ -642,6 +642,20 @@ void TestService() {
                          "{\"name\":\"lokal\",\"passwort\":\"geheim\"}"));
   CHECK(r.has_value() && r->status == 400);
   CHECK_EQ(ErrorCode(*r), "name_reserved");
+  // Review finding 7: a failed save stores nothing, so the retry is no
+  // 409 for a passwordless admin (the users file is a folder here).
+  {
+    const auto blocker = tmp / "daten" / "nutzer" / "nutzer.json";
+    std::filesystem::create_directories(blocker / "x");
+    r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
+                           "{\"name\":\"Chef\",\"passwort\":\"geheim\"}"));
+    CHECK(r.has_value() && r->status == 500);
+    CHECK_EQ(ErrorCode(*r), "users_file");
+    CHECK(!f.store->Find("chef").has_value());
+    CHECK(!f.store->HasAdmin());
+    std::error_code ec;
+    std::filesystem::remove_all(blocker, ec);
+  }
   r = service.Handle(Req("POST", "/router/setup/admin", "127.0.0.1",
                          "{\"name\":\"Chef\",\"passwort\":\"geheim\"}"));
   CHECK(r.has_value() && r->status == 201);
@@ -670,6 +684,28 @@ void TestService() {
     body["schreiben"] = schreiben;
     return Req("POST", "/router/setup/preset", "127.0.0.1", body.dump());
   };
+#ifdef _WIN32
+  {
+    // Review finding 10: a TEMP that is no folder (here: below a file)
+    // neither throws nor fails; the parse probe goes next to the preset.
+    WriteFile(tmp / "keintemp", "x");
+    const std::string bogus = (tmp / "keintemp" / "unter").string();
+    std::string old_tmp;
+    std::string old_temp;
+    if (const char* v = std::getenv("TMP"))
+      old_tmp = v;
+    if (const char* v = std::getenv("TEMP"))
+      old_temp = v;
+    _putenv_s("TMP", bogus.c_str());
+    _putenv_s("TEMP", bogus.c_str());
+    r = service.Handle(request(false));
+    _putenv_s("TMP", old_tmp.c_str());
+    _putenv_s("TEMP", old_temp.c_str());
+    CHECK(r.has_value() && r->status == 200);
+    if (r.has_value() && r->status != 200)
+      std::cerr << "  " << r->body << "\n";
+  }
+#endif
   r = service.Handle(request(false));
   CHECK(r.has_value() && r->status == 200);
   if (r.has_value() && r->status != 200)
@@ -817,7 +853,8 @@ struct FakeHf {
     bool gated{false};
     int fail_first{0};     // 503 for the first n requests
     bool ignore_range{false};
-    int chunk_ms{0};        // >0: streamed in 64 KB chunks with this pause
+    bool refuse_range{false};  // 416 for every Range request
+    int chunk_ms{0};       // >0: streamed in 64 KB chunks with this pause
     bool linked_etag{false};  // X-Linked-ETag with the body's SHA-256
   };
   std::map<std::string, Entry> files;
@@ -886,6 +923,9 @@ struct FakeHf {
       const std::lock_guard<std::mutex> lock(mutex);
       ranges.emplace_back(req.path, range);
     }
+    if (!range.empty() && e.refuse_range)
+      return HttpResponse{.status = 416, .reason = "Range Not Satisfiable",
+                          .body = "{}"};
     if (!range.empty() && !e.ignore_range && range.starts_with("bytes=")) {
       from = static_cast<std::size_t>(
           std::strtoull(range.c_str() + 6, nullptr, 10));
@@ -1044,6 +1084,8 @@ void TestDownloads() {
   const std::string resume = PseudoRandom(200000, 8);
   const std::string noresume = PseudoRandom(150000, 9);
   const std::string slow = PseudoRandom(3 << 20, 10);
+  const std::string refuse = PseudoRandom(90000, 11);
+  const std::string badhex = PseudoRandom(5000, 12);
   hf.files["/acme/repo-a/resolve/abc/good.bin"] = {.body = good};
   hf.files["/acme/repo-a/resolve/abc/nosha.bin"] = {.body = nosha,
                                                      .linked_etag = true};
@@ -1055,6 +1097,9 @@ void TestDownloads() {
   hf.files["/acme/repo-a/resolve/abc/resume.bin"] = {.body = resume};
   hf.files["/acme/repo-a/resolve/abc/noresume.bin"] = {.body = noresume,
                                                         .ignore_range = true};
+  hf.files["/acme/repo-a/resolve/abc/refuse.bin"] = {.body = refuse,
+                                                      .refuse_range = true};
+  hf.files["/acme/repo-a/resolve/abc/badhex.bin"] = {.body = badhex};
   hf.files["/acme/slow/resolve/main/s.bin"] = {.body = slow, .chunk_ms = 15};
   hf.Start();
 
@@ -1099,6 +1144,11 @@ void TestDownloads() {
                           Sha(resume)));
     d.push_back(FileEntry("acme\\repo-a\\noresume.bin", noresume.size(),
                           Sha(noresume)));
+    d.push_back(FileEntry("acme\\repo-a\\refuse.bin", refuse.size(),
+                          Sha(refuse)));
+    // Finding 13: 64 characters but no hex digest = unknown, no mismatch.
+    d.push_back(FileEntry("acme\\repo-a\\badhex.bin", badhex.size(),
+                          std::string(64, 'z')));
     modelle.push_back(ModelEntry("m5", "acme\\repo-a", "acme/repo-a", "abc",
                                  std::move(d)));
   }
@@ -1139,6 +1189,8 @@ void TestDownloads() {
   WriteFile(ziel / "acme" / "repo-a" / "resume.bin.part", resume.substr(0, 1000));
   WriteFile(ziel / "acme" / "repo-a" / "noresume.bin.part",
             noresume.substr(0, 777));
+  WriteFile(ziel / "acme" / "repo-a" / "refuse.bin.part",
+            refuse.substr(0, 500));
   const std::string ziel_json = "\"ziel\":\"" + Esc(ziel.string()) + "\"";
   const auto post = [&](const std::string& body) {
     return service.Handle(
@@ -1165,7 +1217,7 @@ void TestDownloads() {
   {
     const json::Value b = Body(*r);
     CHECK(!b.find("laeuft")->as_bool());
-    CHECK_EQ(b.find("dateien")->size(), std::size_t(10));
+    CHECK_EQ(b.find("dateien")->size(), std::size_t(12));
     CHECK_EQ(FileStatus(b, "acme\\repo-a\\good.bin"), "wartet");
     CHECK_EQ(FileStatus(b, "acme\\repo-a\\sub\\have.bin"), "vorhanden");
     CHECK_EQ(FileStatus(b, "acme\\none\\n.bin"), "fehler");
@@ -1215,6 +1267,22 @@ void TestDownloads() {
     CHECK_EQ(FileStatus(b, "acme\\repo-a\\noresume.bin"), "fertig");
     CHECK_EQ(FileField(b, "acme\\repo-a\\noresume.bin", "sha256_status"), "ok");
     CHECK_EQ(ReadFile(ziel / "acme" / "repo-a" / "noresume.bin"), noresume);
+    // Review finding 9: a 416 for a short .part starts it over at once
+    // instead of retrying the same range until the retries run out.
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\refuse.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\refuse.bin", "sha256_status"), "ok");
+    CHECK_EQ(ReadFile(ziel / "acme" / "repo-a" / "refuse.bin"), refuse);
+    {
+      const std::lock_guard<std::mutex> lock(hf.mutex);
+      int refused = 0;
+      for (const auto& [path, range] : hf.ranges)
+        if (path == "/acme/repo-a/resolve/abc/refuse.bin")
+          ++refused;
+      CHECK_EQ(refused, 1);
+    }
+    CHECK_EQ(FileStatus(b, "acme\\repo-a\\badhex.bin"), "fertig");
+    CHECK_EQ(FileField(b, "acme\\repo-a\\badhex.bin", "sha256_status"),
+             "unbekannt");
     bool resumed = false;
     bool noresumed = false;
     {
@@ -1296,7 +1364,10 @@ void TestDownloads() {
   r = post("{\"aktion\":\"abbrechen\"}");
   CHECK(r.has_value() && r->status == 200);
   {
-    const json::Value b = WaitStatus(service, "acme\\slow\\s.bin", "abgebrochen");
+    (void)WaitStatus(service, "acme\\slow\\s.bin", "abgebrochen");
+    // The worker marks the file before it leaves: wait until it has.
+    const json::Value b = WaitDone(service);
+    CHECK_EQ(FileStatus(b, "acme\\slow\\s.bin"), "abgebrochen");
     CHECK(!b.find("laeuft")->as_bool());
     CHECK(!b.find("pause")->as_bool());
     CHECK(std::filesystem::exists(ziel / "acme" / "slow" / "s.bin.part"));
@@ -1408,6 +1479,8 @@ struct FakeRouter {
   std::mutex mutex;
   std::vector<std::string> unloaded;
   std::vector<std::string> paths;
+  /// "<path> <X-Gufo-Internal>" of every request.
+  std::vector<std::string> keys;
   int video_polls{0};
   int objekt_polls{0};
   int chat_delay_ms{0};
@@ -1473,6 +1546,7 @@ struct FakeRouter {
       const std::lock_guard<std::mutex> lock(mutex);
       paths.push_back(req.method + " " + req.path +
                       (req.query.empty() ? "" : "?" + req.query));
+      keys.push_back(req.path + " " + req.header("X-Gufo-Internal"));
     }
     if (req.path == "/ready" || req.path == "/health") {
       json::Value v = json::Value::object();
@@ -1732,6 +1806,9 @@ void TestSelfTestService() {
   options.users_unbound = true;
   options.gate = f.gate.get();
   options.selbsttest_base_url = router.Base();
+  // Review finding 1: the router's own loopback is called with its
+  // internal key; the partner never gets it.
+  options.selbsttest_headers = {"X-Gufo-Internal: interner-schluessel"};
   options.selbsttest_start_timeout_s = 5;
   options.selbsttest_test_timeout_s = 10;
   options.selbsttest_poll_ms = 20;
@@ -1811,6 +1888,22 @@ void TestSelfTestService() {
                         "gufo-upscale"})
     CHECK_EQ(TestStatus(done, m), std::string("ok"));
   CHECK_EQ(TestStatus(done, router.Base()), std::string("ok"));
+  {
+    const std::lock_guard<std::mutex> lock(router.mutex);
+    std::size_t own = 0;
+    std::size_t partner = 0;
+    for (const std::string& k : router.keys) {
+      if (k.starts_with("/health ")) {
+        ++partner;
+        CHECK_EQ(k, std::string("/health "));
+      } else {
+        ++own;
+        CHECK(k.ends_with(" interner-schluessel"));
+      }
+    }
+    CHECK(own > 8);
+    CHECK(partner >= 1);
+  }
   {
     const json::Value* chat = FindTest(done, "qwen3.8-27b");
     CHECK(chat != nullptr && chat->member_double("dauer_s") >= 0.3);
@@ -1927,6 +2020,57 @@ void TestSelfTestService() {
   std::filesystem::remove_all(tmp, ec);
 }
 
+#ifdef _WIN32
+void TestSelfTestChildEnv() {
+  // Review finding 2: the preset's `# env:` lines reach the child router
+  // only, never this process's environment. The "router" is cmd.exe,
+  // which writes the variable it sees into a file and exits.
+  const char* comspec = std::getenv("ComSpec");
+  if (comspec == nullptr || *comspec == '\0')
+    return;
+  const std::filesystem::path tmp = TempDir();
+  Fixture f(auth::Mode::kOff);
+  einrichtung::ServiceOptions options;
+  options.dir = kDir;
+  options.exe = tmp / "bin" / "gufo.exe";
+  options.port = 8098;
+  options.users_unbound = true;
+  options.gate = f.gate.get();
+  options.selbsttest_start_timeout_s = 5;
+  options.selbsttest_poll_ms = 20;
+  einrichtung::SetupService service(options);
+  const std::filesystem::path probe =
+      std::filesystem::current_path() / "selbsttest-env-probe.txt";
+  std::error_code ec;
+  std::filesystem::remove(probe, ec);
+  const std::filesystem::path preset = tmp / "daten" / "gufo-router.ini";
+  WriteFile(preset, std::string("# start: ") + comspec +
+                        " /d /c echo %GUFO_SELBSTTEST_PROBE%>" +
+                        probe.filename().string() +
+                        "\n# env: GUFO_SELBSTTEST_PROBE=nur-im-kind\n"
+                        "# baustein: router\n[router]\nauth = off\n");
+  std::optional<HttpResponse> r = service.Handle(Req(
+      "POST", "/router/setup/selbsttest", "127.0.0.1",
+      "{\"aktion\":\"start\",\"preset\":\"" + Esc(preset.string()) +
+          "\",\"tests\":[{\"baustein\":\"chat\",\"modell\":\"x\"}]}"));
+  CHECK(r.has_value() && r->status == 202);
+  const json::Value done = WaitSelfTest(service);
+  CHECK(done.find("fertig")->as_bool());
+  CHECK(std::getenv("GUFO_SELBSTTEST_PROBE") == nullptr);
+  std::string seen;
+  {
+    std::ifstream in(probe, std::ios::binary);
+    seen.assign(std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>());
+  }
+  CHECK(seen.starts_with("nur-im-kind"));
+  if (!seen.starts_with("nur-im-kind"))
+    std::cerr << "  probe: '" << seen << "'\n";
+  std::filesystem::remove(probe, ec);
+  std::filesystem::remove_all(tmp, ec);
+}
+#endif
+
 int main() {
   TestClassifyAndGate();
   TestHelpers();
@@ -1937,6 +2081,9 @@ int main() {
   TestRealDownload();
   TestSelfTestPlanning();
   TestSelfTestService();
+#ifdef _WIN32
+  TestSelfTestChildEnv();
+#endif
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

@@ -4282,6 +4282,24 @@ int RunRouter(std::span<const char* const> args) {
     setup_options.port = port;
     setup_options.users_unbound = einrichtung && preset_path.empty();
     setup_options.gate = state->gate.get();
+    if (!einrichtung && !preset_path.empty()) {
+      // A router running a preset tests itself through its own loopback
+      // (with its internal key, as self_fetch below); a child router from
+      // the same preset would collide on worker ports and memory (review
+      // finding 1). Only --einrichtung starts the preset as a child.
+      std::string self_host =
+          host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]"
+              ? std::string("127.0.0.1")
+              : host;
+      if (self_host.find(':') != std::string::npos &&
+          !self_host.starts_with('['))
+        self_host = "[" + self_host + "]";
+      setup_options.selbsttest_base_url =
+          "http://" + self_host + ":" + std::to_string(port);
+      setup_options.selbsttest_headers.push_back(
+          std::string(router::auth::kInternalHeader) + ": " +
+          state->gate->internal_key());
+    }
     setup_options.check_preset =
         [models_dir](const std::filesystem::path& file) -> std::string {
       std::vector<router::PresetModel> probe;

@@ -471,7 +471,8 @@ void SelfTest::Set(std::size_t index, const std::string& status,
 
 SelfTest::Reply SelfTest::Request(const std::string& method,
                                   const std::string& url,
-                                  const std::string& body, long timeout_s) {
+                                  const std::string& body, long timeout_s,
+                                  bool own) {
   Reply r;
   std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
                                                            curl_easy_cleanup);
@@ -498,15 +499,20 @@ SelfTest::Reply SelfTest::Request(const std::string& method,
   curl_easy_setopt(c, CURLOPT_XFERINFODATA, &cancel_);
   std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(
       nullptr, curl_slist_free_all);
+  if (own)
+    for (const std::string& header : options_.headers)
+      headers.reset(curl_slist_append(headers.release(), header.c_str()));
   if (method == "POST") {
-    headers.reset(curl_slist_append(nullptr, "Content-Type: application/json"));
+    headers.reset(
+        curl_slist_append(headers.release(), "Content-Type: application/json"));
     headers.reset(curl_slist_append(headers.release(), "Expect:"));
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(c, CURLOPT_POST, 1L);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE,
                      static_cast<curl_off_t>(body.size()));
   }
+  if (headers != nullptr)
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
   const CURLcode rc = curl_easy_perform(c);
   if (rc != CURLE_OK) {
     r.error = error_buffer[0] != '\0' ? std::string(error_buffer.data())
@@ -521,12 +527,12 @@ SelfTest::Reply SelfTest::Request(const std::string& method,
 }
 
 SelfTest::Reply SelfTest::Get(const std::string& path, long timeout_s) {
-  return Request("GET", base_url_ + path, "", timeout_s);
+  return Request("GET", base_url_ + path, "", timeout_s, true);
 }
 
 SelfTest::Reply SelfTest::Post(const std::string& path, const json::Value& body,
                                long timeout_s) {
-  return Request("POST", base_url_ + path, body.dump(), timeout_s);
+  return Request("POST", base_url_ + path, body.dump(), timeout_s, true);
 }
 
 void SelfTest::Explain(const Reply& r, std::string* hint, std::string* log) {
@@ -592,13 +598,6 @@ bool SelfTest::StartChild(std::string* error) {
              " (\"# start:\" line of the preset)";
     return false;
   }
-  for (const auto& [name, value] : start.env) {
-#ifdef _WIN32
-    SetEnvironmentVariableA(name.c_str(), value.c_str());
-#else
-    setenv(name.c_str(), value.c_str(), 1);
-#endif
-  }
   const int port = ReserveLoopbackPort(error);
   if (port < 0)
     return false;
@@ -607,6 +606,9 @@ bool SelfTest::StartChild(std::string* error) {
   spec.command = start.program;
   spec.args = start.args;
   spec.port = port;
+  // The `# env:` lines go to the child only, never into this router's
+  // own environment (review finding 2).
+  spec.env = start.env;
   std::unique_ptr<Worker> child = Worker::Spawn(spec, options_.exe, error);
   if (child == nullptr)
     return false;

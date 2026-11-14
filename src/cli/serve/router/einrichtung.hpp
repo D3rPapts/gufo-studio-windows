@@ -155,9 +155,14 @@ struct ServiceOptions {
   int download_parallel{2};
   /// Space the start keeps free on top of the open bytes (plan: 2 GB).
   long long download_reserve_bytes{2LL << 30};
-  /// Self-test: a test points this at a fake router instead of starting
-  /// the preset's router as a child; the timeouts are shortened then.
+  /// Self-test target: "" = start the preset's router as a child (only
+  /// with --einrichtung); a router running a preset sets its own loopback
+  /// (review finding 1: a second router from the same preset would fight
+  /// the first for worker ports and memory); a test sets a fake router.
   std::string selbsttest_base_url;
+  /// "Name: value" headers of the calls to that target (the router's
+  /// internal key for its own loopback).
+  std::vector<std::string> selbsttest_headers;
   int selbsttest_start_timeout_s{180};
   int selbsttest_test_timeout_s{900};
   int selbsttest_poll_ms{2000};

@@ -95,6 +95,9 @@ struct SelfTestOptions {
   std::filesystem::path exe;
   /// The target; "" = start the preset's router as a child.
   std::string base_url;
+  /// Extra "Name: value" headers of every call to the target (the
+  /// router's own loopback: its internal key, so auth admits the test).
+  std::vector<std::string> headers;
   std::string partner_url;
   std::vector<SelfTestCase> tests;
   int start_timeout_s{180};
@@ -152,8 +155,10 @@ private:
                std::string* out, std::string* ext);
   bool Partner(std::string* hint, std::string* log);
   void Unload(const std::string& model);
+  /// `own`: a call to the target, which carries SelfTestOptions::headers
+  /// (never sent to the partner).
   Reply Request(const std::string& method, const std::string& url,
-                const std::string& body, long timeout_s);
+                const std::string& body, long timeout_s, bool own = false);
   Reply Get(const std::string& path, long timeout_s);
   Reply Post(const std::string& path, const json::Value& body,
              long timeout_s);

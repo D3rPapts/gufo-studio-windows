@@ -42,14 +42,6 @@ std::string Trim(std::string_view text) {
   return std::string(text);
 }
 
-bool IsHex64(std::string_view text) {
-  if (text.size() != 64)
-    return false;
-  return std::all_of(text.begin(), text.end(), [](unsigned char c) {
-    return std::isxdigit(c) != 0;
-  });
-}
-
 std::FILE* OpenFile(const std::filesystem::path& file, bool append) {
 #ifdef _WIN32
   std::FILE* out = nullptr;
@@ -111,6 +103,14 @@ std::string HttpText(long code) {
 
 }  // namespace
 
+bool IsHex64(std::string_view text) {
+  if (text.size() != 64)
+    return false;
+  return std::all_of(text.begin(), text.end(), [](unsigned char c) {
+    return std::isxdigit(c) != 0;
+  });
+}
+
 const char* ToString(DownloadFile::Status status) {
   switch (status) {
     case DownloadFile::Status::kWartet:
@@ -139,16 +139,13 @@ const char* ToString(DownloadFile::Status status) {
 struct Downloader::Transfer {
   Downloader* self{nullptr};
   std::size_t index{0};
-  CURL* handle{nullptr};  // the GET handle (response code for Write)
   std::FILE* file{nullptr};
   std::filesystem::path part;
   crypto::Sha256Hasher hasher;
   long long written{0};   // bytes in the .part (resumed part included)
   long long resumed_from{0};
-  bool code_checked{false};
   bool write_error{false};
   bool restarted{false};  // the server ignored the Range: began at 0
-  long response_code{0};
   std::chrono::steady_clock::time_point last_space_check{
       std::chrono::steady_clock::now()};
   Headers headers;
@@ -165,25 +162,9 @@ std::size_t Downloader::Transfer::Write(char* data, std::size_t size,
   const std::size_t n = size * count;
   if (t->write_error)
     return 0;
-  if (!t->code_checked) {
-    t->code_checked = true;
-    if (t->handle != nullptr)
-      curl_easy_getinfo(t->handle, CURLINFO_RESPONSE_CODE, &t->response_code);
-    // A resumed request must be answered with 206; a 200 means the server
-    // sent the whole file from the start, so the .part begins again.
-    if (t->resumed_from > 0 && t->response_code == 200) {
-      std::fclose(t->file);
-      t->file = OpenFile(t->part, false);
-      t->hasher = crypto::Sha256Hasher();
-      t->self->AddBytes(t->index, -t->written);
-      t->written = 0;
-      t->restarted = true;
-      if (t->file == nullptr) {
-        t->write_error = true;
-        return 0;
-      }
-    }
-  }
+  // A resumed request answered with 200 (the whole file) never gets here:
+  // libcurl refuses it with CURLE_RANGE_ERROR before the body, and the GET
+  // loop starts the .part over (review finding 12).
   if (std::fwrite(data, 1, n, t->file) != n) {
     t->write_error = true;
     return 0;
@@ -762,7 +743,6 @@ bool Downloader::Attempt(std::size_t index, Transfer* t, bool* retry) {
       }
       curl_easy_reset(get.get());
       t->headers = Headers();
-      t->handle = get.get();
       error_buffer[0] = '\0';
       common(get.get());
       curl_easy_setopt(get.get(), CURLOPT_WRITEFUNCTION, Transfer::Write);
@@ -770,15 +750,23 @@ bool Downloader::Attempt(std::size_t index, Transfer* t, bool* retry) {
       if (have > 0)
         curl_easy_setopt(get.get(), CURLOPT_RESUME_FROM_LARGE,
                          static_cast<curl_off_t>(have));
-      // The write callback needs the response code of the final response;
-      // libcurl exposes it through getinfo once the headers are complete.
-      t->code_checked = false;
       rc = curl_easy_perform(get.get());
       std::fclose(t->file);
       t->file = nullptr;
-      if (rc == CURLE_RANGE_ERROR && have > 0 && pass == 0) {
+      long range_code = 0;
+      curl_easy_getinfo(get.get(), CURLINFO_RESPONSE_CODE, &range_code);
+      // 416 for a .part shorter than the known size: the server does not
+      // take it as a prefix (changed file?), so a retry with the same
+      // .part would only fail again (review finding 9). libcurl answers a
+      // resumed 416 with CURLE_OK ("already complete"), so the code
+      // decides, not rc.
+      const bool range_refused = range_code == 416 && f.bytes > 0 &&
+                                 have != f.bytes;
+      if ((rc == CURLE_RANGE_ERROR || range_refused) && have > 0 &&
+          pass == 0) {
         // The server answered the Range request with the whole file
-        // (libcurl refuses to append that): the .part starts over.
+        // (libcurl refuses to append that) or refused the range: the
+        // .part starts over.
         std::filesystem::remove(t->part, ec);
         t->hasher = crypto::Sha256Hasher();
         t->written = 0;
@@ -805,7 +793,8 @@ bool Downloader::Attempt(std::size_t index, Transfer* t, bool* retry) {
                                   : std::string(curl_easy_strerror(rc));
       if (rc == CURLE_HTTP_RETURNED_ERROR) {
         if (code == 416 && have > 0) {
-          // Range not satisfiable: the server thinks the file is complete.
+          // Range not satisfiable with no known size: the server thinks
+          // the file is complete; the digest decides.
         } else if (code == 401 || code == 403) {
           Set(index, DownloadFile::Status::kFehler, "gated", HttpText(code));
           return false;

@@ -254,9 +254,17 @@ std::unique_ptr<Worker> Worker::Spawn(const WorkerSpec& spec,
   std::vector<std::string> env_strings;
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
     const std::string_view text(*entry);
-    if (!text.starts_with("GUFO_HOST=") && !text.starts_with("GUFO_PORT=")) {
+    const bool own = std::any_of(
+        spec.env.begin(), spec.env.end(), [text](const auto& entry) {
+          return text.starts_with(entry.first + "=");
+        });
+    if (!own && !text.starts_with("GUFO_HOST=") &&
+        !text.starts_with("GUFO_PORT=")) {
       env_strings.emplace_back(text);
     }
+  }
+  for (const auto& [name, value] : spec.env) {
+    env_strings.push_back(name + "=" + value);
   }
   env_strings.push_back("GUFO_HOST=127.0.0.1");
   env_strings.push_back("GUFO_PORT=" + std::to_string(spec.port));
